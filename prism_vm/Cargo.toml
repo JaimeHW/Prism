@@ -1,0 +1,11 @@
+[package]
+name = "prism_vm"
+description = "Virtual machine for Prism"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prism_core.workspace = true
+prism_compiler.workspace = true
+prism_jit.workspace = true
+prism_runtime.workspace = true
