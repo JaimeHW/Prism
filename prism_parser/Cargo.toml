@@ -1,0 +1,14 @@
+[package]
+name = "prism_parser"
+description = "Python 3.12 lexer and parser for Prism"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+prism_core.workspace = true
+thiserror.workspace = true
+unicode-xid.workspace = true
+
+[dev-dependencies]
