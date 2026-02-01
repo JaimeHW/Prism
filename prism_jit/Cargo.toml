@@ -1,0 +1,12 @@
+[package]
+name = "prism_jit"
+description = "JVM/V8-tier JIT compiler for Prism"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prism_core.workspace = true
+memmap2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
