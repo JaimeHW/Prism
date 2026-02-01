@@ -128,6 +128,17 @@ pub struct ExecutableBuffer {
     is_executable: bool,
 }
 
+impl std::fmt::Debug for ExecutableBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutableBuffer")
+            .field("ptr", &self.ptr.as_ptr())
+            .field("capacity", &self.capacity)
+            .field("len", &self.len)
+            .field("is_executable", &self.is_executable)
+            .finish()
+    }
+}
+
 impl ExecutableBuffer {
     /// Minimum allocation size (one page).
     pub const MIN_SIZE: usize = PAGE_SIZE;

@@ -7,8 +7,10 @@
 //! - Native x64 code generation
 //! - Precise GC integration with stack maps
 //! - Runtime code caching and background compilation
+//! - Zero-cost code patching for OSR
 #![deny(unsafe_op_in_unsafe_fn)]
 pub mod backend;
+pub mod codegen;
 pub mod gc;
 pub mod ir;
 pub mod opt;
