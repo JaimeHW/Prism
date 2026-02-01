@@ -1,0 +1,9 @@
+[package]
+name = "prism_builtins"
+description = "Builtin types and functions for Prism"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prism_core.workspace = true
+prism_runtime.workspace = true
