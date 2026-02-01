@@ -49,6 +49,7 @@
 // Core modules
 pub mod error;
 pub mod frame;
+pub mod gc_integration;
 pub mod globals;
 pub mod vm;
 
@@ -58,16 +59,25 @@ pub mod dispatch;
 pub mod inline_cache;
 pub mod profiler;
 
+// JIT integration
+pub mod jit_bridge;
+pub mod jit_context;
+pub mod jit_executor;
+
 // Opcode handlers (organized by category)
 pub mod ops;
 
 // Re-exports
-pub use builtins::BuiltinRegistry;
+pub use builtins::{BuiltinError, BuiltinFn, BuiltinRegistry};
 pub use dispatch::ControlFlow;
 pub use error::{RuntimeError, RuntimeErrorKind, VmResult};
 pub use frame::{ClosureEnv, Frame, MAX_RECURSION_DEPTH};
+pub use gc_integration::{ManagedHeap, RootProvider, SafePoint, StackRoots};
 pub use globals::GlobalScope;
 pub use inline_cache::{CallIC, InlineCacheStore, MonoIC, PolyIC};
+pub use jit_bridge::{BridgeConfig, JitBridge};
+pub use jit_context::{JitConfig, JitContext, JitStats, ProcessedResult};
+pub use jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
 pub use profiler::{CodeId, Profiler, TierUpDecision};
 pub use vm::VirtualMachine;
 

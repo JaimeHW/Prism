@@ -189,6 +189,7 @@ pub fn move_reg(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 }
 
 #[cfg(test)]
+#[allow(unused)]
 mod tests {
     use super::*;
     use prism_compiler::bytecode::{Opcode, Register};

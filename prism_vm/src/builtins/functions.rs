@@ -1,0 +1,645 @@
+//! Core builtin functions (len, abs, min, max, sum, pow, etc.).
+
+use super::BuiltinError;
+use prism_core::Value;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::list::ListObject;
+
+// =============================================================================
+// len
+// =============================================================================
+
+/// Builtin len function.
+///
+/// Returns the length of an object (list, tuple, string, dict, set, range).
+pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "len() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let obj = args[0];
+
+    // Check for known types
+    // TODO: Dispatch via TypeSlots.sq_length when object system is wired
+
+    // For now, return an error for unrecognized types
+    // This will be expanded as we wire up the object system
+    if obj.is_none() {
+        return Err(BuiltinError::TypeError(
+            "object of type 'NoneType' has no len()".to_string(),
+        ));
+    }
+
+    if obj.is_int() {
+        return Err(BuiltinError::TypeError(
+            "object of type 'int' has no len()".to_string(),
+        ));
+    }
+
+    if obj.is_float() {
+        return Err(BuiltinError::TypeError(
+            "object of type 'float' has no len()".to_string(),
+        ));
+    }
+
+    if obj.is_bool() {
+        return Err(BuiltinError::TypeError(
+            "object of type 'bool' has no len()".to_string(),
+        ));
+    }
+
+    // Handle object pointers (list, tuple, dict, set, string, range)
+    if let Some(ptr) = obj.as_object_ptr() {
+        // Extract TypeId from object header
+        use crate::ops::objects::extract_type_id;
+        let type_id = extract_type_id(ptr);
+
+        match type_id {
+            TypeId::LIST => {
+                let list = unsafe { &*(ptr as *const ListObject) };
+                return Value::int(list.len() as i64).ok_or_else(|| {
+                    BuiltinError::OverflowError("list length overflow".to_string())
+                });
+            }
+            // TODO: Add tuple, dict, set, string, range support
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "object of type '{}' has no len()",
+                    type_id.name()
+                )));
+            }
+        }
+    }
+
+    Err(BuiltinError::NotImplemented(
+        "len() for unknown value type".to_string(),
+    ))
+}
+
+// =============================================================================
+// abs
+// =============================================================================
+
+/// Builtin abs function.
+///
+/// Returns the absolute value of a number.
+pub fn builtin_abs(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "abs() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let arg = args[0];
+
+    if let Some(i) = arg.as_int() {
+        return Value::int(i.abs()).ok_or_else(|| {
+            BuiltinError::OverflowError("integer absolute value overflow".to_string())
+        });
+    }
+
+    if let Some(f) = arg.as_float() {
+        return Ok(Value::float(f.abs()));
+    }
+
+    Err(BuiltinError::TypeError(
+        "bad operand type for abs(): expected number".to_string(),
+    ))
+}
+
+// =============================================================================
+// min / max
+// =============================================================================
+
+/// Builtin min function.
+///
+/// Returns the smallest item in an iterable or the smallest of two or more arguments.
+pub fn builtin_min(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "min expected at least 1 argument, got 0".to_string(),
+        ));
+    }
+
+    let mut min_val = args[0];
+
+    for arg in &args[1..] {
+        // Compare integers
+        if let (Some(a), Some(b)) = (arg.as_int(), min_val.as_int()) {
+            if a < b {
+                min_val = *arg;
+            }
+            continue;
+        }
+
+        // Compare floats
+        if let (Some(a), Some(b)) = (arg.as_float_coerce(), min_val.as_float_coerce()) {
+            if a < b {
+                min_val = *arg;
+            }
+            continue;
+        }
+
+        // TODO: Support comparison protocol for objects
+    }
+
+    Ok(min_val)
+}
+
+/// Builtin max function.
+///
+/// Returns the largest item in an iterable or the largest of two or more arguments.
+pub fn builtin_max(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "max expected at least 1 argument, got 0".to_string(),
+        ));
+    }
+
+    let mut max_val = args[0];
+
+    for arg in &args[1..] {
+        // Compare integers
+        if let (Some(a), Some(b)) = (arg.as_int(), max_val.as_int()) {
+            if a > b {
+                max_val = *arg;
+            }
+            continue;
+        }
+
+        // Compare floats
+        if let (Some(a), Some(b)) = (arg.as_float_coerce(), max_val.as_float_coerce()) {
+            if a > b {
+                max_val = *arg;
+            }
+            continue;
+        }
+
+        // TODO: Support comparison protocol for objects
+    }
+
+    Ok(max_val)
+}
+
+// =============================================================================
+// sum
+// =============================================================================
+
+/// Builtin sum function.
+///
+/// Sums the items of an iterable, left to right, with optional start value.
+pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "sum expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    // Get start value (default 0)
+    let start = if args.len() == 2 {
+        args[1].as_int().unwrap_or(0)
+    } else {
+        0
+    };
+
+    // TODO: Iterate over first argument when iteration protocol is wired
+    // For now, if first arg is an int, just return start + arg (simplified)
+    if let Some(i) = args[0].as_int() {
+        return Value::int(start + i)
+            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in sum".to_string()));
+    }
+
+    Err(BuiltinError::NotImplemented(
+        "sum() for iterables not yet implemented".to_string(),
+    ))
+}
+
+// =============================================================================
+// pow
+// =============================================================================
+
+/// Builtin pow function.
+///
+/// pow(base, exp[, mod]) - Compute base**exp, optionally modulo mod.
+pub fn builtin_pow(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "pow expected 2 or 3 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let base = args[0];
+    let exp = args[1];
+
+    // Integer power
+    if let (Some(b), Some(e)) = (base.as_int(), exp.as_int()) {
+        if args.len() == 3 {
+            // Modular exponentiation
+            if let Some(m) = args[2].as_int() {
+                if m == 0 {
+                    return Err(BuiltinError::ValueError(
+                        "pow() 3rd argument cannot be 0".to_string(),
+                    ));
+                }
+                // Use modular exponentiation
+                let result = mod_pow(b, e, m);
+                return Value::int(result).ok_or_else(|| {
+                    BuiltinError::OverflowError("integer overflow in pow".to_string())
+                });
+            }
+        }
+
+        // Simple integer power
+        if e >= 0 && e <= 63 {
+            if let Some(result) = b.checked_pow(e as u32) {
+                return Value::int(result).ok_or_else(|| {
+                    BuiltinError::OverflowError("integer overflow in pow".to_string())
+                });
+            }
+        }
+
+        // Fall back to float for large exponents
+        let result = (b as f64).powf(e as f64);
+        return Ok(Value::float(result));
+    }
+
+    // Float power
+    if let (Some(b), Some(e)) = (base.as_float_coerce(), exp.as_float_coerce()) {
+        let result = b.powf(e);
+        return Ok(Value::float(result));
+    }
+
+    Err(BuiltinError::TypeError(
+        "pow() arguments must be numeric".to_string(),
+    ))
+}
+
+/// Modular exponentiation: (base^exp) mod modulus
+#[inline]
+fn mod_pow(mut base: i64, mut exp: i64, modulus: i64) -> i64 {
+    if exp < 0 {
+        // Negative exponent with modulus is not supported for integers
+        return 0;
+    }
+
+    let mut result: i64 = 1;
+    base = base.rem_euclid(modulus);
+
+    while exp > 0 {
+        if exp % 2 == 1 {
+            result = (result * base).rem_euclid(modulus);
+        }
+        exp /= 2;
+        base = (base * base).rem_euclid(modulus);
+    }
+
+    result
+}
+
+// =============================================================================
+// round
+// =============================================================================
+
+/// Builtin round function.
+///
+/// round(number[, ndigits]) - Round a number to a given precision.
+pub fn builtin_round(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "round expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let ndigits = if args.len() == 2 {
+        args[1].as_int().unwrap_or(0)
+    } else {
+        0
+    };
+
+    if let Some(i) = args[0].as_int() {
+        // Rounding an integer with no ndigits returns the integer
+        if ndigits >= 0 {
+            return Ok(args[0]);
+        }
+        // Negative ndigits: round to nearest 10^(-ndigits)
+        let factor = 10i64.pow((-ndigits) as u32);
+        let rounded = ((i as f64 / factor as f64).round() * factor as f64) as i64;
+        return Value::int(rounded)
+            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in round".to_string()));
+    }
+
+    if let Some(f) = args[0].as_float() {
+        if ndigits == 0 {
+            // Round to integer
+            let rounded = f.round();
+            if rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64 {
+                return Value::int(rounded as i64).ok_or_else(|| {
+                    BuiltinError::OverflowError("integer overflow in round".to_string())
+                });
+            }
+            return Ok(Value::float(rounded));
+        }
+        // Round to ndigits decimal places
+        let factor = 10f64.powi(ndigits as i32);
+        let rounded = (f * factor).round() / factor;
+        return Ok(Value::float(rounded));
+    }
+
+    Err(BuiltinError::TypeError(
+        "round() argument must be a number".to_string(),
+    ))
+}
+
+// =============================================================================
+// divmod
+// =============================================================================
+
+/// Builtin divmod function.
+///
+/// divmod(a, b) - Return (a // b, a % b) as a tuple.
+pub fn builtin_divmod(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "divmod expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    // Integer divmod
+    if let (Some(a), Some(b)) = (args[0].as_int(), args[1].as_int()) {
+        if b == 0 {
+            return Err(BuiltinError::ValueError(
+                "integer division or modulo by zero".to_string(),
+            ));
+        }
+        let quotient = a.div_euclid(b);
+        let _remainder = a.rem_euclid(b);
+        // TODO: Return as tuple Value when TupleObject is wired to Value
+        // For now, return quotient (simplified)
+        return Value::int(quotient)
+            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in divmod".to_string()));
+    }
+
+    Err(BuiltinError::TypeError(
+        "divmod() arguments must be integers".to_string(),
+    ))
+}
+
+// =============================================================================
+// hash
+// =============================================================================
+
+/// Builtin hash function.
+///
+/// hash(object) - Return the hash value of the object.
+pub fn builtin_hash(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "hash() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let obj = args[0];
+
+    // Hashable primitives
+    if obj.is_none() {
+        // hash(None) = 0 in Python, but we'll use a distinct value
+        return Ok(Value::int(0x_C0FFEE).unwrap());
+    }
+
+    if let Some(b) = obj.as_bool() {
+        return Ok(Value::int(if b { 1 } else { 0 }).unwrap());
+    }
+
+    if let Some(i) = obj.as_int() {
+        // Python's hash for small ints is the int itself (with some adjustments for -1)
+        let h = if i == -1 { -2 } else { i };
+        return Value::int(h)
+            .ok_or_else(|| BuiltinError::OverflowError("hash overflow".to_string()));
+    }
+
+    if let Some(f) = obj.as_float() {
+        // Hash float by its bits
+        let h = f.to_bits() as i64;
+        return Value::int(h)
+            .ok_or_else(|| BuiltinError::OverflowError("hash overflow".to_string()));
+    }
+
+    // TODO: Handle strings and tuples via object pointer
+    Err(BuiltinError::TypeError("unhashable type".to_string()))
+}
+
+// =============================================================================
+// id
+// =============================================================================
+
+/// Builtin id function.
+///
+/// id(object) - Return the identity of an object (its memory address).
+pub fn builtin_id(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "id() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let obj = args[0];
+
+    // For objects, return pointer address
+    if let Some(ptr) = obj.as_object_ptr() {
+        return Value::int(ptr as i64)
+            .ok_or_else(|| BuiltinError::OverflowError("id overflow".to_string()));
+    }
+
+    // For primitives, compute a stable ID based on the actual value
+    // Python semantics: identical primitive values may share ID (interning)
+    if obj.is_none() {
+        return Ok(Value::int(0x_DEAD_BEEF).unwrap());
+    }
+    if let Some(b) = obj.as_bool() {
+        return Ok(Value::int(if b { 0x_1 } else { 0x_0 }).unwrap());
+    }
+    if let Some(i) = obj.as_int() {
+        // Small integers get stable IDs (like CPython's -5 to 256 cache)
+        return Value::int(i).ok_or_else(|| BuiltinError::OverflowError("id overflow".to_string()));
+    }
+    if let Some(f) = obj.as_float() {
+        // Use float bits as ID
+        return Value::int(f.to_bits() as i64)
+            .ok_or_else(|| BuiltinError::OverflowError("id overflow".to_string()));
+    }
+
+    // Fallback
+    Ok(Value::int(0).unwrap())
+}
+
+// =============================================================================
+// callable
+// =============================================================================
+
+/// Builtin callable function.
+///
+/// callable(object) - Return True if the object appears callable.
+pub fn builtin_callable(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "callable() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let obj = args[0];
+
+    // Primitives are not callable
+    if obj.is_none() || obj.is_bool() || obj.is_int() || obj.is_float() {
+        return Ok(Value::bool(false));
+    }
+
+    // TODO: Check TypeSlots.tp_call for objects
+    // For now, assume object pointers might be callable (functions, classes)
+    if obj.is_object() {
+        return Ok(Value::bool(true)); // Optimistic assumption
+    }
+
+    Ok(Value::bool(false))
+}
+
+// =============================================================================
+// repr / ascii
+// =============================================================================
+
+/// Builtin repr function.
+///
+/// repr(object) - Return a string containing a printable representation.
+pub fn builtin_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "repr() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    // TODO: Return string Value when StringObject is wired
+    // For now, return None as placeholder
+    Ok(Value::none())
+}
+
+/// Builtin ascii function.
+///
+/// ascii(object) - Like repr() but escape non-ASCII characters.
+pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "ascii() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    // TODO: Return string Value when StringObject is wired
+    Ok(Value::none())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_abs_int() {
+        let result = builtin_abs(&[Value::int(-42).unwrap()]).unwrap();
+        assert_eq!(result.as_int(), Some(42));
+
+        let result = builtin_abs(&[Value::int(42).unwrap()]).unwrap();
+        assert_eq!(result.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_abs_float() {
+        let result = builtin_abs(&[Value::float(-3.14)]).unwrap();
+        assert_eq!(result.as_float(), Some(3.14));
+    }
+
+    #[test]
+    fn test_abs_error() {
+        let result = builtin_abs(&[Value::none()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_min() {
+        let result = builtin_min(&[
+            Value::int(5).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(8).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(result.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_max() {
+        let result = builtin_max(&[
+            Value::int(5).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(8).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(result.as_int(), Some(8));
+    }
+
+    #[test]
+    fn test_pow_int() {
+        let result = builtin_pow(&[Value::int(2).unwrap(), Value::int(10).unwrap()]).unwrap();
+        assert_eq!(result.as_int(), Some(1024));
+    }
+
+    #[test]
+    fn test_pow_mod() {
+        let result = builtin_pow(&[
+            Value::int(2).unwrap(),
+            Value::int(10).unwrap(),
+            Value::int(100).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(result.as_int(), Some(24)); // 1024 % 100 = 24
+    }
+
+    #[test]
+    fn test_round_int() {
+        let result = builtin_round(&[Value::int(42).unwrap()]).unwrap();
+        assert_eq!(result.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_round_float() {
+        let result = builtin_round(&[Value::float(3.7)]).unwrap();
+        assert_eq!(result.as_int(), Some(4));
+    }
+
+    #[test]
+    fn test_hash_int() {
+        let result = builtin_hash(&[Value::int(42).unwrap()]).unwrap();
+        assert_eq!(result.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_callable() {
+        let result = builtin_callable(&[Value::int(42).unwrap()]).unwrap();
+        assert!(!result.is_truthy());
+
+        let result = builtin_callable(&[Value::none()]).unwrap();
+        assert!(!result.is_truthy());
+    }
+}

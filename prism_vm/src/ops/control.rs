@@ -171,6 +171,7 @@ pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 }
 
 #[cfg(test)]
+#[allow(unused)]
 mod tests {
     use super::*;
 

@@ -5,9 +5,7 @@
 
 use crate::VirtualMachine;
 use crate::error::RuntimeError;
-use crate::frame::Frame;
-use prism_compiler::bytecode::CodeObject;
-use prism_compiler::bytecode::{Instruction, Opcode};
+use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
 use prism_core::Value;
 use std::sync::Arc;
 

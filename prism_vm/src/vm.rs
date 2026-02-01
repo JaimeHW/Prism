@@ -9,6 +9,7 @@ use crate::error::{RuntimeError, VmResult};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::globals::GlobalScope;
 use crate::inline_cache::InlineCacheStore;
+use crate::jit_context::{JitConfig, JitContext};
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
 use prism_compiler::bytecode::CodeObject;
 use prism_core::{PrismResult, Value};
@@ -22,6 +23,7 @@ use std::sync::Arc;
 /// - Builtin registry for Python builtins
 /// - Inline caching for attribute access
 /// - Profiling for JIT tier-up decisions
+/// - Optional JIT compilation and execution
 pub struct VirtualMachine {
     /// Frame stack (limited by MAX_RECURSION_DEPTH).
     pub frames: Vec<Frame>,
@@ -35,10 +37,12 @@ pub struct VirtualMachine {
     pub inline_caches: InlineCacheStore,
     /// Execution profiler.
     pub profiler: Profiler,
+    /// JIT context (None when JIT is disabled).
+    jit: Option<JitContext>,
 }
 
 impl VirtualMachine {
-    /// Create a new virtual machine.
+    /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
         Self {
             frames: Vec::with_capacity(64),
@@ -47,6 +51,38 @@ impl VirtualMachine {
             builtins: BuiltinRegistry::with_standard_builtins(),
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
+            jit: None,
+        }
+    }
+
+    /// Create a new virtual machine with JIT compilation enabled.
+    pub fn with_jit() -> Self {
+        Self {
+            frames: Vec::with_capacity(64),
+            current_frame_idx: 0,
+            globals: GlobalScope::new(),
+            builtins: BuiltinRegistry::with_standard_builtins(),
+            inline_caches: InlineCacheStore::default(),
+            profiler: Profiler::new(),
+            jit: Some(JitContext::with_defaults()),
+        }
+    }
+
+    /// Create a virtual machine with custom JIT configuration.
+    pub fn with_jit_config(config: JitConfig) -> Self {
+        let jit = if config.enabled {
+            Some(JitContext::new(config))
+        } else {
+            None
+        };
+        Self {
+            frames: Vec::with_capacity(64),
+            current_frame_idx: 0,
+            globals: GlobalScope::new(),
+            builtins: BuiltinRegistry::with_standard_builtins(),
+            inline_caches: InlineCacheStore::default(),
+            profiler: Profiler::new(),
+            jit,
         }
     }
 
@@ -59,6 +95,7 @@ impl VirtualMachine {
             builtins: BuiltinRegistry::with_standard_builtins(),
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
+            jit: None,
         }
     }
 
@@ -105,8 +142,10 @@ impl VirtualMachine {
 
                 ControlFlow::Jump(offset) => {
                     // Apply relative jump
+                    // Note: offset is computed by compiler relative to instruction after jump,
+                    // and fetch() already advanced ip, so just add offset directly
                     let frame = &mut self.frames[self.current_frame_idx];
-                    let new_ip = (frame.ip as i32) + (offset as i32) - 1; // -1 because we already advanced
+                    let new_ip = (frame.ip as i32) + (offset as i32);
                     frame.ip = new_ip.max(0) as u32;
                 }
 
@@ -143,15 +182,17 @@ impl VirtualMachine {
         let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
         let tier_decision = self.profiler.record_call(code_id);
 
-        // TODO: Handle tier-up decisions
-        match tier_decision {
-            TierUpDecision::Tier1 => {
-                // Queue for template JIT compilation
+        // Handle JIT: check for compiled code and handle tier-up
+        if let Some(jit) = &mut self.jit {
+            // Handle tier-up decision (may trigger compilation)
+            if tier_decision != TierUpDecision::None {
+                jit.handle_tier_up(&code, tier_decision);
             }
-            TierUpDecision::Tier2 => {
-                // Queue for optimizing JIT compilation
-            }
-            TierUpDecision::None => {}
+
+            // Note: Actual JIT execution dispatch will be added in a future phase
+            // when execute_jit method is implemented. For now, we fall through
+            // to interpreter execution after handling tier-up.
+            jit.record_miss();
         }
 
         // Create new frame

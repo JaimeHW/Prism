@@ -4,7 +4,6 @@
 //! be promoted to higher JIT tiers.
 
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
 
 /// Threshold for Template JIT (Tier 1) compilation.
 pub const TIER1_THRESHOLD: u64 = 1_000;
