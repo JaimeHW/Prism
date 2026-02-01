@@ -624,10 +624,11 @@ impl FunctionBuilder {
         self.emit(Instruction::op_ds(Opcode::GetIter, dst, src));
     }
 
-    /// For iteration: dst = next(iter), jump to label on StopIteration.
-    pub fn emit_for_iter(&mut self, dst: Register, label: Label) {
+    /// For iteration: dst = next(iter_src), jump to label on StopIteration.
+    pub fn emit_for_iter(&mut self, dst: Register, iter_src: Register, label: Label) {
         let inst_idx = self.instructions.len();
-        self.emit(Instruction::op_d(Opcode::ForIter, dst));
+        // Encode dst and iter_src; imm16 will be patched with jump offset
+        self.emit(Instruction::op_ds(Opcode::ForIter, dst, iter_src));
         self.forward_refs.push(ForwardRef {
             instruction_index: inst_idx,
             label,
@@ -657,13 +658,27 @@ impl FunctionBuilder {
 
             // Replace instruction with patched version
             let old = self.instructions[fwd.instruction_index];
-            let opcode = old.opcode();
+            let opcode = Opcode::from_u8(old.opcode()).unwrap();
             let dst = old.dst();
 
             // Encode offset as signed 16-bit
             let offset_u16 = offset as i16 as u16;
-            self.instructions[fwd.instruction_index] =
-                Instruction::op_di(Opcode::from_u8(opcode).unwrap(), dst, offset_u16);
+
+            // ForIter needs special handling: preserve src1 (iterator register)
+            // Use the upper byte of offset_u16 for src1, lower byte for offset
+            // Instruction format: [opcode:8][dst:8][src1:8][offset:8]
+            let patched = if opcode == Opcode::ForIter {
+                // ForIter encodes src1 in imm16 high byte, offset in low byte
+                // For now, just encode the offset in src2 position (8 bits signed)
+                let src1 = old.src1();
+                let offset_i8 = offset as i8 as u8;
+                Instruction::new(opcode, dst.0, src1.0, offset_i8)
+            } else {
+                // Standard jump: opcode, dst, imm16
+                Instruction::op_di(opcode, dst, offset_u16)
+            };
+
+            self.instructions[fwd.instruction_index] = patched;
         }
 
         CodeObject {

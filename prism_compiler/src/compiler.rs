@@ -6,9 +6,7 @@
 //! 1. **Scope analysis**: Builds symbol tables and determines variable scopes
 //! 2. **Code generation**: Emits register-based bytecode instructions
 
-use crate::bytecode::{
-    CodeFlags, CodeObject, FunctionBuilder, Instruction, LocalSlot, Opcode, Register,
-};
+use crate::bytecode::{CodeFlags, CodeObject, FunctionBuilder, Instruction, Opcode, Register};
 use crate::scope::{ScopeAnalyzer, SymbolTable};
 use prism_parser::ast::{
     AugOp, BinOp, BoolOp, CmpOp, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
@@ -227,7 +225,8 @@ impl Compiler {
 
                 // Get next item
                 let item_reg = self.builder.alloc_register();
-                self.builder.emit_for_iter(item_reg, loop_else);
+                self.builder
+                    .emit_for_iter(item_reg, iterator_reg, loop_else);
 
                 // Store to target
                 self.compile_store(target, item_reg)?;
@@ -504,26 +503,35 @@ impl Compiler {
                 args,
                 keywords,
             } => {
-                let func_reg = self.compile_expr(func)?;
+                // Strategy to avoid register collisions:
+                // 1. Compile function first
+                // 2. If func_reg falls in the arg range (dst+1..dst+argc), move it to a safe register
+                // 3. Compile args to dst+1..dst+argc
+                // 4. Emit call
 
-                // Compile arguments into consecutive registers
-                let first_arg = if !args.is_empty() {
-                    self.builder.alloc_register()
-                } else {
-                    Register::new(0)
-                };
+                let mut func_reg = self.compile_expr(func)?;
 
-                let mut arg_regs = Vec::with_capacity(args.len());
+                // Check if func_reg collides with arg range (dst+1 to dst+argc)
+                let arg_range_start = reg.0 + 1;
+                let arg_range_end = reg.0 + 1 + args.len() as u8;
+
+                if !args.is_empty() && func_reg.0 >= arg_range_start && func_reg.0 < arg_range_end {
+                    // func_reg would be clobbered by arg writes - move it to a safe register
+                    let safe_reg = self.builder.alloc_register();
+                    self.builder.emit_move(safe_reg, func_reg);
+                    self.builder.free_register(func_reg);
+                    func_reg = safe_reg;
+                }
+
+                // Now compile arguments to their destination registers
+                // These won't collide with func_reg since we moved it out of the way
                 for (i, arg) in args.iter().enumerate() {
-                    let arg_reg = if i == 0 {
-                        first_arg
-                    } else {
-                        self.builder.alloc_register()
-                    };
+                    let arg_dst = Register::new(reg.0 + 1 + i as u8);
                     let temp = self.compile_expr(arg)?;
-                    self.builder.emit_move(arg_reg, temp);
+                    if temp != arg_dst {
+                        self.builder.emit_move(arg_dst, temp);
+                    }
                     self.builder.free_register(temp);
-                    arg_regs.push(arg_reg);
                 }
 
                 // TODO: Handle keyword arguments
@@ -531,13 +539,9 @@ impl Compiler {
                     // For now, ignore keywords
                 }
 
-                // Emit call
+                // Emit call - func_reg is safe, args are at dst+1 onwards
                 self.builder.emit_call(reg, func_reg, args.len() as u8);
 
-                // Free argument registers
-                for arg_reg in arg_regs {
-                    self.builder.free_register(arg_reg);
-                }
                 self.builder.free_register(func_reg);
             }
 
@@ -646,8 +650,7 @@ impl Compiler {
                     // For module-level, store as global
                     let name_idx = self.builder.add_name(name.clone());
                     self.builder.emit_store_global(name_idx, value);
-                    // Also define as local for future lookups
-                    self.builder.define_local(name.clone());
+                    // Note: Do NOT define as local here - globals stay as globals
                 }
             }
 

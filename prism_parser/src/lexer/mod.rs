@@ -463,10 +463,19 @@ impl<'src> Lexer<'src> {
     /// Parse a string starting from a quote character.
     fn parse_string_from_quote(&mut self, _quote: char, prefix: StringPrefix) -> TokenKind {
         // We need to "unread" the quote since parse_string expects to see it
-        // Create a new cursor pointing just before the quote
-        let text = self.cursor.slice_from(self.token_start);
+        // Create a new cursor pointing to the token_start (which includes the quote)
+        // and extending to end of source
+        let text = &self.cursor.source()[self.token_start..];
         let mut temp_cursor = Cursor::new(text);
-        parse_string(&mut temp_cursor, prefix)
+        let result = parse_string(&mut temp_cursor, prefix);
+
+        // Advance main cursor by how many bytes temp_cursor consumed (minus the quote we already consumed)
+        let consumed = temp_cursor.pos();
+        // Move cursor forward by consumed minus 1 (since we already bumped the first quote)
+        for _ in 1..consumed {
+            self.cursor.bump();
+        }
+        result
     }
 
     /// Create a token with the current span.
