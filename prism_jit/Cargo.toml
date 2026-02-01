@@ -7,6 +7,10 @@ edition.workspace = true
 [dependencies]
 prism_core.workspace = true
 memmap2.workspace = true
+bitflags = "2.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

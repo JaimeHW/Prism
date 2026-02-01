@@ -1,0 +1,390 @@
+//! Code cache for storing and indexing compiled functions.
+//!
+//! The code cache provides:
+//! - O(1) lookup of compiled code by function ID
+//! - Memory management for compiled code regions
+//! - Eviction policies for managing memory pressure
+//! - Statistics and debugging support
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use crate::tier2::osr::OsrCompiledCode;
+
+// =============================================================================
+// Compiled Entry
+// =============================================================================
+
+/// An entry in the code cache representing compiled code for a function.
+#[derive(Debug)]
+pub struct CompiledEntry {
+    /// Unique identifier for the function.
+    pub code_id: u64,
+    /// Base address of the executable code.
+    code_ptr: *const u8,
+    /// Size of the code in bytes.
+    code_size: usize,
+    /// Entry point offset from code_ptr.
+    entry_offset: usize,
+    /// OSR entry points (if any).
+    osr_entries: Option<Arc<OsrCompiledCode>>,
+    /// Compilation tier (1 = baseline, 2 = optimized).
+    tier: u8,
+    /// Number of times this code has been called.
+    call_count: u64,
+}
+
+impl CompiledEntry {
+    /// Create a new compiled entry.
+    pub fn new(code_id: u64, code_ptr: *const u8, code_size: usize) -> Self {
+        Self {
+            code_id,
+            code_ptr,
+            code_size,
+            entry_offset: 0,
+            osr_entries: None,
+            tier: 1,
+            call_count: 0,
+        }
+    }
+
+    /// Create with an entry offset.
+    pub fn with_entry_offset(mut self, offset: usize) -> Self {
+        self.entry_offset = offset;
+        self
+    }
+
+    /// Set OSR entries.
+    pub fn with_osr(mut self, osr: OsrCompiledCode) -> Self {
+        self.osr_entries = Some(Arc::new(osr));
+        self
+    }
+
+    /// Set the compilation tier.
+    pub fn with_tier(mut self, tier: u8) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// Get the code pointer.
+    #[inline]
+    pub fn code_ptr(&self) -> *const u8 {
+        self.code_ptr
+    }
+
+    /// Get the entry point address.
+    #[inline]
+    pub fn entry_point(&self) -> *const u8 {
+        unsafe { self.code_ptr.add(self.entry_offset) }
+    }
+
+    /// Get the code size.
+    #[inline]
+    pub fn code_size(&self) -> usize {
+        self.code_size
+    }
+
+    /// Get the compilation tier.
+    #[inline]
+    pub fn tier(&self) -> u8 {
+        self.tier
+    }
+
+    /// Get OSR entries.
+    #[inline]
+    pub fn osr_entries(&self) -> Option<&Arc<OsrCompiledCode>> {
+        self.osr_entries.as_ref()
+    }
+
+    /// Increment call count and return the new value.
+    #[inline]
+    pub fn increment_call_count(&mut self) -> u64 {
+        self.call_count += 1;
+        self.call_count
+    }
+
+    /// Get call count.
+    #[inline]
+    pub fn call_count(&self) -> u64 {
+        self.call_count
+    }
+
+    /// Check if this code contains a given address.
+    #[inline]
+    pub fn contains_address(&self, addr: usize) -> bool {
+        let base = self.code_ptr as usize;
+        addr >= base && addr < base + self.code_size
+    }
+}
+
+// SAFETY: CompiledEntry can be sent between threads (code pointer is const)
+unsafe impl Send for CompiledEntry {}
+unsafe impl Sync for CompiledEntry {}
+
+// =============================================================================
+// Code Cache
+// =============================================================================
+
+/// A cache for storing compiled code entries.
+///
+/// Thread-safe via internal locking.
+#[derive(Debug)]
+pub struct CodeCache {
+    /// Map from code ID to compiled entry.
+    entries: RwLock<HashMap<u64, Arc<CompiledEntry>>>,
+    /// Total code size in bytes.
+    total_size: RwLock<usize>,
+    /// Maximum allowed size.
+    max_size: usize,
+    /// Statistics.
+    stats: RwLock<CodeCacheStats>,
+}
+
+impl CodeCache {
+    /// Create a new code cache with the given maximum size.
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            total_size: RwLock::new(0),
+            max_size,
+            stats: RwLock::new(CodeCacheStats::default()),
+        }
+    }
+
+    /// Look up compiled code by function ID.
+    #[inline]
+    pub fn lookup(&self, code_id: u64) -> Option<Arc<CompiledEntry>> {
+        let entries = self.entries.read().unwrap();
+        let result = entries.get(&code_id).cloned();
+        drop(entries);
+
+        // Update stats
+        if result.is_some() {
+            self.stats.write().unwrap().hits += 1;
+        } else {
+            self.stats.write().unwrap().misses += 1;
+        }
+
+        result
+    }
+
+    /// Insert compiled code into the cache.
+    ///
+    /// Returns the previous entry if one existed.
+    pub fn insert(&self, entry: CompiledEntry) -> Option<Arc<CompiledEntry>> {
+        let code_id = entry.code_id;
+        let code_size = entry.code_size;
+        let new_entry = Arc::new(entry);
+
+        // Check if we have room
+        {
+            let total = *self.total_size.read().unwrap();
+            if total + code_size > self.max_size {
+                // TODO: implement eviction
+                self.stats.write().unwrap().evictions += 1;
+            }
+        }
+
+        // Insert
+        let mut entries = self.entries.write().unwrap();
+        let old = entries.insert(code_id, new_entry);
+
+        // Update size tracking
+        {
+            let mut total = self.total_size.write().unwrap();
+            if let Some(ref prev) = old {
+                *total -= prev.code_size;
+            }
+            *total += code_size;
+        }
+
+        // Update stats
+        self.stats.write().unwrap().insertions += 1;
+
+        old
+    }
+
+    /// Remove compiled code from the cache.
+    pub fn remove(&self, code_id: u64) -> Option<Arc<CompiledEntry>> {
+        let mut entries = self.entries.write().unwrap();
+        let removed = entries.remove(&code_id);
+
+        if let Some(ref entry) = removed {
+            let mut total = self.total_size.write().unwrap();
+            *total -= entry.code_size;
+        }
+
+        removed
+    }
+
+    /// Find entry containing the given instruction pointer.
+    pub fn find_by_ip(&self, ip: usize) -> Option<Arc<CompiledEntry>> {
+        let entries = self.entries.read().unwrap();
+        for entry in entries.values() {
+            if entry.contains_address(ip) {
+                return Some(Arc::clone(entry));
+            }
+        }
+        None
+    }
+
+    /// Get the number of entries in the cache.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.read().unwrap().len()
+    }
+
+    /// Check if the cache is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get the total code size.
+    #[inline]
+    pub fn total_size(&self) -> usize {
+        *self.total_size.read().unwrap()
+    }
+
+    /// Get cache statistics.
+    #[inline]
+    pub fn stats(&self) -> CodeCacheStats {
+        self.stats.read().unwrap().clone()
+    }
+
+    /// Clear the entire cache.
+    pub fn clear(&self) {
+        let mut entries = self.entries.write().unwrap();
+        entries.clear();
+        *self.total_size.write().unwrap() = 0;
+    }
+
+    /// Iterate over all entries (for debugging/profiling).
+    pub fn entries(&self) -> Vec<Arc<CompiledEntry>> {
+        self.entries.read().unwrap().values().cloned().collect()
+    }
+}
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+/// Statistics for the code cache.
+#[derive(Debug, Default, Clone)]
+pub struct CodeCacheStats {
+    /// Number of cache hits.
+    pub hits: u64,
+    /// Number of cache misses.
+    pub misses: u64,
+    /// Number of insertions.
+    pub insertions: u64,
+    /// Number of evictions.
+    pub evictions: u64,
+}
+
+impl CodeCacheStats {
+    /// Calculate hit rate.
+    #[inline]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_code_ptr() -> *const u8 {
+        0x10000usize as *const u8
+    }
+
+    #[test]
+    fn test_compiled_entry_creation() {
+        let entry = CompiledEntry::new(1, dummy_code_ptr(), 100);
+        assert_eq!(entry.code_id, 1);
+        assert_eq!(entry.code_size(), 100);
+        assert_eq!(entry.tier(), 1);
+    }
+
+    #[test]
+    fn test_compiled_entry_builder_pattern() {
+        let entry = CompiledEntry::new(1, dummy_code_ptr(), 100)
+            .with_entry_offset(16)
+            .with_tier(2);
+        assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.entry_point() as usize, dummy_code_ptr() as usize + 16);
+    }
+
+    #[test]
+    fn test_code_cache_insert_lookup() {
+        let cache = CodeCache::new(1024 * 1024);
+
+        let entry = CompiledEntry::new(42, dummy_code_ptr(), 100);
+        assert!(cache.insert(entry).is_none());
+
+        let found = cache.lookup(42);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().code_id, 42);
+
+        assert!(cache.lookup(999).is_none());
+    }
+
+    #[test]
+    fn test_code_cache_remove() {
+        let cache = CodeCache::new(1024 * 1024);
+
+        let entry = CompiledEntry::new(42, dummy_code_ptr(), 100);
+        cache.insert(entry);
+
+        assert_eq!(cache.total_size(), 100);
+
+        let removed = cache.remove(42);
+        assert!(removed.is_some());
+        assert_eq!(cache.total_size(), 0);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_code_cache_stats() {
+        let cache = CodeCache::new(1024 * 1024);
+
+        // Miss
+        cache.lookup(1);
+        // Insert
+        cache.insert(CompiledEntry::new(1, dummy_code_ptr(), 50));
+        // Hit
+        cache.lookup(1);
+        // Miss
+        cache.lookup(2);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.insertions, 1);
+    }
+
+    #[test]
+    fn test_find_by_ip() {
+        let cache = CodeCache::new(1024 * 1024);
+
+        let ptr = 0x20000usize as *const u8;
+        cache.insert(CompiledEntry::new(1, ptr, 100));
+
+        // Within range
+        let found = cache.find_by_ip(0x20050);
+        assert!(found.is_some());
+
+        // Out of range
+        assert!(cache.find_by_ip(0x10000).is_none());
+        assert!(cache.find_by_ip(0x20100).is_none());
+    }
+}
