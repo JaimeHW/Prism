@@ -327,6 +327,139 @@ impl TemplateCompiler {
             TemplateInstruction::Return { value, .. } => {
                 ReturnTemplate { value_reg: *value }.emit(ctx);
             }
+            // Integer comparisons
+            TemplateInstruction::IntLt { dst, lhs, rhs, .. } => {
+                LtTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntLe { dst, lhs, rhs, .. } => {
+                LeTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntGt { dst, lhs, rhs, .. } => {
+                GtTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntGe { dst, lhs, rhs, .. } => {
+                GeTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntEq { dst, lhs, rhs, .. } => {
+                EqTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntNe { dst, lhs, rhs, .. } => {
+                NeTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            // Float comparisons
+            TemplateInstruction::FloatLt { dst, lhs, rhs, .. } => {
+                FloatLtTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatLe { dst, lhs, rhs, .. } => {
+                FloatLeTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatGt { dst, lhs, rhs, .. } => {
+                FloatGtTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatGe { dst, lhs, rhs, .. } => {
+                FloatGeTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatEq { dst, lhs, rhs, .. } => {
+                FloatEqTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatNe { dst, lhs, rhs, .. } => {
+                FloatNeTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            // Type guards
+            TemplateInstruction::GuardInt { reg, .. } => {
+                GuardIntTemplate {
+                    reg: *reg,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::GuardFloat { reg, .. } => {
+                GuardFloatTemplate {
+                    reg: *reg,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::GuardBool { reg, .. } => {
+                GuardBoolTemplate {
+                    reg: *reg,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::GuardNone { reg, .. } => {
+                GuardNoneTemplate {
+                    reg: *reg,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
             TemplateInstruction::Nop { .. } => {
                 // No-op: emit nothing
             }
@@ -416,6 +549,100 @@ pub enum TemplateInstruction {
         rhs: u8,
     },
 
+    // Integer comparisons
+    IntLt {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntLe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntGt {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntGe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntEq {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntNe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+
+    // Float comparisons
+    FloatLt {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    FloatLe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    FloatGt {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    FloatGe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    FloatEq {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    FloatNe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+
+    // Type guards (emit deopt on type mismatch)
+    GuardInt {
+        bc_offset: u32,
+        reg: u8,
+    },
+    GuardFloat {
+        bc_offset: u32,
+        reg: u8,
+    },
+    GuardBool {
+        bc_offset: u32,
+        reg: u8,
+    },
+    GuardNone {
+        bc_offset: u32,
+        reg: u8,
+    },
+
     // Control flow
     Jump {
         bc_offset: u32,
@@ -446,23 +673,39 @@ impl TemplateInstruction {
     /// Get the bytecode offset of this instruction.
     pub fn bc_offset(&self) -> u32 {
         match self {
-            TemplateInstruction::LoadInt { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::LoadFloat { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::LoadNone { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::LoadBool { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::Move { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::IntAdd { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::IntSub { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::IntMul { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::FloatAdd { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::FloatSub { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::FloatMul { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::FloatDiv { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::Jump { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::BranchIfTrue { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::BranchIfFalse { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::Return { bc_offset, .. } => *bc_offset,
-            TemplateInstruction::Nop { bc_offset } => *bc_offset,
+            TemplateInstruction::LoadInt { bc_offset, .. }
+            | TemplateInstruction::LoadFloat { bc_offset, .. }
+            | TemplateInstruction::LoadNone { bc_offset, .. }
+            | TemplateInstruction::LoadBool { bc_offset, .. }
+            | TemplateInstruction::Move { bc_offset, .. }
+            | TemplateInstruction::IntAdd { bc_offset, .. }
+            | TemplateInstruction::IntSub { bc_offset, .. }
+            | TemplateInstruction::IntMul { bc_offset, .. }
+            | TemplateInstruction::FloatAdd { bc_offset, .. }
+            | TemplateInstruction::FloatSub { bc_offset, .. }
+            | TemplateInstruction::FloatMul { bc_offset, .. }
+            | TemplateInstruction::FloatDiv { bc_offset, .. }
+            | TemplateInstruction::IntLt { bc_offset, .. }
+            | TemplateInstruction::IntLe { bc_offset, .. }
+            | TemplateInstruction::IntGt { bc_offset, .. }
+            | TemplateInstruction::IntGe { bc_offset, .. }
+            | TemplateInstruction::IntEq { bc_offset, .. }
+            | TemplateInstruction::IntNe { bc_offset, .. }
+            | TemplateInstruction::FloatLt { bc_offset, .. }
+            | TemplateInstruction::FloatLe { bc_offset, .. }
+            | TemplateInstruction::FloatGt { bc_offset, .. }
+            | TemplateInstruction::FloatGe { bc_offset, .. }
+            | TemplateInstruction::FloatEq { bc_offset, .. }
+            | TemplateInstruction::FloatNe { bc_offset, .. }
+            | TemplateInstruction::GuardInt { bc_offset, .. }
+            | TemplateInstruction::GuardFloat { bc_offset, .. }
+            | TemplateInstruction::GuardBool { bc_offset, .. }
+            | TemplateInstruction::GuardNone { bc_offset, .. }
+            | TemplateInstruction::Jump { bc_offset, .. }
+            | TemplateInstruction::BranchIfTrue { bc_offset, .. }
+            | TemplateInstruction::BranchIfFalse { bc_offset, .. }
+            | TemplateInstruction::Return { bc_offset, .. }
+            | TemplateInstruction::Nop { bc_offset } => *bc_offset,
         }
     }
 
@@ -483,8 +726,18 @@ impl TemplateInstruction {
             TemplateInstruction::IntAdd { .. }
                 | TemplateInstruction::IntSub { .. }
                 | TemplateInstruction::IntMul { .. }
+                | TemplateInstruction::IntLt { .. }
+                | TemplateInstruction::IntLe { .. }
+                | TemplateInstruction::IntGt { .. }
+                | TemplateInstruction::IntGe { .. }
+                | TemplateInstruction::IntEq { .. }
+                | TemplateInstruction::IntNe { .. }
                 | TemplateInstruction::BranchIfTrue { .. }
                 | TemplateInstruction::BranchIfFalse { .. }
+                | TemplateInstruction::GuardInt { .. }
+                | TemplateInstruction::GuardFloat { .. }
+                | TemplateInstruction::GuardBool { .. }
+                | TemplateInstruction::GuardNone { .. }
         )
     }
 
@@ -493,7 +746,17 @@ impl TemplateInstruction {
         match self {
             TemplateInstruction::IntAdd { .. }
             | TemplateInstruction::IntSub { .. }
-            | TemplateInstruction::IntMul { .. } => DeoptReason::TypeGuardFailed,
+            | TemplateInstruction::IntMul { .. }
+            | TemplateInstruction::IntLt { .. }
+            | TemplateInstruction::IntLe { .. }
+            | TemplateInstruction::IntGt { .. }
+            | TemplateInstruction::IntGe { .. }
+            | TemplateInstruction::IntEq { .. }
+            | TemplateInstruction::IntNe { .. }
+            | TemplateInstruction::GuardInt { .. }
+            | TemplateInstruction::GuardFloat { .. }
+            | TemplateInstruction::GuardBool { .. }
+            | TemplateInstruction::GuardNone { .. } => DeoptReason::TypeGuardFailed,
             TemplateInstruction::BranchIfTrue { .. }
             | TemplateInstruction::BranchIfFalse { .. } => DeoptReason::TypeGuardFailed,
             _ => DeoptReason::UncommonTrap,
@@ -664,5 +927,236 @@ mod tests {
         assert_eq!(add.jump_target(), None);
         assert!(add.can_deopt());
         assert_eq!(add.deopt_reason(), DeoptReason::TypeGuardFailed);
+    }
+
+    #[test]
+    fn test_compile_int_comparisons() {
+        let compiler = TemplateCompiler::new_for_testing();
+        let instrs = vec![
+            TemplateInstruction::LoadInt {
+                bc_offset: 0,
+                dst: 0,
+                value: 10,
+            },
+            TemplateInstruction::LoadInt {
+                bc_offset: 4,
+                dst: 1,
+                value: 20,
+            },
+            TemplateInstruction::IntLt {
+                bc_offset: 8,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::IntLe {
+                bc_offset: 12,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::IntGt {
+                bc_offset: 16,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::IntGe {
+                bc_offset: 20,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::IntEq {
+                bc_offset: 24,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::IntNe {
+                bc_offset: 28,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 32,
+                value: 2,
+            },
+        ];
+
+        let result = compiler.compile(4, &instrs);
+        assert!(result.is_ok());
+
+        let func = result.unwrap();
+        // Should have deopt info for all integer comparisons
+        assert!(func.deopt_info.len() >= 6);
+        // Code should be substantial (each comparison generates ~100 bytes)
+        assert!(func.code.len() > 200);
+    }
+
+    #[test]
+    fn test_compile_float_comparisons() {
+        let compiler = TemplateCompiler::new_for_testing();
+        let instrs = vec![
+            TemplateInstruction::LoadFloat {
+                bc_offset: 0,
+                dst: 0,
+                value: 1.5,
+            },
+            TemplateInstruction::LoadFloat {
+                bc_offset: 4,
+                dst: 1,
+                value: 2.5,
+            },
+            TemplateInstruction::FloatLt {
+                bc_offset: 8,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::FloatLe {
+                bc_offset: 12,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::FloatGt {
+                bc_offset: 16,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::FloatGe {
+                bc_offset: 20,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::FloatEq {
+                bc_offset: 24,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::FloatNe {
+                bc_offset: 28,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 32,
+                value: 2,
+            },
+        ];
+
+        let result = compiler.compile(4, &instrs);
+        assert!(result.is_ok());
+
+        let func = result.unwrap();
+        // Float comparisons don't deopt (pure float math)
+        // Code should be substantial
+        assert!(func.code.len() > 100);
+    }
+
+    #[test]
+    fn test_compile_type_guards() {
+        let compiler = TemplateCompiler::new_for_testing();
+        let instrs = vec![
+            TemplateInstruction::LoadInt {
+                bc_offset: 0,
+                dst: 0,
+                value: 42,
+            },
+            TemplateInstruction::GuardInt {
+                bc_offset: 4,
+                reg: 0,
+            },
+            TemplateInstruction::LoadFloat {
+                bc_offset: 8,
+                dst: 1,
+                value: 3.14,
+            },
+            TemplateInstruction::GuardFloat {
+                bc_offset: 12,
+                reg: 1,
+            },
+            TemplateInstruction::LoadBool {
+                bc_offset: 16,
+                dst: 2,
+                value: true,
+            },
+            TemplateInstruction::GuardBool {
+                bc_offset: 20,
+                reg: 2,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 24,
+                value: 0,
+            },
+        ];
+
+        let result = compiler.compile(4, &instrs);
+        assert!(result.is_ok());
+
+        let func = result.unwrap();
+        // Should have deopt info for all 3 guards
+        assert!(func.deopt_info.len() >= 3);
+        // Guards generate compact code
+        assert!(func.code.len() > 50);
+    }
+
+    #[test]
+    fn test_int_comparison_deopt_properties() {
+        // Verify IntLt can deopt
+        let lt = TemplateInstruction::IntLt {
+            bc_offset: 0,
+            dst: 0,
+            lhs: 1,
+            rhs: 2,
+        };
+        assert!(lt.can_deopt());
+        assert_eq!(lt.deopt_reason(), DeoptReason::TypeGuardFailed);
+
+        // Verify IntEq can deopt
+        let eq = TemplateInstruction::IntEq {
+            bc_offset: 0,
+            dst: 0,
+            lhs: 1,
+            rhs: 2,
+        };
+        assert!(eq.can_deopt());
+
+        // Verify FloatLt does NOT deopt (pure float)
+        let float_lt = TemplateInstruction::FloatLt {
+            bc_offset: 0,
+            dst: 0,
+            lhs: 1,
+            rhs: 2,
+        };
+        assert!(!float_lt.can_deopt());
+    }
+
+    #[test]
+    fn test_guard_deopt_properties() {
+        let guard_int = TemplateInstruction::GuardInt {
+            bc_offset: 0,
+            reg: 0,
+        };
+        assert!(guard_int.can_deopt());
+        assert_eq!(guard_int.deopt_reason(), DeoptReason::TypeGuardFailed);
+
+        let guard_float = TemplateInstruction::GuardFloat {
+            bc_offset: 0,
+            reg: 0,
+        };
+        assert!(guard_float.can_deopt());
+
+        let guard_bool = TemplateInstruction::GuardBool {
+            bc_offset: 0,
+            reg: 0,
+        };
+        assert!(guard_bool.can_deopt());
     }
 }

@@ -15,11 +15,15 @@ use crate::tier2::osr::OsrCompiledCode;
 // Compiled Entry
 // =============================================================================
 
+use crate::backend::x64::ExecutableBuffer;
+
 /// An entry in the code cache representing compiled code for a function.
 #[derive(Debug)]
 pub struct CompiledEntry {
     /// Unique identifier for the function.
     pub code_id: u64,
+    /// Owned buffer containing executable code (keeps memory alive).
+    owned_buffer: Option<ExecutableBuffer>,
     /// Base address of the executable code.
     code_ptr: *const u8,
     /// Size of the code in bytes.
@@ -35,10 +39,35 @@ pub struct CompiledEntry {
 }
 
 impl CompiledEntry {
-    /// Create a new compiled entry.
+    /// Create a new compiled entry with an external code pointer.
+    ///
+    /// # Safety
+    /// The caller must ensure `code_ptr` points to memory that remains
+    /// valid for the lifetime of this entry. For JIT-compiled code, prefer
+    /// using `from_executable_buffer()` which takes ownership of the memory.
     pub fn new(code_id: u64, code_ptr: *const u8, code_size: usize) -> Self {
         Self {
             code_id,
+            owned_buffer: None,
+            code_ptr,
+            code_size,
+            entry_offset: 0,
+            osr_entries: None,
+            tier: 1,
+            call_count: 0,
+        }
+    }
+
+    /// Create a new compiled entry that owns its executable memory.
+    ///
+    /// This is the preferred constructor for JIT-compiled code as it
+    /// ensures the executable memory remains valid for the entry's lifetime.
+    pub fn from_executable_buffer(code_id: u64, buffer: ExecutableBuffer) -> Self {
+        let code_ptr = buffer.as_ptr();
+        let code_size = buffer.len();
+        Self {
+            code_id,
+            owned_buffer: Some(buffer),
             code_ptr,
             code_size,
             entry_offset: 0,
