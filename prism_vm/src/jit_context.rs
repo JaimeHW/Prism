@@ -324,14 +324,22 @@ impl JitContext {
 
         let code_id = Arc::as_ptr(code) as u64;
 
-        // Check if already compiled
-        if self.lookup(code_id).is_some() {
-            return false;
+        // Check if already compiled at this tier or higher
+        if let Some(entry) = self.lookup(code_id) {
+            if entry.tier() >= tier {
+                return false;
+            }
         }
 
         if self.config.eager_compilation || !self.config.background_compilation {
-            // Synchronous compilation
-            match self.bridge.compile_sync(code) {
+            // Synchronous compilation - dispatch based on tier
+            let result = if tier >= 2 {
+                self.bridge.compile_tier2(code)
+            } else {
+                self.bridge.compile_sync(code)
+            };
+
+            match result {
                 Ok(entry) => {
                     self.stats.compilations_completed += 1;
                     self.stats.compiled_bytes += entry.code_size() as u64;

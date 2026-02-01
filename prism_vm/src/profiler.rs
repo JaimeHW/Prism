@@ -16,10 +16,22 @@ pub const TIER2_THRESHOLD: u64 = 10_000;
 pub struct CodeId(pub u64);
 
 impl CodeId {
+    /// Create from a raw u64 value.
+    #[inline]
+    pub const fn new(id: u64) -> Self {
+        CodeId(id)
+    }
+
     /// Create from raw pointer (for fast creation from Arc).
     #[inline]
     pub fn from_ptr(ptr: *const ()) -> Self {
         CodeId(ptr as u64)
+    }
+
+    /// Get the underlying u64 value.
+    #[inline(always)]
+    pub const fn as_u64(self) -> u64 {
+        self.0
     }
 }
 

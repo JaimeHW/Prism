@@ -19,8 +19,13 @@
 use std::sync::Arc;
 
 use prism_compiler::bytecode::{CodeObject, Opcode};
+use prism_jit::ir::GraphBuilder;
+use prism_jit::ir::builder::translator::BytecodeTranslator;
+use prism_jit::opt::OptPipeline;
+use prism_jit::regalloc::{AllocatorConfig, LinearScanAllocator, LivenessAnalysis};
 use prism_jit::runtime::{CodeCache, CompiledEntry, RuntimeConfig};
 use prism_jit::tier1::codegen::{TemplateCompiler, TemplateInstruction};
+use prism_jit::tier2::{CodeEmitter, InstructionSelector};
 
 use crate::jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
@@ -246,9 +251,9 @@ impl JitBridge {
             .tier1_compiler
             .compile(code.register_count, &instructions)?;
 
-        // Create cache entry
-        let entry =
-            CompiledEntry::new(code_id, compiled.code.as_ptr(), compiled.code.len()).with_tier(1);
+        // Create cache entry - transfer ownership of executable buffer
+        // This ensures the compiled code memory remains valid for the entry's lifetime
+        let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code).with_tier(1);
 
         // Insert into cache (this wraps in Arc internally)
         self.code_cache.insert(entry);
@@ -257,6 +262,61 @@ impl JitBridge {
         self.code_cache
             .lookup(code_id)
             .ok_or_else(|| "Failed to lookup after insertion".to_string())
+    }
+
+    /// Compile a function with Tier 2 optimizations synchronously.
+    ///
+    /// This uses the full optimizing pipeline:
+    /// 1. Bytecode → Sea-of-Nodes IR Graph
+    /// 2. Optimization passes (DCE, GVN, LICM, Inlining)
+    /// 3. Liveness analysis
+    /// 4. Register allocation (Linear Scan)
+    /// 5. Instruction selection
+    /// 6. Code emission
+    pub fn compile_tier2(&mut self, code: &Arc<CodeObject>) -> Result<Arc<CompiledEntry>, String> {
+        let code_id = code_id_from_arc(code);
+
+        // Check if already compiled at Tier 2
+        if let Some(entry) = self.code_cache.lookup(code_id) {
+            if entry.tier() >= 2 {
+                return Ok(entry);
+            }
+        }
+
+        // Stage 1: Convert bytecode to Sea-of-Nodes IR
+        let builder = GraphBuilder::new(code.register_count as usize, code.arg_count as usize);
+        let translator = BytecodeTranslator::new(builder, code);
+        let mut graph = translator.translate();
+
+        // Stage 2: Run optimization pipeline
+        let mut pipeline = OptPipeline::new();
+        let _stats = pipeline.run(&mut graph);
+
+        // Stage 3: Liveness analysis
+        let liveness = LivenessAnalysis::analyze(&graph);
+        let intervals = liveness.into_intervals();
+
+        // Stage 4: Register allocation
+        let allocator = LinearScanAllocator::new(AllocatorConfig::default());
+        let (alloc_map, _alloc_stats) = allocator.allocate(intervals);
+
+        // Stage 5: Instruction selection
+        let mfunc = InstructionSelector::select(&graph, &alloc_map);
+
+        // Stage 6: Code emission
+        let compiled =
+            CodeEmitter::emit(&mfunc).map_err(|e| format!("Tier 2 code emission failed: {}", e))?;
+
+        // Create cache entry with Tier 2 marker
+        let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code).with_tier(2);
+
+        // Insert into cache
+        self.code_cache.insert(entry);
+
+        // Lookup and return the Arc-wrapped entry
+        self.code_cache
+            .lookup(code_id)
+            .ok_or_else(|| "Failed to lookup after Tier 2 insertion".to_string())
     }
 
     /// Request asynchronous compilation.
