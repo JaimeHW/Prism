@@ -1,0 +1,15 @@
+[package]
+name = "prism_cli"
+description = "Command-line interface for Prism"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "prism"
+path = "src/main.rs"
+
+[dependencies]
+prism_core.workspace = true
+prism_parser.workspace = true
+prism_compiler.workspace = true
+prism_vm.workspace = true
