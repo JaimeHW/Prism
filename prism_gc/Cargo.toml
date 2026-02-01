@@ -1,0 +1,34 @@
+[package]
+name = "prism_gc"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance generational garbage collector for Prism Python runtime"
+authors = ["Prism Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+prism_core = { path = "../prism_core" }
+
+# Fast atomic operations
+crossbeam-utils = "0.8"
+
+# Fast hash maps for object tracking
+rustc-hash = "2.1"
+
+# Parking lot for fast mutexes (write barrier synchronization)
+parking_lot = "0.12"
+
+# Bit manipulation for card tables
+bitflags = "2.4"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+# Enable concurrent marking (Phase 2)
+concurrent = []
+# Enable detailed GC statistics
+stats = []
+# Enable GC tracing/debugging output
+trace = []
+

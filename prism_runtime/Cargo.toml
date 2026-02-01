@@ -1,9 +1,13 @@
 [package]
 name = "prism_runtime"
-description = "Runtime system for Prism (GC, objects)"
+description = "High-performance Python runtime system (objects, types, GC)"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 prism_core.workspace = true
+prism_compiler.workspace = true
+prism_gc.workspace = true
 parking_lot.workspace = true
+bitflags = "2.4"
+rustc-hash = "2.0"
