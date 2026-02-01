@@ -44,10 +44,17 @@
 //! - Lock-free read path for concurrent GC
 //! - Cache-line aligned data structures
 
+pub mod alloc_stub;
 pub mod jit_roots;
+pub mod safepoint;
 pub mod stackmap;
 pub mod write_barrier;
 
+pub use alloc_stub::{AllocSlowFn, AllocStub, TlabOffsets};
 pub use jit_roots::{JitFrameWalker, JitRoots};
+pub use safepoint::{
+    SAFEPOINT_REGISTER, SafepointCoordinator, SafepointPage, SafepointState, SafepointStats,
+    emit_safepoint_poll, should_elide_safepoints,
+};
 pub use stackmap::{SafePoint, StackMap, StackMapBuilder, StackMapRegistry};
 pub use write_barrier::{CARD_SHIFT, CARD_SIZE, CardTable, WriteBarrier};

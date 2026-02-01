@@ -48,8 +48,10 @@
 pub mod barrier;
 pub mod collector;
 pub mod config;
+pub mod gc_array;
 pub mod heap;
 pub mod roots;
+pub mod tlab;
 pub mod trace;
 
 mod alloc;
@@ -58,9 +60,11 @@ mod stats;
 // Re-exports for convenient access
 pub use alloc::GcRef;
 pub use config::GcConfig;
+pub use gc_array::GcArray;
 pub use heap::GcHeap;
 pub use roots::{GcHandle, HandleScope};
 pub use stats::GcStats;
+pub use tlab::{Tlab, TlabConfig, TlabProvider, TlabStats};
 pub use trace::{NoopObjectTracer, ObjectTracer, Trace, Tracer};
 
 /// GC color for tri-color marking algorithm.
