@@ -16,6 +16,7 @@ use std::sync::Arc;
 /// - Name tables
 /// - Debug information
 /// - Execution metadata
+/// - Exception handling table (for zero-cost exceptions)
 #[derive(Debug, Clone)]
 pub struct CodeObject {
     /// Function name (or `<module>` for module-level code).
@@ -66,6 +67,10 @@ pub struct CodeObject {
     /// Line number table (instruction index -> line number).
     /// Stored as delta-encoded pairs for compactness.
     pub line_table: Box<[LineTableEntry]>,
+
+    /// Exception handling table for zero-cost exceptions.
+    /// Sorted by start_pc for binary search during unwinding.
+    pub exception_table: Box<[ExceptionEntry]>,
 }
 
 /// Code object flags.
@@ -93,6 +98,8 @@ impl CodeFlags {
     pub const HAS_CELLVARS: CodeFlags = CodeFlags(1 << 7);
     /// This is module-level code.
     pub const MODULE: CodeFlags = CodeFlags(1 << 8);
+    /// This is class body code.
+    pub const CLASS: CodeFlags = CodeFlags(1 << 9);
 
     /// Check if a flag is set.
     #[inline]
@@ -138,6 +145,29 @@ pub struct LineTableEntry {
     pub line: u32,
 }
 
+/// Exception handler entry for zero-cost exception handling.
+///
+/// During exception unwinding, the VM performs a binary search on these
+/// entries (sorted by start_pc) to find a matching handler. This enables
+/// true zero-cost exceptions: no overhead on the happy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionEntry {
+    /// Starting PC of the try block (inclusive).
+    pub start_pc: u32,
+    /// Ending PC of the try block (exclusive).
+    pub end_pc: u32,
+    /// Handler PC (start of except clause).
+    pub handler_pc: u32,
+    /// Finally block PC (if present).
+    /// A value of u32::MAX indicates no finally block.
+    pub finally_pc: u32,
+    /// Handler depth for nested handlers.
+    pub depth: u16,
+    /// Exception type constant index (for type matching).
+    /// A value of u16::MAX indicates bare `except:`.
+    pub exception_type_idx: u16,
+}
+
 impl CodeObject {
     /// Create a new empty code object.
     pub fn new(name: impl Into<Arc<str>>, filename: impl Into<Arc<str>>) -> Self {
@@ -159,6 +189,7 @@ impl CodeObject {
             register_count: 0,
             flags: CodeFlags::NONE,
             line_table: Box::new([]),
+            exception_table: Box::new([]),
         }
     }
 
