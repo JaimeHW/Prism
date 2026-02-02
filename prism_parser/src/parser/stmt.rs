@@ -173,7 +173,30 @@ impl StmtParser {
         let value = if parser.check(TokenKind::Newline) || parser.check(TokenKind::Eof) {
             None
         } else {
-            Some(Box::new(ExprParser::parse(parser, Precedence::Lowest)?))
+            // Parse first expression
+            let first = ExprParser::parse(parser, Precedence::Lowest)?;
+
+            // Check for comma (tuple return)
+            if parser.match_token(TokenKind::Comma) {
+                let first_start = first.span.start;
+                let mut elements = vec![first];
+
+                // Parse remaining comma-separated expressions
+                while !parser.check(TokenKind::Newline) && !parser.check(TokenKind::Eof) {
+                    elements.push(ExprParser::parse(parser, Precedence::Lowest)?);
+                    if !parser.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+
+                // Create tuple from elements
+                Some(Box::new(Expr::new(
+                    ExprKind::Tuple(elements),
+                    parser.span_from(first_start),
+                )))
+            } else {
+                Some(Box::new(first))
+            }
         };
 
         Ok(Stmt::new(StmtKind::Return(value), parser.span_from(start)))

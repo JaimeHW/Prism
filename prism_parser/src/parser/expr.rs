@@ -753,7 +753,8 @@ impl ExprParser {
                 parser.expect_keyword(KW::For, "expected 'for' after 'async'")?;
             }
 
-            let target = Self::parse(parser, Precedence::Lowest)?;
+            // Parse target at BitwiseOr to stop before 'in' (Comparison level)
+            let target = Self::parse(parser, Precedence::BitwiseOr)?;
             parser.expect_keyword(KW::In, "expected 'in'")?;
             let iter = Self::parse(parser, Precedence::Or)?;
 
