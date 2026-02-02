@@ -336,11 +336,11 @@ impl JitExecutor {
         self.frame_state.num_registers = frame.code.register_count;
         self.frame_state.bc_offset = frame.ip;
         self.frame_state.const_pool = frame.code.constants.as_ptr() as *const u64;
-        self.frame_state.closure_env = frame
-            .closure
-            .as_ref()
-            .map(|c| c.values.as_ptr() as *const u64)
-            .unwrap_or(std::ptr::null());
+        // TODO: Update JIT closure handling for new cell-based ClosureEnv.
+        // The new ClosureEnv uses Arc<Cell> objects for shared mutation semantics.
+        // JIT code needs to be updated to handle cell indirection.
+        // For now, we pass null and let the JIT deoptimize on closure access.
+        self.frame_state.closure_env = std::ptr::null();
         // Global scope would be passed via VM reference
         self.frame_state.global_scope = std::ptr::null();
     }

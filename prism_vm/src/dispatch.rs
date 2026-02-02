@@ -164,6 +164,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::DeleteLocal as usize] = load_store::delete_local;
     table[Opcode::DeleteGlobal as usize] = load_store::delete_global;
     table[Opcode::Move as usize] = load_store::move_reg;
+    table[Opcode::DeleteClosure as usize] = load_store::delete_closure;
 
     // Integer Arithmetic (0x20-0x2F)
     table[Opcode::AddInt as usize] = arithmetic::add_int;

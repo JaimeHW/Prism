@@ -10,6 +10,7 @@ use crate::exception::{ExceptionState, HandlerStack, InlineHandlerCache};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
+use crate::import::ImportResolver;
 use crate::inline_cache::InlineCacheStore;
 use crate::jit_context::{JitConfig, JitContext};
 use crate::jit_executor::ExecutionResult;
@@ -61,6 +62,8 @@ pub struct VirtualMachine {
     handler_cache: InlineHandlerCache,
     /// Currently active exception (if any) being propagated.
     active_exception: Option<Value>,
+    /// Import resolver for module imports.
+    pub import_resolver: ImportResolver,
 }
 
 impl VirtualMachine {
@@ -81,6 +84,7 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            import_resolver: ImportResolver::new(),
         }
     }
 
@@ -101,6 +105,7 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            import_resolver: ImportResolver::new(),
         }
     }
 
@@ -126,6 +131,7 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            import_resolver: ImportResolver::new(),
         }
     }
 
@@ -146,6 +152,7 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            import_resolver: ImportResolver::new(),
         }
     }
 
