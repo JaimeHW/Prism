@@ -2,8 +2,10 @@
 //!
 //! Contains implementations for built-in Python types.
 
+pub mod cell;
 pub mod dict;
 pub mod function;
+pub mod io;
 pub mod iter;
 pub mod list;
 pub mod range;
@@ -12,6 +14,7 @@ pub mod string;
 pub mod tuple;
 
 // Re-export commonly used types
+pub use cell::Cell;
 pub use dict::DictObject;
 pub use function::FunctionObject;
 pub use list::ListObject;

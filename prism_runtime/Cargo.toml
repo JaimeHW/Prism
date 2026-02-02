@@ -9,11 +9,15 @@ prism_core.workspace = true
 prism_compiler.workspace = true
 prism_gc.workspace = true
 parking_lot.workspace = true
+smallvec.workspace = true
 bitflags = "2.4"
 rustc-hash = "2.0"
+memchr = "2.7"
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3.10"
+
 
 [[bench]]
 name = "shapes"

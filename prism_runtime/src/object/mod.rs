@@ -3,9 +3,18 @@
 //! All Python objects share a common header layout for uniform GC handling
 //! and fast type checking.
 
+pub mod call;
+pub mod class;
+pub mod descriptor;
+pub mod instance;
+pub mod metaclass;
+pub mod mro;
+pub mod pool;
 pub mod registry;
 pub mod shape;
 pub mod shaped_object;
+pub mod super_obj;
+pub mod type_builtins;
 pub mod type_obj;
 
 use crate::object::type_obj::TypeId;
