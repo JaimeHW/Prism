@@ -123,6 +123,7 @@ fn op_invalid(_vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 // Import all opcode handlers
 use crate::ops::arithmetic;
 use crate::ops::calls;
+use crate::ops::class;
 use crate::ops::comparison;
 use crate::ops::containers;
 use crate::ops::control;
@@ -228,6 +229,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::ForIter as usize] = objects::for_iter;
     table[Opcode::Len as usize] = objects::len;
     table[Opcode::IsCallable as usize] = objects::is_callable;
+    table[Opcode::BuildClass as usize] = class::build_class;
 
     // Function Calls (0x70-0x7F)
     table[Opcode::Call as usize] = calls::call;

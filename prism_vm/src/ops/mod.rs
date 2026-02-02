@@ -5,6 +5,7 @@
 
 pub mod arithmetic;
 pub mod calls;
+pub mod class;
 pub mod comparison;
 pub mod containers;
 pub mod control;
