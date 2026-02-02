@@ -4,6 +4,8 @@
 //! and fast type checking.
 
 pub mod registry;
+pub mod shape;
+pub mod shaped_object;
 pub mod type_obj;
 
 use crate::object::type_obj::TypeId;
@@ -163,6 +165,16 @@ impl ObjectHeader {
         } else {
             None
         }
+    }
+}
+
+impl std::fmt::Debug for ObjectHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectHeader")
+            .field("type_id", &self.type_id)
+            .field("gc_flags", &self.gc_flags())
+            .field("hash", &self.hash)
+            .finish()
     }
 }
 
