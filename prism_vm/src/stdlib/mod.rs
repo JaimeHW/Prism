@@ -10,6 +10,8 @@
 //! - `os` - Operating system interface
 //! - `sys` - System-specific parameters and functions
 
+pub mod exceptions;
+pub mod generators;
 pub mod math;
 pub mod os;
 pub mod sys;
