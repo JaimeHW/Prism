@@ -83,6 +83,12 @@ impl SymbolFlags {
     pub const fn is_cell(self) -> bool {
         self.contains(Self::CELL)
     }
+
+    /// Remove flags from self (bitwise AND NOT).
+    #[inline]
+    pub const fn remove(self, other: SymbolFlags) -> SymbolFlags {
+        SymbolFlags(self.0 & !other.0)
+    }
 }
 
 impl std::ops::BitOr for SymbolFlags {

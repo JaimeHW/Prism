@@ -11,8 +11,12 @@
 //! 2. **Classification pass**: Classify each name as local/global/free/cell
 //! 3. **Closure analysis**: Determine which variables are captured by nested functions
 
+mod closure;
 mod symbol;
 mod visitor;
 
+pub use closure::{
+    ClosureAnalyzer, ClosureSlot, ClosureStats, scope_can_have_freevars, scope_provides_closures,
+};
 pub use symbol::{Scope, ScopeKind, Symbol, SymbolFlags, SymbolTable};
 pub use visitor::ScopeAnalyzer;

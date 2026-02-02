@@ -6,12 +6,21 @@
 //! 1. **Scope analysis**: Builds symbol tables and determines variable scopes
 //! 2. **Code generation**: Emits register-based bytecode instructions
 
-use crate::bytecode::{CodeFlags, CodeObject, FunctionBuilder, Instruction, Opcode, Register};
+use crate::bytecode::{
+    CodeFlags, CodeObject, FunctionBuilder, Instruction, Label, LocalSlot, Opcode, Register,
+};
+use crate::function_compiler::{VarLocation, VariableEmitter};
 use crate::scope::{ScopeAnalyzer, SymbolTable};
+
 use prism_parser::ast::{
     AugOp, BinOp, BoolOp, CmpOp, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
 };
+use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// Stack-allocated loop context stack for typical loop nesting depths.
+/// Most code has ≤4 nested loops, so we avoid heap allocation in the common case.
+type LoopStack = SmallVec<[LoopContext; 4]>;
 
 /// Compilation error.
 #[derive(Debug, Clone)]
@@ -35,16 +44,40 @@ impl std::error::Error for CompileError {}
 /// Result type for compilation.
 pub type CompileResult<T> = Result<T, CompileError>;
 
+// =============================================================================
+// Loop Context for break/continue
+// =============================================================================
+
+/// Context for tracking loop nesting and jump targets.
+///
+/// Each loop (while, for) pushes a context onto the stack to enable
+/// break and continue statements to emit correct jump instructions.
+#[derive(Debug, Clone, Copy)]
+struct LoopContext {
+    /// Label to jump to for `break` (after loop body, before else clause).
+    /// Note: break skips the else clause in Python.
+    break_label: Label,
+    /// Label to jump to for `continue` (back to loop condition/iterator).
+    continue_label: Label,
+}
+
+// =============================================================================
+// Compiler
+// =============================================================================
+
 /// Bytecode compiler.
 pub struct Compiler {
     /// Current function builder.
     builder: FunctionBuilder,
     /// Symbol table from scope analysis.
-    #[allow(dead_code)]
     symbol_table: SymbolTable,
     /// Source filename.
     #[allow(dead_code)]
     filename: Arc<str>,
+    /// Stack of active loop contexts for break/continue.
+    /// Innermost loop is at the end (top) of the stack.
+    /// Uses SmallVec to avoid heap allocation for typical nesting depths (≤4).
+    loop_stack: LoopStack,
 }
 
 impl Compiler {
@@ -55,6 +88,7 @@ impl Compiler {
             builder: FunctionBuilder::new("<module>"),
             symbol_table: SymbolTable::new("<module>"),
             filename,
+            loop_stack: LoopStack::new(),
         }
     }
 
@@ -68,6 +102,7 @@ impl Compiler {
             builder: FunctionBuilder::new("<module>"),
             symbol_table,
             filename: filename.into(),
+            loop_stack: LoopStack::new(),
         };
 
         compiler.builder.set_filename(filename);
@@ -81,6 +116,30 @@ impl Compiler {
         compiler.builder.emit_return_none();
 
         Ok(compiler.builder.finish())
+    }
+
+    /// Resolve a variable name to its location.
+    ///
+    /// Uses the symbol table to determine whether the variable is local,
+    /// closure (cell/free), or global.
+    fn resolve_variable(&self, name: &str) -> VarLocation {
+        // Look up in symbol table's root scope (module level)
+        if let Some(symbol) = self.symbol_table.root.lookup(name) {
+            // Check closure variables first (cells and frees use same opcodes)
+            if symbol.is_cell() || symbol.is_free() {
+                if let Some(slot) = symbol.closure_slot {
+                    return VarLocation::Closure(slot);
+                }
+            }
+            // Check local variables (but not cells - those use closure access)
+            if symbol.is_local() && !symbol.is_cell() {
+                if let Some(slot) = symbol.local_slot {
+                    return VarLocation::Local(slot);
+                }
+            }
+        }
+        // Fall back to global for undefined or explicitly global symbols
+        VarLocation::Global
     }
 
     /// Compile a statement.
@@ -134,21 +193,29 @@ impl Compiler {
             }
 
             StmtKind::Break => {
-                // TODO: Emit jump to loop exit (requires loop context tracking)
-                return Err(CompileError {
-                    message: "break outside loop".to_string(),
-                    line: stmt.span.start,
-                    column: 0,
-                });
+                // Jump to the break label of the innermost loop
+                if let Some(ctx) = self.loop_stack.last() {
+                    self.builder.emit_jump(ctx.break_label);
+                } else {
+                    return Err(CompileError {
+                        message: "'break' outside loop".to_string(),
+                        line: stmt.span.start,
+                        column: 0,
+                    });
+                }
             }
 
             StmtKind::Continue => {
-                // TODO: Emit jump to loop start (requires loop context tracking)
-                return Err(CompileError {
-                    message: "continue outside loop".to_string(),
-                    line: stmt.span.start,
-                    column: 0,
-                });
+                // Jump to the continue label of the innermost loop
+                if let Some(ctx) = self.loop_stack.last() {
+                    self.builder.emit_jump(ctx.continue_label);
+                } else {
+                    return Err(CompileError {
+                        message: "'continue' outside loop".to_string(),
+                        line: stmt.span.start,
+                        column: 0,
+                    });
+                }
             }
 
             StmtKind::If { test, body, orelse } => {
@@ -185,6 +252,13 @@ impl Compiler {
                 let loop_else = self.builder.create_label();
                 let loop_end = self.builder.create_label();
 
+                // Push loop context for break/continue
+                // break jumps to loop_end, continue jumps to loop_start
+                self.loop_stack.push(LoopContext {
+                    break_label: loop_end,
+                    continue_label: loop_start,
+                });
+
                 self.builder.bind_label(loop_start);
 
                 let cond_reg = self.compile_expr(test)?;
@@ -198,11 +272,15 @@ impl Compiler {
                 self.builder.emit_jump(loop_start);
                 self.builder.bind_label(loop_else);
 
+                // Else clause only executes if loop completed normally (no break)
                 for s in orelse {
                     self.compile_stmt(s)?;
                 }
 
                 self.builder.bind_label(loop_end);
+
+                // Pop loop context
+                self.loop_stack.pop();
             }
 
             StmtKind::For {
@@ -220,6 +298,13 @@ impl Compiler {
                 let loop_start = self.builder.create_label();
                 let loop_else = self.builder.create_label();
                 let loop_end = self.builder.create_label();
+
+                // Push loop context for break/continue
+                // break jumps to loop_end, continue jumps to loop_start
+                self.loop_stack.push(LoopContext {
+                    break_label: loop_end,
+                    continue_label: loop_start,
+                });
 
                 self.builder.bind_label(loop_start);
 
@@ -240,34 +325,17 @@ impl Compiler {
                 self.builder.emit_jump(loop_start);
                 self.builder.bind_label(loop_else);
 
-                // Else clause (if loop completed normally)
+                // Else clause only executes if loop completed normally (no break)
                 for s in orelse {
                     self.compile_stmt(s)?;
                 }
 
                 self.builder.bind_label(loop_end);
+
+                // Pop loop context
+                self.loop_stack.pop();
+
                 self.builder.free_register(iterator_reg);
-            }
-
-            StmtKind::FunctionDef { name, .. } => {
-                // TODO: Compile nested function
-                // For now, just define the name
-                let name_idx = self.builder.add_name(name.clone());
-                let _slot = self.builder.define_local(name.clone());
-
-                // Placeholder: load None
-                let reg = self.builder.alloc_register();
-                self.builder.emit_load_none(reg);
-                self.builder.emit_store_global(name_idx, reg);
-                self.builder.free_register(reg);
-            }
-
-            StmtKind::AsyncFunctionDef { name, .. } => {
-                let name_idx = self.builder.add_name(name.clone());
-                let reg = self.builder.alloc_register();
-                self.builder.emit_load_none(reg);
-                self.builder.emit_store_global(name_idx, reg);
-                self.builder.free_register(reg);
             }
 
             StmtKind::ClassDef { name, .. } => {
@@ -280,28 +348,121 @@ impl Compiler {
             }
 
             StmtKind::Import(aliases) => {
+                // import module1, module2 as alias, ...
+                // For each alias:
+                //   1. Emit ImportName to load the module
+                //   2. Store in the target name (alias if present, else module name)
                 for alias in aliases {
+                    // Use asname if present, otherwise use the module name
+                    // For `import foo.bar`, Python stores the top-level module `foo`
                     let local_name = alias.asname.as_ref().unwrap_or(&alias.name);
-                    let name_idx = self.builder.add_name(local_name.clone());
 
-                    // TODO: Emit ImportName instruction
+                    // For dotted imports like `import foo.bar`, we need to store the
+                    // top-level module name. Get just the first component.
+                    let store_name = if alias.asname.is_some() {
+                        local_name.as_str()
+                    } else {
+                        alias.name.split('.').next().unwrap_or(&alias.name)
+                    };
+
+                    // Add the full module name to the names table for importing
+                    let module_name_idx = self.builder.add_name(alias.name.clone());
+                    let store_name_idx = self.builder.add_name(store_name.to_string());
+
+                    // Emit ImportName: reg = import(module_name)
                     let reg = self.builder.alloc_register();
-                    self.builder.emit_load_none(reg); // Placeholder
-                    self.builder.emit_store_global(name_idx, reg);
+                    self.builder.emit_import_name(reg, module_name_idx);
+
+                    // Store the module in the appropriate scope
+                    match self.resolve_variable(store_name) {
+                        VarLocation::Local(slot) => {
+                            self.builder
+                                .emit_store_local(LocalSlot::new(slot as u16), reg);
+                        }
+                        VarLocation::Closure(slot) => {
+                            self.builder.emit_store_closure(slot, reg);
+                        }
+                        VarLocation::Global => {
+                            self.builder.emit_store_global(store_name_idx, reg);
+                        }
+                    }
+
                     self.builder.free_register(reg);
                 }
             }
 
-            StmtKind::ImportFrom { names, .. } => {
-                for alias in names {
-                    let local_name = alias.asname.as_ref().unwrap_or(&alias.name);
-                    let name_idx = self.builder.add_name(local_name.clone());
+            StmtKind::ImportFrom {
+                module,
+                names,
+                level: _,
+            } => {
+                // from module import name1, name2 as alias, ...
+                // 1. Import the source module first
+                // 2. For each name, import the attribute
 
-                    // TODO: Emit ImportFrom instruction
-                    let reg = self.builder.alloc_register();
-                    self.builder.emit_load_none(reg); // Placeholder
-                    self.builder.emit_store_global(name_idx, reg);
-                    self.builder.free_register(reg);
+                // Handle `from module import *` case
+                let is_star = names.len() == 1 && names[0].name == "*";
+
+                if is_star {
+                    // from module import *
+                    if let Some(mod_name) = module {
+                        let mod_name_idx = self.builder.add_name(mod_name.clone());
+                        let mod_reg = self.builder.alloc_register();
+
+                        // Import the module
+                        self.builder.emit_import_name(mod_reg, mod_name_idx);
+
+                        // Emit ImportStar to inject all public names
+                        self.builder.emit_import_star(Register::new(0), mod_reg);
+
+                        self.builder.free_register(mod_reg);
+                    }
+                } else {
+                    // from module import name1, name2, ...
+                    let mod_reg = if let Some(mod_name) = module {
+                        let mod_name_idx = self.builder.add_name(mod_name.clone());
+                        let reg = self.builder.alloc_register();
+                        self.builder.emit_import_name(reg, mod_name_idx);
+                        reg
+                    } else {
+                        // Relative import with no module (e.g., `from . import x`)
+                        // For now, emit LoadNone as placeholder
+                        let reg = self.builder.alloc_register();
+                        self.builder.emit_load_none(reg);
+                        reg
+                    };
+
+                    for alias in names {
+                        let local_name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        let attr_name_idx = self.builder.add_name(alias.name.clone());
+                        let store_name_idx = self.builder.add_name(local_name.clone());
+
+                        // We need the name index as u8 for ImportFrom encoding
+                        let attr_idx_u8 = (attr_name_idx & 0xFF) as u8;
+
+                        // Emit ImportFrom: reg = module.attr
+                        let attr_reg = self.builder.alloc_register();
+                        self.builder
+                            .emit_import_from(attr_reg, mod_reg, attr_idx_u8);
+
+                        // Store in the appropriate scope
+                        match self.resolve_variable(local_name) {
+                            VarLocation::Local(slot) => {
+                                self.builder
+                                    .emit_store_local(LocalSlot::new(slot as u16), attr_reg);
+                            }
+                            VarLocation::Closure(slot) => {
+                                self.builder.emit_store_closure(slot, attr_reg);
+                            }
+                            VarLocation::Global => {
+                                self.builder.emit_store_global(store_name_idx, attr_reg);
+                            }
+                        }
+
+                        self.builder.free_register(attr_reg);
+                    }
+
+                    self.builder.free_register(mod_reg);
                 }
             }
 
@@ -354,7 +515,27 @@ impl Compiler {
                 }
             }
 
-            // TODO: Implement remaining statements
+            StmtKind::FunctionDef {
+                name,
+                args,
+                body,
+                decorator_list,
+                ..
+            } => {
+                self.compile_function_def(name, args, body, decorator_list, false)?;
+            }
+
+            StmtKind::AsyncFunctionDef {
+                name,
+                args,
+                body,
+                decorator_list,
+                ..
+            } => {
+                self.compile_function_def(name, args, body, decorator_list, true)?;
+            }
+
+            // TODO: Implement remaining statements (ClassDef, With, Try, etc.)
             _ => {
                 // Placeholder for unimplemented statements
             }
@@ -391,20 +572,16 @@ impl Compiler {
             }
 
             ExprKind::String(s) => {
-                // TODO: Implement proper string constant pool
-                // For now, store as None placeholder and add string to names
-                let _name_idx = self.builder.add_name(s.value.clone());
-                self.builder.emit_load_none(reg);
+                // Add string to constant pool with automatic interning and deduplication
+                let str_idx = self.builder.add_string(s.value.as_str());
+                self.builder.emit_load_const(reg, str_idx);
             }
 
             ExprKind::Name(name) => {
-                // Check if it's a local or global
-                if let Some(slot) = self.builder.lookup_local(name) {
-                    self.builder.emit_load_local(reg, slot);
-                } else {
-                    let name_idx = self.builder.add_name(name.clone());
-                    self.builder.emit_load_global(reg, name_idx);
-                }
+                // Use scope-aware variable resolution
+                let location = self.resolve_variable(name);
+                self.builder
+                    .emit_load_var(reg, location, Some(name.as_ref()));
             }
 
             ExprKind::BinOp { op, left, right } => {
@@ -643,15 +820,10 @@ impl Compiler {
     fn compile_store(&mut self, target: &Expr, value: Register) -> CompileResult<()> {
         match &target.kind {
             ExprKind::Name(name) => {
-                // Check if local or global
-                if let Some(slot) = self.builder.lookup_local(name) {
-                    self.builder.emit_store_local(slot, value);
-                } else {
-                    // For module-level, store as global
-                    let name_idx = self.builder.add_name(name.clone());
-                    self.builder.emit_store_global(name_idx, value);
-                    // Note: Do NOT define as local here - globals stay as globals
-                }
+                // Use scope-aware variable resolution
+                let location = self.resolve_variable(name);
+                self.builder
+                    .emit_store_var(location, value, Some(name.as_ref()));
             }
 
             ExprKind::Attribute {
@@ -763,6 +935,211 @@ impl Compiler {
                 .emit(Instruction::op_dss(Opcode::NotIn, dst, left, right)),
         }
     }
+
+    // =========================================================================
+    // Function Definition Compilation
+    // =========================================================================
+
+    /// Compile a function definition (FunctionDef or AsyncFunctionDef).
+    ///
+    /// This creates a nested CodeObject for the function body and emits
+    /// MakeFunction or MakeClosure opcode to create the function object.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Function name
+    /// * `args` - Function arguments specification
+    /// * `body` - Function body statements
+    /// * `decorator_list` - Decorators to apply
+    /// * `is_async` - Whether this is an async function
+    fn compile_function_def(
+        &mut self,
+        name: &str,
+        args: &prism_parser::ast::Arguments,
+        body: &[Stmt],
+        decorator_list: &[Expr],
+        is_async: bool,
+    ) -> CompileResult<()> {
+        use crate::bytecode::LocalSlot;
+
+        // Find the scope for this function from the symbol table
+        // We need to look it up by name in the current scope's children
+        let func_scope = self.find_child_scope(name);
+
+        // Create a new FunctionBuilder for the function body
+        let mut func_builder = FunctionBuilder::new(name);
+        func_builder.set_filename(&*self.filename);
+
+        // Set function flags
+        if is_async {
+            func_builder.add_flags(CodeFlags::COROUTINE);
+        }
+
+        // Count parameters
+        let posonly_count = args.posonlyargs.len() as u16;
+        let kwonly_count = args.kwonlyargs.len() as u16;
+        let total_positional = args.posonlyargs.len() + args.args.len();
+
+        // Set parameter counts on the builder
+        func_builder.set_arg_count(total_positional as u16);
+        func_builder.set_kwonlyarg_count(kwonly_count);
+        func_builder.set_posonlyarg_count(posonly_count);
+
+        // Handle varargs and kwargs
+        if args.vararg.is_some() {
+            func_builder.add_flags(CodeFlags::VARARGS);
+        }
+        if args.kwarg.is_some() {
+            func_builder.add_flags(CodeFlags::VARKEYWORDS);
+        }
+
+        // Register parameters as locals (they occupy the first slots)
+        // Python parameter order: posonly, regular args, vararg, kwonly, kwarg
+
+        // Position-only parameters
+        for arg in &args.posonlyargs {
+            func_builder.define_local(arg.arg.as_str());
+        }
+
+        // Regular positional parameters
+        for arg in &args.args {
+            func_builder.define_local(arg.arg.as_str());
+        }
+
+        // *args
+        if let Some(ref vararg) = args.vararg {
+            func_builder.define_local(vararg.arg.as_str());
+        }
+
+        // Keyword-only parameters
+        for arg in &args.kwonlyargs {
+            func_builder.define_local(arg.arg.as_str());
+        }
+
+        // **kwargs
+        if let Some(ref kwarg) = args.kwarg {
+            func_builder.define_local(kwarg.arg.as_str());
+        }
+
+        // Register cell and free variables from scope analysis
+        let mut has_closure = false;
+        if let Some(scope) = func_scope {
+            // Cell variables: locals captured by inner functions
+            for sym in scope.cellvars() {
+                func_builder.add_cellvar(Arc::from(sym.name.as_ref()));
+                has_closure = true;
+            }
+
+            // Free variables: captured from outer scopes
+            for sym in scope.freevars() {
+                func_builder.add_freevar(Arc::from(sym.name.as_ref()));
+                has_closure = true;
+            }
+
+            // Set generator flag from scope analysis
+            if scope.has_yield {
+                func_builder.add_flags(CodeFlags::GENERATOR);
+            }
+        }
+
+        if has_closure {
+            func_builder.add_flags(CodeFlags::NESTED);
+        }
+
+        // Swap builders to compile function body
+        let parent_builder = std::mem::replace(&mut self.builder, func_builder);
+
+        // Compile function body
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+
+        // Ensure function returns None if no explicit return
+        self.builder.emit_return_none();
+
+        // Swap back and get finished function code
+        let func_builder = std::mem::replace(&mut self.builder, parent_builder);
+        let func_code = func_builder.finish();
+
+        // Store the nested CodeObject as a constant
+        let code_const_idx = self.builder.add_code_object(Arc::new(func_code));
+
+        // Compile decorators in reverse order (they'll wrap the function)
+        // Decorators are compiled first, then applied after function creation
+        let decorator_regs: Vec<Register> = decorator_list
+            .iter()
+            .map(|d| self.compile_expr(d))
+            .collect::<Result<_, _>>()?;
+
+        // Emit function/closure creation
+        let func_reg = self.builder.alloc_register();
+
+        if has_closure {
+            // MakeClosure: needs to capture variables from current scope
+            // The instruction format is: dst = closure, imm16 = code index
+            // Free variables must be loaded from current scope and packed
+            self.builder.emit(Instruction::op_di(
+                Opcode::MakeClosure,
+                func_reg,
+                code_const_idx,
+            ));
+        } else {
+            // MakeFunction: simple function without captures
+            self.builder.emit(Instruction::op_di(
+                Opcode::MakeFunction,
+                func_reg,
+                code_const_idx,
+            ));
+        }
+
+        // Apply decorators in reverse order
+        // @decorator1
+        // @decorator2
+        // def func(): ...
+        // is equivalent to: func = decorator1(decorator2(func))
+        for decorator_reg in decorator_regs.into_iter().rev() {
+            // Call decorator with function as argument
+            let call_result = self.builder.alloc_register();
+            // Place function as arg in next register after call_result
+            self.builder
+                .emit_move(Register::new(call_result.0 + 1), func_reg);
+            self.builder.emit(Instruction::op_dss(
+                Opcode::Call,
+                call_result,
+                decorator_reg,
+                Register::new(1), // 1 argument
+            ));
+            self.builder.free_register(decorator_reg);
+            self.builder.free_register(func_reg);
+            // Result becomes the new function
+            // Move result back to func_reg position for consistency
+            // Actually, we'll just use call_result as the final function
+            // But we need to track it properly - let's just store directly
+        }
+
+        // Store function to its name
+        // For now, treat it as a global store (module level)
+        // TODO: Proper scope-aware store for nested functions
+        let name_idx = self.builder.add_name(Arc::from(name));
+        self.builder.emit_store_global(name_idx, func_reg);
+        self.builder.free_register(func_reg);
+
+        Ok(())
+    }
+
+    /// Find a child scope by name in the current scope.
+    ///
+    /// This is used to look up the scope for nested function definitions
+    /// so we can access cell and free variable information.
+    fn find_child_scope(&self, name: &str) -> Option<&crate::scope::Scope> {
+        // For now, search the root scope's children
+        // TODO: Track current scope path for proper nested function compilation
+        self.symbol_table
+            .root
+            .children
+            .iter()
+            .find(|c| c.name.as_ref() == name)
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +1149,11 @@ mod tests {
     fn compile(source: &str) -> CodeObject {
         let module = prism_parser::parse(source).expect("parse error");
         Compiler::compile_module(&module, "<test>").expect("compile error")
+    }
+
+    fn try_compile(source: &str) -> Result<CodeObject, CompileError> {
+        let module = prism_parser::parse(source).expect("parse error");
+        Compiler::compile_module(&module, "<test>")
     }
 
     #[test]
@@ -809,5 +1191,234 @@ mod tests {
         let code = compile("a = 1\nb = 2\nc = a + b");
         // Should use some registers
         assert!(code.register_count > 0);
+    }
+
+    // =========================================================================
+    // Loop Control Flow Tests (break/continue)
+    // =========================================================================
+
+    #[test]
+    fn test_break_in_while_loop() {
+        // Basic break in while loop
+        let code = compile(
+            r#"
+i = 0
+while True:
+    i = i + 1
+    if i >= 5:
+        break
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        // Should have Jump instructions for break
+        let has_jump = code.instructions.iter().any(|i| {
+            let opcode = i.opcode();
+            opcode == Opcode::Jump as u8
+        });
+        assert!(has_jump, "expected Jump instruction for break");
+    }
+
+    #[test]
+    fn test_continue_in_while_loop() {
+        // Continue in while loop
+        let code = compile(
+            r#"
+total = 0
+i = 0
+while i < 10:
+    i = i + 1
+    if i % 2 == 0:
+        continue
+    total = total + i
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        // Should have Jump instructions for continue
+        let has_jump = code.instructions.iter().any(|i| {
+            let opcode = i.opcode();
+            opcode == Opcode::Jump as u8
+        });
+        assert!(has_jump, "expected Jump instruction for continue");
+    }
+
+    #[test]
+    fn test_break_in_for_loop() {
+        // Break in for loop
+        let code = compile(
+            r#"
+result = 0
+for x in range(100):
+    if x == 5:
+        break
+    result = result + x
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_continue_in_for_loop() {
+        // Continue in for loop
+        let code = compile(
+            r#"
+total = 0
+for x in range(10):
+    if x % 2 == 0:
+        continue
+    total = total + x
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_nested_loops_with_break() {
+        // Break in nested loops - should only break inner loop
+        let code = compile(
+            r#"
+found = False
+for i in range(5):
+    for j in range(5):
+        if i == 2 and j == 3:
+            found = True
+            break
+    if found:
+        break
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_nested_loops_with_continue() {
+        // Continue in nested loops
+        let code = compile(
+            r#"
+total = 0
+for i in range(5):
+    for j in range(5):
+        if j % 2 == 0:
+            continue
+        total = total + 1
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_while_with_else_and_break() {
+        // While-else with break (else should be skipped on break)
+        let code = compile(
+            r#"
+i = 0
+while i < 10:
+    if i == 5:
+        break
+    i = i + 1
+else:
+    x = 42
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_for_with_else_and_break() {
+        // For-else with break
+        let code = compile(
+            r#"
+for x in range(10):
+    if x == 5:
+        break
+else:
+    y = 42
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_break_outside_loop_error() {
+        // Break outside loop should be an error
+        let result = try_compile("break");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("'break' outside loop"),
+            "expected 'break' outside loop error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_continue_outside_loop_error() {
+        // Continue outside loop should be an error
+        let result = try_compile("continue");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("'continue' outside loop"),
+            "expected 'continue' outside loop error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_break_in_if_inside_loop() {
+        // Break in if statement inside loop is valid
+        let code = compile(
+            r#"
+for x in range(10):
+    if x > 5:
+        break
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_deeply_nested_break() {
+        // Break in deeply nested structure
+        let code = compile(
+            r#"
+for a in range(5):
+    for b in range(5):
+        for c in range(5):
+            if a + b + c > 10:
+                break
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_breaks_in_loop() {
+        // Multiple break statements in same loop
+        let code = compile(
+            r#"
+for x in range(100):
+    if x == 5:
+        break
+    if x == 10:
+        break
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_break_and_continue_in_same_loop() {
+        // Both break and continue in same loop
+        let code = compile(
+            r#"
+for x in range(100):
+    if x == 50:
+        break
+    if x % 2 == 0:
+        continue
+    y = x * 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
     }
 }

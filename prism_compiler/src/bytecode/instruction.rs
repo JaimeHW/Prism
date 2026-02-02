@@ -295,6 +295,8 @@ pub enum Opcode {
     DeleteGlobal = 0x1B,
     /// Move register: dst = src.
     Move = 0x1C,
+    /// Delete closure variable: del closure[imm16].
+    DeleteClosure = 0x1D,
 
     // =========================================================================
     // Integer Arithmetic (0x20-0x2F)
@@ -421,6 +423,11 @@ pub enum Opcode {
     Len = 0x68,
     /// Check if callable: dst = callable(src).
     IsCallable = 0x69,
+    /// Build class: dst = class body in src1, name_idx in imm16.
+    /// Bases are in registers starting at dst+1, count in src2.
+    BuildClass = 0x6A,
+    /// Load method for super(): dst = super().method lookup.
+    LoadMethod = 0x6B,
 
     // =========================================================================
     // Function Calls (0x70-0x7F)
@@ -511,6 +518,7 @@ impl Opcode {
             0x1A => Some(Opcode::DeleteLocal),
             0x1B => Some(Opcode::DeleteGlobal),
             0x1C => Some(Opcode::Move),
+            0x1D => Some(Opcode::DeleteClosure),
 
             0x20 => Some(Opcode::AddInt),
             0x21 => Some(Opcode::SubInt),
@@ -568,6 +576,8 @@ impl Opcode {
             0x67 => Some(Opcode::ForIter),
             0x68 => Some(Opcode::Len),
             0x69 => Some(Opcode::IsCallable),
+            0x6A => Some(Opcode::BuildClass),
+            0x6B => Some(Opcode::LoadMethod),
 
             0x70 => Some(Opcode::Call),
             0x71 => Some(Opcode::CallKw),
@@ -618,7 +628,7 @@ impl Opcode {
 
             // Load/store with 16-bit index
             LoadConst | LoadLocal | StoreLocal | LoadClosure | StoreClosure | LoadGlobal
-            | StoreGlobal | DeleteLocal | DeleteGlobal => DstImm16,
+            | StoreGlobal | DeleteLocal | DeleteGlobal | DeleteClosure => DstImm16,
 
             // Move
             Move => DstSrc,
@@ -643,6 +653,10 @@ impl Opcode {
             // Calls
             Call | CallKw | CallMethod | TailCall => DstSrcSrc,
             MakeFunction | MakeClosure => DstImm16,
+
+            // Class operations
+            BuildClass => DstSrcSrc, // dst = class, src1 = body code, src2 = base count
+            LoadMethod => DstSrcSrc, // dst = method, src1 = object, src2 = name_idx
 
             // Container ops
             BuildList | BuildTuple | BuildSet | BuildDict | BuildString | UnpackSequence

@@ -41,6 +41,7 @@
 
 pub mod bytecode;
 pub mod compiler;
+pub mod function_compiler;
 pub mod scope;
 
 // Re-export main types
@@ -49,3 +50,6 @@ pub use bytecode::{
     LineTableEntry, LocalSlot, Opcode, Register, disassemble,
 };
 pub use compiler::Compiler;
+pub use function_compiler::{
+    ClosureInfo, FunctionContext, VarLocation, VariableEmitter, VariableResolver,
+};
