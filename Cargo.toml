@@ -41,6 +41,8 @@ memmap2 = "0.9"
 num-bigint = "0.4"
 num-traits = "0.2"
 unicode-xid = "0.2"
+smallvec = "1.13"
+
 
 [profile.release]
 lto = "fat"

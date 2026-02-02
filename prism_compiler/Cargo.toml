@@ -7,3 +7,4 @@ edition.workspace = true
 [dependencies]
 prism_core.workspace = true
 prism_parser.workspace = true
+smallvec.workspace = true

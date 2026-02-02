@@ -39,12 +39,28 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Hidden Classes (Shapes)** — O(1) property access through inline slots and transition chains
 - **NaN-Boxing** — Efficient 64-bit value representation for primitives and pointers
 - **Small Integer Cache** — Pre-allocated integers from -5 to 256
+- **Descriptor Protocol** — Full implementation of `@property`, `__slots__`, bound methods, and classmethod/staticmethod
+
+### Zero-Cost Exception Handling
+- **Table-Based Unwinding** — Zero runtime overhead for code paths that don't raise
+- **Nested Handler Resolution** — Inner-first linear scan for try/except block matching
+- **Traceback System** — Full stack trace generation with source coordinates
+
+### Generator Protocol
+- **Stackless State Machines** — Minimal-overhead state capture and restoration
+- **Liveness-Aware Frames** — Only live variables captured across yield points
+- **Iterator Integration** — Full `__iter__`/`__next__` protocol support
+
+### I/O System
+- **Layered Architecture** — `FileIO` → `BufferedIO` → `TextIO` stack
+- **Buffer Pooling** — High-throughput file operations via reusable buffers
+- **Thread-Safe Streams** — `sys.stdin`, `sys.stdout`, `sys.stderr` with locking
 
 ### Python 3.12 Compatibility
 - **Complete Parser** — Pratt parser with 16 precedence tiers for Python's complex grammar
 - **Scope Analysis** — Deep binding analysis with Local/Global/Cell/Free variable resolution
 - **Arbitrary Precision Integers** — Full `BigInt` support for Python integer semantics
-- **Standard Library Foundations** — `math`, `sys`, and `os` modules with native performance
+- **Standard Library** — `math`, `sys`, `os`, `time`, and exception hierarchy modules
 
 ## Quick Start
 
@@ -178,22 +194,24 @@ Prism is under active development. Current status:
 | Component | Status | Tests |
 |:----------|:-------|:------|
 | Parser | ✅ Complete | 153 |
-| Compiler | ✅ Complete | — |
-| VM & Interpreter | ✅ Complete | 31 integration |
-| Object System (Shapes) | ✅ Complete | 180+ |
-| Garbage Collector | ✅ Complete | — |
-| JIT Tier 1 & 2 | ✅ Complete | 350+ |
-| Builtins | ✅ Complete | 189 |
+| Compiler | ✅ Complete | 39 |
+| Core Types & Values | ✅ Complete | 190 |
+| VM & Interpreter | ✅ Complete | 69 integration |
+| Object System (Shapes) | ✅ Complete | 381 |
+| Descriptor Protocol | ✅ Complete | 40+ |
+| Garbage Collector | ✅ Complete | 84 |
+| JIT Tier 1 & 2 | ✅ Complete | 639 |
+| Exception System | ✅ Complete | 421 |
+| Generator Protocol | ✅ Complete | 171 |
 | Math Module | ✅ Complete | 305 |
 | Sys Module | ✅ Complete | 172 |
-| OS Module | 🚧 In Progress | — |
+| OS Module | ✅ Complete | 147 |
 
-**Total test coverage: 1600+ tests**
+**Total test coverage: 3,300+ tests**
 
 ### Roadmap
 
-- [ ] Exception system with zero-cost try blocks
-- [ ] Generator/async support with minimal-overhead state machines
+- [ ] Async/await coroutines
 - [ ] ARM64 backend
 - [ ] Extended standard library coverage
 - [ ] Package import system
@@ -206,13 +224,3 @@ Licensed under either of:
 - MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues and pull requests.
-
----
-
-<p align="center">
-  <sub>Built with Rust 🦀</sub>
-</p>
