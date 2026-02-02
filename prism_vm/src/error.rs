@@ -162,6 +162,22 @@ impl RuntimeError {
         Self::new(RuntimeErrorKind::NameError { name: name.into() })
     }
 
+    /// Create an UnboundLocalError for a named variable.
+    #[inline]
+    pub fn unbound_local(name: impl Into<Arc<str>>) -> Self {
+        Self::new(RuntimeErrorKind::UnboundLocalError { name: name.into() })
+    }
+
+    /// Create an UnboundLocalError for a cell slot (closure variable).
+    ///
+    /// Used when a closure variable has been deleted or never assigned.
+    #[inline]
+    pub fn unbound_local_cell(slot: usize) -> Self {
+        Self::new(RuntimeErrorKind::UnboundLocalError {
+            name: format!("<cell {}>", slot).into(),
+        })
+    }
+
     #[inline]
     pub fn attribute_error(type_name: impl Into<Arc<str>>, attr: impl Into<Arc<str>>) -> Self {
         Self::new(RuntimeErrorKind::AttributeError {

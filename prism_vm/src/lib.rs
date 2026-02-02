@@ -79,6 +79,9 @@ pub mod exception;
 // Standard library modules
 pub mod stdlib;
 
+// Import system
+pub mod import;
+
 // Re-exports
 pub use builtins::{BuiltinError, BuiltinFn, BuiltinRegistry};
 pub use dispatch::ControlFlow;
