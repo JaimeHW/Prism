@@ -4,15 +4,23 @@
 //! All builtins use static dispatch for maximum performance.
 
 mod builtin_function;
+mod execution;
 mod functions;
+mod introspect;
 mod io;
 mod itertools;
+mod numeric;
+mod string;
 mod types;
 
 pub use builtin_function::*;
+pub use execution::*;
 pub use functions::*;
+pub use introspect::*;
 pub use io::*;
 pub use itertools::*;
+pub use numeric::*;
+pub use string::*;
 pub use types::*;
 
 use prism_core::Value;
@@ -113,6 +121,33 @@ impl BuiltinRegistry {
         registry.register_function("callable", functions::builtin_callable);
         registry.register_function("repr", functions::builtin_repr);
         registry.register_function("ascii", functions::builtin_ascii);
+
+        // Register numeric formatting functions
+        registry.register_function("bin", numeric::builtin_bin);
+        registry.register_function("hex", numeric::builtin_hex);
+        registry.register_function("oct", numeric::builtin_oct);
+        registry.register_function("complex", numeric::builtin_complex);
+
+        // Register string/bytes functions
+        registry.register_function("ord", string::builtin_ord);
+        registry.register_function("chr", string::builtin_chr);
+        registry.register_function("bytes", string::builtin_bytes);
+        registry.register_function("bytearray", string::builtin_bytearray);
+        registry.register_function("format", string::builtin_format);
+
+        // Register introspection functions
+        registry.register_function("dir", introspect::builtin_dir);
+        registry.register_function("vars", introspect::builtin_vars);
+        registry.register_function("globals", introspect::builtin_globals);
+        registry.register_function("locals", introspect::builtin_locals);
+        registry.register_function("help", introspect::builtin_help);
+        registry.register_function("__import__", introspect::builtin_import);
+
+        // Register execution functions
+        registry.register_function("exec", execution::builtin_exec);
+        registry.register_function("eval", execution::builtin_eval);
+        registry.register_function("compile", execution::builtin_compile);
+        registry.register_function("breakpoint", execution::builtin_breakpoint);
 
         // Register iteration functions
         registry.register_function("range", itertools::builtin_range);

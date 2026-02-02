@@ -73,6 +73,9 @@ pub mod jit_executor;
 // Opcode handlers (organized by category)
 pub mod ops;
 
+// Standard library modules
+pub mod stdlib;
+
 // Re-exports
 pub use builtins::{BuiltinError, BuiltinFn, BuiltinRegistry};
 pub use dispatch::ControlFlow;
