@@ -451,8 +451,10 @@ dependencies = [
  "bitflags",
  "libc",
  "memmap2",
+ "parking_lot",
  "prism_compiler",
  "prism_core",
+ "rustc-hash",
  "smallvec",
  "windows-sys",
 ]

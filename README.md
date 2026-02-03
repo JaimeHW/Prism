@@ -8,6 +8,7 @@
   <a href="#quick-start">Quick Start</a> •
   <a href="#architecture">Architecture</a> •
   <a href="#building">Building</a> •
+  <a href="#project-status">Status</a> •
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -28,6 +29,7 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **On-Stack Replacement** — Mid-loop tier-up from interpreter to optimized code
 - **Loop Optimizations** — LICM, Range Check Elimination, and induction variable analysis
 - **Function Inlining** — Budget-based graph merging with escape analysis
+- **Strength Reduction** — Magic number division, multiplication decomposition into shifts/adds
 
 ### High-Performance Memory Management
 - **Generational GC** — Immix-based heap with opportunistic evacuation and line-level marking
@@ -44,12 +46,18 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 ### Zero-Cost Exception Handling
 - **Table-Based Unwinding** — Zero runtime overhead for code paths that don't raise
 - **Nested Handler Resolution** — Inner-first linear scan for try/except block matching
-- **Traceback System** — Full stack trace generation with source coordinates
+- **Exception Chaining** — Full `raise ... from ...` semantics with `__cause__` and `__context__`
+- **Traceback System** — Complete stack trace generation with source coordinates
 
 ### Generator Protocol
 - **Stackless State Machines** — Minimal-overhead state capture and restoration
 - **Liveness-Aware Frames** — Only live variables captured across yield points
 - **Iterator Integration** — Full `__iter__`/`__next__` protocol support
+
+### Structural Pattern Matching (PEP 634)
+- **Decision Tree Compilation** — Maranget algorithm for optimal pattern dispatch
+- **Full Pattern Support** — Literals, captures, wildcards, sequences, mappings, class patterns, OR/AS patterns
+- **Guard Expressions** — Conditional pattern matching with arbitrary Python expressions
 
 ### I/O System
 - **Layered Architecture** — `FileIO` → `BufferedIO` → `TextIO` stack
@@ -60,7 +68,7 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Complete Parser** — Pratt parser with 16 precedence tiers for Python's complex grammar
 - **Scope Analysis** — Deep binding analysis with Local/Global/Cell/Free variable resolution
 - **Arbitrary Precision Integers** — Full `BigInt` support for Python integer semantics
-- **Standard Library** — `math`, `sys`, `os`, `time`, and exception hierarchy modules
+- **Standard Library** — `math`, `sys`, `os`, `time`, `re`, and exception hierarchy modules
 
 ## Quick Start
 
@@ -82,13 +90,13 @@ Prism is organized as a modular Rust workspace:
 
 ```
 prism/
-├── prism_core      # Fundamental types: Value (NaN-boxing), Span, Error
+├── prism_core      # Fundamental types: Value (NaN-boxing), Span, Error, Interning
 ├── prism_parser    # Python 3.12 grammar and AST construction
-├── prism_compiler  # Scope analysis and register-based bytecode emission
-├── prism_vm        # Execution engine, interpreter, and JIT orchestration
+├── prism_compiler  # Scope analysis, pattern matching, register-based bytecode emission
+├── prism_vm        # Execution engine, interpreter, JIT bridge, stdlib modules
 ├── prism_jit       # Multi-tier JIT: IR, optimization passes, x64 codegen
-├── prism_runtime   # Object system, shapes, and type implementations
-├── prism_gc        # Generational Immix collector with TLABs
+├── prism_runtime   # Object system, shapes, types (list, dict, set, string, etc.)
+├── prism_gc        # Generational Immix collector with TLABs and write barriers
 ├── prism_builtins  # Builtin function implementations
 └── prism_cli       # Command-line interface
 ```
@@ -126,7 +134,7 @@ Source ─▶ Parser ─▶ Compiler ─┼─▶│         (Linear Scan)      
 |:-----|:---------|:--------|:--------------|
 | **0** | Interpreter | Default | Inline caches, type feedback collection |
 | **1** | Template | ~100 calls | Direct translation, speculative guards |
-| **2** | Optimizing | ~1000 calls or hot loop | GVN, DCE, LICM, RCE, Inlining, Escape Analysis |
+| **2** | Optimizing | ~1000 calls or hot loop | GVN, DCE, LICM, RCE, Strength Reduction, Inlining, Escape Analysis |
 
 ### Object Model
 
@@ -192,22 +200,19 @@ strip = true          # Strip symbols
 Prism is under active development. Current status:
 
 | Component | Status | Tests |
-|:----------|:-------|:------|
-| Parser | ✅ Complete | 153 |
-| Compiler | ✅ Complete | 39 |
+|:----------|:-------|------:|
+| Parser | ✅ Complete | 167 |
+| Compiler | ✅ Complete | 522 |
 | Core Types & Values | ✅ Complete | 190 |
-| VM & Interpreter | ✅ Complete | 69 integration |
-| Object System (Shapes) | ✅ Complete | 381 |
-| Descriptor Protocol | ✅ Complete | 40+ |
+| VM & Interpreter | ✅ Complete | 2,017 |
+| Object System (Shapes) | ✅ Complete | — |
+| Descriptor Protocol | ✅ Complete | — |
+| Pattern Matching | ✅ Complete | — |
+| JIT Tier 1 & 2 | ✅ Complete | 889 |
 | Garbage Collector | ✅ Complete | 84 |
-| JIT Tier 1 & 2 | ✅ Complete | 639 |
-| Exception System | ✅ Complete | 421 |
-| Generator Protocol | ✅ Complete | 171 |
-| Math Module | ✅ Complete | 305 |
-| Sys Module | ✅ Complete | 172 |
-| OS Module | ✅ Complete | 147 |
+| Runtime Types | ✅ Complete | 603 |
 
-**Total test coverage: 3,300+ tests**
+**Total test coverage: 4,400+ tests**
 
 ### Roadmap
 
@@ -215,6 +220,10 @@ Prism is under active development. Current status:
 - [ ] ARM64 backend
 - [ ] Extended standard library coverage
 - [ ] Package import system
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
