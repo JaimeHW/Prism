@@ -416,6 +416,8 @@ bitflags::bitflags! {
         const VISITED = 0b0000_1000;
         /// Node is loop-invariant.
         const LOOP_INVARIANT = 0b0001_0000;
+        /// Node has been hoisted out of a loop by LICM.
+        const HOISTED = 0b0010_0000;
     }
 }
 

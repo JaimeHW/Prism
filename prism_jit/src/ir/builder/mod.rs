@@ -8,6 +8,7 @@ use crate::ir::operators::Operator;
 use std::collections::HashMap;
 
 pub mod arithmetic;
+pub mod bitwise;
 pub mod containers;
 pub mod control;
 pub mod guards;
@@ -18,6 +19,7 @@ pub mod translator;
 mod tests;
 
 pub use arithmetic::ArithmeticBuilder;
+pub use bitwise::BitwiseBuilder;
 pub use containers::ContainerBuilder;
 pub use control::ControlBuilder;
 pub use guards::GuardBuilder;

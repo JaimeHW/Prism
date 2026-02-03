@@ -390,6 +390,10 @@ pub enum Operator {
     FloatOp(ArithOp),
     /// Generic (polymorphic) arithmetic.
     GenericOp(ArithOp),
+    /// Unsigned multiply high (upper 64 bits of 128-bit product).
+    MulHigh,
+    /// Signed multiply high (upper 64 bits of 128-bit product).
+    MulHighSigned,
 
     // Comparison
     /// Typed integer comparison.
@@ -476,6 +480,8 @@ impl Operator {
                 OpCategory::Arithmetic
             }
 
+            Operator::MulHigh | Operator::MulHighSigned => OpCategory::Arithmetic,
+
             Operator::IntCmp(_) | Operator::FloatCmp(_) | Operator::GenericCmp(_) => {
                 OpCategory::Comparison
             }
@@ -514,7 +520,9 @@ impl Operator {
             | Operator::IntCmp(_)
             | Operator::FloatCmp(_)
             | Operator::Bitwise(_)
-            | Operator::LogicalNot => true,
+            | Operator::LogicalNot
+            | Operator::MulHigh
+            | Operator::MulHighSigned => true,
 
             // SSA nodes are pure
             Operator::Phi | Operator::LoopPhi | Operator::Projection(_) => true,
@@ -562,6 +570,9 @@ impl Operator {
 
             Operator::FloatOp(_) => ValueType::Float64,
             Operator::GenericOp(_) => ValueType::Numeric,
+
+            // MulHigh operations return the upper 64 bits of 128-bit product
+            Operator::MulHigh | Operator::MulHighSigned => ValueType::Int64,
 
             Operator::IntCmp(_) | Operator::FloatCmp(_) | Operator::GenericCmp(_) => {
                 ValueType::Bool

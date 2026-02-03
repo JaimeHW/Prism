@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod platform {
     use std::ptr;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc,
-        VirtualFree, VirtualProtect,
+        VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+        PAGE_EXECUTE_READ, PAGE_READWRITE,
     };
 
     pub const PAGE_SIZE: usize = 4096;
