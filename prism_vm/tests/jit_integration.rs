@@ -1,5 +1,5 @@
 use prism_compiler::bytecode::{
-    CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode, Register,
+    CodeFlags, CodeObject, ExceptionEntry, Instruction, LineTableEntry, Opcode, Register,
 };
 use prism_core::Value;
 use prism_vm::{JitConfig, JitContext, VirtualMachine};
@@ -30,10 +30,12 @@ fn create_return_const_code(const_val: Value) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_return_const".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
@@ -142,10 +144,12 @@ fn create_loop_code() -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_loop_local".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 

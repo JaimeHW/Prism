@@ -3,7 +3,9 @@
 //! Tests the complete speculation pipeline from bytecode through interpreter
 //! to speculative execution. Focuses on correctness of operations.
 
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_compiler::bytecode::{
+    CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
+};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -36,10 +38,12 @@ fn create_int_add_code(a: i64, b: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_int_add".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
@@ -67,10 +71,12 @@ fn create_float_add_code(a: f64, b: f64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_float_add".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
@@ -98,10 +104,12 @@ fn create_lt_code(a: i64, b: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_lt".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
@@ -129,10 +137,12 @@ fn create_mul_code(a: i64, b: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_mul".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
@@ -211,10 +221,12 @@ fn create_hot_loop_code(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_hot_loop".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
@@ -506,10 +518,12 @@ fn test_e2e_nested_loops() {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "test.py".into(),
         qualname: "test_nested_loops".into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     });
 
     let config = JitConfig::for_testing();

@@ -1,6 +1,8 @@
 //! Shared test utilities for JIT integration tests.
 
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_compiler::bytecode::{
+    CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
+};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -26,10 +28,12 @@ pub fn create_code_object(
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
         filename: "jit_test.py".into(),
         qualname: name.into(),
         flags: CodeFlags::NONE,
         first_lineno: 1,
+        nested_code_objects: Box::new([]),
     })
 }
 
