@@ -10,6 +10,7 @@ pub mod iter;
 pub mod list;
 pub mod range;
 pub mod set;
+pub mod simd;
 pub mod string;
 pub mod tuple;
 

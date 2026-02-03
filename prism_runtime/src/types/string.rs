@@ -266,9 +266,10 @@ impl StringObject {
     /// Get the character (codepoint) count.
     ///
     /// Note: This is O(n) for non-ASCII strings as it counts UTF-8 codepoints.
+    /// Uses SIMD acceleration for counting non-continuation UTF-8 bytes.
     #[inline]
     pub fn char_count(&self) -> usize {
-        self.as_str().chars().count()
+        crate::types::simd::validation::utf8_char_count(self.as_str().as_bytes())
     }
 
     /// Check if this is an interned string.
@@ -540,9 +541,11 @@ impl StringObject {
     }
 
     /// Check if string contains a substring.
+    ///
+    /// Uses SIMD-accelerated substring search for larger strings.
     #[inline]
     pub fn contains(&self, needle: &str) -> bool {
-        self.as_str().contains(needle)
+        crate::types::simd::search::str_contains(self.as_str(), needle)
     }
 
     /// Check if string starts with a prefix.
@@ -558,34 +561,79 @@ impl StringObject {
     }
 
     /// Find the first occurrence of a substring.
+    ///
+    /// Uses SIMD-accelerated substring search (SSE4.2 PCMPESTRI for short patterns).
     #[inline]
     pub fn find(&self, needle: &str) -> Option<usize> {
-        self.as_str().find(needle)
+        crate::types::simd::search::str_find(self.as_str(), needle)
     }
 
     /// Convert to lowercase.
+    ///
+    /// Uses SIMD-accelerated ASCII case conversion for pure ASCII strings,
+    /// falling back to Unicode-aware conversion for non-ASCII.
     pub fn lower(&self) -> StringObject {
-        StringObject::from_string(self.as_str().to_lowercase())
+        let s = self.as_str();
+        // Fast path: use SIMD for ASCII-only strings
+        if crate::types::simd::validation::is_ascii(s.as_bytes()) {
+            return StringObject::from_string(crate::types::simd::case::str_to_lowercase(s));
+        }
+        // Slow path: full Unicode case mapping
+        StringObject::from_string(s.to_lowercase())
     }
 
     /// Convert to uppercase.
+    ///
+    /// Uses SIMD-accelerated ASCII case conversion for pure ASCII strings,
+    /// falling back to Unicode-aware conversion for non-ASCII.
     pub fn upper(&self) -> StringObject {
-        StringObject::from_string(self.as_str().to_uppercase())
+        let s = self.as_str();
+        // Fast path: use SIMD for ASCII-only strings
+        if crate::types::simd::validation::is_ascii(s.as_bytes()) {
+            return StringObject::from_string(crate::types::simd::case::str_to_uppercase(s));
+        }
+        // Slow path: full Unicode case mapping
+        StringObject::from_string(s.to_uppercase())
     }
 
     /// Strip whitespace from both ends.
+    ///
+    /// Uses SIMD-accelerated ASCII whitespace detection for pure ASCII strings,
+    /// falling back to Unicode whitespace for non-ASCII.
     pub fn strip(&self) -> StringObject {
-        StringObject::new(self.as_str().trim())
+        let s = self.as_str();
+        // Fast path: use SIMD for ASCII
+        if crate::types::simd::validation::is_ascii(s.as_bytes()) {
+            return StringObject::new(crate::types::simd::whitespace::trim_str(s));
+        }
+        // Slow path: Unicode whitespace
+        StringObject::new(s.trim())
     }
 
     /// Strip whitespace from the left.
+    ///
+    /// Uses SIMD-accelerated whitespace detection for large ASCII strings.
     pub fn lstrip(&self) -> StringObject {
-        StringObject::new(self.as_str().trim_start())
+        let s = self.as_str();
+        // Fast path: use SIMD for ASCII
+        if crate::types::simd::validation::is_ascii(s.as_bytes()) {
+            return StringObject::new(crate::types::simd::whitespace::trim_start_str(s));
+        }
+        // Slow path: Unicode whitespace
+        StringObject::new(s.trim_start())
     }
 
     /// Strip whitespace from the right.
+    ///
+    /// Uses SIMD-accelerated whitespace detection for large ASCII strings.
     pub fn rstrip(&self) -> StringObject {
-        StringObject::new(self.as_str().trim_end())
+        let s = self.as_str();
+        // Fast path: use SIMD for ASCII
+        if crate::types::simd::validation::is_ascii(s.as_bytes()) {
+            return StringObject::new(crate::types::simd::whitespace::trim_end_str(s));
+        }
+        // Slow path: Unicode whitespace
+        StringObject::new(s.trim_end())
     }
 
     /// Split by a separator.
@@ -649,12 +697,14 @@ impl Clone for StringObject {
 
 impl PartialEq for StringObject {
     fn eq(&self, other: &Self) -> bool {
-        // Fast path: check for interned pointer equality
+        // Fast path 1: Check for interned pointer equality (O(1))
         if let (StringRepr::Interned(a), StringRepr::Interned(b)) = (&self.repr, &other.repr) {
-            return a == b; // O(1) pointer comparison
+            return a == b;
         }
-        // Fallback: compare content
-        self.as_str() == other.as_str()
+
+        // Fast path 2: Use SIMD-accelerated byte comparison
+        // This is faster than std's str comparison for large strings
+        crate::types::simd::equality::str_eq(self.as_str(), other.as_str())
     }
 }
 
@@ -968,5 +1018,362 @@ mod tests {
         let _s1: StringObject = "test".into();
         let _s2: StringObject = String::from("test").into();
         let _s3: StringObject = Arc::<str>::from("test").into();
+    }
+
+    // =========================================================================
+    // SIMD Integration Tests (Comprehensive)
+    // =========================================================================
+
+    mod simd_integration_tests {
+        use super::*;
+
+        // Helper: Generate a pattern string
+        fn make_pattern_string(len: usize, ch: char) -> String {
+            std::iter::repeat(ch).take(len).collect()
+        }
+
+        // Helper: Generate ASCII lowercase string
+        fn make_lowercase_string(len: usize) -> String {
+            (0..len)
+                .map(|i| ((b'a' + (i % 26) as u8) as char))
+                .collect()
+        }
+
+        // Helper: Generate ASCII uppercase string
+        fn make_uppercase_string(len: usize) -> String {
+            (0..len)
+                .map(|i| ((b'A' + (i % 26) as u8) as char))
+                .collect()
+        }
+
+        // -----------------------------------------------------------------
+        // Equality Tests (SIMD str_eq integration)
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_simd_eq_empty() {
+            let s1 = StringObject::new("");
+            let s2 = StringObject::new("");
+            assert_eq!(s1, s2);
+        }
+
+        #[test]
+        fn test_simd_eq_small() {
+            for len in 1..32 {
+                let data = make_pattern_string(len, 'x');
+                let s1 = StringObject::new(&data);
+                let s2 = StringObject::new(&data);
+                assert_eq!(s1, s2, "len={}", len);
+            }
+        }
+
+        #[test]
+        fn test_simd_eq_medium() {
+            for len in [32, 64, 100, 128, 200] {
+                let data = make_pattern_string(len, 'y');
+                let s1 = StringObject::new(&data);
+                let s2 = StringObject::new(&data);
+                assert_eq!(s1, s2, "len={}", len);
+            }
+        }
+
+        #[test]
+        fn test_simd_eq_large() {
+            for len in [256, 512, 1024, 4096, 10000] {
+                let data = make_pattern_string(len, 'z');
+                let s1 = StringObject::new(&data);
+                let s2 = StringObject::new(&data);
+                assert_eq!(s1, s2, "len={}", len);
+            }
+        }
+
+        #[test]
+        fn test_simd_neq_at_start() {
+            let s1 = StringObject::new("hello world");
+            let s2 = StringObject::new("xello world");
+            assert_ne!(s1, s2);
+        }
+
+        #[test]
+        fn test_simd_neq_at_end() {
+            let s1 = StringObject::new("hello world");
+            let s2 = StringObject::new("hello worlx");
+            assert_ne!(s1, s2);
+        }
+
+        #[test]
+        fn test_simd_neq_at_middle() {
+            let data1: String = (0..100).map(|_| 'a').collect();
+            let mut data2 = data1.clone();
+            data2.replace_range(50..51, "x");
+            let s1 = StringObject::new(&data1);
+            let s2 = StringObject::new(&data2);
+            assert_ne!(s1, s2);
+        }
+
+        #[test]
+        fn test_simd_eq_unicode() {
+            let s1 = StringObject::new("héllo wörld 日本語");
+            let s2 = StringObject::new("héllo wörld 日本語");
+            assert_eq!(s1, s2);
+        }
+
+        // -----------------------------------------------------------------
+        // Contains/Find Tests (SIMD search integration)
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_simd_contains_single_byte() {
+            let s = StringObject::new("hello world");
+            assert!(s.contains("o"));
+            assert!(!s.contains("x"));
+        }
+
+        #[test]
+        fn test_simd_contains_short_pattern() {
+            let s = StringObject::new("the quick brown fox jumps over the lazy dog");
+            assert!(s.contains("quick"));
+            assert!(s.contains("fox"));
+            assert!(s.contains("lazy"));
+            assert!(!s.contains("cat"));
+        }
+
+        #[test]
+        fn test_simd_contains_large_haystack() {
+            let haystack = make_pattern_string(10000, 'x');
+            let mut haystack_with_needle = haystack.clone();
+            haystack_with_needle.push_str("needle");
+
+            let s1 = StringObject::new(&haystack);
+            let s2 = StringObject::new(&haystack_with_needle);
+
+            assert!(!s1.contains("needle"));
+            assert!(s2.contains("needle"));
+        }
+
+        #[test]
+        fn test_simd_find_basic() {
+            let s = StringObject::new("hello world");
+            assert_eq!(s.find("world"), Some(6));
+            assert_eq!(s.find("xyz"), None);
+        }
+
+        #[test]
+        fn test_simd_find_at_start() {
+            let s = StringObject::new("hello world");
+            assert_eq!(s.find("hello"), Some(0));
+        }
+
+        #[test]
+        fn test_simd_find_at_end() {
+            let s = StringObject::new("hello world");
+            assert_eq!(s.find("world"), Some(6));
+        }
+
+        #[test]
+        fn test_simd_find_empty_pattern() {
+            let s = StringObject::new("hello");
+            assert_eq!(s.find(""), Some(0));
+        }
+
+        #[test]
+        fn test_simd_find_overlapping() {
+            let s = StringObject::new("aaaa");
+            assert_eq!(s.find("aa"), Some(0));
+        }
+
+        // -----------------------------------------------------------------
+        // Case Conversion Tests (SIMD case integration)
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_simd_lower_ascii() {
+            let s = StringObject::new("HELLO WORLD");
+            assert_eq!(s.lower().as_str(), "hello world");
+        }
+
+        #[test]
+        fn test_simd_lower_mixed() {
+            let s = StringObject::new("HeLLo WoRLd");
+            assert_eq!(s.lower().as_str(), "hello world");
+        }
+
+        #[test]
+        fn test_simd_lower_with_numbers() {
+            let s = StringObject::new("HELLO123WORLD");
+            assert_eq!(s.lower().as_str(), "hello123world");
+        }
+
+        #[test]
+        fn test_simd_lower_large() {
+            let upper = make_uppercase_string(10000);
+            let expected_lower = make_lowercase_string(10000);
+            let s = StringObject::new(&upper);
+            assert_eq!(s.lower().as_str(), expected_lower);
+        }
+
+        #[test]
+        fn test_simd_lower_unicode_fallback() {
+            // Non-ASCII should fall back to std's Unicode-aware lowercase
+            let s = StringObject::new("HÉLLO");
+            // This goes through the Unicode fallback, which handles é properly
+            let lower = s.lower();
+            // Note: é is already lowercase in the input (it's the uppercase that differs)
+            assert!(lower.as_str().starts_with("h"));
+        }
+
+        #[test]
+        fn test_simd_upper_ascii() {
+            let s = StringObject::new("hello world");
+            assert_eq!(s.upper().as_str(), "HELLO WORLD");
+        }
+
+        #[test]
+        fn test_simd_upper_mixed() {
+            let s = StringObject::new("HeLLo WoRLd");
+            assert_eq!(s.upper().as_str(), "HELLO WORLD");
+        }
+
+        #[test]
+        fn test_simd_upper_large() {
+            let lower = make_lowercase_string(10000);
+            let expected_upper = make_uppercase_string(10000);
+            let s = StringObject::new(&lower);
+            assert_eq!(s.upper().as_str(), expected_upper);
+        }
+
+        // -----------------------------------------------------------------
+        // Whitespace Trimming Tests (SIMD whitespace integration)
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_simd_strip_basic() {
+            let s = StringObject::new("  hello world  ");
+            assert_eq!(s.strip().as_str(), "hello world");
+        }
+
+        #[test]
+        fn test_simd_strip_tabs_newlines() {
+            let s = StringObject::new("\t\nhello\r\n\t");
+            assert_eq!(s.strip().as_str(), "hello");
+        }
+
+        #[test]
+        fn test_simd_strip_no_whitespace() {
+            let s = StringObject::new("hello");
+            assert_eq!(s.strip().as_str(), "hello");
+        }
+
+        #[test]
+        fn test_simd_strip_all_whitespace() {
+            let s = StringObject::new("   \t\n   ");
+            assert_eq!(s.strip().as_str(), "");
+        }
+
+        #[test]
+        fn test_simd_strip_large() {
+            let mut data = String::new();
+            for _ in 0..500 {
+                data.push(' ');
+            }
+            data.push_str("hello");
+            for _ in 0..500 {
+                data.push(' ');
+            }
+            let s = StringObject::new(&data);
+            assert_eq!(s.strip().as_str(), "hello");
+        }
+
+        #[test]
+        fn test_simd_lstrip_basic() {
+            let s = StringObject::new("  hello  ");
+            assert_eq!(s.lstrip().as_str(), "hello  ");
+        }
+
+        #[test]
+        fn test_simd_rstrip_basic() {
+            let s = StringObject::new("  hello  ");
+            assert_eq!(s.rstrip().as_str(), "  hello");
+        }
+
+        // -----------------------------------------------------------------
+        // Character Count Tests (SIMD utf8_char_count integration)
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_simd_char_count_ascii() {
+            let s = StringObject::new("hello world");
+            assert_eq!(s.char_count(), 11);
+        }
+
+        #[test]
+        fn test_simd_char_count_unicode() {
+            let s = StringObject::new("héllo wörld");
+            // Each non-ASCII takes 2 bytes but is 1 character
+            assert_eq!(s.char_count(), 11);
+        }
+
+        #[test]
+        fn test_simd_char_count_cjk() {
+            let s = StringObject::new("日本語");
+            assert_eq!(s.char_count(), 3);
+        }
+
+        #[test]
+        fn test_simd_char_count_emoji() {
+            let s = StringObject::new("🦀🐍🎉");
+            assert_eq!(s.char_count(), 3);
+        }
+
+        #[test]
+        fn test_simd_char_count_large_ascii() {
+            let len = 10000;
+            let data = make_pattern_string(len, 'a');
+            let s = StringObject::new(&data);
+            assert_eq!(s.char_count(), len);
+        }
+
+        #[test]
+        fn test_simd_char_count_mixed() {
+            // Mix of ASCII, Latin-1 extended, CJK, and emoji
+            let s = StringObject::new("Hello héllo 日本語 🦀");
+            // h-e-l-l-o- -h-é-l-l-o- -日-本-語- -🦀 = 17 chars
+            assert_eq!(s.char_count(), 17);
+        }
+
+        // -----------------------------------------------------------------
+        // Boundary and Edge Case Tests
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_simd_operations_at_simd_boundaries() {
+            // Test at 16-byte (SSE), 32-byte (AVX2), 64-byte (AVX-512) boundaries
+            for len in [15, 16, 17, 31, 32, 33, 63, 64, 65] {
+                let data = make_pattern_string(len, 'x');
+                let s = StringObject::new(&data);
+
+                // Equality
+                let s2 = StringObject::new(&data);
+                assert_eq!(s, s2, "equality at len={}", len);
+
+                // Contains
+                assert!(s.contains("x"), "contains at len={}", len);
+
+                // Strip (add whitespace around)
+                let with_ws = format!("  {}  ", data);
+                let s_ws = StringObject::new(&with_ws);
+                assert_eq!(s_ws.strip().as_str(), data, "strip at len={}", len);
+            }
+        }
+
+        #[test]
+        fn test_simd_case_preserve_non_letter() {
+            // Numbers, punctuation should be preserved
+            let s = StringObject::new("HELLO123!@#WORLD");
+            assert_eq!(s.lower().as_str(), "hello123!@#world");
+
+            let s2 = StringObject::new("hello456$%^world");
+            assert_eq!(s2.upper().as_str(), "HELLO456$%^WORLD");
+        }
     }
 }
