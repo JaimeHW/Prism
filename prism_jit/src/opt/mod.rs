@@ -27,6 +27,7 @@ pub mod loop_analyzer;
 pub mod pipeline;
 pub mod rce;
 pub mod simplify;
+pub mod strength_reduce;
 
 // Re-export key types
 pub use escape::{Escape, EscapeAnalysis, EscapeState};
@@ -38,6 +39,7 @@ pub use rce::{
     InductionAnalysis, InductionDetector, InductionDirection, InductionInit, InductionStep,
     InductionVariable, RangeCheckElimination,
 };
+pub use strength_reduce::{StrengthReduce, StrengthReduceConfig};
 
 use crate::ir::graph::Graph;
 

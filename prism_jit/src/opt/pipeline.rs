@@ -17,13 +17,13 @@
 //! iteration count is reached. Some passes trigger re-running
 //! of earlier passes (e.g., inlining enables more GVN).
 
-use super::OptimizationPass;
 use super::dce::Dce;
 use super::escape::Escape;
 use super::gvn::Gvn;
 use super::inline::Inline;
 use super::licm::Licm;
 use super::simplify::Simplify;
+use super::OptimizationPass;
 use crate::ir::graph::Graph;
 
 use std::time::{Duration, Instant};
