@@ -71,6 +71,10 @@ pub struct CodeObject {
     /// Exception handling table for zero-cost exceptions.
     /// Sorted by start_pc for binary search during unwinding.
     pub exception_table: Box<[ExceptionEntry]>,
+
+    /// Nested code objects (functions, classes, comprehensions defined in this code).
+    /// Stored separately from constants for test accessibility and debugging.
+    pub nested_code_objects: Box<[Arc<CodeObject>]>,
 }
 
 /// Code object flags.
@@ -190,6 +194,7 @@ impl CodeObject {
             flags: CodeFlags::NONE,
             line_table: Box::new([]),
             exception_table: Box::new([]),
+            nested_code_objects: Box::new([]),
         }
     }
 

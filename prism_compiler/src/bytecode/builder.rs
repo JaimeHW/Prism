@@ -9,6 +9,49 @@ use prism_core::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A tuple of keyword argument names for CallKw instructions.
+///
+/// This is stored in the constant pool and referenced by CallKwEx.
+/// Using a dedicated struct allows efficient lookup during argument binding.
+#[derive(Debug, Clone)]
+pub struct KwNamesTuple {
+    /// Keyword argument names in call order.
+    pub names: Box<[Arc<str>]>,
+}
+
+impl KwNamesTuple {
+    /// Create a new keyword names tuple.
+    pub fn new(names: Vec<Arc<str>>) -> Self {
+        Self {
+            names: names.into_boxed_slice(),
+        }
+    }
+
+    /// Get the number of keyword arguments.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Check if empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Get a keyword name by index.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&Arc<str>> {
+        self.names.get(index)
+    }
+
+    /// Iterate over keyword names.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.names.iter()
+    }
+}
+
 /// A label for jump targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Label(u32);
@@ -107,6 +150,8 @@ pub struct FunctionBuilder {
     line_start_pc: u32,
     /// Exception table entries.
     exception_entries: Vec<ExceptionEntry>,
+    /// Nested code objects (functions, classes defined within this code).
+    nested_code_objects: Vec<Arc<CodeObject>>,
 }
 
 /// Key type for constant deduplication.
@@ -120,6 +165,8 @@ enum ConstantKey {
     String(Arc<str>),
     /// Code object by name (simplified).
     Code(Arc<str>),
+    /// Tuple of strings (for keyword argument names).
+    KwNamesTuple(Box<[Arc<str>]>),
 }
 
 impl ConstantKey {
@@ -172,6 +219,7 @@ impl FunctionBuilder {
             line_table: Vec::new(),
             line_start_pc: 0,
             exception_entries: Vec::new(),
+            nested_code_objects: Vec::new(),
         }
     }
 
@@ -368,10 +416,14 @@ impl FunctionBuilder {
 
         // Store the Arc<CodeObject> as an object pointer constant
         // At runtime, the VM will interpret this as a code object reference
-        let code_ptr = Arc::into_raw(code) as *const ();
+        let code_ptr = Arc::into_raw(Arc::clone(&code)) as *const ();
         let idx = ConstIndex::new(self.constants.len() as u16);
         self.constants.push(Value::object_ptr(code_ptr));
         self.constant_map.insert(key, idx);
+
+        // Store Arc in nested_code_objects for test accessibility
+        self.nested_code_objects.push(code);
+
         idx.0
     }
 
@@ -778,6 +830,195 @@ impl FunctionBuilder {
         self.emit(Instruction::new(Opcode::Call, dst.0, func.0, argc));
     }
 
+    /// Load method for optimized method calls: dst = obj.method (with self).
+    ///
+    /// This is the first half of the LoadMethod/CallMethod optimization pair.
+    /// It performs method lookup and stores the method in `dst` and `self` in `dst+1`.
+    ///
+    /// Register layout after LoadMethod:
+    /// - [dst]: method/function object
+    /// - [dst+1]: self instance (or NULL marker for unbound)
+    ///
+    /// # Arguments
+    /// * `dst` - Register to store method (dst+1 gets self automatically)
+    /// * `obj` - Register containing the object to look up method on
+    /// * `name_idx` - Index into names table for the method name
+    #[inline]
+    pub fn emit_load_method(&mut self, dst: Register, obj: Register, name_idx: u16) {
+        // LoadMethod uses DstSrcSrc format: dst, obj, name_idx (8-bit truncated)
+        // For larger name indices, we'd need an extended encoding
+        self.emit(Instruction::new(
+            Opcode::LoadMethod,
+            dst.0,
+            obj.0,
+            (name_idx & 0xFF) as u8,
+        ));
+    }
+
+    /// Call method using result from LoadMethod: dst = method(self, args...).
+    ///
+    /// This is the second half of the LoadMethod/CallMethod optimization pair.
+    /// It expects the method in `method_reg` and self in `method_reg+1`.
+    ///
+    /// Register layout expected (from LoadMethod):
+    /// - [method_reg]: method/function object
+    /// - [method_reg+1]: self instance
+    /// - [method_reg+2..]: explicit arguments
+    ///
+    /// # Arguments
+    /// * `dst` - Register to store the return value
+    /// * `method_reg` - Register containing method (from LoadMethod)
+    /// * `argc` - Number of explicit arguments (in method_reg+2, method_reg+3, etc.)
+    #[inline]
+    pub fn emit_call_method(&mut self, dst: Register, method_reg: Register, argc: u8) {
+        self.emit(Instruction::new(
+            Opcode::CallMethod,
+            dst.0,
+            method_reg.0,
+            argc,
+        ));
+    }
+
+    /// Call function with keyword arguments: dst = func(pos_args..., kw_args...).
+    ///
+    /// Uses a two-instruction sequence for encoding:
+    /// - Instruction 1: [CallKw][dst][func][posargc]
+    /// - Instruction 2: [CallKwEx][kwargc][kwnames_idx_lo][kwnames_idx_hi]
+    ///
+    /// Arguments layout in registers:
+    /// - dst+1 .. dst+posargc: positional arguments
+    /// - dst+posargc+1 .. dst+posargc+kwargc: keyword argument values
+    ///
+    /// Keyword names are stored as a tuple in the constant pool at kwnames_idx.
+    pub fn emit_call_kw(
+        &mut self,
+        dst: Register,
+        func: Register,
+        posargc: u8,
+        kwargc: u8,
+        kwnames_idx: u16,
+    ) {
+        // First instruction: opcode, dst, func, posargc
+        self.emit(Instruction::new(Opcode::CallKw, dst.0, func.0, posargc));
+        // Second instruction: kwargc, kwnames_idx (split into two bytes)
+        self.emit(Instruction::new(
+            Opcode::CallKwEx,
+            kwargc,
+            (kwnames_idx & 0xFF) as u8,
+            (kwnames_idx >> 8) as u8,
+        ));
+    }
+
+    /// Add a tuple of keyword argument names to the constant pool.
+    ///
+    /// This is used for CallKw instructions to efficiently pass keyword names
+    /// without dictionary allocation. Names are interned strings for fast comparison.
+    ///
+    /// Returns the constant pool index of the tuple.
+    pub fn add_kwnames_tuple(&mut self, names: Vec<Arc<str>>) -> u16 {
+        // Create deduplication key
+        let key = ConstantKey::KwNamesTuple(names.clone().into_boxed_slice());
+
+        if let Some(&idx) = self.constant_map.get(&key) {
+            return idx.0;
+        }
+
+        // Create a tuple value containing the keyword names
+        // For now, we use a packed representation stored as object pointer
+        // The VM will interpret this as a keyword names tuple
+        let tuple = KwNamesTuple::new(names);
+        let tuple_ptr = Box::into_raw(Box::new(tuple)) as *const ();
+        let idx = ConstIndex::new(self.constants.len() as u16);
+        self.constants.push(Value::object_ptr(tuple_ptr));
+        self.constant_map.insert(key, idx);
+        idx.0
+    }
+
+    /// Call function with unpacked arguments: dst = func(*args_tuple, **kwargs_dict).
+    ///
+    /// Used when call site contains *args or **kwargs unpacking. Uses two instructions:
+    /// - Instruction 1: [CallEx][dst][func][args_tuple_reg]
+    /// - Instruction 2: [CallKwEx][kwargs_dict_reg][0][0] (or 0xFF for no kwargs)
+    ///
+    /// The args_tuple_reg should contain a tuple of positional arguments.
+    /// The kwargs_dict_reg should contain a dict of keyword arguments (or None).
+    pub fn emit_call_ex(
+        &mut self,
+        dst: Register,
+        func: Register,
+        args_tuple: Register,
+        kwargs_dict: Option<Register>,
+    ) {
+        // First instruction: CallEx with args tuple register
+        self.emit(Instruction::new(
+            Opcode::CallEx,
+            dst.0,
+            func.0,
+            args_tuple.0,
+        ));
+        // Second instruction as extension: kwargs dict register (0xFF = no kwargs)
+        let kwargs_reg = kwargs_dict.map_or(0xFF, |r| r.0);
+        self.emit(Instruction::new(Opcode::CallKwEx, kwargs_reg, 0, 0));
+    }
+
+    /// Build a tuple from multiple values/iterables with unpacking.
+    ///
+    /// This is used for combining static positional args with *args unpacking.
+    /// The unpack_flags is a bitmap where bit i indicates src+i should be unpacked.
+    /// Values are sourced from consecutive registers starting at `base`.
+    ///
+    /// Format: [BuildTupleUnpack][dst][base][count] + [extension with flags]
+    pub fn emit_build_tuple_unpack(
+        &mut self,
+        dst: Register,
+        base: Register,
+        count: u8,
+        unpack_flags: u32,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::BuildTupleUnpack,
+            dst.0,
+            base.0,
+            count,
+        ));
+        // Extension instruction with unpack flags (lower 24 bits)
+        self.emit(Instruction::new(
+            Opcode::CallKwEx,
+            (unpack_flags & 0xFF) as u8,
+            ((unpack_flags >> 8) & 0xFF) as u8,
+            ((unpack_flags >> 16) & 0xFF) as u8,
+        ));
+    }
+
+    /// Build a dict from multiple values/mappings with unpacking.
+    ///
+    /// This is used for combining static keyword args with **kwargs unpacking.
+    /// The unpack_flags is a bitmap where bit i indicates src+i should be unpacked.
+    /// Values are sourced from consecutive registers starting at `base`.
+    ///
+    /// Format: [BuildDictUnpack][dst][base][count] + [extension with flags]
+    pub fn emit_build_dict_unpack(
+        &mut self,
+        dst: Register,
+        base: Register,
+        count: u8,
+        unpack_flags: u32,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::BuildDictUnpack,
+            dst.0,
+            base.0,
+            count,
+        ));
+        // Extension instruction with unpack flags (lower 24 bits)
+        self.emit(Instruction::new(
+            Opcode::CallKwEx,
+            (unpack_flags & 0xFF) as u8,
+            ((unpack_flags >> 8) & 0xFF) as u8,
+            ((unpack_flags >> 16) & 0xFF) as u8,
+        ));
+    }
+
     // --- Container Operations ---
 
     /// Build list from registers.
@@ -800,6 +1041,25 @@ impl FunctionBuilder {
         let inst_idx = self.instructions.len();
         // Encode dst and iter_src; imm16 will be patched with jump offset
         self.emit(Instruction::op_ds(Opcode::ForIter, dst, iter_src));
+        self.forward_refs.push(ForwardRef {
+            instruction_index: inst_idx,
+            label,
+        });
+    }
+
+    /// End async for: check if register contains StopAsyncIteration, jump to label if so.
+    ///
+    /// This is used at the end of each async for iteration to check if the awaited
+    /// result indicates StopAsyncIteration. If so, the exception is cleared and
+    /// execution jumps to the label (typically the else clause or loop end).
+    ///
+    /// # Arguments
+    /// * `src` - Register containing the awaited result to check
+    /// * `label` - Label to jump to if StopAsyncIteration was raised
+    pub fn emit_end_async_for(&mut self, src: Register, label: Label) {
+        let inst_idx = self.instructions.len();
+        // Emit EndAsyncFor with src register; imm16 will be patched with jump offset
+        self.emit(Instruction::op_d(Opcode::EndAsyncFor, src));
         self.forward_refs.push(ForwardRef {
             instruction_index: inst_idx,
             label,
@@ -960,6 +1220,7 @@ impl FunctionBuilder {
             flags: self.flags,
             line_table: self.line_table.into_boxed_slice(),
             exception_table: self.exception_entries.into_boxed_slice(),
+            nested_code_objects: self.nested_code_objects.into_boxed_slice(),
         }
     }
 }

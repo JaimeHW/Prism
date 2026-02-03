@@ -44,6 +44,7 @@ pub mod class_compiler;
 pub mod compiler;
 pub mod exception_compiler;
 pub mod function_compiler;
+pub mod match_compiler;
 pub mod scope;
 
 // Re-export main types

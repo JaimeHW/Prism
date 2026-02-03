@@ -450,6 +450,21 @@ pub enum Opcode {
     MakeFunction = 0x74,
     /// Make closure with captured variables.
     MakeClosure = 0x75,
+    /// CallKw extension: [kwargc][kwnames_idx_lo][kwnames_idx_hi].
+    /// Always follows CallKw. Contains keyword count and constant pool index.
+    CallKwEx = 0x76,
+    /// Call function with unpacked args: dst = func(*args_tuple, **kwargs_dict).
+    /// src1 = function, src2 = args_tuple register.
+    /// Extension byte contains kwargs_dict register (or 0xFF for no kwargs).
+    CallEx = 0x77,
+    /// Build tuple from multiple iterables with unpacking.
+    /// dst = (*src1, *src2, ...) for count iterables starting at src1.
+    /// src2 = count of source registers. Extension byte has unpack flags.
+    BuildTupleUnpack = 0x78,
+    /// Build dict from multiple mappings with unpacking.
+    /// dst = {**src1, **src2, ...} for count mappings starting at src1.
+    /// src2 = count of source registers. Extension byte has merge flags.
+    BuildDictUnpack = 0x79,
 
     // =========================================================================
     // Container Operations (0x80-0x8F)
@@ -503,6 +518,75 @@ pub enum Opcode {
     /// Check if there's a pending exception (for finally block logic).
     /// dst = True if exception is pending, False otherwise.
     HasExcInfo = 0x96,
+
+    // =========================================================================
+    // With Statement / Context Managers (0x97-0x9F)
+    // =========================================================================
+    /// Prepare context manager: calls __enter__ and stores (mgr, __exit__).
+    /// dst = __enter__() result, src = context manager expression.
+    /// Internally stores (mgr, __exit__) for cleanup on corresponding stack slot.
+    BeforeWith = 0x97,
+    /// Normal exit from with block: calls __exit__(None, None, None).
+    /// dst = result of __exit__, src = context manager slot.
+    ExitWith = 0x98,
+    /// Exception cleanup from with block: calls __exit__(exc_type, exc_val, exc_tb).
+    /// dst = result of __exit__ (True suppresses exception), src = context manager slot.
+    WithCleanup = 0x99,
+
+    // =========================================================================
+    // Pattern Matching (0x9A-0x9F) - PEP 634 Match Statement Support
+    // =========================================================================
+    /// Match class pattern: dst = isinstance(src1, src2).
+    /// Used for class patterns like `case Point(x, y):`.
+    /// Returns True if src1 is an instance of class src2.
+    MatchClass = 0x9A,
+    /// Match mapping pattern: dst = is_mapping(src).
+    /// Returns True if src supports the mapping protocol (__getitem__ and keys()).
+    /// Used for patterns like `case {"key": value}:`.
+    MatchMapping = 0x9B,
+    /// Match sequence pattern: dst = is_sequence(src).
+    /// Returns True if src is a sequence (has __len__ and __getitem__) but NOT str/bytes.
+    /// Used for patterns like `case [a, b, c]:`.
+    MatchSequence = 0x9C,
+    /// Match keys: Extract values from mapping by key tuple.
+    /// dst = tuple of values, src1 = mapping, src2 = tuple of keys.
+    /// Jumps to fail if any key is missing.
+    MatchKeys = 0x9D,
+    /// Copy dict without keys: dst = {k:v for k,v in src1.items() if k not in src2}.
+    /// src1 = mapping, src2 = tuple of keys to exclude.
+    /// Used for **rest capture in mapping patterns.
+    CopyDictWithoutKeys = 0x9E,
+    /// Get __match_args__: dst = getattr(type(src), '__match_args__', ()).
+    /// Used to determine positional attributes for class patterns.
+    GetMatchArgs = 0x9F,
+
+    // =========================================================================
+    // Coroutine/Async Operations (0xA0-0xAF) - PEP 492/525/530 Support
+    // =========================================================================
+    /// Convert object to awaitable for use in `await` expression.
+    /// PEP 492 semantics:
+    /// 1. If coroutine/async_generator → return as-is (fast path)
+    /// 2. If generator with CO_ITERABLE_COROUTINE → return as-is
+    /// 3. If has __await__ → call __await__() and verify iterator result
+    /// 4. Otherwise → raise TypeError
+    GetAwaitable = 0xA0,
+    /// Get async iterator: dst = src.__aiter__().
+    /// Used for `async for` loops to obtain the async iterator.
+    /// Raises TypeError if __aiter__ is not defined.
+    GetAIter = 0xA1,
+    /// Get next from async iterator: dst = src.__anext__().
+    /// Returns an awaitable that yields the next value.
+    /// Used in `async for` loop iteration.
+    GetANext = 0xA2,
+    /// Handle StopAsyncIteration in async for loop.
+    /// Checks if the current exception is StopAsyncIteration.
+    /// If so, clears exception and jumps to offset in imm16.
+    /// Otherwise, re-raises the exception.
+    EndAsyncFor = 0xA3,
+    /// Send value to coroutine/generator: dst = src1.send(src2).
+    /// Implements the send protocol for coroutines and generators.
+    /// src1 = generator/coroutine, src2 = value to send.
+    Send = 0xA4,
 }
 
 impl Opcode {
@@ -608,6 +692,10 @@ impl Opcode {
             0x73 => Some(Opcode::TailCall),
             0x74 => Some(Opcode::MakeFunction),
             0x75 => Some(Opcode::MakeClosure),
+            0x76 => Some(Opcode::CallKwEx),
+            0x77 => Some(Opcode::CallEx),
+            0x78 => Some(Opcode::BuildTupleUnpack),
+            0x79 => Some(Opcode::BuildDictUnpack),
 
             0x80 => Some(Opcode::BuildList),
             0x81 => Some(Opcode::BuildTuple),
@@ -629,6 +717,23 @@ impl Opcode {
             0x94 => Some(Opcode::PushExcInfo),
             0x95 => Some(Opcode::PopExcInfo),
             0x96 => Some(Opcode::HasExcInfo),
+
+            0x97 => Some(Opcode::BeforeWith),
+            0x98 => Some(Opcode::ExitWith),
+            0x99 => Some(Opcode::WithCleanup),
+
+            0x9A => Some(Opcode::MatchClass),
+            0x9B => Some(Opcode::MatchMapping),
+            0x9C => Some(Opcode::MatchSequence),
+            0x9D => Some(Opcode::MatchKeys),
+            0x9E => Some(Opcode::CopyDictWithoutKeys),
+            0x9F => Some(Opcode::GetMatchArgs),
+
+            0xA0 => Some(Opcode::GetAwaitable),
+            0xA1 => Some(Opcode::GetAIter),
+            0xA2 => Some(Opcode::GetANext),
+            0xA3 => Some(Opcode::EndAsyncFor),
+            0xA4 => Some(Opcode::Send),
 
             _ => None,
         }
@@ -682,6 +787,9 @@ impl Opcode {
             // Calls
             Call | CallKw | CallMethod | TailCall => DstSrcSrc,
             MakeFunction | MakeClosure => DstImm16,
+            CallKwEx => DstSrcSrc, // kwargc, kwnames_idx_lo, kwnames_idx_hi
+            CallEx => DstSrcSrc,   // dst, func, args_tuple (extension: kwargs_dict)
+            BuildTupleUnpack | BuildDictUnpack => DstSrcSrc, // dst, base_reg, count
 
             // Class operations
             BuildClass => DstSrcSrc, // dst = class, src1 = body code, src2 = base count
@@ -700,6 +808,21 @@ impl Opcode {
             RaiseFrom => DstSrc,              // dst = exc_reg, src = cause_reg
             PushExcInfo | PopExcInfo => NoOp, // No operands, operates on exception stack
             HasExcInfo => Dst,                // dst = bool result
+
+            // With statement / context managers
+            BeforeWith | ExitWith | WithCleanup => DstSrc, // dst = result, src = context manager
+
+            // Pattern matching (PEP 634)
+            MatchClass => DstSrcSrc, // dst = bool, src1 = subject, src2 = class
+            MatchMapping | MatchSequence => DstSrc, // dst = bool, src = subject
+            MatchKeys => DstSrcSrc,  // dst = values tuple, src1 = mapping, src2 = keys tuple
+            CopyDictWithoutKeys => DstSrcSrc, // dst = new dict, src1 = mapping, src2 = keys to exclude
+            GetMatchArgs => DstSrc,           // dst = __match_args__ tuple, src = subject
+
+            // Coroutine/async (PEP 492/525/530)
+            GetAwaitable | GetAIter | GetANext => DstSrc, // dst = result, src = object
+            EndAsyncFor => DstImm16,                      // dst = value, imm16 = jump offset
+            Send => DstSrcSrc,                            // dst = result, src1 = gen, src2 = value
         }
     }
 }
