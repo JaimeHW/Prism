@@ -27,9 +27,21 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Inline Caching** — Monomorphic and polymorphic caches for property access and method dispatch
 - **Type Speculation** — Profile-driven type guards with fast-path native arithmetic
 - **On-Stack Replacement** — Mid-loop tier-up from interpreter to optimized code
-- **Loop Optimizations** — LICM, Range Check Elimination, and induction variable analysis
+- **Loop Optimizations** — LICM, Range Check Elimination, loop unrolling, and induction variable analysis
 - **Function Inlining** — Budget-based graph merging with escape analysis
 - **Strength Reduction** — Magic number division, multiplication decomposition into shifts/adds
+- **Global Value Numbering** — Common subexpression elimination across the IR graph
+- **Partial Redundancy Elimination** — Optimal code motion with PRE
+- **Sparse Conditional Constant Propagation** — Aggressive constant folding with branch elimination
+- **Tail Call Optimization** — Stack frame reuse for tail-recursive functions
+- **Dead Store Elimination** — Removal of stores that are never read
+- **Auto-Vectorization** — SIMD transformation for compatible loops
+
+### SIMD Acceleration
+- **AVX2 Support** — 256-bit vector operations with YMM registers
+- **AVX-512 Support** — 512-bit vector operations with ZMM registers and EVEX encoding
+- **Opmask Predication** — Hardware-accelerated conditional vector operations (k0-k7)
+- **Width-Aware Spill Slots** — Correct stack allocation for 128/256/512-bit vectors
 
 ### High-Performance Memory Management
 - **Generational GC** — Immix-based heap with opportunistic evacuation and line-level marking
@@ -48,6 +60,9 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Nested Handler Resolution** — Inner-first linear scan for try/except block matching
 - **Exception Chaining** — Full `raise ... from ...` semantics with `__cause__` and `__context__`
 - **Traceback System** — Complete stack trace generation with source coordinates
+- **Flyweight Exception References** — Zero-copy exception propagation with inline caching
+- **Exception State FSM** — Deterministic state machine for exception lifecycle
+- **CPython 3.11+ Compatibility** — Full `PushExcInfo`/`PopExcInfo` semantics for `finally` blocks
 
 ### Generator Protocol
 - **Stackless State Machines** — Minimal-overhead state capture and restoration
@@ -68,7 +83,7 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Complete Parser** — Pratt parser with 16 precedence tiers for Python's complex grammar
 - **Scope Analysis** — Deep binding analysis with Local/Global/Cell/Free variable resolution
 - **Arbitrary Precision Integers** — Full `BigInt` support for Python integer semantics
-- **Standard Library** — `math`, `sys`, `os`, `time`, `re`, and exception hierarchy modules
+- **Standard Library** — `math`, `sys`, `os`, `time`, `re`, generators, and exception hierarchy modules
 
 ## Quick Start
 
@@ -94,7 +109,7 @@ prism/
 ├── prism_parser    # Python 3.12 grammar and AST construction
 ├── prism_compiler  # Scope analysis, pattern matching, register-based bytecode emission
 ├── prism_vm        # Execution engine, interpreter, JIT bridge, stdlib modules
-├── prism_jit       # Multi-tier JIT: IR, optimization passes, x64 codegen
+├── prism_jit       # Multi-tier JIT: IR, optimization passes, x64 codegen, SIMD
 ├── prism_runtime   # Object system, shapes, types (list, dict, set, string, etc.)
 ├── prism_gc        # Generational Immix collector with TLABs and write barriers
 ├── prism_builtins  # Builtin function implementations
@@ -113,7 +128,7 @@ prism/
                               │         ▼                       ▼       │
                               │  ┌─────────────────────────────────┐    │
                               │  │      Register Allocation        │    │
-Source ─▶ Parser ─▶ Compiler ─┼─▶│         (Linear Scan)           │────┼──▶ Native x64
+Source ─▶ Parser ─▶ Compiler ─┼─▶│    (Linear Scan + SIMD Regs)    │────┼──▶ Native x64
    │                          │  └─────────────────────────────────┘    │
    │                          └─────────────────▲───────────────────────┘
    │                                            │ OSR (hot loops)
@@ -128,13 +143,31 @@ Source ─▶ Parser ─▶ Compiler ─┼─▶│         (Linear Scan)      
                               └─────────────────────────────────────────┘
 ```
 
+### Optimization Pipeline
+
+The Tier 2 JIT runs an 11-pass optimization pipeline:
+
+| Pass | Description |
+|:-----|:------------|
+| GVN | Global Value Numbering — CSE across the graph |
+| DCE | Dead Code Elimination — remove unused computations |
+| SCCP | Sparse Conditional Constant Propagation |
+| Copy Prop | Copy Propagation — eliminate redundant moves |
+| LICM | Loop-Invariant Code Motion |
+| RCE | Range Check Elimination |
+| PRE | Partial Redundancy Elimination |
+| Strength Reduce | Division → multiplication, mul → shift/add |
+| DSE | Dead Store Elimination |
+| Inline | Budget-based function inlining |
+| Tail Call | Tail call optimization |
+
 ### JIT Tier Details
 
 | Tier | Strategy | Trigger | Optimizations |
 |:-----|:---------|:--------|:--------------|
 | **0** | Interpreter | Default | Inline caches, type feedback collection |
 | **1** | Template | ~100 calls | Direct translation, speculative guards |
-| **2** | Optimizing | ~1000 calls or hot loop | GVN, DCE, LICM, RCE, Strength Reduction, Inlining, Escape Analysis |
+| **2** | Optimizing | ~1000 calls or hot loop | Full optimization pipeline, SIMD codegen |
 
 ### Object Model
 
@@ -202,17 +235,19 @@ Prism is under active development. Current status:
 | Component | Status | Tests |
 |:----------|:-------|------:|
 | Parser | ✅ Complete | 167 |
-| Compiler | ✅ Complete | 522 |
-| Core Types & Values | ✅ Complete | 190 |
-| VM & Interpreter | ✅ Complete | 2,017 |
+| Compiler | ✅ Complete | 697 |
+| Core Types & Values | ✅ Complete | 192 |
+| VM & Interpreter | ✅ Complete | 2,291 |
 | Object System (Shapes) | ✅ Complete | — |
 | Descriptor Protocol | ✅ Complete | — |
 | Pattern Matching | ✅ Complete | — |
-| JIT Tier 1 & 2 | ✅ Complete | 889 |
-| Garbage Collector | ✅ Complete | 84 |
-| Runtime Types | ✅ Complete | 603 |
+| Exception Handling | ✅ Complete | — |
+| JIT Tier 1 & 2 | ✅ Complete | 1,873 |
+| SIMD Backend (AVX2/AVX-512) | ✅ Complete | — |
+| Garbage Collector | ✅ Complete | 94 |
+| Runtime Types | ✅ Complete | 742 |
 
-**Total test coverage: 4,400+ tests**
+**Total test coverage: 6,000+ tests**
 
 ### Roadmap
 
