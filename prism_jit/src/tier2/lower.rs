@@ -15,6 +15,7 @@
 //! to physical registers during emission.
 
 use crate::backend::x64::registers::{Gpr, MemOperand, Xmm};
+use crate::backend::x64::simd::{Ymm, Zmm};
 use crate::ir::graph::Graph;
 use crate::ir::node::NodeId;
 use crate::ir::operators::{ArithOp, BitwiseOp, CmpOp, ControlOp, Operator};
@@ -54,6 +55,28 @@ impl MachineOperand {
     #[allow(dead_code)]
     pub fn xmm(xmm: Xmm) -> Self {
         MachineOperand::PReg(PReg::Xmm(xmm))
+    }
+
+    /// Create a YMM (256-bit) operand.
+    #[allow(dead_code)]
+    pub fn ymm(ymm: Ymm) -> Self {
+        MachineOperand::PReg(PReg::Ymm(ymm))
+    }
+
+    /// Create a ZMM (512-bit) operand.
+    #[allow(dead_code)]
+    pub fn zmm(zmm: Zmm) -> Self {
+        MachineOperand::PReg(PReg::Zmm(zmm))
+    }
+
+    /// Check if this is a vector register (XMM, YMM, or ZMM).
+    #[allow(dead_code)]
+    pub fn is_vector(&self) -> bool {
+        match self {
+            MachineOperand::PReg(p) => matches!(p, PReg::Xmm(_) | PReg::Ymm(_) | PReg::Zmm(_)),
+            MachineOperand::VReg(_) => false, // Can't determine until allocation
+            _ => false,
+        }
     }
 
     /// Check if this is a register.
@@ -188,6 +211,263 @@ pub enum MachineOp {
     /// XOR packed double (for zeroing).
     #[allow(dead_code)]
     Xorpd,
+
+    // =========================================================================
+    // AVX/AVX2 Vector Operations (YMM - 256-bit)
+    // =========================================================================
+
+    // Vector Data Movement
+    /// Move aligned packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vmovapd256,
+    /// Move aligned packed single-precision (256-bit).
+    #[allow(dead_code)]
+    Vmovaps256,
+    /// Move unaligned packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vmovupd256,
+    /// Move unaligned packed single-precision (256-bit).
+    #[allow(dead_code)]
+    Vmovups256,
+    /// Move aligned packed integer (256-bit).
+    #[allow(dead_code)]
+    Vmovdqa256,
+
+    // Vector Floating-Point Arithmetic
+    /// Add packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vaddpd256,
+    /// Subtract packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vsubpd256,
+    /// Multiply packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vmulpd256,
+    /// Divide packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vdivpd256,
+    /// Square root packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vsqrtpd256,
+    /// Minimum packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vminpd256,
+    /// Maximum packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vmaxpd256,
+
+    // Vector Integer Arithmetic
+    /// Add packed doublewords (256-bit).
+    #[allow(dead_code)]
+    Vpaddd256,
+    /// Subtract packed doublewords (256-bit).
+    #[allow(dead_code)]
+    Vpsubd256,
+    /// Multiply packed doublewords (256-bit).
+    #[allow(dead_code)]
+    Vpmulld256,
+    /// Add packed quadwords (256-bit).
+    #[allow(dead_code)]
+    Vpaddq256,
+    /// Subtract packed quadwords (256-bit).
+    #[allow(dead_code)]
+    Vpsubq256,
+
+    // Vector Logical
+    /// Bitwise AND packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vandpd256,
+    /// Bitwise OR packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vorpd256,
+    /// Bitwise XOR packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vxorpd256,
+    /// Bitwise AND-NOT packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vandnpd256,
+
+    // Vector Compare
+    /// Compare packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vcmppd256,
+
+    // Vector FMA (256-bit)
+    /// Fused multiply-add packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vfmadd213pd256,
+    /// Fused multiply-subtract packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vfmsub213pd256,
+
+    // Vector Shuffle/Permute
+    /// Permute packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vpermpd256,
+    /// Shuffle packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vshufpd256,
+    /// Blend packed double-precision (256-bit).
+    #[allow(dead_code)]
+    Vblendpd256,
+
+    // Vector Broadcast
+    /// Broadcast scalar double to all lanes (256-bit).
+    #[allow(dead_code)]
+    Vbroadcastsd256,
+    /// Broadcast 128-bit to 256-bit.
+    #[allow(dead_code)]
+    Vbroadcastf128,
+
+    // =========================================================================
+    // AVX-512 Vector Operations (ZMM - 512-bit)
+    // =========================================================================
+
+    // Vector Data Movement
+    /// Move aligned packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vmovapd512,
+    /// Move aligned packed single-precision (512-bit).
+    #[allow(dead_code)]
+    Vmovaps512,
+    /// Move unaligned packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vmovupd512,
+    /// Move unaligned packed single-precision (512-bit).
+    #[allow(dead_code)]
+    Vmovups512,
+    /// Move aligned packed 64-bit integer (512-bit).
+    #[allow(dead_code)]
+    Vmovdqa64,
+    /// Move aligned packed 32-bit integer (512-bit).
+    #[allow(dead_code)]
+    Vmovdqa32,
+
+    // Vector Floating-Point Arithmetic
+    /// Add packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vaddpd512,
+    /// Subtract packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vsubpd512,
+    /// Multiply packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vmulpd512,
+    /// Divide packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vdivpd512,
+    /// Square root packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vsqrtpd512,
+    /// Minimum packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vminpd512,
+    /// Maximum packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vmaxpd512,
+
+    // Vector Integer Arithmetic (512-bit)
+    /// Add packed doublewords (512-bit).
+    #[allow(dead_code)]
+    Vpaddd512,
+    /// Subtract packed doublewords (512-bit).
+    #[allow(dead_code)]
+    Vpsubd512,
+    /// Multiply packed doublewords (512-bit).
+    #[allow(dead_code)]
+    Vpmulld512,
+    /// Add packed quadwords (512-bit).
+    #[allow(dead_code)]
+    Vpaddq512,
+    /// Subtract packed quadwords (512-bit).
+    #[allow(dead_code)]
+    Vpsubq512,
+
+    // Vector Logical (512-bit)
+    /// Bitwise AND packed 64-bit integers (512-bit).
+    #[allow(dead_code)]
+    Vpandq512,
+    /// Bitwise OR packed 64-bit integers (512-bit).
+    #[allow(dead_code)]
+    Vporq512,
+    /// Bitwise XOR packed 64-bit integers (512-bit).
+    #[allow(dead_code)]
+    Vpxorq512,
+    /// Bitwise AND-NOT packed 64-bit integers (512-bit).
+    #[allow(dead_code)]
+    Vpandnq512,
+
+    // Vector Compare (512-bit)
+    /// Compare packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vcmppd512,
+
+    // Vector FMA (512-bit)
+    /// Fused multiply-add packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vfmadd213pd512,
+    /// Fused multiply-subtract packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vfmsub213pd512,
+
+    // Vector Shuffle/Permute (512-bit)
+    /// Permute packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vpermpd512,
+    /// Shuffle packed double-precision (512-bit).
+    #[allow(dead_code)]
+    Vshufpd512,
+
+    // Vector Broadcast (512-bit)
+    /// Broadcast scalar double to all lanes (512-bit).
+    #[allow(dead_code)]
+    Vbroadcastsd512,
+
+    // Vector Gather (512-bit)
+    /// Gather packed double-precision using dword indices (512-bit).
+    #[allow(dead_code)]
+    Vgatherdpd512,
+    /// Gather packed double-precision using qword indices (512-bit).
+    #[allow(dead_code)]
+    Vgatherqpd512,
+
+    // Vector Scatter (512-bit)
+    /// Scatter packed double-precision using dword indices (512-bit).
+    #[allow(dead_code)]
+    Vscatterdpd512,
+    /// Scatter packed double-precision using qword indices (512-bit).
+    #[allow(dead_code)]
+    Vscatterqpd512,
+
+    // Vector Mask Operations
+    /// Move mask to GPR.
+    #[allow(dead_code)]
+    Kmovw,
+    /// AND mask registers.
+    #[allow(dead_code)]
+    Kandw,
+    /// OR mask registers.
+    #[allow(dead_code)]
+    Korw,
+    /// NOT mask register.
+    #[allow(dead_code)]
+    Knotw,
+
+    // =========================================================================
+    // Vector Spill/Reload Pseudo-instructions
+    // =========================================================================
+    /// Spill YMM register to stack (256-bit).
+    #[allow(dead_code)]
+    SpillYmm,
+    /// Reload YMM register from stack (256-bit).
+    #[allow(dead_code)]
+    ReloadYmm,
+    /// Spill ZMM register to stack (512-bit).
+    #[allow(dead_code)]
+    SpillZmm,
+    /// Reload ZMM register from stack (512-bit).
+    #[allow(dead_code)]
+    ReloadZmm,
 
     // Special
     /// No operation.

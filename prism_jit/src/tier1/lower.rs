@@ -403,7 +403,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                 // Fall back to generic (would emit runtime call)
                 self.output.push(TemplateInstruction::Nop { bc_offset });
             }
-            TypeHint::None | TypeHint::StrInt | TypeHint::IntStr => {
+            TypeHint::None | TypeHint::StrInt | TypeHint::IntStr | TypeHint::ListList => {
                 // No speculation or invalid type combo - emit generic
                 // For now, fall back to IntAdd as placeholder
                 // A real implementation would emit a runtime call
