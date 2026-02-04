@@ -203,6 +203,11 @@ impl CallDepth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Global lock to serialize tests that use the shared INTERN_POOL.
+    /// This prevents race conditions during parallel test execution.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // =========================================================================
     // getrefcount Tests
@@ -260,6 +265,7 @@ mod tests {
 
     #[test]
     fn test_intern_new_string() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_intern_pool();
         let s = intern("test_intern_new".to_string());
         assert_eq!(s, "test_intern_new");
@@ -267,6 +273,7 @@ mod tests {
 
     #[test]
     fn test_intern_returns_same() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_intern_pool();
         let s1 = intern("shared".to_string());
         let s2 = intern("shared".to_string());
@@ -276,6 +283,7 @@ mod tests {
 
     #[test]
     fn test_is_interned() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_intern_pool();
         intern("is_interned_test".to_string());
         assert!(is_interned("is_interned_test"));
@@ -283,12 +291,14 @@ mod tests {
 
     #[test]
     fn test_is_not_interned() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_intern_pool();
         assert!(!is_interned("never_interned_xyz"));
     }
 
     #[test]
     fn test_intern_count() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_intern_pool();
         let initial = intern_count();
         intern("count_test_1".to_string());
@@ -298,6 +308,7 @@ mod tests {
 
     #[test]
     fn test_intern_count_no_duplicates() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_intern_pool();
         intern("no_dup".to_string());
         let count1 = intern_count();
