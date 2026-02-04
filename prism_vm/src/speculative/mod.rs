@@ -55,6 +55,8 @@ pub enum Speculation {
     StrInt = 6,
     /// Int + String (repetition: 3 * "a").
     IntStr = 7,
+    /// Both operands are lists (concatenation).
+    ListList = 8,
 }
 
 impl Speculation {
@@ -67,9 +69,10 @@ impl Speculation {
             0x22 => Speculation::FloatFloat,
             0x12 => Speculation::IntFloat,
             0x21 => Speculation::FloatInt,
-            0x55 => Speculation::StrStr, // STR_STR
-            0x51 => Speculation::StrInt, // STR_INT
-            0x15 => Speculation::IntStr, // INT_STR
+            0x55 => Speculation::StrStr,   // STR_STR
+            0x51 => Speculation::StrInt,   // STR_INT
+            0x15 => Speculation::IntStr,   // INT_STR
+            0x66 => Speculation::ListList, // LIST_LIST
             _ => Speculation::None,
         }
     }
@@ -114,6 +117,7 @@ impl Speculation {
             Speculation::StrStr => TypeHint::StrStr,
             Speculation::StrInt => TypeHint::StrInt,
             Speculation::IntStr => TypeHint::IntStr,
+            Speculation::ListList => TypeHint::ListList,
         }
     }
 
@@ -130,6 +134,7 @@ impl Speculation {
             TypeHint::StrStr => Speculation::StrStr,
             TypeHint::StrInt => Speculation::StrInt,
             TypeHint::IntStr => Speculation::IntStr,
+            TypeHint::ListList => Speculation::ListList,
         }
     }
 }
@@ -775,6 +780,70 @@ pub fn spec_str_len(a: Value) -> (SpecResult, Value) {
     }
 
     (SpecResult::Deopt, Value::none())
+}
+
+// =============================================================================
+// List Speculation Helpers
+// =============================================================================
+
+use prism_runtime::types::ListObject;
+
+/// Check if a Value is a ListObject (heap object with LIST type).
+///
+/// This performs a two-step check:
+/// 1. Check if Value is an object pointer (TAG_OBJECT)
+/// 2. Read the object header to verify TypeId::LIST
+///
+/// Returns the pointer to the ListObject if valid, None otherwise.
+#[inline(always)]
+fn extract_list_object(v: Value) -> Option<*const ListObject> {
+    if !v.is_object() {
+        return None;
+    }
+
+    if let Some(ptr) = v.as_object_ptr() {
+        // Read the object header to check the type
+        let header_ptr = ptr as *const prism_runtime::ObjectHeader;
+        // SAFETY: We've verified this is an object pointer. The first field
+        // of any Python object is the ObjectHeader.
+        let type_id = unsafe { (*header_ptr).type_id };
+
+        if type_id == TypeId::LIST {
+            return Some(ptr as *const ListObject);
+        }
+    }
+
+    None
+}
+
+/// Speculative list concatenation (list + list).
+///
+/// # Performance
+///
+/// Uses type header inspection for ListObject detection:
+/// 1. Check both values are object pointers with LIST type
+/// 2. Direct pointer extraction
+/// 3. Delegates to optimized `ListObject::concat` with pre-allocation
+#[inline(always)]
+pub fn spec_list_concat(a: Value, b: Value) -> (SpecResult, Value) {
+    // Extract ListObject pointers with type verification
+    let a_ptr = match extract_list_object(a) {
+        Some(p) => p,
+        None => return (SpecResult::Deopt, Value::none()),
+    };
+    let b_ptr = match extract_list_object(b) {
+        Some(p) => p,
+        None => return (SpecResult::Deopt, Value::none()),
+    };
+
+    // SAFETY: Type checks above ensure these are valid ListObject pointers.
+    let result = unsafe { (*a_ptr).concat(&*b_ptr) };
+
+    // Box the result and create a Value::object for it
+    // Note: In production, this would integrate with the GC allocator
+    let boxed = Box::new(result);
+    let ptr = Box::into_raw(boxed) as *const ();
+    (SpecResult::Success, Value::object_ptr(ptr))
 }
 
 // =============================================================================

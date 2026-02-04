@@ -126,8 +126,10 @@ use crate::ops::calls;
 use crate::ops::class;
 use crate::ops::comparison;
 use crate::ops::containers;
+use crate::ops::context;
 use crate::ops::control;
 use crate::ops::coroutine;
+use crate::ops::exception;
 use crate::ops::load_store;
 use crate::ops::r#match;
 use crate::ops::method_dispatch;
@@ -148,10 +150,12 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::JumpIfTrue as usize] = control::jump_if_true;
     table[Opcode::JumpIfNone as usize] = control::jump_if_none;
     table[Opcode::JumpIfNotNone as usize] = control::jump_if_not_none;
-    table[Opcode::PopExceptHandler as usize] = control::pop_except_handler;
-    table[Opcode::Raise as usize] = control::raise;
-    table[Opcode::Reraise as usize] = control::reraise;
-    table[Opcode::EndFinally as usize] = control::end_finally;
+    table[Opcode::PopExceptHandler as usize] = exception::pop_except_handler;
+    table[Opcode::Raise as usize] = exception::raise;
+    table[Opcode::Reraise as usize] = exception::reraise;
+    table[Opcode::EndFinally as usize] = exception::end_finally;
+    table[Opcode::ExceptionMatch as usize] = exception::exception_match;
+    table[Opcode::LoadException as usize] = exception::load_exception;
     table[Opcode::Yield as usize] = control::yield_value;
     table[Opcode::YieldFrom as usize] = control::yield_from;
 
@@ -261,10 +265,24 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::UnpackEx as usize] = containers::unpack_ex;
     table[Opcode::BuildSlice as usize] = containers::build_slice;
 
-    // Import (0x90-0x9F)
+    // Import (0x90-0x92)
     table[Opcode::ImportName as usize] = containers::import_name;
     table[Opcode::ImportFrom as usize] = containers::import_from;
     table[Opcode::ImportStar as usize] = containers::import_star;
+
+    // Exception Handling (CPython 3.11+) (0x93-0x96, 0xAB)
+    table[Opcode::Raise as usize] = exception::raise;
+    table[Opcode::Reraise as usize] = exception::reraise;
+    table[Opcode::RaiseFrom as usize] = exception::raise_from;
+    table[Opcode::PushExcInfo as usize] = exception::push_exc_info;
+    table[Opcode::PopExcInfo as usize] = exception::pop_exc_info;
+    table[Opcode::HasExcInfo as usize] = exception::has_exc_info;
+    table[Opcode::ClearException as usize] = exception::clear_exception;
+
+    // Context Managers (0x97-0x99)
+    table[Opcode::BeforeWith as usize] = context::before_with;
+    table[Opcode::ExitWith as usize] = context::exit_with;
+    table[Opcode::WithCleanup as usize] = context::with_cleanup;
 
     // Pattern Matching (0x9A-0x9F)
     table[Opcode::MatchClass as usize] = r#match::match_class;

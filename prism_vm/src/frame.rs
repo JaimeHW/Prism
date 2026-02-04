@@ -51,6 +51,13 @@ pub struct Frame {
     /// Registers r0-r255 used for local computation.
     /// Parameters are passed in r0, r1, r2, ...
     pub registers: [Value; REGISTER_COUNT],
+
+    // =========================================================================
+    // Generator Support
+    // =========================================================================
+    /// Yield point index for generators (0 = not a generator or not yet yielded).
+    /// When a generator yields, this stores the resume table index for O(1) dispatch.
+    pub yield_point: u32,
 }
 
 /// Closure environment holding captured variables.
@@ -231,6 +238,7 @@ impl Frame {
             closure: None,
             // Initialize all registers to None for safety
             registers: [Value::none(); REGISTER_COUNT],
+            yield_point: 0,
         }
     }
 
@@ -249,6 +257,7 @@ impl Frame {
             return_reg,
             closure: Some(closure),
             registers: [Value::none(); REGISTER_COUNT],
+            yield_point: 0,
         }
     }
 
@@ -345,6 +354,39 @@ impl Frame {
     #[inline(always)]
     pub fn code_id(&self) -> crate::profiler::CodeId {
         crate::profiler::CodeId::from_ptr(std::sync::Arc::as_ptr(&self.code) as *const ())
+    }
+
+    // =========================================================================
+    // Generator Support
+    // =========================================================================
+
+    /// Set the yield point for generator suspension.
+    ///
+    /// The yield point is an index into the resume table, enabling O(1)
+    /// dispatch when the generator is resumed.
+    #[inline(always)]
+    pub fn set_yield_point(&mut self, point: u32) {
+        self.yield_point = point;
+    }
+
+    /// Get the current yield point.
+    ///
+    /// Returns 0 if the frame is not a generator or hasn't yielded yet.
+    #[inline(always)]
+    pub fn get_yield_point(&self) -> u32 {
+        self.yield_point
+    }
+
+    /// Check if this frame is a suspended generator.
+    #[inline(always)]
+    pub fn is_generator_suspended(&self) -> bool {
+        self.yield_point != 0
+    }
+
+    /// Clear the yield point (used when resuming).
+    #[inline(always)]
+    pub fn clear_yield_point(&mut self) {
+        self.yield_point = 0;
     }
 }
 

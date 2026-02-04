@@ -4,20 +4,28 @@
 //! All builtins use static dispatch for maximum performance.
 
 mod builtin_function;
+mod exception_type;
+mod exception_value;
+mod exceptions;
 mod execution;
 mod functions;
 mod introspect;
 mod io;
+mod iter_dispatch;
 mod itertools;
 mod numeric;
 mod string;
 mod types;
 
 pub use builtin_function::*;
+pub use exception_type::*;
+pub use exception_value::*;
+pub use exceptions::*;
 pub use execution::*;
 pub use functions::*;
 pub use introspect::*;
 pub use io::*;
+pub use iter_dispatch::*;
 pub use itertools::*;
 pub use numeric::*;
 pub use string::*;
@@ -185,6 +193,20 @@ impl BuiltinRegistry {
         registry.register_function("setattr", types::builtin_setattr);
         registry.register_function("hasattr", types::builtin_hasattr);
         registry.register_function("delattr", types::builtin_delattr);
+
+        // Register exception type objects (as callable types, not functions)
+        // This allows except ValueError: to match correctly via type_id extraction
+        for (name, exc_type) in exception_type::EXCEPTION_TYPE_TABLE {
+            // Get a pointer to the static ExceptionTypeObject
+            // exc_type is &LazyLock<ExceptionTypeObject>
+            // We need to borrow the inner ExceptionTypeObject via Deref
+            use std::ops::Deref;
+            let exc_type_obj: &exception_type::ExceptionTypeObject = exc_type.deref();
+            let ptr = exc_type_obj as *const exception_type::ExceptionTypeObject as *const ();
+            registry
+                .entries
+                .insert(Arc::from(*name), Value::object_ptr(ptr));
+        }
 
         registry
     }
