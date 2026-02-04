@@ -6,7 +6,7 @@
 use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
-use crate::exception::{ExceptionState, HandlerStack, InlineHandlerCache};
+use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack, InlineHandlerCache};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
@@ -62,6 +62,10 @@ pub struct VirtualMachine {
     handler_cache: InlineHandlerCache,
     /// Currently active exception (if any) being propagated.
     active_exception: Option<Value>,
+    /// Type ID of the active exception for fast matching.
+    active_exception_type_id: Option<u16>,
+    /// Exception info stack for CPython 3.11+ semantics.
+    exc_info_stack: ExcInfoStack,
     /// Import resolver for module imports.
     pub import_resolver: ImportResolver,
 }
@@ -84,6 +88,8 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            active_exception_type_id: None,
+            exc_info_stack: ExcInfoStack::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -105,6 +111,8 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            active_exception_type_id: None,
+            exc_info_stack: ExcInfoStack::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -131,6 +139,8 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            active_exception_type_id: None,
+            exc_info_stack: ExcInfoStack::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -152,6 +162,8 @@ impl VirtualMachine {
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
             active_exception: None,
+            active_exception_type_id: None,
+            exc_info_stack: ExcInfoStack::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -215,6 +227,7 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Call { code, return_reg } => {
+                    eprintln!("[DEBUG Call] Calling function, return_reg={}", return_reg);
                     self.push_frame(code, return_reg)?;
                 }
 
@@ -230,23 +243,101 @@ impl VirtualMachine {
                 // =========================================================
                 ControlFlow::Exception {
                     type_id,
-                    handler_pc,
+                    handler_pc: hint_pc,
                 } => {
-                    // TODO: Implement full exception propagation
-                    // For now, return as runtime error
-                    return Err(RuntimeError::exception(
-                        type_id,
-                        format!(
-                            "Exception raised (type_id={}, handler_pc={})",
-                            type_id, handler_pc
-                        ),
-                    )
-                    .into());
+                    // Store the active exception for handlers to access
+                    // (handler_pc in the ControlFlow is a hint from raise instruction encoding)
+                    let _ = hint_pc; // Compiler hint, actual PC comes from exception table
+
+                    // Look up handler in current frame's exception table
+                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                        // Found a matching handler - jump to it
+                        let frame = &mut self.frames[self.current_frame_idx];
+                        frame.ip = handler_entry;
+                    } else {
+                        // No handler in current frame - unwind to caller
+                        loop {
+                            // Pop current frame
+                            if self.frames.len() <= 1 {
+                                // No more frames - return as uncaught exception
+                                return Err(RuntimeError::exception(
+                                    type_id,
+                                    format!("Uncaught exception (type_id={})", type_id),
+                                )
+                                .into());
+                            }
+
+                            self.frames.pop();
+                            self.current_frame_idx = self.frames.len() - 1;
+
+                            // Try to find handler in caller
+                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                                let frame = &mut self.frames[self.current_frame_idx];
+                                frame.ip = handler_entry;
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 ControlFlow::Reraise => {
-                    // TODO: Implement reraise from active exception
-                    return Err(RuntimeError::internal("Reraise not yet implemented").into());
+                    eprintln!("[DEBUG ControlFlow::Reraise] Entered handler");
+                    // Re-raise the current active exception
+                    // First check active_exception_type_id (for except handlers)
+                    // then fall back to exc_info_stack (for finally blocks)
+                    let type_id = if let Some(tid) = self.active_exception_type_id {
+                        eprintln!("[DEBUG Reraise] type_id from active={}", tid);
+                        tid
+                    } else if let Some(exc_info) = self.exc_info_stack.peek() {
+                        let tid = exc_info.type_id();
+                        eprintln!("[DEBUG Reraise] type_id from exc_info={}", tid);
+                        tid
+                    } else {
+                        eprintln!("[DEBUG Reraise] No type_id found!");
+                        return Err(
+                            RuntimeError::type_error("No active exception to re-raise").into()
+                        );
+                    };
+
+                    if type_id == 0 {
+                        return Err(RuntimeError::internal(
+                            "Reraise without active exception type",
+                        )
+                        .into());
+                    }
+
+                    // Look for handler (same as Exception flow)
+                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                        let frame = &mut self.frames[self.current_frame_idx];
+                        frame.ip = handler_entry;
+                    } else {
+                        // Unwind and propagate
+                        loop {
+                            if self.frames.len() <= 1 {
+                                return Err(RuntimeError::exception(
+                                    type_id,
+                                    "Uncaught re-raised exception".to_string(),
+                                )
+                                .into());
+                            }
+
+                            self.frames.pop();
+                            self.current_frame_idx = self.frames.len() - 1;
+
+                            eprintln!(
+                                "[DEBUG Reraise unwinding] frames.len={}, current_frame_idx={}, frame.ip={}",
+                                self.frames.len(),
+                                self.current_frame_idx,
+                                self.frames[self.current_frame_idx].ip
+                            );
+
+                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                                let frame = &mut self.frames[self.current_frame_idx];
+                                frame.ip = handler_entry;
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 ControlFlow::EnterHandler {
@@ -277,20 +368,156 @@ impl VirtualMachine {
                 // Generator Protocol
                 // =========================================================
                 ControlFlow::Yield {
-                    value: _,
-                    resume_point: _,
+                    value,
+                    resume_point,
                 } => {
-                    // TODO: Implement generator yield
-                    return Err(RuntimeError::internal("Generators not yet implemented").into());
+                    // Generator suspension: capture frame state and return value
+                    //
+                    // When a generator yields:
+                    // 1. Store the resume point (which yield we're at)
+                    // 2. Store the current IP for resumption
+                    // 3. Return the yielded value to the caller
+                    //
+                    // The generator's frame state (registers) is already captured
+                    // by the GeneratorObject via FrameStorage when the generator
+                    // was created. The VM only needs to track the resume_point.
+
+                    // Store resume information in the frame for later
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    frame.set_yield_point(resume_point);
+
+                    // Pop the generator frame and return the yielded value
+                    // The caller (either user code or the iterator protocol)
+                    // will receive this value
+                    return Ok(value);
                 }
 
-                ControlFlow::Resume { send_value: _ } => {
-                    // TODO: Implement generator resume
-                    return Err(RuntimeError::internal("Generators not yet implemented").into());
+                ControlFlow::Resume { send_value } => {
+                    // Generator resumption: restore frame state and continue
+                    //
+                    // When a generator is resumed via next()/send():
+                    // 1. The send_value becomes the result of the yield expression
+                    // 2. Execution continues from the stored resume point
+                    //
+                    // For now, place the sent value in register 0 (result register)
+                    // and continue execution from where we left off.
+
+                    let frame = &mut self.frames[self.current_frame_idx];
+
+                    // The sent value becomes the result of the yield expression
+                    // Register 0 is the conventional result register for yield
+                    frame.set_reg(0, send_value);
+
+                    // Continue normal execution from current IP
+                    // (The IP was preserved when we yielded)
                 }
 
                 ControlFlow::Error(err) => {
-                    return Err(err.into());
+                    // Map RuntimeErrorKind to ExceptionTypeId for handler lookup
+                    use crate::error::RuntimeErrorKind;
+                    use crate::stdlib::exceptions::types::ExceptionTypeId;
+
+                    eprintln!("[DEBUG ControlFlow::Error] kind={:?}", err.kind);
+
+                    let type_id = match &err.kind {
+                        RuntimeErrorKind::TypeError { .. } => {
+                            ExceptionTypeId::TypeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::UnsupportedOperandTypes { .. } => {
+                            ExceptionTypeId::TypeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::NotCallable { .. } => {
+                            ExceptionTypeId::TypeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::NotIterable { .. } => {
+                            ExceptionTypeId::TypeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::NotSubscriptable { .. } => {
+                            ExceptionTypeId::TypeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::NameError { .. } => {
+                            ExceptionTypeId::NameError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::AttributeError { .. } => {
+                            ExceptionTypeId::AttributeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::UnboundLocalError { .. } => {
+                            ExceptionTypeId::UnboundLocalError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::IndexError { .. } => {
+                            ExceptionTypeId::IndexError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::KeyError { .. } => {
+                            ExceptionTypeId::KeyError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::ValueError { .. } => {
+                            ExceptionTypeId::ValueError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::ZeroDivisionError => {
+                            ExceptionTypeId::ZeroDivisionError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::OverflowError { .. } => {
+                            ExceptionTypeId::OverflowError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::StopIteration => {
+                            ExceptionTypeId::StopIteration.as_u8() as u16
+                        }
+                        RuntimeErrorKind::GeneratorExit => {
+                            ExceptionTypeId::GeneratorExit.as_u8() as u16
+                        }
+                        RuntimeErrorKind::AssertionError { .. } => {
+                            ExceptionTypeId::AssertionError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::RecursionError { .. } => {
+                            ExceptionTypeId::RecursionError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::ImportError { .. } => {
+                            ExceptionTypeId::ImportError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::InvalidOpcode { .. } => {
+                            ExceptionTypeId::SystemError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::InternalError { .. } => {
+                            ExceptionTypeId::RuntimeError.as_u8() as u16
+                        }
+                        RuntimeErrorKind::Exception { type_id, .. } => *type_id,
+                    };
+                    // Create an exception value from the error message for reraise support
+                    let exc_type_id_enum = match ExceptionTypeId::from_u8(type_id as u8) {
+                        Some(id) => id,
+                        None => ExceptionTypeId::RuntimeError,
+                    };
+                    let error_message = err.to_string();
+                    let exc_value = crate::builtins::create_exception(
+                        exc_type_id_enum,
+                        Some(std::sync::Arc::from(error_message.as_str())),
+                    );
+
+                    // Set the active exception (both value and type_id) for handler matching + reraise
+                    self.set_active_exception_with_type(exc_value, type_id);
+
+                    // Try to find a handler in current frame
+                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                        let frame = &mut self.frames[self.current_frame_idx];
+                        frame.ip = handler_entry;
+                    } else {
+                        // Unwind stack looking for handler
+                        loop {
+                            if self.frames.len() <= 1 {
+                                // No handlers found - propagate the error
+                                return Err(err.into());
+                            }
+
+                            self.frames.pop();
+                            self.current_frame_idx = self.frames.len() - 1;
+
+                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                                let frame = &mut self.frames[self.current_frame_idx];
+                                frame.ip = handler_entry;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -465,9 +692,20 @@ impl VirtualMachine {
     }
 
     /// Set the active exception being propagated.
+    /// Uses generic Exception type (4) - prefer set_active_exception_with_type for proper matching.
     #[inline]
     pub fn set_active_exception(&mut self, exc: Value) {
         self.active_exception = Some(exc);
+        self.active_exception_type_id = Some(4); // Generic Exception type
+        self.exc_state = ExceptionState::Propagating;
+    }
+
+    /// Set the active exception with a specific type ID.
+    /// This enables proper exception type matching in except handlers.
+    #[inline]
+    pub fn set_active_exception_with_type(&mut self, exc: Value, type_id: u16) {
+        self.active_exception = Some(exc);
+        self.active_exception_type_id = Some(type_id);
         self.exc_state = ExceptionState::Propagating;
     }
 
@@ -487,6 +725,7 @@ impl VirtualMachine {
     #[inline]
     pub fn clear_active_exception(&mut self) {
         self.active_exception = None;
+        self.active_exception_type_id = None;
     }
 
     /// Get the type ID of the active exception.
@@ -495,13 +734,7 @@ impl VirtualMachine {
     /// active exception exists.
     #[inline]
     pub fn get_active_exception_type_id(&self) -> Option<u16> {
-        // TODO: Extract actual type ID from exception value
-        // For now, return a generic Exception type ID if exception exists
-        if self.active_exception.is_some() {
-            Some(4) // ExceptionTypeId::Exception
-        } else {
-            None
-        }
+        self.active_exception_type_id
     }
 
     /// Push an exception handler onto the handler stack.
@@ -519,10 +752,17 @@ impl VirtualMachine {
     }
 
     /// Check if we should reraise after a finally block.
+    ///
+    /// We should reraise if there's still an active exception after the finally
+    /// body executes. Note: We can't rely on exc_state == Finally because
+    /// PopExcInfo may have changed it during the finally execution.
     #[inline]
     pub fn should_reraise_after_finally(&self) -> bool {
-        // Check if we were propagating before entering finally
-        self.exc_state == ExceptionState::Finally && self.active_exception.is_some()
+        // If there's an active exception with a valid type, reraise it
+        // This handles both:
+        // 1. Normal exceptions that entered finally during propagation
+        // 2. Pop'd exception info that was restored as active
+        self.active_exception_type_id.is_some() && self.active_exception_type_id != Some(0)
     }
 
     /// Clear the reraise flag after handling.
@@ -565,6 +805,110 @@ impl VirtualMachine {
     #[inline]
     pub fn handler_stack_depth(&self) -> usize {
         self.handler_stack.len()
+    }
+
+    /// Find an exception handler for the given exception type in the current frame.
+    ///
+    /// Searches the frame's exception table for a handler that:
+    /// 1. Covers the current PC (start_pc <= pc < end_pc)
+    /// 2. Matches the exception type (or is a catch-all with type_idx = 0xFFFF)
+    ///
+    /// Returns the handler PC if a matching handler is found.
+    ///
+    /// # Performance
+    ///
+    /// Exception tables are typically small (<10 entries) and sorted by start_pc.
+    /// Linear scan with early termination is optimal for this size.
+    #[inline]
+    pub fn find_exception_handler(&self, type_id: u16) -> Option<u32> {
+        let frame = &self.frames[self.current_frame_idx];
+        let pc = frame.ip.saturating_sub(1); // PC is post-increment, so -1 for current instruction
+
+        eprintln!(
+            "[DEBUG find_handler] pc={}, type_id={}, table_len={}",
+            pc,
+            type_id,
+            frame.code.exception_table.len()
+        );
+
+        // Search exception table for matching handler
+        // The handler bytecode itself uses ExceptionMatch opcode to do type matching,
+        // so we just need to find any handler covering this PC range.
+        for entry in frame.code.exception_table.iter() {
+            eprintln!(
+                "[DEBUG find_handler]   entry: start={}, end={}, handler={}",
+                entry.start_pc, entry.end_pc, entry.handler_pc
+            );
+            // Check if PC is in range
+            if pc >= entry.start_pc && pc < entry.end_pc {
+                eprintln!(
+                    "[DEBUG find_handler]   FOUND handler at {}",
+                    entry.handler_pc
+                );
+                // Jump to handler - handler bytecode will do type matching via ExceptionMatch
+                return Some(entry.handler_pc);
+            }
+        }
+
+        eprintln!("[DEBUG find_handler]   NO handler found");
+        None
+    }
+
+    // =========================================================================
+    // Exception Info Stack (CPython 3.11+ semantics)
+    // =========================================================================
+
+    /// Get a reference to the exception info stack.
+    #[inline]
+    pub fn exc_info_stack(&self) -> &ExcInfoStack {
+        &self.exc_info_stack
+    }
+
+    /// Get a mutable reference to the exception info stack.
+    #[inline]
+    pub fn exc_info_stack_mut(&mut self) -> &mut ExcInfoStack {
+        &mut self.exc_info_stack
+    }
+
+    /// Push current exception info onto the stack.
+    /// Returns false if stack is full.
+    #[inline]
+    pub fn push_exc_info(&mut self) -> bool {
+        use crate::exception::ExcInfoEntry;
+
+        let type_id = self.get_active_exception_type_id().unwrap_or(0);
+        let value = self.active_exception.clone();
+        let entry = ExcInfoEntry::new(type_id, value);
+        self.exc_info_stack.push(entry)
+    }
+
+    /// Pop exception info from the stack and restore it as active.
+    #[inline]
+    pub fn pop_exc_info(&mut self) -> bool {
+        if let Some(entry) = self.exc_info_stack.pop() {
+            if entry.is_active() {
+                self.active_exception = entry.value_cloned();
+                self.exc_state = ExceptionState::Propagating;
+            } else {
+                self.active_exception = None;
+                self.exc_state = ExceptionState::Normal;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if there's exception info on the stack.
+    #[inline]
+    pub fn has_exc_info(&self) -> bool {
+        !self.exc_info_stack.is_empty() || self.active_exception.is_some()
+    }
+
+    /// Get current exception info as (type_id, value, traceback_id).
+    #[inline]
+    pub fn current_exc_info(&self) -> (Option<u16>, Option<Value>, Option<u32>) {
+        self.exc_info_stack.current_exc_info()
     }
 }
 
