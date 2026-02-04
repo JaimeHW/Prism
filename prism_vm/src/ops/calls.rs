@@ -10,6 +10,7 @@
 
 use crate::VirtualMachine;
 use crate::builtins::BuiltinFunctionObject;
+use crate::builtins::{EXCEPTION_TYPE_ID, ExceptionTypeObject};
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction};
@@ -46,6 +47,12 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 /// Uses O(1) type discrimination via ObjectHeader for fast dispatch.
 #[inline(always)]
 pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    eprintln!(
+        "[DEBUG call] dst={}, src1={}, src2={}",
+        inst.dst().0,
+        inst.src1().0,
+        inst.src2().0
+    );
     let func_val = vm.current_frame().get_reg(inst.src1().0);
     let argc = inst.src2().0 as usize;
     let dst_reg = inst.dst().0;
@@ -53,6 +60,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // Check if this is a callable object
     if let Some(ptr) = func_val.as_object_ptr() {
         let type_id = extract_type_id(ptr);
+        eprintln!("[DEBUG call] type_id={}", type_id.name());
 
         match type_id {
             TypeId::BUILTIN_FUNCTION => {
@@ -74,18 +82,50 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     Err(e) => ControlFlow::Error(RuntimeError::type_error(e.to_string())),
                 }
             }
+            _ if type_id == EXCEPTION_TYPE_ID => {
+                // Exception type object - call to construct an exception instance
+                let exc_type = unsafe { &*(ptr as *const ExceptionTypeObject) };
+
+                // Collect arguments from registers
+                let frame = vm.current_frame();
+                let args: Vec<Value> = (0..argc)
+                    .map(|i| frame.get_reg(dst_reg + 1 + i as u8))
+                    .collect();
+
+                // Call the exception type's call method
+                match exc_type.call(&args) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(e) => ControlFlow::Error(RuntimeError::type_error(e.to_string())),
+                }
+            }
             TypeId::FUNCTION | TypeId::CLOSURE => {
                 // User-defined function - push frame
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 let code = Arc::clone(&func.code);
+                eprintln!(
+                    "[DEBUG call FUNCTION] code.name={}, instructions={}",
+                    code.name,
+                    code.instructions.len()
+                );
 
                 // Push new frame for function execution
                 if let Err(e) = vm.push_frame(Arc::clone(&code), dst_reg) {
                     return ControlFlow::Error(e);
                 }
+                eprintln!(
+                    "[DEBUG call FUNCTION] after push_frame, depth={}",
+                    vm.call_depth()
+                );
 
                 // Copy arguments to new frame's registers
                 let caller_frame_idx = vm.call_depth() - 1;
+                eprintln!(
+                    "[DEBUG call FUNCTION] caller_frame_idx={}, argc={}",
+                    caller_frame_idx, argc
+                );
 
                 // Collect args from caller and set in new frame
                 let args: Vec<Value> = (0..argc)
@@ -591,20 +631,26 @@ pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     let dst = inst.dst().0;
 
     // Get code object from constant pool
-    // Constants can contain Arc<CodeObject> for nested function definitions
+    // The compiler stores Arc<CodeObject> as Arc::into_raw pointer in constant pool
     let code_val = frame.get_const(code_idx);
 
-    // For now, we need to extract the CodeObject from the constant
-    // In a full implementation, the constant pool would store CodeObject directly
-    // TODO: Properly handle code object constants
-    if let Some(_code_ptr) = code_val.as_object_ptr() {
-        // Assume this points to a CodeObject wrapper
-        // For now, create a placeholder function
+    if let Some(code_ptr) = code_val.as_object_ptr() {
+        // Reconstruct Arc<CodeObject> from raw pointer
+        // SAFETY: The compiler stored Arc::into_raw(Arc<CodeObject>) in the constant pool.
+        // We clone the Arc here to increment reference count (the constant pool keeps its copy).
+        let code_raw = code_ptr as *const CodeObject;
+        // Clone the Arc without taking ownership (the constant pool still owns the original)
+        let code = unsafe { Arc::from_raw(code_raw) };
+        let code_clone = Arc::clone(&code);
+        // Prevent dropping (the constant pool still owns this Arc)
+        std::mem::forget(code);
+
+        // Create FunctionObject with the actual compiled code
         let func = Box::new(FunctionObject::new(
-            Arc::new(CodeObject::new("anonymous", "<module>")),
-            Arc::from("anonymous"),
-            None,
-            None,
+            code_clone,
+            Arc::from(frame.code.name.as_ref()),
+            None, // defaults - TODO: handle function defaults
+            None, // closure - TODO: handle captured variables (use MakeClosure for that)
         ));
         let func_ptr = Box::into_raw(func) as *const ();
         frame.set_reg(dst, Value::object_ptr(func_ptr));
@@ -627,23 +673,41 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let dst = inst.dst().0;
 
     // Get code object from constant pool
-    let _code_val = frame.get_const(code_idx);
+    // The compiler stores Arc<CodeObject> as Arc::into_raw pointer in constant pool
+    let code_val = frame.get_const(code_idx);
 
-    // TODO: Properly implement closure creation
-    // 1. Get the list of free variables from the code object
-    // 2. Capture values from the current frame's registers or closure env
-    // 3. Create ClosureEnv and FunctionObject
+    if let Some(code_ptr) = code_val.as_object_ptr() {
+        // Reconstruct Arc<CodeObject> from raw pointer
+        // SAFETY: The compiler stored Arc::into_raw(Arc<CodeObject>) in the constant pool.
+        // We clone the Arc here to increment reference count (the constant pool keeps its copy).
+        let code_raw = code_ptr as *const CodeObject;
+        // Clone the Arc without taking ownership (the constant pool still owns the original)
+        let code = unsafe { Arc::from_raw(code_raw) };
+        let code_clone = Arc::clone(&code);
+        // Prevent dropping (the constant pool still owns this Arc)
+        std::mem::forget(code);
 
-    // Placeholder: create function without closure
-    let func = Box::new(FunctionObject::new(
-        Arc::new(CodeObject::new("closure", "<module>")),
-        Arc::from("closure"),
-        None,
-        None, // Should be Some(ClosureEnv) with captured values
-    ));
-    let func_ptr = Box::into_raw(func) as *const ();
-    frame.set_reg(dst, Value::object_ptr(func_ptr));
-    ControlFlow::Continue
+        // TODO: Capture closure environment from current frame
+        // For now, create function without captured variables
+        // When properly implemented:
+        // 1. Get list of free variables from code_clone.freevars
+        // 2. Capture values from current frame's closure or registers
+        // 3. Create ClosureEnv with captured values
+
+        let func = Box::new(FunctionObject::new(
+            code_clone,
+            Arc::from(frame.code.name.as_ref()),
+            None, // defaults - TODO: handle function defaults
+            None, // closure - TODO: implement ClosureEnv capture
+        ));
+        let func_ptr = Box::into_raw(func) as *const ();
+        frame.set_reg(dst, Value::object_ptr(func_ptr));
+        ControlFlow::Continue
+    } else {
+        ControlFlow::Error(RuntimeError::internal(
+            "Invalid code object in constant pool for closure",
+        ))
+    }
 }
 
 #[cfg(test)]

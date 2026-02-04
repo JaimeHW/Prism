@@ -8,6 +8,7 @@ pub mod calls;
 pub mod class;
 pub mod comparison;
 pub mod containers;
+pub mod context;
 pub mod control;
 pub mod coroutine;
 pub mod exception;

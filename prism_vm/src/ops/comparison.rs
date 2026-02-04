@@ -50,8 +50,11 @@ pub fn lt(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -134,8 +137,11 @@ pub fn le(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -201,8 +207,11 @@ pub fn gt(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -266,8 +275,11 @@ pub fn ge(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -337,8 +349,11 @@ pub fn eq(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -419,8 +434,11 @@ pub fn ne(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 

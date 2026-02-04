@@ -335,7 +335,7 @@ pub fn neg_float(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use crate::ic_manager::ICSiteId;
     use crate::speculative::{
-        SpecResult, Speculation, spec_add_float, spec_add_int, spec_str_concat,
+        SpecResult, Speculation, spec_add_float, spec_add_int, spec_list_concat, spec_str_concat,
     };
     use crate::type_feedback::OperandPair;
 
@@ -379,6 +379,16 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
+            Speculation::ListList => {
+                // List concatenation fast path
+                let (result, value) = spec_list_concat(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
             Speculation::None | Speculation::StrInt | Speculation::IntStr => {
                 // StrInt/IntStr don't apply to addition (only mul for repetition)
             }
@@ -411,6 +421,17 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
         }
         return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+    }
+
+    // Try list + list (slow path for list concatenation)
+    if a.is_object() && b.is_object() {
+        // Use spec_list_concat which handles type checking internally
+        let (result, value) = spec_list_concat(a, b);
+        if result == SpecResult::Success {
+            frame.set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
+        }
+        // If deopt, fall through to other type checks
     }
 
     // Try float + float or mixed int/float
@@ -470,8 +491,11 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -573,8 +597,8 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     }
                 }
             }
-            Speculation::None | Speculation::StrStr => {
-                // StrStr doesn't apply to multiplication
+            Speculation::None | Speculation::StrStr | Speculation::ListList => {
+                // StrStr and ListList don't apply to multiplication
             }
         }
     }
@@ -741,8 +765,11 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     }
                 }
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -853,8 +880,11 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     }
                 }
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
@@ -954,8 +984,11 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
                 vm.speculation_cache.invalidate(site);
             }
-            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
-            }
+            Speculation::None
+            | Speculation::StrStr
+            | Speculation::StrInt
+            | Speculation::IntStr
+            | Speculation::ListList => {}
         }
     }
 
