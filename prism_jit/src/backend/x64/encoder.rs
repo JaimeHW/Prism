@@ -173,7 +173,7 @@ impl EncodedInst {
 
     /// Push a byte.
     #[inline]
-    fn push(&mut self, byte: u8) {
+    pub(crate) fn push(&mut self, byte: u8) {
         debug_assert!((self.len as usize) < MAX_INST_LEN);
         self.bytes[self.len as usize] = byte;
         self.len += 1;
@@ -189,7 +189,7 @@ impl EncodedInst {
 
     /// Push a u32 (little-endian).
     #[inline]
-    fn push_u32(&mut self, val: u32) {
+    pub(crate) fn push_u32(&mut self, val: u32) {
         let bytes = val.to_le_bytes();
         self.push(bytes[0]);
         self.push(bytes[1]);
