@@ -134,6 +134,9 @@ impl OperandPair {
     /// Int + String operand pair (for string repetition).
     /// With Int=1, String=5: (1 << 4) | 5 = 0x15
     pub const INT_STR: Self = OperandPair(0x15);
+    /// List + List operand pair (for list concatenation).
+    /// With List=6: (6 << 4) | 6 = 0x66
+    pub const LIST_LIST: Self = OperandPair(0x66);
 
     /// Create from two values.
     #[inline(always)]
