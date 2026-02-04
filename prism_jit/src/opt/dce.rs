@@ -60,6 +60,9 @@ impl Dce {
             // Memory operations that mutate
             Operator::Memory(_) => true,
 
+            // Vector memory operations have side effects
+            Operator::VectorMemory(..) => true,
+
             // Guards must be preserved
             Operator::Guard(_) => true,
 
@@ -94,6 +97,18 @@ impl Dce {
             | Operator::Box
             | Operator::Unbox
             | Operator::Projection(_) => false,
+
+            // Pure vector operations (can be removed if unused)
+            Operator::VectorArith(..)
+            | Operator::VectorFma(_)
+            | Operator::VectorBroadcast(_)
+            | Operator::VectorExtract(..)
+            | Operator::VectorInsert(..)
+            | Operator::VectorShuffle(..)
+            | Operator::VectorHadd(_)
+            | Operator::VectorCmp(..)
+            | Operator::VectorBlend(_)
+            | Operator::VectorSplat(..) => false,
         }
     }
 }

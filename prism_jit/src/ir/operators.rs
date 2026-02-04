@@ -44,6 +44,8 @@ pub enum OpCategory {
     Projection = 8,
     /// Phi nodes (SSA merge).
     Phi = 9,
+    /// Vector/SIMD operations.
+    Vector = 10,
 }
 
 // =============================================================================
@@ -362,6 +364,199 @@ pub enum ControlOp {
 }
 
 // =============================================================================
+// Vector/SIMD Operators
+// =============================================================================
+
+/// Descriptor for a vector operation.
+///
+/// This specifies the element type and number of lanes for SIMD operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorOp {
+    /// Element type (Int64 or Float64).
+    pub element: ValueType,
+    /// Number of lanes (2, 4, or 8).
+    pub lanes: u8,
+}
+
+impl VectorOp {
+    /// Create a new vector operation descriptor.
+    #[inline]
+    pub const fn new(element: ValueType, lanes: u8) -> Self {
+        Self { element, lanes }
+    }
+
+    /// Vector of 2 × i64 (128-bit).
+    pub const V2I64: Self = Self {
+        element: ValueType::Int64,
+        lanes: 2,
+    };
+    /// Vector of 4 × i64 (256-bit).
+    pub const V4I64: Self = Self {
+        element: ValueType::Int64,
+        lanes: 4,
+    };
+    /// Vector of 8 × i64 (512-bit).
+    pub const V8I64: Self = Self {
+        element: ValueType::Int64,
+        lanes: 8,
+    };
+    /// Vector of 2 × f64 (128-bit).
+    pub const V2F64: Self = Self {
+        element: ValueType::Float64,
+        lanes: 2,
+    };
+    /// Vector of 4 × f64 (256-bit).
+    pub const V4F64: Self = Self {
+        element: ValueType::Float64,
+        lanes: 4,
+    };
+    /// Vector of 8 × f64 (512-bit).
+    pub const V8F64: Self = Self {
+        element: ValueType::Float64,
+        lanes: 8,
+    };
+
+    /// Get the bit width of this vector (128, 256, or 512).
+    #[inline]
+    pub const fn bit_width(&self) -> u16 {
+        let elem_bits = match self.element {
+            ValueType::Int64 | ValueType::Float64 => 64,
+            _ => 64, // Default to 64-bit elements
+        };
+        (self.lanes as u16) * elem_bits
+    }
+
+    /// Get the corresponding ValueType for this vector.
+    #[inline]
+    pub const fn value_type(&self) -> ValueType {
+        match (self.element, self.lanes) {
+            (ValueType::Int64, 2) => ValueType::V2I64,
+            (ValueType::Int64, 4) => ValueType::V4I64,
+            (ValueType::Int64, 8) => ValueType::V8I64,
+            (ValueType::Float64, 2) => ValueType::V2F64,
+            (ValueType::Float64, 4) => ValueType::V4F64,
+            (ValueType::Float64, 8) => ValueType::V8F64,
+            _ => ValueType::Top,
+        }
+    }
+
+    /// Check if this is a floating-point vector.
+    #[inline]
+    pub const fn is_float(&self) -> bool {
+        matches!(self.element, ValueType::Float64)
+    }
+
+    /// Check if this is an integer vector.
+    #[inline]
+    pub const fn is_integer(&self) -> bool {
+        matches!(self.element, ValueType::Int64)
+    }
+}
+
+/// Vector arithmetic operation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum VectorArithKind {
+    /// Vector add (element-wise): a + b
+    Add = 0,
+    /// Vector subtract (element-wise): a - b
+    Sub = 1,
+    /// Vector multiply (element-wise): a * b
+    Mul = 2,
+    /// Vector divide (element-wise): a / b
+    Div = 3,
+    /// Vector min (element-wise): min(a, b)
+    Min = 4,
+    /// Vector max (element-wise): max(a, b)
+    Max = 5,
+    /// Vector abs (element-wise): |a|
+    Abs = 6,
+    /// Vector negate (element-wise): -a
+    Neg = 7,
+    /// Vector square root (element-wise): sqrt(a)
+    Sqrt = 8,
+}
+
+impl VectorArithKind {
+    /// Check if this operation is commutative.
+    #[inline]
+    pub const fn is_commutative(self) -> bool {
+        matches!(self, Self::Add | Self::Mul | Self::Min | Self::Max)
+    }
+
+    /// Check if this is a unary operation.
+    #[inline]
+    pub const fn is_unary(self) -> bool {
+        matches!(self, Self::Abs | Self::Neg | Self::Sqrt)
+    }
+}
+
+/// Vector memory operation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum VectorMemoryKind {
+    /// Aligned load from memory.
+    LoadAligned = 0,
+    /// Unaligned load from memory.
+    LoadUnaligned = 1,
+    /// Aligned store to memory.
+    StoreAligned = 2,
+    /// Unaligned store to memory.
+    StoreUnaligned = 3,
+    /// Gather (indexed load from multiple addresses).
+    Gather = 4,
+    /// Scatter (indexed store to multiple addresses).
+    Scatter = 5,
+}
+
+/// Vector shuffle descriptor.
+///
+/// Encodes a permutation of lanes. Each element is the source lane index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorShuffle {
+    /// Permutation indices (up to 8 lanes).
+    /// Value 0xFF means undefined/zero.
+    pub indices: [u8; 8],
+    /// Number of lanes in use.
+    pub lanes: u8,
+}
+
+impl VectorShuffle {
+    /// Identity shuffle (no permutation).
+    pub const fn identity(lanes: u8) -> Self {
+        let mut indices = [0xFF; 8];
+        let mut i = 0;
+        while i < lanes as usize && i < 8 {
+            indices[i] = i as u8;
+            i += 1;
+        }
+        Self { indices, lanes }
+    }
+
+    /// Broadcast lane 0 to all lanes.
+    pub const fn broadcast(lanes: u8) -> Self {
+        let mut indices = [0; 8];
+        let mut i = 0;
+        while i < 8 {
+            indices[i] = 0;
+            i += 1;
+        }
+        Self { indices, lanes }
+    }
+
+    /// Reverse lanes.
+    pub const fn reverse(lanes: u8) -> Self {
+        let mut indices = [0xFF; 8];
+        let mut i = 0;
+        while i < lanes as usize && i < 8 {
+            indices[i] = lanes - 1 - i as u8;
+            i += 1;
+        }
+        Self { indices, lanes }
+    }
+}
+
+// =============================================================================
 // Operator (Unified)
 // =============================================================================
 
@@ -464,6 +659,42 @@ pub enum Operator {
     Box,
     /// Unbox object to primitive.
     Unbox,
+
+    // =========================================================================
+    // Vector/SIMD Operations
+    // =========================================================================
+    /// Vector arithmetic (add, sub, mul, div, etc.).
+    VectorArith(VectorOp, VectorArithKind),
+
+    /// Fused multiply-add: a * b + c (element-wise).
+    VectorFma(VectorOp),
+
+    /// Vector memory operation (load/store).
+    VectorMemory(VectorOp, VectorMemoryKind),
+
+    /// Broadcast scalar to all vector lanes.
+    VectorBroadcast(VectorOp),
+
+    /// Extract scalar from vector lane.
+    VectorExtract(VectorOp, u8),
+
+    /// Insert scalar into vector lane.
+    VectorInsert(VectorOp, u8),
+
+    /// Shuffle/permute vector lanes.
+    VectorShuffle(VectorOp, VectorShuffle),
+
+    /// Horizontal add (sum all lanes to scalar).
+    VectorHadd(VectorOp),
+
+    /// Vector comparison (element-wise, returns vector mask).
+    VectorCmp(VectorOp, CmpOp),
+
+    /// Vector blend (select lanes from two vectors based on mask).
+    VectorBlend(VectorOp),
+
+    /// Vector splat (create vector with all lanes = constant).
+    VectorSplat(VectorOp, i64),
 }
 
 impl Operator {
@@ -500,6 +731,19 @@ impl Operator {
 
             Operator::Phi | Operator::LoopPhi => OpCategory::Phi,
 
+            // Vector operations
+            Operator::VectorArith(..)
+            | Operator::VectorFma(_)
+            | Operator::VectorMemory(..)
+            | Operator::VectorBroadcast(_)
+            | Operator::VectorExtract(..)
+            | Operator::VectorInsert(..)
+            | Operator::VectorShuffle(..)
+            | Operator::VectorHadd(_)
+            | Operator::VectorCmp(..)
+            | Operator::VectorBlend(_)
+            | Operator::VectorSplat(..) => OpCategory::Vector,
+
             _ => OpCategory::Memory, // Container/type ops are memory-like
         }
     }
@@ -530,6 +774,21 @@ impl Operator {
             // Type ops are pure
             Operator::TypeCheck | Operator::Box | Operator::Unbox | Operator::Len => true,
 
+            // Pure vector operations (no memory access)
+            Operator::VectorArith(..)
+            | Operator::VectorFma(_)
+            | Operator::VectorBroadcast(_)
+            | Operator::VectorExtract(..)
+            | Operator::VectorInsert(..)
+            | Operator::VectorShuffle(..)
+            | Operator::VectorHadd(_)
+            | Operator::VectorCmp(..)
+            | Operator::VectorBlend(_)
+            | Operator::VectorSplat(..) => true,
+
+            // Vector memory operations have side effects
+            Operator::VectorMemory(..) => false,
+
             // Memory, control, calls, guards have effects
             _ => false,
         }
@@ -545,6 +804,8 @@ impl Operator {
                 op.is_commutative()
             }
             Operator::Bitwise(op) => op.is_commutative(),
+            // Vector arithmetic commutativity
+            Operator::VectorArith(_, kind) => kind.is_commutative(),
             _ => false,
         }
     }
@@ -596,6 +857,33 @@ impl Operator {
             Operator::GetAttr => ValueType::Top,
             Operator::Len => ValueType::Int64,
             Operator::TypeCheck => ValueType::Bool,
+
+            // Vector operations return vector types
+            Operator::VectorArith(vop, _)
+            | Operator::VectorFma(vop)
+            | Operator::VectorBroadcast(vop)
+            | Operator::VectorInsert(vop, _)
+            | Operator::VectorShuffle(vop, _)
+            | Operator::VectorBlend(vop)
+            | Operator::VectorSplat(vop, _)
+            | Operator::VectorCmp(vop, _) => vop.value_type(),
+
+            // Extract returns scalar element type
+            Operator::VectorExtract(vop, _) => vop.element,
+
+            // Horizontal add returns scalar
+            Operator::VectorHadd(vop) => vop.element,
+
+            // Memory operations: loads return vector type
+            Operator::VectorMemory(vop, kind) => {
+                match kind {
+                    VectorMemoryKind::LoadAligned
+                    | VectorMemoryKind::LoadUnaligned
+                    | VectorMemoryKind::Gather => vop.value_type(),
+                    // Stores return nothing meaningful
+                    _ => ValueType::Effect,
+                }
+            }
 
             _ => ValueType::Top,
         }
@@ -668,5 +956,205 @@ mod tests {
         assert!(!Operator::IntOp(ArithOp::Sub).is_commutative());
         assert!(Operator::IntCmp(CmpOp::Eq).is_commutative());
         assert!(!Operator::IntCmp(CmpOp::Lt).is_commutative());
+    }
+
+    // =========================================================================
+    // Vector Operator Tests
+    // =========================================================================
+
+    #[test]
+    fn test_vector_op_constants() {
+        assert_eq!(VectorOp::V2I64.element, ValueType::Int64);
+        assert_eq!(VectorOp::V2I64.lanes, 2);
+        assert_eq!(VectorOp::V4I64.lanes, 4);
+        assert_eq!(VectorOp::V8I64.lanes, 8);
+        assert_eq!(VectorOp::V2F64.element, ValueType::Float64);
+        assert_eq!(VectorOp::V4F64.lanes, 4);
+        assert_eq!(VectorOp::V8F64.lanes, 8);
+    }
+
+    #[test]
+    fn test_vector_op_bit_width() {
+        assert_eq!(VectorOp::V2I64.bit_width(), 128);
+        assert_eq!(VectorOp::V4I64.bit_width(), 256);
+        assert_eq!(VectorOp::V8I64.bit_width(), 512);
+        assert_eq!(VectorOp::V2F64.bit_width(), 128);
+        assert_eq!(VectorOp::V4F64.bit_width(), 256);
+        assert_eq!(VectorOp::V8F64.bit_width(), 512);
+    }
+
+    #[test]
+    fn test_vector_op_value_type() {
+        assert_eq!(VectorOp::V2I64.value_type(), ValueType::V2I64);
+        assert_eq!(VectorOp::V4I64.value_type(), ValueType::V4I64);
+        assert_eq!(VectorOp::V8I64.value_type(), ValueType::V8I64);
+        assert_eq!(VectorOp::V2F64.value_type(), ValueType::V2F64);
+        assert_eq!(VectorOp::V4F64.value_type(), ValueType::V4F64);
+        assert_eq!(VectorOp::V8F64.value_type(), ValueType::V8F64);
+    }
+
+    #[test]
+    fn test_vector_op_is_float_integer() {
+        assert!(!VectorOp::V2I64.is_float());
+        assert!(VectorOp::V2I64.is_integer());
+        assert!(VectorOp::V2F64.is_float());
+        assert!(!VectorOp::V2F64.is_integer());
+    }
+
+    #[test]
+    fn test_vector_arith_kind_commutative() {
+        assert!(VectorArithKind::Add.is_commutative());
+        assert!(VectorArithKind::Mul.is_commutative());
+        assert!(VectorArithKind::Min.is_commutative());
+        assert!(VectorArithKind::Max.is_commutative());
+        assert!(!VectorArithKind::Sub.is_commutative());
+        assert!(!VectorArithKind::Div.is_commutative());
+    }
+
+    #[test]
+    fn test_vector_arith_kind_unary() {
+        assert!(VectorArithKind::Abs.is_unary());
+        assert!(VectorArithKind::Neg.is_unary());
+        assert!(VectorArithKind::Sqrt.is_unary());
+        assert!(!VectorArithKind::Add.is_unary());
+        assert!(!VectorArithKind::Mul.is_unary());
+    }
+
+    #[test]
+    fn test_vector_shuffle_identity() {
+        let shuffle = VectorShuffle::identity(4);
+        assert_eq!(shuffle.lanes, 4);
+        assert_eq!(shuffle.indices[0], 0);
+        assert_eq!(shuffle.indices[1], 1);
+        assert_eq!(shuffle.indices[2], 2);
+        assert_eq!(shuffle.indices[3], 3);
+    }
+
+    #[test]
+    fn test_vector_shuffle_broadcast() {
+        let shuffle = VectorShuffle::broadcast(4);
+        assert_eq!(shuffle.lanes, 4);
+        assert_eq!(shuffle.indices[0], 0);
+        assert_eq!(shuffle.indices[1], 0);
+        assert_eq!(shuffle.indices[2], 0);
+        assert_eq!(shuffle.indices[3], 0);
+    }
+
+    #[test]
+    fn test_vector_shuffle_reverse() {
+        let shuffle = VectorShuffle::reverse(4);
+        assert_eq!(shuffle.lanes, 4);
+        assert_eq!(shuffle.indices[0], 3);
+        assert_eq!(shuffle.indices[1], 2);
+        assert_eq!(shuffle.indices[2], 1);
+        assert_eq!(shuffle.indices[3], 0);
+    }
+
+    #[test]
+    fn test_vector_operator_category() {
+        let vadd = Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Add);
+        assert_eq!(vadd.category(), OpCategory::Vector);
+
+        let vload = Operator::VectorMemory(VectorOp::V4F64, VectorMemoryKind::LoadAligned);
+        assert_eq!(vload.category(), OpCategory::Vector);
+
+        let vbcast = Operator::VectorBroadcast(VectorOp::V4F64);
+        assert_eq!(vbcast.category(), OpCategory::Vector);
+    }
+
+    #[test]
+    fn test_vector_operator_pure() {
+        // Pure vector operations
+        assert!(Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Add).is_pure());
+        assert!(Operator::VectorFma(VectorOp::V4F64).is_pure());
+        assert!(Operator::VectorBroadcast(VectorOp::V4F64).is_pure());
+        assert!(Operator::VectorExtract(VectorOp::V4F64, 0).is_pure());
+        assert!(Operator::VectorHadd(VectorOp::V4F64).is_pure());
+        assert!(Operator::VectorSplat(VectorOp::V4F64, 0).is_pure());
+
+        // Vector memory operations have side effects
+        assert!(!Operator::VectorMemory(VectorOp::V4F64, VectorMemoryKind::LoadAligned).is_pure());
+        assert!(!Operator::VectorMemory(VectorOp::V4F64, VectorMemoryKind::StoreAligned).is_pure());
+    }
+
+    #[test]
+    fn test_vector_operator_commutative() {
+        // Commutative vector operations
+        let vadd = Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Add);
+        assert!(vadd.is_commutative());
+
+        let vmul = Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Mul);
+        assert!(vmul.is_commutative());
+
+        // Non-commutative vector operations
+        let vsub = Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Sub);
+        assert!(!vsub.is_commutative());
+
+        let vdiv = Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Div);
+        assert!(!vdiv.is_commutative());
+    }
+
+    #[test]
+    fn test_vector_operator_result_type() {
+        // Vector arithmetic returns vector type
+        let vadd = Operator::VectorArith(VectorOp::V4F64, VectorArithKind::Add);
+        assert_eq!(vadd.result_type(&[]), ValueType::V4F64);
+
+        // Vector extract returns scalar
+        let vextract = Operator::VectorExtract(VectorOp::V4F64, 1);
+        assert_eq!(vextract.result_type(&[]), ValueType::Float64);
+
+        // Horizontal add returns scalar
+        let vhadd = Operator::VectorHadd(VectorOp::V4I64);
+        assert_eq!(vhadd.result_type(&[]), ValueType::Int64);
+
+        // Vector load returns vector
+        let vload = Operator::VectorMemory(VectorOp::V4F64, VectorMemoryKind::LoadAligned);
+        assert_eq!(vload.result_type(&[]), ValueType::V4F64);
+
+        // Vector store returns effect
+        let vstore = Operator::VectorMemory(VectorOp::V4F64, VectorMemoryKind::StoreAligned);
+        assert_eq!(vstore.result_type(&[]), ValueType::Effect);
+    }
+
+    #[test]
+    fn test_vector_operator_128bit() {
+        let vop = VectorOp::V2F64;
+        let vadd = Operator::VectorArith(vop, VectorArithKind::Add);
+        assert_eq!(vadd.result_type(&[]), ValueType::V2F64);
+        assert_eq!(vop.bit_width(), 128);
+    }
+
+    #[test]
+    fn test_vector_operator_512bit() {
+        let vop = VectorOp::V8F64;
+        let vadd = Operator::VectorArith(vop, VectorArithKind::Add);
+        assert_eq!(vadd.result_type(&[]), ValueType::V8F64);
+        assert_eq!(vop.bit_width(), 512);
+    }
+
+    #[test]
+    fn test_vector_fma_operator() {
+        let vfma = Operator::VectorFma(VectorOp::V4F64);
+        assert!(vfma.is_pure());
+        assert_eq!(vfma.category(), OpCategory::Vector);
+        assert_eq!(vfma.result_type(&[]), ValueType::V4F64);
+    }
+
+    #[test]
+    fn test_vector_blend_operator() {
+        let vblend = Operator::VectorBlend(VectorOp::V4F64);
+        assert!(vblend.is_pure());
+        assert_eq!(vblend.category(), OpCategory::Vector);
+        assert_eq!(vblend.result_type(&[]), ValueType::V4F64);
+    }
+
+    #[test]
+    fn test_vector_cmp_operator() {
+        let vcmp = Operator::VectorCmp(VectorOp::V4F64, CmpOp::Lt);
+        assert!(vcmp.is_pure());
+        assert_eq!(vcmp.category(), OpCategory::Vector);
+        // Comparison returns a vector mask (same type as input vector)
+        assert_eq!(vcmp.result_type(&[]), ValueType::V4F64);
     }
 }

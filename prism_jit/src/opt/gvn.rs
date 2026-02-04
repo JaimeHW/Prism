@@ -95,6 +95,18 @@ impl Gvn {
             // Projections are pure
             Operator::Projection(_) => true,
 
+            // Pure vector operations (no memory access)
+            Operator::VectorArith(..)
+            | Operator::VectorFma(_)
+            | Operator::VectorBroadcast(_)
+            | Operator::VectorExtract(..)
+            | Operator::VectorInsert(..)
+            | Operator::VectorShuffle(..)
+            | Operator::VectorHadd(_)
+            | Operator::VectorCmp(..)
+            | Operator::VectorBlend(_)
+            | Operator::VectorSplat(..) => true,
+
             // These have side effects or are context-dependent
             Operator::Parameter(_)
             | Operator::Phi
@@ -103,6 +115,7 @@ impl Gvn {
             | Operator::Guard(_)
             | Operator::Call(_)
             | Operator::Memory(_)
+            | Operator::VectorMemory(..)
             | Operator::GetItem
             | Operator::SetItem
             | Operator::GetAttr

@@ -18,28 +18,40 @@
 //!
 //! The pipeline runs until a fixed point is reached (no more changes).
 
+pub mod copy_prop;
 pub mod dce;
+pub mod dse;
 pub mod escape;
 pub mod gvn;
 pub mod inline;
+pub mod instcombine;
 pub mod licm;
 pub mod loop_analyzer;
 pub mod pipeline;
+pub mod pre;
 pub mod rce;
+pub mod sccp;
 pub mod simplify;
 pub mod strength_reduce;
+pub mod tailcall;
+pub mod unroll;
 
 // Re-export key types
+pub use dse::{Dse, DseConfig, DseStats};
 pub use escape::{Escape, EscapeAnalysis, EscapeState};
 pub use inline::{Inline, InlineConfig};
+pub use instcombine::{InstCombine, InstCombineConfig, InstCombineStats};
 pub use licm::Licm;
 pub use loop_analyzer::LoopInvariantAnalysis;
 pub use pipeline::{OptPipeline, PipelineConfig};
+pub use pre::{Pre, PreConfig, PreStats};
 pub use rce::{
     InductionAnalysis, InductionDetector, InductionDirection, InductionInit, InductionStep,
     InductionVariable, RangeCheckElimination,
 };
+pub use sccp::{Sccp, SccpConfig};
 pub use strength_reduce::{StrengthReduce, StrengthReduceConfig};
+pub use tailcall::{TailCallOpt, TcoConfig};
 
 use crate::ir::graph::Graph;
 
