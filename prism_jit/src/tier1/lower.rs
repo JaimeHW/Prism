@@ -608,6 +608,110 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
             }
 
             // =================================================================
+            // Container Building Operations
+            // =================================================================
+            Some(Opcode::BuildList) => {
+                // BuildList: dst = [r(src1)..r(src1+src2)]
+                self.output.push(TemplateInstruction::BuildList {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                });
+            }
+            Some(Opcode::BuildTuple) => {
+                // BuildTuple: dst = (r(src1)..r(src1+src2))
+                self.output.push(TemplateInstruction::BuildTuple {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                });
+            }
+            Some(Opcode::BuildSet) => {
+                // BuildSet: dst = {r(src1)..r(src1+src2)}
+                self.output.push(TemplateInstruction::BuildSet {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                });
+            }
+            Some(Opcode::BuildDict) => {
+                // BuildDict: dst = {} with src2 key-value pairs starting at src1
+                self.output.push(TemplateInstruction::BuildDict {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                });
+            }
+            Some(Opcode::BuildString) => {
+                // BuildString: dst = "".join(r(src1)..r(src1+src2))
+                self.output.push(TemplateInstruction::BuildString {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                });
+            }
+            Some(Opcode::BuildSlice) => {
+                // BuildSlice: dst = slice(src1, src2)
+                self.output.push(TemplateInstruction::BuildSlice {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    start: inst.src1().0,
+                    stop: inst.src2().0,
+                });
+            }
+            Some(Opcode::ListAppend) => {
+                // ListAppend: src1.append(src2)
+                self.output.push(TemplateInstruction::ListAppend {
+                    bc_offset,
+                    list: inst.src1().0,
+                    value: inst.src2().0,
+                });
+            }
+            Some(Opcode::SetAdd) => {
+                // SetAdd: src1.add(src2)
+                self.output.push(TemplateInstruction::SetAdd {
+                    bc_offset,
+                    set: inst.src1().0,
+                    value: inst.src2().0,
+                });
+            }
+            Some(Opcode::DictSet) => {
+                // DictSet: src1[dst] = src2 (key in dst field)
+                self.output.push(TemplateInstruction::DictSet {
+                    bc_offset,
+                    dict: inst.src1().0,
+                    key: inst.dst().0,
+                    value: inst.src2().0,
+                });
+            }
+            Some(Opcode::UnpackSequence) => {
+                // UnpackSequence: r(dst)..r(dst+src2) = unpack(src1)
+                self.output.push(TemplateInstruction::UnpackSequence {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    src: inst.src1().0,
+                    count: inst.src2().0,
+                });
+            }
+            Some(Opcode::UnpackEx) => {
+                // UnpackEx: unpack with *rest - before/after counts encoded in src2
+                // High nibble = before, low nibble = after
+                let counts = inst.src2().0;
+                self.output.push(TemplateInstruction::UnpackEx {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    src: inst.src1().0,
+                    before: counts >> 4,
+                    after: counts & 0x0F,
+                });
+            }
+
+            // =================================================================
             // Control Flow Operations
             // =================================================================
             Some(Opcode::Jump) => {
