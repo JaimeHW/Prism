@@ -488,6 +488,51 @@ impl OpcodeTemplate for FloatNegTemplate {
     }
 }
 
+/// Template for float floor division: dst = floor(lhs / rhs).
+/// Currently uses deoptimization fallback until SSE4.1 roundsd is added to assembler.
+pub struct FloatFloorDivTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+    pub deopt_idx: usize,
+}
+
+impl OpcodeTemplate for FloatFloorDivTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        // TODO: Implement inline SSE4.1 roundsd once available in assembler
+        // For now, deopt to interpreter for correct Python floor division semantics
+        ctx.asm.jmp(ctx.deopt_label(self.deopt_idx));
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        8
+    }
+}
+
+/// Template for float modulo: dst = lhs % rhs (Python semantics).
+/// Currently uses deoptimization fallback until SSE4.1 roundsd is added to assembler.
+pub struct FloatModTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+    pub deopt_idx: usize,
+}
+
+impl OpcodeTemplate for FloatModTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        // TODO: Implement inline Python modulo once SSE4.1 roundsd is available
+        // Python modulo: x % y = x - floor(x / y) * y
+        // For now, deopt to interpreter for correct semantics
+        ctx.asm.jmp(ctx.deopt_label(self.deopt_idx));
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        8
+    }
+}
+
 // =============================================================================
 // Generic Arithmetic (polymorphic, with type dispatch)
 // =============================================================================
