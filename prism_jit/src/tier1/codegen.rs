@@ -342,6 +342,51 @@ impl TemplateCompiler {
                 // Callable check requires type checking - deopt for Tier 1
                 ctx.asm.nop();
             }
+            // Container building operations - deopt to interpreter for Tier 1
+            TemplateInstruction::BuildList { .. } => {
+                // List allocation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildTuple { .. } => {
+                // Tuple allocation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildSet { .. } => {
+                // Set allocation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildDict { .. } => {
+                // Dict allocation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildString { .. } => {
+                // String allocation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildSlice { .. } => {
+                // Slice allocation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ListAppend { .. } => {
+                // List append requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::SetAdd { .. } => {
+                // Set add requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::DictSet { .. } => {
+                // Dict set requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::UnpackSequence { .. } => {
+                // Unpack requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::UnpackEx { .. } => {
+                // Unpack with star requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
             TemplateInstruction::IntAdd { dst, lhs, rhs, .. } => {
                 IntAddTemplate {
                     dst_reg: *dst,
@@ -917,6 +962,95 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         src: u8,
+    },
+
+    // Container building operations
+    /// Build list: dst = [r(start)..r(start+count)]
+    /// Requires allocation - deopt for Tier 1
+    BuildList {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
+    },
+    /// Build tuple: dst = (r(start)..r(start+count))
+    /// Requires allocation - deopt for Tier 1
+    BuildTuple {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
+    },
+    /// Build set: dst = {r(start)..r(start+count)}
+    /// Requires allocation - deopt for Tier 1
+    BuildSet {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
+    },
+    /// Build dict: dst = {} with count key-value pairs starting at start
+    /// Requires allocation - deopt for Tier 1
+    BuildDict {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
+    },
+    /// Build string: dst = "".join(r(start)..r(start+count))
+    /// Requires allocation - deopt for Tier 1
+    BuildString {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
+    },
+    /// Build slice: dst = slice(start, stop)
+    /// Requires allocation - deopt for Tier 1
+    BuildSlice {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        stop: u8,
+    },
+    /// List append: list.append(value)
+    /// Requires type dispatch - deopt for Tier 1
+    ListAppend {
+        bc_offset: u32,
+        list: u8,
+        value: u8,
+    },
+    /// Set add: set.add(value)
+    /// Requires type dispatch - deopt for Tier 1
+    SetAdd {
+        bc_offset: u32,
+        set: u8,
+        value: u8,
+    },
+    /// Dict set: dict[key] = value
+    /// Requires type dispatch - deopt for Tier 1
+    DictSet {
+        bc_offset: u32,
+        dict: u8,
+        key: u8,
+        value: u8,
+    },
+    /// Unpack sequence: r(dst)..r(dst+count) = unpack(src)
+    /// Requires type dispatch - deopt for Tier 1
+    UnpackSequence {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+        count: u8,
+    },
+    /// Unpack with star: unpack with *rest
+    /// Requires type dispatch - deopt for Tier 1
+    UnpackEx {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+        before: u8, // Elements before *rest
+        after: u8,  // Elements after *rest
     },
 
     // Integer arithmetic
