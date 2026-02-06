@@ -4,6 +4,7 @@
 //! a reference to the VM and an instruction, returning a ControlFlow.
 
 pub mod arithmetic;
+pub mod attribute;
 pub mod calls;
 pub mod class;
 pub mod comparison;
@@ -18,6 +19,7 @@ pub mod load_store;
 pub mod r#match;
 pub mod method_dispatch;
 pub mod objects;
+pub mod subscript;
 pub mod unpack;
 
 // Re-export common types for convenience
