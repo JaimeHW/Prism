@@ -311,6 +311,37 @@ impl TemplateCompiler {
                 // Method loading requires type dispatch - deopt for Tier 1
                 ctx.asm.nop();
             }
+            // Container item operations - deopt to interpreter for Tier 1
+            TemplateInstruction::GetItem { .. } => {
+                // Container indexing requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::SetItem { .. } => {
+                // Container item write requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::DelItem { .. } => {
+                // Container item delete requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Iteration operations - deopt to interpreter for Tier 1
+            TemplateInstruction::GetIter { .. } => {
+                // Iterator creation requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ForIter { .. } => {
+                // Iterator advance requires iterator state - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Utility operations - deopt to interpreter for Tier 1
+            TemplateInstruction::Len { .. } => {
+                // Length requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::IsCallable { .. } => {
+                // Callable check requires type checking - deopt for Tier 1
+                ctx.asm.nop();
+            }
             TemplateInstruction::IntAdd { dst, lhs, rhs, .. } => {
                 IntAddTemplate {
                     dst_reg: *dst,
@@ -1250,6 +1281,13 @@ impl TemplateInstruction {
             | TemplateInstruction::SetAttr { bc_offset, .. }
             | TemplateInstruction::DelAttr { bc_offset, .. }
             | TemplateInstruction::LoadMethod { bc_offset, .. }
+            | TemplateInstruction::GetItem { bc_offset, .. }
+            | TemplateInstruction::SetItem { bc_offset, .. }
+            | TemplateInstruction::DelItem { bc_offset, .. }
+            | TemplateInstruction::GetIter { bc_offset, .. }
+            | TemplateInstruction::ForIter { bc_offset, .. }
+            | TemplateInstruction::Len { bc_offset, .. }
+            | TemplateInstruction::IsCallable { bc_offset, .. }
             | TemplateInstruction::IntAdd { bc_offset, .. }
             | TemplateInstruction::IntSub { bc_offset, .. }
             | TemplateInstruction::IntMul { bc_offset, .. }
