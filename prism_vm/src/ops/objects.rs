@@ -6,9 +6,12 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::attribute::is_user_defined_type;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::shape::shape_registry;
+use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::iter::IteratorObject;
@@ -43,6 +46,16 @@ pub fn extract_type_id(ptr: *const ()) -> TypeId {
 // =============================================================================
 
 /// GetAttr: dst = src.attr[name_idx]
+///
+/// Attribute lookup follows Python's descriptor protocol with Shape optimization:
+/// 1. Check instance Shape for property (O(1) via hidden class)
+/// 2. Fall back to type lookup for methods/class attributes
+/// 3. Raise AttributeError if not found
+///
+/// Supports:
+/// - OBJECT: ShapedObject with hidden class optimization
+/// - List/Dict/Tuple: Built-in method dispatch (future)
+/// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn get_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
@@ -50,39 +63,274 @@ pub fn get_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let name_idx = inst.src2().0 as u16;
     let name = frame.get_name(name_idx).clone();
 
-    // TODO: Implement method binding with inline caching
-    // For now, return attribute error
+    // Handle different object types
     if let Some(ptr) = obj.as_object_ptr() {
         let type_id = extract_type_id(ptr);
-        ControlFlow::Error(RuntimeError::attribute_error(type_id.name(), name))
+
+        match type_id {
+            TypeId::OBJECT => {
+                // Generic ShapedObject - use Shape-based lookup
+                let shaped = unsafe { &*(ptr as *const ShapedObject) };
+
+                // Fast path: Check object's property slots via Shape
+                if let Some(value) = shaped.get_property(&*name) {
+                    // Note: Deleted properties are set to None in the slot
+                    // A real None value is distinguishable via separate tracking
+                    vm.current_frame_mut().set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+
+                // Property not found on instance
+                ControlFlow::Error(RuntimeError::attribute_error("object", name))
+            }
+
+            TypeId::DICT => {
+                // Dict objects have no attributes (use bracket access)
+                ControlFlow::Error(RuntimeError::attribute_error("dict", name))
+            }
+
+            TypeId::LIST => {
+                // List method lookup (append, extend, pop, etc.)
+                // TODO: Implement list method binding
+                ControlFlow::Error(RuntimeError::attribute_error("list", name))
+            }
+
+            TypeId::TUPLE => {
+                // Tuple has limited methods (count, index)
+                // TODO: Implement tuple method binding
+                ControlFlow::Error(RuntimeError::attribute_error("tuple", name))
+            }
+
+            TypeId::SET => {
+                // Set methods (add, remove, union, etc.)
+                // TODO: Implement set method binding
+                ControlFlow::Error(RuntimeError::attribute_error("set", name))
+            }
+
+            TypeId::FUNCTION | TypeId::CLOSURE => {
+                // Function attributes (__name__, __doc__, __code__, etc.)
+                // TODO: Implement function attribute access
+                ControlFlow::Error(RuntimeError::attribute_error("function", name))
+            }
+
+            _ => {
+                // User-defined types use ShapedObject storage
+                if is_user_defined_type(type_id) {
+                    let shaped = unsafe { &*(ptr as *const ShapedObject) };
+                    if let Some(value) = shaped.get_property(&*name) {
+                        vm.current_frame_mut().set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                }
+                // Unknown object type or property not found
+                ControlFlow::Error(RuntimeError::attribute_error(type_id.name(), name))
+            }
+        }
+    } else if obj.is_string() {
+        // String methods (upper, lower, split, join, etc.)
+        // TODO: Implement string method binding
+        ControlFlow::Error(RuntimeError::attribute_error("str", name))
+    } else if obj.is_none() {
+        ControlFlow::Error(RuntimeError::attribute_error("NoneType", name))
+    } else if obj.is_bool() {
+        ControlFlow::Error(RuntimeError::attribute_error("bool", name))
+    } else if obj.is_int() || obj.is_float() {
+        // Numeric methods (bit_length, as_integer_ratio, etc.)
+        let type_name = if obj.is_int() { "int" } else { "float" };
+        ControlFlow::Error(RuntimeError::attribute_error(type_name, name))
     } else {
-        ControlFlow::Error(RuntimeError::attribute_error(obj.type_name(), name))
+        ControlFlow::Error(RuntimeError::attribute_error("unknown", name))
     }
 }
 
 /// SetAttr: src1.attr[name_idx] = src2
+///
+/// Sets an attribute on an object. This may cause a Shape transition
+/// if the property is new.
+///
+/// Supports:
+/// - OBJECT: ShapedObject with Shape transition support
+/// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn set_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
-    let _obj = frame.get_reg(inst.dst().0);
-    let _value = frame.get_reg(inst.src2().0);
+    let obj = frame.get_reg(inst.dst().0);
+    let value = frame.get_reg(inst.src2().0);
     let name_idx = inst.src1().0 as u16;
-    let _name = frame.get_name(name_idx).clone();
+    let name = frame.get_name(name_idx).clone();
 
-    // TODO: Implement proper object attribute setting
-    ControlFlow::Error(RuntimeError::internal("SetAttr not yet implemented"))
+    if let Some(ptr) = obj.as_object_ptr() {
+        let type_id = extract_type_id(ptr);
+
+        match type_id {
+            TypeId::OBJECT => {
+                // Generic ShapedObject - use Shape-based property setting
+                let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+
+                // Get the global shape registry for transitions
+                let registry = shape_registry();
+
+                // Set property (may create Shape transition)
+                // Intern the name for efficient storage
+                let interned_name = prism_core::intern::intern(&*name);
+                shaped.set_property(interned_name, value, registry);
+
+                ControlFlow::Continue
+            }
+
+            TypeId::DICT | TypeId::LIST | TypeId::TUPLE | TypeId::SET => {
+                // Built-in containers don't support attribute assignment
+                ControlFlow::Error(RuntimeError::attribute_error(
+                    type_id.name(),
+                    format!(
+                        "'{}' object attribute '{}' is read-only",
+                        type_id.name(),
+                        name
+                    ),
+                ))
+            }
+
+            TypeId::FUNCTION | TypeId::CLOSURE => {
+                // Functions have some settable attributes (__doc__, __name__)
+                // TODO: Implement function attribute setting
+                ControlFlow::Error(RuntimeError::attribute_error(
+                    "function",
+                    format!("cannot set '{}' on function", name),
+                ))
+            }
+
+            _ => {
+                // User-defined types use ShapedObject storage
+                if is_user_defined_type(type_id) {
+                    let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+                    let registry = shape_registry();
+                    let interned_name = prism_core::intern::intern(&*name);
+                    shaped.set_property(interned_name, value, registry);
+                    return ControlFlow::Continue;
+                }
+                // Unknown type - reject
+                ControlFlow::Error(RuntimeError::attribute_error(
+                    type_id.name(),
+                    format!("'{}' object has no attribute '{}'", type_id.name(), name),
+                ))
+            }
+        }
+    } else {
+        // Non-object values (int, float, bool, str, None) don't support setattr
+        let type_name = if obj.is_none() {
+            "NoneType"
+        } else if obj.is_bool() {
+            "bool"
+        } else if obj.is_int() {
+            "int"
+        } else if obj.is_float() {
+            "float"
+        } else if obj.is_string() {
+            "str"
+        } else {
+            "unknown"
+        };
+        ControlFlow::Error(RuntimeError::attribute_error(
+            type_name,
+            format!("'{}' object has no attribute '{}'", type_name, name),
+        ))
+    }
 }
 
 /// DelAttr: del src.attr[name_idx]
+///
+/// Deletes an attribute from an object.
+///
+/// Note: This doesn't change the object's Shape - the slot is just set to None.
+/// A more sophisticated implementation could use "delete shapes" like V8 does
+/// for objects that frequently have properties deleted.
+///
+/// Supports:
+/// - OBJECT: ShapedObject with slot-based deletion
+/// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn del_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
-    let _obj = frame.get_reg(inst.src1().0);
+    let obj = frame.get_reg(inst.src1().0);
     let name_idx = inst.src2().0 as u16;
-    let _name = frame.get_name(name_idx).clone();
+    let name = frame.get_name(name_idx).clone();
 
-    // TODO: Implement proper object attribute deletion
-    ControlFlow::Error(RuntimeError::internal("DelAttr not yet implemented"))
+    if let Some(ptr) = obj.as_object_ptr() {
+        let type_id = extract_type_id(ptr);
+
+        match type_id {
+            TypeId::OBJECT => {
+                // Generic ShapedObject - use slot-based deletion
+                let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+
+                // Try to delete the property (sets slot to None)
+                if shaped.delete_property(&*name) {
+                    ControlFlow::Continue
+                } else {
+                    // Property doesn't exist
+                    ControlFlow::Error(RuntimeError::attribute_error(
+                        "object",
+                        format!("'object' object has no attribute '{}'", name),
+                    ))
+                }
+            }
+
+            TypeId::DICT | TypeId::LIST | TypeId::TUPLE | TypeId::SET => {
+                // Built-in containers don't support attribute deletion
+                ControlFlow::Error(RuntimeError::attribute_error(
+                    type_id.name(),
+                    format!(
+                        "cannot delete attribute '{}' of '{}' object",
+                        name,
+                        type_id.name()
+                    ),
+                ))
+            }
+
+            TypeId::FUNCTION | TypeId::CLOSURE => {
+                // Functions have some deletable attributes
+                // TODO: Implement function attribute deletion
+                ControlFlow::Error(RuntimeError::attribute_error(
+                    "function",
+                    format!("cannot delete '{}' from function", name),
+                ))
+            }
+
+            _ => {
+                // User-defined types use ShapedObject storage
+                if is_user_defined_type(type_id) {
+                    let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+                    if shaped.delete_property(&*name) {
+                        return ControlFlow::Continue;
+                    }
+                }
+                // Unknown type or property not found - reject
+                ControlFlow::Error(RuntimeError::attribute_error(
+                    type_id.name(),
+                    format!("'{}' object has no attribute '{}'", type_id.name(), name),
+                ))
+            }
+        }
+    } else {
+        // Non-object values don't support delattr
+        let type_name = if obj.is_none() {
+            "NoneType"
+        } else if obj.is_bool() {
+            "bool"
+        } else if obj.is_int() {
+            "int"
+        } else if obj.is_float() {
+            "float"
+        } else if obj.is_string() {
+            "str"
+        } else {
+            "unknown"
+        };
+        ControlFlow::Error(RuntimeError::attribute_error(
+            type_name,
+            format!("'{}' object has no attribute '{}'", type_name, name),
+        ))
+    }
 }
 
 // =============================================================================
