@@ -537,6 +537,77 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
             }
 
             // =================================================================
+            // Container Item Operations
+            // =================================================================
+            Some(Opcode::GetItem) => {
+                // GetItem: dst = container[key]
+                self.output.push(TemplateInstruction::GetItem {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    container: inst.src1().0,
+                    key: inst.src2().0,
+                });
+            }
+            Some(Opcode::SetItem) => {
+                // SetItem: src1[dst] = src2 (key in dst field)
+                self.output.push(TemplateInstruction::SetItem {
+                    bc_offset,
+                    container: inst.src1().0,
+                    key: inst.dst().0,
+                    value: inst.src2().0,
+                });
+            }
+            Some(Opcode::DelItem) => {
+                // DelItem: del src1[src2]
+                self.output.push(TemplateInstruction::DelItem {
+                    bc_offset,
+                    container: inst.src1().0,
+                    key: inst.src2().0,
+                });
+            }
+
+            // =================================================================
+            // Iteration Operations
+            // =================================================================
+            Some(Opcode::GetIter) => {
+                // GetIter: dst = iter(src1)
+                self.output.push(TemplateInstruction::GetIter {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    src: inst.src1().0,
+                });
+            }
+            Some(Opcode::ForIter) => {
+                // ForIter: dst = next(src1), offset in src2 (as i8)
+                self.output.push(TemplateInstruction::ForIter {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    iter: inst.src1().0,
+                    offset: inst.src2().0 as i8,
+                });
+            }
+
+            // =================================================================
+            // Utility Operations
+            // =================================================================
+            Some(Opcode::Len) => {
+                // Len: dst = len(src1)
+                self.output.push(TemplateInstruction::Len {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    src: inst.src1().0,
+                });
+            }
+            Some(Opcode::IsCallable) => {
+                // IsCallable: dst = callable(src1)
+                self.output.push(TemplateInstruction::IsCallable {
+                    bc_offset,
+                    dst: inst.dst().0,
+                    src: inst.src1().0,
+                });
+            }
+
+            // =================================================================
             // Control Flow Operations
             // =================================================================
             Some(Opcode::Jump) => {
@@ -3577,6 +3648,296 @@ mod tests {
                 name_idx: 2,
                 ..
             }
+        ));
+    }
+
+    // =========================================================================
+    // Phase 12: Container Item Operations
+    // =========================================================================
+
+    #[test]
+    fn test_lower_get_item_basic() {
+        // GetItem: dst = container[key]
+        let code = make_code(vec![Instruction::op_dss(
+            Opcode::GetItem,
+            Register(3),
+            Register(1),
+            Register(2),
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::GetItem {
+                dst: 3,
+                container: 1,
+                key: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lower_set_item_basic() {
+        // SetItem: src1[dst] = src2 (using DstSrcSrc, key in dst field)
+        let code = make_code(vec![Instruction::op_dss(
+            Opcode::SetItem,
+            Register(2), // key
+            Register(0), // container
+            Register(5), // value
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::SetItem {
+                container: 0,
+                key: 2,
+                value: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lower_del_item_basic() {
+        // DelItem: del src1[src2]
+        let code = make_code(vec![Instruction::op_dss(
+            Opcode::DelItem,
+            Register(0), // unused dst
+            Register(1), // container
+            Register(4), // key
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::DelItem {
+                container: 1,
+                key: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lower_get_iter_basic() {
+        // GetIter: dst = iter(src)
+        let code = make_code(vec![Instruction::op_ds(
+            Opcode::GetIter,
+            Register(2),
+            Register(0),
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::GetIter { dst: 2, src: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn test_lower_for_iter_basic() {
+        // ForIter: dst = next(iter), jump offset in src2
+        let code = make_code(vec![Instruction::op_dss(
+            Opcode::ForIter,
+            Register(3),
+            Register(1),
+            Register(10), // offset as u8 (treated as i8)
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::ForIter {
+                dst: 3,
+                iter: 1,
+                offset: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lower_len_basic() {
+        // Len: dst = len(src)
+        let code = make_code(vec![Instruction::op_ds(
+            Opcode::Len,
+            Register(5),
+            Register(2),
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::Len { dst: 5, src: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn test_lower_is_callable_basic() {
+        // IsCallable: dst = callable(src)
+        let code = make_code(vec![Instruction::op_ds(
+            Opcode::IsCallable,
+            Register(4),
+            Register(1),
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::IsCallable { dst: 4, src: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_lower_all_container_ops() {
+        // Verify all container opcodes produce output
+        let container_ops = [
+            ("GetItem", Opcode::GetItem),
+            ("SetItem", Opcode::SetItem),
+            ("DelItem", Opcode::DelItem),
+        ];
+
+        for (name, opcode) in container_ops {
+            let code = make_code(vec![Instruction::op_dss(
+                opcode,
+                Register(0),
+                Register(1),
+                Register(2),
+            )]);
+            let speculation = NoSpeculation;
+            let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+            let ir = lowerer.lower(&code);
+            assert_eq!(ir.len(), 1, "Failed for container op: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_lower_all_iteration_ops() {
+        // Verify all iteration opcodes produce output
+        let iter_ops = [
+            ("GetIter", Opcode::GetIter, true),
+            ("ForIter", Opcode::ForIter, false),
+        ];
+
+        for (name, opcode, is_ds) in iter_ops {
+            let code = if is_ds {
+                make_code(vec![Instruction::op_ds(opcode, Register(0), Register(1))])
+            } else {
+                make_code(vec![Instruction::op_dss(
+                    opcode,
+                    Register(0),
+                    Register(1),
+                    Register(2),
+                )])
+            };
+            let speculation = NoSpeculation;
+            let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+            let ir = lowerer.lower(&code);
+            assert_eq!(ir.len(), 1, "Failed for iteration op: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_lower_all_utility_ops() {
+        // Verify utility opcodes produce output
+        let utility_ops = [("Len", Opcode::Len), ("IsCallable", Opcode::IsCallable)];
+
+        for (name, opcode) in utility_ops {
+            let code = make_code(vec![Instruction::op_ds(opcode, Register(0), Register(1))]);
+            let speculation = NoSpeculation;
+            let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+            let ir = lowerer.lower(&code);
+            assert_eq!(ir.len(), 1, "Failed for utility op: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_lower_for_loop_pattern() {
+        // Realistic for-loop pattern: GetIter + ForIter
+        let code = make_code(vec![
+            // iter = iter(list)
+            Instruction::op_ds(Opcode::GetIter, Register(1), Register(0)),
+            // item = next(iter), jump on StopIteration
+            Instruction::op_dss(Opcode::ForIter, Register(2), Register(1), Register(5)),
+        ]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 2);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::GetIter { dst: 1, src: 0, .. }
+        ));
+        assert!(matches!(
+            ir[1],
+            TemplateInstruction::ForIter {
+                dst: 2,
+                iter: 1,
+                offset: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_lower_container_access_sequence() {
+        // Pattern: list[0], list[1] = value, len(list)
+        let code = make_code(vec![
+            Instruction::op_dss(Opcode::GetItem, Register(2), Register(0), Register(1)),
+            Instruction::op_dss(Opcode::SetItem, Register(3), Register(0), Register(4)),
+            Instruction::op_ds(Opcode::Len, Register(5), Register(0)),
+        ]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 3);
+        assert!(matches!(ir[0], TemplateInstruction::GetItem { .. }));
+        assert!(matches!(ir[1], TemplateInstruction::SetItem { .. }));
+        assert!(matches!(ir[2], TemplateInstruction::Len { .. }));
+    }
+
+    #[test]
+    fn test_lower_negative_for_iter_offset() {
+        // ForIter with negative offset (backward jump for continue)
+        let code = make_code(vec![Instruction::op_dss(
+            Opcode::ForIter,
+            Register(0),
+            Register(1),
+            Register(0xFB), // -5 as u8
+        )]);
+        let speculation = NoSpeculation;
+        let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
+
+        let ir = lowerer.lower(&code);
+        assert_eq!(ir.len(), 1);
+        assert!(matches!(
+            ir[0],
+            TemplateInstruction::ForIter { offset: -5, .. }
         ));
     }
 }
