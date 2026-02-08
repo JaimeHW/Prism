@@ -36,6 +36,10 @@ pub mod strength_reduce;
 pub mod tailcall;
 pub mod unroll;
 
+// PGO optimization passes
+pub mod branch_probability;
+pub mod hot_cold;
+
 // Re-export key types
 pub use dse::{Dse, DseConfig, DseStats};
 pub use escape::{Escape, EscapeAnalysis, EscapeState};

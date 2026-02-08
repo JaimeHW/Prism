@@ -6,10 +6,11 @@
 //! # Pass Phases
 //!
 //! 1. **Canonicalization**: Simplify, constant folding
-//! 2. **Local**: GVN, copy propagation
-//! 3. **Loop**: LICM, loop unrolling
-//! 4. **Interprocedural**: Inlining, escape analysis
-//! 5. **Cleanup**: DCE, CFG simplification
+//! 2. **ProfileGuided**: Branch probability, hot/cold splitting
+//! 3. **Local**: GVN, copy propagation
+//! 4. **Loop**: LICM, loop unrolling
+//! 5. **Interprocedural**: Inlining, escape analysis
+//! 6. **Cleanup**: DCE, CFG simplification
 //!
 //! # Fixed-Point Iteration
 //!
@@ -18,11 +19,13 @@
 //! of earlier passes (e.g., inlining enables more GVN).
 
 use super::OptimizationPass;
+use super::branch_probability::BranchProbabilityPass;
 use super::copy_prop::CopyProp;
 use super::dce::Dce;
 use super::dse::Dse;
 use super::escape::Escape;
 use super::gvn::Gvn;
+use super::hot_cold::HotColdPass;
 use super::inline::Inline;
 use super::instcombine::InstCombine;
 use super::licm::Licm;
@@ -46,6 +49,8 @@ use std::time::{Duration, Instant};
 pub enum PassPhase {
     /// Early passes: canonicalization, constant folding.
     Canonicalization,
+    /// Profile-guided optimizations: branch probability, hot/cold splitting.
+    ProfileGuided,
     /// Local optimizations: GVN, copy propagation.
     Local,
     /// Loop optimizations: LICM, unrolling.
@@ -113,6 +118,15 @@ pub struct PipelineConfig {
     pub enable_instcombine: bool,
 
     // =========================================================================
+    // ProfileGuided Phase
+    // =========================================================================
+    /// Enable branch probability annotation (PGO).
+    pub enable_branch_probability: bool,
+
+    /// Enable hot/cold code splitting (PGO).
+    pub enable_hot_cold: bool,
+
+    // =========================================================================
     // Local Phase
     // =========================================================================
     /// Enable Copy Propagation.
@@ -176,6 +190,9 @@ impl Default for PipelineConfig {
             enable_simplify: true,
             enable_sccp: true,
             enable_instcombine: true,
+            // ProfileGuided
+            enable_branch_probability: true,
+            enable_hot_cold: true,
             // Local
             enable_copy_prop: true,
             enable_gvn: true,
@@ -209,6 +226,9 @@ impl PipelineConfig {
             enable_simplify: true,
             enable_sccp: false,       // Skip expensive dataflow
             enable_instcombine: true, // Cheap and effective
+            // ProfileGuided - skip PGO in Tier-1 for compile speed
+            enable_branch_probability: false,
+            enable_hot_cold: false,
             // Local - only essential
             enable_copy_prop: true, // Cheap and improves code quality
             enable_gvn: true,       // Essential for code quality
@@ -309,6 +329,20 @@ impl OptPipeline {
         // InstCombine: peephole optimizations on instruction sequences
         if self.config.enable_instcombine {
             self.register(InstCombine::new(), PassPhase::Canonicalization);
+        }
+
+        // =====================================================================
+        // ProfileGuided phase - PGO-driven optimizations
+        // =====================================================================
+
+        // Branch probability: annotate branches with measured/estimated weights
+        if self.config.enable_branch_probability {
+            self.register(BranchProbabilityPass::new(), PassPhase::ProfileGuided);
+        }
+
+        // Hot/cold splitting: partition code by execution temperature
+        if self.config.enable_hot_cold {
+            self.register(HotColdPass::new(), PassPhase::ProfileGuided);
         }
 
         // =====================================================================
@@ -961,6 +995,8 @@ mod tests {
             enable_simplify: false,
             enable_sccp: false,
             enable_instcombine: false,
+            enable_branch_probability: false,
+            enable_hot_cold: false,
             enable_copy_prop: false,
             enable_gvn: false,
             enable_dse: false,
