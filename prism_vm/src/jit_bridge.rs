@@ -27,6 +27,7 @@ use prism_jit::runtime::{CodeCache, CompiledEntry, RuntimeConfig};
 use prism_jit::tier1::codegen::{TemplateCompiler, TemplateInstruction};
 use prism_jit::tier2::{CodeEmitter, InstructionSelector};
 
+use crate::compilation_queue::CompilationQueue;
 use crate::jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
 
@@ -121,8 +122,10 @@ pub struct JitBridge {
     executor: JitExecutor,
     /// Template compiler for Tier 1.
     tier1_compiler: TemplateCompiler,
-    /// Code cache (shared with executor).
+    /// Code cache (shared with executor and compilation queue).
     code_cache: Arc<CodeCache>,
+    /// Background compilation queue (lazy-initialized when needed).
+    compilation_queue: Option<CompilationQueue>,
 }
 
 impl JitBridge {
@@ -140,11 +143,22 @@ impl JitBridge {
         let executor = JitExecutor::new(Arc::clone(&code_cache));
         let tier1_compiler = TemplateCompiler::new_for_testing();
 
+        // Create compilation queue if background compilation is enabled
+        let compilation_queue = if config.background_compilation {
+            Some(CompilationQueue::new(
+                Arc::clone(&code_cache),
+                config.max_queue_size,
+            ))
+        } else {
+            None
+        };
+
         Self {
             config,
             executor,
             tier1_compiler,
             code_cache,
+            compilation_queue,
         }
     }
 
@@ -321,10 +335,15 @@ impl JitBridge {
 
     /// Request asynchronous compilation.
     ///
-    /// Returns immediately, compilation happens in background.
-    pub fn compile_async(&self, _code: Arc<CodeObject>) {
-        // TODO: Queue compilation request to background thread
-        // For now, this is a no-op - caller should use compile_sync
+    /// Enqueues the code object for background compilation. Returns immediately.
+    /// The compiled code will appear in the shared code cache once the worker
+    /// thread finishes compilation.
+    pub fn compile_async(&self, code: Arc<CodeObject>) {
+        if let Some(ref queue) = self.compilation_queue {
+            queue.enqueue(code, 1);
+        }
+        // If no queue (background_compilation=false), silently drop.
+        // Caller should have checked config before calling this path.
     }
 
     // =========================================================================

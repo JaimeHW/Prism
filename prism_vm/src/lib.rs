@@ -65,6 +65,7 @@ pub mod speculative;
 pub mod type_feedback;
 
 // JIT integration
+pub mod compilation_queue;
 pub mod deopt;
 pub mod jit_bridge;
 pub mod jit_context;
