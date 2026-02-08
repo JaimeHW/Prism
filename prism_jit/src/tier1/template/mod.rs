@@ -23,6 +23,8 @@ pub mod control;
 pub mod dict_specialize;
 pub mod guards;
 pub mod ic_helpers;
+pub mod int_specialize;
+pub mod list_enhance;
 pub mod list_specialize;
 pub mod memory;
 pub mod objects;
