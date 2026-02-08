@@ -438,6 +438,7 @@ impl OptPipeline {
         // Run phases in order
         for phase in &[
             PassPhase::Canonicalization,
+            PassPhase::ProfileGuided,
             PassPhase::Local,
             PassPhase::Loop,
             PassPhase::Interprocedural,
