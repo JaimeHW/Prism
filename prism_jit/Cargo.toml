@@ -4,8 +4,14 @@ description = "JVM/V8-tier JIT compiler for Prism"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+arm64 = []  # Enable ARM64 backend compilation on non-ARM platforms
+
+
 [dependencies]
 prism_core.workspace = true
+prism_runtime.workspace = true
 memmap2.workspace = true
 bitflags = "2.6"
 prism_compiler.workspace = true
