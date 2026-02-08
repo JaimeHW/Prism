@@ -15,6 +15,7 @@ pub use large_object_space::LargeObjectSpace;
 pub use nursery::Nursery;
 pub use old_space::OldSpace;
 
+use crate::barrier::RememberedSet;
 use crate::config::GcConfig;
 use crate::stats::GcStats;
 use crate::Generation;
@@ -41,6 +42,10 @@ pub struct GcHeap {
 
     /// Total bytes allocated since last GC.
     bytes_since_gc: AtomicUsize,
+
+    /// Remembered set for tracking old→young references.
+    /// Used by the write barrier and drained during minor GC.
+    remembered_set: RememberedSet,
 }
 
 impl GcHeap {
@@ -59,6 +64,7 @@ impl GcHeap {
             large_objects,
             stats: GcStats::new(),
             bytes_since_gc: AtomicUsize::new(0),
+            remembered_set: RememberedSet::new(),
         }
     }
 
@@ -227,6 +233,31 @@ impl GcHeap {
     /// Get mutable large object space access.
     pub fn large_objects_mut(&mut self) -> &mut LargeObjectSpace {
         &mut self.large_objects
+    }
+
+    // =========================================================================
+    // Remembered Set (Write Barrier Integration)
+    // =========================================================================
+
+    /// Get the remembered set for write barrier marking.
+    ///
+    /// The write barrier calls this to record old→young references.
+    #[inline]
+    pub fn remembered_set(&self) -> &RememberedSet {
+        &self.remembered_set
+    }
+
+    /// Drain the remembered set for GC root scanning.
+    ///
+    /// Called during minor collection to get all old→young references
+    /// that need to be treated as roots.
+    pub fn drain_remembered_set(&self) -> Vec<crate::barrier::RememberedEntry> {
+        self.remembered_set.drain()
+    }
+
+    /// Clear the remembered set.
+    pub fn clear_remembered_set(&self) {
+        self.remembered_set.clear();
     }
 }
 

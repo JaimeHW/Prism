@@ -59,6 +59,7 @@ mod stats;
 
 // Re-exports for convenient access
 pub use alloc::GcRef;
+pub use barrier::{CardTable, RememberedEntry, RememberedSet};
 pub use config::GcConfig;
 pub use gc_array::GcArray;
 pub use heap::GcHeap;

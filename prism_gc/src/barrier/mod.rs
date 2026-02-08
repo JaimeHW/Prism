@@ -5,8 +5,10 @@
 //! old generation to find references into the nursery.
 
 mod card_table;
+mod remembered_set;
 
 pub use card_table::CardTable;
+pub use remembered_set::{RememberedEntry, RememberedSet};
 
 use crate::heap::GcHeap;
 use prism_core::Value;
@@ -52,10 +54,8 @@ pub fn write_barrier_ptr(heap: &GcHeap, holder: *const (), new_ptr: *const ()) {
 
     // Check if new_ptr points to young generation
     if heap.is_young(new_ptr) {
-        // Old→Young reference: mark card dirty
-        // This will be implemented when card_table is integrated with heap
-        #[cfg(feature = "trace")]
-        eprintln!("BARRIER: old {:p} -> young {:p}", holder, new_ptr);
+        // Old→Young reference: record in remembered set
+        heap.remembered_set().insert(holder);
     }
 }
 
