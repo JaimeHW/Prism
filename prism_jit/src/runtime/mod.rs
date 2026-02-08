@@ -41,6 +41,7 @@ pub mod compiler_thread;
 pub mod entry_stub;
 pub mod profile_collector;
 pub mod profile_data;
+pub mod type_feedback;
 
 #[cfg(test)]
 mod profile_data_tests;
@@ -51,6 +52,10 @@ pub use entry_stub::{EntryStub, ExitReason};
 pub use profile_data::{
     AtomicBranchCounter, BranchProfile, CallProfile, CallTarget, ProfileData, ProfileError,
     TypeProfile, TypeProfileEntry,
+};
+pub use type_feedback::{
+    CallSpeculation, GenericReason, ObservedType, OracleConfig, SpeculationDecision,
+    TypeFeedbackOracle, TypeStability,
 };
 
 // =============================================================================
