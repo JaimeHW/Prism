@@ -601,11 +601,13 @@ impl From<u8> for Value {
 // Helper for InternedString to avoid circular dependency
 impl InternedString {
     /// Clone the underlying Arc for use in Value.
-    fn clone_arc(&self) -> std::sync::Arc<str> {
-        // We need to access the inner Arc - this requires the type to expose it
-        // For now, we'll use a workaround by re-interning
-        // TODO: Add proper Arc access to InternedString
-        std::sync::Arc::from(self.as_str())
+    ///
+    /// This clones the Arc (incrementing the reference count) rather than
+    /// creating a new allocation. This is critical for Value's NaN-boxing
+    /// scheme: the data pointer stored in a Value must be the same for
+    /// equal interned strings, enabling O(1) equality via bit comparison.
+    pub(crate) fn clone_arc(&self) -> std::sync::Arc<str> {
+        self.get_arc()
     }
 }
 

@@ -55,6 +55,15 @@ impl InternedString {
     fn ptr(&self) -> *const u8 {
         self.inner.as_ptr()
     }
+
+    /// Get a clone of the underlying Arc.
+    ///
+    /// This increments the reference count rather than creating a new allocation,
+    /// ensuring pointer stability for NaN-boxing in `Value::string()`.
+    #[inline]
+    pub fn get_arc(&self) -> Arc<str> {
+        self.inner.clone()
+    }
 }
 
 impl PartialEq for InternedString {
