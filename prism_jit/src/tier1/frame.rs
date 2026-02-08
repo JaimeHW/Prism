@@ -128,6 +128,11 @@ impl FrameLayout {
         Self::new(num_registers, 0, GprSet::EMPTY)
     }
 
+    /// Create a frame layout for a function from a CodeObject.
+    pub fn for_function(code: &prism_compiler::bytecode::CodeObject) -> Self {
+        Self::minimal(code.register_count)
+    }
+
     /// Get memory operand for a bytecode register slot.
     #[inline]
     pub fn register_slot(&self, reg_idx: u16) -> MemOperand {

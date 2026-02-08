@@ -9,6 +9,8 @@
 
 pub mod codegen;
 pub mod deopt;
+pub mod deopt_ic;
+pub mod driver;
 pub mod frame;
 pub mod lower;
 pub mod template;
@@ -16,6 +18,10 @@ pub mod template;
 // Re-export main types
 pub use codegen::TemplateCompiler;
 pub use deopt::DeoptInfo;
+pub use deopt_ic::{IcDeoptContext, IcDeoptStats, IcUpdateResult, handle_ic_deopt};
+pub use driver::{
+    CompilationConfig, CompilationError, CompilationStats, CompiledCode, Tier1Compiler,
+};
 pub use frame::FrameLayout;
 pub use lower::{BytecodeLowerer, ComparisonOp, LoweringConfig};
 pub use template::OpcodeTemplate;
