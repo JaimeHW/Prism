@@ -9,12 +9,22 @@
 //! - `math` - Mathematical functions (sin, cos, sqrt, etc.)
 //! - `os` - Operating system interface
 //! - `sys` - System-specific parameters and functions
+//! - `functools` - Higher-order functions and callable operations
+//! - `itertools` - Iterator building blocks for efficient looping
+//! - `io` - Core I/O primitives (StringIO, BytesIO, FileMode)
 
+pub mod collections;
 pub mod exceptions;
+pub mod functools;
 pub mod generators;
+pub mod io;
+pub mod itertools;
+pub mod json;
 pub mod math;
 pub mod os;
+pub mod re;
 pub mod sys;
+pub mod time;
 
 use prism_core::Value;
 use std::sync::Arc;
@@ -87,6 +97,36 @@ impl StdlibRegistry {
 
         // Register sys module
         modules.insert(Arc::from("sys"), Box::new(sys::SysModule::new()));
+
+        // Register time module
+        modules.insert(Arc::from("time"), Box::new(time::TimeModule::new()));
+
+        // Register re module
+        modules.insert(Arc::from("re"), Box::new(re::ReModule::new()));
+
+        // Register json module
+        modules.insert(Arc::from("json"), Box::new(json::JsonModule::new()));
+
+        // Register collections module
+        modules.insert(
+            Arc::from("collections"),
+            Box::new(collections::CollectionsModule::new()),
+        );
+
+        // Register functools module
+        modules.insert(
+            Arc::from("functools"),
+            Box::new(functools::FunctoolsModule::new()),
+        );
+
+        // Register itertools module
+        modules.insert(
+            Arc::from("itertools"),
+            Box::new(itertools::ItertoolsModule::new()),
+        );
+
+        // Register io module
+        modules.insert(Arc::from("io"), Box::new(io::IoModule::new()));
 
         Self { modules }
     }
