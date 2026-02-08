@@ -21,6 +21,7 @@ pub mod comparison;
 pub mod containers;
 pub mod control;
 pub mod dict_specialize;
+pub mod float_specialize;
 pub mod guards;
 pub mod ic_helpers;
 pub mod int_specialize;
@@ -30,6 +31,7 @@ pub mod memory;
 pub mod objects;
 pub mod specialize_common;
 pub mod string_specialize;
+pub mod tuple_specialize;
 pub mod values;
 
 use crate::backend::x64::{Assembler, Label};
