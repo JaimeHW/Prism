@@ -30,6 +30,7 @@ pub mod list_specialize;
 pub mod memory;
 pub mod objects;
 pub mod specialize_common;
+pub mod string_enhance;
 pub mod string_specialize;
 pub mod tuple_specialize;
 pub mod values;
