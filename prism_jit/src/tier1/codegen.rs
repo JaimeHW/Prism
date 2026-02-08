@@ -293,15 +293,45 @@ impl TemplateCompiler {
                 // Closure cell clear requires VM context - deopt for Tier 1
                 ctx.asm.nop();
             }
-            // Object attribute operations - deopt to interpreter for Tier 1
-            // (requires type dispatch and Shape/slot management)
-            TemplateInstruction::GetAttr { .. } => {
-                // Attribute access requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            // Object attribute operations - use IC templates for inline caching
+            TemplateInstruction::GetAttr {
+                dst,
+                obj,
+                name_idx,
+                ic_site_idx,
+                ..
+            } => {
+                // Calculate IC offset from site index
+                // Each IC site is 8 bytes (shape_id: 4, slot_offset: 2, flags: 2)
+                let ic_offset = ic_site_idx.map(|idx| (idx as i32) * 8);
+
+                GetAttrTemplate {
+                    dst_reg: *dst,
+                    obj_reg: *obj,
+                    name_idx: *name_idx as u16,
+                    deopt_idx: ctx.create_deopt_label(),
+                    ic_site_offset: ic_offset,
+                }
+                .emit(ctx);
             }
-            TemplateInstruction::SetAttr { .. } => {
-                // Attribute write requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::SetAttr {
+                obj,
+                name_idx,
+                value,
+                ic_site_idx,
+                ..
+            } => {
+                // Calculate IC offset from site index
+                let ic_offset = ic_site_idx.map(|idx| (idx as i32) * 8);
+
+                SetAttrTemplate {
+                    obj_reg: *obj,
+                    name_idx: *name_idx as u16,
+                    value_reg: *value,
+                    deopt_idx: ctx.create_deopt_label(),
+                    ic_site_offset: ic_offset,
+                }
+                .emit(ctx);
             }
             TemplateInstruction::DelAttr { .. } => {
                 // Attribute delete requires type dispatch - deopt for Tier 1
@@ -385,6 +415,173 @@ impl TemplateCompiler {
             }
             TemplateInstruction::UnpackEx { .. } => {
                 // Unpack with star requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Function call operations - deopt to interpreter for Tier 1
+            TemplateInstruction::Call { .. } => {
+                // Call dispatch requires frame setup - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::CallKw { .. } => {
+                // Keyword call requires frame setup - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::CallMethod { .. } => {
+                // Method call requires frame setup - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::TailCall { .. } => {
+                // Tail call requires frame reuse - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::MakeFunction { .. } => {
+                // Function creation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::MakeClosure { .. } => {
+                // Closure creation requires GC - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::CallKwEx { .. } => {
+                // CallKw extension - handled with CallKw
+                ctx.asm.nop();
+            }
+            TemplateInstruction::CallEx { .. } => {
+                // Unpacking call requires frame setup - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildTupleUnpack { .. } => {
+                // Tuple unpack requires iteration - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::BuildDictUnpack { .. } => {
+                // Dict unpack requires iteration - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Exception handling operations - deopt to interpreter for Tier 1
+            TemplateInstruction::Raise { .. } => {
+                // Raise unwinds the stack - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::Reraise { .. } => {
+                // Re-raise unwinds the stack - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::RaiseFrom { .. } => {
+                // Chained raise unwinds the stack - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::PopExceptHandler { .. } => {
+                // Handler stack management - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ExceptionMatch { .. } => {
+                // Exception type matching - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::LoadException { .. } => {
+                // Load current exception - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::PushExcInfo { .. } => {
+                // Push exception info for finally - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::PopExcInfo { .. } => {
+                // Pop exception info after finally - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::HasExcInfo { .. } => {
+                // Check pending exception - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ClearException { .. } => {
+                // Clear exception state - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::EndFinally { .. } => {
+                // End finally block - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Generator operations - deopt to interpreter for Tier 1
+            TemplateInstruction::Yield { .. } => {
+                // Yield suspends generator state - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::YieldFrom { .. } => {
+                // Yield from delegates to sub-generator - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Context manager operations - deopt to interpreter for Tier 1
+            TemplateInstruction::BeforeWith { .. } => {
+                // Enter context manager - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ExitWith { .. } => {
+                // Exit context manager normally - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::WithCleanup { .. } => {
+                // Exit context manager on exception - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Import operations - deopt to interpreter for Tier 1
+            TemplateInstruction::ImportName { .. } => {
+                // Import module - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ImportFrom { .. } => {
+                // Import from module - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::ImportStar { .. } => {
+                // Import star - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Pattern matching operations (PEP 634) - deopt to interpreter for Tier 1
+            TemplateInstruction::MatchClass { .. } => {
+                // Match class pattern - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::MatchMapping { .. } => {
+                // Match mapping pattern - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::MatchSequence { .. } => {
+                // Match sequence pattern - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::MatchKeys { .. } => {
+                // Extract keys from mapping - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::CopyDictWithoutKeys { .. } => {
+                // Copy dict without specified keys - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::GetMatchArgs { .. } => {
+                // Get __match_args__ - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Async/coroutine operations - deopt to interpreter for Tier 1
+            TemplateInstruction::GetAwaitable { .. } => {
+                // Get awaitable object - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::GetAIter { .. } => {
+                // Get async iterator - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::GetANext { .. } => {
+                // Get next from async iterator - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::EndAsyncFor { .. } => {
+                // End async for loop - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::Send { .. } => {
+                // Send value to generator/coroutine - deopt for Tier 1
                 ctx.asm.nop();
             }
             TemplateInstruction::IntAdd { dst, lhs, rhs, .. } => {
@@ -875,20 +1072,24 @@ pub enum TemplateInstruction {
 
     // Object attribute operations
     /// Get attribute: dst = obj.attr[name_idx]
-    /// Requires type dispatch - deopt for Tier 1
+    /// Uses inline caching when ic_site_idx is Some for O(1) property access.
     GetAttr {
         bc_offset: u32,
         dst: u8,
         obj: u8,
         name_idx: u8, // 8-bit name index from src2 field
+        /// IC site index for inline caching (None = no IC, deopt directly)
+        ic_site_idx: Option<u32>,
     },
     /// Set attribute: obj.attr[name_idx] = value
-    /// Requires type dispatch - deopt for Tier 1
+    /// Uses inline caching when ic_site_idx is Some for O(1) property access.
     SetAttr {
         bc_offset: u32,
         obj: u8,
         name_idx: u8,
         value: u8,
+        /// IC site index for inline caching (None = no IC, deopt directly)
+        ic_site_idx: Option<u32>,
     },
     /// Delete attribute: del obj.attr[name_idx]
     /// Requires type dispatch - deopt for Tier 1
@@ -1051,6 +1252,85 @@ pub enum TemplateInstruction {
         src: u8,
         before: u8, // Elements before *rest
         after: u8,  // Elements after *rest
+    },
+
+    // Function call operations
+    /// Call function: dst = func(args...)
+    /// Requires call dispatch - deopt for Tier 1
+    Call {
+        bc_offset: u32,
+        dst: u8,
+        func: u8,
+        argc: u8,
+    },
+    /// Call with keyword args
+    /// Requires call dispatch - deopt for Tier 1
+    CallKw {
+        bc_offset: u32,
+        dst: u8,
+        func: u8,
+        argc: u8,
+    },
+    /// Call method: dst = obj.method(args...)
+    /// Requires call dispatch - deopt for Tier 1
+    CallMethod {
+        bc_offset: u32,
+        dst: u8,
+        method: u8,
+        argc: u8,
+    },
+    /// Tail call (reuse frame)
+    /// Requires call dispatch - deopt for Tier 1
+    TailCall {
+        bc_offset: u32,
+        func: u8,
+        argc: u8,
+    },
+    /// Make function from code object
+    /// Requires allocation - deopt for Tier 1
+    MakeFunction {
+        bc_offset: u32,
+        dst: u8,
+        code_idx: u16, // Constant pool index
+    },
+    /// Make closure with captured variables
+    /// Requires allocation - deopt for Tier 1
+    MakeClosure {
+        bc_offset: u32,
+        dst: u8,
+        code_idx: u16,
+    },
+    /// CallKw extension: keyword count and names index
+    /// Always follows CallKw
+    CallKwEx {
+        bc_offset: u32,
+        kwargc: u8,
+        kwnames_idx: u16,
+    },
+    /// Call with *args/**kwargs unpacking
+    /// Requires call dispatch - deopt for Tier 1
+    CallEx {
+        bc_offset: u32,
+        dst: u8,
+        func: u8,
+        args_tuple: u8,
+        kwargs_dict: u8, // 0xFF if no kwargs
+    },
+    /// Build tuple with unpacking: dst = (*src1, *src2, ...)
+    /// Requires allocation - deopt for Tier 1
+    BuildTupleUnpack {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
+    },
+    /// Build dict with unpacking: dst = {**src1, **src2, ...}
+    /// Requires allocation - deopt for Tier 1
+    BuildDictUnpack {
+        bc_offset: u32,
+        dst: u8,
+        start: u8,
+        count: u8,
     },
 
     // Integer arithmetic
@@ -1391,6 +1671,246 @@ pub enum TemplateInstruction {
     Nop {
         bc_offset: u32,
     },
+
+    // =========================================================================
+    // Exception Handling (Phase 16)
+    // =========================================================================
+    /// Raise exception: raise exc_reg
+    Raise {
+        bc_offset: u32,
+        /// Register containing exception to raise
+        exc: u8,
+    },
+    /// Re-raise current exception (bare raise)
+    Reraise {
+        bc_offset: u32,
+    },
+    /// Raise with chained cause: raise exc from cause
+    RaiseFrom {
+        bc_offset: u32,
+        /// Register containing exception to raise
+        exc: u8,
+        /// Register containing cause exception
+        cause: u8,
+    },
+    /// Pop exception handler from handler stack
+    PopExceptHandler {
+        bc_offset: u32,
+        /// Handler index (imm16)
+        handler_idx: u16,
+    },
+    /// Check if exception matches type: dst = isinstance(exc, type)
+    ExceptionMatch {
+        bc_offset: u32,
+        /// Destination for bool result
+        dst: u8,
+        /// Register containing exception type to match against
+        exc_type: u8,
+    },
+    /// Load current exception into register
+    LoadException {
+        bc_offset: u32,
+        /// Destination register for current exception
+        dst: u8,
+    },
+    /// Push exception info to stack (for finally block preservation)
+    PushExcInfo {
+        bc_offset: u32,
+    },
+    /// Pop exception info from stack (restore after finally)
+    PopExcInfo {
+        bc_offset: u32,
+    },
+    /// Check if there's a pending exception: dst = has_pending_exception()
+    HasExcInfo {
+        bc_offset: u32,
+        /// Destination register for bool result
+        dst: u8,
+    },
+    /// Clear exception state after handler processes exception
+    ClearException {
+        bc_offset: u32,
+    },
+    /// End finally block (re-raise or continue based on pending exception)
+    EndFinally {
+        bc_offset: u32,
+    },
+
+    // =========================================================================
+    // Generator Operations (Phase 17)
+    // =========================================================================
+    /// Yield value: suspend generator and yield dst
+    Yield {
+        bc_offset: u32,
+        /// Value to yield
+        value: u8,
+    },
+    /// Yield from: delegate to sub-generator
+    YieldFrom {
+        bc_offset: u32,
+        /// Destination for received value
+        dst: u8,
+        /// Sub-generator to delegate to
+        iter: u8,
+    },
+
+    // =========================================================================
+    // Context Manager Operations (Phase 18)
+    // =========================================================================
+    /// Prepare context manager: call __enter__ and setup __exit__
+    BeforeWith {
+        bc_offset: u32,
+        /// Destination for __enter__() result
+        dst: u8,
+        /// Context manager expression
+        mgr: u8,
+    },
+    /// Normal exit from with block: call __exit__(None, None, None)
+    ExitWith {
+        bc_offset: u32,
+        /// Destination for __exit__ result
+        dst: u8,
+        /// Context manager slot
+        mgr: u8,
+    },
+    /// Exception cleanup from with block: call __exit__(exc_type, exc_val, exc_tb)
+    WithCleanup {
+        bc_offset: u32,
+        /// Destination for __exit__ result (True suppresses exception)
+        dst: u8,
+        /// Context manager slot
+        mgr: u8,
+    },
+
+    // =========================================================================
+    // Import Operations (Phase 19)
+    // =========================================================================
+    /// Import module: dst = import(name_idx)
+    ImportName {
+        bc_offset: u32,
+        /// Destination for imported module
+        dst: u8,
+        /// Constant pool index for module name
+        name_idx: u16,
+    },
+    /// Import from module: dst = from module import name
+    ImportFrom {
+        bc_offset: u32,
+        /// Destination for imported name
+        dst: u8,
+        /// Constant pool index for name
+        name_idx: u16,
+    },
+    /// Import star: from module import *
+    ImportStar {
+        bc_offset: u32,
+        /// Module to import from
+        module: u8,
+    },
+
+    // =========================================================================
+    // Pattern Matching Operations (Phase 20, PEP 634)
+    // =========================================================================
+    /// Match class pattern: dst = isinstance(subject, cls)
+    MatchClass {
+        bc_offset: u32,
+        /// Destination for bool result
+        dst: u8,
+        /// Subject to match
+        subject: u8,
+        /// Class to match against
+        cls: u8,
+    },
+    /// Match mapping pattern: dst = is_mapping(subject)
+    MatchMapping {
+        bc_offset: u32,
+        /// Destination for bool result
+        dst: u8,
+        /// Subject to check
+        subject: u8,
+    },
+    /// Match sequence pattern: dst = is_sequence(subject)
+    MatchSequence {
+        bc_offset: u32,
+        /// Destination for bool result
+        dst: u8,
+        /// Subject to check
+        subject: u8,
+    },
+    /// Match keys: extract values from mapping by key tuple
+    MatchKeys {
+        bc_offset: u32,
+        /// Destination for values tuple
+        dst: u8,
+        /// Mapping to extract from
+        mapping: u8,
+        /// Tuple of keys to extract
+        keys: u8,
+    },
+    /// Copy dict without specified keys (for **rest capture)
+    CopyDictWithoutKeys {
+        bc_offset: u32,
+        /// Destination for new dict
+        dst: u8,
+        /// Source mapping
+        mapping: u8,
+        /// Keys to exclude
+        keys: u8,
+    },
+    /// Get __match_args__ from subject's type
+    GetMatchArgs {
+        bc_offset: u32,
+        /// Destination for __match_args__ tuple
+        dst: u8,
+        /// Subject to get match args from
+        subject: u8,
+    },
+
+    // =========================================================================
+    // Async/Coroutine Operations (Phase 21, PEP 492/525/530)
+    // =========================================================================
+    /// Get awaitable from object for await expression
+    GetAwaitable {
+        bc_offset: u32,
+        /// Destination for awaitable
+        dst: u8,
+        /// Object to convert to awaitable
+        obj: u8,
+    },
+    /// Get async iterator: dst = src.__aiter__()
+    GetAIter {
+        bc_offset: u32,
+        /// Destination for async iterator
+        dst: u8,
+        /// Object to get async iterator from
+        obj: u8,
+    },
+    /// Get next from async iterator: dst = src.__anext__()
+    GetANext {
+        bc_offset: u32,
+        /// Destination for awaitable yielding next value
+        dst: u8,
+        /// Async iterator
+        iter: u8,
+    },
+    /// Handle StopAsyncIteration in async for loop
+    EndAsyncFor {
+        bc_offset: u32,
+        /// Value register
+        dst: u8,
+        /// Jump offset on StopAsyncIteration
+        target: u16,
+    },
+    /// Send value to coroutine/generator: dst = generator.send(value)
+    Send {
+        bc_offset: u32,
+        /// Destination for result
+        dst: u8,
+        /// Generator/coroutine
+        generator: u8,
+        /// Value to send
+        value: u8,
+    },
 }
 
 impl TemplateInstruction {
@@ -1433,6 +1953,51 @@ impl TemplateInstruction {
             | TemplateInstruction::DictSet { bc_offset, .. }
             | TemplateInstruction::UnpackSequence { bc_offset, .. }
             | TemplateInstruction::UnpackEx { bc_offset, .. }
+            | TemplateInstruction::Call { bc_offset, .. }
+            | TemplateInstruction::CallKw { bc_offset, .. }
+            | TemplateInstruction::CallMethod { bc_offset, .. }
+            | TemplateInstruction::TailCall { bc_offset, .. }
+            | TemplateInstruction::MakeFunction { bc_offset, .. }
+            | TemplateInstruction::MakeClosure { bc_offset, .. }
+            | TemplateInstruction::CallKwEx { bc_offset, .. }
+            | TemplateInstruction::CallEx { bc_offset, .. }
+            | TemplateInstruction::BuildTupleUnpack { bc_offset, .. }
+            | TemplateInstruction::BuildDictUnpack { bc_offset, .. }
+            | TemplateInstruction::Raise { bc_offset, .. }
+            | TemplateInstruction::Reraise { bc_offset, .. }
+            | TemplateInstruction::RaiseFrom { bc_offset, .. }
+            | TemplateInstruction::PopExceptHandler { bc_offset, .. }
+            | TemplateInstruction::ExceptionMatch { bc_offset, .. }
+            | TemplateInstruction::LoadException { bc_offset, .. }
+            | TemplateInstruction::PushExcInfo { bc_offset, .. }
+            | TemplateInstruction::PopExcInfo { bc_offset, .. }
+            | TemplateInstruction::HasExcInfo { bc_offset, .. }
+            | TemplateInstruction::ClearException { bc_offset, .. }
+            | TemplateInstruction::EndFinally { bc_offset, .. }
+            // Phase 17: Generator operations
+            | TemplateInstruction::Yield { bc_offset, .. }
+            | TemplateInstruction::YieldFrom { bc_offset, .. }
+            // Phase 18: Context manager operations
+            | TemplateInstruction::BeforeWith { bc_offset, .. }
+            | TemplateInstruction::ExitWith { bc_offset, .. }
+            | TemplateInstruction::WithCleanup { bc_offset, .. }
+            // Phase 19: Import operations
+            | TemplateInstruction::ImportName { bc_offset, .. }
+            | TemplateInstruction::ImportFrom { bc_offset, .. }
+            | TemplateInstruction::ImportStar { bc_offset, .. }
+            // Phase 20: Pattern matching operations
+            | TemplateInstruction::MatchClass { bc_offset, .. }
+            | TemplateInstruction::MatchMapping { bc_offset, .. }
+            | TemplateInstruction::MatchSequence { bc_offset, .. }
+            | TemplateInstruction::MatchKeys { bc_offset, .. }
+            | TemplateInstruction::CopyDictWithoutKeys { bc_offset, .. }
+            | TemplateInstruction::GetMatchArgs { bc_offset, .. }
+            // Phase 21: Async/coroutine operations
+            | TemplateInstruction::GetAwaitable { bc_offset, .. }
+            | TemplateInstruction::GetAIter { bc_offset, .. }
+            | TemplateInstruction::GetANext { bc_offset, .. }
+            | TemplateInstruction::EndAsyncFor { bc_offset, .. }
+            | TemplateInstruction::Send { bc_offset, .. }
             | TemplateInstruction::IntAdd { bc_offset, .. }
             | TemplateInstruction::IntSub { bc_offset, .. }
             | TemplateInstruction::IntMul { bc_offset, .. }
