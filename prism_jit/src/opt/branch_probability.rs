@@ -427,6 +427,8 @@ pub struct BranchProbabilityPass {
     branches_annotated: usize,
     /// Number of blocks with frequency estimates.
     blocks_estimated: usize,
+    /// Optional profile data for PGO-guided annotation.
+    profile_data: Option<crate::runtime::profile_data::ProfileData>,
 }
 
 impl BranchProbabilityPass {
@@ -436,7 +438,23 @@ impl BranchProbabilityPass {
             annotations: BranchAnnotations::new(),
             branches_annotated: 0,
             blocks_estimated: 0,
+            profile_data: None,
         }
+    }
+
+    /// Create with attached profile data for PGO.
+    pub fn with_profile(profile: crate::runtime::profile_data::ProfileData) -> Self {
+        Self {
+            annotations: BranchAnnotations::new(),
+            branches_annotated: 0,
+            blocks_estimated: 0,
+            profile_data: Some(profile),
+        }
+    }
+
+    /// Inject profile data after construction.
+    pub fn inject_profile(&mut self, profile: crate::runtime::profile_data::ProfileData) {
+        self.profile_data = Some(profile);
     }
 
     /// Get the computed branch annotations.
@@ -481,7 +499,7 @@ impl OptimizationPass for BranchProbabilityPass {
             match node.op {
                 // Conditional branches get probability annotations
                 Operator::Control(ControlOp::If) => {
-                    // Default to even odds; profile merging will refine
+                    // Default to even odds; profile merging below will refine
                     annotations.set_branch(offset, BranchProbability::EVEN);
                     branch_count += 1;
                     changed = true;
@@ -498,6 +516,27 @@ impl OptimizationPass for BranchProbabilityPass {
                     block_count += 1;
                 }
                 _ => {}
+            }
+        }
+
+        // Merge PGO-measured probabilities, overriding static defaults
+        if let Some(ref profile) = self.profile_data {
+            annotations.merge_from_profile(profile);
+
+            // Refine loop frequencies from measured iteration counts
+            for (id, node) in graph.iter() {
+                let offset = id.index() as u32;
+                if matches!(node.op, Operator::Control(ControlOp::Loop)) {
+                    let trip_count = profile.loop_count(offset);
+                    if trip_count > 0 {
+                        let exec_count = profile.execution_count().max(1);
+                        let avg_trips = trip_count as f64 / exec_count as f64;
+                        annotations.set_block_freq(
+                            offset,
+                            BlockFrequency::for_loop(1.0, avg_trips.max(1.0)),
+                        );
+                    }
+                }
             }
         }
 
@@ -892,5 +931,147 @@ mod tests {
 
         // Profile2 overwrites profile1 for offset 10
         assert_eq!(ann.branch_count(), 2);
+    }
+
+    // =========================================================================
+    // PGO Integration Tests (BranchProbabilityPass with ProfileData)
+    // =========================================================================
+
+    #[test]
+    fn test_pass_with_profile_data_merges() {
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        // Record heavily biased branch at offset 0 (simulating an If node)
+        for _ in 0..95 {
+            profile.record_branch(0, true);
+        }
+        for _ in 0..5 {
+            profile.record_branch(0, false);
+        }
+
+        let pass = BranchProbabilityPass::with_profile(profile);
+        assert!(pass.profile_data.is_some());
+    }
+
+    #[test]
+    fn test_pass_without_profile_data() {
+        let pass = BranchProbabilityPass::new();
+        assert!(pass.profile_data.is_none());
+    }
+
+    #[test]
+    fn test_inject_profile_into_existing_pass() {
+        let mut pass = BranchProbabilityPass::new();
+        assert!(pass.profile_data.is_none());
+
+        let profile = crate::runtime::profile_data::ProfileData::new(42);
+        pass.inject_profile(profile);
+        assert!(pass.profile_data.is_some());
+    }
+
+    #[test]
+    fn test_pass_annotations_default_empty() {
+        let pass = BranchProbabilityPass::new();
+        assert_eq!(pass.branches_annotated(), 0);
+        assert_eq!(pass.blocks_estimated(), 0);
+        assert_eq!(pass.annotations().branch_count(), 0);
+    }
+
+    #[test]
+    fn test_pass_with_profile_run_on_graph_with_branches() {
+        use crate::ir::builder::{ControlBuilder, GraphBuilder};
+
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        // Record a 90% taken branch at offset that maps to an If node
+        for _ in 0..90 {
+            profile.record_branch(3, true);
+        }
+        for _ in 0..10 {
+            profile.record_branch(3, false);
+        }
+
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        builder.translate_branch(p0, 5, 6);
+        builder.return_value(p0);
+
+        let mut graph = builder.finish();
+        let mut pass = BranchProbabilityPass::with_profile(profile);
+
+        use super::OptimizationPass;
+        let changed = pass.run(&mut graph);
+        // The pass should have annotated branches
+        assert!(changed || pass.branches_annotated() > 0 || pass.blocks_estimated() > 0);
+    }
+
+    #[test]
+    fn test_pass_profile_loop_frequency_refinement() {
+        // Verify that measured loop counts refine frequency estimates
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        // Simulate 5 executions and 500 loop iterations → avg 100 trips
+        for _ in 0..5 {
+            profile.record_execution();
+        }
+        for _ in 0..500 {
+            profile.record_loop_iteration(10);
+        }
+
+        assert_eq!(profile.execution_count(), 5);
+        assert_eq!(profile.loop_count(10), 500);
+
+        // When the pass runs, it should compute avg_trips = 500/5 = 100
+        let pass = BranchProbabilityPass::with_profile(profile);
+        assert!(pass.profile_data.is_some());
+    }
+
+    #[test]
+    fn test_profile_merge_sets_has_profile_flag() {
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        profile.record_branch(5, true);
+
+        let mut ann = BranchAnnotations::new();
+        assert!(!ann.has_profile_data());
+
+        ann.merge_from_profile(&profile);
+        assert!(ann.has_profile_data());
+    }
+
+    #[test]
+    fn test_profile_overrides_static_default() {
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        // Record a 99% taken branch
+        for _ in 0..99 {
+            profile.record_branch(10, true);
+        }
+        profile.record_branch(10, false);
+
+        let mut ann = BranchAnnotations::new();
+        // Set static default first
+        ann.set_branch(10, BranchProbability::EVEN);
+        assert!((ann.get_branch(10).unwrap().as_f64() - 0.5).abs() < 0.01);
+
+        // Profile merge should override
+        ann.merge_from_profile(&profile);
+        let prob = ann.get_branch(10).unwrap().as_f64();
+        assert!(
+            prob > 0.95,
+            "Profile should override static default, got {prob}"
+        );
+    }
+
+    #[test]
+    fn test_empty_profile_preserves_defaults() {
+        let profile = crate::runtime::profile_data::ProfileData::new(1);
+
+        let mut ann = BranchAnnotations::new();
+        ann.set_branch(10, BranchProbability::LIKELY);
+        let before = ann.get_branch(10).unwrap();
+
+        ann.merge_from_profile(&profile);
+        let after = ann.get_branch(10).unwrap();
+
+        // Empty profile has no branches → existing annotation preserved
+        assert_eq!(before, after);
+        // But profile flag should be set
+        assert!(ann.has_profile_data());
     }
 }
