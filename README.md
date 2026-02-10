@@ -224,18 +224,6 @@ cargo build --workspace --release
 cargo test --workspace
 ```
 
-### Release Profile
-
-The release profile is tuned for maximum performance:
-
-```toml
-[profile.release]
-lto = "fat"           # Link-time optimization
-codegen-units = 1     # Single codegen unit for better optimization
-panic = "abort"       # Reduced binary size
-strip = true          # Strip symbols
-```
-
 ## Project Status
 
 Prism is under active development. Current status:
