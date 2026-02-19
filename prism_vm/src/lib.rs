@@ -71,6 +71,7 @@ pub mod jit_bridge;
 pub mod jit_context;
 pub mod jit_dispatch;
 pub mod jit_executor;
+mod tier1_lowering;
 
 // Opcode handlers (organized by category)
 pub mod ops;

@@ -18,18 +18,19 @@
 
 use std::sync::Arc;
 
-use prism_compiler::bytecode::{CodeObject, Opcode};
+use prism_compiler::bytecode::CodeObject;
 use prism_jit::ir::GraphBuilder;
 use prism_jit::ir::builder::translator::BytecodeTranslator;
 use prism_jit::opt::OptPipeline;
 use prism_jit::regalloc::{AllocatorConfig, LinearScanAllocator, LivenessAnalysis};
 use prism_jit::runtime::{CodeCache, CompiledEntry, RuntimeConfig};
-use prism_jit::tier1::codegen::{TemplateCompiler, TemplateInstruction};
+use prism_jit::tier1::codegen::TemplateCompiler;
 use prism_jit::tier2::{CodeEmitter, InstructionSelector};
 
 use crate::compilation_queue::CompilationQueue;
 use crate::jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
+use crate::tier1_lowering::lower_code_to_templates;
 
 // =============================================================================
 // Bridge Configuration
@@ -258,7 +259,7 @@ impl JitBridge {
         }
 
         // Convert bytecode to template IR
-        let instructions = bytecode_to_templates(code)?;
+        let instructions = lower_code_to_templates(code)?;
 
         // Compile
         let compiled = self
@@ -300,7 +301,9 @@ impl JitBridge {
         // Stage 1: Convert bytecode to Sea-of-Nodes IR
         let builder = GraphBuilder::new(code.register_count as usize, code.arg_count as usize);
         let translator = BytecodeTranslator::new(builder, code);
-        let mut graph = translator.translate();
+        let mut graph = translator
+            .translate()
+            .map_err(|e| format!("Tier 2 bytecode translation failed: {}", e))?;
 
         // Stage 2: Run optimization pipeline
         let mut pipeline = OptPipeline::new();
@@ -338,9 +341,9 @@ impl JitBridge {
     /// Enqueues the code object for background compilation. Returns immediately.
     /// The compiled code will appear in the shared code cache once the worker
     /// thread finishes compilation.
-    pub fn compile_async(&self, code: Arc<CodeObject>) {
+    pub fn compile_async(&self, code: Arc<CodeObject>, tier: u8) {
         if let Some(ref queue) = self.compilation_queue {
-            queue.enqueue(code, 1);
+            queue.enqueue(code, tier);
         }
         // If no queue (background_compilation=false), silently drop.
         // Caller should have checked config before calling this path.
@@ -447,126 +450,6 @@ impl JitBridge {
 #[inline]
 fn code_id_from_arc(code: &Arc<CodeObject>) -> u64 {
     Arc::as_ptr(code) as u64
-}
-
-/// Convert bytecode to template IR.
-///
-/// This is a simplified conversion for the template JIT.
-/// A full implementation would handle all opcodes.
-fn bytecode_to_templates(code: &CodeObject) -> Result<Vec<TemplateInstruction>, String> {
-    let mut templates = Vec::with_capacity(code.instructions.len());
-
-    for (idx, inst) in code.instructions.iter().enumerate() {
-        let bc_offset = idx as u32;
-        let opcode_byte = inst.opcode();
-
-        let template = match Opcode::from_u8(opcode_byte) {
-            Some(Opcode::Nop) => TemplateInstruction::Nop { bc_offset },
-
-            Some(Opcode::LoadConst) => {
-                let dst = inst.dst().index();
-                let idx = inst.imm16();
-                // Get value from constants
-                if (idx as usize) < code.constants.len() {
-                    let value = code.constants[idx as usize];
-                    // Determine type and create appropriate template
-                    if let Some(i) = value.as_int() {
-                        TemplateInstruction::LoadInt {
-                            bc_offset,
-                            dst,
-                            value: i,
-                        }
-                    } else if let Some(f) = value.as_float() {
-                        TemplateInstruction::LoadFloat {
-                            bc_offset,
-                            dst,
-                            value: f,
-                        }
-                    } else {
-                        // Unsupported constant type - emit nop
-                        TemplateInstruction::Nop { bc_offset }
-                    }
-                } else {
-                    TemplateInstruction::Nop { bc_offset }
-                }
-            }
-
-            Some(Opcode::LoadNone) => TemplateInstruction::LoadNone {
-                bc_offset,
-                dst: inst.dst().index(),
-            },
-
-            Some(Opcode::LoadTrue) => TemplateInstruction::LoadBool {
-                bc_offset,
-                dst: inst.dst().index(),
-                value: true,
-            },
-
-            Some(Opcode::LoadFalse) => TemplateInstruction::LoadBool {
-                bc_offset,
-                dst: inst.dst().index(),
-                value: false,
-            },
-
-            Some(Opcode::Move) => TemplateInstruction::Move {
-                bc_offset,
-                dst: inst.dst().index(),
-                src: inst.src1().index(),
-            },
-
-            Some(Opcode::Add) => TemplateInstruction::IntAdd {
-                bc_offset,
-                dst: inst.dst().index(),
-                lhs: inst.src1().index(),
-                rhs: inst.src2().index(),
-            },
-
-            Some(Opcode::Sub) => TemplateInstruction::IntSub {
-                bc_offset,
-                dst: inst.dst().index(),
-                lhs: inst.src1().index(),
-                rhs: inst.src2().index(),
-            },
-
-            Some(Opcode::Mul) => TemplateInstruction::IntMul {
-                bc_offset,
-                dst: inst.dst().index(),
-                lhs: inst.src1().index(),
-                rhs: inst.src2().index(),
-            },
-
-            Some(Opcode::Jump) => TemplateInstruction::Jump {
-                bc_offset,
-                target: inst.imm16() as u32,
-            },
-
-            Some(Opcode::JumpIfTrue) => TemplateInstruction::BranchIfTrue {
-                bc_offset,
-                cond: inst.dst().index(),
-                target: inst.imm16() as u32,
-            },
-
-            Some(Opcode::JumpIfFalse) => TemplateInstruction::BranchIfFalse {
-                bc_offset,
-                cond: inst.dst().index(),
-                target: inst.imm16() as u32,
-            },
-
-            Some(Opcode::Return) => TemplateInstruction::Return {
-                bc_offset,
-                value: inst.dst().index(),
-            },
-
-            _ => {
-                // Unsupported opcode - emit nop (will deopt)
-                TemplateInstruction::Nop { bc_offset }
-            }
-        };
-
-        templates.push(template);
-    }
-
-    Ok(templates)
 }
 
 // =============================================================================

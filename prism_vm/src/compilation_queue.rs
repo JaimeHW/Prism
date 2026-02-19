@@ -32,9 +32,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use prism_compiler::bytecode::{CodeObject, Opcode};
+use prism_compiler::bytecode::CodeObject;
+#[cfg(test)]
+use prism_compiler::bytecode::Opcode;
 use prism_jit::runtime::{CodeCache, CompiledEntry};
-use prism_jit::tier1::codegen::{TemplateCompiler, TemplateInstruction};
+use prism_jit::tier1::codegen::TemplateCompiler;
+
+use crate::tier1_lowering::lower_code_to_templates;
 
 /// A request to compile a function in the background.
 struct CompilationRequest {
@@ -238,7 +242,7 @@ impl CompilationQueue {
         }
 
         // Convert bytecode to template IR
-        let instructions = match bytecode_to_templates(&request.code) {
+        let instructions = match lower_code_to_templates(&request.code) {
             Ok(instrs) => instrs,
             Err(_e) => {
                 #[cfg(debug_assertions)]
@@ -275,124 +279,6 @@ impl Drop for CompilationQueue {
             let _ = handle.join();
         }
     }
-}
-
-/// Convert bytecode to template IR for the worker thread.
-///
-/// This is the same logic as `jit_bridge::bytecode_to_templates`, duplicated
-/// here because the worker thread runs in a separate context and cannot share
-/// mutable state. Keeping this self-contained avoids cross-module coupling.
-fn bytecode_to_templates(code: &CodeObject) -> Result<Vec<TemplateInstruction>, String> {
-    let mut templates = Vec::with_capacity(code.instructions.len());
-
-    for (idx, inst) in code.instructions.iter().enumerate() {
-        let bc_offset = idx as u32;
-        let opcode_byte = inst.opcode();
-
-        let template = match Opcode::from_u8(opcode_byte) {
-            Some(Opcode::Nop) => TemplateInstruction::Nop { bc_offset },
-
-            Some(Opcode::LoadConst) => {
-                let dst = inst.dst().index();
-                let idx = inst.imm16();
-                if (idx as usize) < code.constants.len() {
-                    let value = code.constants[idx as usize];
-                    if let Some(i) = value.as_int() {
-                        TemplateInstruction::LoadInt {
-                            bc_offset,
-                            dst,
-                            value: i,
-                        }
-                    } else if let Some(f) = value.as_float() {
-                        TemplateInstruction::LoadFloat {
-                            bc_offset,
-                            dst,
-                            value: f,
-                        }
-                    } else {
-                        TemplateInstruction::Nop { bc_offset }
-                    }
-                } else {
-                    TemplateInstruction::Nop { bc_offset }
-                }
-            }
-
-            Some(Opcode::LoadNone) => TemplateInstruction::LoadNone {
-                bc_offset,
-                dst: inst.dst().index(),
-            },
-
-            Some(Opcode::LoadTrue) => TemplateInstruction::LoadBool {
-                bc_offset,
-                dst: inst.dst().index(),
-                value: true,
-            },
-
-            Some(Opcode::LoadFalse) => TemplateInstruction::LoadBool {
-                bc_offset,
-                dst: inst.dst().index(),
-                value: false,
-            },
-
-            Some(Opcode::Move) => TemplateInstruction::Move {
-                bc_offset,
-                dst: inst.dst().index(),
-                src: inst.src1().index(),
-            },
-
-            Some(Opcode::Add) => TemplateInstruction::IntAdd {
-                bc_offset,
-                dst: inst.dst().index(),
-                lhs: inst.src1().index(),
-                rhs: inst.src2().index(),
-            },
-
-            Some(Opcode::Sub) => TemplateInstruction::IntSub {
-                bc_offset,
-                dst: inst.dst().index(),
-                lhs: inst.src1().index(),
-                rhs: inst.src2().index(),
-            },
-
-            Some(Opcode::Mul) => TemplateInstruction::IntMul {
-                bc_offset,
-                dst: inst.dst().index(),
-                lhs: inst.src1().index(),
-                rhs: inst.src2().index(),
-            },
-
-            Some(Opcode::Jump) => TemplateInstruction::Jump {
-                bc_offset,
-                target: inst.imm16() as u32,
-            },
-
-            Some(Opcode::JumpIfTrue) => TemplateInstruction::BranchIfTrue {
-                bc_offset,
-                cond: inst.dst().index(),
-                target: inst.imm16() as u32,
-            },
-
-            Some(Opcode::JumpIfFalse) => TemplateInstruction::BranchIfFalse {
-                bc_offset,
-                cond: inst.dst().index(),
-                target: inst.imm16() as u32,
-            },
-
-            Some(Opcode::Return) => TemplateInstruction::Return {
-                bc_offset,
-                value: inst.dst().index(),
-            },
-
-            _ => {
-                // Unsupported opcode - emit nop (will deopt)
-                TemplateInstruction::Nop { bc_offset }
-            }
-        };
-
-        templates.push(template);
-    }
-
-    Ok(templates)
 }
 
 #[cfg(test)]
