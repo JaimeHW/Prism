@@ -7,6 +7,7 @@
 //! - Statistics and debugging support
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::tier2::osr::OsrCompiledCode;
@@ -165,8 +166,14 @@ pub struct CodeCache {
     total_size: RwLock<usize>,
     /// Maximum allowed size.
     max_size: usize,
-    /// Statistics.
-    stats: RwLock<CodeCacheStats>,
+    /// Lookup hit counter.
+    hits: AtomicU64,
+    /// Lookup miss counter.
+    misses: AtomicU64,
+    /// Insert counter.
+    insertions: AtomicU64,
+    /// Eviction counter.
+    evictions: AtomicU64,
 }
 
 impl CodeCache {
@@ -176,7 +183,10 @@ impl CodeCache {
             entries: RwLock::new(HashMap::new()),
             total_size: RwLock::new(0),
             max_size,
-            stats: RwLock::new(CodeCacheStats::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            insertions: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -189,9 +199,9 @@ impl CodeCache {
 
         // Update stats
         if result.is_some() {
-            self.stats.write().unwrap().hits += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.stats.write().unwrap().misses += 1;
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
 
         result
@@ -205,30 +215,32 @@ impl CodeCache {
         let code_size = entry.code_size;
         let new_entry = Arc::new(entry);
 
-        // Check if we have room
-        {
-            let total = *self.total_size.read().unwrap();
-            if total + code_size > self.max_size {
-                // TODO: implement eviction
-                self.stats.write().unwrap().evictions += 1;
+        // Insert while enforcing memory limit.
+        let mut entries = self.entries.write().unwrap();
+        let mut total = self.total_size.write().unwrap();
+
+        while *total + code_size > self.max_size && !entries.is_empty() {
+            let victim_id = entries.keys().next().copied();
+            if let Some(victim_id) = victim_id {
+                if let Some(victim) = entries.remove(&victim_id) {
+                    *total = total.saturating_sub(victim.code_size);
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
             }
         }
 
-        // Insert
-        let mut entries = self.entries.write().unwrap();
         let old = entries.insert(code_id, new_entry);
 
         // Update size tracking
-        {
-            let mut total = self.total_size.write().unwrap();
-            if let Some(ref prev) = old {
-                *total -= prev.code_size;
-            }
-            *total += code_size;
+        if let Some(ref prev) = old {
+            *total = total.saturating_sub(prev.code_size);
         }
+        *total += code_size;
 
         // Update stats
-        self.stats.write().unwrap().insertions += 1;
+        self.insertions.fetch_add(1, Ordering::Relaxed);
 
         old
     }
@@ -278,7 +290,12 @@ impl CodeCache {
     /// Get cache statistics.
     #[inline]
     pub fn stats(&self) -> CodeCacheStats {
-        self.stats.read().unwrap().clone()
+        CodeCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            insertions: self.insertions.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
     }
 
     /// Clear the entire cache.
@@ -399,6 +416,21 @@ mod tests {
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.insertions, 1);
+    }
+
+    #[test]
+    fn test_code_cache_evicts_when_capacity_exceeded() {
+        let cache = CodeCache::new(150);
+
+        cache.insert(CompiledEntry::new(1, dummy_code_ptr(), 100));
+        cache.insert(CompiledEntry::new(2, (dummy_code_ptr() as usize + 64) as *const u8, 100));
+
+        assert!(cache.total_size() <= 150);
+        assert_eq!(cache.len(), 1);
+
+        let stats = cache.stats();
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(stats.insertions, 2);
     }
 
     #[test]
