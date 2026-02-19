@@ -180,9 +180,10 @@ impl ClosureAnalyzer {
     ) -> bool {
         // Search enclosing scopes from innermost to outermost
         for (i, enc_info) in enclosing_scopes.iter().rev().enumerate() {
-            // Class scopes don't provide closure capture (Python quirk)
-            // Variables in class scope are accessed via self, not closure
-            if enc_info.kind == ScopeKind::Class {
+            // Class and module scopes don't provide closure capture:
+            // - Class vars are accessed via attributes, not lexical cells.
+            // - Module vars are globals, not closure cells.
+            if enc_info.kind == ScopeKind::Class || enc_info.kind == ScopeKind::Module {
                 continue;
             }
 
@@ -701,6 +702,13 @@ def outer():
         // Module level x is global, not a cell
         let x = table.root.lookup("x").unwrap();
         assert!(!x.flags.contains(SymbolFlags::CELL));
+
+        // inner should treat x as global, not a free/cell capture.
+        let outer_scope = &table.root.children[0];
+        let inner_scope = &outer_scope.children[0];
+        let x_inner = inner_scope.lookup("x").unwrap();
+        assert!(x_inner.flags.contains(SymbolFlags::GLOBAL_IMPLICIT));
+        assert!(!x_inner.flags.contains(SymbolFlags::FREE));
     }
 
     // -------------------------------------------------------------------------

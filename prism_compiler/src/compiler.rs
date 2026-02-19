@@ -10,7 +10,7 @@ use crate::bytecode::{
     CodeFlags, CodeObject, FunctionBuilder, Instruction, Label, LocalSlot, Opcode, Register,
 };
 use crate::function_compiler::{VarLocation, VariableEmitter};
-use crate::scope::{ScopeAnalyzer, SymbolTable};
+use crate::scope::{ClosureAnalyzer, ScopeAnalyzer, ScopeKind, SymbolTable};
 
 use prism_parser::ast::{
     AugOp, BinOp, BoolOp, CmpOp, ExceptHandler, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
@@ -21,6 +21,10 @@ use std::sync::Arc;
 /// Stack-allocated loop context stack for typical loop nesting depths.
 /// Most code has ≤4 nested loops, so we avoid heap allocation in the common case.
 type LoopStack = SmallVec<[LoopContext; 4]>;
+/// BuildSlice step-extension marker byte 1 (`CallKwEx.dst = step register`).
+const SLICE_STEP_EXT_TAG_A: u8 = b'S';
+/// BuildSlice step-extension marker byte 2.
+const SLICE_STEP_EXT_TAG_B: u8 = b'L';
 
 /// Compilation error.
 #[derive(Debug, Clone)]
@@ -103,6 +107,12 @@ pub struct Compiler {
     in_function_context: bool,
     /// Compiler optimization level.
     optimize: OptimizationLevel,
+    /// Path to the current scope in the symbol table.
+    /// Empty path means module root scope.
+    scope_path: Vec<usize>,
+    /// Per-scope child cursor for deterministic nested-scope lookup.
+    /// Indexed by scope depth (`scope_path.len()`).
+    scope_child_offsets: Vec<usize>,
 }
 
 impl Compiler {
@@ -125,6 +135,8 @@ impl Compiler {
             in_async_context: false,
             in_function_context: false,
             optimize,
+            scope_path: Vec::new(),
+            scope_child_offsets: vec![0],
         }
     }
 
@@ -140,7 +152,8 @@ impl Compiler {
         optimize: OptimizationLevel,
     ) -> CompileResult<CodeObject> {
         // Phase 1: Scope analysis
-        let symbol_table = ScopeAnalyzer::new().analyze(module, "<module>");
+        let mut symbol_table = ScopeAnalyzer::new().analyze(module, "<module>");
+        ClosureAnalyzer::new().analyze(&mut symbol_table.root);
 
         // Phase 2: Code generation
         let mut compiler = Compiler {
@@ -151,6 +164,8 @@ impl Compiler {
             in_async_context: false,
             in_function_context: false,
             optimize,
+            scope_path: Vec::new(),
+            scope_child_offsets: vec![0],
         };
 
         compiler.builder.set_filename(filename);
@@ -188,30 +203,66 @@ impl Compiler {
     ///
     /// For nested functions, also checks the builder's local map for
     /// parameters and locals defined via define_local().
-    fn resolve_variable(&self, name: &str) -> VarLocation {
-        // First, check if this name is defined as a local in the current builder.
-        // This handles function parameters and body-level locals in nested functions.
-        if let Some(slot) = self.builder.lookup_local(name) {
-            return VarLocation::Local(slot.0);
+    fn resolve_variable(&mut self, name: &str) -> VarLocation {
+        let in_module_scope = self.current_scope().kind == ScopeKind::Module;
+        let symbol_info = self.current_scope().lookup(name).map(|symbol| {
+            (
+                symbol.is_cell(),
+                symbol.is_free(),
+                symbol.is_local(),
+                symbol.closure_slot,
+            )
+        });
+
+        if let Some((is_cell, is_free, is_local, closure_slot)) = symbol_info {
+            if (is_cell || is_free) && closure_slot.is_some() {
+                return VarLocation::Closure(closure_slot.unwrap());
+            }
+
+            if is_local && !is_cell {
+                // Module-scope names are always global namespace entries.
+                if in_module_scope {
+                    return VarLocation::Global;
+                }
+                if let Some(slot) = self.builder.lookup_local(name) {
+                    return VarLocation::Local(slot.0);
+                }
+                // Lazily materialize locals discovered by scope analysis.
+                return VarLocation::Local(self.builder.define_local(name).0);
+            }
         }
 
-        // Look up in symbol table's root scope (module level)
-        if let Some(symbol) = self.symbol_table.root.lookup(name) {
-            // Check closure variables first (cells and frees use same opcodes)
-            if symbol.is_cell() || symbol.is_free() {
-                if let Some(slot) = symbol.closure_slot {
-                    return VarLocation::Closure(slot);
-                }
-            }
-            // Check local variables (but not cells - those use closure access)
-            if symbol.is_local() && !symbol.is_cell() {
-                if let Some(slot) = symbol.local_slot {
-                    return VarLocation::Local(slot);
-                }
+        if !in_module_scope {
+            if let Some(slot) = self.builder.lookup_local(name) {
+                return VarLocation::Local(slot.0);
             }
         }
-        // Fall back to global for undefined or explicitly global symbols
+
+        // Fall back to global for undefined or explicitly global symbols.
         VarLocation::Global
+    }
+
+    /// Get the current scope from the symbol table.
+    fn current_scope(&self) -> &crate::scope::Scope {
+        let mut scope = &self.symbol_table.root;
+        for &child_idx in &self.scope_path {
+            scope = &scope.children[child_idx];
+        }
+        scope
+    }
+
+    /// Enter a child scope by index.
+    fn enter_child_scope(&mut self, child_idx: usize) {
+        self.scope_path.push(child_idx);
+        self.scope_child_offsets.push(0);
+    }
+
+    /// Exit the current scope.
+    fn exit_child_scope(&mut self) {
+        let _ = self.scope_path.pop();
+        if self.scope_child_offsets.len() > 1 {
+            self.scope_child_offsets.pop();
+        }
     }
 
     /// Compile a statement.
@@ -540,7 +591,22 @@ impl Compiler {
 
                 // Step 3: Create the class body code object using builder-swap pattern
                 // Find the scope for this class from the symbol table
-                let class_scope = self.find_child_scope(name);
+                let class_scope_idx = self.find_child_scope(ScopeKind::Class, name.as_ref());
+                let (class_cellvars, class_freevars) = if let Some(scope_idx) = class_scope_idx {
+                    let scope = &self.current_scope().children[scope_idx];
+                    let cellvars = scope
+                        .cellvars()
+                        .filter(|sym| sym.name.as_ref() != "__class__")
+                        .map(|sym| Arc::from(sym.name.as_ref()))
+                        .collect::<Vec<_>>();
+                    let freevars = scope
+                        .freevars()
+                        .map(|sym| Arc::from(sym.name.as_ref()))
+                        .collect::<Vec<_>>();
+                    (cellvars, freevars)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
                 // Create a new FunctionBuilder for the class body
                 let mut class_builder = FunctionBuilder::new(name.clone());
@@ -557,23 +623,19 @@ impl Compiler {
                 }
 
                 // Register cell and free variables from scope analysis
-                if let Some(scope) = class_scope {
-                    // Cell variables: names captured by inner functions
-                    for sym in scope.cellvars() {
-                        // Skip __class__ if we already added it
-                        if sym.name.as_ref() != "__class__" {
-                            class_builder.add_cellvar(Arc::from(sym.name.as_ref()));
-                        }
-                    }
-
-                    // Free variables: names captured from outer scopes
-                    for sym in scope.freevars() {
-                        class_builder.add_freevar(Arc::from(sym.name.as_ref()));
-                    }
+                for name in class_cellvars {
+                    class_builder.add_cellvar(name);
+                }
+                for name in class_freevars {
+                    class_builder.add_freevar(name);
                 }
 
                 // Swap builders to compile class body
                 let parent_builder = std::mem::replace(&mut self.builder, class_builder);
+
+                if let Some(scope_idx) = class_scope_idx {
+                    self.enter_child_scope(scope_idx);
+                }
 
                 // Compile class body statements (method definitions, class variables, etc.)
                 for (index, stmt) in body.iter().enumerate() {
@@ -581,6 +643,10 @@ impl Compiler {
                         continue;
                     }
                     self.compile_stmt(stmt)?;
+                }
+
+                if class_scope_idx.is_some() {
+                    self.exit_child_scope();
                 }
 
                 // Class body returns the namespace dict (implicit)
@@ -1222,27 +1288,223 @@ impl Compiler {
                 self.builder.free_register(key_reg);
             }
 
-            ExprKind::List(elts) => {
-                let first_elem = self.builder.alloc_register();
-                let mut elem_regs = Vec::with_capacity(elts.len());
+            ExprKind::Slice { lower, upper, step } => {
+                // Build a slice object for subscription keys.
+                let start_reg = if let Some(lower_expr) = lower {
+                    self.compile_expr(lower_expr)?
+                } else {
+                    let none_reg = self.builder.alloc_register();
+                    self.builder.emit_load_none(none_reg);
+                    none_reg
+                };
 
-                for (i, elt) in elts.iter().enumerate() {
-                    let elem_reg = if i == 0 {
-                        first_elem
-                    } else {
-                        self.builder.alloc_register()
-                    };
-                    let temp = self.compile_expr(elt)?;
-                    self.builder.emit_move(elem_reg, temp);
-                    self.builder.free_register(temp);
-                    elem_regs.push(elem_reg);
-                }
+                let stop_reg = if let Some(upper_expr) = upper {
+                    self.compile_expr(upper_expr)?
+                } else {
+                    let none_reg = self.builder.alloc_register();
+                    self.builder.emit_load_none(none_reg);
+                    none_reg
+                };
+
+                let step_reg = if let Some(step_expr) = step {
+                    Some(self.compile_expr(step_expr)?)
+                } else {
+                    None
+                };
 
                 self.builder
-                    .emit_build_list(reg, first_elem, elts.len() as u8);
+                    .emit(Instruction::op_dss(Opcode::BuildSlice, reg, start_reg, stop_reg));
 
-                for elem_reg in elem_regs {
-                    self.builder.free_register(elem_reg);
+                // Encode optional step in an extension instruction consumed by BuildSlice.
+                if let Some(step_reg) = step_reg {
+                    self.builder.emit(Instruction::new(
+                        Opcode::CallKwEx,
+                        step_reg.0,
+                        SLICE_STEP_EXT_TAG_A,
+                        SLICE_STEP_EXT_TAG_B,
+                    ));
+                    self.builder.free_register(step_reg);
+                }
+
+                self.builder.free_register(start_reg);
+                self.builder.free_register(stop_reg);
+            }
+
+            ExprKind::List(elts) => {
+                // BuildList expects a consecutive register block.
+                if elts.is_empty() {
+                    self.builder.emit_build_list(reg, reg, 0);
+                } else {
+                    if elts.len() > u8::MAX as usize {
+                        return Err(CompileError {
+                            message: "list literal has too many elements".to_string(),
+                            line: expr.span.start,
+                            column: 0,
+                        });
+                    }
+
+                    let count = elts.len() as u8;
+                    let first_elem = self.builder.alloc_register_block(count);
+
+                    for (i, elt) in elts.iter().enumerate() {
+                        let elem_reg = Register::new(first_elem.0 + i as u8);
+                        let temp = self.compile_expr(elt)?;
+                        if temp != elem_reg {
+                            self.builder.emit_move(elem_reg, temp);
+                        }
+                        self.builder.free_register(temp);
+                    }
+
+                    self.builder.emit_build_list(reg, first_elem, count);
+                    self.builder.free_register_block(first_elem, count);
+                }
+            }
+
+            ExprKind::Set(elts) => {
+                // BuildSet also reads a consecutive register range [start, start+count).
+                if elts.is_empty() {
+                    self.builder
+                        .emit(Instruction::new(Opcode::BuildSet, reg.0, reg.0, 0));
+                } else {
+                    if elts.len() > u8::MAX as usize {
+                        return Err(CompileError {
+                            message: "set literal has too many elements".to_string(),
+                            line: expr.span.start,
+                            column: 0,
+                        });
+                    }
+                    let count = elts.len() as u8;
+                    let first_elem = self.builder.alloc_register_block(count);
+
+                    for (i, elt) in elts.iter().enumerate() {
+                        let elem_reg = Register::new(first_elem.0 + i as u8);
+                        let temp = self.compile_expr(elt)?;
+                        if temp != elem_reg {
+                            self.builder.emit_move(elem_reg, temp);
+                        }
+                        self.builder.free_register(temp);
+                    }
+
+                    self.builder
+                        .emit(Instruction::new(Opcode::BuildSet, reg.0, first_elem.0, count));
+                    self.builder.free_register_block(first_elem, count);
+                }
+            }
+
+            ExprKind::Dict { keys, values } => {
+                if keys.len() != values.len() {
+                    return Err(CompileError {
+                        message: "dict literal has mismatched keys/values".to_string(),
+                        line: expr.span.start,
+                        column: 0,
+                    });
+                }
+
+                let entry_count = values.len();
+                if entry_count == 0 {
+                    self.builder
+                        .emit(Instruction::new(Opcode::BuildDict, reg.0, reg.0, 0));
+                } else {
+                    let has_unpack = keys.iter().any(|k| k.is_none());
+
+                    if !has_unpack {
+                        // Fast path: direct BuildDict from contiguous [k0, v0, k1, v1, ...].
+                        if entry_count > (u8::MAX as usize / 2) {
+                            return Err(CompileError {
+                                message: "dict literal has too many entries".to_string(),
+                                line: expr.span.start,
+                                column: 0,
+                            });
+                        }
+
+                        let pair_regs = (entry_count * 2) as u8;
+                        let first_pair = self.builder.alloc_register_block(pair_regs);
+
+                        for i in 0..entry_count {
+                            let key_reg = Register::new(first_pair.0 + (i * 2) as u8);
+                            let val_reg = Register::new(first_pair.0 + (i * 2 + 1) as u8);
+
+                            let key_expr = keys[i].as_ref().expect("checked no unpack above");
+                            let key_tmp = self.compile_expr(key_expr)?;
+                            if key_tmp != key_reg {
+                                self.builder.emit_move(key_reg, key_tmp);
+                            }
+                            self.builder.free_register(key_tmp);
+
+                            let val_tmp = self.compile_expr(&values[i])?;
+                            if val_tmp != val_reg {
+                                self.builder.emit_move(val_reg, val_tmp);
+                            }
+                            self.builder.free_register(val_tmp);
+                        }
+
+                        self.builder.emit(Instruction::new(
+                            Opcode::BuildDict,
+                            reg.0,
+                            first_pair.0,
+                            entry_count as u8,
+                        ));
+                        self.builder.free_register_block(first_pair, pair_regs);
+                    } else {
+                        // General path: materialize each entry as a mapping and merge.
+                        // Static k:v entries become singleton dicts; **m entries merge directly.
+                        if entry_count > 24 {
+                            return Err(CompileError {
+                                message: "dict unpack supports at most 24 entries".to_string(),
+                                line: expr.span.start,
+                                column: 0,
+                            });
+                        }
+
+                        let base = self.builder.alloc_register_block(entry_count as u8);
+                        let mut unpack_flags: u32 = 0;
+
+                        for i in 0..entry_count {
+                            let entry_reg = Register::new(base.0 + i as u8);
+
+                            if let Some(key_expr) = &keys[i] {
+                                let pair_base = self.builder.alloc_register_block(2);
+                                let key_reg = pair_base;
+                                let val_reg = Register::new(pair_base.0 + 1);
+
+                                let key_tmp = self.compile_expr(key_expr)?;
+                                if key_tmp != key_reg {
+                                    self.builder.emit_move(key_reg, key_tmp);
+                                }
+                                self.builder.free_register(key_tmp);
+
+                                let val_tmp = self.compile_expr(&values[i])?;
+                                if val_tmp != val_reg {
+                                    self.builder.emit_move(val_reg, val_tmp);
+                                }
+                                self.builder.free_register(val_tmp);
+
+                                self.builder.emit(Instruction::new(
+                                    Opcode::BuildDict,
+                                    entry_reg.0,
+                                    pair_base.0,
+                                    1,
+                                ));
+                                self.builder.free_register_block(pair_base, 2);
+                            } else {
+                                let mapping_tmp = self.compile_expr(&values[i])?;
+                                if mapping_tmp != entry_reg {
+                                    self.builder.emit_move(entry_reg, mapping_tmp);
+                                }
+                                self.builder.free_register(mapping_tmp);
+                            }
+
+                            unpack_flags |= 1 << i;
+                        }
+
+                        self.builder.emit_build_dict_unpack(
+                            reg,
+                            base,
+                            entry_count as u8,
+                            unpack_flags,
+                        );
+                        self.builder.free_register_block(base, entry_count as u8);
+                    }
                 }
             }
 
@@ -1521,16 +1783,85 @@ impl Compiler {
             }
 
             ExprKind::Tuple(elts) | ExprKind::List(elts) => {
-                // Unpack assignment
-                for (i, elt) in elts.iter().enumerate() {
-                    let item_reg = self.builder.alloc_register();
-                    let idx = self.builder.add_int(i as i64);
-                    let idx_reg = self.builder.alloc_register();
-                    self.builder.emit_load_const(idx_reg, idx);
-                    self.builder.emit_get_item(item_reg, value, idx_reg);
-                    self.compile_store(elt, item_reg)?;
-                    self.builder.free_register(item_reg);
-                    self.builder.free_register(idx_reg);
+                let starred_indices: Vec<usize> = elts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, elt)| match &elt.kind {
+                        ExprKind::Starred(_) => Some(i),
+                        _ => None,
+                    })
+                    .collect();
+
+                if starred_indices.len() > 1 {
+                    return Err(CompileError {
+                        message: "multiple starred expressions in assignment".to_string(),
+                        line: target.span.start,
+                        column: 0,
+                    });
+                }
+
+                if let Some(star_idx) = starred_indices.first().copied() {
+                    if elts.len() > u8::MAX as usize {
+                        return Err(CompileError {
+                            message: "too many assignment targets to unpack".to_string(),
+                            line: target.span.start,
+                            column: 0,
+                        });
+                    }
+
+                    let before_count = star_idx;
+                    let after_count = elts.len().saturating_sub(star_idx + 1);
+
+                    if before_count > 0x0F || after_count > 0x0F {
+                        return Err(CompileError {
+                            message: "starred unpacking supports at most 15 items before/after '*'"
+                                .to_string(),
+                            line: target.span.start,
+                            column: 0,
+                        });
+                    }
+
+                    let packed = ((before_count as u8) << 4) | (after_count as u8);
+                    let base = self.builder.alloc_register_block(elts.len() as u8);
+                    self.builder.emit(Instruction::op_dss(
+                        Opcode::UnpackEx,
+                        base,
+                        value,
+                        Register::new(packed),
+                    ));
+
+                    for (i, elt) in elts.iter().enumerate() {
+                        let item_reg = Register::new(base.0 + i as u8);
+                        match &elt.kind {
+                            ExprKind::Starred(inner) => self.compile_store(inner, item_reg)?,
+                            _ => self.compile_store(elt, item_reg)?,
+                        }
+                    }
+
+                    self.builder.free_register_block(base, elts.len() as u8);
+                } else {
+                    if elts.len() > u8::MAX as usize {
+                        return Err(CompileError {
+                            message: "too many assignment targets to unpack".to_string(),
+                            line: target.span.start,
+                            column: 0,
+                        });
+                    }
+
+                    let base = self.builder.alloc_register_block(elts.len() as u8);
+                    self.builder.emit(Instruction::op_dss(
+                        Opcode::UnpackSequence,
+                        base,
+                        value,
+                        Register::new(elts.len() as u8),
+                    ));
+
+                    for (i, elt) in elts.iter().enumerate() {
+                        let item_reg = Register::new(base.0 + i as u8);
+                        self.compile_store(elt, item_reg)?;
+                    }
+
+                    self.builder.free_register_block(base, elts.len() as u8);
                 }
             }
 
@@ -1631,7 +1962,7 @@ impl Compiler {
         args: &[Expr],
         keywords: &[prism_parser::ast::Keyword],
         dst: Register,
-        _line: u32,
+        line: u32,
     ) -> CompileResult<Register> {
         // Step 1: Compile function
         let func_reg = self.compile_expr(func)?;
@@ -1644,8 +1975,16 @@ impl Compiler {
             self.builder.emit_build_tuple(tuple_reg, tuple_reg, 0);
             tuple_reg
         } else {
+            if args.len() > 24 {
+                return Err(CompileError {
+                    message: "call-site *args unpack supports at most 24 positional entries"
+                        .to_string(),
+                    line,
+                    column: 0,
+                });
+            }
             // Compile each arg and track which are starred
-            let base_reg = self.builder.alloc_register();
+            let base_reg = self.builder.alloc_register_block(args.len() as u8);
             let mut unpack_flags: u32 = 0;
 
             for (i, arg) in args.iter().enumerate() {
@@ -1682,11 +2021,8 @@ impl Compiler {
                 unpack_flags,
             );
 
-            // Free arg registers
-            for i in 0..args.len() {
-                self.builder
-                    .free_register(Register::new(base_reg.0 + i as u8));
-            }
+            // Free arg register block
+            self.builder.free_register_block(base_reg, args.len() as u8);
 
             tuple_reg
         };
@@ -1695,27 +2031,37 @@ impl Compiler {
         let kwargs_dict_reg = if keywords.is_empty() {
             None
         } else {
-            // Compile each keyword and track which are **dict
-            let base_reg = self.builder.alloc_register();
+            if keywords.len() > 24 {
+                return Err(CompileError {
+                    message: "call-site **kwargs unpack supports at most 24 keyword entries"
+                        .to_string(),
+                    line,
+                    column: 0,
+                });
+            }
+
+            // Represent every entry as a mapping in `base_reg+i`, then merge.
+            let base_reg = self.builder.alloc_register_block(keywords.len() as u8);
             let mut unpack_flags: u32 = 0;
-            let mut static_key_regs: Vec<(Register, Register)> = Vec::new(); // (key_reg, val_reg)
 
             for (i, kw) in keywords.iter().enumerate() {
-                let val_reg = Register::new(base_reg.0 + i as u8);
+                let entry_reg = Register::new(base_reg.0 + i as u8);
 
                 if kw.arg.is_none() {
-                    // This is **dict - compile the mapping
+                    // **mapping entry
                     let temp = self.compile_expr(&kw.value)?;
-                    if temp != val_reg {
-                        self.builder.emit_move(val_reg, temp);
+                    if temp != entry_reg {
+                        self.builder.emit_move(entry_reg, temp);
                     }
                     self.builder.free_register(temp);
-                    unpack_flags |= 1 << i;
+                    unpack_flags |= 1 << i; // merge this mapping
                 } else {
-                    // Static keyword - we need both key and value
+                    // Static keyword: build singleton dict {"name": value}
                     let key_name = kw.arg.as_ref().unwrap();
                     let key_idx = self.builder.add_string(key_name);
-                    let key_reg = self.builder.alloc_register();
+                    let pair_base = self.builder.alloc_register_block(2);
+                    let key_reg = pair_base;
+                    let val_reg = Register::new(pair_base.0 + 1);
                     self.builder.emit_load_const(key_reg, key_idx);
 
                     let temp = self.compile_expr(&kw.value)?;
@@ -1724,7 +2070,10 @@ impl Compiler {
                     }
                     self.builder.free_register(temp);
 
-                    static_key_regs.push((key_reg, val_reg));
+                    self.builder
+                        .emit(Instruction::new(Opcode::BuildDict, entry_reg.0, pair_base.0, 1));
+                    self.builder.free_register_block(pair_base, 2);
+                    unpack_flags |= 1 << i; // merge singleton mapping
                 }
             }
 
@@ -1737,14 +2086,9 @@ impl Compiler {
                 unpack_flags,
             );
 
-            // Free registers
-            for (key_reg, _) in &static_key_regs {
-                self.builder.free_register(*key_reg);
-            }
-            for i in 0..keywords.len() {
-                self.builder
-                    .free_register(Register::new(base_reg.0 + i as u8));
-            }
+            // Free mapping entry block
+            self.builder
+                .free_register_block(base_reg, keywords.len() as u8);
 
             Some(dict_reg)
         };
@@ -2848,6 +3192,99 @@ impl Compiler {
     // Function Definition Compilation
     // =========================================================================
 
+    /// Compile positional default expressions into a tuple register.
+    fn compile_positional_defaults_tuple(&mut self, defaults: &[Expr]) -> CompileResult<Option<Register>> {
+        if defaults.is_empty() {
+            return Ok(None);
+        }
+        if defaults.len() > u8::MAX as usize {
+            return Err(CompileError {
+                message: "too many positional defaults".to_string(),
+                line: defaults[0].span.start,
+                column: 0,
+            });
+        }
+
+        let count = defaults.len() as u8;
+        let first = self.builder.alloc_register_block(count);
+        for (i, expr) in defaults.iter().enumerate() {
+            let dst = Register::new(first.0 + i as u8);
+            let tmp = self.compile_expr(expr)?;
+            if tmp != dst {
+                self.builder.emit_move(dst, tmp);
+            }
+            self.builder.free_register(tmp);
+        }
+
+        let tuple_reg = self.builder.alloc_register();
+        self.builder.emit_build_tuple(tuple_reg, first, count);
+        self.builder.free_register_block(first, count);
+        Ok(Some(tuple_reg))
+    }
+
+    /// Compile keyword-only defaults into a dict register (name -> default value).
+    fn compile_kw_defaults_dict(
+        &mut self,
+        kwonlyargs: &[prism_parser::ast::Arg],
+        kw_defaults: &[Option<Expr>],
+    ) -> CompileResult<Option<Register>> {
+        if kwonlyargs.len() != kw_defaults.len() {
+            return Err(CompileError {
+                message: "internal error: kwonly args/defaults length mismatch".to_string(),
+                line: 0,
+                column: 0,
+            });
+        }
+
+        let mut entries: Vec<(&str, &Expr)> = Vec::new();
+        for (arg, default_expr) in kwonlyargs.iter().zip(kw_defaults.iter()) {
+            if let Some(expr) = default_expr {
+                entries.push((arg.arg.as_str(), expr));
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        if entries.len() > (u8::MAX as usize / 2) {
+            return Err(CompileError {
+                message: "too many keyword-only defaults".to_string(),
+                line: entries[0].1.span.start,
+                column: 0,
+            });
+        }
+
+        let pair_count = entries.len() as u8;
+        let pair_regs = pair_count
+            .checked_mul(2)
+            .expect("pair_count bounded by u8::MAX/2");
+        let first_pair = self.builder.alloc_register_block(pair_regs);
+
+        for (i, (name, value_expr)) in entries.iter().enumerate() {
+            let key_reg = Register::new(first_pair.0 + (i as u8 * 2));
+            let value_reg = Register::new(key_reg.0 + 1);
+
+            let key_idx = self.builder.add_string(*name);
+            self.builder.emit_load_const(key_reg, key_idx);
+
+            let value_tmp = self.compile_expr(value_expr)?;
+            if value_tmp != value_reg {
+                self.builder.emit_move(value_reg, value_tmp);
+            }
+            self.builder.free_register(value_tmp);
+        }
+
+        let dict_reg = self.builder.alloc_register();
+        self.builder.emit(Instruction::new(
+            Opcode::BuildDict,
+            dict_reg.0,
+            first_pair.0,
+            pair_count,
+        ));
+        self.builder.free_register_block(first_pair, pair_regs);
+        Ok(Some(dict_reg))
+    }
+
     /// Compile a function definition (FunctionDef or AsyncFunctionDef).
     ///
     /// This creates a nested CodeObject for the function body and emits
@@ -2868,11 +3305,29 @@ impl Compiler {
         decorator_list: &[Expr],
         is_async: bool,
     ) -> CompileResult<()> {
-        use crate::bytecode::LocalSlot;
-
         // Find the scope for this function from the symbol table
         // We need to look it up by name in the current scope's children
-        let func_scope = self.find_child_scope(name);
+        let func_scope_idx = self.find_child_scope(ScopeKind::Function, name);
+        let (func_cellvars, func_freevars, func_locals, scope_has_yield) =
+            if let Some(scope_idx) = func_scope_idx {
+            let scope = &self.current_scope().children[scope_idx];
+            let cellvars = scope
+                .cellvars()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<_>>();
+            let freevars = scope
+                .freevars()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<_>>();
+            let mut locals = scope
+                .locals()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<Arc<str>>>();
+            locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            (cellvars, freevars, locals, scope.has_yield)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), false)
+            };
 
         // Create a new FunctionBuilder for the function body
         let mut func_builder = FunctionBuilder::new(name);
@@ -2929,30 +3384,34 @@ impl Compiler {
             func_builder.define_local(kwarg.arg.as_str());
         }
 
+        // Register non-cell locals from scope analysis so nested captures can
+        // reliably resolve by name from `code.locals`.
+        for name in func_locals {
+            func_builder.define_local(name);
+        }
+
         // Register cell and free variables from scope analysis
         let mut has_closure = false;
-        if let Some(scope) = func_scope {
-            // Cell variables: locals captured by inner functions
-            for sym in scope.cellvars() {
-                func_builder.add_cellvar(Arc::from(sym.name.as_ref()));
-                has_closure = true;
-            }
+        // Cell variables: locals captured by inner functions
+        for name in func_cellvars {
+            func_builder.add_cellvar(name);
+            has_closure = true;
+        }
 
-            // Free variables: captured from outer scopes
-            for sym in scope.freevars() {
-                func_builder.add_freevar(Arc::from(sym.name.as_ref()));
-                has_closure = true;
-            }
+        // Free variables: captured from outer scopes
+        for name in func_freevars {
+            func_builder.add_freevar(name);
+            has_closure = true;
+        }
 
-            // Set generator flag from scope analysis
-            if scope.has_yield {
-                if is_async {
-                    // async def with yield = async generator
-                    func_builder.add_flags(CodeFlags::ASYNC_GENERATOR);
-                } else {
-                    // regular generator
-                    func_builder.add_flags(CodeFlags::GENERATOR);
-                }
+        // Set generator flag from scope analysis
+        if scope_has_yield {
+            if is_async {
+                // async def with yield = async generator
+                func_builder.add_flags(CodeFlags::ASYNC_GENERATOR);
+            } else {
+                // regular generator
+                func_builder.add_flags(CodeFlags::GENERATOR);
             }
         }
 
@@ -2968,6 +3427,9 @@ impl Compiler {
         let parent_function_context = self.in_function_context;
         self.in_async_context = is_async;
         self.in_function_context = true;
+        if let Some(scope_idx) = func_scope_idx {
+            self.enter_child_scope(scope_idx);
+        }
 
         // Compile function body
         for (index, stmt) in body.iter().enumerate() {
@@ -2975,6 +3437,10 @@ impl Compiler {
                 continue;
             }
             self.compile_stmt(stmt)?;
+        }
+
+        if func_scope_idx.is_some() {
+            self.exit_child_scope();
         }
 
         // Ensure function returns None if no explicit return
@@ -2998,8 +3464,11 @@ impl Compiler {
             .map(|d| self.compile_expr(d))
             .collect::<Result<_, _>>()?;
 
+        let positional_defaults_reg = self.compile_positional_defaults_tuple(&args.defaults)?;
+        let kw_defaults_reg = self.compile_kw_defaults_dict(&args.kwonlyargs, &args.kw_defaults)?;
+
         // Emit function/closure creation
-        let func_reg = self.builder.alloc_register();
+        let mut func_reg = self.builder.alloc_register();
 
         if has_closure {
             // MakeClosure: needs to capture variables from current scope
@@ -3017,6 +3486,34 @@ impl Compiler {
                 func_reg,
                 code_const_idx,
             ));
+        }
+
+        if positional_defaults_reg.is_some() || kw_defaults_reg.is_some() {
+            let none_reg = if positional_defaults_reg.is_none() || kw_defaults_reg.is_none() {
+                let reg = self.builder.alloc_register();
+                self.builder.emit_load_none(reg);
+                Some(reg)
+            } else {
+                None
+            };
+            let positional_reg = positional_defaults_reg
+                .or(none_reg)
+                .expect("positional defaults register must exist");
+            let kw_reg = kw_defaults_reg
+                .or(none_reg)
+                .expect("keyword defaults register must exist");
+            self.builder
+                .emit_set_function_defaults(func_reg, positional_reg, kw_reg);
+
+            if let Some(reg) = positional_defaults_reg {
+                self.builder.free_register(reg);
+            }
+            if let Some(reg) = kw_defaults_reg {
+                self.builder.free_register(reg);
+            }
+            if let Some(reg) = none_reg {
+                self.builder.free_register(reg);
+            }
         }
 
         // Apply decorators in reverse order
@@ -3038,34 +3535,54 @@ impl Compiler {
             ));
             self.builder.free_register(decorator_reg);
             self.builder.free_register(func_reg);
-            // Result becomes the new function
-            // Move result back to func_reg position for consistency
-            // Actually, we'll just use call_result as the final function
-            // But we need to track it properly - let's just store directly
+            // Result becomes the function value for the next decorator (or final store).
+            func_reg = call_result;
         }
 
-        // Store function to its name
-        // For now, treat it as a global store (module level)
-        // TODO: Proper scope-aware store for nested functions
-        let name_idx = self.builder.add_name(Arc::from(name));
-        self.builder.emit_store_global(name_idx, func_reg);
+        // Store function using lexical scope resolution.
+        let location = self.resolve_variable(name);
+        self.builder.emit_store_var(location, func_reg, Some(name));
         self.builder.free_register(func_reg);
 
         Ok(())
     }
 
-    /// Find a child scope by name in the current scope.
+    /// Find a child scope by kind and name in the current scope.
     ///
-    /// This is used to look up the scope for nested function definitions
-    /// so we can access cell and free variable information.
-    fn find_child_scope(&self, name: &str) -> Option<&crate::scope::Scope> {
-        // For now, search the root scope's children
-        // TODO: Track current scope path for proper nested function compilation
-        self.symbol_table
-            .root
-            .children
-            .iter()
-            .find(|c| c.name.as_ref() == name)
+    /// Uses a per-scope cursor so repeated nested definitions with the same
+    /// name (e.g. redefinitions) resolve deterministically in source order.
+    fn find_child_scope(&mut self, kind: ScopeKind, name: &str) -> Option<usize> {
+        let depth = self.scope_path.len();
+        let start = *self.scope_child_offsets.get(depth).unwrap_or(&0);
+        let child_count = self.current_scope().children.len();
+
+        let mut found = None;
+        for idx in start..child_count {
+            let child = &self.current_scope().children[idx];
+            if child.kind == kind && child.name.as_ref() == name {
+                found = Some(idx);
+                break;
+            }
+        }
+
+        if found.is_none() {
+            for idx in 0..start.min(child_count) {
+                let child = &self.current_scope().children[idx];
+                if child.kind == kind && child.name.as_ref() == name {
+                    found = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        if let Some(idx) = found {
+            if let Some(offset) = self.scope_child_offsets.get_mut(depth) {
+                *offset = idx + 1;
+            }
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     // =========================================================================
@@ -3091,7 +3608,27 @@ impl Compiler {
         dst: Register,
     ) -> CompileResult<Register> {
         // Find lambda scope from symbol table (lambdas are named "<lambda>" in scope analysis)
-        let lambda_scope = self.find_child_scope("<lambda>");
+        let lambda_scope_idx = self.find_child_scope(ScopeKind::Lambda, "<lambda>");
+        let (lambda_cellvars, lambda_freevars, lambda_locals) =
+            if let Some(scope_idx) = lambda_scope_idx {
+            let scope = &self.current_scope().children[scope_idx];
+            let cellvars = scope
+                .cellvars()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<_>>();
+            let freevars = scope
+                .freevars()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<_>>();
+            let mut locals = scope
+                .locals()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<Arc<str>>>();
+            locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            (cellvars, freevars, locals)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         // Create a new FunctionBuilder for the lambda body
         let mut lambda_builder = FunctionBuilder::new("<lambda>");
@@ -3133,17 +3670,19 @@ impl Compiler {
             lambda_builder.define_local(kwarg.arg.as_str());
         }
 
+        for name in lambda_locals {
+            lambda_builder.define_local(name);
+        }
+
         // Register cell and free variables from scope analysis
         let mut has_closure = false;
-        if let Some(scope) = lambda_scope {
-            for sym in scope.cellvars() {
-                lambda_builder.add_cellvar(Arc::from(sym.name.as_ref()));
-                has_closure = true;
-            }
-            for sym in scope.freevars() {
-                lambda_builder.add_freevar(Arc::from(sym.name.as_ref()));
-                has_closure = true;
-            }
+        for name in lambda_cellvars {
+            lambda_builder.add_cellvar(name);
+            has_closure = true;
+        }
+        for name in lambda_freevars {
+            lambda_builder.add_freevar(name);
+            has_closure = true;
         }
 
         // Swap builders to compile lambda body
@@ -3152,9 +3691,16 @@ impl Compiler {
         let parent_function_context = self.in_function_context;
         // Lambda inherits async context from enclosing scope but sets function context
         self.in_function_context = true;
+        if let Some(scope_idx) = lambda_scope_idx {
+            self.enter_child_scope(scope_idx);
+        }
 
         // Compile the expression body
         let result_reg = self.compile_expr(body)?;
+
+        if lambda_scope_idx.is_some() {
+            self.exit_child_scope();
+        }
 
         // Emit implicit return of the expression result
         self.builder.emit_return(result_reg);
@@ -3170,6 +3716,9 @@ impl Compiler {
         // Store the nested CodeObject as a constant
         let code_const_idx = self.builder.add_code_object(Arc::new(lambda_code));
 
+        let positional_defaults_reg = self.compile_positional_defaults_tuple(&args.defaults)?;
+        let kw_defaults_reg = self.compile_kw_defaults_dict(&args.kwonlyargs, &args.kw_defaults)?;
+
         // Emit function/closure creation
         if has_closure {
             self.builder
@@ -3180,6 +3729,34 @@ impl Compiler {
                 dst,
                 code_const_idx,
             ));
+        }
+
+        if positional_defaults_reg.is_some() || kw_defaults_reg.is_some() {
+            let none_reg = if positional_defaults_reg.is_none() || kw_defaults_reg.is_none() {
+                let reg = self.builder.alloc_register();
+                self.builder.emit_load_none(reg);
+                Some(reg)
+            } else {
+                None
+            };
+            let positional_reg = positional_defaults_reg
+                .or(none_reg)
+                .expect("positional defaults register must exist");
+            let kw_reg = kw_defaults_reg
+                .or(none_reg)
+                .expect("keyword defaults register must exist");
+            self.builder
+                .emit_set_function_defaults(dst, positional_reg, kw_reg);
+
+            if let Some(reg) = positional_defaults_reg {
+                self.builder.free_register(reg);
+            }
+            if let Some(reg) = kw_defaults_reg {
+                self.builder.free_register(reg);
+            }
+            if let Some(reg) = none_reg {
+                self.builder.free_register(reg);
+            }
         }
 
         Ok(dst)

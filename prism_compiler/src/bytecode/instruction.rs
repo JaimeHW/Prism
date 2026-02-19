@@ -465,6 +465,10 @@ pub enum Opcode {
     /// dst = {**src1, **src2, ...} for count mappings starting at src1.
     /// src2 = count of source registers. Extension byte has merge flags.
     BuildDictUnpack = 0x79,
+    /// Attach default-argument metadata to a function object.
+    /// dst = function register, src1 = positional defaults tuple or None,
+    /// src2 = keyword-only defaults dict or None.
+    SetFunctionDefaults = 0x7A,
 
     // =========================================================================
     // Container Operations (0x80-0x8F)
@@ -700,6 +704,7 @@ impl Opcode {
             0x77 => Some(Opcode::CallEx),
             0x78 => Some(Opcode::BuildTupleUnpack),
             0x79 => Some(Opcode::BuildDictUnpack),
+            0x7A => Some(Opcode::SetFunctionDefaults),
 
             0x80 => Some(Opcode::BuildList),
             0x81 => Some(Opcode::BuildTuple),
@@ -794,7 +799,7 @@ impl Opcode {
             MakeFunction | MakeClosure => DstImm16,
             CallKwEx => DstSrcSrc, // kwargc, kwnames_idx_lo, kwnames_idx_hi
             CallEx => DstSrcSrc,   // dst, func, args_tuple (extension: kwargs_dict)
-            BuildTupleUnpack | BuildDictUnpack => DstSrcSrc, // dst, base_reg, count
+            BuildTupleUnpack | BuildDictUnpack | SetFunctionDefaults => DstSrcSrc, // dst, base_reg, count
 
             // Class operations
             BuildClass => DstSrcSrc, // dst = class, src1 = body code, src2 = base count

@@ -484,6 +484,13 @@ impl FunctionBuilder {
         let slot = LocalSlot::new(self.locals.len() as u16);
         self.local_map.insert(name.clone(), slot);
         self.locals.push(name);
+        // Locals are addressed by register index at runtime.
+        // Reserve the backing register so temporary allocation never clobbers locals.
+        let required = (slot.0 as usize) + 1;
+        if required > self.next_register as usize {
+            self.next_register = u8::try_from(required).expect("register overflow");
+            self.max_registers = self.max_registers.max(self.next_register);
+        }
         slot
     }
 
@@ -1003,6 +1010,25 @@ impl FunctionBuilder {
         // Second instruction as extension: kwargs dict register (0xFF = no kwargs)
         let kwargs_reg = kwargs_dict.map_or(0xFF, |r| r.0);
         self.emit(Instruction::new(Opcode::CallKwEx, kwargs_reg, 0, 0));
+    }
+
+    /// Attach default metadata to a function object.
+    ///
+    /// - `func`: function object register
+    /// - `pos_defaults`: tuple of positional defaults or `None`
+    /// - `kw_defaults`: dict of keyword-only defaults or `None`
+    pub fn emit_set_function_defaults(
+        &mut self,
+        func: Register,
+        pos_defaults: Register,
+        kw_defaults: Register,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::SetFunctionDefaults,
+            func.0,
+            pos_defaults.0,
+            kw_defaults.0,
+        ));
     }
 
     /// Build a tuple from multiple values/iterables with unpacking.
