@@ -170,6 +170,7 @@ impl OverflowStorage {
 ///
 /// Uses Shape-based property layout for O(1) access to inline properties.
 /// Falls back to overflow dictionary for large objects.
+#[repr(C)]
 #[derive(Debug)]
 pub struct ShapedObject {
     /// Standard object header for GC and type info.
