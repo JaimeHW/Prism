@@ -45,6 +45,7 @@ use super::BuiltinError;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
@@ -161,6 +162,14 @@ fn value_as_set(value: &Value) -> Option<&SetObject> {
     Some(unsafe { &*(ptr as *const SetObject) })
 }
 
+/// Extract BytesObject from Value.
+#[inline(always)]
+fn value_as_bytes(value: &Value) -> Option<&BytesObject> {
+    let ptr = value.as_object_ptr()?;
+    // SAFETY: Caller verified TypeId::BYTES or TypeId::BYTEARRAY
+    Some(unsafe { &*(ptr as *const BytesObject) })
+}
+
 /// Extract IteratorObject from Value (mutable).
 #[inline(always)]
 pub fn get_iterator_mut(value: &Value) -> Option<&mut IteratorObject> {
@@ -274,11 +283,11 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             Ok(IteratorObject::from_values(values))
         }
 
-        TypeId::BYTES => {
-            // TODO: Bytes iteration (yields ints 0-255)
-            Err(IterError::NotIterable(
-                "bytes iteration not yet implemented".into(),
-            ))
+        TypeId::BYTES | TypeId::BYTEARRAY => {
+            let bytes = value_as_bytes(value).ok_or(IterError::InvalidObject)?;
+            let mut values = Vec::with_capacity(bytes.len());
+            values.extend(bytes.iter().map(|b| Value::int_unchecked(b as i64)));
+            Ok(IteratorObject::from_values(values))
         }
 
         TypeId::GENERATOR => {
@@ -661,6 +670,36 @@ mod tests {
         }
         values.sort();
         assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Bytes Iterator Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_iter_bytes_yields_ints() {
+        let bytes = BytesObject::from_slice(&[0, 65, 255]);
+        let ptr = Box::leak(Box::new(bytes)) as *mut BytesObject as *const ();
+        let value = Value::object_ptr(ptr);
+
+        let mut iter = value_to_iterator(&value).expect("bytes should be iterable");
+        assert_eq!(iter.next().unwrap().as_int(), Some(0));
+        assert_eq!(iter.next().unwrap().as_int(), Some(65));
+        assert_eq!(iter.next().unwrap().as_int(), Some(255));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_iter_bytearray_yields_ints() {
+        let bytearray = BytesObject::bytearray_from_slice(&[1, 2, 3]);
+        let ptr = Box::leak(Box::new(bytearray)) as *mut BytesObject as *const ();
+        let value = Value::object_ptr(ptr);
+
+        let mut iter = value_to_iterator(&value).expect("bytearray should be iterable");
+        assert_eq!(iter.next().unwrap().as_int(), Some(1));
+        assert_eq!(iter.next().unwrap().as_int(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(3));
+        assert!(iter.next().is_none());
     }
 
     // -------------------------------------------------------------------------

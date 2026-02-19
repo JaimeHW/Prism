@@ -4,6 +4,7 @@ use super::BuiltinError;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr, interned_len_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
@@ -64,6 +65,14 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
             TypeId::FROZENSET => {
                 let set = unsafe { &*(ptr as *const SetObject) };
                 len_to_value(set.len(), "frozenset")
+            }
+            TypeId::BYTES => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                len_to_value(bytes.len(), "bytes")
+            }
+            TypeId::BYTEARRAY => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                len_to_value(bytes.len(), "bytearray")
             }
             TypeId::STR => {
                 let string = unsafe { &*(ptr as *const StringObject) };
@@ -873,6 +882,17 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
             let string = unsafe { &*(ptr as *const StringObject) };
             Ok(quote_python_string(string.as_str()))
         }
+        TypeId::BYTES => {
+            let bytes = unsafe { &*(ptr as *const BytesObject) };
+            Ok(quote_python_bytes(bytes.as_bytes()))
+        }
+        TypeId::BYTEARRAY => {
+            let bytes = unsafe { &*(ptr as *const BytesObject) };
+            Ok(format!(
+                "bytearray({})",
+                quote_python_bytes(bytes.as_bytes())
+            ))
+        }
         TypeId::LIST => {
             let list = unsafe { &*(ptr as *const ListObject) };
             let mut out = String::from("[");
@@ -973,6 +993,38 @@ fn quote_python_string(input: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+fn quote_python_bytes(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len() + 3);
+    out.push('b');
+    out.push('\'');
+    for &byte in input {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => {
+                out.push_str("\\x");
+                out.push(nibble_to_hex(byte >> 4));
+                out.push(nibble_to_hex(byte & 0x0f));
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[inline]
+fn nibble_to_hex(nibble: u8) -> char {
+    debug_assert!(nibble <= 0x0f);
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'a' + (nibble - 10)) as char,
+    }
 }
 
 #[inline]
@@ -1103,6 +1155,24 @@ mod tests {
         let (value, ptr) = boxed_value(set);
         let result = builtin_len(&[value]).unwrap();
         assert_eq!(result.as_int(), Some(2));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_bytes_object() {
+        let bytes = BytesObject::from_slice(b"hello");
+        let (value, ptr) = boxed_value(bytes);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(5));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_bytearray_object() {
+        let bytearray = BytesObject::bytearray_from_slice(&[1, 2, 3, 4]);
+        let (value, ptr) = boxed_value(bytearray);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(4));
         unsafe { drop_boxed(ptr) };
     }
 
@@ -1460,6 +1530,21 @@ mod tests {
         let repr = tagged_string_value_to_rust_string(builtin_repr(&[range_value]).unwrap());
         assert_eq!(repr, "range(1, 6, 2)");
         unsafe { drop_boxed(range_ptr) };
+    }
+
+    #[test]
+    fn test_repr_bytes_and_bytearray_objects() {
+        let (bytes_value, bytes_ptr) = boxed_value(BytesObject::from_slice(b"a'\n\\"));
+        let bytes_repr = tagged_string_value_to_rust_string(builtin_repr(&[bytes_value]).unwrap());
+        assert_eq!(bytes_repr, "b'a\\'\\n\\\\'");
+        unsafe { drop_boxed(bytes_ptr) };
+
+        let (bytearray_value, bytearray_ptr) =
+            boxed_value(BytesObject::bytearray_from_slice(&[0, 65, 255]));
+        let bytearray_repr =
+            tagged_string_value_to_rust_string(builtin_repr(&[bytearray_value]).unwrap());
+        assert_eq!(bytearray_repr, "bytearray(b'\\x00A\\xff')");
+        unsafe { drop_boxed(bytearray_ptr) };
     }
 
     #[test]
