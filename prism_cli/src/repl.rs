@@ -35,7 +35,11 @@ pub fn run_repl(config: &RuntimeConfig) -> ExitCode {
     }
 
     // Create a persistent VM for the REPL session.
-    let mut vm = prism_vm::VirtualMachine::new();
+    let mut vm = if config.jit_enabled() {
+        prism_vm::VirtualMachine::with_jit()
+    } else {
+        prism_vm::VirtualMachine::new()
+    };
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();

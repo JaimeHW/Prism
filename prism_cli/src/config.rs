@@ -118,6 +118,25 @@ impl RuntimeConfig {
         }
     }
 
+    /// Whether the VM should run with JIT enabled.
+    ///
+    /// Defaults to enabled. `-X` options can force behavior:
+    /// - disable: `jit=off`, `jit=0`, `nojit`
+    /// - enable: `jit=on`, `jit=1`
+    pub fn jit_enabled(&self) -> bool {
+        let mut enabled = true;
+
+        for opt in &self.x_options {
+            match opt.as_str() {
+                "jit=off" | "jit=0" | "nojit" => enabled = false,
+                "jit=on" | "jit=1" => enabled = true,
+                _ => {}
+            }
+        }
+
+        enabled
+    }
+
     /// Check if an environment variable is set to a non-empty, truthy value.
     #[inline]
     fn env_bool(var: &str) -> bool {
@@ -287,5 +306,46 @@ mod tests {
         // env_bool internally: empty string is considered false.
         // We can test the helper directly.
         assert!(!RuntimeConfig::env_bool("PRISM_TEST_NONEXISTENT_21398721"));
+    }
+
+    #[test]
+    fn test_jit_enabled_default_true() {
+        let config = RuntimeConfig::from_args(&PrismArgs::default());
+        assert!(config.jit_enabled());
+    }
+
+    #[test]
+    fn test_jit_enabled_can_be_disabled_with_x_option() {
+        let args = PrismArgs {
+            x_options: vec!["jit=off".to_string()],
+            ..Default::default()
+        };
+        let config = RuntimeConfig::from_args(&args);
+        assert!(!config.jit_enabled());
+    }
+
+    #[test]
+    fn test_jit_enabled_nojit_alias_disables() {
+        let args = PrismArgs {
+            x_options: vec!["nojit".to_string()],
+            ..Default::default()
+        };
+        let config = RuntimeConfig::from_args(&args);
+        assert!(!config.jit_enabled());
+    }
+
+    #[test]
+    fn test_jit_enabled_last_option_wins() {
+        let args = PrismArgs {
+            x_options: vec![
+                "jit=off".to_string(),
+                "jit=on".to_string(),
+                "jit=0".to_string(),
+                "jit=1".to_string(),
+            ],
+            ..Default::default()
+        };
+        let config = RuntimeConfig::from_args(&args);
+        assert!(config.jit_enabled());
     }
 }
