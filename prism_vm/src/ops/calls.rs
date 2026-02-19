@@ -47,12 +47,6 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 /// Uses O(1) type discrimination via ObjectHeader for fast dispatch.
 #[inline(always)]
 pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    eprintln!(
-        "[DEBUG call] dst={}, src1={}, src2={}",
-        inst.dst().0,
-        inst.src1().0,
-        inst.src2().0
-    );
     let func_val = vm.current_frame().get_reg(inst.src1().0);
     let argc = inst.src2().0 as usize;
     let dst_reg = inst.dst().0;
@@ -60,7 +54,6 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // Check if this is a callable object
     if let Some(ptr) = func_val.as_object_ptr() {
         let type_id = extract_type_id(ptr);
-        eprintln!("[DEBUG call] type_id={}", type_id.name());
 
         match type_id {
             TypeId::BUILTIN_FUNCTION => {
@@ -105,27 +98,14 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 // User-defined function - push frame
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 let code = Arc::clone(&func.code);
-                eprintln!(
-                    "[DEBUG call FUNCTION] code.name={}, instructions={}",
-                    code.name,
-                    code.instructions.len()
-                );
 
                 // Push new frame for function execution
                 if let Err(e) = vm.push_frame(Arc::clone(&code), dst_reg) {
                     return ControlFlow::Error(e);
                 }
-                eprintln!(
-                    "[DEBUG call FUNCTION] after push_frame, depth={}",
-                    vm.call_depth()
-                );
 
                 // Copy arguments to new frame's registers
                 let caller_frame_idx = vm.call_depth() - 1;
-                eprintln!(
-                    "[DEBUG call FUNCTION] caller_frame_idx={}, argc={}",
-                    caller_frame_idx, argc
-                );
 
                 // Collect args from caller and set in new frame
                 let args: Vec<Value> = (0..argc)

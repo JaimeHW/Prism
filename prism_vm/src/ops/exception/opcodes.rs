@@ -95,8 +95,6 @@ pub fn raise(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // Extract type ID from instruction or infer from value
     let type_id = extract_type_id(inst, &exc_value);
 
-    eprintln!("[DEBUG raise] type_id={}, exc={:?}", type_id, exc_value);
-
     // Store the active exception in the VM with its type
     vm.set_active_exception_with_type(exc_value, type_id);
 
@@ -151,17 +149,10 @@ pub fn raise_with_cause(vm: &mut VirtualMachine, inst: Instruction) -> ControlFl
 #[inline(always)]
 pub fn reraise(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
     // Check if there's an active exception to reraise
-    eprintln!(
-        "[DEBUG reraise] has_active_exception={}, type_id={:?}",
-        vm.has_active_exception(),
-        vm.get_active_exception_type_id()
-    );
     if !vm.has_active_exception() {
-        eprintln!("[DEBUG reraise] No active exception!");
         return ControlFlow::Error(RuntimeError::internal("No active exception to reraise"));
     }
 
-    eprintln!("[DEBUG reraise] Returning ControlFlow::Reraise");
     // Return Reraise control flow - VM preserves the current exception
     ControlFlow::Reraise
 }
@@ -640,34 +631,13 @@ pub fn exception_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
     // Get the active exception type
     let exc_type_id = vm.get_active_exception_type_id().unwrap_or(0);
 
-    eprintln!(
-        "[DEBUG ExceptionMatch] exc_type_id={}, type_value={:?}, is_object={}",
-        exc_type_id,
-        type_value,
-        type_value.is_object()
-    );
-
     // Try to match against the provided type
     // First check if it's encoded as a type ID in the value
     let matches = if let Some(target_type_id) = type_value.as_int() {
-        eprintln!(
-            "[DEBUG ExceptionMatch] as_int match: target_type_id={}",
-            target_type_id
-        );
         is_subclass(exc_type_id, target_type_id as u16)
     } else {
         // Try dynamic matching first (single exception type)
-        let extracted = super::helpers::extract_type_from_type_value(&type_value);
-        eprintln!(
-            "[DEBUG ExceptionMatch] extract_type_from_type_value returned {:?}",
-            extracted
-        );
-
         let single_match = check_dynamic_match(exc_type_id, &type_value);
-        eprintln!(
-            "[DEBUG ExceptionMatch] check_dynamic_match returned {}",
-            single_match
-        );
         if single_match {
             true
         } else {
@@ -675,8 +645,6 @@ pub fn exception_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
             check_tuple_match(exc_type_id, &type_value)
         }
     };
-
-    eprintln!("[DEBUG ExceptionMatch] final matches={}", matches);
 
     vm.current_frame_mut()
         .set_reg(dst_reg, Value::bool(matches));

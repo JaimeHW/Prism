@@ -3147,8 +3147,6 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
-        eprintln!("[DEBUG compile_listcomp] dst={}, entering", dst.0);
-
         // For now, compile comprehension inline for simplicity
         // Full implementation would create a nested scope
 
@@ -3159,11 +3157,6 @@ impl Compiler {
         // alloc_register_block allocates from next_register (guaranteed contiguous),
         // not from the free list which could give us a register adjacent to Call's dst.
         let list_reg = self.builder.alloc_register_block(1);
-        eprintln!(
-            "[DEBUG compile_listcomp] list_reg={} (will use for BuildList)",
-            list_reg.0
-        );
-
         // CRITICAL: Clear the free register list to prevent register reuse.
         // Call instructions use consecutive registers [dst, dst+1, ...], and if dst
         // is reused from the free list at a position before list_reg, then dst+1
@@ -3178,12 +3171,7 @@ impl Compiler {
         self.compile_comprehension_generators(elt, generators, list_reg, ComprehensionKind::List)?;
 
         // Move result to destination
-        eprintln!(
-            "[DEBUG compile_listcomp] moving list_reg={} to dst={}",
-            list_reg.0, dst.0
-        );
         self.builder.emit_move(dst, list_reg);
-        eprintln!("[DEBUG compile_listcomp] freeing list_reg={}", list_reg.0);
         self.builder.free_register(list_reg);
 
         Ok(dst)
@@ -3306,10 +3294,6 @@ impl Compiler {
             let elem_reg = self.compile_expr(elt)?;
             match kind {
                 ComprehensionKind::List => {
-                    eprintln!(
-                        "[DEBUG emit ListAppend] result_reg={}, elem_reg={}",
-                        result_reg.0, elem_reg.0
-                    );
                     // ListAppend: src1.append(src2) - list in src1, element in src2
                     self.builder.emit(Instruction::op_dss(
                         Opcode::ListAppend,
