@@ -740,6 +740,9 @@ impl TemplateCompiler {
             TemplateInstruction::Return { value, .. } => {
                 ReturnTemplate { value_reg: *value }.emit(ctx);
             }
+            TemplateInstruction::ReturnNone { .. } => {
+                ReturnNoneTemplate.emit(ctx);
+            }
             // Integer comparisons
             TemplateInstruction::IntLt { dst, lhs, rhs, .. } => {
                 LtTemplate {
@@ -1666,6 +1669,9 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         value: u8,
     },
+    ReturnNone {
+        bc_offset: u32,
+    },
 
     // No-op
     Nop {
@@ -2050,6 +2056,7 @@ impl TemplateInstruction {
             | TemplateInstruction::BranchIfNone { bc_offset, .. }
             | TemplateInstruction::BranchIfNotNone { bc_offset, .. }
             | TemplateInstruction::Return { bc_offset, .. }
+            | TemplateInstruction::ReturnNone { bc_offset }
             | TemplateInstruction::Nop { bc_offset } => *bc_offset,
         }
     }
@@ -2060,6 +2067,9 @@ impl TemplateInstruction {
             TemplateInstruction::Jump { target, .. } => Some(*target),
             TemplateInstruction::BranchIfTrue { target, .. } => Some(*target),
             TemplateInstruction::BranchIfFalse { target, .. } => Some(*target),
+            TemplateInstruction::BranchIfNone { target, .. } => Some(*target),
+            TemplateInstruction::BranchIfNotNone { target, .. } => Some(*target),
+            TemplateInstruction::EndAsyncFor { target, .. } => Some(*target as u32),
             _ => None,
         }
     }
@@ -2300,6 +2310,25 @@ mod tests {
         assert_eq!(add.jump_target(), None);
         assert!(add.can_deopt());
         assert_eq!(add.deopt_reason(), DeoptReason::TypeGuardFailed);
+
+        let branch_none = TemplateInstruction::BranchIfNone {
+            bc_offset: 8,
+            cond: 0,
+            target: 20,
+        };
+        assert_eq!(branch_none.jump_target(), Some(20));
+
+        let end_async_for = TemplateInstruction::EndAsyncFor {
+            bc_offset: 12,
+            dst: 0,
+            target: 28,
+        };
+        assert_eq!(end_async_for.jump_target(), Some(28));
+
+        let ret_none = TemplateInstruction::ReturnNone { bc_offset: 16 };
+        assert_eq!(ret_none.bc_offset(), 16);
+        assert_eq!(ret_none.jump_target(), None);
+        assert!(!ret_none.can_deopt());
     }
 
     #[test]

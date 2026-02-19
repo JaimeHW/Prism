@@ -30,7 +30,7 @@ impl<'a> BytecodeTranslator<'a> {
     }
 
     /// Translate the bytecode to a Graph.
-    pub fn translate(mut self) -> Graph {
+    pub fn translate(mut self) -> Result<Graph, String> {
         let instructions = &self.code.instructions;
         let len = instructions.len();
         let mut pc = 0;
@@ -46,12 +46,12 @@ impl<'a> BytecodeTranslator<'a> {
             let inst = instructions[pc];
 
             // Dispatch instruction
-            self.dispatch(inst, offset);
+            self.dispatch(inst, offset, len)?;
 
             pc += 1;
         }
 
-        self.builder.finish()
+        Ok(self.builder.finish())
     }
 
     /// Helper to get a value from a register.
@@ -66,146 +66,190 @@ impl<'a> BytecodeTranslator<'a> {
         self.builder.set_register(reg.index() as u16, node)
     }
 
+    /// Resolve a signed relative jump target in instruction units.
+    #[inline]
+    fn resolve_jump_target(
+        &self,
+        offset: u32,
+        relative: i16,
+        instruction_count: usize,
+    ) -> Result<u32, String> {
+        let target = offset as i64 + 1 + relative as i64;
+        let max = instruction_count as i64;
+        if !(0..=max).contains(&target) {
+            return Err(format!(
+                "invalid jump target {target} at instruction offset {offset} (delta {relative}, max {max})"
+            ));
+        }
+        Ok(target as u32)
+    }
+
     /// Dispatch instruction to appropriate builder method.
-    fn dispatch(&mut self, inst: Instruction, offset: u32) {
-        if let Some(op) = Opcode::from_u8(inst.opcode()) {
-            match op {
-                // Control Flow
-                Opcode::Jump => {
-                    let rel = inst.imm16() as i16;
-                    let target = (offset as i32 + rel as i32) as u32;
-                    self.builder.translate_jump(target);
-                }
-                Opcode::JumpIfFalse => {
-                    let cond = self.get_register(inst.dst());
-                    let rel = inst.imm16() as i16;
-                    let target = (offset as i32 + rel as i32) as u32;
-                    // JumpIfFalse: if !cond goto target else goto fallthrough
-                    // fallthrough is offset + 1 (next instruction)
-                    let fallthrough = offset + 1;
-                    self.builder.translate_branch(cond, fallthrough, target);
-                }
-                Opcode::JumpIfTrue => {
-                    let cond = self.get_register(inst.dst());
-                    let rel = inst.imm16() as i16;
-                    let target = (offset as i32 + rel as i32) as u32;
-                    let fallthrough = offset + 1;
-                    self.builder.translate_branch(cond, target, fallthrough);
-                }
+    fn dispatch(
+        &mut self,
+        inst: Instruction,
+        offset: u32,
+        instruction_count: usize,
+    ) -> Result<(), String> {
+        let Some(op) = Opcode::from_u8(inst.opcode()) else {
+            return Err(format!(
+                "invalid opcode byte 0x{:02X} at instruction offset {}",
+                inst.opcode(),
+                offset
+            ));
+        };
 
-                Opcode::Return => {
-                    let val = self.get_register(inst.dst());
-                    self.builder.return_value(val);
-                }
-                Opcode::ReturnNone => {
-                    let val = self.builder.const_none();
-                    self.builder.return_value(val);
-                }
+        match op {
+            // Control Flow
+            Opcode::Jump => {
+                let target =
+                    self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
+                self.builder.translate_jump(target);
+            }
+            Opcode::JumpIfFalse => {
+                let cond = self.get_register(inst.dst());
+                let target =
+                    self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
+                // JumpIfFalse: if !cond goto target else goto fallthrough
+                let fallthrough = offset + 1;
+                self.builder.translate_branch(cond, fallthrough, target);
+            }
+            Opcode::JumpIfTrue => {
+                let cond = self.get_register(inst.dst());
+                let target =
+                    self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
+                let fallthrough = offset + 1;
+                self.builder.translate_branch(cond, target, fallthrough);
+            }
 
-                // Constants / Loads
-                Opcode::LoadConst => {
-                    let const_idx = inst.imm16();
-                    if let Some(val) = self.code.constants.get(const_idx as usize) {
-                        let node = if let Some(i) = val.as_int() {
-                            self.builder.const_int(i)
-                        } else if let Some(f) = val.as_float() {
-                            self.builder.const_float(f)
-                        } else if let Some(b) = val.as_bool() {
-                            self.builder.const_bool(b)
-                        } else if val.is_none() {
-                            self.builder.const_none()
-                        } else {
-                            self.builder.const_none()
-                        };
-                        self.set_register(inst.dst(), node);
-                    }
-                }
-                Opcode::LoadNone => {
-                    let val = self.builder.const_none();
-                    self.set_register(inst.dst(), val);
-                }
-                Opcode::LoadTrue => {
-                    let val = self.builder.const_bool(true);
-                    self.set_register(inst.dst(), val);
-                }
-                Opcode::LoadFalse => {
-                    let val = self.builder.const_bool(false);
-                    self.set_register(inst.dst(), val);
-                }
-                Opcode::Move => {
-                    let val = self.get_register(inst.src1());
-                    self.set_register(inst.dst(), val);
-                }
+            Opcode::Return => {
+                let val = self.get_register(inst.dst());
+                self.builder.return_value(val);
+            }
+            Opcode::ReturnNone => {
+                let val = self.builder.const_none();
+                self.builder.return_value(val);
+            }
 
-                // Arithmetic
-                Opcode::AddInt | Opcode::AddFloat | Opcode::Add => {
-                    let lhs = self.get_register(inst.src1());
-                    let rhs = self.get_register(inst.src2());
-                    let res = match op {
-                        Opcode::AddInt => self.builder.int_add(lhs, rhs),
-                        Opcode::AddFloat => self.builder.float_add(lhs, rhs),
-                        _ => self.builder.generic_add(lhs, rhs),
-                    };
-                    self.set_register(inst.dst(), res);
-                }
-                Opcode::SubInt | Opcode::SubFloat | Opcode::Sub => {
-                    let lhs = self.get_register(inst.src1());
-                    let rhs = self.get_register(inst.src2());
-                    let res = match op {
-                        Opcode::SubInt => self.builder.int_sub(lhs, rhs),
-                        Opcode::SubFloat => self.builder.float_sub(lhs, rhs),
-                        _ => self.builder.generic_sub(lhs, rhs),
-                    };
-                    self.set_register(inst.dst(), res);
-                }
-                Opcode::MulInt | Opcode::MulFloat | Opcode::Mul => {
-                    let lhs = self.get_register(inst.src1());
-                    let rhs = self.get_register(inst.src2());
-                    let res = match op {
-                        Opcode::MulInt => self.builder.int_mul(lhs, rhs),
-                        Opcode::MulFloat => self.builder.float_mul(lhs, rhs),
-                        _ => self.builder.generic_mul(lhs, rhs),
-                    };
-                    self.set_register(inst.dst(), res);
-                }
-                // ... extend other arithmetic ...
+            // Constants / Loads
+            Opcode::LoadConst => {
+                let const_idx = inst.imm16() as usize;
+                let val = self.code.constants.get(const_idx).ok_or_else(|| {
+                    format!(
+                        "invalid constant index {} at instruction offset {} ({} constants)",
+                        const_idx,
+                        offset,
+                        self.code.constants.len()
+                    )
+                })?;
 
-                // Comparisons
-                Opcode::Lt | Opcode::Le | Opcode::Eq | Opcode::Ne | Opcode::Gt | Opcode::Ge => {
-                    let lhs = self.get_register(inst.src1());
-                    let rhs = self.get_register(inst.src2());
-                    let res = match op {
-                        Opcode::Lt => self.builder.generic_lt(lhs, rhs),
-                        Opcode::Le => self.builder.generic_le(lhs, rhs),
-                        Opcode::Eq => self.builder.generic_eq(lhs, rhs),
-                        Opcode::Ne => self.builder.generic_ne(lhs, rhs),
-                        Opcode::Gt => self.builder.generic_gt(lhs, rhs),
-                        Opcode::Ge => self.builder.generic_ge(lhs, rhs),
-                        _ => unreachable!(),
-                    };
-                    self.set_register(inst.dst(), res);
-                }
+                let node = if let Some(i) = val.as_int() {
+                    self.builder.const_int(i)
+                } else if let Some(f) = val.as_float() {
+                    self.builder.const_float(f)
+                } else if let Some(b) = val.as_bool() {
+                    self.builder.const_bool(b)
+                } else if val.is_none() {
+                    self.builder.const_none()
+                } else {
+                    return Err(format!(
+                        "unsupported constant type at index {} for instruction offset {}",
+                        const_idx, offset
+                    ));
+                };
+                self.set_register(inst.dst(), node);
+            }
+            Opcode::LoadNone => {
+                let val = self.builder.const_none();
+                self.set_register(inst.dst(), val);
+            }
+            Opcode::LoadTrue => {
+                let val = self.builder.const_bool(true);
+                self.set_register(inst.dst(), val);
+            }
+            Opcode::LoadFalse => {
+                let val = self.builder.const_bool(false);
+                self.set_register(inst.dst(), val);
+            }
+            Opcode::Move => {
+                let val = self.get_register(inst.src1());
+                self.set_register(inst.dst(), val);
+            }
 
-                // Objects
-                Opcode::GetAttr | Opcode::SetAttr | Opcode::GetItem | Opcode::SetItem => {
-                    self.dispatch_object_op(op, inst);
-                }
+            // Arithmetic
+            Opcode::AddInt | Opcode::AddFloat | Opcode::Add => {
+                let lhs = self.get_register(inst.src1());
+                let rhs = self.get_register(inst.src2());
+                let res = match op {
+                    Opcode::AddInt => self.builder.int_add(lhs, rhs),
+                    Opcode::AddFloat => self.builder.float_add(lhs, rhs),
+                    _ => self.builder.generic_add(lhs, rhs),
+                };
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::SubInt | Opcode::SubFloat | Opcode::Sub => {
+                let lhs = self.get_register(inst.src1());
+                let rhs = self.get_register(inst.src2());
+                let res = match op {
+                    Opcode::SubInt => self.builder.int_sub(lhs, rhs),
+                    Opcode::SubFloat => self.builder.float_sub(lhs, rhs),
+                    _ => self.builder.generic_sub(lhs, rhs),
+                };
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::MulInt | Opcode::MulFloat | Opcode::Mul => {
+                let lhs = self.get_register(inst.src1());
+                let rhs = self.get_register(inst.src2());
+                let res = match op {
+                    Opcode::MulInt => self.builder.int_mul(lhs, rhs),
+                    Opcode::MulFloat => self.builder.float_mul(lhs, rhs),
+                    _ => self.builder.generic_mul(lhs, rhs),
+                };
+                self.set_register(inst.dst(), res);
+            }
+            // ... extend other arithmetic ...
 
-                // Calls
-                Opcode::Call | Opcode::CallMethod => {
-                    self.dispatch_call_op(op, inst);
-                }
+            // Comparisons
+            Opcode::Lt | Opcode::Le | Opcode::Eq | Opcode::Ne | Opcode::Gt | Opcode::Ge => {
+                let lhs = self.get_register(inst.src1());
+                let rhs = self.get_register(inst.src2());
+                let res = match op {
+                    Opcode::Lt => self.builder.generic_lt(lhs, rhs),
+                    Opcode::Le => self.builder.generic_le(lhs, rhs),
+                    Opcode::Eq => self.builder.generic_eq(lhs, rhs),
+                    Opcode::Ne => self.builder.generic_ne(lhs, rhs),
+                    Opcode::Gt => self.builder.generic_gt(lhs, rhs),
+                    Opcode::Ge => self.builder.generic_ge(lhs, rhs),
+                    _ => unreachable!(),
+                };
+                self.set_register(inst.dst(), res);
+            }
 
-                // Containers
-                Opcode::BuildList | Opcode::BuildTuple | Opcode::GetIter | Opcode::Len => {
-                    self.dispatch_container_op(op, inst);
-                }
+            // Objects
+            Opcode::GetAttr | Opcode::SetAttr | Opcode::GetItem | Opcode::SetItem => {
+                self.dispatch_object_op(op, inst);
+            }
 
-                _ => {
-                    // Unimplemented opcodes
-                }
+            // Calls
+            Opcode::Call | Opcode::CallMethod => {
+                self.dispatch_call_op(op, inst);
+            }
+
+            // Containers
+            Opcode::BuildList | Opcode::BuildTuple | Opcode::GetIter | Opcode::Len => {
+                self.dispatch_container_op(op, inst);
+            }
+
+            _ => {
+                return Err(format!(
+                    "unsupported opcode 0x{:02X} encountered at instruction offset {}",
+                    inst.opcode(),
+                    offset
+                ));
             }
         }
+
+        Ok(())
     }
 
     fn dispatch_object_op(&mut self, op: Opcode, inst: Instruction) {
@@ -293,5 +337,113 @@ impl<'a> BytecodeTranslator<'a> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_compiler::bytecode::Register;
+
+    #[test]
+    fn test_translate_simple_return_is_ok() {
+        let mut code = CodeObject::new("simple", "<test>");
+        code.register_count = 1;
+        code.instructions =
+            vec![Instruction::op_d(Opcode::ReturnNone, Register::new(0))].into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let graph = translator.translate();
+        assert!(graph.is_ok());
+    }
+
+    #[test]
+    fn test_translate_rejects_unsupported_opcode() {
+        let mut code = CodeObject::new("unsupported", "<test>");
+        code.register_count = 1;
+        code.instructions =
+            vec![Instruction::op_d(Opcode::BuildClass, Register::new(0))].into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("unsupported opcode"));
+    }
+
+    #[test]
+    fn test_translate_rejects_invalid_constant_index() {
+        let mut code = CodeObject::new("bad_const", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![
+            Instruction::op_di(Opcode::LoadConst, Register::new(0), 99),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("invalid constant index"));
+    }
+
+    #[test]
+    fn test_translate_rejects_jump_target_underflow() {
+        let mut code = CodeObject::new("bad_jump_underflow", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![
+            Instruction::op_di(Opcode::Jump, Register::new(0), (-2_i16) as u16),
+            Instruction::op(Opcode::ReturnNone),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("invalid jump target"));
+    }
+
+    #[test]
+    fn test_translate_rejects_jump_target_overflow() {
+        let mut code = CodeObject::new("bad_jump_overflow", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![
+            Instruction::op_di(Opcode::Jump, Register::new(0), 10),
+            Instruction::op(Opcode::ReturnNone),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("invalid jump target"));
+    }
+
+    #[test]
+    fn test_translate_accepts_jump_to_end() {
+        let mut code = CodeObject::new("jump_to_end", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![
+            // offset 0 -> next is 1, rel 1 => target 2 (end sentinel)
+            Instruction::op_di(Opcode::Jump, Register::new(0), 1),
+            Instruction::op(Opcode::ReturnNone),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        assert!(translator.translate().is_ok());
+    }
+
+    #[test]
+    fn test_translate_rejects_invalid_opcode_byte() {
+        let mut code = CodeObject::new("invalid_opcode", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![Instruction::from_raw(0xFF00_0000)].into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("invalid opcode byte"));
     }
 }

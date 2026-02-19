@@ -226,11 +226,8 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                 });
             }
             Some(Opcode::ReturnNone) => {
-                // Return with implicit None value (use register 0 as placeholder)
-                self.output.push(TemplateInstruction::Return {
-                    bc_offset,
-                    value: 0,
-                });
+                self.output
+                    .push(TemplateInstruction::ReturnNone { bc_offset });
             }
 
             // =================================================================
@@ -1144,10 +1141,12 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
             Some(Opcode::EndAsyncFor) => {
                 // Handle StopAsyncIteration in async for loop
                 // Format: DstImm16 (dst = value, imm16 = jump offset on StopAsyncIteration)
+                let target = self.calculate_jump_target(bc_offset, inst.imm16() as i16);
+                let target = u16::try_from(target).unwrap_or(u16::MAX);
                 self.output.push(TemplateInstruction::EndAsyncFor {
                     bc_offset,
                     dst: inst.dst().0,
-                    target: inst.imm16(),
+                    target,
                 });
             }
             Some(Opcode::Send) => {
@@ -3259,11 +3258,10 @@ mod tests {
 
         let ir = lowerer.lower(&code);
         assert_eq!(ir.len(), 1);
-        if let TemplateInstruction::Return { bc_offset, value } = ir[0] {
+        if let TemplateInstruction::ReturnNone { bc_offset } = ir[0] {
             assert_eq!(bc_offset, 0);
-            assert_eq!(value, 0); // Placeholder register 0
         } else {
-            panic!("Expected Return instruction for ReturnNone");
+            panic!("Expected ReturnNone instruction");
         }
     }
 
@@ -3535,10 +3533,7 @@ mod tests {
             TemplateInstruction::BranchIfNone { cond: 0, .. }
         ));
         assert!(matches!(ir[1], TemplateInstruction::IntAdd { .. }));
-        assert!(matches!(
-            ir[2],
-            TemplateInstruction::Return { value: 0, .. }
-        ));
+        assert!(matches!(ir[2], TemplateInstruction::ReturnNone { .. }));
     }
 
     #[test]
@@ -6317,7 +6312,8 @@ mod tests {
             ir[0],
             TemplateInstruction::EndAsyncFor {
                 dst: 0,
-                target: 100,
+                // Target = (0 + 4) + (100 * 4) = 404
+                target: 404,
                 ..
             }
         ));
