@@ -218,6 +218,13 @@ impl JitExecutor {
         // Execute compiled code
         let result = unsafe { entry_fn(&mut self.frame_state) };
 
+        // Tier 1 baseline JIT currently returns raw Prism Value bits in RAX.
+        // Handle this path directly to avoid interpreting valid values as exit reasons.
+        if entry.tier() == 1 {
+            self.restore_frame_state(frame);
+            return ExecutionResult::Return(Value::from_bits(result));
+        }
+
         // Decode result and update interpreter frame
         let (exit_reason, data) = decode_jit_result(result);
 
@@ -302,6 +309,12 @@ impl JitExecutor {
 
         // Execute from OSR entry
         let result = unsafe { osr_entry_fn(&mut self.frame_state) };
+
+        // Tier 1 baseline JIT returns raw Prism Value bits.
+        if entry.tier() == 1 {
+            self.restore_frame_state(frame);
+            return ExecutionResult::Return(Value::from_bits(result));
+        }
 
         // Handle result same as regular execution
         let (exit_reason, data) = decode_jit_result(result);
