@@ -4630,6 +4630,42 @@ class Empty:
     }
 
     #[test]
+    fn test_compile_build_class_encodes_code_const_index_and_base_count() {
+        let code = compile(
+            r#"
+class Child(Base1, Base2):
+    pass
+"#,
+        );
+
+        let build_class = code
+            .instructions
+            .iter()
+            .find(|inst| inst.opcode() == Opcode::BuildClass as u8)
+            .expect("expected BUILD_CLASS instruction");
+
+        assert_eq!(build_class.src2().0, 2, "base count must match source");
+
+        let code_idx = build_class.src1().0 as usize;
+        let code_const = code
+            .constants
+            .get(code_idx)
+            .copied()
+            .expect("BUILD_CLASS code index must be in constant pool");
+        let code_ptr = code_const
+            .as_object_ptr()
+            .expect("BUILD_CLASS constant must be a code object pointer");
+
+        let nested = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| Arc::as_ptr(nested) as *const () == code_ptr)
+            .expect("BUILD_CLASS code object must exist in nested_code_objects");
+
+        assert_eq!(nested.name.as_ref(), "Child");
+    }
+
+    #[test]
     fn test_compile_class_with_method() {
         // Class with a simple method
         let code = compile(

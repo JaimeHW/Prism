@@ -678,12 +678,24 @@ impl FunctionBuilder {
     /// - `base_count`: Number of base classes (stored in consecutive registers starting at dst+1)
     ///
     /// # Encoding
-    /// Uses DstSrcSrc format: dst = class, src1 = code_idx as u8, src2 = base_count
+    /// Uses DstSrcSrc format:
+    /// - `dst` = result class object
+    /// - `src1` = class body code object constant index (8-bit)
+    /// - `src2` = base class count
+    ///
+    /// # Panics
+    /// Panics if `code_idx > 255` because the current opcode encoding stores
+    /// the code constant index in an 8-bit field.
     pub fn emit_build_class(&mut self, dst: Register, code_idx: u16, base_count: u8) {
+        assert!(
+            code_idx <= u8::MAX as u16,
+            "BUILD_CLASS code index {} exceeds 8-bit encoding",
+            code_idx
+        );
         self.emit(Instruction::op_dss(
             Opcode::BuildClass,
             dst,
-            Register::new(code_idx as u8), // code object index (low byte)
+            Register::new(code_idx as u8),
             Register::new(base_count),
         ));
     }
@@ -1379,6 +1391,29 @@ mod tests {
 
         assert_eq!(inst.opcode(), Opcode::GetAttr as u8);
         assert_eq!(inst.src2().0, 0x23);
+    }
+
+    #[test]
+    fn test_emit_build_class_encodes_code_index_and_base_count() {
+        let mut builder = FunctionBuilder::new("class_builder");
+        let dst = builder.alloc_register();
+
+        builder.emit_build_class(dst, 0x2A, 3);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::BuildClass as u8);
+        assert_eq!(inst.dst().0, dst.0);
+        assert_eq!(inst.src1().0, 0x2A);
+        assert_eq!(inst.src2().0, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUILD_CLASS code index")]
+    fn test_emit_build_class_panics_for_out_of_range_code_index() {
+        let mut builder = FunctionBuilder::new("class_builder_overflow");
+        let dst = builder.alloc_register();
+        builder.emit_build_class(dst, 256, 0);
     }
 
     // =========================================================================

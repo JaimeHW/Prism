@@ -31,12 +31,15 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use prism_compiler::bytecode::Instruction;
+use prism_compiler::bytecode::{CodeObject, Instruction};
 use prism_core::Value;
-use prism_core::intern::{InternedString, intern, interned_by_ptr};
+use prism_core::intern::{InternedString, intern};
+#[cfg(test)]
+use prism_core::intern::interned_by_ptr;
 use prism_runtime::object::class::{ClassDict, PyClassObject};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_obj::TypeId;
+#[cfg(test)]
 use prism_runtime::types::string::StringObject;
 use std::sync::Arc;
 
@@ -48,9 +51,8 @@ use std::sync::Arc;
 ///
 /// # Opcode Format (DstSrcSrc)
 /// - dst: Destination register for the new class object
-/// - src1: Register containing class name string
+/// - src1: Class body `CodeObject` constant index (8-bit)
 /// - src2: Number of base classes
-/// - imm16: Constant pool index of the class body CodeObject
 ///
 /// # Register Layout
 /// ```text
@@ -63,7 +65,7 @@ use std::sync::Arc;
 ///
 /// # Algorithm
 /// 1. Load class body CodeObject from constants
-/// 2. Execute body to create class namespace (attribute dict)
+/// 2. Extract class name from class body code object metadata
 /// 3. Collect base classes from registers
 /// 4. Create PyClassObject with name, bases, namespace
 /// 5. Store result in destination register
@@ -76,27 +78,25 @@ use std::sync::Arc;
 #[inline(always)]
 pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let dst_reg = inst.dst().0;
-    let name_reg = inst.src1().0;
+    let code_idx = inst.src1().0 as u16;
     let base_count = inst.src2().0 as usize;
 
-    // Get class name from register
-    let name_val = vm.current_frame().get_reg(name_reg);
-    let class_name = match extract_string_name(name_val) {
-        Some(name) => name,
-        None => {
-            return ControlFlow::Error(RuntimeError::type_error("class name must be a string"));
+    // Resolve class name from class body code-object constant.
+    let class_name = {
+        let frame = vm.current_frame();
+        let code_const = frame.get_const(code_idx);
+        match extract_class_name_from_code_const(code_const, &frame.code.nested_code_objects) {
+            Some(name) => name,
+            None => {
+                return ControlFlow::Error(RuntimeError::type_error(
+                    "class body must be a valid code object constant",
+                ));
+            }
         }
     };
 
-    // Get code object index from instruction (encoded after base count)
-    // The code object index is stored in the upper bits or as immediate
-    let code_idx = inst.imm16();
-
-    // Load class body CodeObject from constants
-    let frame = vm.current_frame();
-    let code_const = frame.get_const(code_idx);
-
     // Collect base classes from registers
+    let frame = vm.current_frame();
     let mut base_class_ids = Vec::with_capacity(base_count);
     for i in 0..base_count {
         let base_val = frame.get_reg(dst_reg + 1 + i as u8);
@@ -165,6 +165,7 @@ pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 ///
 /// Supports both interned strings (small) and heap-allocated strings.
 #[inline]
+#[cfg(test)]
 fn extract_string_name(val: Value) -> Option<InternedString> {
     if val.is_string() {
         let ptr = val.as_string_object_ptr()?;
@@ -178,6 +179,20 @@ fn extract_string_name(val: Value) -> Option<InternedString> {
 
     let string = unsafe { &*(ptr as *const StringObject) };
     Some(intern(string.as_str()))
+}
+
+/// Resolve class name from a code-object constant by pointer identity against
+/// the frame's nested code-object list.
+#[inline]
+fn extract_class_name_from_code_const(
+    code_const: Value,
+    nested_code_objects: &[Arc<CodeObject>],
+) -> Option<InternedString> {
+    let code_ptr = code_const.as_object_ptr()? as *const CodeObject;
+    nested_code_objects
+        .iter()
+        .find(|nested| Arc::as_ptr(nested) == code_ptr)
+        .map(|nested| intern(nested.name.as_ref()))
 }
 
 /// Extract ClassId from a class object Value.
@@ -280,6 +295,34 @@ mod tests {
     fn test_extract_string_name_invalid_returns_none() {
         let name = extract_string_name(Value::none());
         assert!(name.is_none());
+    }
+
+    #[test]
+    fn test_extract_class_name_from_code_const() {
+        let code = Arc::new(CodeObject::new("ExtractedClass", "<test>"));
+        let raw = Arc::into_raw(Arc::clone(&code)) as *const ();
+        let code_const = Value::object_ptr(raw);
+
+        let name = extract_class_name_from_code_const(code_const, &[Arc::clone(&code)]);
+        assert_eq!(name.unwrap().as_ref(), "ExtractedClass");
+
+        unsafe {
+            let _ = Arc::from_raw(raw as *const CodeObject);
+        }
+    }
+
+    #[test]
+    fn test_extract_class_name_from_code_const_returns_none_when_pointer_not_nested() {
+        let code = Arc::new(CodeObject::new("UnlistedClass", "<test>"));
+        let raw = Arc::into_raw(Arc::clone(&code)) as *const ();
+        let code_const = Value::object_ptr(raw);
+
+        let name = extract_class_name_from_code_const(code_const, &[]);
+        assert!(name.is_none());
+
+        unsafe {
+            let _ = Arc::from_raw(raw as *const CodeObject);
+        }
     }
 
     // =========================================================================

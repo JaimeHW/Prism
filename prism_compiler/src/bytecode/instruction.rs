@@ -802,7 +802,7 @@ impl Opcode {
             BuildTupleUnpack | BuildDictUnpack | SetFunctionDefaults => DstSrcSrc, // dst, base_reg, count
 
             // Class operations
-            BuildClass => DstSrcSrc, // dst = class, src1 = body code, src2 = base count
+            BuildClass => DstSrcSrc, // dst = class, src1 = class-body code const index (u8), src2 = base count
             LoadMethod => DstSrcSrc, // dst = method, src1 = object, src2 = name_idx
 
             // Container ops
