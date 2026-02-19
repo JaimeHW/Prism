@@ -2,7 +2,7 @@
 
 use super::BuiltinError;
 use prism_core::Value;
-use prism_core::intern::intern;
+use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -10,6 +10,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
 use std::sync::{LazyLock, Mutex};
@@ -223,6 +224,27 @@ fn dict_item_to_pair(item: Value, index: usize) -> Result<(Value, Value), Builti
         )));
     }
     Ok((values[0], values[1]))
+}
+
+fn attribute_name(name: Value) -> Result<InternedString, BuiltinError> {
+    if name.is_string() {
+        let ptr = name
+            .as_string_object_ptr()
+            .ok_or_else(|| BuiltinError::TypeError("attribute name must be string".to_string()))?;
+        return interned_by_ptr(ptr as *const u8)
+            .ok_or_else(|| BuiltinError::TypeError("attribute name must be string".to_string()));
+    }
+
+    if let Some(ptr) = name.as_object_ptr() {
+        if crate::ops::objects::extract_type_id(ptr) == TypeId::STR {
+            let string_obj = unsafe { &*(ptr as *const StringObject) };
+            return Ok(intern(string_obj.as_str()));
+        }
+    }
+
+    Err(BuiltinError::TypeError(
+        "attribute name must be string".to_string(),
+    ))
 }
 
 /// Builtin int constructor.
@@ -503,41 +525,14 @@ pub fn builtin_getattr(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let obj = args[0];
-    let name = args[1];
+    let name = attribute_name(args[1])?;
     let default = args.get(2).copied();
-
-    // Validate name is a string
-    let name_str = if let Some(ptr) = name.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::type_obj::TypeId;
-        use prism_runtime::types::string::StringObject;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-        if type_id == TypeId::STR {
-            let string_obj = unsafe { &*(ptr as *const StringObject) };
-            string_obj.as_str().to_string()
-        } else {
-            return Err(BuiltinError::TypeError(
-                "attribute name must be string".to_string(),
-            ));
-        }
-    } else {
-        return Err(BuiltinError::TypeError(
-            "attribute name must be string".to_string(),
-        ));
-    };
 
     // Try to get the attribute
     if let Some(ptr) = obj.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::shaped_object::ShapedObject;
-        use prism_runtime::object::type_obj::TypeId;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-
-        if type_id == TypeId::OBJECT {
+        if crate::ops::objects::extract_type_id(ptr) == TypeId::OBJECT {
             let shaped = unsafe { &*(ptr as *const ShapedObject) };
-            if let Some(value) = shaped.get_property(&name_str) {
+            if let Some(value) = shaped.get_property_interned(&name) {
                 return Ok(value);
             }
         }
@@ -549,7 +544,7 @@ pub fn builtin_getattr(args: &[Value]) -> Result<Value, BuiltinError> {
         None => Err(BuiltinError::AttributeError(format!(
             "'{}' object has no attribute '{}'",
             get_type_name(obj),
-            name_str
+            name.as_str()
         ))),
     }
 }
@@ -570,50 +565,22 @@ pub fn builtin_setattr(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let obj = args[0];
-    let name = args[1];
+    let name = attribute_name(args[1])?;
     let value = args[2];
-
-    // Validate name is a string
-    let name_str = if let Some(ptr) = name.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::type_obj::TypeId;
-        use prism_runtime::types::string::StringObject;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-        if type_id == TypeId::STR {
-            let string_obj = unsafe { &*(ptr as *const StringObject) };
-            string_obj.as_str().to_string()
-        } else {
-            return Err(BuiltinError::TypeError(
-                "attribute name must be string".to_string(),
-            ));
-        }
-    } else {
-        return Err(BuiltinError::TypeError(
-            "attribute name must be string".to_string(),
-        ));
-    };
 
     // Try to set the attribute
     if let Some(ptr) = obj.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::shape::shape_registry;
-        use prism_runtime::object::shaped_object::ShapedObject;
-        use prism_runtime::object::type_obj::TypeId;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-
+        let type_id = crate::ops::objects::extract_type_id(ptr);
         if type_id == TypeId::OBJECT {
             let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
             let registry = shape_registry();
-            let interned_name = prism_core::intern::intern(&name_str);
-            shaped.set_property(interned_name, value, registry);
+            shaped.set_property(name.clone(), value, registry);
             return Ok(Value::none());
         } else {
             return Err(BuiltinError::TypeError(format!(
                 "'{}' object has no attribute '{}'",
                 type_id.name(),
-                name_str
+                name.as_str()
             )));
         }
     }
@@ -622,7 +589,7 @@ pub fn builtin_setattr(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::TypeError(format!(
         "'{}' object has no attribute '{}'",
         get_type_name(obj),
-        name_str
+        name.as_str()
     )))
 }
 
@@ -642,40 +609,13 @@ pub fn builtin_hasattr(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let obj = args[0];
-    let name = args[1];
-
-    // Validate name is a string
-    let name_str = if let Some(ptr) = name.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::type_obj::TypeId;
-        use prism_runtime::types::string::StringObject;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-        if type_id == TypeId::STR {
-            let string_obj = unsafe { &*(ptr as *const StringObject) };
-            string_obj.as_str().to_string()
-        } else {
-            return Err(BuiltinError::TypeError(
-                "attribute name must be string".to_string(),
-            ));
-        }
-    } else {
-        return Err(BuiltinError::TypeError(
-            "attribute name must be string".to_string(),
-        ));
-    };
+    let name = attribute_name(args[1])?;
 
     // Check if the attribute exists
     if let Some(ptr) = obj.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::shaped_object::ShapedObject;
-        use prism_runtime::object::type_obj::TypeId;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-
-        if type_id == TypeId::OBJECT {
+        if crate::ops::objects::extract_type_id(ptr) == TypeId::OBJECT {
             let shaped = unsafe { &*(ptr as *const ShapedObject) };
-            return Ok(Value::bool(shaped.get_property(&name_str).is_some()));
+            return Ok(Value::bool(shaped.has_property_interned(&name)));
         }
     }
 
@@ -699,52 +639,26 @@ pub fn builtin_delattr(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let obj = args[0];
-    let name = args[1];
-
-    // Validate name is a string
-    let name_str = if let Some(ptr) = name.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::type_obj::TypeId;
-        use prism_runtime::types::string::StringObject;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-        if type_id == TypeId::STR {
-            let string_obj = unsafe { &*(ptr as *const StringObject) };
-            string_obj.as_str().to_string()
-        } else {
-            return Err(BuiltinError::TypeError(
-                "attribute name must be string".to_string(),
-            ));
-        }
-    } else {
-        return Err(BuiltinError::TypeError(
-            "attribute name must be string".to_string(),
-        ));
-    };
+    let name = attribute_name(args[1])?;
 
     // Try to delete the attribute
     if let Some(ptr) = obj.as_object_ptr() {
-        use prism_runtime::object::ObjectHeader;
-        use prism_runtime::object::shaped_object::ShapedObject;
-        use prism_runtime::object::type_obj::TypeId;
-
-        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-
+        let type_id = crate::ops::objects::extract_type_id(ptr);
         if type_id == TypeId::OBJECT {
             let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
-            if shaped.delete_property(&name_str) {
+            if shaped.delete_property_interned(&name) {
                 return Ok(Value::none());
             } else {
                 return Err(BuiltinError::AttributeError(format!(
                     "'object' object has no attribute '{}'",
-                    name_str
+                    name.as_str()
                 )));
             }
         } else {
             return Err(BuiltinError::TypeError(format!(
                 "'{}' object has no attribute '{}'",
                 type_id.name(),
-                name_str
+                name.as_str()
             )));
         }
     }
@@ -753,7 +667,7 @@ pub fn builtin_delattr(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::TypeError(format!(
         "'{}' object has no attribute '{}'",
         get_type_name(obj),
-        name_str
+        name.as_str()
     )))
 }
 
@@ -1166,5 +1080,51 @@ mod tests {
         let err2 = builtin_issubclass(&[int_type, Value::int(2).unwrap()]).unwrap_err();
         assert!(matches!(err2, BuiltinError::TypeError(_)));
         assert!(err2.to_string().contains("arg 2 must be a class"));
+    }
+
+    #[test]
+    fn test_attribute_builtins_roundtrip_with_tagged_name() {
+        let object = builtin_object(&[]).unwrap();
+        let object_ptr = object.as_object_ptr().unwrap();
+        let name = Value::string(intern("field"));
+
+        builtin_setattr(&[object, name, Value::int(42).unwrap()]).unwrap();
+        assert_eq!(
+            builtin_getattr(&[object, name]).unwrap().as_int(),
+            Some(42)
+        );
+        assert!(builtin_hasattr(&[object, name]).unwrap().as_bool().unwrap());
+
+        // Distinguish explicit None assignment from deletion.
+        builtin_setattr(&[object, name, Value::none()]).unwrap();
+        assert!(builtin_hasattr(&[object, name]).unwrap().as_bool().unwrap());
+        assert!(builtin_getattr(&[object, name]).unwrap().is_none());
+
+        builtin_delattr(&[object, name]).unwrap();
+        assert!(!builtin_hasattr(&[object, name]).unwrap().as_bool().unwrap());
+
+        let err = builtin_getattr(&[object, name]).unwrap_err();
+        assert!(matches!(err, BuiltinError::AttributeError(_)));
+
+        let fallback = Value::int(7).unwrap();
+        assert_eq!(builtin_getattr(&[object, name, fallback]).unwrap(), fallback);
+
+        unsafe { drop_boxed(object_ptr as *mut ShapedObject) };
+    }
+
+    #[test]
+    fn test_attribute_builtins_accept_heap_string_name() {
+        let object = builtin_object(&[]).unwrap();
+        let object_ptr = object.as_object_ptr().unwrap();
+        let (name, name_ptr) = boxed_value(StringObject::new("heap_name"));
+
+        builtin_setattr(&[object, name, Value::int(11).unwrap()]).unwrap();
+        assert_eq!(builtin_getattr(&[object, name]).unwrap().as_int(), Some(11));
+        assert!(builtin_hasattr(&[object, name]).unwrap().as_bool().unwrap());
+        builtin_delattr(&[object, name]).unwrap();
+        assert!(!builtin_hasattr(&[object, name]).unwrap().as_bool().unwrap());
+
+        unsafe { drop_boxed(name_ptr) };
+        unsafe { drop_boxed(object_ptr as *mut ShapedObject) };
     }
 }

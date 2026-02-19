@@ -14,9 +14,23 @@ use prism_core::Value;
 
 mod builtin_tests {
     use super::*;
+    use prism_core::intern::intern;
+    use prism_runtime::object::shape::shape_registry;
+    use prism_runtime::object::shaped_object::ShapedObject;
+    use prism_runtime::types::string::StringObject;
     use prism_vm::builtins::{
         BuiltinError, builtin_delattr, builtin_getattr, builtin_hasattr, builtin_setattr,
     };
+
+    fn new_object_value() -> (Value, *mut ShapedObject) {
+        let object = ShapedObject::with_empty_shape(shape_registry().empty_shape());
+        let ptr = Box::into_raw(Box::new(object));
+        (Value::object_ptr(ptr as *const ()), ptr)
+    }
+
+    unsafe fn drop_boxed<T>(ptr: *mut T) {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
 
     // =========================================================================
     // getattr() Argument Validation
@@ -204,6 +218,55 @@ mod builtin_tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_attribute_roundtrip_with_tagged_name() {
+        let (obj, obj_ptr) = new_object_value();
+        let name = Value::string(intern("field"));
+
+        builtin_setattr(&[obj, name, Value::int(10).unwrap()]).unwrap();
+        assert_eq!(builtin_getattr(&[obj, name]).unwrap().as_int(), Some(10));
+        assert!(builtin_hasattr(&[obj, name]).unwrap().as_bool().unwrap());
+
+        builtin_delattr(&[obj, name]).unwrap();
+        assert!(!builtin_hasattr(&[obj, name]).unwrap().as_bool().unwrap());
+        assert!(matches!(
+            builtin_getattr(&[obj, name]).unwrap_err(),
+            BuiltinError::AttributeError(_)
+        ));
+
+        unsafe { drop_boxed(obj_ptr) };
+    }
+
+    #[test]
+    fn test_attribute_name_heap_string_object() {
+        let (obj, obj_ptr) = new_object_value();
+        let string_ptr = Box::into_raw(Box::new(StringObject::new("heap_name")));
+        let name = Value::object_ptr(string_ptr as *const ());
+
+        builtin_setattr(&[obj, name, Value::int(22).unwrap()]).unwrap();
+        assert_eq!(builtin_getattr(&[obj, name]).unwrap().as_int(), Some(22));
+        builtin_delattr(&[obj, name]).unwrap();
+        assert!(!builtin_hasattr(&[obj, name]).unwrap().as_bool().unwrap());
+
+        unsafe { drop_boxed(string_ptr) };
+        unsafe { drop_boxed(obj_ptr) };
+    }
+
+    #[test]
+    fn test_setattr_none_is_not_deletion() {
+        let (obj, obj_ptr) = new_object_value();
+        let name = Value::string(intern("nullable"));
+
+        builtin_setattr(&[obj, name, Value::none()]).unwrap();
+        assert!(builtin_hasattr(&[obj, name]).unwrap().as_bool().unwrap());
+        assert!(builtin_getattr(&[obj, name]).unwrap().is_none());
+
+        builtin_delattr(&[obj, name]).unwrap();
+        assert!(!builtin_hasattr(&[obj, name]).unwrap().as_bool().unwrap());
+
+        unsafe { drop_boxed(obj_ptr) };
     }
 }
 
