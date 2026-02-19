@@ -863,6 +863,7 @@ mod tests {
             TypeId::FLOAT,
             TypeId::STR,
             TypeId::BYTES,
+            TypeId::BYTEARRAY,
             TypeId::LIST,
             TypeId::TUPLE,
             TypeId::DICT,

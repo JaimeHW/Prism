@@ -29,6 +29,7 @@
 //! and read-only thereafter, making it safe for concurrent access during GC.
 
 use crate::object::type_obj::TypeId;
+use crate::types::bytes::BytesObject;
 use crate::types::dict::DictObject;
 use crate::types::function::FunctionObject;
 use crate::types::iter::IteratorObject;
@@ -152,6 +153,24 @@ fn init_dispatch_table() -> DispatchTable {
             trace: trace_string,
             size: size_string,
             finalize: finalize_string,
+        },
+    );
+
+    table.register(
+        TypeId::BYTES,
+        DispatchEntry {
+            trace: trace_bytes,
+            size: size_bytes,
+            finalize: finalize_bytes,
+        },
+    );
+
+    table.register(
+        TypeId::BYTEARRAY,
+        DispatchEntry {
+            trace: trace_bytes,
+            size: size_bytes,
+            finalize: finalize_bytes,
         },
     );
 
@@ -308,6 +327,27 @@ unsafe fn finalize_string(ptr: *mut ()) {
 }
 
 // =============================================================================
+// BytesObject Dispatch
+// =============================================================================
+
+unsafe fn trace_bytes(ptr: *const (), tracer: &mut dyn Tracer) {
+    // SAFETY: Caller guarantees ptr points to valid BytesObject
+    let obj = unsafe { &*(ptr as *const BytesObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_bytes(ptr: *const ()) -> usize {
+    // SAFETY: Caller guarantees ptr points to valid BytesObject
+    let obj = unsafe { &*(ptr as *const BytesObject) };
+    std::mem::size_of::<BytesObject>() + obj.len()
+}
+
+unsafe fn finalize_bytes(ptr: *mut ()) {
+    // SAFETY: Caller guarantees ptr points to valid BytesObject
+    unsafe { std::ptr::drop_in_place(ptr as *mut BytesObject) };
+}
+
+// =============================================================================
 // ListObject Dispatch
 // =============================================================================
 
@@ -447,6 +487,7 @@ unsafe fn finalize_iterator(ptr: *mut ()) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::bytes::BytesObject;
     use crate::types::list::ListObject;
     use prism_core::Value;
 
@@ -519,6 +560,17 @@ mod tests {
     }
 
     #[test]
+    fn test_size_of_bytes() {
+        init_gc_dispatch();
+
+        let bytes = BytesObject::from_slice(b"hello");
+        let ptr = &bytes as *const BytesObject as *const ();
+
+        let size = unsafe { size_of_object(ptr, TypeId::BYTES) };
+        assert_eq!(size, mem::size_of::<BytesObject>() + 5);
+    }
+
+    #[test]
     fn test_noop_for_unknown_type() {
         init_gc_dispatch();
 
@@ -541,6 +593,8 @@ mod tests {
         // Verify known types have non-noop entries
         let type_ids = [
             TypeId::STR,
+            TypeId::BYTES,
+            TypeId::BYTEARRAY,
             TypeId::LIST,
             TypeId::TUPLE,
             TypeId::DICT,

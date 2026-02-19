@@ -25,6 +25,7 @@
 use prism_gc::trace::{Trace, Tracer};
 
 use crate::object::ObjectHeader;
+use crate::types::bytes::BytesObject;
 use crate::types::dict::DictObject;
 use crate::types::function::{ClosureEnv, FunctionObject};
 use crate::types::iter::IteratorObject;
@@ -62,6 +63,21 @@ unsafe impl Trace for StringObject {
         // StringObject is a leaf type:
         // - ObjectHeader (traced but empty)
         // - StringRepr: Inline | Heap(Arc<str>) | Interned - no GC refs
+    }
+
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>() + self.len()
+    }
+}
+
+/// Safety: BytesObject contains no GC-managed references.
+/// Underlying storage is `Vec<u8>` (plain bytes only).
+unsafe impl Trace for BytesObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // BytesObject is a leaf type:
+        // - ObjectHeader (traced but empty)
+        // - Vec<u8> data (no GC-managed references)
     }
 
     fn size_of(&self) -> usize {
@@ -306,6 +322,17 @@ mod tests {
         range.trace(&mut tracer);
 
         // RangeObject is a leaf type - no values traced
+        assert_eq!(tracer.value_count, 0);
+        assert_eq!(tracer.ptr_count, 0);
+    }
+
+    #[test]
+    fn test_bytes_object_trace() {
+        let mut tracer = CountingTracer::new();
+        let bytes = BytesObject::from_slice(b"abc");
+        bytes.trace(&mut tracer);
+
+        // BytesObject is a leaf type - no values traced
         assert_eq!(tracer.value_count, 0);
         assert_eq!(tracer.ptr_count, 0);
     }
