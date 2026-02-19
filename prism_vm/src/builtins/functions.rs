@@ -516,24 +516,86 @@ pub fn builtin_divmod(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // Integer divmod
-    if let (Some(a), Some(b)) = (args[0].as_int(), args[1].as_int()) {
+    // Integer divmod (includes bool as int subclass semantics).
+    if args[0].as_float().is_none() && args[1].as_float().is_none() {
+        let a = if let Some(i) = args[0].as_int() {
+            i
+        } else if let Some(b) = args[0].as_bool() {
+            if b { 1 } else { 0 }
+        } else {
+            return Err(BuiltinError::TypeError(
+                "divmod() arguments must be numeric".to_string(),
+            ));
+        };
+        let b = if let Some(i) = args[1].as_int() {
+            i
+        } else if let Some(b) = args[1].as_bool() {
+            if b { 1 } else { 0 }
+        } else {
+            return Err(BuiltinError::TypeError(
+                "divmod() arguments must be numeric".to_string(),
+            ));
+        };
+
         if b == 0 {
             return Err(BuiltinError::ValueError(
                 "integer division or modulo by zero".to_string(),
             ));
         }
-        let quotient = a.div_euclid(b);
-        let _remainder = a.rem_euclid(b);
-        // TODO: Return as tuple Value when TupleObject is wired to Value
-        // For now, return quotient (simplified)
-        return Value::int(quotient)
-            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in divmod".to_string()));
+
+        let mut quotient = a / b;
+        let mut remainder = a % b;
+        if remainder != 0 && (remainder < 0) != (b < 0) {
+            quotient -= 1;
+            remainder += b;
+        }
+        let q = Value::int(quotient)
+            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in divmod".to_string()))?;
+        let r = Value::int(remainder)
+            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in divmod".to_string()))?;
+        return Ok(make_tuple2(q, r));
     }
 
-    Err(BuiltinError::TypeError(
-        "divmod() arguments must be integers".to_string(),
-    ))
+    let a = if let Some(f) = args[0].as_float() {
+        f
+    } else if let Some(i) = args[0].as_int() {
+        i as f64
+    } else if let Some(b) = args[0].as_bool() {
+        if b { 1.0 } else { 0.0 }
+    } else {
+        return Err(BuiltinError::TypeError(
+            "divmod() arguments must be numeric".to_string(),
+        ));
+    };
+    let b = if let Some(f) = args[1].as_float() {
+        f
+    } else if let Some(i) = args[1].as_int() {
+        i as f64
+    } else if let Some(b) = args[1].as_bool() {
+        if b { 1.0 } else { 0.0 }
+    } else {
+        return Err(BuiltinError::TypeError(
+            "divmod() arguments must be numeric".to_string(),
+        ));
+    };
+
+    if b == 0.0 {
+        return Err(BuiltinError::ValueError(
+            "float divmod() by zero".to_string(),
+        ));
+    }
+
+    // Python semantics: floor division quotient and remainder with sign of divisor.
+    let quotient = (a / b).floor();
+    let remainder = a - quotient * b;
+    return Ok(make_tuple2(Value::float(quotient), Value::float(remainder)));
+}
+
+#[inline]
+fn make_tuple2(a: Value, b: Value) -> Value {
+    let tuple = TupleObject::from_slice(&[a, b]);
+    let ptr = Box::leak(Box::new(tuple)) as *mut TupleObject as *const ();
+    Value::object_ptr(ptr)
 }
 
 // =============================================================================
@@ -987,6 +1049,52 @@ mod tests {
     fn test_round_float() {
         let result = builtin_round(&[Value::float(3.7)]).unwrap();
         assert_eq!(result.as_int(), Some(4));
+    }
+
+    #[test]
+    fn test_divmod_int_returns_tuple() {
+        let result = builtin_divmod(&[Value::int(17).unwrap(), Value::int(5).unwrap()]).unwrap();
+        let ptr = result.as_object_ptr().expect("divmod should return tuple");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        assert_eq!(tuple.len(), 2);
+        assert_eq!(tuple.get(0).unwrap().as_int(), Some(3));
+        assert_eq!(tuple.get(1).unwrap().as_int(), Some(2));
+    }
+
+    #[test]
+    fn test_divmod_int_negative_divisor() {
+        let result = builtin_divmod(&[Value::int(7).unwrap(), Value::int(-3).unwrap()]).unwrap();
+        let ptr = result.as_object_ptr().expect("divmod should return tuple");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        assert_eq!(tuple.get(0).unwrap().as_int(), Some(-3));
+        assert_eq!(tuple.get(1).unwrap().as_int(), Some(-2));
+    }
+
+    #[test]
+    fn test_divmod_float_returns_tuple() {
+        let result = builtin_divmod(&[Value::float(7.5), Value::float(2.0)]).unwrap();
+        let ptr = result.as_object_ptr().expect("divmod should return tuple");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        assert_eq!(tuple.get(0).unwrap().as_float(), Some(3.0));
+        assert_eq!(tuple.get(1).unwrap().as_float(), Some(1.5));
+    }
+
+    #[test]
+    fn test_divmod_mixed_numeric() {
+        let result = builtin_divmod(&[Value::int(7).unwrap(), Value::float(2.0)]).unwrap();
+        let ptr = result.as_object_ptr().expect("divmod should return tuple");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        assert_eq!(tuple.get(0).unwrap().as_float(), Some(3.0));
+        assert_eq!(tuple.get(1).unwrap().as_float(), Some(1.0));
+    }
+
+    #[test]
+    fn test_divmod_zero_errors() {
+        let int_err = builtin_divmod(&[Value::int(1).unwrap(), Value::int(0).unwrap()]);
+        assert!(matches!(int_err, Err(BuiltinError::ValueError(_))));
+
+        let float_err = builtin_divmod(&[Value::float(1.0), Value::float(0.0)]);
+        assert!(matches!(float_err, Err(BuiltinError::ValueError(_))));
     }
 
     #[test]
