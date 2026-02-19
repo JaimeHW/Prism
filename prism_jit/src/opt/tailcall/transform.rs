@@ -285,11 +285,7 @@ mod tests {
         remap.add(NodeId::new(1), NodeId::new(10));
         remap.add(NodeId::new(2), NodeId::new(20));
 
-        let mut slice = vec![
-            NodeId::new(1),
-            NodeId::new(2),
-            NodeId::new(3),
-        ];
+        let mut slice = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
         remap.remap_slice(&mut slice);
 
         assert_eq!(slice[0], NodeId::new(10));
@@ -391,4 +387,3 @@ mod tests {
         assert_eq!(count_call_args(&graph, NodeId::new(999)), 0);
     }
 }
-

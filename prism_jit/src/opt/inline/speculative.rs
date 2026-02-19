@@ -63,8 +63,8 @@ use crate::ir::operators::{CmpOp, ControlOp, GuardKind, Operator};
 use crate::ir::types::ValueType;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // =============================================================================
 // Type Constants
@@ -550,7 +550,7 @@ impl SpeculativeInliner {
             None => {
                 return Err(InlineError::InvalidTransformation(
                     "No type profile available".into(),
-                ))
+                ));
             }
         };
 

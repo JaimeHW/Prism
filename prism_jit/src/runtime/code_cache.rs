@@ -451,7 +451,11 @@ mod tests {
         let cache = CodeCache::new(150);
 
         cache.insert(CompiledEntry::new(1, dummy_code_ptr(), 100));
-        cache.insert(CompiledEntry::new(2, (dummy_code_ptr() as usize + 64) as *const u8, 100));
+        cache.insert(CompiledEntry::new(
+            2,
+            (dummy_code_ptr() as usize + 64) as *const u8,
+            100,
+        ));
 
         assert!(cache.total_size() <= 150);
         assert_eq!(cache.len(), 1);

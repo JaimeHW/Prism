@@ -559,4 +559,3 @@ mod tests {
         assert_eq!(result.functions_transformed, 2);
     }
 }
-

@@ -31,8 +31,8 @@
 //!   if (i < n) goto loop
 //! ```
 
-use super::loop_analyzer::LoopInvariantAnalysis;
 use super::OptimizationPass;
+use super::loop_analyzer::LoopInvariantAnalysis;
 use crate::ir::cfg::{BlockId, Cfg, DominatorTree, LoopAnalysis};
 use crate::ir::graph::Graph;
 use crate::ir::node::{NodeFlags, NodeId};

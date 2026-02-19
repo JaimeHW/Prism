@@ -332,4 +332,3 @@ mod tests {
         assert!(!has_self_tail_calls(&without_self));
     }
 }
-

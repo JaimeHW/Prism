@@ -501,11 +501,7 @@ impl MulDecomposition {
             }
         }
 
-        if self.negate_result {
-            -result
-        } else {
-            result
-        }
+        if self.negate_result { -result } else { result }
     }
 }
 

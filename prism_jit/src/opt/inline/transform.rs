@@ -30,8 +30,8 @@
 //! └─────────┘                      └─────────┘
 //! ```
 
-use super::clone::GraphCloner;
 use super::CallSite;
+use super::clone::GraphCloner;
 use crate::ir::graph::Graph;
 use crate::ir::node::{InputList, NodeId};
 use crate::ir::operators::{ControlOp, Operator};

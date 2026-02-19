@@ -520,4 +520,3 @@ mod tests {
         assert_eq!(calls[0].status, TailCallStatus::ResultUsed);
     }
 }
-
