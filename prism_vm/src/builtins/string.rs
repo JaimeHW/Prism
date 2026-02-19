@@ -19,6 +19,9 @@
 
 use super::BuiltinError;
 use prism_core::Value;
+use prism_core::intern::{intern, interned_by_ptr};
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::string::StringObject;
 
 // =============================================================================
 // Unicode Constants
@@ -63,11 +66,17 @@ pub fn builtin_ord(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // TODO: Extract string from StringObject when wired
-    // For now, return NotImplemented
-    Err(BuiltinError::NotImplemented(
-        "ord() requires StringObject type".to_string(),
-    ))
+    let s = value_to_string(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "ord() expected string of length 1, but {} found",
+            type_name_of(args[0])
+        ))
+    })?;
+
+    let code_point = ord_from_str(&s)?;
+    Value::int(code_point as i64).ok_or_else(|| {
+        BuiltinError::OverflowError("ord() result out of supported integer range".to_string())
+    })
 }
 
 /// Get Unicode code point from a single-character string slice.
@@ -126,10 +135,9 @@ pub fn builtin_chr(args: &[Value]) -> Result<Value, BuiltinError> {
     let code_point = extract_code_point(&args[0])?;
     let c = chr_from_code_point(code_point)?;
 
-    // TODO: Return StringObject when wired
-    // For now, verify the logic works and return placeholder
-    let _ = c;
-    Ok(Value::none())
+    let mut buf = [0u8; 4];
+    let s = c.encode_utf8(&mut buf);
+    Ok(Value::string(intern(s)))
 }
 
 /// Extract a Unicode code point from a Value.
@@ -320,28 +328,30 @@ pub fn builtin_format(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let value = &args[0];
+    let value = args[0];
     let format_spec = if args.len() == 2 {
-        // TODO: Extract format spec string from args[1]
-        ""
+        value_to_string(args[1]).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "format() argument 2 must be str, not {}",
+                type_name_of(args[1])
+            ))
+        })?
     } else {
-        ""
+        String::new()
     };
 
     // Handle basic numeric formatting
-    format_value(value, format_spec)
+    format_value(value, &format_spec)
 }
 
 /// Format a value according to format_spec.
 ///
 /// This is a simplified implementation for numeric types.
 #[inline]
-fn format_value(value: &Value, format_spec: &str) -> Result<Value, BuiltinError> {
+fn format_value(value: Value, format_spec: &str) -> Result<Value, BuiltinError> {
     // Empty format spec: default formatting
     if format_spec.is_empty() {
-        // Return string representation
-        // TODO: Return StringObject when wired
-        return Ok(Value::none());
+        return super::types::builtin_str(&[value]);
     }
 
     // Integer formatting
@@ -354,10 +364,10 @@ fn format_value(value: &Value, format_spec: &str) -> Result<Value, BuiltinError>
         return format_float(f, format_spec);
     }
 
-    // TODO: Handle __format__ protocol for objects
-    Err(BuiltinError::NotImplemented(
-        "format() for this type".to_string(),
-    ))
+    Err(BuiltinError::TypeError(format!(
+        "unsupported format string passed to {}.__format__",
+        type_name_of(value)
+    )))
 }
 
 /// Format an integer according to format_spec.
@@ -402,9 +412,7 @@ fn format_int(n: i64, format_spec: &str) -> Result<Value, BuiltinError> {
         _ => format!("{}", n),
     };
 
-    // TODO: Return StringObject
-    let _ = formatted;
-    Ok(Value::none())
+    Ok(Value::string(intern(&formatted)))
 }
 
 /// Format a float according to format_spec.
@@ -431,8 +439,7 @@ fn format_float(f: f64, format_spec: &str) -> Result<Value, BuiltinError> {
         _ => format!("{}", f),
     };
 
-    let _ = formatted;
-    Ok(Value::none())
+    Ok(Value::string(intern(&formatted)))
 }
 
 /// Parse precision from format spec like ".2f" → 2.
@@ -510,6 +517,41 @@ pub const fn is_surrogate(code_point: u32) -> bool {
     code_point >= SURROGATE_START && code_point <= SURROGATE_END
 }
 
+#[inline]
+fn value_to_string(value: Value) -> Option<String> {
+    if value.is_string() {
+        let ptr = value.as_string_object_ptr()?;
+        let interned = interned_by_ptr(ptr as *const u8)?;
+        return Some(interned.as_str().to_string());
+    }
+
+    let ptr = value.as_object_ptr()?;
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::STR {
+        return None;
+    }
+    let string_obj = unsafe { &*(ptr as *const StringObject) };
+    Some(string_obj.as_str().to_string())
+}
+
+#[inline]
+fn type_name_of(value: Value) -> &'static str {
+    if value.is_none() {
+        "NoneType"
+    } else if value.is_bool() {
+        "bool"
+    } else if value.is_int() {
+        "int"
+    } else if value.is_float() {
+        "float"
+    } else if value.is_string() {
+        "str"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        crate::ops::objects::extract_type_id(ptr).name()
+    } else {
+        "object"
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -517,6 +559,35 @@ pub const fn is_surrogate(code_point: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::{intern, interned_by_ptr};
+    use prism_runtime::types::string::StringObject;
+
+    fn value_to_rust_string(value: Value) -> String {
+        if value.is_string() {
+            let ptr = value
+                .as_string_object_ptr()
+                .expect("tagged string should have pointer");
+            let interned =
+                interned_by_ptr(ptr as *const u8).expect("interned pointer should resolve");
+            return interned.as_str().to_string();
+        }
+
+        let ptr = value
+            .as_object_ptr()
+            .expect("string value should be object-backed");
+        assert_eq!(crate::ops::objects::extract_type_id(ptr), TypeId::STR);
+        let string_obj = unsafe { &*(ptr as *const StringObject) };
+        string_obj.as_str().to_string()
+    }
+
+    fn boxed_value<T>(obj: T) -> (Value, *mut T) {
+        let ptr = Box::into_raw(Box::new(obj));
+        (Value::object_ptr(ptr as *const ()), ptr)
+    }
+
+    unsafe fn drop_boxed<T>(ptr: *mut T) {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
 
     // =========================================================================
     // ord() Argument Validation Tests
@@ -538,6 +609,20 @@ mod tests {
     fn test_ord_too_many_args() {
         let result = builtin_ord(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ord_tagged_string() {
+        let result = builtin_ord(&[Value::string(intern("A"))]).unwrap();
+        assert_eq!(result.as_int(), Some(65));
+    }
+
+    #[test]
+    fn test_ord_heap_string() {
+        let (string_value, string_ptr) = boxed_value(StringObject::new("€"));
+        let result = builtin_ord(&[string_value]).unwrap();
+        assert_eq!(result.as_int(), Some(8364));
+        unsafe { drop_boxed(string_ptr) };
     }
 
     // =========================================================================
@@ -644,6 +729,15 @@ mod tests {
             }
             _ => panic!("Expected TypeError"),
         }
+    }
+
+    #[test]
+    fn test_chr_ascii_and_unicode_return_strings() {
+        let ascii = builtin_chr(&[Value::int(97).unwrap()]).unwrap();
+        assert_eq!(value_to_rust_string(ascii), "a");
+
+        let unicode = builtin_chr(&[Value::int(127881).unwrap()]).unwrap();
+        assert_eq!(value_to_rust_string(unicode), "🎉");
     }
 
     // =========================================================================
@@ -811,6 +905,33 @@ mod tests {
             Value::int(3).unwrap(),
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_default_and_numeric_specs() {
+        let default = builtin_format(&[Value::int(42).unwrap()]).unwrap();
+        assert_eq!(value_to_rust_string(default), "42");
+
+        let hex = builtin_format(&[Value::int(255).unwrap(), Value::string(intern("#x"))]).unwrap();
+        assert_eq!(value_to_rust_string(hex), "0xff");
+
+        let grouped =
+            builtin_format(&[Value::int(1_234_567).unwrap(), Value::string(intern(","))]).unwrap();
+        assert_eq!(value_to_rust_string(grouped), "1,234,567");
+    }
+
+    #[test]
+    fn test_format_second_arg_must_be_str() {
+        let err = builtin_format(&[Value::int(1).unwrap(), Value::int(2).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(err.to_string().contains("argument 2 must be str"));
+    }
+
+    #[test]
+    fn test_format_non_empty_spec_on_unsupported_type_errors() {
+        let err = builtin_format(&[Value::none(), Value::string(intern("x"))]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(err.to_string().contains("unsupported format string"));
     }
 
     // =========================================================================
