@@ -59,11 +59,13 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// StoreLocal: frame.registers[imm16] = src1
+/// StoreLocal: frame.registers[imm16] = dst-register
 #[inline(always)]
 pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame_mut();
-    let value = frame.get_reg(inst.src1().0);
+    // Store opcodes use DstImm16 encoding where the source register is carried
+    // in the dst field and imm16 is the destination slot index.
+    let value = frame.get_reg(inst.dst().0);
     let slot = inst.imm16() as u8;
     frame.set_reg(slot, value);
     ControlFlow::Continue
@@ -106,12 +108,14 @@ pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 }
 
-/// StoreGlobal: globals[names[imm16]] = src1
+/// StoreGlobal: globals[names[imm16]] = dst-register
 #[inline(always)]
 pub fn store_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let name = frame.get_name(inst.imm16()).clone();
-    let value = frame.get_reg(inst.src1().0);
+    // Store opcodes use DstImm16 encoding where the source register is carried
+    // in the dst field and imm16 is the name index.
+    let value = frame.get_reg(inst.dst().0);
 
     vm.globals.set(name, value);
     ControlFlow::Continue
@@ -162,7 +166,7 @@ pub fn load_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 }
 
-/// StoreClosure: closure[imm16].set(src1)
+/// StoreClosure: closure[imm16].set(dst-register)
 ///
 /// Stores a value into a cell in the closure environment.
 /// The cell uses interior mutability (atomic operations), so this works
@@ -170,7 +174,9 @@ pub fn load_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 #[inline(always)]
 pub fn store_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
-    let value = frame.get_reg(inst.src1().0);
+    // Store opcodes use DstImm16 encoding where the source register is carried
+    // in the dst field and imm16 is the closure slot.
+    let value = frame.get_reg(inst.dst().0);
     let idx = inst.imm16() as usize;
 
     match &frame.closure {
@@ -220,10 +226,16 @@ pub fn move_reg(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{Instruction, Opcode, Register};
+    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
     use prism_core::Value;
     use prism_runtime::types::Cell;
     use std::sync::Arc;
+
+    fn vm_with_frame(code: CodeObject) -> VirtualMachine {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(code), 0).expect("frame push failed");
+        vm
+    }
 
     // ==========================================================================
     // Cell Integration Tests
@@ -389,6 +401,58 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("UnboundLocalError"));
         assert!(msg.contains("'x'"));
+    }
+
+    // ==========================================================================
+    // Store Opcode Semantics
+    // ==========================================================================
+
+    #[test]
+    fn test_store_local_uses_dst_register_for_source() {
+        let mut vm = vm_with_frame(CodeObject::new("test_store_local", "<test>"));
+        let frame = vm.current_frame_mut();
+        frame.set_reg(9, Value::int(123).unwrap());
+        frame.set_reg(0x23, Value::int(999).unwrap());
+
+        // imm16=0x2345 => src1 byte is 0x23, local slot low byte is 0x45.
+        let inst = Instruction::op_di(Opcode::StoreLocal, Register::new(9), 0x2345);
+        assert!(matches!(store_local(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(0x45).as_int(), Some(123));
+    }
+
+    #[test]
+    fn test_store_global_uses_dst_register_for_source() {
+        let mut code = CodeObject::new("test_store_global", "<test>");
+        code.names = vec!["unused".into(), "answer".into()].into_boxed_slice();
+
+        let mut vm = vm_with_frame(code);
+        let frame = vm.current_frame_mut();
+        frame.set_reg(4, Value::int(42).unwrap());
+        frame.set_reg(0, Value::int(7).unwrap());
+
+        let inst = Instruction::op_di(Opcode::StoreGlobal, Register::new(4), 1);
+        assert!(matches!(store_global(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.globals.get("answer").and_then(|v| v.as_int()), Some(42));
+    }
+
+    #[test]
+    fn test_store_closure_uses_dst_register_for_source() {
+        use crate::frame::ClosureEnv;
+
+        let mut vm = vm_with_frame(CodeObject::new("test_store_closure", "<test>"));
+        let closure = Arc::new(ClosureEnv::with_unbound_cells(1));
+
+        let frame = vm.current_frame_mut();
+        frame.closure = Some(Arc::clone(&closure));
+        frame.set_reg(5, Value::int(314).unwrap());
+        frame.set_reg(0, Value::int(271).unwrap());
+
+        let inst = Instruction::op_di(Opcode::StoreClosure, Register::new(5), 0);
+        assert!(matches!(
+            store_closure(&mut vm, inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(closure.get(0).as_int(), Some(314));
     }
 
     // ==========================================================================
