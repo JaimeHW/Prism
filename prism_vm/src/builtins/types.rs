@@ -41,6 +41,12 @@ fn to_object_value<T>(object: T) -> Value {
     Value::object_ptr(ptr)
 }
 
+#[inline]
+fn to_frozenset_value(mut set: SetObject) -> Value {
+    set.header.type_id = TypeId::FROZENSET;
+    to_object_value(set)
+}
+
 fn type_object_for_type_id(type_id: TypeId) -> Value {
     {
         let map = TYPE_OBJECTS_BY_TYPE_ID
@@ -435,10 +441,24 @@ pub fn builtin_frozenset(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    // TODO: Create FrozenSetObject
-    Err(BuiltinError::NotImplemented(
-        "frozenset() not yet implemented".to_string(),
-    ))
+    if args.is_empty() {
+        return Ok(to_frozenset_value(SetObject::new()));
+    }
+
+    if let Some(ptr) = args[0].as_object_ptr() {
+        match crate::ops::objects::extract_type_id(ptr) {
+            // CPython returns the same object for frozenset(frozenset_obj).
+            TypeId::FROZENSET => return Ok(args[0]),
+            TypeId::SET => {
+                let source = unsafe { &*(ptr as *const SetObject) };
+                return Ok(to_frozenset_value(SetObject::from_iter(source.iter())));
+            }
+            _ => {}
+        }
+    }
+
+    let values = iter_values(args[0])?;
+    Ok(to_frozenset_value(SetObject::from_iter(values)))
 }
 
 /// Builtin type function.
@@ -863,6 +883,44 @@ mod tests {
         assert!(set.contains(Value::int(2).unwrap()));
         unsafe { drop_boxed(set_ptr as *mut SetObject) };
         unsafe { drop_boxed(list_ptr) };
+    }
+
+    #[test]
+    fn test_frozenset_empty_and_deduplicated() {
+        let empty = builtin_frozenset(&[]).unwrap();
+        let empty_ptr = empty.as_object_ptr().unwrap();
+        assert_eq!(crate::ops::objects::extract_type_id(empty_ptr), TypeId::FROZENSET);
+        let empty_set = unsafe { &*(empty_ptr as *const SetObject) };
+        assert_eq!(empty_set.len(), 0);
+        unsafe { drop_boxed(empty_ptr as *mut SetObject) };
+
+        let list = ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let frozen = builtin_frozenset(&[list_value]).unwrap();
+        let frozen_ptr = frozen.as_object_ptr().unwrap();
+        assert_eq!(crate::ops::objects::extract_type_id(frozen_ptr), TypeId::FROZENSET);
+        let frozen_set = unsafe { &*(frozen_ptr as *const SetObject) };
+        assert_eq!(frozen_set.len(), 2);
+        assert!(frozen_set.contains(Value::int(1).unwrap()));
+        assert!(frozen_set.contains(Value::int(2).unwrap()));
+
+        unsafe { drop_boxed(frozen_ptr as *mut SetObject) };
+        unsafe { drop_boxed(list_ptr) };
+    }
+
+    #[test]
+    fn test_frozenset_identity_for_existing_frozenset() {
+        let source = builtin_frozenset(&[]).unwrap();
+        let source_ptr = source.as_object_ptr().unwrap();
+
+        let again = builtin_frozenset(&[source]).unwrap();
+        assert_eq!(again, source);
+
+        unsafe { drop_boxed(source_ptr as *mut SetObject) };
     }
 
     #[test]

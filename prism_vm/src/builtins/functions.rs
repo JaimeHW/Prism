@@ -61,6 +61,10 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
                 let set = unsafe { &*(ptr as *const SetObject) };
                 len_to_value(set.len(), "set")
             }
+            TypeId::FROZENSET => {
+                let set = unsafe { &*(ptr as *const SetObject) };
+                len_to_value(set.len(), "frozenset")
+            }
             TypeId::STR => {
                 let string = unsafe { &*(ptr as *const StringObject) };
                 len_to_value(string.len(), "str")
@@ -1085,6 +1089,20 @@ mod tests {
         let (value, ptr) = boxed_value(set);
         let result = builtin_len(&[value]).unwrap();
         assert_eq!(result.as_int(), Some(3));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_frozenset_object() {
+        let mut set = SetObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]);
+        set.header.type_id = TypeId::FROZENSET;
+        let (value, ptr) = boxed_value(set);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(2));
         unsafe { drop_boxed(ptr) };
     }
 
