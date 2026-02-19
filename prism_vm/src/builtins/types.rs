@@ -889,7 +889,10 @@ mod tests {
     fn test_frozenset_empty_and_deduplicated() {
         let empty = builtin_frozenset(&[]).unwrap();
         let empty_ptr = empty.as_object_ptr().unwrap();
-        assert_eq!(crate::ops::objects::extract_type_id(empty_ptr), TypeId::FROZENSET);
+        assert_eq!(
+            crate::ops::objects::extract_type_id(empty_ptr),
+            TypeId::FROZENSET
+        );
         let empty_set = unsafe { &*(empty_ptr as *const SetObject) };
         assert_eq!(empty_set.len(), 0);
         unsafe { drop_boxed(empty_ptr as *mut SetObject) };
@@ -902,7 +905,10 @@ mod tests {
         let (list_value, list_ptr) = boxed_value(list);
         let frozen = builtin_frozenset(&[list_value]).unwrap();
         let frozen_ptr = frozen.as_object_ptr().unwrap();
-        assert_eq!(crate::ops::objects::extract_type_id(frozen_ptr), TypeId::FROZENSET);
+        assert_eq!(
+            crate::ops::objects::extract_type_id(frozen_ptr),
+            TypeId::FROZENSET
+        );
         let frozen_set = unsafe { &*(frozen_ptr as *const SetObject) };
         assert_eq!(frozen_set.len(), 2);
         assert!(frozen_set.contains(Value::int(1).unwrap()));
@@ -1147,10 +1153,7 @@ mod tests {
         let name = Value::string(intern("field"));
 
         builtin_setattr(&[object, name, Value::int(42).unwrap()]).unwrap();
-        assert_eq!(
-            builtin_getattr(&[object, name]).unwrap().as_int(),
-            Some(42)
-        );
+        assert_eq!(builtin_getattr(&[object, name]).unwrap().as_int(), Some(42));
         assert!(builtin_hasattr(&[object, name]).unwrap().as_bool().unwrap());
 
         // Distinguish explicit None assignment from deletion.
@@ -1165,7 +1168,10 @@ mod tests {
         assert!(matches!(err, BuiltinError::AttributeError(_)));
 
         let fallback = Value::int(7).unwrap();
-        assert_eq!(builtin_getattr(&[object, name, fallback]).unwrap(), fallback);
+        assert_eq!(
+            builtin_getattr(&[object, name, fallback]).unwrap(),
+            fallback
+        );
 
         unsafe { drop_boxed(object_ptr as *mut ShapedObject) };
     }

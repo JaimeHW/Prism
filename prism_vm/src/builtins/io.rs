@@ -78,7 +78,9 @@ fn read_input<R: BufRead, W: Write>(
     let mut line = String::new();
     let bytes = input.read_line(&mut line).unwrap_or(0);
     if bytes == 0 {
-        return Err(BuiltinError::ValueError("EOF when reading a line".to_string()));
+        return Err(BuiltinError::ValueError(
+            "EOF when reading a line".to_string(),
+        ));
     }
 
     if line.ends_with('\n') {
@@ -167,8 +169,12 @@ mod tests {
         let mut input = Cursor::new(b"value\n".to_vec());
         let mut output = Vec::new();
 
-        let value = read_input(&[Value::string(intern("prompt> "))], &mut input, &mut output)
-            .unwrap();
+        let value = read_input(
+            &[Value::string(intern("prompt> "))],
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(value_to_rust_string(value), "value");
         assert_eq!(String::from_utf8(output).unwrap(), "prompt> ");
     }
