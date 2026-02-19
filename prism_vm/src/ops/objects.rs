@@ -9,6 +9,7 @@ use crate::error::RuntimeError;
 use crate::ops::attribute::is_user_defined_type;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_core::intern::interned_len_by_ptr;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -17,6 +18,8 @@ use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
+use prism_runtime::types::set::SetObject;
+use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 
 // =============================================================================
@@ -622,6 +625,14 @@ pub fn len(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 let dict = unsafe { &*(ptr as *const DictObject) };
                 dict.len() as i64
             }
+            TypeId::SET => {
+                let set = unsafe { &*(ptr as *const SetObject) };
+                set.len() as i64
+            }
+            TypeId::STR => {
+                let string = unsafe { &*(ptr as *const StringObject) };
+                string.len() as i64
+            }
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
                 range.len() as i64
@@ -638,10 +649,23 @@ pub fn len(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         frame.set_reg(dst, value);
         ControlFlow::Continue
     } else if obj.is_string() {
-        // String length - strings are stored differently (interned)
-        // TODO: Implement proper string length extraction from InternedString
-        // For now, return error as strings need special handling
-        ControlFlow::Error(RuntimeError::type_error("string len() not yet implemented"))
+        let ptr = match obj.as_string_object_ptr() {
+            Some(ptr) => ptr as *const u8,
+            None => {
+                return ControlFlow::Error(RuntimeError::type_error("invalid interned string"));
+            }
+        };
+
+        let len = match interned_len_by_ptr(ptr) {
+            Some(len) => len,
+            None => {
+                return ControlFlow::Error(RuntimeError::type_error("invalid interned string"));
+            }
+        };
+
+        let value = Value::int(len as i64).unwrap_or_else(Value::none);
+        frame.set_reg(dst, value);
+        ControlFlow::Continue
     } else {
         ControlFlow::Error(RuntimeError::type_error("object has no len()"))
     }
@@ -674,7 +698,30 @@ pub fn is_callable(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VirtualMachine;
+    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_core::Value;
+    use prism_core::intern::intern;
     use prism_runtime::object::ObjectHeader;
+    use prism_runtime::types::set::SetObject;
+    use prism_runtime::types::string::StringObject;
+    use std::sync::Arc;
+
+    fn vm_with_frame() -> VirtualMachine {
+        let mut vm = VirtualMachine::new();
+        let code = Arc::new(CodeObject::new("test_len", "<test>"));
+        vm.push_frame(code, 0).expect("frame push failed");
+        vm
+    }
+
+    fn boxed_value<T>(obj: T) -> (Value, *mut T) {
+        let ptr = Box::into_raw(Box::new(obj));
+        (Value::object_ptr(ptr as *const ()), ptr)
+    }
+
+    unsafe fn drop_boxed<T>(ptr: *mut T) {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
 
     #[test]
     fn test_extract_type_id() {
@@ -697,5 +744,58 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ObjectHeader, type_id), 0);
         assert_eq!(std::mem::size_of::<TypeId>(), 4);
         assert_eq!(std::mem::size_of::<ObjectHeader>(), 16);
+    }
+
+    #[test]
+    fn test_len_opcode_tagged_string() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut()
+            .set_reg(1, Value::string(intern("hello")));
+
+        let inst = Instruction::op_ds(Opcode::Len, Register::new(2), Register::new(1));
+        assert!(matches!(len(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(5));
+    }
+
+    #[test]
+    fn test_len_opcode_set_object() {
+        let mut vm = vm_with_frame();
+        let set = SetObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let (set_value, ptr) = boxed_value(set);
+        vm.current_frame_mut().set_reg(1, set_value);
+
+        let inst = Instruction::op_ds(Opcode::Len, Register::new(2), Register::new(1));
+        assert!(matches!(len(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(3));
+
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_opcode_string_object() {
+        let mut vm = vm_with_frame();
+        let (string_value, ptr) = boxed_value(StringObject::new("runtime"));
+        vm.current_frame_mut().set_reg(1, string_value);
+
+        let inst = Instruction::op_ds(Opcode::Len, Register::new(2), Register::new(1));
+        assert!(matches!(len(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(7));
+
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_opcode_type_error_for_int() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(1, Value::int(42).unwrap());
+
+        let inst = Instruction::op_ds(Opcode::Len, Register::new(2), Register::new(1));
+        let flow = len(&mut vm, inst);
+        assert!(matches!(flow, ControlFlow::Error(_)));
     }
 }

@@ -2,8 +2,14 @@
 
 use super::BuiltinError;
 use prism_core::Value;
+use prism_core::intern::interned_len_by_ptr;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::range::RangeObject;
+use prism_runtime::types::set::SetObject;
+use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
 
 // =============================================================================
 // len
@@ -22,61 +28,83 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let obj = args[0];
 
-    // Check for known types
-    // TODO: Dispatch via TypeSlots.sq_length when object system is wired
+    // Tagged interned strings (Value::string) are not object pointers.
+    if obj.is_string() {
+        let ptr = obj
+            .as_string_object_ptr()
+            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
+        let len = interned_len_by_ptr(ptr as *const u8)
+            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
+        return len_to_value(len, "str");
+    }
 
-    // For now, return an error for unrecognized types
-    // This will be expanded as we wire up the object system
+    // Heap objects (list/tuple/dict/set/str/range).
+    if let Some(ptr) = obj.as_object_ptr() {
+        use crate::ops::objects::extract_type_id;
+        let type_id = extract_type_id(ptr);
+
+        return match type_id {
+            TypeId::LIST => {
+                let list = unsafe { &*(ptr as *const ListObject) };
+                len_to_value(list.len(), "list")
+            }
+            TypeId::TUPLE => {
+                let tuple = unsafe { &*(ptr as *const TupleObject) };
+                len_to_value(tuple.len(), "tuple")
+            }
+            TypeId::DICT => {
+                let dict = unsafe { &*(ptr as *const DictObject) };
+                len_to_value(dict.len(), "dict")
+            }
+            TypeId::SET => {
+                let set = unsafe { &*(ptr as *const SetObject) };
+                len_to_value(set.len(), "set")
+            }
+            TypeId::STR => {
+                let string = unsafe { &*(ptr as *const StringObject) };
+                len_to_value(string.len(), "str")
+            }
+            TypeId::RANGE => {
+                let range = unsafe { &*(ptr as *const RangeObject) };
+                len_to_value(range.len(), "range")
+            }
+            _ => Err(BuiltinError::TypeError(format!(
+                "object of type '{}' has no len()",
+                type_id.name()
+            ))),
+        };
+    }
+
     if obj.is_none() {
         return Err(BuiltinError::TypeError(
             "object of type 'NoneType' has no len()".to_string(),
         ));
     }
-
     if obj.is_int() {
         return Err(BuiltinError::TypeError(
             "object of type 'int' has no len()".to_string(),
         ));
     }
-
     if obj.is_float() {
         return Err(BuiltinError::TypeError(
             "object of type 'float' has no len()".to_string(),
         ));
     }
-
     if obj.is_bool() {
         return Err(BuiltinError::TypeError(
             "object of type 'bool' has no len()".to_string(),
         ));
     }
 
-    // Handle object pointers (list, tuple, dict, set, string, range)
-    if let Some(ptr) = obj.as_object_ptr() {
-        // Extract TypeId from object header
-        use crate::ops::objects::extract_type_id;
-        let type_id = extract_type_id(ptr);
+    Err(BuiltinError::TypeError("object has no len()".to_string()))
+}
 
-        match type_id {
-            TypeId::LIST => {
-                let list = unsafe { &*(ptr as *const ListObject) };
-                return Value::int(list.len() as i64).ok_or_else(|| {
-                    BuiltinError::OverflowError("list length overflow".to_string())
-                });
-            }
-            // TODO: Add tuple, dict, set, string, range support
-            _ => {
-                return Err(BuiltinError::TypeError(format!(
-                    "object of type '{}' has no len()",
-                    type_id.name()
-                )));
-            }
-        }
-    }
-
-    Err(BuiltinError::NotImplemented(
-        "len() for unknown value type".to_string(),
-    ))
+#[inline]
+fn len_to_value(len: usize, type_name: &str) -> Result<Value, BuiltinError> {
+    let len_i64 = i64::try_from(len)
+        .map_err(|_| BuiltinError::OverflowError(format!("{} length overflow", type_name)))?;
+    Value::int(len_i64)
+        .ok_or_else(|| BuiltinError::OverflowError(format!("{} length overflow", type_name)))
 }
 
 // =============================================================================
@@ -555,6 +583,105 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::intern;
+
+    fn boxed_value<T>(obj: T) -> (Value, *mut T) {
+        let ptr = Box::into_raw(Box::new(obj));
+        (Value::object_ptr(ptr as *const ()), ptr)
+    }
+
+    unsafe fn drop_boxed<T>(ptr: *mut T) {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+
+    #[test]
+    fn test_len_tagged_string() {
+        let value = Value::string(intern("hello"));
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(5));
+    }
+
+    #[test]
+    fn test_len_list_object() {
+        let list = ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(3));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_tuple_object() {
+        let tuple = TupleObject::from_slice(&[
+            Value::int(10).unwrap(),
+            Value::int(20).unwrap(),
+            Value::int(30).unwrap(),
+            Value::int(40).unwrap(),
+        ]);
+        let (value, ptr) = boxed_value(tuple);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(4));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_dict_object() {
+        let mut dict = DictObject::new();
+        dict.set(Value::int(1).unwrap(), Value::int(11).unwrap());
+        dict.set(Value::int(2).unwrap(), Value::int(22).unwrap());
+        let (value, ptr) = boxed_value(dict);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(2));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_set_object() {
+        let set = SetObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let (value, ptr) = boxed_value(set);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(3));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_range_object() {
+        let range = RangeObject::new(0, 10, 2);
+        let (value, ptr) = boxed_value(range);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(5));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_string_object() {
+        let string = StringObject::new("runtime");
+        let (value, ptr) = boxed_value(string);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(7));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_arity_error() {
+        let result = builtin_len(&[]);
+        assert!(matches!(result, Err(BuiltinError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_len_non_sized_type_error() {
+        let result = builtin_len(&[Value::int(42).unwrap()]);
+        assert!(matches!(result, Err(BuiltinError::TypeError(_))));
+    }
 
     #[test]
     fn test_abs_int() {
