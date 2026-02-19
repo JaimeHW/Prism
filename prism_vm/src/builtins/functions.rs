@@ -2,7 +2,7 @@
 
 use super::BuiltinError;
 use prism_core::Value;
-use prism_core::intern::{interned_by_ptr, interned_len_by_ptr};
+use prism_core::intern::{intern, interned_by_ptr, interned_len_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
@@ -798,9 +798,8 @@ pub fn builtin_repr(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // TODO: Return string Value when StringObject is wired
-    // For now, return None as placeholder
-    Ok(Value::none())
+    let repr = repr_value(args[0], 0)?;
+    Ok(Value::string(intern(&repr)))
 }
 
 /// Builtin ascii function.
@@ -814,8 +813,180 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // TODO: Return string Value when StringObject is wired
-    Ok(Value::none())
+    let repr = repr_value(args[0], 0)?;
+    let ascii = escape_non_ascii(&repr);
+    Ok(Value::string(intern(&ascii)))
+}
+
+const MAX_REPR_DEPTH: usize = 12;
+
+fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
+    if depth >= MAX_REPR_DEPTH {
+        return Ok("...".to_string());
+    }
+
+    if value.is_none() {
+        return Ok("None".to_string());
+    }
+    if let Some(b) = value.as_bool() {
+        return Ok(if b {
+            "True".to_string()
+        } else {
+            "False".to_string()
+        });
+    }
+    if let Some(i) = value.as_int() {
+        return Ok(i.to_string());
+    }
+    if let Some(f) = value.as_float() {
+        if f.fract() == 0.0 && f.is_finite() {
+            return Ok(format!("{:.1}", f));
+        }
+        return Ok(f.to_string());
+    }
+    if value.is_string() {
+        let ptr = value
+            .as_string_object_ptr()
+            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
+        let interned = interned_by_ptr(ptr as *const u8)
+            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
+        return Ok(quote_python_string(interned.as_str()));
+    }
+
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("invalid object reference".to_string()))?;
+    let type_id = crate::ops::objects::extract_type_id(ptr);
+    match type_id {
+        TypeId::STR => {
+            let string = unsafe { &*(ptr as *const StringObject) };
+            Ok(quote_python_string(string.as_str()))
+        }
+        TypeId::LIST => {
+            let list = unsafe { &*(ptr as *const ListObject) };
+            let mut out = String::from("[");
+            let mut first = true;
+            for item in list.iter() {
+                if !first {
+                    out.push_str(", ");
+                }
+                first = false;
+                out.push_str(&repr_value(*item, depth + 1)?);
+            }
+            out.push(']');
+            Ok(out)
+        }
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            if tuple.is_empty() {
+                return Ok("()".to_string());
+            }
+            let mut out = String::from("(");
+            for (index, item) in tuple.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&repr_value(*item, depth + 1)?);
+            }
+            if tuple.len() == 1 {
+                out.push(',');
+            }
+            out.push(')');
+            Ok(out)
+        }
+        TypeId::DICT => {
+            let dict = unsafe { &*(ptr as *const DictObject) };
+            let mut out = String::from("{");
+            let mut first = true;
+            for (key, value) in dict.iter() {
+                if !first {
+                    out.push_str(", ");
+                }
+                first = false;
+                out.push_str(&repr_value(key, depth + 1)?);
+                out.push_str(": ");
+                out.push_str(&repr_value(value, depth + 1)?);
+            }
+            out.push('}');
+            Ok(out)
+        }
+        TypeId::SET => {
+            let set = unsafe { &*(ptr as *const SetObject) };
+            if set.is_empty() {
+                return Ok("set()".to_string());
+            }
+            let mut out = String::from("{");
+            let mut first = true;
+            for value in set.iter() {
+                if !first {
+                    out.push_str(", ");
+                }
+                first = false;
+                out.push_str(&repr_value(value, depth + 1)?);
+            }
+            out.push('}');
+            Ok(out)
+        }
+        TypeId::RANGE => {
+            let range = unsafe { &*(ptr as *const RangeObject) };
+            if range.step == 1 {
+                Ok(format!("range({}, {})", range.start, range.stop))
+            } else {
+                Ok(format!(
+                    "range({}, {}, {})",
+                    range.start, range.stop, range.step
+                ))
+            }
+        }
+        _ => Ok(format!(
+            "<{} object at 0x{:x}>",
+            type_id.name(),
+            ptr as usize
+        )),
+    }
+}
+
+fn quote_python_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('\'');
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&escape_char(c)),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[inline]
+fn escape_non_ascii(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            out.push_str(&escape_char(ch));
+        }
+    }
+    out
+}
+
+#[inline]
+fn escape_char(ch: char) -> String {
+    let code = ch as u32;
+    if code <= 0xFF {
+        format!("\\x{:02x}", code)
+    } else if code <= 0xFFFF {
+        format!("\\u{:04x}", code)
+    } else {
+        format!("\\U{:08x}", code)
+    }
 }
 
 // =============================================================================
@@ -837,6 +1008,17 @@ mod tests {
 
     unsafe fn drop_boxed<T>(ptr: *mut T) {
         drop(unsafe { Box::from_raw(ptr) });
+    }
+
+    fn tagged_string_value_to_rust_string(value: Value) -> String {
+        assert!(value.is_string(), "expected tagged string, got {value:?}");
+        let ptr = value
+            .as_string_object_ptr()
+            .expect("tagged string pointer missing") as *const u8;
+        prism_core::intern::interned_by_ptr(ptr)
+            .expect("tagged string pointer not interned")
+            .as_str()
+            .to_string()
     }
 
     #[test]
@@ -1161,6 +1343,99 @@ mod tests {
 
         let float_err = builtin_divmod(&[Value::float(1.0), Value::float(0.0)]);
         assert!(matches!(float_err, Err(BuiltinError::ValueError(_))));
+    }
+
+    #[test]
+    fn test_repr_primitives() {
+        assert_eq!(
+            tagged_string_value_to_rust_string(builtin_repr(&[Value::none()]).unwrap()),
+            "None"
+        );
+        assert_eq!(
+            tagged_string_value_to_rust_string(builtin_repr(&[Value::bool(true)]).unwrap()),
+            "True"
+        );
+        assert_eq!(
+            tagged_string_value_to_rust_string(builtin_repr(&[Value::int(42).unwrap()]).unwrap()),
+            "42"
+        );
+        assert_eq!(
+            tagged_string_value_to_rust_string(builtin_repr(&[Value::float(1.5)]).unwrap()),
+            "1.5"
+        );
+    }
+
+    #[test]
+    fn test_repr_tagged_string_escaping() {
+        let value = Value::string(intern("a'b\n"));
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[value]).unwrap());
+        assert_eq!(repr, "'a\\'b\\n'");
+    }
+
+    #[test]
+    fn test_repr_runtime_string() {
+        let (value, ptr) = boxed_value(StringObject::new("runtime"));
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[value]).unwrap());
+        assert_eq!(repr, "'runtime'");
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_repr_containers() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let list_repr = tagged_string_value_to_rust_string(builtin_repr(&[list_value]).unwrap());
+        assert_eq!(list_repr, "[1, 2]");
+        unsafe { drop_boxed(list_ptr) };
+
+        let tuple = TupleObject::from_slice(&[Value::int(1).unwrap()]);
+        let (tuple_value, tuple_ptr) = boxed_value(tuple);
+        let tuple_repr = tagged_string_value_to_rust_string(builtin_repr(&[tuple_value]).unwrap());
+        assert_eq!(tuple_repr, "(1,)");
+        unsafe { drop_boxed(tuple_ptr) };
+
+        let mut dict = DictObject::new();
+        dict.set(Value::int(1).unwrap(), Value::int(2).unwrap());
+        let (dict_value, dict_ptr) = boxed_value(dict);
+        let dict_repr = tagged_string_value_to_rust_string(builtin_repr(&[dict_value]).unwrap());
+        assert_eq!(dict_repr, "{1: 2}");
+        unsafe { drop_boxed(dict_ptr) };
+
+        let mut set = SetObject::new();
+        set.add(Value::int(3).unwrap());
+        let (set_value, set_ptr) = boxed_value(set);
+        let set_repr = tagged_string_value_to_rust_string(builtin_repr(&[set_value]).unwrap());
+        assert_eq!(set_repr, "{3}");
+        unsafe { drop_boxed(set_ptr) };
+    }
+
+    #[test]
+    fn test_repr_range_object() {
+        let (range_value, range_ptr) = boxed_value(RangeObject::new(1, 6, 2));
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[range_value]).unwrap());
+        assert_eq!(repr, "range(1, 6, 2)");
+        unsafe { drop_boxed(range_ptr) };
+    }
+
+    #[test]
+    fn test_ascii_non_ascii_escaping() {
+        let tagged = Value::string(intern("hé"));
+        let tagged_ascii = tagged_string_value_to_rust_string(builtin_ascii(&[tagged]).unwrap());
+        assert_eq!(tagged_ascii, "'h\\xe9'");
+
+        let (runtime, ptr) = boxed_value(StringObject::new("漢"));
+        let runtime_ascii = tagged_string_value_to_rust_string(builtin_ascii(&[runtime]).unwrap());
+        assert_eq!(runtime_ascii, "'\\u6f22'");
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_repr_ascii_arity_errors() {
+        let repr_err = builtin_repr(&[]);
+        assert!(matches!(repr_err, Err(BuiltinError::TypeError(_))));
+
+        let ascii_err = builtin_ascii(&[]);
+        assert!(matches!(ascii_err, Err(BuiltinError::TypeError(_))));
     }
 
     #[test]
