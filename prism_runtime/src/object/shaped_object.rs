@@ -266,7 +266,10 @@ impl ShapedObject {
                     Some(value)
                 };
             }
-            return self.overflow.as_ref().and_then(|overflow| overflow.get(name).copied());
+            return self
+                .overflow
+                .as_ref()
+                .and_then(|overflow| overflow.get(name).copied());
         }
 
         // Check overflow storage
@@ -429,8 +432,7 @@ impl ShapedObject {
                 if is_deleted_property(current) {
                     return false;
                 }
-                self.inline_slots
-                    .set(slot_index, deleted_property_value());
+                self.inline_slots.set(slot_index, deleted_property_value());
                 return true;
             }
             return self
