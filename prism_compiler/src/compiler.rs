@@ -898,7 +898,8 @@ impl Compiler {
                     self.builder.free_register_block(block, block_size);
                 }
 
-                self.builder.emit(Instruction::op_d(Opcode::Raise, ctor_reg));
+                self.builder
+                    .emit(Instruction::op_d(Opcode::Raise, ctor_reg));
                 self.builder.free_register(ctor_reg);
 
                 self.builder.bind_label(pass_label);
@@ -1312,8 +1313,12 @@ impl Compiler {
                     None
                 };
 
-                self.builder
-                    .emit(Instruction::op_dss(Opcode::BuildSlice, reg, start_reg, stop_reg));
+                self.builder.emit(Instruction::op_dss(
+                    Opcode::BuildSlice,
+                    reg,
+                    start_reg,
+                    stop_reg,
+                ));
 
                 // Encode optional step in an extension instruction consumed by BuildSlice.
                 if let Some(step_reg) = step_reg {
@@ -1385,8 +1390,12 @@ impl Compiler {
                         self.builder.free_register(temp);
                     }
 
-                    self.builder
-                        .emit(Instruction::new(Opcode::BuildSet, reg.0, first_elem.0, count));
+                    self.builder.emit(Instruction::new(
+                        Opcode::BuildSet,
+                        reg.0,
+                        first_elem.0,
+                        count,
+                    ));
                     self.builder.free_register_block(first_elem, count);
                 }
             }
@@ -2070,8 +2079,12 @@ impl Compiler {
                     }
                     self.builder.free_register(temp);
 
-                    self.builder
-                        .emit(Instruction::new(Opcode::BuildDict, entry_reg.0, pair_base.0, 1));
+                    self.builder.emit(Instruction::new(
+                        Opcode::BuildDict,
+                        entry_reg.0,
+                        pair_base.0,
+                        1,
+                    ));
                     self.builder.free_register_block(pair_base, 2);
                     unpack_flags |= 1 << i; // merge singleton mapping
                 }
@@ -3193,7 +3206,10 @@ impl Compiler {
     // =========================================================================
 
     /// Compile positional default expressions into a tuple register.
-    fn compile_positional_defaults_tuple(&mut self, defaults: &[Expr]) -> CompileResult<Option<Register>> {
+    fn compile_positional_defaults_tuple(
+        &mut self,
+        defaults: &[Expr],
+    ) -> CompileResult<Option<Register>> {
         if defaults.is_empty() {
             return Ok(None);
         }
@@ -3310,21 +3326,21 @@ impl Compiler {
         let func_scope_idx = self.find_child_scope(ScopeKind::Function, name);
         let (func_cellvars, func_freevars, func_locals, scope_has_yield) =
             if let Some(scope_idx) = func_scope_idx {
-            let scope = &self.current_scope().children[scope_idx];
-            let cellvars = scope
-                .cellvars()
-                .map(|sym| Arc::from(sym.name.as_ref()))
-                .collect::<Vec<_>>();
-            let freevars = scope
-                .freevars()
-                .map(|sym| Arc::from(sym.name.as_ref()))
-                .collect::<Vec<_>>();
-            let mut locals = scope
-                .locals()
-                .map(|sym| Arc::from(sym.name.as_ref()))
-                .collect::<Vec<Arc<str>>>();
-            locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-            (cellvars, freevars, locals, scope.has_yield)
+                let scope = &self.current_scope().children[scope_idx];
+                let cellvars = scope
+                    .cellvars()
+                    .map(|sym| Arc::from(sym.name.as_ref()))
+                    .collect::<Vec<_>>();
+                let freevars = scope
+                    .freevars()
+                    .map(|sym| Arc::from(sym.name.as_ref()))
+                    .collect::<Vec<_>>();
+                let mut locals = scope
+                    .locals()
+                    .map(|sym| Arc::from(sym.name.as_ref()))
+                    .collect::<Vec<Arc<str>>>();
+                locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+                (cellvars, freevars, locals, scope.has_yield)
             } else {
                 (Vec::new(), Vec::new(), Vec::new(), false)
             };
@@ -3611,21 +3627,21 @@ impl Compiler {
         let lambda_scope_idx = self.find_child_scope(ScopeKind::Lambda, "<lambda>");
         let (lambda_cellvars, lambda_freevars, lambda_locals) =
             if let Some(scope_idx) = lambda_scope_idx {
-            let scope = &self.current_scope().children[scope_idx];
-            let cellvars = scope
-                .cellvars()
-                .map(|sym| Arc::from(sym.name.as_ref()))
-                .collect::<Vec<_>>();
-            let freevars = scope
-                .freevars()
-                .map(|sym| Arc::from(sym.name.as_ref()))
-                .collect::<Vec<_>>();
-            let mut locals = scope
-                .locals()
-                .map(|sym| Arc::from(sym.name.as_ref()))
-                .collect::<Vec<Arc<str>>>();
-            locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-            (cellvars, freevars, locals)
+                let scope = &self.current_scope().children[scope_idx];
+                let cellvars = scope
+                    .cellvars()
+                    .map(|sym| Arc::from(sym.name.as_ref()))
+                    .collect::<Vec<_>>();
+                let freevars = scope
+                    .freevars()
+                    .map(|sym| Arc::from(sym.name.as_ref()))
+                    .collect::<Vec<_>>();
+                let mut locals = scope
+                    .locals()
+                    .map(|sym| Arc::from(sym.name.as_ref()))
+                    .collect::<Vec<Arc<str>>>();
+                locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+                (cellvars, freevars, locals)
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
@@ -4274,7 +4290,11 @@ mod tests {
             .iter()
             .find(|inst| inst.opcode() == Opcode::Call as u8)
             .expect("assert with message should emit Call");
-        assert_eq!(call.src2().0, 1, "assert message should be passed as 1 call arg");
+        assert_eq!(
+            call.src2().0,
+            1,
+            "assert message should be passed as 1 call arg"
+        );
     }
 
     #[test]

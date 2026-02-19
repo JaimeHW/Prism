@@ -9,7 +9,9 @@ fn compile_source(source: &str) -> prism_compiler::CodeObject {
 }
 
 fn has_opcode(code: &prism_compiler::CodeObject, opcode: Opcode) -> bool {
-    code.instructions.iter().any(|inst| inst.opcode() == opcode as u8)
+    code.instructions
+        .iter()
+        .any(|inst| inst.opcode() == opcode as u8)
 }
 
 #[test]
@@ -38,7 +40,10 @@ fn test_slice_without_step_emits_build_slice_only() {
         .iter()
         .position(|inst| inst.opcode() == Opcode::BuildSlice as u8)
         .expect("missing BuildSlice");
-    assert_eq!(code.instructions[build_idx + 1].opcode(), Opcode::GetItem as u8);
+    assert_eq!(
+        code.instructions[build_idx + 1].opcode(),
+        Opcode::GetItem as u8
+    );
 }
 
 #[test]
