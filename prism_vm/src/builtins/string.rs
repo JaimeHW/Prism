@@ -21,6 +21,7 @@ use super::BuiltinError;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::string::StringObject;
 
 // =============================================================================
@@ -38,6 +39,48 @@ const SURROGATE_END: u32 = 0xDFFF;
 
 /// ASCII printable range end.
 const ASCII_MAX: u32 = 0x7F;
+
+/// Maximum byte sequence length accepted by constructors.
+const MAX_BYTE_SEQUENCE_SIZE: i64 = 1_000_000_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteSequenceKind {
+    Bytes,
+    ByteArray,
+}
+
+impl ByteSequenceKind {
+    #[inline]
+    fn fn_name(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::ByteArray => "bytearray",
+        }
+    }
+
+    #[inline]
+    fn type_id(self) -> TypeId {
+        match self {
+            Self::Bytes => TypeId::BYTES,
+            Self::ByteArray => TypeId::BYTEARRAY,
+        }
+    }
+
+    #[inline]
+    fn range_error(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes must be in range(0, 256)",
+            Self::ByteArray => "byte must be in range(0, 256)",
+        }
+    }
+
+    #[inline]
+    fn from_data(self, data: Vec<u8>) -> Value {
+        let obj = BytesObject::from_vec_with_type(data, self.type_id());
+        let ptr = Box::leak(Box::new(obj)) as *mut BytesObject as *const ();
+        Value::object_ptr(ptr)
+    }
+}
 
 // =============================================================================
 // ord() - Get Unicode Code Point
@@ -218,43 +261,9 @@ pub fn chr_from_code_point(code_point: u32) -> Result<char, BuiltinError> {
 /// - `bytes([65, 66, 67])` → `b'ABC'`
 /// - `bytes('hello', 'utf-8')` → `b'hello'`
 ///
-/// # Implementation Note
-/// Full implementation requires BytesObject type in runtime.
+/// Fully supports empty/count/iterable/string+encoding constructor forms.
 pub fn builtin_bytes(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.len() > 3 {
-        return Err(BuiltinError::TypeError(format!(
-            "bytes() takes at most 3 arguments ({} given)",
-            args.len()
-        )));
-    }
-
-    // No arguments: empty bytes
-    if args.is_empty() {
-        // TODO: Return BytesObject::empty() when wired
-        return Ok(Value::none());
-    }
-
-    // Single integer argument: null bytes of that length
-    if args.len() == 1 {
-        if let Some(n) = args[0].as_int() {
-            if n < 0 {
-                return Err(BuiltinError::ValueError("negative count".to_string()));
-            }
-            // Validate reasonable size (prevent DoS)
-            if n > 1_000_000_000 {
-                return Err(BuiltinError::OverflowError(
-                    "bytes size too large".to_string(),
-                ));
-            }
-            // TODO: Create BytesObject of size n filled with 0x00
-            return Ok(Value::none());
-        }
-    }
-
-    // TODO: Handle iterable and string+encoding cases
-    Err(BuiltinError::NotImplemented(
-        "bytes() requires BytesObject type".to_string(),
-    ))
+    build_byte_sequence(args, ByteSequenceKind::Bytes)
 }
 
 // =============================================================================
@@ -268,39 +277,239 @@ pub fn builtin_bytes(args: &[Value]) -> Result<Value, BuiltinError> {
 /// # Python Semantics
 /// Same as bytes() but returns mutable bytearray.
 ///
-/// # Implementation Note
-/// Full implementation requires ByteArrayObject type in runtime.
+/// Fully supports empty/count/iterable/string+encoding constructor forms.
 pub fn builtin_bytearray(args: &[Value]) -> Result<Value, BuiltinError> {
+    build_byte_sequence(args, ByteSequenceKind::ByteArray)
+}
+
+fn build_byte_sequence(args: &[Value], kind: ByteSequenceKind) -> Result<Value, BuiltinError> {
+    let fn_name = kind.fn_name();
     if args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
-            "bytearray() takes at most 3 arguments ({} given)",
+            "{}() takes at most 3 arguments ({} given)",
+            fn_name,
             args.len()
         )));
     }
 
-    // No arguments: empty bytearray
     if args.is_empty() {
-        return Ok(Value::none());
+        return Ok(kind.from_data(Vec::new()));
     }
 
-    // Single integer argument: mutable null bytes
-    if args.len() == 1 {
-        if let Some(n) = args[0].as_int() {
-            if n < 0 {
-                return Err(BuiltinError::ValueError("negative count".to_string()));
-            }
-            if n > 1_000_000_000 {
-                return Err(BuiltinError::OverflowError(
-                    "bytearray size too large".to_string(),
+    // source + encoding[, errors]
+    if args.len() >= 2 {
+        let source = value_to_string(args[0]).ok_or_else(|| {
+            BuiltinError::TypeError("encoding without a string argument".to_string())
+        })?;
+        let encoding = value_to_string(args[1]).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{}() argument 2 must be str, not {}",
+                fn_name,
+                type_name_of(args[1])
+            ))
+        })?;
+        let errors = if args.len() == 3 {
+            value_to_string(args[2]).ok_or_else(|| {
+                BuiltinError::TypeError(format!(
+                    "{}() argument 3 must be str, not {}",
+                    fn_name,
+                    type_name_of(args[2])
+                ))
+            })?
+        } else {
+            "strict".to_string()
+        };
+
+        let data = encode_string(&source, &encoding, &errors, fn_name)?;
+        return Ok(kind.from_data(data));
+    }
+
+    // Single-argument form.
+    let source = args[0];
+    if let Some(count) = source.as_int() {
+        return sequence_from_count(kind, count);
+    }
+    if let Some(b) = source.as_bool() {
+        return sequence_from_count(kind, if b { 1 } else { 0 });
+    }
+
+    if source.is_string() {
+        return Err(BuiltinError::TypeError(
+            "string argument without an encoding".to_string(),
+        ));
+    }
+
+    if let Some(ptr) = source.as_object_ptr() {
+        match crate::ops::objects::extract_type_id(ptr) {
+            TypeId::STR => {
+                return Err(BuiltinError::TypeError(
+                    "string argument without an encoding".to_string(),
                 ));
             }
-            return Ok(Value::none());
+            TypeId::BYTES => {
+                if kind == ByteSequenceKind::Bytes {
+                    return Ok(source);
+                }
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                return Ok(kind.from_data(bytes.to_vec()));
+            }
+            TypeId::BYTEARRAY => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                return Ok(kind.from_data(bytes.to_vec()));
+            }
+            _ => {}
         }
     }
 
-    Err(BuiltinError::NotImplemented(
-        "bytearray() requires ByteArrayObject type".to_string(),
-    ))
+    let data = sequence_from_iterable(source, kind)?;
+    Ok(kind.from_data(data))
+}
+
+#[inline]
+fn sequence_from_count(kind: ByteSequenceKind, count: i64) -> Result<Value, BuiltinError> {
+    if count < 0 {
+        return Err(BuiltinError::ValueError("negative count".to_string()));
+    }
+    if count > MAX_BYTE_SEQUENCE_SIZE {
+        return Err(BuiltinError::OverflowError(format!(
+            "{} size too large",
+            kind.fn_name()
+        )));
+    }
+    Ok(kind.from_data(vec![0; count as usize]))
+}
+
+#[inline]
+fn sequence_from_iterable(source: Value, kind: ByteSequenceKind) -> Result<Vec<u8>, BuiltinError> {
+    let values = if let Some(iter) = super::iter_dispatch::get_iterator_mut(&source) {
+        iter.collect_remaining()
+    } else {
+        let mut iter =
+            super::iter_dispatch::value_to_iterator(&source).map_err(BuiltinError::from)?;
+        iter.collect_remaining()
+    };
+
+    let mut data = Vec::with_capacity(values.len());
+    for value in values {
+        data.push(value_to_byte(value, kind)?);
+    }
+    Ok(data)
+}
+
+#[inline]
+fn value_to_byte(value: Value, kind: ByteSequenceKind) -> Result<u8, BuiltinError> {
+    if let Some(i) = value.as_int() {
+        return i64_to_byte(i, kind);
+    }
+    if let Some(b) = value.as_bool() {
+        return Ok(if b { 1 } else { 0 });
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name_of(value)
+    )))
+}
+
+#[inline]
+fn i64_to_byte(value: i64, kind: ByteSequenceKind) -> Result<u8, BuiltinError> {
+    if (0..=255).contains(&value) {
+        Ok(value as u8)
+    } else {
+        Err(BuiltinError::ValueError(kind.range_error().to_string()))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EncodingErrorPolicy {
+    Strict,
+    Ignore,
+    Replace,
+}
+
+#[inline]
+fn parse_encoding_error_policy(errors: &str) -> Result<EncodingErrorPolicy, BuiltinError> {
+    match errors.to_ascii_lowercase().as_str() {
+        "strict" => Ok(EncodingErrorPolicy::Strict),
+        "ignore" => Ok(EncodingErrorPolicy::Ignore),
+        "replace" => Ok(EncodingErrorPolicy::Replace),
+        _ => Err(BuiltinError::ValueError(format!(
+            "unknown error handler name '{}'",
+            errors
+        ))),
+    }
+}
+
+fn encode_string(
+    input: &str,
+    encoding: &str,
+    errors: &str,
+    fn_name: &str,
+) -> Result<Vec<u8>, BuiltinError> {
+    let normalized = encoding.trim().to_ascii_lowercase().replace('_', "-");
+    let policy = parse_encoding_error_policy(errors)?;
+
+    match normalized.as_str() {
+        "utf8" | "utf-8" => Ok(input.as_bytes().to_vec()),
+        "ascii" => encode_ascii(input, policy, fn_name),
+        "latin1" | "latin-1" | "iso-8859-1" => encode_latin1(input, policy, fn_name),
+        _ => Err(BuiltinError::ValueError(format!(
+            "unknown encoding: {}",
+            encoding
+        ))),
+    }
+}
+
+fn encode_ascii(
+    input: &str,
+    policy: EncodingErrorPolicy,
+    fn_name: &str,
+) -> Result<Vec<u8>, BuiltinError> {
+    let mut out = Vec::with_capacity(input.len());
+    for ch in input.chars() {
+        let code = ch as u32;
+        if code <= 0x7f {
+            out.push(code as u8);
+            continue;
+        }
+        match policy {
+            EncodingErrorPolicy::Strict => {
+                return Err(BuiltinError::ValueError(format!(
+                    "{}() could not encode character U+{:04X} with ascii codec",
+                    fn_name, code
+                )));
+            }
+            EncodingErrorPolicy::Ignore => {}
+            EncodingErrorPolicy::Replace => out.push(b'?'),
+        }
+    }
+    Ok(out)
+}
+
+fn encode_latin1(
+    input: &str,
+    policy: EncodingErrorPolicy,
+    fn_name: &str,
+) -> Result<Vec<u8>, BuiltinError> {
+    let mut out = Vec::with_capacity(input.len());
+    for ch in input.chars() {
+        let code = ch as u32;
+        if code <= 0xff {
+            out.push(code as u8);
+            continue;
+        }
+        match policy {
+            EncodingErrorPolicy::Strict => {
+                return Err(BuiltinError::ValueError(format!(
+                    "{}() could not encode character U+{:04X} with latin-1 codec",
+                    fn_name, code
+                )));
+            }
+            EncodingErrorPolicy::Ignore => {}
+            EncodingErrorPolicy::Replace => out.push(b'?'),
+        }
+    }
+    Ok(out)
 }
 
 // =============================================================================
@@ -560,6 +769,7 @@ fn type_name_of(value: Value) -> &'static str {
 mod tests {
     use super::*;
     use prism_core::intern::{intern, interned_by_ptr};
+    use prism_runtime::types::bytes::BytesObject;
     use prism_runtime::types::string::StringObject;
 
     fn value_to_rust_string(value: Value) -> String {
@@ -587,6 +797,27 @@ mod tests {
 
     unsafe fn drop_boxed<T>(ptr: *mut T) {
         drop(unsafe { Box::from_raw(ptr) });
+    }
+
+    fn value_to_byte_vec(value: Value) -> Vec<u8> {
+        let ptr = value
+            .as_object_ptr()
+            .expect("byte sequence should be object-backed");
+        let type_id = crate::ops::objects::extract_type_id(ptr);
+        assert!(
+            type_id == TypeId::BYTES || type_id == TypeId::BYTEARRAY,
+            "unexpected type id for byte sequence: {:?}",
+            type_id
+        );
+        let bytes_obj = unsafe { &*(ptr as *const BytesObject) };
+        bytes_obj.as_bytes().to_vec()
+    }
+
+    fn byte_sequence_type(value: Value) -> TypeId {
+        let ptr = value
+            .as_object_ptr()
+            .expect("byte sequence should be object-backed");
+        crate::ops::objects::extract_type_id(ptr)
     }
 
     // =========================================================================
@@ -840,51 +1071,320 @@ mod tests {
     }
 
     // =========================================================================
-    // bytes() Argument Validation Tests
+    // bytes() Constructor Tests
     // =========================================================================
 
     #[test]
     fn test_bytes_too_many_args() {
-        let result = builtin_bytes(&[
+        let err = builtin_bytes(&[
             Value::int(1).unwrap(),
             Value::int(2).unwrap(),
             Value::int(3).unwrap(),
             Value::int(4).unwrap(),
-        ]);
-        assert!(result.is_err());
+        ])
+        .unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_bytes_empty_constructor() {
+        let value = builtin_bytes(&[]).unwrap();
+        assert_eq!(byte_sequence_type(value), TypeId::BYTES);
+        assert_eq!(value_to_byte_vec(value), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_bytes_count_constructor() {
+        let value = builtin_bytes(&[Value::int(4).unwrap()]).unwrap();
+        assert_eq!(byte_sequence_type(value), TypeId::BYTES);
+        assert_eq!(value_to_byte_vec(value), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_bytes_bool_count_constructor() {
+        let false_value = builtin_bytes(&[Value::bool(false)]).unwrap();
+        assert_eq!(value_to_byte_vec(false_value), Vec::<u8>::new());
+
+        let true_value = builtin_bytes(&[Value::bool(true)]).unwrap();
+        assert_eq!(value_to_byte_vec(true_value), vec![0]);
     }
 
     #[test]
     fn test_bytes_negative_count() {
-        let result = builtin_bytes(&[Value::int(-5).unwrap()]);
-        assert!(result.is_err());
-        match result {
-            Err(BuiltinError::ValueError(msg)) => {
-                assert!(msg.contains("negative"));
-            }
-            _ => panic!("Expected ValueError"),
-        }
+        let err = builtin_bytes(&[Value::int(-5).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::ValueError(_)));
+        assert!(err.to_string().contains("negative count"));
+    }
+
+    #[test]
+    fn test_bytes_overflow_count() {
+        let err = builtin_bytes(&[Value::int(MAX_BYTE_SEQUENCE_SIZE + 1).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::OverflowError(_)));
+    }
+
+    #[test]
+    fn test_bytes_string_without_encoding_errors() {
+        let err = builtin_bytes(&[Value::string(intern("abc"))]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(err.to_string().contains("without an encoding"));
+    }
+
+    #[test]
+    fn test_bytes_from_tagged_string_with_utf8() {
+        let value = builtin_bytes(&[
+            Value::string(intern("h\u{00e9}")),
+            Value::string(intern("utf-8")),
+        ])
+        .unwrap();
+        assert_eq!(byte_sequence_type(value), TypeId::BYTES);
+        assert_eq!(value_to_byte_vec(value), "h\u{00e9}".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_bytes_from_heap_string_with_latin1() {
+        let (heap_str, str_ptr) = boxed_value(StringObject::new("\u{00e9}"));
+        let value = builtin_bytes(&[heap_str, Value::string(intern("latin-1"))]).unwrap();
+        assert_eq!(value_to_byte_vec(value), vec![0xe9]);
+        unsafe { drop_boxed(str_ptr) };
+    }
+
+    #[test]
+    fn test_bytes_ascii_error_policies() {
+        let strict_err = builtin_bytes(&[
+            Value::string(intern("A\u{00e9}")),
+            Value::string(intern("ascii")),
+        ])
+        .unwrap_err();
+        assert!(matches!(strict_err, BuiltinError::ValueError(_)));
+
+        let ignore = builtin_bytes(&[
+            Value::string(intern("A\u{00e9}")),
+            Value::string(intern("ascii")),
+            Value::string(intern("ignore")),
+        ])
+        .unwrap();
+        assert_eq!(value_to_byte_vec(ignore), b"A");
+
+        let replace = builtin_bytes(&[
+            Value::string(intern("A\u{00e9}")),
+            Value::string(intern("ascii")),
+            Value::string(intern("replace")),
+        ])
+        .unwrap();
+        assert_eq!(value_to_byte_vec(replace), b"A?");
+    }
+
+    #[test]
+    fn test_bytes_latin1_strict_error() {
+        let err = builtin_bytes(&[
+            Value::string(intern("\u{20ac}")),
+            Value::string(intern("latin-1")),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, BuiltinError::ValueError(_)));
+        assert!(err.to_string().contains("latin-1"));
+    }
+
+    #[test]
+    fn test_bytes_unknown_encoding_and_error_policy() {
+        let unknown_encoding = builtin_bytes(&[
+            Value::string(intern("abc")),
+            Value::string(intern("does-not-exist")),
+        ])
+        .unwrap_err();
+        assert!(matches!(unknown_encoding, BuiltinError::ValueError(_)));
+        assert!(unknown_encoding.to_string().contains("unknown encoding"));
+
+        let unknown_policy = builtin_bytes(&[
+            Value::string(intern("abc")),
+            Value::string(intern("utf-8")),
+            Value::string(intern("not-a-policy")),
+        ])
+        .unwrap_err();
+        assert!(matches!(unknown_policy, BuiltinError::ValueError(_)));
+        assert!(unknown_policy.to_string().contains("unknown error handler"));
+    }
+
+    #[test]
+    fn test_bytes_encoding_requires_string_source() {
+        let err =
+            builtin_bytes(&[Value::int(1).unwrap(), Value::string(intern("utf-8"))]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(
+            err.to_string()
+                .contains("encoding without a string argument")
+        );
+    }
+
+    #[test]
+    fn test_bytes_encoding_and_errors_argument_types() {
+        let err2 =
+            builtin_bytes(&[Value::string(intern("abc")), Value::int(1).unwrap()]).unwrap_err();
+        assert!(matches!(err2, BuiltinError::TypeError(_)));
+        assert!(err2.to_string().contains("argument 2 must be str"));
+
+        let err3 = builtin_bytes(&[
+            Value::string(intern("abc")),
+            Value::string(intern("utf-8")),
+            Value::int(1).unwrap(),
+        ])
+        .unwrap_err();
+        assert!(matches!(err3, BuiltinError::TypeError(_)));
+        assert!(err3.to_string().contains("argument 3 must be str"));
+    }
+
+    #[test]
+    fn test_bytes_from_iterable_values() {
+        let list = prism_runtime::types::list::ListObject::from_slice(&[
+            Value::int(65).unwrap(),
+            Value::bool(true),
+            Value::int(0).unwrap(),
+            Value::int(255).unwrap(),
+        ]);
+        let (list_value, list_ptr) = boxed_value(list);
+
+        let value = builtin_bytes(&[list_value]).unwrap();
+        assert_eq!(value_to_byte_vec(value), vec![65, 1, 0, 255]);
+
+        unsafe { drop_boxed(list_ptr) };
+    }
+
+    #[test]
+    fn test_bytes_from_iterable_out_of_range_error() {
+        let list = prism_runtime::types::list::ListObject::from_slice(&[Value::int(256).unwrap()]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let err = builtin_bytes(&[list_value]).unwrap_err();
+        assert!(matches!(err, BuiltinError::ValueError(_)));
+        assert!(err.to_string().contains("range(0, 256)"));
+        unsafe { drop_boxed(list_ptr) };
+    }
+
+    #[test]
+    fn test_bytes_from_iterable_non_int_error() {
+        let list =
+            prism_runtime::types::list::ListObject::from_slice(&[Value::string(intern("x"))]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let err = builtin_bytes(&[list_value]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(
+            err.to_string()
+                .contains("cannot be interpreted as an integer")
+        );
+        unsafe { drop_boxed(list_ptr) };
+    }
+
+    #[test]
+    fn test_bytes_from_bytes_returns_same_object() {
+        let (src, src_ptr) = boxed_value(BytesObject::from_slice(b"abc"));
+        let out = builtin_bytes(&[src]).unwrap();
+        assert_eq!(out.as_object_ptr(), src.as_object_ptr());
+        unsafe { drop_boxed(src_ptr) };
+    }
+
+    #[test]
+    fn test_bytes_from_bytearray_copies() {
+        let (src, src_ptr) = boxed_value(BytesObject::bytearray_from_slice(&[1, 2, 3]));
+        let out = builtin_bytes(&[src]).unwrap();
+        assert_eq!(byte_sequence_type(out), TypeId::BYTES);
+        assert_eq!(value_to_byte_vec(out), vec![1, 2, 3]);
+        assert_ne!(out.as_object_ptr(), src.as_object_ptr());
+        unsafe { drop_boxed(src_ptr) };
     }
 
     // =========================================================================
-    // bytearray() Argument Validation Tests
+    // bytearray() Constructor Tests
     // =========================================================================
 
     #[test]
     fn test_bytearray_too_many_args() {
-        let result = builtin_bytearray(&[
+        let err = builtin_bytearray(&[
             Value::int(1).unwrap(),
             Value::int(2).unwrap(),
             Value::int(3).unwrap(),
             Value::int(4).unwrap(),
-        ]);
-        assert!(result.is_err());
+        ])
+        .unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_bytearray_empty_and_count_constructor() {
+        let empty = builtin_bytearray(&[]).unwrap();
+        assert_eq!(byte_sequence_type(empty), TypeId::BYTEARRAY);
+        assert_eq!(value_to_byte_vec(empty), Vec::<u8>::new());
+
+        let counted = builtin_bytearray(&[Value::int(3).unwrap()]).unwrap();
+        assert_eq!(byte_sequence_type(counted), TypeId::BYTEARRAY);
+        assert_eq!(value_to_byte_vec(counted), vec![0, 0, 0]);
     }
 
     #[test]
     fn test_bytearray_negative_count() {
-        let result = builtin_bytearray(&[Value::int(-5).unwrap()]);
-        assert!(result.is_err());
+        let err = builtin_bytearray(&[Value::int(-5).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::ValueError(_)));
+    }
+
+    #[test]
+    fn test_bytearray_from_string_with_encoding() {
+        let out = builtin_bytearray(&[
+            Value::string(intern("h\u{00e9}")),
+            Value::string(intern("utf-8")),
+        ])
+        .unwrap();
+        assert_eq!(byte_sequence_type(out), TypeId::BYTEARRAY);
+        assert_eq!(value_to_byte_vec(out), "h\u{00e9}".as_bytes());
+    }
+
+    #[test]
+    fn test_bytearray_encoding_without_string_error() {
+        let err = builtin_bytearray(&[Value::int(1).unwrap(), Value::string(intern("utf-8"))])
+            .unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(
+            err.to_string()
+                .contains("encoding without a string argument")
+        );
+    }
+
+    #[test]
+    fn test_bytearray_from_iterable_and_range_error() {
+        let list = prism_runtime::types::list::ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let out = builtin_bytearray(&[list_value]).unwrap();
+        assert_eq!(value_to_byte_vec(out), vec![1, 2, 3]);
+        unsafe { drop_boxed(list_ptr) };
+
+        let bad = prism_runtime::types::list::ListObject::from_slice(&[Value::int(-1).unwrap()]);
+        let (bad_value, bad_ptr) = boxed_value(bad);
+        let err = builtin_bytearray(&[bad_value]).unwrap_err();
+        assert!(matches!(err, BuiltinError::ValueError(_)));
+        assert!(err.to_string().contains("range(0, 256)"));
+        unsafe { drop_boxed(bad_ptr) };
+    }
+
+    #[test]
+    fn test_bytearray_from_bytes_and_bytearray_copy() {
+        let (bytes_src, bytes_src_ptr) = boxed_value(BytesObject::from_slice(&[5, 6]));
+        let from_bytes = builtin_bytearray(&[bytes_src]).unwrap();
+        assert_eq!(byte_sequence_type(from_bytes), TypeId::BYTEARRAY);
+        assert_eq!(value_to_byte_vec(from_bytes), vec![5, 6]);
+        assert_ne!(from_bytes.as_object_ptr(), bytes_src.as_object_ptr());
+        unsafe { drop_boxed(bytes_src_ptr) };
+
+        let (bytearray_src, bytearray_src_ptr) =
+            boxed_value(BytesObject::bytearray_from_slice(&[7, 8]));
+        let from_bytearray = builtin_bytearray(&[bytearray_src]).unwrap();
+        assert_eq!(byte_sequence_type(from_bytearray), TypeId::BYTEARRAY);
+        assert_eq!(value_to_byte_vec(from_bytearray), vec![7, 8]);
+        assert_ne!(
+            from_bytearray.as_object_ptr(),
+            bytearray_src.as_object_ptr()
+        );
+        unsafe { drop_boxed(bytearray_src_ptr) };
     }
 
     // =========================================================================
