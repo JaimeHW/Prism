@@ -143,21 +143,22 @@ pub fn end_finally(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 ///
 /// # Instruction Format
 ///
-/// - dst: Register containing the value to yield
-/// - src1: Resume point index (encoded as register number)
-/// - src2: Optional result register for sent value on resume
+/// - `dst`: Register that receives the value passed back in via `send()`
+/// - `src1`: Register containing the value to yield
 ///
 /// # Returns
 ///
-/// `ControlFlow::Yield` with the value and resume point.
+/// `ControlFlow::Yield` with:
+/// - yielded value from `src1`
+/// - resume register encoded in `dst`
 #[inline(always)]
 pub fn yield_value(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
-    let value = frame.get_reg(inst.dst().0);
+    let value = frame.get_reg(inst.src1().0);
 
-    // Resume point is encoded in src1 - this is the yield point index
-    // that will be used to dispatch back to the correct PC on resume
-    let resume_point = inst.src1().0 as u32;
+    // The destination operand encodes which register should receive the
+    // next sent value when this generator resumes.
+    let resume_point = inst.dst().0 as u32;
 
     ControlFlow::Yield {
         value,
@@ -173,8 +174,8 @@ pub fn yield_value(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 ///
 /// # Instruction Format
 ///
-/// - dst: Register containing the sub-generator/iterable
-/// - src1: Resume point index
+/// - `dst`: Register that receives sub-generator completion value
+/// - `src1`: Register containing sub-generator/iterable
 ///
 /// # Returns
 ///
@@ -182,8 +183,8 @@ pub fn yield_value(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 #[inline(always)]
 pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
-    let sub_gen = frame.get_reg(inst.dst().0);
-    let resume_point = inst.src1().0 as u32;
+    let sub_gen = frame.get_reg(inst.src1().0);
+    let resume_point = inst.dst().0 as u32;
 
     // For yield from, we need to:
     // 1. Get the next value from the sub-generator

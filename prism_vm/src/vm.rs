@@ -18,10 +18,22 @@ use crate::jit_context::{JitConfig, JitContext};
 use crate::jit_executor::ExecutionResult;
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
 use crate::speculative::SpeculationCache;
+use crate::stdlib::generators::{
+    GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
+};
 use prism_compiler::bytecode::CodeObject;
 use prism_core::{PrismResult, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Result of driving a generator frame for a single send()/next() step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum GeneratorResumeOutcome {
+    /// Generator yielded a value and suspended.
+    Yielded(Value),
+    /// Generator returned and is exhausted.
+    Returned(Value),
+}
 
 /// The Prism virtual machine.
 ///
@@ -424,86 +436,7 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Error(err) => {
-                    // Map RuntimeErrorKind to ExceptionTypeId for handler lookup
-                    use crate::error::RuntimeErrorKind;
-                    use crate::stdlib::exceptions::types::ExceptionTypeId;
-
-                    let type_id = match &err.kind {
-                        RuntimeErrorKind::TypeError { .. } => {
-                            ExceptionTypeId::TypeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::UnsupportedOperandTypes { .. } => {
-                            ExceptionTypeId::TypeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::NotCallable { .. } => {
-                            ExceptionTypeId::TypeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::NotIterable { .. } => {
-                            ExceptionTypeId::TypeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::NotSubscriptable { .. } => {
-                            ExceptionTypeId::TypeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::NameError { .. } => {
-                            ExceptionTypeId::NameError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::AttributeError { .. } => {
-                            ExceptionTypeId::AttributeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::UnboundLocalError { .. } => {
-                            ExceptionTypeId::UnboundLocalError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::IndexError { .. } => {
-                            ExceptionTypeId::IndexError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::KeyError { .. } => {
-                            ExceptionTypeId::KeyError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::ValueError { .. } => {
-                            ExceptionTypeId::ValueError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::ZeroDivisionError => {
-                            ExceptionTypeId::ZeroDivisionError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::OverflowError { .. } => {
-                            ExceptionTypeId::OverflowError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::StopIteration => {
-                            ExceptionTypeId::StopIteration.as_u8() as u16
-                        }
-                        RuntimeErrorKind::GeneratorExit => {
-                            ExceptionTypeId::GeneratorExit.as_u8() as u16
-                        }
-                        RuntimeErrorKind::AssertionError { .. } => {
-                            ExceptionTypeId::AssertionError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::RecursionError { .. } => {
-                            ExceptionTypeId::RecursionError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::ImportError { .. } => {
-                            ExceptionTypeId::ImportError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::InvalidOpcode { .. } => {
-                            ExceptionTypeId::SystemError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::InternalError { .. } => {
-                            ExceptionTypeId::RuntimeError.as_u8() as u16
-                        }
-                        RuntimeErrorKind::Exception { type_id, .. } => *type_id,
-                    };
-                    // Create an exception value from the error message for reraise support
-                    let exc_type_id_enum = match ExceptionTypeId::from_u8(type_id as u8) {
-                        Some(id) => id,
-                        None => ExceptionTypeId::RuntimeError,
-                    };
-                    let error_message = err.to_string();
-                    let exc_value = crate::builtins::create_exception(
-                        exc_type_id_enum,
-                        Some(std::sync::Arc::from(error_message.as_str())),
-                    );
-
-                    // Set the active exception (both value and type_id) for handler matching + reraise
-                    self.set_active_exception_with_type(exc_value, type_id);
+                    let type_id = self.materialize_active_exception_from_runtime_error(&err);
 
                     // Try to find a handler in current frame
                     if let Some(handler_entry) = self.find_exception_handler(type_id) {
@@ -532,9 +465,325 @@ impl VirtualMachine {
         }
     }
 
+    /// Map a runtime error kind to a concrete exception type ID.
+    #[inline(always)]
+    fn runtime_error_exception_type_id(kind: &crate::error::RuntimeErrorKind) -> u16 {
+        use crate::error::RuntimeErrorKind;
+        use crate::stdlib::exceptions::types::ExceptionTypeId;
+
+        match kind {
+            RuntimeErrorKind::TypeError { .. }
+            | RuntimeErrorKind::UnsupportedOperandTypes { .. }
+            | RuntimeErrorKind::NotCallable { .. }
+            | RuntimeErrorKind::NotIterable { .. }
+            | RuntimeErrorKind::NotSubscriptable { .. } => {
+                ExceptionTypeId::TypeError.as_u8() as u16
+            }
+            RuntimeErrorKind::NameError { .. } => ExceptionTypeId::NameError.as_u8() as u16,
+            RuntimeErrorKind::AttributeError { .. } => {
+                ExceptionTypeId::AttributeError.as_u8() as u16
+            }
+            RuntimeErrorKind::UnboundLocalError { .. } => {
+                ExceptionTypeId::UnboundLocalError.as_u8() as u16
+            }
+            RuntimeErrorKind::IndexError { .. } => ExceptionTypeId::IndexError.as_u8() as u16,
+            RuntimeErrorKind::KeyError { .. } => ExceptionTypeId::KeyError.as_u8() as u16,
+            RuntimeErrorKind::ValueError { .. } => ExceptionTypeId::ValueError.as_u8() as u16,
+            RuntimeErrorKind::ZeroDivisionError => {
+                ExceptionTypeId::ZeroDivisionError.as_u8() as u16
+            }
+            RuntimeErrorKind::OverflowError { .. } => ExceptionTypeId::OverflowError.as_u8() as u16,
+            RuntimeErrorKind::StopIteration => ExceptionTypeId::StopIteration.as_u8() as u16,
+            RuntimeErrorKind::GeneratorExit => ExceptionTypeId::GeneratorExit.as_u8() as u16,
+            RuntimeErrorKind::AssertionError { .. } => {
+                ExceptionTypeId::AssertionError.as_u8() as u16
+            }
+            RuntimeErrorKind::RecursionError { .. } => {
+                ExceptionTypeId::RecursionError.as_u8() as u16
+            }
+            RuntimeErrorKind::ImportError { .. } => ExceptionTypeId::ImportError.as_u8() as u16,
+            RuntimeErrorKind::InvalidOpcode { .. } => ExceptionTypeId::SystemError.as_u8() as u16,
+            RuntimeErrorKind::InternalError { .. } => ExceptionTypeId::RuntimeError.as_u8() as u16,
+            RuntimeErrorKind::Exception { type_id, .. } => *type_id,
+        }
+    }
+
+    /// Materialize and register active exception state from a runtime error.
+    #[inline]
+    fn materialize_active_exception_from_runtime_error(&mut self, err: &RuntimeError) -> u16 {
+        use crate::stdlib::exceptions::types::ExceptionTypeId;
+
+        let type_id = Self::runtime_error_exception_type_id(&err.kind);
+        let exc_type_id_enum =
+            ExceptionTypeId::from_u8(type_id as u8).unwrap_or(ExceptionTypeId::RuntimeError);
+        let error_message = err.to_string();
+        let exc_value = crate::builtins::create_exception(
+            exc_type_id_enum,
+            Some(Arc::from(error_message.as_str())),
+        );
+        self.set_active_exception_with_type(exc_value, type_id);
+        type_id
+    }
+
+    /// Propagate an active exception through generator-owned frames.
+    ///
+    /// Returns true when a handler was found and execution can continue.
+    /// Returns false when propagation reaches the non-generator caller boundary.
+    #[inline]
+    fn propagate_exception_within_generator_frames(
+        &mut self,
+        type_id: u16,
+        caller_depth: usize,
+    ) -> bool {
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            let frame = &mut self.frames[self.current_frame_idx];
+            frame.ip = handler_entry;
+            return true;
+        }
+
+        while self.frames.len() > caller_depth {
+            self.frames.pop();
+            self.current_frame_idx = self.frames.len() - 1;
+
+            if self.frames.len() <= caller_depth {
+                return false;
+            }
+
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                let frame = &mut self.frames[self.current_frame_idx];
+                frame.ip = handler_entry;
+                return true;
+            }
+        }
+
+        false
+    }
+
     // =========================================================================
     // Frame Management
     // =========================================================================
+
+    /// Resume a generator object for exactly one send()/next() step.
+    ///
+    /// Executes bytecode until:
+    /// - a `Yield` control transfer (returns `Yielded`)
+    /// - a function return / implicit end-of-code (returns `Returned`)
+    /// - an error (returned as `Err`)
+    ///
+    /// This path is used by the coroutine `Send` opcode.
+    pub(crate) fn resume_generator_for_send(
+        &mut self,
+        generator: &mut GeneratorObject,
+        send_value: Value,
+    ) -> VmResult<GeneratorResumeOutcome> {
+        let prev_state = match generator.try_start() {
+            Some(state) => state,
+            None if generator.is_running() => {
+                return Err(RuntimeError::value_error("generator already executing"));
+            }
+            None => {
+                return Err(RuntimeError::stop_iteration());
+            }
+        };
+
+        if prev_state == RuntimeGeneratorState::Created && !send_value.is_none() {
+            return Err(RuntimeError::type_error(
+                "can't send non-None value to a just-started generator",
+            ));
+        }
+
+        if self.frames.is_empty() {
+            return Err(RuntimeError::internal(
+                "cannot resume generator without an active caller frame",
+            ));
+        }
+
+        let caller_idx = self.current_frame_idx;
+        let caller_depth = self.frames.len();
+        let caller_scratch_255 = self.frames[caller_idx].get_reg(255);
+
+        let mut frame = Frame::new(Arc::clone(generator.code()), Some(caller_idx as u32), 255);
+        frame.ip = if prev_state == RuntimeGeneratorState::Suspended {
+            generator.ip()
+        } else {
+            0
+        };
+
+        // Restore captured live state (or seeded locals for first start).
+        generator.restore(&mut frame.registers);
+
+        if prev_state == RuntimeGeneratorState::Suspended {
+            let resume_reg = u8::try_from(generator.resume_index())
+                .map_err(|_| RuntimeError::internal("generator resume register out of range"))?;
+            frame.set_reg(resume_reg, send_value);
+        }
+
+        self.frames.push(frame);
+        self.current_frame_idx = self.frames.len() - 1;
+        let generator_frame_idx = self.current_frame_idx;
+
+        let mut outcome: Option<GeneratorResumeOutcome> = None;
+        let mut failure: Option<RuntimeError> = None;
+
+        'exec: loop {
+            let inst = {
+                let frame = &mut self.frames[self.current_frame_idx];
+
+                if frame.ip as usize >= frame.code.instructions.len() {
+                    if self.current_frame_idx == generator_frame_idx {
+                        generator.exhaust();
+                        outcome = Some(GeneratorResumeOutcome::Returned(Value::none()));
+                        break 'exec;
+                    }
+
+                    match self.pop_frame(Value::none()) {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            failure = Some(RuntimeError::internal(
+                                "generator resume unwound to empty frame stack",
+                            ));
+                            break 'exec;
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break 'exec;
+                        }
+                    }
+                    continue;
+                }
+
+                frame.fetch()
+            };
+
+            let control = get_handler(inst.opcode())(self, inst);
+            match control {
+                ControlFlow::Continue => {}
+                ControlFlow::Jump(offset) => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    let new_ip = (frame.ip as i32) + (offset as i32);
+                    frame.ip = new_ip.max(0) as u32;
+                }
+                ControlFlow::Call { code, return_reg } => {
+                    if let Err(e) = self.push_frame(code, return_reg) {
+                        failure = Some(e);
+                        break 'exec;
+                    }
+                }
+                ControlFlow::Return(value) => {
+                    if self.current_frame_idx == generator_frame_idx {
+                        generator.exhaust();
+                        outcome = Some(GeneratorResumeOutcome::Returned(value));
+                        break 'exec;
+                    }
+
+                    match self.pop_frame(value) {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            failure = Some(RuntimeError::internal(
+                                "generator return unwound to empty frame stack",
+                            ));
+                            break 'exec;
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break 'exec;
+                        }
+                    }
+                }
+                ControlFlow::Yield {
+                    value,
+                    resume_point,
+                } => {
+                    if self.current_frame_idx != generator_frame_idx {
+                        failure = Some(RuntimeError::internal(
+                            "nested frame yielded during generator send",
+                        ));
+                        break 'exec;
+                    }
+
+                    let frame = &self.frames[self.current_frame_idx];
+                    generator.suspend(frame.ip, resume_point, &frame.registers, LivenessMap::ALL);
+                    outcome = Some(GeneratorResumeOutcome::Yielded(value));
+                    break 'exec;
+                }
+                ControlFlow::Resume { send_value } => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    frame.set_reg(0, send_value);
+                }
+                ControlFlow::Error(err) => {
+                    let type_id = self.materialize_active_exception_from_runtime_error(&err);
+                    if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
+                        failure = Some(err);
+                        break 'exec;
+                    }
+                }
+                ControlFlow::Exception { type_id, .. } => {
+                    if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
+                        failure = Some(RuntimeError::exception(
+                            type_id,
+                            format!("Uncaught exception (type_id={})", type_id),
+                        ));
+                        break 'exec;
+                    }
+                }
+                ControlFlow::Reraise => {
+                    let type_id = if let Some(tid) = self.active_exception_type_id {
+                        tid
+                    } else if let Some(exc_info) = self.exc_info_stack.peek() {
+                        exc_info.type_id()
+                    } else {
+                        failure = Some(RuntimeError::type_error("No active exception to re-raise"));
+                        break 'exec;
+                    };
+
+                    if type_id == 0 {
+                        failure = Some(RuntimeError::internal(
+                            "Reraise without active exception type",
+                        ));
+                        break 'exec;
+                    }
+
+                    if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
+                        failure = Some(RuntimeError::exception(
+                            type_id,
+                            "Uncaught re-raised exception",
+                        ));
+                        break 'exec;
+                    }
+                }
+                ControlFlow::EnterHandler { handler_pc, .. } => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    frame.ip = handler_pc;
+                }
+                ControlFlow::EnterFinally { finally_pc, .. } => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    frame.ip = finally_pc;
+                }
+                ControlFlow::ExitHandler => {
+                    // Handler stack updates are currently no-ops in the main loop as well.
+                }
+            }
+        }
+
+        // Always restore caller-visible frame stack state.
+        if self.frames.len() > caller_depth {
+            self.frames.truncate(caller_depth);
+        }
+        self.current_frame_idx = caller_idx;
+        self.frames[caller_idx].set_reg(255, caller_scratch_255);
+
+        if let Some(err) = failure {
+            generator.exhaust();
+            return Err(err);
+        }
+
+        match outcome {
+            Some(result) => Ok(result),
+            None => Err(RuntimeError::internal(
+                "generator resume exited without outcome",
+            )),
+        }
+    }
 
     /// Push a new frame for calling a function.
     ///

@@ -25,10 +25,11 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::stdlib::generators::{GeneratorObject, GeneratorState as RuntimeGeneratorState};
+use crate::vm::GeneratorResumeOutcome;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
-use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::type_obj::TypeId;
+
+use super::protocol::type_name;
 
 /// Send: Send value to coroutine/generator.
 ///
@@ -132,27 +133,6 @@ fn get_generator_state(value: &Value) -> GeneratorState {
 }
 
 /// Get the type name of a value for error messages.
-#[inline]
-fn type_name(value: &Value) -> &'static str {
-    if value.is_none() {
-        "NoneType"
-    } else if value.is_bool() {
-        "bool"
-    } else if value.is_int() {
-        "int"
-    } else if value.is_float() {
-        "float"
-    } else if let Some(ptr) = value.as_object_ptr() {
-        extract_type_id(ptr).name()
-    } else {
-        "unknown"
-    }
-}
-
-// =============================================================================
-// Generator Resumption
-// =============================================================================
-
 /// Result of resuming a generator.
 enum ResumeResult {
     /// Generator yielded a value.
@@ -165,22 +145,18 @@ enum ResumeResult {
 
 /// Resume a generator with a sent value.
 #[inline]
-fn resume_generator(_vm: &mut VirtualMachine, _gen: Value, _value: Value) -> ResumeResult {
-    if GeneratorObject::from_value(_gen).is_none() {
+fn resume_generator(vm: &mut VirtualMachine, gen_value: Value, send_value: Value) -> ResumeResult {
+    let Some(generator) = GeneratorObject::from_value_mut(gen_value) else {
         return ResumeResult::Error(RuntimeError::type_error(
             "send target is not a generator object",
         ));
+    };
+
+    match vm.resume_generator_for_send(generator, send_value) {
+        Ok(GeneratorResumeOutcome::Yielded(value)) => ResumeResult::Yielded(value),
+        Ok(GeneratorResumeOutcome::Returned(value)) => ResumeResult::Returned(value),
+        Err(e) => ResumeResult::Error(e),
     }
-
-    ResumeResult::Error(RuntimeError::internal(
-        "generator send/resume execution is not integrated yet",
-    ))
-}
-
-#[inline(always)]
-fn extract_type_id(ptr: *const ()) -> TypeId {
-    let header = ptr as *const ObjectHeader;
-    unsafe { (*header).type_id }
 }
 
 // =============================================================================
@@ -190,8 +166,13 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::CodeObject;
+    use crate::builtins::create_exception;
+    use crate::error::RuntimeErrorKind;
+    use crate::stdlib::exceptions::ExceptionTypeId;
     use crate::stdlib::generators::LivenessMap;
+    use prism_compiler::bytecode::{
+        CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
+    };
     use std::sync::Arc;
 
     fn generator_value_for_state(state: GeneratorState) -> Value {
@@ -215,6 +196,102 @@ mod tests {
             GeneratorState::NotAGenerator => {}
         }
 
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
+
+    fn push_caller_frame(vm: &mut VirtualMachine) {
+        let mut caller = CodeObject::new("send_caller", "<test>");
+        caller.register_count = 16;
+        vm.push_frame(Arc::new(caller), 0)
+            .expect("failed to push caller frame");
+    }
+
+    fn runtime_send_generator() -> Value {
+        let mut code = CodeObject::new("runtime_send_generator", "<test>");
+        code.flags = CodeFlags::GENERATOR;
+        code.register_count = 8;
+        code.constants = vec![Value::int(1).unwrap()].into_boxed_slice();
+        code.instructions = vec![
+            // r2 = 1
+            Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
+            // first yield: yields r2, sent value lands in r1
+            Instruction::op_ds(Opcode::Yield, Register::new(1), Register::new(2)),
+            // second yield: yields last sent value from r1
+            Instruction::op_ds(Opcode::Yield, Register::new(1), Register::new(1)),
+            // stop
+            Instruction::op(Opcode::ReturnNone),
+        ]
+        .into_boxed_slice();
+
+        let generator = GeneratorObject::from_code(Arc::new(code));
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
+
+    fn runtime_raise_generator() -> Value {
+        let mut code = CodeObject::new("runtime_raise_generator", "<test>");
+        code.flags = CodeFlags::GENERATOR;
+        code.register_count = 8;
+        code.constants = vec![create_exception(
+            ExceptionTypeId::TypeError,
+            Some(Arc::from("boom from generator")),
+        )]
+        .into_boxed_slice();
+        code.instructions = vec![
+            Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
+            Instruction::op_di(
+                Opcode::Raise,
+                Register::new(2),
+                ExceptionTypeId::TypeError as u16,
+            ),
+            Instruction::op(Opcode::ReturnNone),
+        ]
+        .into_boxed_slice();
+
+        let generator = GeneratorObject::from_code(Arc::new(code));
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
+
+    fn runtime_handled_raise_generator() -> Value {
+        let mut code = CodeObject::new("runtime_handled_raise_generator", "<test>");
+        code.flags = CodeFlags::GENERATOR;
+        code.register_count = 8;
+        code.constants = vec![
+            create_exception(
+                ExceptionTypeId::TypeError,
+                Some(Arc::from("caught in generator")),
+            ),
+            Value::int(9).unwrap(),
+        ]
+        .into_boxed_slice();
+        code.instructions = vec![
+            // Raise TypeError from try-range [pc=1, pc=2)
+            Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
+            Instruction::op_di(
+                Opcode::Raise,
+                Register::new(2),
+                ExceptionTypeId::TypeError as u16,
+            ),
+            Instruction::op(Opcode::ReturnNone),
+            // Exception handler target: yield sentinel 9 and keep normal generator protocol.
+            Instruction::op_di(Opcode::LoadConst, Register::new(3), 1),
+            Instruction::op_ds(Opcode::Yield, Register::new(1), Register::new(3)),
+            Instruction::op(Opcode::ReturnNone),
+        ]
+        .into_boxed_slice();
+        code.exception_table = vec![ExceptionEntry {
+            start_pc: 1,
+            end_pc: 2,
+            handler_pc: 3,
+            finally_pc: u32::MAX,
+            depth: 0,
+            exception_type_idx: u16::MAX,
+        }]
+        .into_boxed_slice();
+
+        let generator = GeneratorObject::from_code(Arc::new(code));
         let ptr = Box::into_raw(Box::new(generator)) as *const ();
         Value::object_ptr(ptr)
     }
@@ -333,5 +410,149 @@ mod tests {
     fn test_generator_state_debug() {
         let state = GeneratorState::Suspended;
         assert!(!format!("{:?}", state).is_empty());
+    }
+
+    #[test]
+    fn test_send_resumes_generator_and_yields_sent_value() {
+        let mut vm = VirtualMachine::new();
+        push_caller_frame(&mut vm);
+
+        let generator = runtime_send_generator();
+        vm.current_frame_mut().set_reg(1, generator);
+
+        // First resume must send None and should yield constant 1.
+        vm.current_frame_mut().set_reg(2, Value::none());
+        let inst = Instruction::new(Opcode::Send, 0, 1, 2);
+        let control = send(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(1));
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Suspended
+        );
+
+        // Second resume sends 77 and generator immediately yields it back.
+        vm.current_frame_mut().set_reg(2, Value::int(77).unwrap());
+        let control = send(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(77));
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Suspended
+        );
+
+        // Third resume reaches return and raises StopIteration.
+        vm.current_frame_mut().set_reg(2, Value::none());
+        let control = send(&mut vm, inst);
+        match control {
+            ControlFlow::Error(err) => {
+                assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
+            }
+            other => panic!("expected StopIteration, got {other:?}"),
+        }
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Exhausted
+        );
+    }
+
+    #[test]
+    fn test_send_rejects_non_none_on_initial_resume() {
+        let mut vm = VirtualMachine::new();
+        push_caller_frame(&mut vm);
+
+        let generator = runtime_send_generator();
+        vm.current_frame_mut().set_reg(1, generator);
+        vm.current_frame_mut().set_reg(2, Value::int(5).unwrap());
+
+        let inst = Instruction::new(Opcode::Send, 0, 1, 2);
+        let control = send(&mut vm, inst);
+        match control {
+            ControlFlow::Error(err) => {
+                assert!(err.to_string().contains("can't send non-None"));
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+
+        // Generator should remain in created state after protocol violation.
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Created
+        );
+    }
+
+    #[test]
+    fn test_send_propagates_uncaught_generator_exception() {
+        let mut vm = VirtualMachine::new();
+        push_caller_frame(&mut vm);
+
+        let generator = runtime_raise_generator();
+        vm.current_frame_mut().set_reg(1, generator);
+        vm.current_frame_mut().set_reg(2, Value::none());
+
+        let inst = Instruction::new(Opcode::Send, 0, 1, 2);
+        let control = send(&mut vm, inst);
+        match control {
+            ControlFlow::Error(err) => {
+                assert!(matches!(
+                    err.kind,
+                    RuntimeErrorKind::Exception { type_id, .. }
+                        if type_id == ExceptionTypeId::TypeError as u16
+                ));
+            }
+            other => panic!("expected propagated exception, got {other:?}"),
+        }
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Exhausted
+        );
+    }
+
+    #[test]
+    fn test_send_handles_generator_exception_table_path() {
+        let mut vm = VirtualMachine::new();
+        push_caller_frame(&mut vm);
+
+        let generator = runtime_handled_raise_generator();
+        vm.current_frame_mut().set_reg(1, generator);
+        vm.current_frame_mut().set_reg(2, Value::none());
+        let inst = Instruction::new(Opcode::Send, 0, 1, 2);
+
+        // First send triggers raise, catches in generator exception table, then yields 9.
+        let control = send(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(9));
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Suspended
+        );
+
+        // Next send cleanly completes generator.
+        vm.current_frame_mut().set_reg(2, Value::none());
+        let control = send(&mut vm, inst);
+        match control {
+            ControlFlow::Error(err) => {
+                assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
+            }
+            other => panic!("expected StopIteration, got {other:?}"),
+        }
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Exhausted
+        );
     }
 }
