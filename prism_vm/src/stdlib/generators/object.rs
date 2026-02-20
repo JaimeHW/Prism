@@ -22,8 +22,12 @@
 //! └───────────────────────────────────────────────────────────────┘
 //! ```
 
-use prism_compiler::bytecode::CodeObject;
+use prism_compiler::bytecode::{CodeFlags, CodeObject};
 use prism_core::Value;
+use prism_gc::trace::Tracer;
+use prism_gc::Trace;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 use std::fmt;
 use std::sync::Arc;
 
@@ -104,10 +108,15 @@ impl std::ops::BitOrAssign for GeneratorFlags {
 /// - Yield: ~3-5 cycles (state update + value copy)
 /// - Resume: ~5 cycles (state check + dispatch)
 /// - Memory: 96 bytes typical (2 cache lines)
+#[repr(C)]
 pub struct GeneratorObject {
+    // === PYOBJECT HEADER (16 bytes) ===
+    /// Object header for O(1) VM type dispatch.
+    pub header: ObjectHeader,
+
     // === HEADER (8 bytes) ===
     /// Tagged state + resume index.
-    header: GeneratorHeader,
+    state_header: GeneratorHeader,
     /// Configuration flags.
     flags: GeneratorFlags,
     /// Padding for alignment.
@@ -140,7 +149,8 @@ impl GeneratorObject {
     #[inline]
     pub fn new(code: Arc<CodeObject>) -> Self {
         Self {
-            header: GeneratorHeader::new(),
+            header: ObjectHeader::new(TypeId::GENERATOR),
+            state_header: GeneratorHeader::new(),
             flags: GeneratorFlags::INLINE_STORAGE,
             _pad: 0,
             code,
@@ -155,7 +165,8 @@ impl GeneratorObject {
     #[inline]
     pub fn with_flags(code: Arc<CodeObject>, flags: GeneratorFlags) -> Self {
         Self {
-            header: GeneratorHeader::new(),
+            header: ObjectHeader::new(TypeId::GENERATOR),
+            state_header: GeneratorHeader::new(),
             flags,
             _pad: 0,
             code,
@@ -166,6 +177,47 @@ impl GeneratorObject {
         }
     }
 
+    /// Creates a generator object from code flags.
+    ///
+    /// This maps compiler-level function flags onto runtime generator flags.
+    #[inline]
+    pub fn from_code(code: Arc<CodeObject>) -> Self {
+        let mut flags = GeneratorFlags::INLINE_STORAGE;
+        if code.flags.contains(CodeFlags::COROUTINE) {
+            flags |= GeneratorFlags::IS_COROUTINE;
+        }
+        if code.flags.contains(CodeFlags::ASYNC_GENERATOR) {
+            flags |= GeneratorFlags::IS_ASYNC;
+        }
+        Self::with_flags(code, flags)
+    }
+
+    /// Returns a shared generator reference if the value is a generator object.
+    #[inline]
+    pub fn from_value(value: Value) -> Option<&'static Self> {
+        let ptr = value.as_object_ptr()?;
+        Self::from_object_ptr(ptr)
+    }
+
+    /// Returns a mutable generator reference if the value is a generator object.
+    #[inline]
+    pub fn from_value_mut(value: Value) -> Option<&'static mut Self> {
+        let ptr = value.as_object_ptr()?;
+        if object_type_id(ptr) != TypeId::GENERATOR {
+            return None;
+        }
+        Some(unsafe { &mut *(ptr as *mut Self) })
+    }
+
+    /// Returns a shared generator reference from a raw object pointer.
+    #[inline]
+    pub fn from_object_ptr(ptr: *const ()) -> Option<&'static Self> {
+        if object_type_id(ptr) != TypeId::GENERATOR {
+            return None;
+        }
+        Some(unsafe { &*(ptr as *const Self) })
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // State Accessors
     // ═══════════════════════════════════════════════════════════════════════
@@ -173,31 +225,31 @@ impl GeneratorObject {
     /// Returns the current generator state.
     #[inline(always)]
     pub fn state(&self) -> GeneratorState {
-        self.header.state()
+        self.state_header.state()
     }
 
     /// Returns the resume index (yield point ID).
     #[inline(always)]
     pub fn resume_index(&self) -> u32 {
-        self.header.resume_index()
+        self.state_header.resume_index()
     }
 
     /// Returns true if the generator can be resumed.
     #[inline(always)]
     pub fn is_resumable(&self) -> bool {
-        self.header.is_resumable()
+        self.state_header.is_resumable()
     }
 
     /// Returns true if the generator is exhausted.
     #[inline(always)]
     pub fn is_exhausted(&self) -> bool {
-        self.header.is_exhausted()
+        self.state_header.is_exhausted()
     }
 
     /// Returns true if the generator is currently running.
     #[inline(always)]
     pub fn is_running(&self) -> bool {
-        self.header.is_running()
+        self.state_header.is_running()
     }
 
     /// Returns the generator's flags.
@@ -234,7 +286,7 @@ impl GeneratorObject {
     /// cannot be resumed (already running or exhausted).
     #[inline]
     pub fn try_start(&self) -> Option<GeneratorState> {
-        self.header.try_start()
+        self.state_header.try_start()
     }
 
     /// Suspends the generator at a yield point.
@@ -255,13 +307,13 @@ impl GeneratorObject {
         self.ip = ip;
         self.liveness_bits = liveness.bits() as u32;
         self.storage.capture(registers, liveness);
-        self.header.suspend(resume_index);
+        self.state_header.suspend(resume_index);
     }
 
     /// Marks the generator as exhausted (returned or closed).
     #[inline]
     pub fn exhaust(&self) {
-        self.header.exhaust();
+        self.state_header.exhaust();
     }
 
     /// Restores the generator's frame to a register file.
@@ -269,6 +321,16 @@ impl GeneratorObject {
     pub fn restore(&self, registers: &mut [Value; 256]) {
         let liveness = self.liveness();
         self.storage.restore(registers, liveness);
+    }
+
+    /// Seeds the initial local register snapshot used when this generator starts.
+    ///
+    /// This is called from the function call path when a generator/coroutine object
+    /// is created from bound call arguments.
+    #[inline]
+    pub fn seed_locals(&mut self, registers: &[Value; 256], liveness: LivenessMap) {
+        self.liveness_bits = liveness.bits() as u32;
+        self.storage.capture(registers, liveness);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -327,7 +389,8 @@ impl GeneratorObject {
 impl Clone for GeneratorObject {
     fn clone(&self) -> Self {
         Self {
-            header: self.header.clone(),
+            header: ObjectHeader::new(TypeId::GENERATOR),
+            state_header: self.state_header.clone(),
             flags: self.flags,
             _pad: 0,
             code: Arc::clone(&self.code),
@@ -355,6 +418,21 @@ impl fmt::Debug for GeneratorObject {
 // (though concurrent access to a single generator is not safe)
 unsafe impl Send for GeneratorObject {}
 
+unsafe impl Trace for GeneratorObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        for idx in 0..self.storage.len() {
+            self.storage.get(idx).trace(tracer);
+        }
+        self.receive_value.trace(tracer);
+    }
+}
+
+#[inline(always)]
+fn object_type_id(ptr: *const ()) -> TypeId {
+    let header = ptr as *const ObjectHeader;
+    unsafe { (*header).type_id }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -376,8 +454,13 @@ mod tests {
     #[test]
     fn test_generator_size() {
         let size = std::mem::size_of::<GeneratorObject>();
-        // Should be reasonably small, target ~96 bytes
-        assert!(size <= 160, "GeneratorObject too large: {}", size);
+        // Includes ObjectHeader (16 bytes) + generator state/storage fields.
+        assert!(size <= 192, "GeneratorObject too large: {}", size);
+    }
+
+    #[test]
+    fn test_generator_layout_header_first() {
+        assert_eq!(std::mem::offset_of!(GeneratorObject, header), 0);
     }
 
     #[test]
@@ -402,6 +485,46 @@ mod tests {
         assert!(generator.is_coroutine());
         assert!(!generator.is_async());
         assert_eq!(generator.flags(), flags);
+    }
+
+    #[test]
+    fn test_generator_from_code_maps_coroutine_flags() {
+        let mut code = CodeObject::new("test_generator", "<test>");
+        code.flags = CodeFlags::COROUTINE;
+        let generator = GeneratorObject::from_code(Arc::new(code));
+        assert!(generator.is_coroutine());
+        assert!(!generator.is_async());
+    }
+
+    #[test]
+    fn test_generator_from_code_maps_async_generator_flags() {
+        let mut code = CodeObject::new("test_async_generator", "<test>");
+        code.flags = CodeFlags::ASYNC_GENERATOR;
+        let generator = GeneratorObject::from_code(Arc::new(code));
+        assert!(generator.is_async());
+    }
+
+    #[test]
+    fn test_generator_from_value_roundtrip() {
+        let generator = GeneratorObject::new(test_code());
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        let value = Value::object_ptr(ptr);
+        let recovered = GeneratorObject::from_value(value).expect("generator should roundtrip");
+        assert_eq!(recovered.header.type_id, TypeId::GENERATOR);
+    }
+
+    #[test]
+    fn test_seed_locals_captures_values() {
+        let mut generator = GeneratorObject::new(test_code());
+        let mut regs = [Value::none(); 256];
+        regs[0] = Value::int(7).unwrap();
+        regs[2] = Value::int(11).unwrap();
+        generator.seed_locals(&regs, LivenessMap::from_bits(0b101));
+
+        let mut restored = [Value::none(); 256];
+        generator.restore(&mut restored);
+        assert_eq!(restored[0].as_int(), Some(7));
+        assert_eq!(restored[2].as_int(), Some(11));
     }
 
     // ════════════════════════════════════════════════════════════════════════
