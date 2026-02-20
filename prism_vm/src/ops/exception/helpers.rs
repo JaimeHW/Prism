@@ -409,6 +409,25 @@ pub fn extract_type_id(encoded_type_id: u16, value: &Value) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_runtime::types::TupleObject;
+
+    fn exception_type_value(name: &str) -> Value {
+        let exc_type = crate::builtins::get_exception_type(name)
+            .unwrap_or_else(|| panic!("missing exception type: {name}"));
+        Value::object_ptr(exc_type as *const _ as *const ())
+    }
+
+    fn tuple_value(values: &[Value]) -> Value {
+        let tuple = TupleObject::from_slice(values);
+        let ptr = Box::leak(Box::new(tuple)) as *mut TupleObject as *const ();
+        Value::object_ptr(ptr)
+    }
+
+    unsafe fn drop_boxed<T>(ptr: *mut T) {
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     // Constant Tests
@@ -534,6 +553,20 @@ mod tests {
         assert!(!check_dynamic_match(exc_type_id, &type_value));
     }
 
+    #[test]
+    fn test_check_dynamic_match_type_object_direct_match() {
+        let exc_type_id = ExceptionTypeId::TypeError as u16;
+        let type_value = exception_type_value("TypeError");
+        assert!(check_dynamic_match(exc_type_id, &type_value));
+    }
+
+    #[test]
+    fn test_check_dynamic_match_type_object_subclass_match() {
+        let exc_type_id = ExceptionTypeId::TypeError as u16;
+        let type_value = exception_type_value("Exception");
+        assert!(check_dynamic_match(exc_type_id, &type_value));
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // Tuple Match Tests
     // ════════════════════════════════════════════════════════════════════════
@@ -559,6 +592,19 @@ mod tests {
         let exc_type_id = ExceptionTypeId::ValueError as u16;
         let types_tuple = Value::bool(true);
         assert!(!check_tuple_match(exc_type_id, &types_tuple));
+    }
+
+    #[test]
+    fn test_check_tuple_match_type_object_elements() {
+        let exc_type_id = ExceptionTypeId::TypeError as u16;
+        let value_error = exception_type_value("ValueError");
+        let type_error = exception_type_value("TypeError");
+        let types_tuple = tuple_value(&[value_error, type_error]);
+        assert!(check_tuple_match(exc_type_id, &types_tuple));
+
+        let tuple_ptr =
+            types_tuple.as_object_ptr().expect("tuple should be object") as *mut TupleObject;
+        unsafe { drop_boxed(tuple_ptr) };
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -635,6 +681,15 @@ mod tests {
     fn test_extract_type_from_type_value_int() {
         let type_value = Value::int(42).unwrap();
         assert!(extract_type_from_type_value(&type_value).is_none());
+    }
+
+    #[test]
+    fn test_extract_type_from_type_value_exception_type_object() {
+        let type_value = exception_type_value("TypeError");
+        assert_eq!(
+            extract_type_from_type_value(&type_value),
+            Some(ExceptionTypeId::TypeError as u16)
+        );
     }
 
     #[test]
