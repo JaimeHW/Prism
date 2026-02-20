@@ -14,6 +14,7 @@ use crate::builtins::{EXCEPTION_TYPE_ID, ExceptionTypeObject};
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::frame::ClosureEnv;
+use crate::stdlib::generators::{GeneratorObject, LivenessMap};
 use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
@@ -101,6 +102,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             TypeId::FUNCTION | TypeId::CLOSURE => {
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 let code = &func.code;
+                let is_generator_function = is_generator_code(code);
 
                 // Fast path for exact-arity positional calls without advanced binding.
                 let defaults_empty = func.defaults.as_ref().is_none_or(|d| d.is_empty());
@@ -112,7 +114,9 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     && kwdefaults_empty
                     && argc == code.arg_count as usize;
 
-                if simple_positional {
+                if is_generator_function && simple_positional {
+                    create_generator_from_simple_call(vm, code, dst_reg, argc)
+                } else if simple_positional {
                     let closure = vm.lookup_function_closure(ptr);
                     let caller_frame_idx = vm.call_depth() - 1;
 
@@ -449,10 +453,6 @@ fn call_kw_user_function(
     // Phase 5: Push new frame and populate locals
     // =========================================================================
 
-    if let Err(e) = vm.push_frame_with_closure(Arc::clone(&code), dst_reg, closure) {
-        return ControlFlow::Error(e);
-    }
-
     // Allocate *args tuple on GC heap if needed
     let varargs_value = if has_varargs {
         let tuple = match &varargs_values {
@@ -491,6 +491,42 @@ fn call_kw_user_function(
         None
     };
 
+    if is_generator_code(&code) {
+        let mut locals = [Value::none(); 256];
+        let mut local_idx = 0usize;
+
+        for i in 0..arg_count {
+            locals[local_idx] = bound_args[i];
+            local_idx += 1;
+        }
+
+        if let Some(tuple_val) = varargs_value {
+            locals[local_idx] = tuple_val;
+            local_idx += 1;
+        }
+
+        for i in arg_count..total_params {
+            locals[local_idx] = bound_args[i];
+            local_idx += 1;
+        }
+
+        if let Some(dict_val) = varkw_value {
+            locals[local_idx] = dict_val;
+            local_idx += 1;
+        }
+
+        let mut generator = GeneratorObject::from_code(Arc::clone(&code));
+        generator.seed_locals(&locals, prefix_liveness(local_idx));
+        let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
+        vm.current_frame_mut()
+            .set_reg(dst_reg, Value::object_ptr(gen_ptr));
+        return ControlFlow::Continue;
+    }
+
+    if let Err(e) = vm.push_frame_with_closure(Arc::clone(&code), dst_reg, closure) {
+        return ControlFlow::Error(e);
+    }
+
     // Populate bound parameters in new frame
     // Locals layout:
     // - [0..arg_count): positional parameters
@@ -527,6 +563,43 @@ fn call_kw_user_function(
     let initialized_local_count = local_idx as usize + usize::from(varkw_value.is_some());
     initialize_closure_cellvars_from_locals(new_frame, initialized_local_count);
     ControlFlow::Continue
+}
+
+#[inline(always)]
+fn is_generator_code(code: &CodeObject) -> bool {
+    code.is_generator() || code.is_coroutine() || code.is_async_generator()
+}
+
+#[inline]
+fn create_generator_from_simple_call(
+    vm: &mut VirtualMachine,
+    code: &Arc<CodeObject>,
+    dst_reg: u8,
+    argc: usize,
+) -> ControlFlow {
+    let caller_frame_idx = vm.call_depth() - 1;
+    let mut locals = [Value::none(); 256];
+    for i in 0..argc {
+        locals[i] = vm.frames[caller_frame_idx].get_reg(dst_reg + 1 + i as u8);
+    }
+
+    let mut generator = GeneratorObject::from_code(Arc::clone(code));
+    generator.seed_locals(&locals, prefix_liveness(argc));
+    let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
+    vm.current_frame_mut()
+        .set_reg(dst_reg, Value::object_ptr(gen_ptr));
+    ControlFlow::Continue
+}
+
+#[inline(always)]
+fn prefix_liveness(count: usize) -> LivenessMap {
+    if count == 0 {
+        LivenessMap::empty()
+    } else if count >= 64 {
+        LivenessMap::ALL
+    } else {
+        LivenessMap::from_bits((1u64 << count) - 1)
+    }
 }
 
 /// Tracks which parameters have been bound during argument binding.
