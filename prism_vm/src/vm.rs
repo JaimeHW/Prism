@@ -7,7 +7,7 @@ use crate::allocator::GcAllocator;
 use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
-use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack, InlineHandlerCache};
+use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
@@ -86,8 +86,6 @@ pub struct VirtualMachine {
     exc_state: ExceptionState,
     /// Runtime handler stack for active try/except/finally blocks.
     handler_stack: HandlerStack,
-    /// Inline handler cache for fast handler lookup by PC.
-    handler_cache: InlineHandlerCache,
     /// Currently active exception (if any) being propagated.
     active_exception: Option<Value>,
     /// Type ID of the active exception for fast matching.
@@ -116,7 +114,6 @@ impl VirtualMachine {
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
-            handler_cache: InlineHandlerCache::new(),
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
@@ -141,7 +138,6 @@ impl VirtualMachine {
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
-            handler_cache: InlineHandlerCache::new(),
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
@@ -171,7 +167,6 @@ impl VirtualMachine {
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
-            handler_cache: InlineHandlerCache::new(),
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
@@ -196,7 +191,6 @@ impl VirtualMachine {
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
-            handler_cache: InlineHandlerCache::new(),
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
@@ -204,11 +198,10 @@ impl VirtualMachine {
         }
     }
 
-    /// Switch active frame and invalidate frame-local handler lookup cache.
+    /// Switch active frame.
     #[inline(always)]
     fn set_current_frame_idx(&mut self, idx: usize) {
         self.current_frame_idx = idx;
-        self.handler_cache.invalidate();
     }
 
     // =========================================================================
@@ -1174,13 +1167,17 @@ impl VirtualMachine {
     /// Cache a handler lookup result for fast path.
     #[inline]
     pub fn cache_handler(&mut self, pc: u32, handler_idx: u16) {
-        self.handler_cache.record(pc, handler_idx);
+        self.frames[self.current_frame_idx]
+            .handler_cache
+            .record(pc, handler_idx);
     }
 
     /// Look up a cached handler for a PC.
     #[inline]
     pub fn lookup_cached_handler(&mut self, pc: u32) -> Option<u16> {
-        self.handler_cache.try_get(pc)
+        self.frames[self.current_frame_idx]
+            .handler_cache
+            .try_get(pc)
     }
 
     /// Get the handler stack depth.
@@ -1219,7 +1216,9 @@ impl VirtualMachine {
             {
                 return Some(entry.handler_pc);
             }
-            self.handler_cache.invalidate();
+            self.frames[self.current_frame_idx]
+                .handler_cache
+                .invalidate();
         }
 
         // Slow path: linear scan (tables are small and sorted by start_pc).
@@ -1244,7 +1243,9 @@ impl VirtualMachine {
             return Some(handler_pc);
         }
 
-        self.handler_cache.record_miss(pc);
+        self.frames[self.current_frame_idx]
+            .handler_cache
+            .record_miss(pc);
         None
     }
 
@@ -1549,11 +1550,11 @@ mod tests {
         vm.current_frame_mut().ip = 5;
 
         assert_eq!(vm.find_exception_handler(24), Some(77));
-        assert!(vm.handler_cache.is_valid());
-        assert_eq!(vm.handler_cache.cached_handler(), Some(0));
+        assert!(vm.current_frame().handler_cache.is_valid());
+        assert_eq!(vm.current_frame().handler_cache.cached_handler(), Some(0));
 
         assert_eq!(vm.find_exception_handler(24), Some(77));
-        assert!(vm.handler_cache.hit_count() >= 1);
+        assert!(vm.current_frame().handler_cache.hit_count() >= 1);
     }
 
     #[test]
@@ -1565,12 +1566,15 @@ mod tests {
         vm.current_frame_mut().ip = 3;
 
         assert_eq!(vm.find_exception_handler(24), None);
-        assert!(vm.handler_cache.is_empty() || vm.handler_cache.cached_handler().is_none());
-        assert_eq!(vm.handler_cache.cached_pc(), Some(2));
+        assert!(
+            vm.current_frame().handler_cache.is_empty()
+                || vm.current_frame().handler_cache.cached_handler().is_none()
+        );
+        assert_eq!(vm.current_frame().handler_cache.cached_pc(), Some(2));
     }
 
     #[test]
-    fn test_handler_cache_invalidated_on_push_frame_switch() {
+    fn test_handler_cache_isolation_on_push_frame_switch() {
         let mut vm = VirtualMachine::new();
         let frame_a = code_with_exception_entries(
             "frame_a",
@@ -1584,16 +1588,16 @@ mod tests {
         vm.push_frame(frame_a, 0).unwrap();
         vm.current_frame_mut().ip = 5;
         assert_eq!(vm.find_exception_handler(24), Some(11));
-        assert_eq!(vm.handler_cache.cached_handler(), Some(1));
+        assert_eq!(vm.current_frame().handler_cache.cached_handler(), Some(1));
 
         vm.push_frame(frame_b, 0).unwrap();
-        assert!(vm.handler_cache.is_empty());
+        assert!(vm.current_frame().handler_cache.is_empty());
         vm.current_frame_mut().ip = 5;
         assert_eq!(vm.find_exception_handler(24), Some(21));
     }
 
     #[test]
-    fn test_handler_cache_invalidated_on_pop_frame_switch() {
+    fn test_handler_cache_persists_per_frame_across_pop_switch() {
         let mut vm = VirtualMachine::new();
         let caller = code_with_exception_entries(
             "caller",
@@ -1611,12 +1615,13 @@ mod tests {
         vm.push_frame(callee, 0).unwrap();
         vm.current_frame_mut().ip = 5;
         assert_eq!(vm.find_exception_handler(24), Some(41));
-        assert_eq!(vm.handler_cache.cached_handler(), Some(1));
+        assert_eq!(vm.current_frame().handler_cache.cached_handler(), Some(1));
 
         let popped = vm.pop_frame(Value::none()).unwrap();
         assert!(popped.is_none());
-        assert!(vm.handler_cache.is_empty());
+        assert_eq!(vm.current_frame().handler_cache.cached_handler(), Some(0));
         vm.current_frame_mut().ip = 5;
         assert_eq!(vm.find_exception_handler(24), Some(31));
+        assert!(vm.current_frame().handler_cache.hit_count() >= 1);
     }
 }

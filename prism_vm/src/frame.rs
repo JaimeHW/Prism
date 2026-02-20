@@ -3,6 +3,7 @@
 //! The Frame struct is the core execution context for a function call.
 //! It uses a stack-allocated register file for maximum performance.
 
+use crate::exception::InlineHandlerCache;
 use prism_compiler::bytecode::CodeObject;
 use prism_core::Value;
 use std::sync::Arc;
@@ -58,6 +59,9 @@ pub struct Frame {
     /// Yield point index for generators (0 = not a generator or not yet yielded).
     /// When a generator yields, this stores the resume table index for O(1) dispatch.
     pub yield_point: u32,
+
+    /// Inline cache for exception-handler lookup at this frame's current PC.
+    pub handler_cache: InlineHandlerCache,
 }
 
 /// Closure environment holding captured variables.
@@ -239,6 +243,7 @@ impl Frame {
             // Initialize all registers to None for safety
             registers: [Value::none(); REGISTER_COUNT],
             yield_point: 0,
+            handler_cache: InlineHandlerCache::new(),
         }
     }
 
@@ -258,6 +263,7 @@ impl Frame {
             closure: Some(closure),
             registers: [Value::none(); REGISTER_COUNT],
             yield_point: 0,
+            handler_cache: InlineHandlerCache::new(),
         }
     }
 
