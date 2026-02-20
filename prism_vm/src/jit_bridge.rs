@@ -51,6 +51,8 @@ pub struct BridgeConfig {
     pub enable_osr: bool,
     /// Maximum compilation queue size.
     pub max_queue_size: usize,
+    /// Maximum compiled code cache size in bytes.
+    pub max_code_size: usize,
 }
 
 impl Default for BridgeConfig {
@@ -62,6 +64,7 @@ impl Default for BridgeConfig {
             background_compilation: true,
             enable_osr: true,
             max_queue_size: 64,
+            max_code_size: 64 * 1024 * 1024,
         }
     }
 }
@@ -76,6 +79,7 @@ impl BridgeConfig {
             background_compilation: false,
             enable_osr: false,
             max_queue_size: 4,
+            max_code_size: 1024 * 1024,
         }
     }
 
@@ -133,7 +137,7 @@ impl JitBridge {
     /// Create a new JIT bridge.
     pub fn new(config: BridgeConfig) -> Self {
         let runtime_config = RuntimeConfig {
-            max_code_size: 64 * 1024 * 1024,
+            max_code_size: config.max_code_size,
             compiler_threads: if config.background_compilation { 1 } else { 0 },
             tier_up_threshold: config.tier1_threshold as u32,
             enable_osr: config.enable_osr,
@@ -142,7 +146,7 @@ impl JitBridge {
 
         let code_cache = Arc::new(CodeCache::new(runtime_config.max_code_size));
         let executor = JitExecutor::new(Arc::clone(&code_cache));
-        let tier1_compiler = TemplateCompiler::new_for_testing();
+        let tier1_compiler = TemplateCompiler::new_runtime();
 
         // Create compilation queue if background compilation is enabled
         let compilation_queue = if config.background_compilation {
@@ -258,17 +262,7 @@ impl JitBridge {
             return Ok(entry);
         }
 
-        // Convert bytecode to template IR
-        let instructions = lower_code_to_templates(code)?;
-
-        // Compile
-        let compiled = self
-            .tier1_compiler
-            .compile(code.register_count, &instructions)?;
-
-        // Create cache entry - transfer ownership of executable buffer
-        // This ensures the compiled code memory remains valid for the entry's lifetime
-        let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code).with_tier(1);
+        let entry = compile_tier1_entry(code, &mut self.tier1_compiler)?;
 
         // Insert into cache (this wraps in Arc internally)
         self.code_cache.insert(entry);
@@ -298,36 +292,7 @@ impl JitBridge {
             }
         }
 
-        // Stage 1: Convert bytecode to Sea-of-Nodes IR
-        let builder = GraphBuilder::new(code.register_count as usize, code.arg_count as usize);
-        let translator = BytecodeTranslator::new(builder, code);
-        let mut graph = translator
-            .translate()
-            .map_err(|e| format!("Tier 2 bytecode translation failed: {}", e))?;
-
-        // Stage 2: Run optimization pipeline
-        let mut pipeline = OptPipeline::new();
-        let _stats = pipeline.run(&mut graph);
-
-        // Stage 3: Liveness analysis
-        let liveness = LivenessAnalysis::analyze(&graph);
-        let intervals = liveness.into_intervals();
-
-        // Stage 4: Register allocation
-        let allocator = LinearScanAllocator::new(AllocatorConfig::default());
-        let (alloc_map, _alloc_stats) = allocator.allocate(intervals);
-
-        // Stage 5: Instruction selection
-        let mfunc = InstructionSelector::select(&graph, &alloc_map);
-
-        // Stage 6: Code emission
-        let compiled =
-            CodeEmitter::emit(&mfunc).map_err(|e| format!("Tier 2 code emission failed: {}", e))?;
-
-        // Create cache entry with Tier 2 marker
-        let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code)
-            .with_tier(2)
-            .with_return_abi(ReturnAbi::EncodedExitReason);
+        let entry = compile_tier2_entry(code)?;
 
         // Insert into cache
         self.code_cache.insert(entry);
@@ -454,6 +419,54 @@ fn code_id_from_arc(code: &Arc<CodeObject>) -> u64 {
     Arc::as_ptr(code) as u64
 }
 
+/// Compile a code object into a Tier 1 cache entry.
+pub(crate) fn compile_tier1_entry(
+    code: &Arc<CodeObject>,
+    compiler: &mut TemplateCompiler,
+) -> Result<CompiledEntry, String> {
+    let code_id = code_id_from_arc(code);
+    let instructions = lower_code_to_templates(code)?;
+    let compiled = compiler.compile(code.register_count, &instructions)?;
+    Ok(CompiledEntry::from_executable_buffer(code_id, compiled.code).with_tier(1))
+}
+
+/// Compile a code object into a Tier 2 cache entry.
+pub(crate) fn compile_tier2_entry(code: &Arc<CodeObject>) -> Result<CompiledEntry, String> {
+    let code_id = code_id_from_arc(code);
+
+    // Stage 1: Convert bytecode to Sea-of-Nodes IR
+    let builder = GraphBuilder::new(code.register_count as usize, code.arg_count as usize);
+    let translator = BytecodeTranslator::new(builder, code);
+    let mut graph = translator
+        .translate()
+        .map_err(|e| format!("Tier 2 bytecode translation failed: {}", e))?;
+
+    // Stage 2: Run optimization pipeline
+    let mut pipeline = OptPipeline::new();
+    let _stats = pipeline.run(&mut graph);
+
+    // Stage 3: Liveness analysis
+    let liveness = LivenessAnalysis::analyze(&graph);
+    let intervals = liveness.into_intervals();
+
+    // Stage 4: Register allocation
+    let allocator = LinearScanAllocator::new(AllocatorConfig::default());
+    let (alloc_map, _alloc_stats) = allocator.allocate(intervals);
+
+    // Stage 5: Instruction selection
+    let mfunc = InstructionSelector::select(&graph, &alloc_map);
+
+    // Stage 6: Code emission
+    let compiled =
+        CodeEmitter::emit(&mfunc).map_err(|e| format!("Tier 2 code emission failed: {}", e))?;
+
+    Ok(
+        CompiledEntry::from_executable_buffer(code_id, compiled.code)
+            .with_tier(2)
+            .with_return_abi(ReturnAbi::EncodedExitReason),
+    )
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -468,6 +481,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.tier1_threshold, 1_000);
         assert_eq!(config.tier2_threshold, 10_000);
+        assert_eq!(config.max_code_size, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -476,6 +490,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.tier1_threshold, 10);
         assert!(!config.background_compilation);
+        assert_eq!(config.max_code_size, 1024 * 1024);
     }
 
     #[test]
@@ -496,5 +511,24 @@ mod tests {
     fn test_compilation_state() {
         let state = CompilationState::Interpreted;
         assert_eq!(state, CompilationState::Interpreted);
+    }
+
+    #[test]
+    fn test_compile_tier2_sets_tier_and_encoded_abi() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+
+        let mut bridge = JitBridge::new(BridgeConfig::for_testing());
+        let mut code = CodeObject::new("tier2_test", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![
+            Instruction::op_d(Opcode::LoadNone, Register::new(0)),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+        let code = Arc::new(code);
+
+        let entry = bridge.compile_tier2(&code).unwrap();
+        assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
     }
 }

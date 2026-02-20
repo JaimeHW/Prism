@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use prism_compiler::bytecode::CodeObject;
-use prism_jit::runtime::{CodeCache, CompiledEntry};
+use prism_jit::runtime::CompiledEntry;
 
 use crate::error::RuntimeError;
 use crate::frame::Frame;
@@ -97,6 +97,7 @@ impl JitConfig {
             background_compilation: self.background_compilation,
             enable_osr: self.enable_osr,
             max_queue_size: 64,
+            max_code_size: self.max_code_size,
         }
     }
 }
@@ -164,9 +165,6 @@ impl JitStats {
 pub struct JitContext {
     /// JIT bridge for compilation coordination.
     bridge: JitBridge,
-    /// Code cache for compiled code lookup (shared with bridge).
-    #[allow(dead_code)]
-    code_cache: Arc<CodeCache>,
     /// Configuration.
     config: JitConfig,
     /// Execution statistics.
@@ -179,12 +177,10 @@ pub struct JitContext {
 impl JitContext {
     /// Create a new JIT context with the given configuration.
     pub fn new(config: JitConfig) -> Self {
-        let code_cache = Arc::new(CodeCache::new(config.max_code_size));
         let bridge = JitBridge::new(config.to_bridge_config());
 
         Self {
             bridge,
-            code_cache,
             config,
             stats: JitStats::default(),
             frame_state: JitFrameState::default(),
@@ -334,10 +330,7 @@ impl JitContext {
         if self.config.eager_compilation || !self.config.background_compilation {
             // Synchronous compilation - dispatch based on tier
             let result = if tier >= 2 {
-                // Tier 2 remains correctness-gated until full value-tag/ABI
-                // parity is guaranteed across the optimizing pipeline.
-                // Keep execution on the validated synchronous tier.
-                self.bridge.compile_sync(code)
+                self.bridge.compile_tier2(code)
             } else {
                 self.bridge.compile_sync(code)
             };
@@ -499,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_config_to_bridge_config_propagates_max_code_size() {
+        let config = JitConfig {
+            max_code_size: 2 * 1024 * 1024,
+            ..JitConfig::for_testing()
+        };
+        let bridge = config.to_bridge_config();
+        assert_eq!(bridge.max_code_size, 2 * 1024 * 1024);
+    }
+
+    #[test]
     fn test_jit_context_creation() {
         let ctx = JitContext::with_defaults();
         assert!(ctx.is_enabled());
@@ -569,5 +572,28 @@ mod tests {
             profiler.record_call(code_id);
         }
         assert_eq!(ctx.check_tier_up(&profiler, code_id), TierUpDecision::Tier2);
+    }
+
+    #[test]
+    fn test_handle_tier_up_tier2_compiles_tier2_in_sync_mode() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_jit::runtime::ReturnAbi;
+
+        let mut ctx = JitContext::for_testing();
+        let mut code = CodeObject::new("jit_ctx_tier2", "<test>");
+        code.register_count = 1;
+        code.instructions = vec![
+            Instruction::op_d(Opcode::LoadNone, Register::new(0)),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let code = Arc::new(code);
+        let code_id = Arc::as_ptr(&code) as u64;
+
+        assert!(ctx.handle_tier_up(&code, TierUpDecision::Tier2));
+        let entry = ctx.lookup(code_id).expect("tier2 entry should be cached");
+        assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
     }
 }
