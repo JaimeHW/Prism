@@ -267,7 +267,12 @@ impl<'a> BytecodeTranslator<'a> {
         Ok(())
     }
 
-    fn dispatch_object_op(&mut self, op: Opcode, inst: Instruction, offset: u32) -> Result<(), String> {
+    fn dispatch_object_op(
+        &mut self,
+        op: Opcode,
+        inst: Instruction,
+        offset: u32,
+    ) -> Result<(), String> {
         match op {
             Opcode::GetAttr => {
                 let obj = self.read_register(inst.src1(), offset, op)?;
@@ -340,7 +345,12 @@ impl<'a> BytecodeTranslator<'a> {
         Ok(())
     }
 
-    fn dispatch_call_op(&mut self, op: Opcode, inst: Instruction, offset: u32) -> Result<(), String> {
+    fn dispatch_call_op(
+        &mut self,
+        op: Opcode,
+        inst: Instruction,
+        offset: u32,
+    ) -> Result<(), String> {
         match op {
             Opcode::Call => {
                 let func = self.read_register(inst.src1(), offset, op)?;
@@ -355,7 +365,39 @@ impl<'a> BytecodeTranslator<'a> {
                 self.set_register(inst.dst(), res);
             }
             Opcode::CallMethod => {
-                // TODO: Determine CallMethod encoding.
+                // CallMethod encoding:
+                // - src1: method register (loaded by LoadMethod)
+                // - src1+1: implicit self slot (or None marker for unbound)
+                // - src2: explicit argument count
+                // - src1+2..: explicit arguments
+                let method_reg = inst.src1().index();
+                let argc = inst.src2().index() as u16;
+
+                let self_reg_idx = method_reg as u16 + 1;
+                if self_reg_idx > u8::MAX as u16 {
+                    return Err(format!(
+                        "CallMethod self register overflow at instruction offset {} (base r{})",
+                        offset, method_reg
+                    ));
+                }
+
+                let mut args = Vec::with_capacity(argc as usize + 1);
+                args.push(self.read_register(Register(self_reg_idx as u8), offset, op)?);
+
+                for i in 0..argc {
+                    let arg_reg_idx = method_reg as u16 + 2 + i;
+                    if arg_reg_idx > u8::MAX as u16 {
+                        return Err(format!(
+                            "CallMethod argument register overflow at instruction offset {} (base r{}, arg index {})",
+                            offset, method_reg, i
+                        ));
+                    }
+                    args.push(self.read_register(Register(arg_reg_idx as u8), offset, op)?);
+                }
+
+                let func = self.read_register(inst.src1(), offset, op)?;
+                let res = self.builder.call(func, &args);
+                self.set_register(inst.dst(), res);
             }
             _ => {}
         }
@@ -366,7 +408,7 @@ impl<'a> BytecodeTranslator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::operators::{ArithOp, Operator};
+    use crate::ir::operators::{ArithOp, CallKind, Operator};
     use prism_compiler::bytecode::Register;
 
     #[test]
@@ -476,7 +518,12 @@ mod tests {
         let mut code = CodeObject::new("uninitialized_read", "<test>");
         code.register_count = 3;
         code.instructions = vec![
-            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_dss(
+                Opcode::Add,
+                Register::new(2),
+                Register::new(0),
+                Register::new(1),
+            ),
             Instruction::op_d(Opcode::Return, Register::new(2)),
         ]
         .into_boxed_slice();
@@ -494,14 +541,21 @@ mod tests {
         code.register_count = 2;
         code.arg_count = 2;
         code.instructions = vec![
-            Instruction::op_dss(Opcode::Add, Register::new(0), Register::new(0), Register::new(1)),
+            Instruction::op_dss(
+                Opcode::Add,
+                Register::new(0),
+                Register::new(0),
+                Register::new(1),
+            ),
             Instruction::op_d(Opcode::Return, Register::new(0)),
         ]
         .into_boxed_slice();
 
         let builder = GraphBuilder::new(2, 2);
         let translator = BytecodeTranslator::new(builder, &code);
-        let graph = translator.translate().expect("argument registers should be seeded");
+        let graph = translator
+            .translate()
+            .expect("argument registers should be seeded");
 
         let mut found_arg_add = false;
         for (_, node) in graph.iter() {
@@ -515,6 +569,63 @@ mod tests {
             }
         }
 
-        assert!(found_arg_add, "expected translated add node using parameter inputs");
+        assert!(
+            found_arg_add,
+            "expected translated add node using parameter inputs"
+        );
+    }
+
+    #[test]
+    fn test_translate_call_method_uses_method_self_and_explicit_args() {
+        let mut code = CodeObject::new("call_method", "<test>");
+        code.register_count = 4;
+        code.arg_count = 4; // r0..r3 seeded as parameters
+        code.instructions = vec![
+            // r0 = r1(r2, r3)
+            Instruction::new(Opcode::CallMethod, 0, 1, 1),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(4, 4);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let graph = translator
+            .translate()
+            .expect("call method translation should succeed");
+
+        let mut call_verified = false;
+        for (_, node) in graph.iter() {
+            if let Operator::Call(CallKind::Direct) = node.op {
+                assert_eq!(node.inputs.len(), 3);
+                let func_op = graph.node(node.inputs.get(0).unwrap()).op;
+                let self_op = graph.node(node.inputs.get(1).unwrap()).op;
+                let arg0_op = graph.node(node.inputs.get(2).unwrap()).op;
+                assert!(matches!(func_op, Operator::Parameter(1)));
+                assert!(matches!(self_op, Operator::Parameter(2)));
+                assert!(matches!(arg0_op, Operator::Parameter(3)));
+                call_verified = true;
+                break;
+            }
+        }
+
+        assert!(call_verified, "expected translated CallMethod call node");
+    }
+
+    #[test]
+    fn test_translate_call_method_rejects_uninitialized_self_slot() {
+        let mut code = CodeObject::new("call_method_uninit_self", "<test>");
+        code.register_count = 4;
+        code.arg_count = 2; // r2 (self slot) is uninitialized
+        code.instructions = vec![
+            Instruction::new(Opcode::CallMethod, 0, 1, 0),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(4, 2);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("uninitialized register"));
+        assert!(err.contains("r2"));
     }
 }
