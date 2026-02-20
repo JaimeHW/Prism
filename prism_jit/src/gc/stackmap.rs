@@ -183,7 +183,7 @@ impl ExactSizeIterator for LiveBitmapIter<u64> {}
 /// Stack map for an entire compiled function.
 ///
 /// Contains sorted safepoints for O(log n) lookup by code offset.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StackMap {
     /// Start address of the compiled code.
     pub code_start: usize,
@@ -345,6 +345,7 @@ impl StackMapBuilder {
 ///
 /// Uses a sorted BTreeMap for O(log n) lookup by code address.
 /// Thread-safe with RwLock for concurrent access.
+#[derive(Debug)]
 pub struct StackMapRegistry {
     /// Maps code start address → stack map.
     /// Using BTreeMap for ordered iteration and range queries.

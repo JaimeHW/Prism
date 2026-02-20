@@ -724,6 +724,8 @@ pub struct MachineFunction {
     pub spill_slots: u32,
     /// Conservative GC root locations available at every safepoint.
     pub gc_roots: MachineGcRoots,
+    /// Bytecode offset for each IR node index (for safepoint/deopt metadata).
+    pub node_bc_offsets: Vec<Option<u32>>,
 }
 
 impl MachineFunction {
@@ -736,6 +738,7 @@ impl MachineFunction {
             frame_size: 0,
             spill_slots: 0,
             gc_roots: MachineGcRoots::default(),
+            node_bc_offsets: Vec::new(),
         }
     }
 
@@ -811,9 +814,11 @@ impl<'a> InstructionSelector<'a> {
         let spill_frame_size = alloc_map.spill_slot_count().saturating_mul(8);
         let mut node_to_vreg = HashMap::new();
         let mut next_vreg = 0u32;
+        let mut node_bc_offsets = vec![None; graph.len()];
 
         // Pre-seed vreg mapping to match liveness numbering exactly.
         for (id, node) in graph.iter() {
+            node_bc_offsets[id.as_usize()] = Some(node.bc_offset);
             if node.is_dead() || !Self::node_produces_value(node.op) {
                 continue;
             }
@@ -826,6 +831,7 @@ impl<'a> InstructionSelector<'a> {
             alloc_map,
             mfunc: MachineFunction {
                 frame_size: spill_frame_size,
+                node_bc_offsets,
                 ..MachineFunction::new()
             },
             node_to_vreg,
@@ -891,13 +897,28 @@ impl<'a> InstructionSelector<'a> {
         }
 
         let mut scheduled = Vec::with_capacity(self.graph.len());
+        let mut rpo_visited = vec![false; buckets.len()];
         for block in cfg.rpo.iter().copied() {
             if block.is_valid() && block.as_usize() < buckets.len() {
-                scheduled.extend(buckets[block.as_usize()].iter().copied());
+                let index = block.as_usize();
+                if !rpo_visited[index] {
+                    scheduled.extend(buckets[index].iter().copied());
+                    rpo_visited[index] = true;
+                }
             }
         }
 
-        // Preserve deterministic lowering for any nodes outside the reachable CFG.
+        // Preserve deterministic lowering for blocks that were not reachable via
+        // RPO (e.g. when CFG edges are hidden behind non-block control tokens such
+        // as If projections). Dropping these blocks can leave branch target labels
+        // unbound at emission time.
+        for (index, nodes) in buckets.iter().enumerate() {
+            if !rpo_visited[index] {
+                scheduled.extend(nodes.iter().copied());
+            }
+        }
+
+        // Preserve deterministic lowering for any nodes outside discovered blocks.
         scheduled.extend(overflow);
         scheduled
     }
@@ -2187,6 +2208,60 @@ mod tests {
                 .iter()
                 .any(|inst| inst.op == MachineOp::Ret && inst.origin == Some(false_ret))
         );
+    }
+
+    #[test]
+    fn test_instruction_selection_materializes_labels_for_projection_region_targets() {
+        let mut graph = Graph::new();
+        let cond = graph.add_node(Operator::ConstBool(true), InputList::Single(graph.start));
+        let if_node = graph.add_node(
+            Operator::Control(ControlOp::If),
+            InputList::from_slice(&[graph.start, cond]),
+        );
+        let true_proj = graph.add_node(Operator::Projection(0), InputList::Single(if_node));
+        let false_proj = graph.add_node(Operator::Projection(1), InputList::Single(if_node));
+        let merge = graph.add_node(
+            Operator::Control(ControlOp::Region),
+            InputList::from_slice(&[true_proj, false_proj]),
+        );
+        let ret_val = graph.add_node(Operator::ConstInt(1), InputList::Empty);
+        let _ret = graph.add_node(
+            Operator::Control(ControlOp::Return),
+            InputList::from_slice(&[merge, ret_val]),
+        );
+
+        let alloc_map = AllocationMap::new();
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("region targets fed by projections should still be scheduled and labeled");
+
+        let mut referenced = std::collections::BTreeSet::new();
+        let mut defined = std::collections::BTreeSet::new();
+        for inst in &mfunc.insts {
+            match inst.op {
+                MachineOp::Jmp | MachineOp::Jcc => {
+                    if let MachineOperand::Label(id) = inst.dst {
+                        referenced.insert(id);
+                    }
+                }
+                MachineOp::Label => {
+                    if let MachineOperand::Label(id) = inst.dst {
+                        defined.insert(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            !referenced.is_empty(),
+            "test must generate at least one branch target label"
+        );
+        for label in referenced {
+            assert!(
+                defined.contains(&label),
+                "branch references label {label}, but no LABEL pseudo-instruction defines it"
+            );
+        }
     }
 
     #[test]

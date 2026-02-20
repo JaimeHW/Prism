@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::gc::{StackMap, StackMapRegistry};
+use crate::gc::stackmap::StackMapRef;
 use crate::tier2::osr::OsrCompiledCode;
 
 // =============================================================================
@@ -39,6 +41,10 @@ pub struct CompiledEntry {
     return_abi: ReturnAbi,
     /// Number of times this code has been called.
     call_count: u64,
+    /// Precise GC stack map metadata for this code blob.
+    stack_map: Option<Arc<StackMap>>,
+    /// Deoptimization sites sorted by machine-code offset.
+    deopt_sites: Box<[DeoptSite]>,
 }
 
 /// Return ABI for compiled code entry points.
@@ -48,6 +54,15 @@ pub enum ReturnAbi {
     RawValueBits,
     /// Return encoded exit reason/data in RAX.
     EncodedExitReason,
+}
+
+/// Deoptimization site metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeoptSite {
+    /// Machine-code offset where deoptimization can occur.
+    pub code_offset: u32,
+    /// Bytecode offset to resume interpretation at.
+    pub bc_offset: u32,
 }
 
 impl CompiledEntry {
@@ -68,6 +83,8 @@ impl CompiledEntry {
             tier: 1,
             return_abi: ReturnAbi::RawValueBits,
             call_count: 0,
+            stack_map: None,
+            deopt_sites: Box::new([]),
         }
     }
 
@@ -88,6 +105,8 @@ impl CompiledEntry {
             tier: 1,
             return_abi: ReturnAbi::RawValueBits,
             call_count: 0,
+            stack_map: None,
+            deopt_sites: Box::new([]),
         }
     }
 
@@ -112,6 +131,20 @@ impl CompiledEntry {
     /// Set return ABI.
     pub fn with_return_abi(mut self, return_abi: ReturnAbi) -> Self {
         self.return_abi = return_abi;
+        self
+    }
+
+    /// Attach stack map metadata.
+    pub fn with_stack_map(mut self, stack_map: StackMap) -> Self {
+        self.stack_map = Some(Arc::new(stack_map));
+        self
+    }
+
+    /// Attach deoptimization sites.
+    pub fn with_deopt_sites(mut self, mut sites: Vec<DeoptSite>) -> Self {
+        sites.sort_by_key(|site| site.code_offset);
+        sites.dedup_by(|a, b| a.code_offset == b.code_offset && a.bc_offset == b.bc_offset);
+        self.deopt_sites = sites.into_boxed_slice();
         self
     }
 
@@ -149,6 +182,40 @@ impl CompiledEntry {
     #[inline]
     pub fn osr_entries(&self) -> Option<&Arc<OsrCompiledCode>> {
         self.osr_entries.as_ref()
+    }
+
+    /// Get stack map metadata.
+    #[inline]
+    pub fn stack_map(&self) -> Option<&Arc<StackMap>> {
+        self.stack_map.as_ref()
+    }
+
+    /// Get deoptimization sites.
+    #[inline]
+    pub fn deopt_sites(&self) -> &[DeoptSite] {
+        &self.deopt_sites
+    }
+
+    /// Lookup the nearest deopt resume offset by machine code offset.
+    #[inline]
+    pub fn lookup_deopt_bc_offset(&self, code_offset: u32) -> Option<u32> {
+        if self.deopt_sites.is_empty() {
+            return None;
+        }
+        match self
+            .deopt_sites
+            .binary_search_by_key(&code_offset, |site| site.code_offset)
+        {
+            Ok(idx) => Some(self.deopt_sites[idx].bc_offset),
+            Err(0) => None,
+            Err(idx) => Some(self.deopt_sites[idx - 1].bc_offset),
+        }
+    }
+
+    /// Lookup deopt resume offset by deopt-site index.
+    #[inline]
+    pub fn lookup_deopt_bc_offset_by_index(&self, index: u32) -> Option<u32> {
+        self.deopt_sites.get(index as usize).map(|site| site.bc_offset)
     }
 
     /// Increment call count and return the new value.
@@ -191,6 +258,8 @@ pub struct CodeCache {
     total_size: RwLock<usize>,
     /// Maximum allowed size.
     max_size: usize,
+    /// Stack map registry synchronized with live cache entries.
+    stack_maps: StackMapRegistry,
     /// Lookup hit counter.
     hits: AtomicU64,
     /// Lookup miss counter.
@@ -208,6 +277,7 @@ impl CodeCache {
             entries: RwLock::new(HashMap::new()),
             total_size: RwLock::new(0),
             max_size,
+            stack_maps: StackMapRegistry::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             insertions: AtomicU64::new(0),
@@ -261,8 +331,15 @@ impl CodeCache {
         // Update size tracking
         if let Some(ref prev) = old {
             *total = total.saturating_sub(prev.code_size);
+            if let Some(map) = prev.stack_map() {
+                self.stack_maps.remove(map.code_start);
+            }
         }
         *total += code_size;
+
+        if let Some(map) = entries.get(&code_id).and_then(|entry| entry.stack_map()) {
+            self.stack_maps.insert((**map).clone());
+        }
 
         // Update stats
         self.insertions.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +355,9 @@ impl CodeCache {
         if let Some(ref entry) = removed {
             let mut total = self.total_size.write().unwrap();
             *total -= entry.code_size;
+            if let Some(map) = entry.stack_map() {
+                self.stack_maps.remove(map.code_start);
+            }
         }
 
         removed
@@ -328,11 +408,24 @@ impl CodeCache {
         let mut entries = self.entries.write().unwrap();
         entries.clear();
         *self.total_size.write().unwrap() = 0;
+        self.stack_maps.clear();
     }
 
     /// Iterate over all entries (for debugging/profiling).
     pub fn entries(&self) -> Vec<Arc<CompiledEntry>> {
         self.entries.read().unwrap().values().cloned().collect()
+    }
+
+    /// Lookup stack map metadata by instruction pointer.
+    #[inline]
+    pub fn lookup_stack_map(&self, ip: usize) -> Option<StackMapRef> {
+        self.stack_maps.lookup(ip)
+    }
+
+    /// Access the synchronized stack map registry.
+    #[inline]
+    pub fn stack_map_registry(&self) -> &StackMapRegistry {
+        &self.stack_maps
     }
 }
 
@@ -385,6 +478,8 @@ mod tests {
         assert_eq!(entry.code_size(), 100);
         assert_eq!(entry.tier(), 1);
         assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
+        assert!(entry.stack_map().is_none());
+        assert!(entry.deopt_sites().is_empty());
     }
 
     #[test]
@@ -392,10 +487,23 @@ mod tests {
         let entry = CompiledEntry::new(1, dummy_code_ptr(), 100)
             .with_entry_offset(16)
             .with_tier(2)
-            .with_return_abi(ReturnAbi::EncodedExitReason);
+            .with_return_abi(ReturnAbi::EncodedExitReason)
+            .with_deopt_sites(vec![
+                DeoptSite {
+                    code_offset: 12,
+                    bc_offset: 3,
+                },
+                DeoptSite {
+                    code_offset: 24,
+                    bc_offset: 8,
+                },
+            ]);
         assert_eq!(entry.tier(), 2);
         assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
         assert_eq!(entry.entry_point() as usize, dummy_code_ptr() as usize + 16);
+        assert_eq!(entry.lookup_deopt_bc_offset(12), Some(3));
+        assert_eq!(entry.lookup_deopt_bc_offset(20), Some(3));
+        assert_eq!(entry.lookup_deopt_bc_offset_by_index(1), Some(8));
     }
 
     #[test]
@@ -479,5 +587,31 @@ mod tests {
         // Out of range
         assert!(cache.find_by_ip(0x10000).is_none());
         assert!(cache.find_by_ip(0x20100).is_none());
+    }
+
+    #[test]
+    fn test_code_cache_tracks_stack_map_registry_lifecycle() {
+        use crate::gc::SafePoint;
+
+        let cache = CodeCache::new(1024 * 1024);
+        let code_start = dummy_code_ptr() as usize;
+        let map = StackMap::new(
+            code_start,
+            100,
+            48,
+            vec![SafePoint::new(0x10, 0b0010, 0b0101)],
+        );
+
+        cache.insert(CompiledEntry::new(99, dummy_code_ptr(), 100).with_stack_map(map));
+
+        let lookup = cache
+            .lookup_stack_map(code_start + 0x10)
+            .expect("stack map lookup should resolve registered entry");
+        assert_eq!(lookup.frame_size, 48);
+        assert_eq!(lookup.safepoint.register_bitmap, 0b0010);
+        assert_eq!(lookup.safepoint.stack_bitmap, 0b0101);
+
+        cache.remove(99);
+        assert!(cache.lookup_stack_map(code_start + 0x10).is_none());
     }
 }

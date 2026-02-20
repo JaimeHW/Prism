@@ -19,6 +19,7 @@ use super::safepoint_placement::{SafepointAnalyzer, SafepointEmitter};
 use crate::backend::x64::encoder::Condition;
 use crate::backend::x64::registers::{CallingConvention, Gpr, MemOperand, Xmm};
 use crate::backend::x64::{Assembler, ExecutableBuffer, Label};
+use crate::ir::node::NodeId;
 use crate::regalloc::PReg;
 use std::collections::{HashMap, HashSet};
 
@@ -59,6 +60,8 @@ impl CondCode {
 pub struct StackMapEntry {
     /// Offset in code where this safepoint occurs.
     pub code_offset: u32,
+    /// Bytecode offset associated with this safepoint (if known).
+    pub bc_offset: Option<u32>,
     /// Stack slots that contain object pointers.
     pub gc_slots: Vec<i32>,
     /// Registers that contain object pointers.
@@ -205,7 +208,7 @@ impl<'a> CodeEmitter<'a> {
 
             // Emit safepoint poll if needed after this instruction
             if self.poll_indices.contains(&i) {
-                self.emit_safepoint_poll();
+                self.emit_safepoint_poll(self.mfunc.insts[i].origin);
             }
         }
 
@@ -452,7 +455,7 @@ impl<'a> CodeEmitter<'a> {
 
             MachineOp::Call => {
                 // Record safepoint for GC
-                self.record_safepoint();
+                self.record_safepoint(inst.origin);
 
                 if let MachineOperand::Imm(addr) = inst.dst {
                     // Call to absolute address
@@ -692,11 +695,20 @@ impl<'a> CodeEmitter<'a> {
         }
     }
 
+    /// Resolve bytecode offset metadata for an instruction origin.
+    fn bc_offset_for_origin(&self, origin: Option<NodeId>) -> Option<u32> {
+        origin
+            .and_then(|node_id| self.mfunc.node_bc_offsets.get(node_id.as_usize()))
+            .copied()
+            .flatten()
+    }
+
     /// Record a safepoint for GC.
-    fn record_safepoint(&mut self) {
+    fn record_safepoint(&mut self, origin: Option<NodeId>) {
         let offset = self.asm.offset() as u32;
         self.stack_maps.push(StackMapEntry {
             code_offset: offset,
+            bc_offset: self.bc_offset_for_origin(origin),
             gc_slots: self.mfunc.gc_roots.stack_slots.clone(),
             gc_regs: self.mfunc.gc_roots.regs.clone(),
         });
@@ -707,7 +719,7 @@ impl<'a> CodeEmitter<'a> {
     /// This emits `test [r15], al` which is a 3-byte memory read.
     /// When the safepoint page is protected, this will fault and trigger
     /// the signal/exception handler which will stop the thread for GC.
-    fn emit_safepoint_poll(&mut self) {
+    fn emit_safepoint_poll(&mut self, origin: Option<NodeId>) {
         // test byte ptr [r15], al
         // Encoding: 41 84 07
         //   41 = REX.B prefix (R15 is an extended register)
@@ -716,7 +728,7 @@ impl<'a> CodeEmitter<'a> {
         self.asm.emit_bytes(&[0x41, 0x84, 0x07]);
 
         // Record this as a safepoint for stack map generation
-        self.record_safepoint();
+        self.record_safepoint(origin);
     }
 
     /// Finalize and produce executable code.
@@ -805,9 +817,11 @@ mod tests {
     fn test_stack_map_entry() {
         let entry = StackMapEntry {
             code_offset: 0x10,
+            bc_offset: Some(12),
             gc_slots: vec![-8, -16],
             gc_regs: vec![Gpr::Rax, Gpr::Rbx],
         };
+        assert_eq!(entry.bc_offset, Some(12));
         assert_eq!(entry.gc_slots.len(), 2);
         assert_eq!(entry.gc_regs.len(), 2);
     }
@@ -826,8 +840,26 @@ mod tests {
 
         let code = CodeEmitter::emit(&mfunc).expect("emission should succeed");
         assert_eq!(code.stack_maps.len(), 1);
+        assert_eq!(code.stack_maps[0].bc_offset, None);
         assert_eq!(code.stack_maps[0].gc_slots, vec![-24, -8]);
         assert_eq!(code.stack_maps[0].gc_regs, vec![Gpr::Rbx, Gpr::R12]);
+    }
+
+    #[test]
+    fn test_call_safepoint_records_origin_bc_offset() {
+        use crate::ir::node::NodeId;
+
+        let mut mfunc = MachineFunction::new();
+        mfunc.node_bc_offsets = vec![None, Some(37)];
+        mfunc.push(
+            MachineInst::new(MachineOp::Call, MachineOperand::Imm(0x1234), MachineOperand::None)
+                .with_origin(NodeId::new(1)),
+        );
+        mfunc.push(MachineInst::nullary(MachineOp::Ret));
+
+        let code = CodeEmitter::emit(&mfunc).expect("emission should succeed");
+        assert_eq!(code.stack_maps.len(), 1);
+        assert_eq!(code.stack_maps[0].bc_offset, Some(37));
     }
 
     #[test]
@@ -853,7 +885,9 @@ mod tests {
         assert!(code
             .stack_maps
             .iter()
-            .all(|entry| entry.gc_slots == vec![-32] && entry.gc_regs == vec![Gpr::R13]));
+            .all(|entry| {
+                entry.gc_slots == vec![-32] && entry.gc_regs == vec![Gpr::R13] && entry.bc_offset.is_none()
+            }));
     }
 
     #[test]
