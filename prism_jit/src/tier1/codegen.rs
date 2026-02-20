@@ -61,21 +61,26 @@ impl CompiledFunction {
 
 /// Main entry point for template JIT compilation.
 pub struct TemplateCompiler {
-    /// Address of the runtime deopt handler.
-    deopt_handler: u64,
+    /// Reserved for ABI compatibility while deopt exits are encoded in RAX.
+    _deopt_handler: u64,
 }
 
 impl TemplateCompiler {
     /// Create a new template compiler.
     pub fn new(deopt_handler: u64) -> Self {
-        TemplateCompiler { deopt_handler }
+        TemplateCompiler {
+            _deopt_handler: deopt_handler,
+        }
     }
 
-    /// Create a compiler with a dummy deopt handler (for testing).
+    /// Create a compiler for runtime execution paths.
+    pub fn new_runtime() -> Self {
+        Self::new(0)
+    }
+
+    /// Create a compiler for testing.
     pub fn new_for_testing() -> Self {
-        // Use a placeholder address - actual deopts will crash but
-        // we can still test code generation
-        Self::new(0xDEAD_BEEF_DEAD_BEEF)
+        Self::new_runtime()
     }
 
     /// Compile a function.
@@ -161,7 +166,7 @@ impl TemplateCompiler {
         self.emit_epilogue(&mut asm, &frame);
 
         // Emit deopt stubs
-        let deopt_info = deopt_gen.emit_stubs(&mut asm, &frame, self.deopt_handler);
+        let deopt_info = deopt_gen.emit_stubs(&mut asm, &frame);
 
         // Finalize - now we own asm
         let code = asm.finalize_executable()?;

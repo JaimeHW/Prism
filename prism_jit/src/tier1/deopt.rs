@@ -13,8 +13,9 @@
 //! 4. Reconstruct interpreter frame
 //! 5. Resume interpreter execution
 
-use super::frame::{FrameLayout, RegisterAssignment};
+use super::frame::FrameLayout;
 use crate::backend::x64::{Assembler, Gpr, Label};
+use crate::runtime::ExitReason;
 
 // =============================================================================
 // Deoptimization Reason
@@ -140,9 +141,7 @@ impl DeoptStubGenerator {
         self,
         asm: &mut Assembler,
         frame: &FrameLayout,
-        deopt_handler_addr: u64,
     ) -> Vec<DeoptInfo> {
-        let regs = RegisterAssignment::host();
         let mut deopt_infos = Vec::with_capacity(self.pending_deopts.len());
 
         for (idx, deopt) in self.pending_deopts.into_iter().enumerate() {
@@ -158,36 +157,25 @@ impl DeoptStubGenerator {
                 idx as u16,
             ));
 
-            // Emit the stub:
-            // 1. Save volatile state
-            // 2. Set up deopt metadata
-            // 3. Call deopt handler
-            // 4. Handler doesn't return (restores to interpreter)
+            // Emit deopt return:
+            // 1. Encode deopt metadata in RAX as ExitReason::Deoptimize payload.
+            // 2. Restore the compiled frame (same as normal epilogue).
+            // 3. Return to VM dispatcher.
+            let encoded = encode_deopt_exit(deopt.bc_offset, deopt.reason);
+            asm.mov_ri64(Gpr::Rax, encoded as i64);
 
-            // Store bc_offset in first arg register
-            #[cfg(target_os = "windows")]
-            let arg_regs = (Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9);
-            #[cfg(not(target_os = "windows"))]
-            let arg_regs = (Gpr::Rdi, Gpr::Rsi, Gpr::Rdx, Gpr::Rcx);
+            let frame_size = frame.frame_size();
+            if frame_size > 0 {
+                asm.add_ri(Gpr::Rsp, frame_size);
+            }
+            asm.pop(Gpr::Rbp);
 
-            // arg0: context pointer (load from frame)
-            let ctx_slot = frame.context_slot();
-            asm.mov_rm(arg_regs.0, &ctx_slot);
+            let saved_regs: Vec<Gpr> = frame.saved_regs.iter().collect();
+            for reg in saved_regs.into_iter().rev() {
+                asm.pop(reg);
+            }
 
-            // arg1: bytecode offset
-            asm.mov_ri64(arg_regs.1, deopt.bc_offset as i64);
-
-            // arg2: deopt reason
-            asm.mov_ri64(arg_regs.2, deopt.reason as i64);
-
-            // arg3: stub index
-            asm.mov_ri64(arg_regs.3, idx as i64);
-
-            // Call the deopt handler (does not return)
-            asm.call_abs(deopt_handler_addr, regs.scratch1);
-
-            // Emit UD2 as a guard (should never be reached)
-            asm.ud2();
+            asm.ret();
         }
 
         deopt_infos
@@ -198,6 +186,17 @@ impl Default for DeoptStubGenerator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[inline]
+fn encode_deopt_exit(bc_offset: u32, reason: DeoptReason) -> u64 {
+    // VM decodes:
+    // - low 8 bits: ExitReason
+    // - next 8 bits: DeoptReason
+    // - next 24 bits: bytecode offset
+    debug_assert!(bc_offset <= 0x00FF_FFFF);
+    let payload = (((bc_offset as u64) & 0x00FF_FFFF) << 8) | (reason as u8 as u64);
+    (ExitReason::Deoptimize as u64) | (payload << 8)
 }
 
 // =============================================================================
@@ -321,6 +320,20 @@ mod tests {
         generator.register_deopt(label2, 84, DeoptReason::IntegerOverflow);
 
         assert_eq!(generator.deopt_count(), 2);
+
+        let frame = FrameLayout::minimal(2);
+        let infos = generator.emit_stubs(&mut asm, &frame);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].bc_offset, 42);
+        assert_eq!(infos[1].bc_offset, 84);
+    }
+
+    #[test]
+    fn test_encode_deopt_exit_layout() {
+        let encoded = encode_deopt_exit(0x123456, DeoptReason::InlineCacheMiss);
+        assert_eq!((encoded & 0xFF) as u8, ExitReason::Deoptimize as u8);
+        assert_eq!(((encoded >> 8) & 0xFF) as u8, DeoptReason::InlineCacheMiss as u8);
+        assert_eq!(((encoded >> 16) & 0x00FF_FFFF) as u32, 0x123456);
     }
 
     #[test]
