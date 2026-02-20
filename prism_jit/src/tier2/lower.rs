@@ -16,6 +16,7 @@
 
 use crate::backend::x64::registers::{Gpr, MemOperand, Xmm};
 use crate::backend::x64::simd::{Ymm, Zmm};
+use crate::ir::cfg::{BlockId, Cfg};
 use crate::ir::graph::Graph;
 use crate::ir::node::NodeId;
 use crate::ir::operators::{ArithOp, BitwiseOp, CmpOp, ControlOp, Operator};
@@ -698,6 +699,15 @@ impl MachineInst {
 // Machine Function
 // =============================================================================
 
+/// GC root metadata collected during instruction selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineGcRoots {
+    /// Stack slots containing boxed VM values.
+    pub stack_slots: Vec<i32>,
+    /// GPRs containing boxed VM values.
+    pub regs: Vec<Gpr>,
+}
+
 /// A function in machine code representation.
 #[derive(Debug)]
 pub struct MachineFunction {
@@ -712,6 +722,8 @@ pub struct MachineFunction {
     /// Number of spill slots used.
     #[allow(dead_code)]
     pub spill_slots: u32,
+    /// Conservative GC root locations available at every safepoint.
+    pub gc_roots: MachineGcRoots,
 }
 
 impl MachineFunction {
@@ -723,6 +735,7 @@ impl MachineFunction {
             label_map: HashMap::new(),
             frame_size: 0,
             spill_slots: 0,
+            gc_roots: MachineGcRoots::default(),
         }
     }
 
@@ -834,14 +847,168 @@ impl<'a> InstructionSelector<'a> {
     fn select_all(&mut self) -> Result<(), String> {
         self.materialize_parameters()?;
 
-        // Process nodes in order (simplified - real impl uses RPO)
+        // Schedule nodes by CFG RPO so block labels and branches are emitted
+        // in a deterministic control-flow order.
+        let schedule = self.compute_node_schedule();
+        for id in schedule {
+            self.select_node(id)?;
+        }
+        self.finalize_gc_roots();
+        Ok(())
+    }
+
+    /// Compute a CFG-guided node order for lowering.
+    fn compute_node_schedule(&self) -> Vec<NodeId> {
+        let cfg = Cfg::build(self.graph);
+        if cfg.rpo.is_empty() {
+            return self
+                .graph
+                .iter()
+                .filter_map(|(id, node)| (!node.is_dead()).then_some(id))
+                .collect();
+        }
+
+        let node_blocks = self.compute_node_blocks(&cfg);
+        let default_block = if cfg.entry.is_valid() {
+            cfg.entry
+        } else {
+            BlockId::new(0)
+        };
+
+        let mut buckets: Vec<Vec<NodeId>> = vec![Vec::new(); cfg.len()];
+        let mut overflow = Vec::new();
+
         for (id, node) in self.graph.iter() {
             if node.is_dead() {
                 continue;
             }
-            self.select_node(id)?;
+            let block = node_blocks[id.as_usize()].unwrap_or(default_block);
+            if block.is_valid() && block.as_usize() < buckets.len() {
+                buckets[block.as_usize()].push(id);
+            } else {
+                overflow.push(id);
+            }
         }
-        Ok(())
+
+        let mut scheduled = Vec::with_capacity(self.graph.len());
+        for block in cfg.rpo.iter().copied() {
+            if block.is_valid() && block.as_usize() < buckets.len() {
+                scheduled.extend(buckets[block.as_usize()].iter().copied());
+            }
+        }
+
+        // Preserve deterministic lowering for any nodes outside the reachable CFG.
+        scheduled.extend(overflow);
+        scheduled
+    }
+
+    /// Assign each node to a CFG block for scheduling.
+    fn compute_node_blocks(&self, cfg: &Cfg) -> Vec<Option<BlockId>> {
+        let mut node_blocks = vec![None; self.graph.len()];
+
+        // Seed block starts (Start/Region/Loop/End).
+        for (block_id, block) in cfg.iter() {
+            node_blocks[block.region.as_usize()] = Some(block_id);
+        }
+
+        // Propagate block ownership through control/value edges.
+        let max_iters = self.graph.len().max(1);
+        for _ in 0..max_iters {
+            let mut changed = false;
+
+            for (id, node) in self.graph.iter() {
+                if node.is_dead() || node_blocks[id.as_usize()].is_some() {
+                    continue;
+                }
+
+                let mut assigned = node
+                    .control_input()
+                    .and_then(|ctrl| self.resolve_block_in_control_chain(ctrl, &node_blocks));
+
+                if assigned.is_none() {
+                    for input in node.inputs.iter() {
+                        if let Some(block) = node_blocks[input.as_usize()] {
+                            assigned = Some(block);
+                            break;
+                        }
+                    }
+                }
+
+                if assigned.is_none() {
+                    for &user in self.graph.uses(id) {
+                        if self.graph.node(user).is_dead() {
+                            continue;
+                        }
+                        if let Some(block) = node_blocks[user.as_usize()] {
+                            assigned = Some(block);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(block) = assigned {
+                    node_blocks[id.as_usize()] = Some(block);
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        if cfg.entry.is_valid() {
+            for (id, node) in self.graph.iter() {
+                if !node.is_dead() && node_blocks[id.as_usize()].is_none() {
+                    node_blocks[id.as_usize()] = Some(cfg.entry);
+                }
+            }
+        }
+
+        node_blocks
+    }
+
+    fn resolve_block_in_control_chain(
+        &self,
+        start: NodeId,
+        node_blocks: &[Option<BlockId>],
+    ) -> Option<BlockId> {
+        let mut current = Some(start);
+        let mut hops = 0usize;
+
+        while let Some(node_id) = current {
+            if let Some(block) = node_blocks[node_id.as_usize()] {
+                return Some(block);
+            }
+
+            if hops >= self.graph.len() {
+                break;
+            }
+            hops += 1;
+
+            current = self.graph.node(node_id).control_input();
+        }
+
+        None
+    }
+
+    fn finalize_gc_roots(&mut self) {
+        let mut roots = MachineGcRoots::default();
+
+        for &vreg in self.node_to_vreg.values() {
+            match self.alloc_map.get(vreg) {
+                Allocation::Register(PReg::Gpr(gpr)) => roots.regs.push(gpr),
+                Allocation::Spill(slot) => roots.stack_slots.push(slot.offset()),
+                _ => {}
+            }
+        }
+
+        roots.regs.sort_by_key(|gpr| gpr.encoding());
+        roots.regs.dedup();
+        roots.stack_slots.sort_unstable();
+        roots.stack_slots.dedup();
+
+        self.mfunc.gc_roots = roots;
     }
 
     /// Materialize parameter nodes from the VM frame into machine operands.
@@ -1127,58 +1294,207 @@ impl<'a> InstructionSelector<'a> {
             }
 
             ArithOp::TrueDiv | ArithOp::FloorDiv => {
-                // Division is complex: RDX:RAX / divisor
                 let lhs = self.required_input_operand(node_id, 0)?;
                 let rhs = self.required_input_operand(node_id, 1)?;
-                // Move dividend to RAX
-                self.mfunc.push(MachineInst::new(
-                    MachineOp::Mov,
-                    MachineOperand::gpr(Gpr::Rax),
-                    lhs,
-                ));
+                let rhs = self.prepare_divisor_operand(rhs, node_id)?;
 
-                // Sign extend to RDX:RAX
-                self.mfunc.push(MachineInst::nullary(MachineOp::Cqo));
-
-                // Divide
+                self.mfunc.push(
+                    MachineInst::new(MachineOp::Mov, MachineOperand::gpr(Gpr::Rax), lhs)
+                        .with_origin(node_id),
+                );
+                self.mfunc
+                    .push(MachineInst::nullary(MachineOp::Cqo).with_origin(node_id));
                 self.mfunc.push(
                     MachineInst::new(MachineOp::Idiv, MachineOperand::gpr(Gpr::Rax), rhs)
                         .with_origin(node_id),
                 );
 
-                // Move result from RAX to destination
+                if matches!(op, ArithOp::FloorDiv) {
+                    let done_label = self.mfunc.new_label();
+                    let rem_positive_label = self.mfunc.new_label();
+
+                    self.mfunc.push(
+                        MachineInst::binary(
+                            MachineOp::Cmp,
+                            MachineOperand::None,
+                            MachineOperand::gpr(Gpr::Rdx),
+                            MachineOperand::Imm(0),
+                        )
+                        .with_origin(node_id),
+                    );
+                    self.mfunc
+                        .push(MachineInst::jcc(CondCode::E, done_label).with_origin(node_id));
+
+                    self.mfunc.push(
+                        MachineInst::binary(
+                            MachineOp::Cmp,
+                            MachineOperand::None,
+                            MachineOperand::gpr(Gpr::Rdx),
+                            MachineOperand::Imm(0),
+                        )
+                        .with_origin(node_id),
+                    );
+                    self.mfunc.push(
+                        MachineInst::jcc(CondCode::G, rem_positive_label).with_origin(node_id),
+                    );
+
+                    // Remainder is negative: adjust only when divisor is positive.
+                    self.mfunc.push(
+                        MachineInst::binary(
+                            MachineOp::Cmp,
+                            MachineOperand::None,
+                            rhs,
+                            MachineOperand::Imm(0),
+                        )
+                        .with_origin(node_id),
+                    );
+                    self.mfunc
+                        .push(MachineInst::jcc(CondCode::L, done_label).with_origin(node_id));
+                    self.mfunc.push(
+                        MachineInst::binary(
+                            MachineOp::Sub,
+                            MachineOperand::gpr(Gpr::Rax),
+                            MachineOperand::gpr(Gpr::Rax),
+                            MachineOperand::Imm(1),
+                        )
+                        .with_origin(node_id),
+                    );
+                    self.mfunc.push(
+                        MachineInst::new(
+                            MachineOp::Jmp,
+                            MachineOperand::Label(done_label),
+                            MachineOperand::None,
+                        )
+                        .with_origin(node_id),
+                    );
+
+                    self.mfunc.add_label(rem_positive_label);
+                    // Remainder is positive: adjust only when divisor is negative.
+                    self.mfunc.push(
+                        MachineInst::binary(
+                            MachineOp::Cmp,
+                            MachineOperand::None,
+                            rhs,
+                            MachineOperand::Imm(0),
+                        )
+                        .with_origin(node_id),
+                    );
+                    self.mfunc
+                        .push(MachineInst::jcc(CondCode::G, done_label).with_origin(node_id));
+                    self.mfunc.push(
+                        MachineInst::binary(
+                            MachineOp::Sub,
+                            MachineOperand::gpr(Gpr::Rax),
+                            MachineOperand::gpr(Gpr::Rax),
+                            MachineOperand::Imm(1),
+                        )
+                        .with_origin(node_id),
+                    );
+
+                    self.mfunc.add_label(done_label);
+                }
+
                 if dst != MachineOperand::gpr(Gpr::Rax) {
-                    self.mfunc.push(MachineInst::new(
-                        MachineOp::Mov,
-                        dst,
-                        MachineOperand::gpr(Gpr::Rax),
-                    ));
+                    self.mfunc.push(
+                        MachineInst::new(MachineOp::Mov, dst, MachineOperand::gpr(Gpr::Rax))
+                            .with_origin(node_id),
+                    );
                 }
                 Ok(())
             }
 
             ArithOp::Mod => {
-                // Modulo: remainder is in RDX after IDIV
                 let lhs = self.required_input_operand(node_id, 0)?;
                 let rhs = self.required_input_operand(node_id, 1)?;
-                self.mfunc.push(MachineInst::new(
-                    MachineOp::Mov,
-                    MachineOperand::gpr(Gpr::Rax),
-                    lhs,
-                ));
-                self.mfunc.push(MachineInst::nullary(MachineOp::Cqo));
+                let rhs = self.prepare_divisor_operand(rhs, node_id)?;
+                self.mfunc.push(
+                    MachineInst::new(MachineOp::Mov, MachineOperand::gpr(Gpr::Rax), lhs)
+                        .with_origin(node_id),
+                );
+                self.mfunc
+                    .push(MachineInst::nullary(MachineOp::Cqo).with_origin(node_id));
                 self.mfunc.push(
                     MachineInst::new(MachineOp::Idiv, MachineOperand::gpr(Gpr::Rax), rhs)
                         .with_origin(node_id),
                 );
 
-                // Remainder is in RDX
-                if dst != MachineOperand::gpr(Gpr::Rdx) {
-                    self.mfunc.push(MachineInst::new(
-                        MachineOp::Mov,
-                        dst,
+                let done_label = self.mfunc.new_label();
+                let rem_positive_label = self.mfunc.new_label();
+
+                self.mfunc.push(
+                    MachineInst::binary(
+                        MachineOp::Cmp,
+                        MachineOperand::None,
                         MachineOperand::gpr(Gpr::Rdx),
-                    ));
+                        MachineOperand::Imm(0),
+                    )
+                    .with_origin(node_id),
+                );
+                self.mfunc
+                    .push(MachineInst::jcc(CondCode::E, done_label).with_origin(node_id));
+
+                self.mfunc.push(
+                    MachineInst::binary(
+                        MachineOp::Cmp,
+                        MachineOperand::None,
+                        MachineOperand::gpr(Gpr::Rdx),
+                        MachineOperand::Imm(0),
+                    )
+                    .with_origin(node_id),
+                );
+                self.mfunc
+                    .push(MachineInst::jcc(CondCode::G, rem_positive_label).with_origin(node_id));
+
+                // Remainder is negative: adjust only when divisor is positive.
+                self.mfunc.push(
+                    MachineInst::binary(MachineOp::Cmp, MachineOperand::None, rhs, MachineOperand::Imm(0))
+                        .with_origin(node_id),
+                );
+                self.mfunc
+                    .push(MachineInst::jcc(CondCode::L, done_label).with_origin(node_id));
+                self.mfunc.push(
+                    MachineInst::binary(
+                        MachineOp::Add,
+                        MachineOperand::gpr(Gpr::Rdx),
+                        MachineOperand::gpr(Gpr::Rdx),
+                        rhs,
+                    )
+                    .with_origin(node_id),
+                );
+                self.mfunc.push(
+                    MachineInst::new(
+                        MachineOp::Jmp,
+                        MachineOperand::Label(done_label),
+                        MachineOperand::None,
+                    )
+                    .with_origin(node_id),
+                );
+
+                self.mfunc.add_label(rem_positive_label);
+                // Remainder is positive: adjust only when divisor is negative.
+                self.mfunc.push(
+                    MachineInst::binary(MachineOp::Cmp, MachineOperand::None, rhs, MachineOperand::Imm(0))
+                        .with_origin(node_id),
+                );
+                self.mfunc
+                    .push(MachineInst::jcc(CondCode::G, done_label).with_origin(node_id));
+                self.mfunc.push(
+                    MachineInst::binary(
+                        MachineOp::Add,
+                        MachineOperand::gpr(Gpr::Rdx),
+                        MachineOperand::gpr(Gpr::Rdx),
+                        rhs,
+                    )
+                    .with_origin(node_id),
+                );
+
+                self.mfunc.add_label(done_label);
+
+                if dst != MachineOperand::gpr(Gpr::Rdx) {
+                    self.mfunc.push(
+                        MachineInst::new(MachineOp::Mov, dst, MachineOperand::gpr(Gpr::Rdx))
+                            .with_origin(node_id),
+                    );
                 }
                 Ok(())
             }
@@ -1193,6 +1509,14 @@ impl<'a> InstructionSelector<'a> {
                     .push(MachineInst::new(MachineOp::Neg, dst, dst).with_origin(node_id));
                 Ok(())
             }
+            ArithOp::Pos => {
+                let src = self.required_input_operand(node_id, 0)?;
+                if dst != src {
+                    self.mfunc
+                        .push(MachineInst::new(MachineOp::Mov, dst, src).with_origin(node_id));
+                }
+                Ok(())
+            }
 
             _ => Err(format!(
                 "Tier2 integer lowering does not support {:?} at node {:?}",
@@ -1204,24 +1528,53 @@ impl<'a> InstructionSelector<'a> {
     /// Select instructions for floating-point arithmetic.
     fn select_float_arith(&mut self, node_id: NodeId, op: ArithOp) -> Result<(), String> {
         let dst = self.operand_for_node(node_id);
-
-        let lhs = self.required_input_operand(node_id, 0)?;
-        let rhs = self.required_input_operand(node_id, 1)?;
-        let machine_op = match op {
-            ArithOp::Add => MachineOp::Addsd,
-            ArithOp::Sub => MachineOp::Subsd,
-            ArithOp::Mul => MachineOp::Mulsd,
-            ArithOp::TrueDiv => MachineOp::Divsd,
-            _ => {
-                return Err(format!(
-                    "Tier2 float lowering does not support {:?} at node {:?}",
-                    op, node_id
-                ));
+        match op {
+            ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::TrueDiv => {
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                let machine_op = match op {
+                    ArithOp::Add => MachineOp::Addsd,
+                    ArithOp::Sub => MachineOp::Subsd,
+                    ArithOp::Mul => MachineOp::Mulsd,
+                    ArithOp::TrueDiv => MachineOp::Divsd,
+                    _ => unreachable!(),
+                };
+                self.emit_float_binary(machine_op, dst, lhs, rhs, node_id);
+                Ok(())
             }
-        };
-
-        self.emit_binary(machine_op, dst, lhs, rhs, node_id);
-        Ok(())
+            ArithOp::Neg => {
+                let src = self.required_input_operand(node_id, 0)?;
+                let src_for_sub = if src == dst {
+                    let scratch = MachineOperand::xmm(Xmm::Xmm15);
+                    self.mfunc.push(
+                        MachineInst::new(MachineOp::Movsd, scratch, src).with_origin(node_id),
+                    );
+                    scratch
+                } else {
+                    src
+                };
+                self.mfunc.push(
+                    MachineInst::binary(MachineOp::Xorpd, dst, dst, dst).with_origin(node_id),
+                );
+                self.mfunc.push(
+                    MachineInst::binary(MachineOp::Subsd, dst, dst, src_for_sub)
+                        .with_origin(node_id),
+                );
+                Ok(())
+            }
+            ArithOp::Pos => {
+                let src = self.required_input_operand(node_id, 0)?;
+                if dst != src {
+                    self.mfunc
+                        .push(MachineInst::new(MachineOp::Movsd, dst, src).with_origin(node_id));
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "Tier2 float lowering does not support {:?} at node {:?}",
+                op, node_id
+            )),
+        }
     }
 
     /// Select instructions for integer comparison.
@@ -1551,6 +1904,51 @@ impl<'a> InstructionSelector<'a> {
             .push(MachineInst::binary(op, dst, dst, rhs).with_origin(node_id));
     }
 
+    /// Emit a binary scalar-float operation.
+    fn emit_float_binary(
+        &mut self,
+        op: MachineOp,
+        dst: MachineOperand,
+        lhs: MachineOperand,
+        rhs: MachineOperand,
+        node_id: NodeId,
+    ) {
+        if dst != lhs {
+            self.mfunc
+                .push(MachineInst::new(MachineOp::Movsd, dst, lhs).with_origin(node_id));
+        }
+        self.mfunc
+            .push(MachineInst::binary(op, dst, dst, rhs).with_origin(node_id));
+    }
+
+    fn prepare_divisor_operand(
+        &mut self,
+        rhs: MachineOperand,
+        node_id: NodeId,
+    ) -> Result<MachineOperand, String> {
+        match rhs {
+            MachineOperand::PReg(PReg::Gpr(_)) | MachineOperand::VReg(_) => Ok(rhs),
+            MachineOperand::StackSlot(offset) => {
+                let scratch = MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR);
+                self.mfunc.push(
+                    MachineInst::new(MachineOp::Mov, scratch, MachineOperand::StackSlot(offset))
+                        .with_origin(node_id),
+                );
+                Ok(scratch)
+            }
+            MachineOperand::Imm(imm) => {
+                let scratch = MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR);
+                self.mfunc
+                    .push(MachineInst::new(MachineOp::Mov, scratch, MachineOperand::Imm(imm)).with_origin(node_id));
+                Ok(scratch)
+            }
+            other => Err(format!(
+                "integer division/modulo requires GPR/stack/immediate divisor, got {:?}",
+                other
+            )),
+        }
+    }
+
     /// Emit a shift operation (shift count must be in CL or immediate).
     fn emit_shift(
         &mut self,
@@ -1815,6 +2213,81 @@ mod tests {
         let err = InstructionSelector::select(&graph, &alloc_map)
             .expect_err("If lowering must fail without any live projection targets");
         assert!(err.contains("projection-based control targets"));
+    }
+
+    #[test]
+    fn test_instruction_selection_collects_machine_gc_root_metadata() {
+        let mut builder = GraphBuilder::new(3, 1);
+        let p0 = builder.parameter(0).expect("parameter should exist");
+        let c1 = builder.const_int(1);
+        let sum = builder.int_add(p0, c1);
+        let _ret = builder.return_value(sum);
+        let graph = builder.finish();
+
+        let mut alloc_map = AllocationMap::new();
+        let spill = alloc_map.alloc_spill_slot();
+        alloc_map.set(VReg::new(0), Allocation::Register(PReg::Gpr(Gpr::Rbx)));
+        alloc_map.set(VReg::new(1), Allocation::Spill(spill));
+        alloc_map.set(VReg::new(2), Allocation::Register(PReg::Gpr(Gpr::Rbx)));
+
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("instruction selection should collect machine GC roots");
+
+        assert_eq!(mfunc.gc_roots.regs, vec![Gpr::Rbx]);
+        assert_eq!(mfunc.gc_roots.stack_slots, vec![spill.offset()]);
+    }
+
+    #[test]
+    fn test_instruction_selection_materializes_spilled_divisor_for_floor_div() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).expect("parameter 0 should exist");
+        let p1 = builder.parameter(1).expect("parameter 1 should exist");
+        let q = builder.int_div(p0, p1);
+        let _ret = builder.return_value(q);
+        let graph = builder.finish();
+
+        let mut alloc_map = AllocationMap::new();
+        let spill = alloc_map.alloc_spill_slot();
+        alloc_map.set(VReg::new(0), Allocation::Register(PReg::Gpr(Gpr::Rax)));
+        alloc_map.set(VReg::new(1), Allocation::Spill(spill));
+
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("floor-div lowering should support spilled divisors");
+
+        let floor_div_node = q;
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.origin == Some(floor_div_node)
+                && inst.op == MachineOp::Mov
+                && inst.dst == MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR)
+                && inst.src1 == MachineOperand::StackSlot(spill.offset())
+        }));
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.origin == Some(floor_div_node)
+                && inst.op == MachineOp::Idiv
+                && inst.src1 == MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR)
+        }));
+    }
+
+    #[test]
+    fn test_instruction_selection_emits_float_neg_with_zero_minus_operand() {
+        let mut builder = GraphBuilder::new(2, 0);
+        let val = builder.const_float(3.5);
+        let neg = builder.float_neg(val);
+        let _ret = builder.return_value(neg);
+        let graph = builder.finish();
+
+        let alloc_map = AllocationMap::new();
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("float neg lowering should succeed");
+
+        assert!(mfunc
+            .insts
+            .iter()
+            .any(|inst| inst.origin == Some(neg) && inst.op == MachineOp::Xorpd));
+        assert!(mfunc
+            .insts
+            .iter()
+            .any(|inst| inst.origin == Some(neg) && inst.op == MachineOp::Subsd));
     }
 
     #[test]
