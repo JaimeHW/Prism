@@ -60,6 +60,17 @@ fn test_builder_register_state() {
     assert!(!builder.get_register(1).is_valid()); // Uninitialized
 }
 
+#[test]
+fn test_builder_initializes_argument_registers_from_parameters() {
+    let builder = GraphBuilder::new(4, 2);
+    let p0 = builder.parameter(0).unwrap();
+    let p1 = builder.parameter(1).unwrap();
+
+    assert_eq!(builder.get_register(0), p0);
+    assert_eq!(builder.get_register(1), p1);
+    assert!(!builder.get_register(2).is_valid());
+}
+
 // =============================================================================
 // ArithmeticBuilder Tests - Constants
 // =============================================================================

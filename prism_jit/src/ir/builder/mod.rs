@@ -99,7 +99,12 @@ impl GraphBuilder {
             parameters.push(param);
         }
 
-        let state = RegisterState::new(num_registers, start);
+        let mut state = RegisterState::new(num_registers, start);
+        // Bytecode calling convention: positional arguments are preloaded into
+        // the first N virtual registers.
+        for (reg, &param) in parameters.iter().enumerate().take(num_registers) {
+            state.set(reg as u16, param);
+        }
 
         GraphBuilder {
             graph,

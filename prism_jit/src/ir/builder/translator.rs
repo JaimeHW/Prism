@@ -56,8 +56,23 @@ impl<'a> BytecodeTranslator<'a> {
 
     /// Helper to get a value from a register.
     #[inline(always)]
-    fn get_register(&mut self, reg: Register) -> crate::ir::node::NodeId {
-        self.builder.get_register(reg.index() as u16)
+    fn read_register(
+        &mut self,
+        reg: Register,
+        offset: u32,
+        op: Opcode,
+    ) -> Result<crate::ir::node::NodeId, String> {
+        let value = self.builder.get_register(reg.index() as u16);
+        if value.is_valid() {
+            Ok(value)
+        } else {
+            Err(format!(
+                "read of uninitialized register r{} at instruction offset {} for opcode {:?}",
+                reg.index(),
+                offset,
+                op
+            ))
+        }
     }
 
     /// Helper to set a value to a register.
@@ -107,7 +122,7 @@ impl<'a> BytecodeTranslator<'a> {
                 self.builder.translate_jump(target);
             }
             Opcode::JumpIfFalse => {
-                let cond = self.get_register(inst.dst());
+                let cond = self.read_register(inst.dst(), offset, op)?;
                 let target =
                     self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
                 // JumpIfFalse: if !cond goto target else goto fallthrough
@@ -115,7 +130,7 @@ impl<'a> BytecodeTranslator<'a> {
                 self.builder.translate_branch(cond, fallthrough, target);
             }
             Opcode::JumpIfTrue => {
-                let cond = self.get_register(inst.dst());
+                let cond = self.read_register(inst.dst(), offset, op)?;
                 let target =
                     self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
                 let fallthrough = offset + 1;
@@ -123,7 +138,7 @@ impl<'a> BytecodeTranslator<'a> {
             }
 
             Opcode::Return => {
-                let val = self.get_register(inst.dst());
+                let val = self.read_register(inst.dst(), offset, op)?;
                 self.builder.return_value(val);
             }
             Opcode::ReturnNone => {
@@ -172,14 +187,14 @@ impl<'a> BytecodeTranslator<'a> {
                 self.set_register(inst.dst(), val);
             }
             Opcode::Move => {
-                let val = self.get_register(inst.src1());
+                let val = self.read_register(inst.src1(), offset, op)?;
                 self.set_register(inst.dst(), val);
             }
 
             // Arithmetic
             Opcode::AddInt | Opcode::AddFloat | Opcode::Add => {
-                let lhs = self.get_register(inst.src1());
-                let rhs = self.get_register(inst.src2());
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
                 let res = match op {
                     Opcode::AddInt => self.builder.int_add(lhs, rhs),
                     Opcode::AddFloat => self.builder.float_add(lhs, rhs),
@@ -188,8 +203,8 @@ impl<'a> BytecodeTranslator<'a> {
                 self.set_register(inst.dst(), res);
             }
             Opcode::SubInt | Opcode::SubFloat | Opcode::Sub => {
-                let lhs = self.get_register(inst.src1());
-                let rhs = self.get_register(inst.src2());
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
                 let res = match op {
                     Opcode::SubInt => self.builder.int_sub(lhs, rhs),
                     Opcode::SubFloat => self.builder.float_sub(lhs, rhs),
@@ -198,8 +213,8 @@ impl<'a> BytecodeTranslator<'a> {
                 self.set_register(inst.dst(), res);
             }
             Opcode::MulInt | Opcode::MulFloat | Opcode::Mul => {
-                let lhs = self.get_register(inst.src1());
-                let rhs = self.get_register(inst.src2());
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
                 let res = match op {
                     Opcode::MulInt => self.builder.int_mul(lhs, rhs),
                     Opcode::MulFloat => self.builder.float_mul(lhs, rhs),
@@ -211,8 +226,8 @@ impl<'a> BytecodeTranslator<'a> {
 
             // Comparisons
             Opcode::Lt | Opcode::Le | Opcode::Eq | Opcode::Ne | Opcode::Gt | Opcode::Ge => {
-                let lhs = self.get_register(inst.src1());
-                let rhs = self.get_register(inst.src2());
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
                 let res = match op {
                     Opcode::Lt => self.builder.generic_lt(lhs, rhs),
                     Opcode::Le => self.builder.generic_le(lhs, rhs),
@@ -227,17 +242,17 @@ impl<'a> BytecodeTranslator<'a> {
 
             // Objects
             Opcode::GetAttr | Opcode::SetAttr | Opcode::GetItem | Opcode::SetItem => {
-                self.dispatch_object_op(op, inst);
+                self.dispatch_object_op(op, inst, offset)?;
             }
 
             // Calls
             Opcode::Call | Opcode::CallMethod => {
-                self.dispatch_call_op(op, inst);
+                self.dispatch_call_op(op, inst, offset)?;
             }
 
             // Containers
             Opcode::BuildList | Opcode::BuildTuple | Opcode::GetIter | Opcode::Len => {
-                self.dispatch_container_op(op, inst);
+                self.dispatch_container_op(op, inst, offset)?;
             }
 
             _ => {
@@ -252,44 +267,50 @@ impl<'a> BytecodeTranslator<'a> {
         Ok(())
     }
 
-    fn dispatch_object_op(&mut self, op: Opcode, inst: Instruction) {
+    fn dispatch_object_op(&mut self, op: Opcode, inst: Instruction, offset: u32) -> Result<(), String> {
         match op {
             Opcode::GetAttr => {
-                let obj = self.get_register(inst.src1());
-                let name = self.get_register(inst.src2());
+                let obj = self.read_register(inst.src1(), offset, op)?;
+                let name = self.read_register(inst.src2(), offset, op)?;
                 let res = self.builder.get_attr(obj, name);
                 self.set_register(inst.dst(), res);
             }
             Opcode::SetAttr => {
-                let obj = self.get_register(inst.dst());
-                let name = self.get_register(inst.src1());
-                let val = self.get_register(inst.src2());
+                let obj = self.read_register(inst.dst(), offset, op)?;
+                let name = self.read_register(inst.src1(), offset, op)?;
+                let val = self.read_register(inst.src2(), offset, op)?;
                 self.builder.set_attr(obj, name, val);
             }
             Opcode::GetItem => {
-                let obj = self.get_register(inst.src1());
-                let key = self.get_register(inst.src2());
+                let obj = self.read_register(inst.src1(), offset, op)?;
+                let key = self.read_register(inst.src2(), offset, op)?;
                 let res = self.builder.get_item(obj, key);
                 self.set_register(inst.dst(), res);
             }
             Opcode::SetItem => {
-                let obj = self.get_register(inst.dst());
-                let key = self.get_register(inst.src1());
-                let val = self.get_register(inst.src2());
+                let obj = self.read_register(inst.dst(), offset, op)?;
+                let key = self.read_register(inst.src1(), offset, op)?;
+                let val = self.read_register(inst.src2(), offset, op)?;
                 self.builder.set_item(obj, key, val);
             }
             _ => {}
         }
+        Ok(())
     }
 
-    fn dispatch_container_op(&mut self, op: Opcode, inst: Instruction) {
+    fn dispatch_container_op(
+        &mut self,
+        op: Opcode,
+        inst: Instruction,
+        offset: u32,
+    ) -> Result<(), String> {
         match op {
             Opcode::BuildList => {
                 let start_reg = inst.src1().index();
                 let count = inst.src2().index();
                 let mut elements = Vec::with_capacity(count as usize);
                 for i in 0..count {
-                    elements.push(self.get_register(Register(start_reg + i)));
+                    elements.push(self.read_register(Register(start_reg + i), offset, op)?);
                 }
                 let res = self.builder.build_list(&elements);
                 self.set_register(inst.dst(), res);
@@ -299,35 +320,36 @@ impl<'a> BytecodeTranslator<'a> {
                 let count = inst.src2().index();
                 let mut elements = Vec::with_capacity(count as usize);
                 for i in 0..count {
-                    elements.push(self.get_register(Register(start_reg + i)));
+                    elements.push(self.read_register(Register(start_reg + i), offset, op)?);
                 }
                 let res = self.builder.build_tuple(&elements);
                 self.set_register(inst.dst(), res);
             }
             Opcode::GetIter => {
-                let obj = self.get_register(inst.src1());
+                let obj = self.read_register(inst.src1(), offset, op)?;
                 let res = self.builder.get_iter(obj);
                 self.set_register(inst.dst(), res);
             }
             Opcode::Len => {
-                let obj = self.get_register(inst.src1());
+                let obj = self.read_register(inst.src1(), offset, op)?;
                 let res = self.builder.len(obj);
                 self.set_register(inst.dst(), res);
             }
             _ => {}
         }
+        Ok(())
     }
 
-    fn dispatch_call_op(&mut self, op: Opcode, inst: Instruction) {
+    fn dispatch_call_op(&mut self, op: Opcode, inst: Instruction, offset: u32) -> Result<(), String> {
         match op {
             Opcode::Call => {
-                let func = self.get_register(inst.src1());
+                let func = self.read_register(inst.src1(), offset, op)?;
                 let argc = inst.src2().index();
                 let start_reg = inst.dst().index() + 1;
 
                 let mut args = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
-                    args.push(self.get_register(Register(start_reg + i)));
+                    args.push(self.read_register(Register(start_reg + i), offset, op)?);
                 }
                 let res = self.builder.call(func, &args);
                 self.set_register(inst.dst(), res);
@@ -337,12 +359,14 @@ impl<'a> BytecodeTranslator<'a> {
             }
             _ => {}
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::operators::{ArithOp, Operator};
     use prism_compiler::bytecode::Register;
 
     #[test]
@@ -445,5 +469,52 @@ mod tests {
         let translator = BytecodeTranslator::new(builder, &code);
         let err = translator.translate().unwrap_err();
         assert!(err.contains("invalid opcode byte"));
+    }
+
+    #[test]
+    fn test_translate_rejects_uninitialized_register_read() {
+        let mut code = CodeObject::new("uninitialized_read", "<test>");
+        code.register_count = 3;
+        code.instructions = vec![
+            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_d(Opcode::Return, Register::new(2)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(3, 0);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let err = translator.translate().unwrap_err();
+        assert!(err.contains("uninitialized register"));
+        assert!(err.contains("r0") || err.contains("r1"));
+    }
+
+    #[test]
+    fn test_translate_reads_argument_registers_from_parameters() {
+        let mut code = CodeObject::new("arg_add", "<test>");
+        code.register_count = 2;
+        code.arg_count = 2;
+        code.instructions = vec![
+            Instruction::op_dss(Opcode::Add, Register::new(0), Register::new(0), Register::new(1)),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(2, 2);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let graph = translator.translate().expect("argument registers should be seeded");
+
+        let mut found_arg_add = false;
+        for (_, node) in graph.iter() {
+            if let Operator::GenericOp(ArithOp::Add) = node.op {
+                let lhs = graph.node(node.inputs.get(0).unwrap()).op;
+                let rhs = graph.node(node.inputs.get(1).unwrap()).op;
+                assert!(matches!(lhs, Operator::Parameter(0)));
+                assert!(matches!(rhs, Operator::Parameter(1)));
+                found_arg_add = true;
+                break;
+            }
+        }
+
+        assert!(found_arg_add, "expected translated add node using parameter inputs");
     }
 }
