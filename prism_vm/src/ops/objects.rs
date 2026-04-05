@@ -7,6 +7,7 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::attribute::is_user_defined_type;
+use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 use prism_core::intern::interned_len_by_ptr;
@@ -15,7 +16,6 @@ use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
@@ -557,53 +557,12 @@ pub fn get_iter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let obj = frame.get_reg(inst.src1().0);
     let dst = inst.dst().0;
 
-    if let Some(ptr) = obj.as_object_ptr() {
-        let type_id = extract_type_id(ptr);
-
-        let iter = match type_id {
-            TypeId::LIST => {
-                // Create Arc reference to list for iterator
-                let list = unsafe { &*(ptr as *const ListObject) };
-                // Clone values for now - TODO: use Arc<ListObject> properly
-                let values: Vec<Value> = list.iter().cloned().collect();
-                IteratorObject::from_values(values)
-            }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                let values: Vec<Value> = tuple.iter().cloned().collect();
-                IteratorObject::from_values(values)
-            }
-            TypeId::RANGE => {
-                let range = unsafe { &*(ptr as *const RangeObject) };
-                IteratorObject::from_range(range.iter())
-            }
-            TypeId::DICT => {
-                // Iterate over dict keys
-                let dict = unsafe { &*(ptr as *const DictObject) };
-                let keys: Vec<Value> = dict.keys().collect();
-                IteratorObject::from_values(keys)
-            }
-            TypeId::ITERATOR => {
-                // Already an iterator - return as-is
-                frame.set_reg(dst, obj);
-                return ControlFlow::Continue;
-            }
-            _ => {
-                return ControlFlow::Error(RuntimeError::type_error(format!(
-                    "'{}' object is not iterable",
-                    type_id.name()
-                )));
-            }
-        };
-
-        // Allocate iterator on heap
-        // TODO: Use GC allocator instead of Box::into_raw
-        let iter_box = Box::new(iter);
-        let iter_ptr = Box::into_raw(iter_box) as *const ();
-        frame.set_reg(dst, Value::object_ptr(iter_ptr));
-        ControlFlow::Continue
-    } else {
-        ControlFlow::Error(RuntimeError::type_error("object is not iterable"))
+    match ensure_iterator_value(obj) {
+        Ok(iterator) => {
+            frame.set_reg(dst, iterator);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -612,29 +571,18 @@ pub fn get_iter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Advances the iterator and jumps to offset if exhausted.
 #[inline(always)]
 pub fn for_iter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let iter_val = frame.get_reg(inst.src1().0);
+    let iter_val = vm.current_frame().get_reg(inst.src1().0);
     let dst = inst.dst().0;
     // Offset is encoded in src2 position as 8-bit signed
     let offset = inst.src2().0 as i8 as i16;
 
-    if let Some(ptr) = iter_val.as_object_ptr() {
-        let type_id = extract_type_id(ptr);
-
-        if type_id != TypeId::ITERATOR {
-            return ControlFlow::Error(RuntimeError::type_error("for loop requires an iterator"));
-        }
-
-        let iter = unsafe { &mut *(ptr as *mut IteratorObject) };
-        if let Some(val) = iter.next() {
-            frame.set_reg(dst, val);
+    match next_step(vm, iter_val) {
+        Ok(IterStep::Yielded(value)) => {
+            vm.current_frame_mut().set_reg(dst, value);
             ControlFlow::Continue
-        } else {
-            // StopIteration - jump to exit
-            ControlFlow::Jump(offset)
         }
-    } else {
-        ControlFlow::Error(RuntimeError::type_error("object is not an iterator"))
+        Ok(IterStep::Exhausted) => ControlFlow::Jump(offset),
+        Err(err) => ControlFlow::Error(err),
     }
 }
 

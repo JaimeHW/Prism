@@ -28,6 +28,8 @@ use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+use super::iteration::{IterStep, next_step};
+
 // =============================================================================
 // Type ID Extraction Helper
 // =============================================================================
@@ -39,6 +41,29 @@ use std::sync::Arc;
 fn extract_type_id(ptr: *const ()) -> TypeId {
     let header_ptr = ptr as *const ObjectHeader;
     unsafe { (*header_ptr).type_id }
+}
+
+pub(crate) fn invoke_builtin(
+    vm: &mut VirtualMachine,
+    builtin: &BuiltinFunctionObject,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    if builtin.name() == "next" {
+        if args.is_empty() || args.len() > 2 {
+            return Err(RuntimeError::type_error(format!(
+                "next() expected 1 or 2 arguments, got {}",
+                args.len()
+            )));
+        }
+
+        let default = args.get(1).copied();
+        return match next_step(vm, args[0])? {
+            IterStep::Yielded(value) => Ok(value),
+            IterStep::Exhausted => default.ok_or_else(RuntimeError::stop_iteration),
+        };
+    }
+
+    builtin.call(args).map_err(RuntimeError::from)
 }
 
 // =============================================================================
@@ -72,12 +97,12 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     .collect();
 
                 // Call the builtin function
-                match builtin.call(&args) {
+                match invoke_builtin(vm, builtin, &args) {
                     Ok(result) => {
                         vm.current_frame_mut().set_reg(dst_reg, result);
                         ControlFlow::Continue
                     }
-                    Err(e) => ControlFlow::Error(RuntimeError::type_error(e.to_string())),
+                    Err(e) => ControlFlow::Error(e),
                 }
             }
             _ if type_id == EXCEPTION_TYPE_ID => {
@@ -226,12 +251,12 @@ fn call_kw_builtin(
     }
 
     // Call the builtin
-    match builtin.call(&args) {
+    match invoke_builtin(vm, builtin, &args) {
         Ok(result) => {
             vm.current_frame_mut().set_reg(dst_reg, result);
             ControlFlow::Continue
         }
-        Err(e) => ControlFlow::Error(RuntimeError::type_error(e.to_string())),
+        Err(e) => ControlFlow::Error(e),
     }
 }
 

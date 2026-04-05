@@ -28,6 +28,7 @@ use crate::VirtualMachine;
 use crate::builtins::BuiltinFunctionObject;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::calls::invoke_builtin;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
@@ -172,12 +173,12 @@ fn call_builtin_function(
     }
 
     // Call the builtin function
-    match builtin.call(&args) {
+    match invoke_builtin(vm, builtin, &args) {
         Ok(result) => {
             vm.current_frame_mut().set_reg(dst, result);
             ControlFlow::Continue
         }
-        Err(e) => ControlFlow::Error(RuntimeError::type_error(e.to_string())),
+        Err(e) => ControlFlow::Error(e),
     }
 }
 

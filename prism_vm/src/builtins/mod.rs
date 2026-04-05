@@ -52,6 +52,8 @@ pub enum BuiltinError {
     TypeError(String),
     /// Value error (e.g., negative index).
     ValueError(String),
+    /// Iterator exhaustion.
+    StopIteration,
     /// Attribute error.
     AttributeError(String),
     /// Key error.
@@ -69,6 +71,7 @@ impl std::fmt::Display for BuiltinError {
         match self {
             BuiltinError::TypeError(msg) => write!(f, "TypeError: {}", msg),
             BuiltinError::ValueError(msg) => write!(f, "ValueError: {}", msg),
+            BuiltinError::StopIteration => write!(f, "StopIteration"),
             BuiltinError::AttributeError(msg) => write!(f, "AttributeError: {}", msg),
             BuiltinError::KeyError(msg) => write!(f, "KeyError: {}", msg),
             BuiltinError::IndexError(msg) => write!(f, "IndexError: {}", msg),

@@ -5,13 +5,13 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::bytes::BytesObject;
 use crate::types::list::ListObject;
 use crate::types::range::RangeIterator;
 use crate::types::string::StringObject;
 use crate::types::tuple::TupleObject;
 use prism_core::Value;
 use std::fmt;
-use std::sync::Arc;
 
 // =============================================================================
 // Tuple creation helpers for composite iterators
@@ -74,20 +74,20 @@ enum IterKind {
     Range(RangeIterator),
 
     /// Iterator over a list.
-    List { list: Arc<ListObject>, index: usize },
+    List { list: Value, index: usize },
 
     /// Iterator over a tuple.
-    Tuple {
-        tuple: Arc<TupleObject>,
-        index: usize,
-    },
+    Tuple { tuple: Value, index: usize },
 
     /// Iterator over string characters.
     StringChars {
-        string: Arc<StringObject>,
+        string: Value,
         /// Byte offset into UTF-8 string.
         byte_offset: usize,
     },
+
+    /// Iterator over bytes / bytearray.
+    Bytes { bytes: Value, index: usize },
 
     /// Iterator over a generic sequence of values.
     /// Used as fallback for custom iterables.
@@ -166,6 +166,41 @@ enum IterKind {
     SetIter { values: Vec<Value>, index: usize },
 }
 
+#[inline(always)]
+fn object_ref<T>(value: Value, expected: TypeId) -> &'static T {
+    let ptr = value
+        .as_object_ptr()
+        .expect("iterator backing value must be an object");
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    debug_assert_eq!(header.type_id, expected);
+    unsafe { &*(ptr as *const T) }
+}
+
+#[inline(always)]
+fn list_from_value(value: Value) -> &'static ListObject {
+    object_ref(value, TypeId::LIST)
+}
+
+#[inline(always)]
+fn tuple_from_value(value: Value) -> &'static TupleObject {
+    object_ref(value, TypeId::TUPLE)
+}
+
+#[inline(always)]
+fn string_from_value(value: Value) -> &'static StringObject {
+    object_ref(value, TypeId::STR)
+}
+
+#[inline(always)]
+fn bytes_from_value(value: Value) -> &'static BytesObject {
+    let ptr = value
+        .as_object_ptr()
+        .expect("bytes iterator backing value must be an object");
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    debug_assert!(matches!(header.type_id, TypeId::BYTES | TypeId::BYTEARRAY));
+    unsafe { &*(ptr as *const BytesObject) }
+}
+
 impl IteratorObject {
     /// Create an empty iterator.
     #[inline]
@@ -189,8 +224,9 @@ impl IteratorObject {
 
     /// Create an iterator over a list.
     #[inline]
-    pub fn from_list(list: Arc<ListObject>) -> Self {
-        let exhausted = list.is_empty();
+    pub fn from_list(list: Value) -> Self {
+        let list_ref = list_from_value(list);
+        let exhausted = list_ref.is_empty();
         Self {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::List { list, index: 0 },
@@ -200,8 +236,9 @@ impl IteratorObject {
 
     /// Create an iterator over a tuple.
     #[inline]
-    pub fn from_tuple(tuple: Arc<TupleObject>) -> Self {
-        let exhausted = tuple.is_empty();
+    pub fn from_tuple(tuple: Value) -> Self {
+        let tuple_ref = tuple_from_value(tuple);
+        let exhausted = tuple_ref.is_empty();
         Self {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::Tuple { tuple, index: 0 },
@@ -211,14 +248,27 @@ impl IteratorObject {
 
     /// Create an iterator over string characters.
     #[inline]
-    pub fn from_string_chars(string: Arc<StringObject>) -> Self {
-        let exhausted = string.is_empty();
+    pub fn from_string_chars(string: Value) -> Self {
+        let string_ref = string_from_value(string);
+        let exhausted = string_ref.is_empty();
         Self {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::StringChars {
                 string,
                 byte_offset: 0,
             },
+            exhausted,
+        }
+    }
+
+    /// Create an iterator over bytes or bytearray.
+    #[inline]
+    pub fn from_bytes(bytes: Value) -> Self {
+        let bytes_ref = bytes_from_value(bytes);
+        let exhausted = bytes_ref.is_empty();
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::Bytes { bytes, index: 0 },
             exhausted,
         }
     }
@@ -401,6 +451,7 @@ impl IteratorObject {
             },
 
             IterKind::List { list, index } => {
+                let list = list_from_value(*list);
                 if *index < list.len() {
                     let value = list.get(*index as i64);
                     *index += 1;
@@ -412,6 +463,7 @@ impl IteratorObject {
             }
 
             IterKind::Tuple { tuple, index } => {
+                let tuple = tuple_from_value(*tuple);
                 if *index < tuple.len() {
                     let value = tuple.get(*index as i64);
                     *index += 1;
@@ -426,6 +478,7 @@ impl IteratorObject {
                 string,
                 byte_offset,
             } => {
+                let string = string_from_value(*string);
                 let s = string.as_str();
                 if *byte_offset >= s.len() {
                     self.exhausted = true;
@@ -440,6 +493,18 @@ impl IteratorObject {
                     // Note: For now, return as interned string via string method
                     let interned = prism_core::intern::intern(&c.to_string());
                     Some(Value::string(interned))
+                } else {
+                    self.exhausted = true;
+                    None
+                }
+            }
+
+            IterKind::Bytes { bytes, index } => {
+                let bytes = bytes_from_value(*bytes);
+                if *index < bytes.len() {
+                    let value = Value::int(bytes.as_bytes()[*index] as i64);
+                    *index += 1;
+                    value
                 } else {
                     self.exhausted = true;
                     None
@@ -607,20 +672,29 @@ impl IteratorObject {
 
         match &self.kind {
             IterKind::Range(iter) => Some(iter.len()),
-            IterKind::List { list, index } => Some(list.len().saturating_sub(*index)),
-            IterKind::Tuple { tuple, index } => Some(tuple.len().saturating_sub(*index)),
+            IterKind::List { list, index } => {
+                Some(list_from_value(*list).len().saturating_sub(*index))
+            }
+            IterKind::Tuple { tuple, index } => {
+                Some(tuple_from_value(*tuple).len().saturating_sub(*index))
+            }
             IterKind::StringChars {
                 string,
                 byte_offset,
             } => {
                 // We can't know exactly without scanning, so return None
                 // Could count remaining chars but that's O(n)
-                let remaining_bytes = string.len().saturating_sub(*byte_offset);
+                let remaining_bytes = string_from_value(*string)
+                    .len()
+                    .saturating_sub(*byte_offset);
                 if remaining_bytes == 0 {
                     Some(0)
                 } else {
                     None // Unknown without counting
                 }
+            }
+            IterKind::Bytes { bytes, index } => {
+                Some(bytes_from_value(*bytes).len().saturating_sub(*index))
             }
             IterKind::Values { values, index } => Some(values.len().saturating_sub(*index)),
             IterKind::Empty => Some(0),
@@ -661,6 +735,7 @@ impl fmt::Debug for IteratorObject {
             IterKind::List { .. } => "list_iterator",
             IterKind::Tuple { .. } => "tuple_iterator",
             IterKind::StringChars { .. } => "str_iterator",
+            IterKind::Bytes { .. } => "bytes_iterator",
             IterKind::Values { .. } => "iterator",
             IterKind::Empty => "empty_iterator",
             // Composite iterators
@@ -697,6 +772,11 @@ mod tests {
     use super::*;
     use crate::types::range::RangeObject;
 
+    fn leak_value<T>(obj: T) -> Value {
+        let ptr = Box::into_raw(Box::new(obj)) as *const ();
+        Value::object_ptr(ptr)
+    }
+
     #[test]
     fn test_empty_iterator() {
         let mut iter = IteratorObject::empty();
@@ -719,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_list_iterator() {
-        let list = Arc::new(ListObject::from_slice(&[
+        let list = leak_value(ListObject::from_slice(&[
             Value::int(1).unwrap(),
             Value::int(2).unwrap(),
             Value::int(3).unwrap(),
@@ -734,8 +814,27 @@ mod tests {
     }
 
     #[test]
+    fn test_list_iterator_observes_growth_after_creation() {
+        let list = Box::into_raw(Box::new(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ])));
+        let list_value = Value::object_ptr(list as *const ());
+        let mut iter = IteratorObject::from_list(list_value);
+
+        assert_eq!(iter.next().unwrap().as_int(), Some(1));
+        unsafe { &mut *list }.push(Value::int(3).unwrap());
+
+        assert_eq!(iter.size_hint(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(3));
+        assert_eq!(iter.size_hint(), Some(0));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
     fn test_tuple_iterator() {
-        let tuple = Arc::new(TupleObject::from_slice(&[
+        let tuple = leak_value(TupleObject::from_slice(&[
             Value::int(10).unwrap(),
             Value::int(20).unwrap(),
             Value::int(30).unwrap(),
@@ -758,6 +857,20 @@ mod tests {
         assert_eq!(iter.next().unwrap().as_int().unwrap(), 100);
         assert_eq!(iter.size_hint(), Some(1));
         assert_eq!(iter.next().unwrap().as_int().unwrap(), 200);
+        assert_eq!(iter.size_hint(), Some(0));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_bytes_iterator_yields_ints_and_updates_hint() {
+        let bytes = leak_value(BytesObject::from_slice(&[0, 65, 255]));
+        let mut iter = IteratorObject::from_bytes(bytes);
+
+        assert_eq!(iter.size_hint(), Some(3));
+        assert_eq!(iter.next().unwrap().as_int(), Some(0));
+        assert_eq!(iter.size_hint(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(65));
+        assert_eq!(iter.next().unwrap().as_int(), Some(255));
         assert_eq!(iter.size_hint(), Some(0));
         assert!(iter.next().is_none());
     }
@@ -792,7 +905,7 @@ mod tests {
 
     #[test]
     fn test_enumerate_basic() {
-        let list = Arc::new(ListObject::from_slice(&[
+        let list = leak_value(ListObject::from_slice(&[
             Value::int(10).unwrap(),
             Value::int(20).unwrap(),
             Value::int(30).unwrap(),
@@ -845,12 +958,12 @@ mod tests {
 
     #[test]
     fn test_zip_two_iterators() {
-        let list1 = Arc::new(ListObject::from_slice(&[
+        let list1 = leak_value(ListObject::from_slice(&[
             Value::int(1).unwrap(),
             Value::int(2).unwrap(),
             Value::int(3).unwrap(),
         ]));
-        let list2 = Arc::new(ListObject::from_slice(&[
+        let list2 = leak_value(ListObject::from_slice(&[
             Value::int(10).unwrap(),
             Value::int(20).unwrap(),
             Value::int(30).unwrap(),
@@ -876,9 +989,9 @@ mod tests {
     #[test]
     fn test_zip_unequal_lengths() {
         // Short iterator
-        let list1 = Arc::new(ListObject::from_slice(&[Value::int(1).unwrap()]));
+        let list1 = leak_value(ListObject::from_slice(&[Value::int(1).unwrap()]));
         // Long iterator
-        let list2 = Arc::new(ListObject::from_slice(&[
+        let list2 = leak_value(ListObject::from_slice(&[
             Value::int(10).unwrap(),
             Value::int(20).unwrap(),
             Value::int(30).unwrap(),
@@ -901,11 +1014,11 @@ mod tests {
 
     #[test]
     fn test_zip_size_hint() {
-        let list1 = Arc::new(ListObject::from_slice(&[
+        let list1 = leak_value(ListObject::from_slice(&[
             Value::int(1).unwrap(),
             Value::int(2).unwrap(),
         ]));
-        let list2 = Arc::new(ListObject::from_slice(&[
+        let list2 = leak_value(ListObject::from_slice(&[
             Value::int(10).unwrap(),
             Value::int(20).unwrap(),
             Value::int(30).unwrap(),

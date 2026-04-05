@@ -14,6 +14,7 @@ pub mod control;
 pub mod coroutine;
 pub mod exception;
 pub mod generator;
+pub mod iteration;
 pub mod kw_binding;
 pub mod load_store;
 pub mod r#match;

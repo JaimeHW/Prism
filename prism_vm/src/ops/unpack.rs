@@ -19,6 +19,7 @@ use crate::VirtualMachine;
 use crate::builtins::BuiltinFunctionObject;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::calls::invoke_builtin;
 
 /// Handle BuildTupleUnpack opcode.
 ///
@@ -193,12 +194,12 @@ pub fn call_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         match type_id {
             TypeId::BUILTIN_FUNCTION => {
                 let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
-                match builtin.call(&args) {
+                match invoke_builtin(vm, builtin, &args) {
                     Ok(result) => {
                         vm.current_frame_mut().set_reg(dst, result);
                         ControlFlow::Continue
                     }
-                    Err(e) => ControlFlow::Error(RuntimeError::type_error(e.to_string())),
+                    Err(e) => ControlFlow::Error(e),
                 }
             }
             TypeId::FUNCTION | TypeId::CLOSURE => {

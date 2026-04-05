@@ -3,6 +3,7 @@
 //! This module defines all error types that can occur during bytecode execution.
 //! Errors are designed for minimal allocation and fast construction on hot paths.
 
+use crate::builtins::BuiltinError;
 use prism_core::{PrismError, Span};
 use std::fmt;
 use std::sync::Arc;
@@ -326,6 +327,33 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+impl From<BuiltinError> for RuntimeError {
+    fn from(err: BuiltinError) -> Self {
+        use crate::stdlib::exceptions::types::ExceptionTypeId;
+
+        match err {
+            BuiltinError::TypeError(message) => Self::type_error(message),
+            BuiltinError::ValueError(message) => Self::value_error(message),
+            BuiltinError::StopIteration => Self::stop_iteration(),
+            BuiltinError::AttributeError(message) => {
+                Self::exception(ExceptionTypeId::AttributeError.as_u8() as u16, message)
+            }
+            BuiltinError::KeyError(message) => {
+                Self::exception(ExceptionTypeId::KeyError.as_u8() as u16, message)
+            }
+            BuiltinError::IndexError(message) => {
+                Self::exception(ExceptionTypeId::IndexError.as_u8() as u16, message)
+            }
+            BuiltinError::OverflowError(message) => {
+                Self::exception(ExceptionTypeId::OverflowError.as_u8() as u16, message)
+            }
+            BuiltinError::NotImplemented(message) => {
+                Self::exception(ExceptionTypeId::NotImplementedError.as_u8() as u16, message)
+            }
+        }
+    }
+}
+
 impl From<RuntimeError> for PrismError {
     fn from(err: RuntimeError) -> Self {
         match &err.kind {
@@ -401,5 +429,12 @@ mod tests {
         });
         assert_eq!(err.traceback.len(), 1);
         assert_eq!(&*err.traceback[0].func_name, "foo");
+    }
+
+    #[test]
+    fn test_builtin_stop_iteration_maps_to_runtime_stop_iteration() {
+        let err = RuntimeError::from(crate::builtins::BuiltinError::StopIteration);
+        assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
+        assert_eq!(err.to_string(), "StopIteration");
     }
 }

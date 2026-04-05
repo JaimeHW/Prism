@@ -30,7 +30,7 @@
 //! |-----------|--------|-------|
 //! | TypeId extraction | ~3 | Single pointer + offset load |
 //! | Dispatch switch | ~3 | Jump table |
-//! | Iterator creation | ~10 | Arc clone + struct init |
+//! | Iterator creation | ~10 | Handle capture + struct init |
 //! | **Total (built-in)** | ~16 | vs ~80 for CPython |
 //!
 //! # Example
@@ -45,15 +45,18 @@ use super::BuiltinError;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
+#[cfg(test)]
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::iter::IteratorObject;
+#[cfg(test)]
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
+#[cfg(test)]
 use prism_runtime::types::string::StringObject;
+#[cfg(test)]
 use prism_runtime::types::tuple::TupleObject;
-use std::sync::Arc;
 
 // =============================================================================
 // Error Types
@@ -108,36 +111,6 @@ fn get_type_id(value: &Value) -> Option<TypeId> {
     Some(header.type_id)
 }
 
-/// Extract ListObject from Value.
-#[inline(always)]
-fn value_as_list(value: &Value) -> Option<Arc<ListObject>> {
-    let ptr = value.as_object_ptr()?;
-    // SAFETY: Caller verified TypeId::LIST
-    let list = unsafe { &*(ptr as *const ListObject) };
-    // Create Arc without incrementing refcount (we're borrowing)
-    // For now, we clone the data into a new Arc
-    // TODO: Proper Arc management with GC
-    Some(Arc::new(ListObject::from_slice(list.as_slice())))
-}
-
-/// Extract TupleObject from Value.
-#[inline(always)]
-fn value_as_tuple(value: &Value) -> Option<Arc<TupleObject>> {
-    let ptr = value.as_object_ptr()?;
-    // SAFETY: Caller verified TypeId::TUPLE
-    let tuple = unsafe { &*(ptr as *const TupleObject) };
-    Some(Arc::new(TupleObject::from_slice(tuple.as_slice())))
-}
-
-/// Extract StringObject from Value.
-#[inline(always)]
-fn value_as_string(value: &Value) -> Option<Arc<StringObject>> {
-    let ptr = value.as_object_ptr()?;
-    // SAFETY: Caller verified TypeId::STR
-    let string = unsafe { &*(ptr as *const StringObject) };
-    Some(Arc::new(StringObject::new(string.as_str())))
-}
-
 /// Extract RangeObject from Value.
 #[inline(always)]
 fn value_as_range(value: &Value) -> Option<&RangeObject> {
@@ -162,14 +135,6 @@ fn value_as_set(value: &Value) -> Option<&SetObject> {
     Some(unsafe { &*(ptr as *const SetObject) })
 }
 
-/// Extract BytesObject from Value.
-#[inline(always)]
-fn value_as_bytes(value: &Value) -> Option<&BytesObject> {
-    let ptr = value.as_object_ptr()?;
-    // SAFETY: Caller verified TypeId::BYTES or TypeId::BYTEARRAY
-    Some(unsafe { &*(ptr as *const BytesObject) })
-}
-
 /// Extract IteratorObject from Value (mutable).
 #[inline(always)]
 pub fn get_iterator_mut(value: &Value) -> Option<&mut IteratorObject> {
@@ -187,7 +152,7 @@ pub fn get_iterator_mut(value: &Value) -> Option<&mut IteratorObject> {
 #[inline(always)]
 pub fn is_iterator(value: &Value) -> bool {
     match get_type_id(value) {
-        Some(TypeId::ITERATOR) => true,
+        Some(TypeId::ITERATOR | TypeId::GENERATOR) => true,
         _ => false,
     }
 }
@@ -250,20 +215,20 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
 
     // TypeId-based dispatch (jump table optimization)
     match type_id {
-        TypeId::LIST => {
-            let list = value_as_list(value).ok_or(IterError::InvalidObject)?;
-            Ok(IteratorObject::from_list(list))
-        }
+        TypeId::LIST => value
+            .as_object_ptr()
+            .ok_or(IterError::InvalidObject)
+            .map(|_| IteratorObject::from_list(*value)),
 
-        TypeId::TUPLE => {
-            let tuple = value_as_tuple(value).ok_or(IterError::InvalidObject)?;
-            Ok(IteratorObject::from_tuple(tuple))
-        }
+        TypeId::TUPLE => value
+            .as_object_ptr()
+            .ok_or(IterError::InvalidObject)
+            .map(|_| IteratorObject::from_tuple(*value)),
 
-        TypeId::STR => {
-            let string = value_as_string(value).ok_or(IterError::InvalidObject)?;
-            Ok(IteratorObject::from_string_chars(string))
-        }
+        TypeId::STR => value
+            .as_object_ptr()
+            .ok_or(IterError::InvalidObject)
+            .map(|_| IteratorObject::from_string_chars(*value)),
 
         TypeId::RANGE => {
             let range = value_as_range(value).ok_or(IterError::InvalidObject)?;
@@ -283,20 +248,14 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             Ok(IteratorObject::from_values(values))
         }
 
-        TypeId::BYTES | TypeId::BYTEARRAY => {
-            let bytes = value_as_bytes(value).ok_or(IterError::InvalidObject)?;
-            let mut values = Vec::with_capacity(bytes.len());
-            values.extend(bytes.iter().map(|b| Value::int_unchecked(b as i64)));
-            Ok(IteratorObject::from_values(values))
-        }
+        TypeId::BYTES | TypeId::BYTEARRAY => value
+            .as_object_ptr()
+            .ok_or(IterError::InvalidObject)
+            .map(|_| IteratorObject::from_bytes(*value)),
 
-        TypeId::GENERATOR => {
-            // Generators are already iterators
-            // TODO: Wrap generator in iterator protocol
-            Err(IterError::NotIterable(
-                "generator iteration not yet implemented".into(),
-            ))
-        }
+        TypeId::GENERATOR => Err(IterError::NotIterable(
+            "iter() should receive generators directly".into(),
+        )),
 
         _ => {
             // Fallback: Try __iter__ protocol
@@ -348,6 +307,15 @@ pub fn iterator_to_value(iter: IteratorObject) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_interned_string(value: Value, expected: &str) {
+        let ptr = value
+            .as_string_object_ptr()
+            .expect("iterator should yield an interned string") as *const u8;
+        let actual = prism_core::intern::interned_by_ptr(ptr)
+            .expect("string pointer should resolve through the interner");
+        assert_eq!(actual.as_str(), expected);
+    }
 
     // -------------------------------------------------------------------------
     // Type Detection Tests
@@ -503,6 +471,23 @@ mod tests {
         assert_eq!(remaining[1].as_int(), Some(30));
     }
 
+    #[test]
+    fn test_iter_list_observes_mutation_after_creation() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let ptr = Box::leak(Box::new(list)) as *mut ListObject;
+        let value = Value::object_ptr(ptr as *const ());
+
+        let mut iter = value_to_iterator(&value).expect("list should be iterable");
+        assert_eq!(iter.next().unwrap().as_int(), Some(1));
+
+        unsafe { &mut *ptr }.push(Value::int(3).unwrap());
+
+        assert_eq!(iter.size_hint(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(3));
+        assert!(iter.next().is_none());
+    }
+
     // -------------------------------------------------------------------------
     // Tuple Iterator Tests
     // -------------------------------------------------------------------------
@@ -544,6 +529,19 @@ mod tests {
         assert_eq!(iter.next().unwrap().as_float(), Some(2.5));
         assert!(iter.next().unwrap().is_none());
         assert!(iter.next().unwrap().is_truthy());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_iter_string_unicode_chars() {
+        let string = StringObject::from_string("aé🙂".to_string());
+        let ptr = Box::leak(Box::new(string)) as *mut StringObject as *const ();
+        let value = Value::object_ptr(ptr);
+
+        let mut iter = value_to_iterator(&value).expect("string should be iterable");
+        assert_interned_string(iter.next().unwrap(), "a");
+        assert_interned_string(iter.next().unwrap(), "é");
+        assert_interned_string(iter.next().unwrap(), "🙂");
         assert!(iter.next().is_none());
     }
 

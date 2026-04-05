@@ -162,11 +162,7 @@ pub fn builtin_next(args: &[Value]) -> Result<Value, BuiltinError> {
         Some(value) => Ok(value),
         None => match default {
             Some(d) => Ok(d),
-            None => {
-                // Signal StopIteration - for now use ValueError
-                // TODO: Proper StopIteration exception integration
-                Err(BuiltinError::ValueError("StopIteration".to_string()))
-            }
+            None => Err(BuiltinError::StopIteration),
         },
     }
 }
@@ -988,6 +984,32 @@ mod tests {
 
         let second = builtin_next(&[iter_again]).unwrap();
         assert_eq!(second.as_int(), Some(20));
+    }
+
+    #[test]
+    fn test_next_exhausted_raises_stop_iteration() {
+        let list = ListObject::from_slice(&[Value::int(10).unwrap()]);
+        let list_ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let list_value = Value::object_ptr(list_ptr);
+
+        let iter = builtin_iter(&[list_value]).unwrap();
+        assert_eq!(builtin_next(&[iter]).unwrap().as_int(), Some(10));
+
+        let err = builtin_next(&[iter]).unwrap_err();
+        assert!(matches!(err, BuiltinError::StopIteration));
+    }
+
+    #[test]
+    fn test_next_exhausted_returns_default() {
+        let list = ListObject::from_slice(&[Value::int(10).unwrap()]);
+        let list_ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let list_value = Value::object_ptr(list_ptr);
+
+        let iter = builtin_iter(&[list_value]).unwrap();
+        assert_eq!(builtin_next(&[iter]).unwrap().as_int(), Some(10));
+
+        let default = Value::int(99).unwrap();
+        assert_eq!(builtin_next(&[iter, default]).unwrap().as_int(), Some(99));
     }
 
     #[test]
