@@ -379,8 +379,12 @@ pub fn push_exc_info(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow
     vm.push_exc_info();
 
     // If there's an active exception, we're entering a finally block during
-    // exception propagation. Set state to Finally so EndFinally knows to reraise.
-    if vm.has_active_exception() {
+    // exception propagation. Handler-local exception contexts should not force
+    // finally blocks to reraise on normal completion.
+    if matches!(
+        vm.exception_state(),
+        crate::exception::ExceptionState::Propagating | crate::exception::ExceptionState::Finally
+    ) {
         vm.set_exception_state(crate::exception::ExceptionState::Finally);
     }
 
@@ -426,6 +430,42 @@ pub fn clear_exception(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFl
     vm.clear_active_exception();
     vm.clear_exception_state();
     ControlFlow::Continue
+}
+
+/// Enter an `except` handler and preserve its exception for nested handlers.
+#[inline(always)]
+pub fn enter_except(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
+    if vm.enter_except_handler() {
+        ControlFlow::Continue
+    } else {
+        ControlFlow::Error(RuntimeError::internal(
+            "EnterExcept without an active exception",
+        ))
+    }
+}
+
+/// Exit an `except` handler normally and restore any outer handler context.
+#[inline(always)]
+pub fn exit_except(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
+    if vm.exit_except_handler() {
+        ControlFlow::Continue
+    } else {
+        ControlFlow::Error(RuntimeError::internal(
+            "ExitExcept without an active handler",
+        ))
+    }
+}
+
+/// Abort the current `except` handler while an exception escapes.
+#[inline(always)]
+pub fn abort_except(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
+    if vm.abort_except_handler() {
+        ControlFlow::Continue
+    } else {
+        ControlFlow::Error(RuntimeError::internal(
+            "AbortExcept without an active handler",
+        ))
+    }
 }
 
 // =============================================================================

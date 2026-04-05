@@ -2227,6 +2227,7 @@ impl Compiler {
             self.builder.bind_label(handler_labels[i]);
 
             let handler_start_pc = self.builder.current_pc();
+            let handler_abort_label = self.builder.create_label();
 
             // Compile handler match logic
             let type_idx = if let Some(type_expr) = &handler.typ {
@@ -2303,18 +2304,18 @@ impl Compiler {
             // Handler Body Execution
             // =============================================================
 
-            // NOTE: We do NOT clear the exception here at the start.
-            // Bare `raise` inside the handler needs to access the exception.
-            // We clear it AFTER the handler body completes successfully.
+            self.builder.emit(Instruction::op(Opcode::EnterExcept));
+            let handler_body_start_pc = self.builder.current_pc();
 
             // Compile handler body
             for stmt in &handler.body {
                 self.compile_stmt(stmt)?;
             }
+            let handler_body_end_pc = self.builder.current_pc();
 
-            // Clear exception state AFTER successful handler execution
-            // If handler body contained bare `raise`, control flow never reaches here
-            self.builder.emit(Instruction::op(Opcode::ClearException));
+            // Successful handler completion restores any outer handler context
+            // and fully clears the exception when this was the outermost handler.
+            self.builder.emit(Instruction::op(Opcode::ExitExcept));
 
             // Jump to finally or end after successful handler execution
             if let Some(fin_label) = finally_label {
@@ -2322,6 +2323,11 @@ impl Compiler {
             } else {
                 self.builder.emit_jump(end_label);
             }
+
+            self.builder.bind_label(handler_abort_label);
+            let handler_abort_pc = self.builder.current_pc();
+            self.builder.emit(Instruction::op(Opcode::AbortExcept));
+            self.builder.emit(Instruction::op(Opcode::Reraise));
 
             // Add exception entry for this handler
             self.builder.add_exception_entry(ExceptionEntry {
@@ -2332,6 +2338,17 @@ impl Compiler {
                 depth: stack_depth as u16,
                 exception_type_idx: type_idx.unwrap_or(u16::MAX),
             });
+
+            if handler_body_start_pc < handler_body_end_pc {
+                self.builder.add_exception_entry(ExceptionEntry {
+                    start_pc: handler_body_start_pc,
+                    end_pc: handler_body_end_pc,
+                    handler_pc: handler_abort_pc,
+                    finally_pc: u32::MAX,
+                    depth: stack_depth as u16,
+                    exception_type_idx: u16::MAX,
+                });
+            }
         }
 
         // =================================================================

@@ -35,6 +35,14 @@ pub(crate) enum GeneratorResumeOutcome {
     Returned(Value),
 }
 
+/// Active `except` handler context that must survive nested handlers.
+#[derive(Debug, Clone, Copy)]
+struct ActiveExceptHandler {
+    frame_id: u32,
+    value: Value,
+    type_id: u16,
+}
+
 /// The Prism virtual machine.
 ///
 /// Executes register-based bytecode with:
@@ -92,6 +100,8 @@ pub struct VirtualMachine {
     active_exception_type_id: Option<u16>,
     /// Exception info stack for CPython 3.11+ semantics.
     exc_info_stack: ExcInfoStack,
+    /// Stack of entered except handlers for nested bare-raise semantics.
+    active_except_handlers: Vec<ActiveExceptHandler>,
     /// Import resolver for module imports.
     pub import_resolver: ImportResolver,
 }
@@ -117,6 +127,7 @@ impl VirtualMachine {
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
+            active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -141,6 +152,7 @@ impl VirtualMachine {
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
+            active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -170,6 +182,7 @@ impl VirtualMachine {
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
+            active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -194,6 +207,7 @@ impl VirtualMachine {
             active_exception: None,
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
+            active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
         }
     }
@@ -202,6 +216,33 @@ impl VirtualMachine {
     #[inline(always)]
     fn set_current_frame_idx(&mut self, idx: usize) {
         self.current_frame_idx = idx;
+    }
+
+    #[inline]
+    fn restore_outer_except_handler(&mut self) {
+        if let Some(previous) = self.active_except_handlers.last().copied() {
+            self.active_exception = Some(previous.value);
+            self.active_exception_type_id = Some(previous.type_id);
+            self.exc_state = ExceptionState::Handling;
+        } else {
+            self.active_exception = None;
+            self.active_exception_type_id = None;
+            self.exc_state = ExceptionState::Normal;
+        }
+    }
+
+    #[inline]
+    fn discard_except_handlers_for_frame(&mut self, frame_id: u32) {
+        while self
+            .active_except_handlers
+            .last()
+            .is_some_and(|entry| entry.frame_id == frame_id)
+        {
+            self.active_except_handlers.pop();
+        }
+        if self.exc_state == ExceptionState::Handling {
+            self.restore_outer_except_handler();
+        }
     }
 
     // =========================================================================
@@ -910,6 +951,7 @@ impl VirtualMachine {
     fn pop_top_frame_for_unwind(&mut self) {
         let top_idx = self.frames.len() - 1;
         self.handler_stack.pop_frame_handlers(top_idx as u32);
+        self.discard_except_handlers_for_frame(top_idx as u32);
         self.frames.pop();
         self.set_current_frame_idx(self.frames.len().saturating_sub(1));
     }
@@ -919,6 +961,7 @@ impl VirtualMachine {
     pub fn pop_frame(&mut self, return_value: Value) -> VmResult<Option<Value>> {
         let top_idx = self.frames.len() - 1;
         self.handler_stack.pop_frame_handlers(top_idx as u32);
+        self.discard_except_handlers_for_frame(top_idx as u32);
         let frame = self.frames.pop().expect("no frame to pop");
 
         if self.frames.is_empty() {
@@ -977,6 +1020,7 @@ impl VirtualMachine {
         self.active_exception = None;
         self.active_exception_type_id = None;
         self.exc_info_stack.clear();
+        self.active_except_handlers.clear();
     }
 
     /// Clear only the frame stack (keep globals).
@@ -988,6 +1032,7 @@ impl VirtualMachine {
         self.active_exception = None;
         self.active_exception_type_id = None;
         self.exc_info_stack.clear();
+        self.active_except_handlers.clear();
         self.exc_state = ExceptionState::Normal;
     }
 
@@ -1112,6 +1157,51 @@ impl VirtualMachine {
         self.active_exception_type_id
     }
 
+    /// Enter an `except` handler and preserve its exception for nested handlers.
+    #[inline]
+    pub fn enter_except_handler(&mut self) -> bool {
+        let Some(value) = self.active_exception else {
+            return false;
+        };
+        let Some(type_id) = self.active_exception_type_id else {
+            return false;
+        };
+
+        self.active_except_handlers.push(ActiveExceptHandler {
+            frame_id: self.current_frame_id(),
+            value,
+            type_id,
+        });
+        self.exc_state = ExceptionState::Handling;
+        true
+    }
+
+    /// Exit the current `except` handler normally.
+    #[inline]
+    pub fn exit_except_handler(&mut self) -> bool {
+        if self.active_except_handlers.pop().is_none() {
+            return false;
+        }
+
+        self.restore_outer_except_handler();
+        true
+    }
+
+    /// Abort the current `except` handler while preserving the new propagating exception.
+    #[inline]
+    pub fn abort_except_handler(&mut self) -> bool {
+        if self.active_except_handlers.pop().is_none() {
+            return false;
+        }
+
+        self.exc_state = if self.active_exception_type_id.is_some() {
+            ExceptionState::Propagating
+        } else {
+            ExceptionState::Normal
+        };
+        true
+    }
+
     /// Push an exception handler onto the handler stack.
     ///
     /// Returns false if the stack is full.
@@ -1133,11 +1223,9 @@ impl VirtualMachine {
     /// PopExcInfo may have changed it during the finally execution.
     #[inline]
     pub fn should_reraise_after_finally(&self) -> bool {
-        // If there's an active exception with a valid type, reraise it
-        // This handles both:
-        // 1. Normal exceptions that entered finally during propagation
-        // 2. Pop'd exception info that was restored as active
-        self.active_exception_type_id.is_some() && self.active_exception_type_id != Some(0)
+        self.exc_state == ExceptionState::Propagating
+            && self.active_exception_type_id.is_some()
+            && self.active_exception_type_id != Some(0)
     }
 
     /// Clear the reraise flag after handling.
@@ -1196,8 +1284,9 @@ impl VirtualMachine {
     ///
     /// # Performance
     ///
-    /// Exception tables are typically small (<10 entries) and sorted by start_pc.
-    /// Linear scan with early termination is optimal for this size.
+    /// Exception tables are typically small (<10 entries).
+    /// We prefer the most specific covering range so nested handlers work even
+    /// when entries are emitted in source order rather than sorted order.
     #[inline]
     pub fn find_exception_handler(&mut self, _type_id: u16) -> Option<u32> {
         let pc = {
@@ -1221,21 +1310,28 @@ impl VirtualMachine {
                 .invalidate();
         }
 
-        // Slow path: linear scan (tables are small and sorted by start_pc).
+        // Slow path: linear scan for the most specific covering region.
         let matched = {
             let frame = &self.frames[self.current_frame_idx];
-            let mut matched: Option<(u16, u32)> = None;
+            let mut matched: Option<(u16, u32, u32, u32)> = None;
             for (idx, entry) in frame.code.exception_table.iter().enumerate() {
-                if pc >= entry.start_pc && pc < entry.end_pc {
-                    matched = Some((idx as u16, entry.handler_pc));
-                    break;
+                if pc < entry.start_pc || pc >= entry.end_pc {
+                    continue;
                 }
 
-                if pc < entry.start_pc {
-                    break;
+                let span = entry.end_pc.saturating_sub(entry.start_pc);
+                let replace = match matched {
+                    None => true,
+                    Some((_, _, best_span, best_start)) => {
+                        span < best_span || (span == best_span && entry.start_pc > best_start)
+                    }
+                };
+
+                if replace {
+                    matched = Some((idx as u16, entry.handler_pc, span, entry.start_pc));
                 }
             }
-            matched
+            matched.map(|(idx, handler_pc, _, _)| (idx, handler_pc))
         };
 
         if let Some((handler_idx, handler_pc)) = matched {
@@ -1269,22 +1365,31 @@ impl VirtualMachine {
     /// Returns false if stack is full.
     #[inline]
     pub fn push_exc_info(&mut self) -> bool {
-        use crate::exception::ExcInfoEntry;
+        use crate::exception::{EntryFlags, ExcInfoEntry};
 
         let type_id = self.get_active_exception_type_id().unwrap_or(0);
         let value = self.active_exception.clone();
-        let entry = ExcInfoEntry::new(type_id, value);
+        let mut entry = ExcInfoEntry::new(type_id, value);
+        if self.exc_state == ExceptionState::Handling {
+            entry.flags_mut().set(EntryFlags::HANDLING);
+        }
         self.exc_info_stack.push(entry)
     }
 
     /// Pop exception info from the stack and restore it as active.
     #[inline]
     pub fn pop_exc_info(&mut self) -> bool {
+        use crate::exception::EntryFlags;
+
         if let Some(entry) = self.exc_info_stack.pop() {
             if entry.is_active() {
                 self.active_exception = entry.value_cloned();
                 self.active_exception_type_id = Some(entry.type_id());
-                self.exc_state = ExceptionState::Propagating;
+                self.exc_state = if entry.flags().has(EntryFlags::HANDLING) {
+                    ExceptionState::Handling
+                } else {
+                    ExceptionState::Propagating
+                };
             } else {
                 self.active_exception = None;
                 self.active_exception_type_id = None;
@@ -1532,6 +1637,46 @@ mod tests {
     }
 
     #[test]
+    fn test_exit_except_handler_restores_outer_context() {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(empty_code("outer"), 0).unwrap();
+
+        vm.set_active_exception_with_type(Value::int(10).unwrap(), 24);
+        assert!(vm.enter_except_handler());
+        assert_eq!(vm.exception_state(), ExceptionState::Handling);
+
+        vm.set_active_exception_with_type(Value::int(20).unwrap(), 25);
+        assert!(vm.enter_except_handler());
+        assert_eq!(vm.get_active_exception_type_id(), Some(25));
+
+        assert!(vm.exit_except_handler());
+        assert_eq!(vm.get_active_exception_type_id(), Some(24));
+        assert_eq!(vm.get_active_exception().and_then(Value::as_int), Some(10));
+        assert_eq!(vm.exception_state(), ExceptionState::Handling);
+
+        assert!(vm.exit_except_handler());
+        assert!(vm.get_active_exception().is_none());
+        assert_eq!(vm.get_active_exception_type_id(), None);
+        assert_eq!(vm.exception_state(), ExceptionState::Normal);
+    }
+
+    #[test]
+    fn test_abort_except_handler_preserves_escaping_exception() {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(empty_code("outer"), 0).unwrap();
+
+        vm.set_active_exception_with_type(Value::int(10).unwrap(), 24);
+        assert!(vm.enter_except_handler());
+
+        vm.set_active_exception_with_type(Value::int(99).unwrap(), 33);
+        assert!(vm.abort_except_handler());
+
+        assert_eq!(vm.get_active_exception_type_id(), Some(33));
+        assert_eq!(vm.get_active_exception().and_then(Value::as_int), Some(99));
+        assert_eq!(vm.exception_state(), ExceptionState::Propagating);
+    }
+
+    #[test]
     fn test_find_exception_handler_populates_cache_and_hits_fast_path() {
         let mut vm = VirtualMachine::new();
         let code = code_with_exception_entries(
@@ -1571,6 +1716,25 @@ mod tests {
                 || vm.current_frame().handler_cache.cached_handler().is_none()
         );
         assert_eq!(vm.current_frame().handler_cache.cached_pc(), Some(2));
+    }
+
+    #[test]
+    fn test_find_exception_handler_prefers_most_specific_range_when_unsorted() {
+        let mut vm = VirtualMachine::new();
+        let code = code_with_exception_entries(
+            "eh_nested",
+            vec![
+                catch_all_entry(0, 20, 100),
+                catch_all_entry(5, 10, 200),
+                catch_all_entry(0, 12, 150),
+            ],
+        );
+
+        vm.push_frame(code, 0).unwrap();
+        vm.current_frame_mut().ip = 8;
+
+        assert_eq!(vm.find_exception_handler(24), Some(200));
+        assert_eq!(vm.current_frame().handler_cache.cached_handler(), Some(1));
     }
 
     #[test]

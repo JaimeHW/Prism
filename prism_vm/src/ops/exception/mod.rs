@@ -42,10 +42,10 @@ pub mod traceback;
 
 // Re-export opcode handlers for direct use
 pub use opcodes::{
-    bind_exception, check_exc_match, check_exc_match_tuple, clear_exception, end_finally,
-    exception_match, get_exception, get_exception_traceback, has_exc_info, load_exception,
-    pop_exc_info, pop_except_handler, push_exc_info, raise, raise_from, raise_with_cause, reraise,
-    setup_except,
+    abort_except, bind_exception, check_exc_match, check_exc_match_tuple, clear_exception,
+    end_finally, enter_except, exception_match, exit_except, get_exception,
+    get_exception_traceback, has_exc_info, load_exception, pop_exc_info, pop_except_handler,
+    push_exc_info, raise, raise_from, raise_with_cause, reraise, setup_except,
 };
 
 // Re-export commonly used items

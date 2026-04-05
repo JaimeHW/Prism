@@ -595,6 +595,12 @@ pub enum Opcode {
     /// Implements the send protocol for coroutines and generators.
     /// src1 = generator/coroutine, src2 = value to send.
     Send = 0xA4,
+    /// Enter an except handler and mark its exception as active handler context.
+    EnterExcept = 0xA5,
+    /// Exit an except handler normally and restore any outer handler context.
+    ExitExcept = 0xA6,
+    /// Abort the current except handler while an exception escapes.
+    AbortExcept = 0xA7,
 }
 
 impl Opcode {
@@ -744,6 +750,9 @@ impl Opcode {
             0xA2 => Some(Opcode::GetANext),
             0xA3 => Some(Opcode::EndAsyncFor),
             0xA4 => Some(Opcode::Send),
+            0xA5 => Some(Opcode::EnterExcept),
+            0xA6 => Some(Opcode::ExitExcept),
+            0xA7 => Some(Opcode::AbortExcept),
 
             _ => None,
         }
@@ -833,6 +842,7 @@ impl Opcode {
             GetAwaitable | GetAIter | GetANext => DstSrc, // dst = result, src = object
             EndAsyncFor => DstImm16,                      // dst = value, imm16 = jump offset
             Send => DstSrcSrc,                            // dst = result, src1 = gen, src2 = value
+            EnterExcept | ExitExcept | AbortExcept => NoOp,
         }
     }
 }

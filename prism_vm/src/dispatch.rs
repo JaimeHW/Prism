@@ -300,6 +300,9 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::GetANext as usize] = coroutine::get_anext;
     table[Opcode::EndAsyncFor as usize] = coroutine::end_async_for;
     table[Opcode::Send as usize] = coroutine::send;
+    table[Opcode::EnterExcept as usize] = exception::enter_except;
+    table[Opcode::ExitExcept as usize] = exception::exit_except;
+    table[Opcode::AbortExcept as usize] = exception::abort_except;
 
     table
 }
