@@ -1170,6 +1170,67 @@ except StopIteration:
 }
 
 #[test]
+fn test_iter_on_generator_returns_same_object_and_honors_default() {
+    assert_executes(
+        r#"
+def gen():
+    yield 1
+
+g = gen()
+assert iter(g) is g
+assert next(g) == 1
+assert next(g, 99) == 99
+"#,
+        "iter_on_generator_returns_same_object_and_honors_default",
+    );
+}
+
+#[test]
+fn test_bare_raise_after_nested_handler_restores_outer_exception() {
+    assert_executes(
+        r#"
+caught_outer = False
+try:
+    try:
+        raise KeyError("outer")
+    except KeyError:
+        try:
+            raise ValueError("inner")
+        except ValueError:
+            pass
+        raise
+except KeyError:
+    caught_outer = True
+
+assert caught_outer
+"#,
+        "bare_raise_after_nested_handler_restores_outer_exception",
+    );
+}
+
+#[test]
+fn test_exception_escaping_nested_handler_reaches_enclosing_handler() {
+    assert_executes(
+        r#"
+caught = False
+try:
+    try:
+        raise KeyError("outer")
+    except KeyError:
+        try:
+            raise ValueError("inner")
+        except ValueError:
+            raise TypeError("escaped")
+except TypeError:
+    caught = True
+
+assert caught
+"#,
+        "exception_escaping_nested_handler_reaches_enclosing_handler",
+    );
+}
+
+#[test]
 fn test_exception_clears_after_except() {
     assert_executes(
         r#"

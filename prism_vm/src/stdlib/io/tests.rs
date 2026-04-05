@@ -457,7 +457,7 @@ mod bytes_io_tests {
     #[test]
     fn test_new_empty() {
         let bio = BytesIO::new();
-        assert_eq!(bio.getvalue(), &[]);
+        assert_eq!(bio.getvalue(), b"");
         assert_eq!(bio.len(), 0);
         assert!(bio.is_empty());
     }
@@ -478,7 +478,7 @@ mod bytes_io_tests {
     #[test]
     fn test_default() {
         let bio = BytesIO::default();
-        assert_eq!(bio.getvalue(), &[]);
+        assert_eq!(bio.getvalue(), b"");
     }
 
     // =========================================================================
@@ -733,7 +733,7 @@ mod bytes_io_tests {
     fn test_truncate_to_zero() {
         let mut bio = BytesIO::with_initial(b"hello");
         bio.truncate(Some(0)).unwrap();
-        assert_eq!(bio.getvalue(), &[]);
+        assert_eq!(bio.getvalue(), b"");
     }
 
     // =========================================================================
