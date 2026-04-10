@@ -556,6 +556,7 @@ dependencies = [
  "prism_core",
  "prism_parser",
  "prism_vm",
+ "serde",
  "serde_json",
 ]
 
