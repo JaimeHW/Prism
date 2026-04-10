@@ -3,14 +3,8 @@
 //! This is the main CLI entry point that provides CPython-compatible
 //! command-line interface for running Python programs.
 
-mod args;
-mod config;
-mod diagnostics;
-mod error;
-mod pipeline;
-mod repl;
-
-use args::ExecutionMode;
+use prism_cli::args::{self, ExecutionMode};
+use prism_cli::{config, error, pipeline, repl};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
