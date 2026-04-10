@@ -75,6 +75,14 @@ pub struct ModuleManifest {
     pub static_imports: Vec<String>,
     /// Candidate submodules referenced through `from ... import ...`.
     pub from_import_candidates: Vec<String>,
+    /// Whether the current native lowering subset can emit a module-init stub.
+    pub native_init_supported: bool,
+    /// Stable symbol name for the native init stub when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_init_symbol: Option<String>,
+    /// Diagnostic describing why native lowering is not yet available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_init_diagnostic: Option<String>,
 }
 
 impl BuildManifest {
@@ -138,6 +146,12 @@ impl From<&BuildPlan> for BuildManifest {
                     nested_code_object_count: module.nested_code_object_count,
                     static_imports: module.static_imports.clone(),
                     from_import_candidates: module.from_import_candidates.clone(),
+                    native_init_supported: module.native_init.is_some(),
+                    native_init_symbol: module
+                        .native_init
+                        .as_ref()
+                        .map(|plan| plan.symbol_name.clone()),
+                    native_init_diagnostic: module.native_init_diagnostic.clone(),
                 })
                 .collect(),
         }

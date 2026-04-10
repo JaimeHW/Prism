@@ -7,6 +7,7 @@ use prism_vm::stdlib::StdlibRegistry;
 use crate::bundle::CodeImage;
 use crate::error::AotError;
 use crate::imports::collect_static_imports;
+use crate::native::NativeModuleInitPlan;
 
 /// Initial entrypoint for an AOT build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,10 @@ pub struct PlannedModule {
     pub from_import_candidates: Vec<String>,
     /// Deterministic serialized code image for future native lowering.
     pub code_image: Option<CodeImage>,
+    /// Native top-level init plan when the source module fits the current AOT subset.
+    pub native_init: Option<NativeModuleInitPlan>,
+    /// Lowering diagnostic when native init emission is not yet supported.
+    pub native_init_diagnostic: Option<String>,
 }
 
 /// Entire build plan for a standalone native executable.
@@ -190,6 +195,8 @@ impl BuildPlanner {
                         static_imports: Vec::new(),
                         from_import_candidates: Vec::new(),
                         code_image: None,
+                        native_init: None,
+                        native_init_diagnostic: None,
                     },
                 );
                 continue;
@@ -411,6 +418,11 @@ impl BuildPlanner {
         })?;
         let static_imports = collect_static_imports(&parsed, &resolved.package_name)?;
         let code_image = CodeImage::from_code_object(&resolved.module_name, &code)?;
+        let (native_init, native_init_diagnostic) =
+            match NativeModuleInitPlan::lower(&resolved.module_name, &parsed) {
+                Ok(plan) => (Some(plan), None),
+                Err(err) => (None, Some(err.to_string())),
+            };
 
         Ok(PlannedModule {
             name: resolved.module_name.clone(),
@@ -424,6 +436,8 @@ impl BuildPlanner {
             static_imports: static_imports.required_modules,
             from_import_candidates: static_imports.from_import_candidates,
             code_image: Some(code_image),
+            native_init,
+            native_init_diagnostic,
         })
     }
 
@@ -782,5 +796,29 @@ mod tests {
         assert_eq!(parsed["formatVersion"], 1);
         assert_eq!(parsed["entry"]["canonicalModule"], "__main__");
         assert!(parsed["modules"].is_array());
+    }
+
+    #[test]
+    fn test_plan_tracks_native_init_support_diagnostics() {
+        let temp = TestTempDir::new();
+        let main_path = temp.path.join("main.py");
+        write_file(&main_path, "def helper():\n    return 1\n");
+
+        let plan = planner_for(&temp.path)
+            .plan(BuildEntry::Script(main_path))
+            .expect("plan should still succeed for non-lowerable source");
+        let main = plan
+            .modules
+            .iter()
+            .find(|module| module.name == "__main__")
+            .expect("main module should exist");
+
+        assert!(main.native_init.is_none());
+        assert!(
+            main.native_init_diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot lower statement")
+        );
     }
 }

@@ -8,6 +8,7 @@ mod error;
 mod imports;
 mod link;
 mod manifest;
+mod native;
 mod planner;
 mod runtime;
 
@@ -21,6 +22,10 @@ pub use link::{
     LinkableBundleArtifact,
 };
 pub use manifest::{BuildManifest, EntryManifest, InvocationManifest, ModuleManifest};
+pub use native::{
+    NativeExpr, NativeImmediate, NativeInitOperation, NativeLoweringError, NativeModuleInitPlan,
+    NativeOperand, native_init_symbol,
+};
 pub use planner::{
     BuildEntry, BuildOptions, BuildPlan, BuildPlanner, ModuleKind, PlannedEntry, PlannedModule,
 };
