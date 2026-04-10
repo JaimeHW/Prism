@@ -47,6 +47,7 @@
 #![allow(clippy::new_without_default)]
 
 // Core modules
+pub mod aot_abi;
 pub mod allocator;
 pub mod error;
 pub mod frame;

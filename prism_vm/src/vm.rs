@@ -107,6 +107,8 @@ pub struct VirtualMachine {
     pub import_resolver: ImportResolver,
     /// Optimization level used when compiling imported source modules.
     compiler_optimization: OptimizationLevel,
+    /// Most recent runtime error reported by a native AOT helper call.
+    last_aot_error: Option<RuntimeError>,
 }
 
 impl VirtualMachine {
@@ -132,28 +134,45 @@ impl VirtualMachine {
         }
     }
 
+    pub(crate) fn module_scope_value_for_module(
+        &self,
+        module: &ModuleObject,
+        name: &str,
+    ) -> Option<Value> {
+        if let Some(value) = module.get_attr(name) {
+            return Some(value);
+        }
+
+        if module.name() == "__main__" {
+            return self.globals.get(name);
+        }
+
+        None
+    }
+
     pub fn module_scope_value(&self, name: &Arc<str>) -> Option<Value> {
         if let Some(module) = self.current_module() {
-            if let Some(value) = module.get_attr(name) {
-                return Some(value);
-            }
-
-            if module.name() == "__main__" {
-                return self.globals.get_arc(name);
-            }
-
-            None
+            self.module_scope_value_for_module(module, name)
         } else {
             self.globals.get_arc(name)
         }
     }
 
+    pub(crate) fn set_module_scope_value_for_module(
+        &mut self,
+        module: &Arc<ModuleObject>,
+        name: &str,
+        value: Value,
+    ) {
+        module.set_attr(name, value);
+        if module.name() == "__main__" {
+            self.globals.set(Arc::from(name), value);
+        }
+    }
+
     pub fn set_module_scope_value(&mut self, name: Arc<str>, value: Value) {
         if let Some(module) = self.current_module_cloned() {
-            module.set_attr(&name, value);
-            if module.name() == "__main__" {
-                self.globals.set(name, value);
-            }
+            self.set_module_scope_value_for_module(&module, &name, value);
         } else {
             self.globals.set(name, value);
         }
@@ -221,6 +240,18 @@ impl VirtualMachine {
         self.compiler_optimization = level;
     }
 
+    pub(crate) fn record_aot_error(&mut self, err: RuntimeError) {
+        self.last_aot_error = Some(err);
+    }
+
+    pub(crate) fn clear_last_aot_error(&mut self) {
+        self.last_aot_error = None;
+    }
+
+    pub fn take_last_aot_error(&mut self) -> Option<RuntimeError> {
+        self.last_aot_error.take()
+    }
+
     fn import_error_to_runtime(err: ImportError) -> RuntimeError {
         let module = match &err {
             ImportError::ModuleNotFound { module }
@@ -236,13 +267,17 @@ impl VirtualMachine {
         })
     }
 
-    fn resolve_import_name(&self, raw_name: &str) -> VmResult<String> {
+    fn resolve_import_name_with_context(
+        &self,
+        raw_name: &str,
+        current_module: Option<&ModuleObject>,
+    ) -> VmResult<String> {
         let level = raw_name.chars().take_while(|ch| *ch == '.').count() as u32;
         if level == 0 {
             return Ok(raw_name.to_string());
         }
 
-        let current_module = self.current_module().ok_or_else(|| {
+        let current_module = current_module.ok_or_else(|| {
             RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
                 module: Arc::from(raw_name),
                 message: Arc::from("relative import outside of module execution"),
@@ -251,6 +286,10 @@ impl VirtualMachine {
         let package = current_module.package_name().unwrap_or("");
         resolve_relative_import(&raw_name[level as usize..], level, package)
             .map_err(Self::import_error_to_runtime)
+    }
+
+    fn resolve_import_name(&self, raw_name: &str) -> VmResult<String> {
+        self.resolve_import_name_with_context(raw_name, self.current_module())
     }
 
     fn compile_source_module(
@@ -515,8 +554,13 @@ impl VirtualMachine {
         }
     }
 
-    pub fn import_module_named(&mut self, raw_name: &str) -> VmResult<Arc<ModuleObject>> {
-        let absolute_name = self.resolve_import_name(raw_name)?;
+    pub(crate) fn import_module_with_context(
+        &mut self,
+        raw_name: &str,
+        current_module: Option<&Arc<ModuleObject>>,
+    ) -> VmResult<Arc<ModuleObject>> {
+        let absolute_name =
+            self.resolve_import_name_with_context(raw_name, current_module.map(Arc::as_ref))?;
 
         if let Some(module) = self.import_resolver.get_cached(&absolute_name) {
             return Ok(module);
@@ -536,7 +580,7 @@ impl VirtualMachine {
         let top_level = segments
             .next()
             .expect("dotted import missing top-level segment");
-        let mut current = self.import_module_named(top_level)?;
+        let mut current = self.import_module_with_context(top_level, current_module)?;
         let mut prefix = top_level.to_string();
 
         for segment in segments {
@@ -576,6 +620,23 @@ impl VirtualMachine {
         Ok(current)
     }
 
+    pub fn import_module_named(&mut self, raw_name: &str) -> VmResult<Arc<ModuleObject>> {
+        let current_module = self.current_module_cloned();
+        self.import_module_with_context(raw_name, current_module.as_ref())
+    }
+
+    pub(crate) fn import_from_with_context(
+        &mut self,
+        module_spec: &str,
+        name: &str,
+        current_module: Option<&Arc<ModuleObject>>,
+    ) -> VmResult<Value> {
+        let module = self.import_module_with_context(module_spec, current_module)?;
+        self.import_resolver
+            .import_from(&module, name)
+            .map_err(Self::import_error_to_runtime)
+    }
+
     /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
         Self {
@@ -599,6 +660,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
             compiler_optimization: OptimizationLevel::None,
+            last_aot_error: None,
         }
     }
 
@@ -625,6 +687,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
             compiler_optimization: OptimizationLevel::None,
+            last_aot_error: None,
         }
     }
 
@@ -656,6 +719,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
             compiler_optimization: OptimizationLevel::None,
+            last_aot_error: None,
         }
     }
 
@@ -682,6 +746,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
             compiler_optimization: OptimizationLevel::None,
+            last_aot_error: None,
         }
     }
 
