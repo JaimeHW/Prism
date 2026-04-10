@@ -249,6 +249,7 @@ fn default_target() -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -289,6 +290,38 @@ mod tests {
             std::fs::create_dir_all(parent).expect("failed to create parent dir");
         }
         std::fs::write(path, content).expect("failed to write test file");
+    }
+
+    fn execute_frozen_bundle(
+        bundle: &FrozenModuleBundle,
+    ) -> Result<Arc<prism_vm::import::ModuleObject>, String> {
+        let runtime = bundle
+            .decode_runtime_bundle()
+            .map_err(|err| err.to_string())?;
+        let entry = runtime.entry_module().map_err(|err| err.to_string())?;
+
+        let mut vm = prism_vm::VirtualMachine::new();
+        for module in &runtime.modules {
+            vm.import_resolver.insert_frozen_module(
+                module.name.as_ref(),
+                prism_vm::import::FrozenModuleSource::new(
+                    Arc::clone(&module.code),
+                    Arc::clone(&module.filename),
+                    Arc::clone(&module.package_name),
+                    module.is_package,
+                ),
+            );
+        }
+
+        let main_module = Arc::new(prism_vm::import::ModuleObject::with_metadata(
+            Arc::clone(&runtime.entry.execution_name),
+            None,
+            Some(Arc::clone(&entry.filename)),
+            Some(Arc::clone(&runtime.entry.package_name)),
+        ));
+        vm.execute_in_module(Arc::clone(&entry.code), Arc::clone(&main_module))
+            .map_err(|err| err.to_string())?;
+        Ok(main_module)
     }
 
     #[test]
@@ -436,6 +469,41 @@ mod tests {
                 .expect("object metadata should exist")
                 .len()
                 > 0
+        );
+    }
+
+    #[test]
+    fn test_execute_built_bundle_runs_package_entrypoint() {
+        let temp = TestTempDir::new();
+        let manifest_output = temp.path.join("out").join("build-plan.json");
+        let bundle_output = temp.path.join("out").join("frozen-modules.prism");
+        write_file(&temp.path.join("pkg").join("__init__.py"), "");
+        write_file(
+            &temp.path.join("pkg").join("__main__.py"),
+            "from .helper import VALUE\nRESULT = VALUE + 5\n",
+        );
+        write_file(&temp.path.join("pkg").join("helper.py"), "VALUE = 37\n");
+
+        let args = CompilerArgs {
+            entry: BuildEntry::Module("pkg".to_string()),
+            output: manifest_output,
+            bundle_output: bundle_output.clone(),
+            object_output: None,
+            optimize: OptimizationLevel::Basic,
+            target: "x86_64-pc-windows-msvc".to_string(),
+            search_paths: vec![temp.path.clone()],
+        };
+
+        execute_build(&args).expect("build execution should succeed");
+        let bundle = FrozenModuleBundle::read_from_path(&bundle_output)
+            .expect("frozen bundle should round-trip from disk");
+        let main_module = execute_frozen_bundle(&bundle).expect("bundle should execute");
+
+        assert_eq!(
+            main_module
+                .get_attr("RESULT")
+                .and_then(|value| value.as_int()),
+            Some(42)
         );
     }
 
