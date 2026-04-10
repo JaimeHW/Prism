@@ -438,13 +438,47 @@ impl VirtualMachine {
             })
         })?;
         let filename: Arc<str> = Arc::from(location.path.to_string_lossy().into_owned());
-        let package_name: Arc<str> = if location.is_package {
-            Arc::from(name)
-        } else if let Some((package, _)) = name.rsplit_once('.') {
-            Arc::from(package)
-        } else {
-            Arc::from("")
+        let code = self.compile_source_module(name, &source, filename.as_ref());
+
+        let code = match code {
+            Ok(code) => code,
+            Err(err) => return Err(err),
         };
+
+        self.execute_loaded_module(
+            name,
+            code,
+            filename,
+            module_package_name(name, location.is_package),
+        )
+    }
+
+    fn load_frozen_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
+        if let Some(module) = self.import_resolver.get_cached(name) {
+            return Ok(module);
+        }
+
+        let Some(frozen) = self.import_resolver.get_frozen_module(name) else {
+            return Err(Self::import_error_to_runtime(ImportError::ModuleNotFound {
+                module: Arc::from(name),
+            }));
+        };
+
+        self.execute_loaded_module(
+            name,
+            Arc::clone(&frozen.code),
+            Arc::clone(&frozen.filename),
+            Arc::clone(&frozen.package_name),
+        )
+    }
+
+    fn execute_loaded_module(
+        &mut self,
+        name: &str,
+        code: Arc<CodeObject>,
+        filename: Arc<str>,
+        package_name: Arc<str>,
+    ) -> VmResult<Arc<ModuleObject>> {
         let module = Arc::new(ModuleObject::with_metadata(
             Arc::from(name),
             None,
@@ -454,18 +488,10 @@ impl VirtualMachine {
 
         self.import_resolver
             .insert_module(name, Arc::clone(&module));
-        let code = self.compile_source_module(name, &source, filename.as_ref());
         let caller_depth = self.frames.len();
 
-        let code = match code {
-            Ok(code) => code,
-            Err(err) => {
-                self.import_resolver.remove_module(name);
-                return Err(err);
-            }
-        };
-
-        if let Err(err) = self.push_frame_internal(code, 0, None, Some(Arc::clone(&module)), false)
+        if let Err(err) =
+            self.push_frame_internal(code, 0, None, Some(Arc::clone(&module)), false)
         {
             self.import_resolver.remove_module(name);
             return Err(err);
@@ -481,6 +507,14 @@ impl VirtualMachine {
         Ok(module)
     }
 
+    fn load_non_stdlib_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
+        if self.import_resolver.has_frozen_module(name) {
+            self.load_frozen_module(name)
+        } else {
+            self.load_source_module(name)
+        }
+    }
+
     pub fn import_module_named(&mut self, raw_name: &str) -> VmResult<Arc<ModuleObject>> {
         let absolute_name = self.resolve_import_name(raw_name)?;
 
@@ -491,7 +525,9 @@ impl VirtualMachine {
         if !absolute_name.contains('.') {
             return match self.import_resolver.import_module(&absolute_name) {
                 Ok(module) => Ok(module),
-                Err(ImportError::ModuleNotFound { .. }) => self.load_source_module(&absolute_name),
+                Err(ImportError::ModuleNotFound { .. }) => {
+                    self.load_non_stdlib_module(&absolute_name)
+                }
                 Err(err) => Err(Self::import_error_to_runtime(err)),
             };
         }
@@ -527,7 +563,7 @@ impl VirtualMachine {
                             .insert_module(&prefix, Arc::clone(&module));
                         module
                     } else {
-                        self.load_source_module(&prefix)?
+                        self.load_non_stdlib_module(&prefix)?
                     }
                 }
                 Err(err) => return Err(Self::import_error_to_runtime(err)),
@@ -1885,11 +1921,24 @@ impl Default for VirtualMachine {
     }
 }
 
+fn module_package_name(name: &str, is_package: bool) -> Arc<str> {
+    if is_package {
+        Arc::from(name)
+    } else if let Some((package, _)) = name.rsplit_once('.') {
+        Arc::from(package)
+    } else {
+        Arc::from("")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::FrozenModuleSource;
     use crate::exception::HandlerFrame;
     use prism_compiler::bytecode::{CodeFlags, CodeObject, ExceptionEntry};
+    use prism_compiler::{Compiler, OptimizationLevel};
+    use prism_parser::parse;
     use std::sync::Arc;
 
     fn empty_code(name: &str) -> Arc<CodeObject> {
@@ -1950,6 +1999,14 @@ mod tests {
             depth: 0,
             exception_type_idx: u16::MAX,
         }
+    }
+
+    fn compile_module(source: &str, filename: &str) -> Arc<CodeObject> {
+        let parsed = parse(source).expect("source should parse");
+        Arc::new(
+            Compiler::compile_module_with_optimization(&parsed, filename, OptimizationLevel::Basic)
+                .expect("source should compile"),
+        )
     }
 
     #[test]
@@ -2252,5 +2309,71 @@ mod tests {
         vm.current_frame_mut().ip = 5;
         assert_eq!(vm.find_exception_handler(24), Some(31));
         assert!(vm.current_frame().handler_cache.hit_count() >= 1);
+    }
+
+    #[test]
+    fn test_import_module_named_executes_frozen_module() {
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver.insert_frozen_module(
+            "helper",
+            FrozenModuleSource::new(
+                compile_module("VALUE = 123\n", "<frozen:helper>"),
+                "<frozen:helper>",
+                "",
+                false,
+            ),
+        );
+
+        let helper = vm
+            .import_module_named("helper")
+            .expect("frozen helper should import");
+        assert_eq!(helper.get_attr("VALUE").and_then(|value| value.as_int()), Some(123));
+        assert!(vm.import_resolver.get_cached("helper").is_some());
+    }
+
+    #[test]
+    fn test_execute_in_module_supports_relative_imports_from_frozen_package() {
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver.insert_frozen_module(
+            "pkg",
+            FrozenModuleSource::new(
+                compile_module("PACKAGE = True\n", "<frozen:pkg.__init__>"),
+                "<frozen:pkg.__init__>",
+                "pkg",
+                true,
+            ),
+        );
+        vm.import_resolver.insert_frozen_module(
+            "pkg.helper",
+            FrozenModuleSource::new(
+                compile_module("VALUE = 7\n", "<frozen:pkg.helper>"),
+                "<frozen:pkg.helper>",
+                "pkg",
+                false,
+            ),
+        );
+
+        let main_code = compile_module(
+            "from .helper import VALUE\nRESULT = VALUE + 1\n",
+            "<frozen:pkg.__main__>",
+        );
+        let main_module = Arc::new(ModuleObject::with_metadata(
+            "__main__",
+            None,
+            Some(Arc::from("<frozen:pkg.__main__>")),
+            Some(Arc::from("pkg")),
+        ));
+
+        vm.execute_in_module(main_code, Arc::clone(&main_module))
+            .expect("frozen package entry should execute");
+
+        assert_eq!(
+            main_module
+                .get_attr("RESULT")
+                .and_then(|value| value.as_int()),
+            Some(8)
+        );
+        assert!(vm.import_resolver.get_cached("pkg").is_some());
+        assert!(vm.import_resolver.get_cached("pkg.helper").is_some());
     }
 }

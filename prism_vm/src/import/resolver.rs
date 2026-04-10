@@ -5,7 +5,7 @@
 //! 2. Stdlib registry (built-in modules)
 //! 3. File system (future: .py/.pyc loading)
 
-use super::ModuleObject;
+use super::{FrozenModuleSource, ModuleObject};
 use crate::stdlib::{Module, ModuleError, StdlibRegistry};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
@@ -170,6 +170,9 @@ pub struct ImportResolver {
     /// Future use for .py file loading.
     search_paths: RwLock<Vec<Arc<str>>>,
 
+    /// Frozen source modules installed by the AOT bootstrap path.
+    frozen_modules: RwLock<FxHashMap<InternedString, Arc<FrozenModuleSource>>>,
+
     /// Modules currently being imported (for circular import detection and wait semantics).
     /// Maps module name to ImportState which tracks the loading thread and provides
     /// a Condvar for other threads to wait on.
@@ -203,6 +206,7 @@ impl ImportResolver {
             sys_modules: RwLock::new(FxHashMap::default()),
             stdlib,
             search_paths: RwLock::new(paths),
+            frozen_modules: RwLock::new(FxHashMap::default()),
             loading: RwLock::new(FxHashMap::default()),
             module_ptrs: RwLock::new(FxHashMap::default()),
         }
@@ -528,6 +532,33 @@ impl ImportResolver {
         self.search_paths.write().unwrap().push(path);
     }
 
+    /// Install a frozen source module that can be executed without filesystem access.
+    pub fn insert_frozen_module(&self, name: &str, module: FrozenModuleSource) {
+        let key = intern(name);
+        self.frozen_modules
+            .write()
+            .unwrap()
+            .insert(key, Arc::new(module));
+    }
+
+    /// Resolve a frozen source module by canonical name.
+    pub fn get_frozen_module(&self, name: &str) -> Option<Arc<FrozenModuleSource>> {
+        let key = intern(name);
+        self.frozen_modules.read().unwrap().get(&key).cloned()
+    }
+
+    /// Remove a frozen source module.
+    pub fn remove_frozen_module(&self, name: &str) -> Option<Arc<FrozenModuleSource>> {
+        let key = intern(name);
+        self.frozen_modules.write().unwrap().remove(&key)
+    }
+
+    /// Check whether a frozen source module is installed.
+    pub fn has_frozen_module(&self, name: &str) -> bool {
+        let key = intern(name);
+        self.frozen_modules.read().unwrap().contains_key(&key)
+    }
+
     /// Get current search paths.
     pub fn search_paths(&self) -> Vec<Arc<str>> {
         self.search_paths.read().unwrap().clone()
@@ -570,7 +601,9 @@ impl ImportResolver {
     /// Check if a module is available (cached or in stdlib).
     pub fn module_exists(&self, name: &str) -> bool {
         let key = intern(name);
-        self.sys_modules.read().unwrap().contains_key(&key) || self.stdlib.contains(name)
+        self.sys_modules.read().unwrap().contains_key(&key)
+            || self.frozen_modules.read().unwrap().contains_key(&key)
+            || self.stdlib.contains(name)
     }
 
     fn register_module_ptr(&self, module: &Arc<ModuleObject>) {
@@ -760,6 +793,34 @@ mod tests {
 
         // Unknown modules don't exist
         assert!(!resolver.module_exists("unknown_module_xyz"));
+    }
+
+    #[test]
+    fn test_frozen_module_registry() {
+        let resolver = ImportResolver::new();
+        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+            "<module>",
+            "<frozen>",
+        ));
+
+        resolver.insert_frozen_module(
+            "pkg.helper",
+            FrozenModuleSource::new(code.clone(), "<frozen>", "pkg", false),
+        );
+
+        let frozen = resolver
+            .get_frozen_module("pkg.helper")
+            .expect("frozen module should be available");
+        assert_eq!(frozen.filename.as_ref(), "<frozen>");
+        assert_eq!(frozen.package_name.as_ref(), "pkg");
+        assert!(Arc::ptr_eq(&frozen.code, &code));
+        assert!(resolver.module_exists("pkg.helper"));
+
+        let removed = resolver
+            .remove_frozen_module("pkg.helper")
+            .expect("frozen module should be removable");
+        assert!(Arc::ptr_eq(&removed.code, &code));
+        assert!(resolver.get_frozen_module("pkg.helper").is_none());
     }
 
     #[test]

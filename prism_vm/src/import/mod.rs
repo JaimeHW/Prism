@@ -21,6 +21,7 @@
 //! let value = vm.import_resolver().import_from(&module, "sqrt")?;
 //! ```
 
+pub mod frozen;
 pub mod module_object;
 pub mod package;
 pub mod resolver;
@@ -28,6 +29,7 @@ pub mod resolver;
 #[cfg(test)]
 mod tests;
 
+pub use frozen::FrozenModuleSource;
 pub use module_object::ModuleObject;
 pub use package::{DottedName, resolve_relative_import};
 pub use resolver::{ImportError, ImportResolver, SourceModuleLocation};
