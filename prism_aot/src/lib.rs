@@ -9,6 +9,7 @@ mod imports;
 mod link;
 mod manifest;
 mod planner;
+mod runtime;
 
 pub use bundle::{
     CodeImage, ConstantImage, ExceptionTableImage, FrozenEntryImage, FrozenModuleBundle,
@@ -23,3 +24,4 @@ pub use manifest::{BuildManifest, EntryManifest, InvocationManifest, ModuleManif
 pub use planner::{
     BuildEntry, BuildOptions, BuildPlan, BuildPlanner, ModuleKind, PlannedEntry, PlannedModule,
 };
+pub use runtime::{RuntimeFrozenBundle, RuntimeFrozenEntry, RuntimeFrozenModule};

@@ -105,6 +105,18 @@ impl CodeFlags {
     /// This is class body code.
     pub const CLASS: CodeFlags = CodeFlags(1 << 9);
 
+    /// Bitmask of all currently defined flags.
+    pub const ALL_BITS: u32 = Self::VARARGS.bits()
+        | Self::VARKEYWORDS.bits()
+        | Self::GENERATOR.bits()
+        | Self::COROUTINE.bits()
+        | Self::ASYNC_GENERATOR.bits()
+        | Self::NESTED.bits()
+        | Self::HAS_FREEVARS.bits()
+        | Self::HAS_CELLVARS.bits()
+        | Self::MODULE.bits()
+        | Self::CLASS.bits();
+
     /// Check if a flag is set.
     #[inline]
     pub const fn contains(self, other: CodeFlags) -> bool {
@@ -121,6 +133,16 @@ impl CodeFlags {
     #[inline]
     pub const fn bits(self) -> u32 {
         self.0
+    }
+
+    /// Construct flags from raw bits when every bit is known.
+    #[inline]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL_BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
     }
 }
 
@@ -298,6 +320,19 @@ mod tests {
         assert!(flags.contains(CodeFlags::GENERATOR));
         assert!(flags.contains(CodeFlags::NESTED));
         assert!(!flags.contains(CodeFlags::COROUTINE));
+    }
+
+    #[test]
+    fn test_code_flags_from_bits_accepts_known_flags() {
+        let bits = (CodeFlags::GENERATOR | CodeFlags::MODULE).bits();
+        let flags = CodeFlags::from_bits(bits).expect("known flag set should decode");
+        assert!(flags.contains(CodeFlags::GENERATOR));
+        assert!(flags.contains(CodeFlags::MODULE));
+    }
+
+    #[test]
+    fn test_code_flags_from_bits_rejects_unknown_flags() {
+        assert!(CodeFlags::from_bits(CodeFlags::ALL_BITS | (1 << 31)).is_none());
     }
 
     #[test]
