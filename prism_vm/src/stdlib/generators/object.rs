@@ -139,6 +139,9 @@ pub struct GeneratorObject {
     // === SEND/THROW VALUE ===
     /// Value received via send() or throw().
     receive_value: Option<Value>,
+
+    /// Module globals backing this generator's code.
+    module_ptr: *const (),
 }
 
 impl GeneratorObject {
@@ -158,6 +161,7 @@ impl GeneratorObject {
             liveness_bits: 0,
             storage: FrameStorage::new(),
             receive_value: None,
+            module_ptr: std::ptr::null(),
         }
     }
 
@@ -174,6 +178,7 @@ impl GeneratorObject {
             liveness_bits: 0,
             storage: FrameStorage::new(),
             receive_value: None,
+            module_ptr: std::ptr::null(),
         }
     }
 
@@ -357,6 +362,18 @@ impl GeneratorObject {
         self.receive_value
     }
 
+    /// Record the module globals context that should be restored on resume.
+    #[inline]
+    pub fn set_module_ptr(&mut self, module_ptr: *const ()) {
+        self.module_ptr = module_ptr;
+    }
+
+    /// Get the module globals pointer captured for this generator.
+    #[inline]
+    pub fn module_ptr(&self) -> *const () {
+        self.module_ptr
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Flag Manipulation
     // ═══════════════════════════════════════════════════════════════════════
@@ -398,6 +415,7 @@ impl Clone for GeneratorObject {
             liveness_bits: self.liveness_bits,
             storage: self.storage.clone(),
             receive_value: self.receive_value,
+            module_ptr: self.module_ptr,
         }
     }
 }

@@ -11,6 +11,7 @@ use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::tuple::TupleObject;
+use std::sync::Arc;
 
 // =============================================================================
 // Container Construction
@@ -518,14 +519,7 @@ pub fn import_name(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let module_name = frame.get_name(name_idx).clone();
 
-    // Use dotted import resolution when needed.
-    let import_result = if module_name.contains('.') {
-        vm.import_resolver.import_dotted(&module_name)
-    } else {
-        vm.import_resolver.import_module(&module_name)
-    };
-
-    match import_result {
+    match vm.import_module_named(&module_name) {
         Ok(module) => {
             // Store a stable pointer to the cached ModuleObject.
             // ImportResolver owns the Arc in sys.modules, so this pointer stays valid.
@@ -575,23 +569,33 @@ pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    // Get the attribute from the module
-    match module.get_attr(&attr_name) {
-        Some(value) => {
+    match vm.import_resolver.import_from(&module, &attr_name) {
+        Ok(value) => {
             vm.current_frame_mut().set_reg(dst.0, value);
             ControlFlow::Continue
         }
-        None => ControlFlow::Error(RuntimeError::new(
-            crate::error::RuntimeErrorKind::ImportError {
-                module: module.name().into(),
-                message: format!(
-                    "cannot import name '{}' from '{}'",
-                    attr_name,
-                    module.name()
-                )
-                .into(),
-            },
-        )),
+        Err(_) => {
+            let submodule_name = format!("{}.{}", module.name(), attr_name);
+            match vm.import_module_named(&submodule_name) {
+                Ok(submodule) => {
+                    let value = Value::object_ptr(Arc::as_ptr(&submodule) as *const ());
+                    module.set_attr(&attr_name, value);
+                    vm.current_frame_mut().set_reg(dst.0, value);
+                    ControlFlow::Continue
+                }
+                Err(_) => ControlFlow::Error(RuntimeError::new(
+                    crate::error::RuntimeErrorKind::ImportError {
+                        module: module.name().into(),
+                        message: format!(
+                            "cannot import name '{}' from '{}'",
+                            attr_name,
+                            module.name()
+                        )
+                        .into(),
+                    },
+                )),
+            }
+        }
     }
 }
 
@@ -626,9 +630,7 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     // Get all public names from the module
     // If __all__ is defined, use it; otherwise use all non-underscore names
-    for (name, value) in module.public_attrs() {
-        vm.globals.set((*name).into(), value);
-    }
+    vm.import_star_into_current_scope(&module);
 
     ControlFlow::Continue
 }

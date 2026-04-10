@@ -10,6 +10,7 @@ use crate::stdlib::{Module, ModuleError, StdlibRegistry};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use rustc_hash::FxHashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::ThreadId;
 
@@ -67,6 +68,15 @@ impl std::fmt::Display for ImportError {
 }
 
 impl std::error::Error for ImportError {}
+
+/// Filesystem location of a Python source module or package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceModuleLocation {
+    /// Path to the source file backing the module.
+    pub path: PathBuf,
+    /// Whether the path points at a package `__init__.py`.
+    pub is_package: bool,
+}
 
 // =============================================================================
 // ImportState - Concurrent Import Synchronization
@@ -350,19 +360,23 @@ impl ImportResolver {
                     .insert(cached_key, Arc::clone(&module));
                 // Also set as attribute on parent
                 // (deferred — the parent module should already expose it)
+                self.register_module_ptr(&module);
+                current.set_attr(part, Value::object_ptr(Arc::as_ptr(&module) as *const ()));
                 current = module;
                 continue;
             }
 
             // Try to get as attribute from parent module
-            if let Some(_value) = current.get_attr(part) {
-                // The attribute exists on the parent. If it's a module object
-                // in our cache, use that. Otherwise, create a wrapper.
-                // For now, if we have a cached submodule, use it.
-                // TODO: once we have proper type checking, handle module-typed attrs
-                return Err(ImportError::ModuleNotFound {
-                    module: Arc::from(full_name.as_str()),
-                });
+            if let Some(value) = current.get_attr(part)
+                && let Some(module_ptr) = value.as_object_ptr()
+                && let Some(module) = self.module_from_ptr(module_ptr)
+            {
+                self.sys_modules
+                    .write()
+                    .unwrap()
+                    .insert(cached_key, Arc::clone(&module));
+                current = module;
+                continue;
             }
 
             return Err(ImportError::ModuleNotFound {
@@ -438,12 +452,21 @@ impl ImportResolver {
         module: &Arc<ModuleObject>,
         name: &str,
     ) -> Result<Value, ImportError> {
-        module
-            .get_attr(name)
-            .ok_or_else(|| ImportError::ImportFromError {
-                module: Arc::from(module.name()),
-                name: Arc::from(name),
-            })
+        if let Some(value) = module.get_attr(name) {
+            return Ok(value);
+        }
+
+        let submodule_name = format!("{}.{}", module.name(), name);
+        if let Ok(submodule) = self.import_dotted(&submodule_name) {
+            let value = Value::object_ptr(Arc::as_ptr(&submodule) as *const ());
+            module.set_attr(name, value);
+            return Ok(value);
+        }
+
+        Err(ImportError::ImportFromError {
+            module: Arc::from(module.name()),
+            name: Arc::from(name),
+        })
     }
 
     /// Import all public names from a module.
@@ -510,6 +533,30 @@ impl ImportResolver {
         self.search_paths.read().unwrap().clone()
     }
 
+    /// Resolve a module name to a filesystem source location, if available.
+    pub fn resolve_source_location(&self, name: &str) -> Option<SourceModuleLocation> {
+        use super::package::{DottedName, find_dotted_module_source, find_module_source};
+
+        let search_paths = self.search_paths();
+        let (path, is_package) = if let Some(dotted) = DottedName::parse(name) {
+            if dotted.is_simple() {
+                find_module_source(name, &search_paths)
+            } else {
+                find_dotted_module_source(&dotted, &search_paths)
+            }
+        } else {
+            None
+        }?;
+
+        Some(SourceModuleLocation { path, is_package })
+    }
+
+    /// Check whether a module name is provided by Prism's built-in stdlib.
+    #[inline]
+    pub fn is_stdlib_module(&self, name: &str) -> bool {
+        self.stdlib.contains(name)
+    }
+
     /// List all cached modules.
     pub fn cached_modules(&self) -> Vec<Arc<str>> {
         self.sys_modules
@@ -556,6 +603,47 @@ mod tests {
     use super::*;
     use prism_core::intern::interned_by_ptr;
     use prism_runtime::types::list::ListObject;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos();
+
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "prism_import_resolver_tests_{}_{}_{}",
+                std::process::id(),
+                nanos,
+                unique
+            ));
+            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_file(path: &std::path::Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("failed to create parent dir");
+        }
+        std::fs::write(path, content).expect("failed to write test file");
+    }
 
     #[test]
     fn test_import_resolver_new() {
@@ -726,6 +814,30 @@ mod tests {
     }
 
     #[test]
+    fn test_import_dotted_stdlib_submodule() {
+        let resolver = ImportResolver::new();
+        let module = resolver
+            .import_dotted("os.path")
+            .expect("os.path import should succeed");
+
+        assert_eq!(module.name(), "os.path");
+
+        let os = resolver
+            .import_module("os")
+            .expect("os import should succeed");
+        let path_value = resolver
+            .import_from(&os, "path")
+            .expect("from os import path should resolve submodule");
+        let path_ptr = path_value
+            .as_object_ptr()
+            .expect("os.path should be exposed as module object");
+        let resolved = resolver
+            .module_from_ptr(path_ptr)
+            .expect("module pointer should resolve");
+        assert_eq!(resolved.name(), "os.path");
+    }
+
+    #[test]
     fn test_search_paths() {
         let resolver = ImportResolver::new();
 
@@ -744,6 +856,22 @@ mod tests {
         let resolver = ImportResolver::with_paths(paths);
 
         assert_eq!(resolver.search_paths().len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_source_location_finds_dotted_module() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("pkg").join("__init__.py"), "");
+        write_file(&temp.path.join("pkg").join("helper.py"), "VALUE = 1\n");
+
+        let resolver =
+            ImportResolver::with_paths(vec![Arc::from(temp.path.to_string_lossy().into_owned())]);
+        let resolved = resolver
+            .resolve_source_location("pkg.helper")
+            .expect("expected dotted module source");
+
+        assert_eq!(resolved.path, temp.path.join("pkg").join("helper.py"));
+        assert!(!resolved.is_package);
     }
 
     #[test]

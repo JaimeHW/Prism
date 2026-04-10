@@ -12,7 +12,7 @@ use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
-use crate::import::ImportResolver;
+use crate::import::{ImportError, ImportResolver, ModuleObject, resolve_relative_import};
 use crate::inline_cache::InlineCacheStore;
 use crate::jit_context::{JitConfig, JitContext};
 use crate::jit_executor::ExecutionResult;
@@ -21,8 +21,9 @@ use crate::speculative::SpeculationCache;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
-use prism_compiler::bytecode::CodeObject;
+use prism_compiler::{OptimizationLevel, bytecode::CodeObject};
 use prism_core::{PrismResult, Value};
+use prism_parser::parse as parse_module_source;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -104,9 +105,441 @@ pub struct VirtualMachine {
     active_except_handlers: Vec<ActiveExceptHandler>,
     /// Import resolver for module imports.
     pub import_resolver: ImportResolver,
+    /// Optimization level used when compiling imported source modules.
+    compiler_optimization: OptimizationLevel,
 }
 
 impl VirtualMachine {
+    fn current_module_ref(&self) -> Option<&Arc<ModuleObject>> {
+        self.frames
+            .get(self.current_frame_idx)
+            .and_then(|frame| frame.module.as_ref())
+    }
+
+    pub fn current_module(&self) -> Option<&ModuleObject> {
+        self.current_module_ref().map(Arc::as_ref)
+    }
+
+    pub fn current_module_cloned(&self) -> Option<Arc<ModuleObject>> {
+        self.current_module_ref().cloned()
+    }
+
+    pub fn module_from_globals_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
+        if ptr.is_null() {
+            None
+        } else {
+            self.import_resolver.module_from_ptr(ptr)
+        }
+    }
+
+    pub fn module_scope_value(&self, name: &Arc<str>) -> Option<Value> {
+        if let Some(module) = self.current_module() {
+            if let Some(value) = module.get_attr(name) {
+                return Some(value);
+            }
+
+            if module.name() == "__main__" {
+                return self.globals.get_arc(name);
+            }
+
+            None
+        } else {
+            self.globals.get_arc(name)
+        }
+    }
+
+    pub fn set_module_scope_value(&mut self, name: Arc<str>, value: Value) {
+        if let Some(module) = self.current_module_cloned() {
+            module.set_attr(&name, value);
+            if module.name() == "__main__" {
+                self.globals.set(name, value);
+            }
+        } else {
+            self.globals.set(name, value);
+        }
+    }
+
+    pub fn delete_module_scope_value(&mut self, name: &str) -> Option<Value> {
+        if let Some(module) = self.current_module_cloned() {
+            let removed = module.get_attr(name);
+            let existed = module.del_attr(name);
+            if module.name() == "__main__" {
+                let _ = self.globals.delete(name);
+            }
+            if existed { removed } else { None }
+        } else {
+            self.globals.delete(name)
+        }
+    }
+
+    pub fn import_star_into_current_scope(&mut self, module: &ModuleObject) {
+        if let Some(target_module) = self.current_module_cloned() {
+            let is_main = target_module.name() == "__main__";
+            for (name, value) in module.public_attrs() {
+                target_module.set_attr(&name, value);
+                if is_main {
+                    self.globals.set(Arc::from(name.as_ref()), value);
+                }
+            }
+        } else {
+            for (name, value) in module.public_attrs() {
+                self.globals.set(Arc::from(name.as_ref()), value);
+            }
+        }
+    }
+
+    pub fn bind_module(&mut self, module: Arc<ModuleObject>) {
+        let name = Arc::<str>::from(module.name());
+        self.import_resolver
+            .insert_module(&name, Arc::clone(&module));
+        if module.name() == "__main__" {
+            self.globals = GlobalScope::new();
+            for (attr_name, value) in module.all_attrs() {
+                self.globals.set(Arc::from(attr_name.as_ref()), value);
+            }
+        }
+    }
+
+    pub fn execute_in_module(
+        &mut self,
+        code: Arc<CodeObject>,
+        module: Arc<ModuleObject>,
+    ) -> PrismResult<Value> {
+        self.bind_module(Arc::clone(&module));
+
+        self.push_frame_with_module(code, 0, Some(module))?;
+
+        if self.frames.is_empty() {
+            return Ok(self.jit_return_value.take().unwrap_or_else(Value::none));
+        }
+
+        self.run_loop()
+    }
+
+    #[inline]
+    pub fn set_compiler_optimization(&mut self, level: OptimizationLevel) {
+        self.compiler_optimization = level;
+    }
+
+    fn import_error_to_runtime(err: ImportError) -> RuntimeError {
+        let module = match &err {
+            ImportError::ModuleNotFound { module }
+            | ImportError::CircularImport { module }
+            | ImportError::LoadError { module, .. }
+            | ImportError::ExecutionError { module, .. }
+            | ImportError::ImportFromError { module, .. } => Arc::clone(module),
+        };
+
+        RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
+            module,
+            message: Arc::from(err.to_string()),
+        })
+    }
+
+    fn resolve_import_name(&self, raw_name: &str) -> VmResult<String> {
+        let level = raw_name.chars().take_while(|ch| *ch == '.').count() as u32;
+        if level == 0 {
+            return Ok(raw_name.to_string());
+        }
+
+        let current_module = self.current_module().ok_or_else(|| {
+            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
+                module: Arc::from(raw_name),
+                message: Arc::from("relative import outside of module execution"),
+            })
+        })?;
+        let package = current_module.package_name().unwrap_or("");
+        resolve_relative_import(&raw_name[level as usize..], level, package)
+            .map_err(Self::import_error_to_runtime)
+    }
+
+    fn compile_source_module(
+        &self,
+        module_name: &str,
+        source: &str,
+        filename: &str,
+    ) -> VmResult<Arc<CodeObject>> {
+        let parsed = parse_module_source(source).map_err(|err| {
+            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
+                module: Arc::from(module_name),
+                message: Arc::from(err.to_string()),
+            })
+        })?;
+
+        prism_compiler::Compiler::compile_module_with_optimization(
+            &parsed,
+            filename,
+            self.compiler_optimization,
+        )
+        .map(Arc::new)
+        .map_err(|err| {
+            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
+                module: Arc::from(module_name),
+                message: Arc::from(err.to_string()),
+            })
+        })
+    }
+
+    fn run_nested_module_until_depth(&mut self, stop_depth: usize) -> VmResult<()> {
+        loop {
+            if self.frames.len() <= stop_depth {
+                return Ok(());
+            }
+
+            let inst = {
+                let frame = &mut self.frames[self.current_frame_idx];
+
+                if frame.ip as usize >= frame.code.instructions.len() {
+                    match self.pop_frame(Value::none())? {
+                        Some(_) => return Ok(()),
+                        None => {
+                            if self.frames.len() <= stop_depth {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                frame.fetch()
+            };
+
+            let control = get_handler(inst.opcode())(self, inst);
+            match control {
+                ControlFlow::Continue => {}
+                ControlFlow::Jump(offset) => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    let new_ip = (frame.ip as i32) + (offset as i32);
+                    frame.ip = new_ip.max(0) as u32;
+                }
+                ControlFlow::Call { code, return_reg } => {
+                    self.push_frame(code, return_reg)?;
+                }
+                ControlFlow::Return(value) => match self.pop_frame(value)? {
+                    Some(_) => return Ok(()),
+                    None => {
+                        if self.frames.len() <= stop_depth {
+                            return Ok(());
+                        }
+                    }
+                },
+                ControlFlow::Exception { type_id, .. } => {
+                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                        self.frames[self.current_frame_idx].ip = handler_entry;
+                    } else {
+                        loop {
+                            if self.frames.len() <= stop_depth {
+                                return Err(RuntimeError::exception(
+                                    type_id,
+                                    format!("Uncaught exception (type_id={})", type_id),
+                                ));
+                            }
+
+                            self.pop_top_frame_for_unwind();
+                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                                self.frames[self.current_frame_idx].ip = handler_entry;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ControlFlow::Reraise => {
+                    let type_id = if let Some(tid) = self.active_exception_type_id {
+                        tid
+                    } else if let Some(exc_info) = self.exc_info_stack.peek() {
+                        exc_info.type_id()
+                    } else {
+                        return Err(RuntimeError::type_error("No active exception to re-raise"));
+                    };
+
+                    if type_id == 0 {
+                        return Err(RuntimeError::internal(
+                            "Reraise without active exception type",
+                        ));
+                    }
+
+                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                        self.frames[self.current_frame_idx].ip = handler_entry;
+                    } else {
+                        loop {
+                            if self.frames.len() <= stop_depth {
+                                return Err(RuntimeError::exception(
+                                    type_id,
+                                    "Uncaught re-raised exception",
+                                ));
+                            }
+
+                            self.pop_top_frame_for_unwind();
+                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                                self.frames[self.current_frame_idx].ip = handler_entry;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ControlFlow::EnterHandler { handler_pc, .. } => {
+                    self.frames[self.current_frame_idx].ip = handler_pc;
+                }
+                ControlFlow::EnterFinally { finally_pc, .. } => {
+                    self.frames[self.current_frame_idx].ip = finally_pc;
+                }
+                ControlFlow::ExitHandler => {
+                    self.pop_exception_handler();
+                }
+                ControlFlow::Yield { .. } => {
+                    return Err(RuntimeError::internal(
+                        "yield is not valid while executing module top-level code",
+                    ));
+                }
+                ControlFlow::Resume { send_value } => {
+                    self.frames[self.current_frame_idx].set_reg(0, send_value);
+                }
+                ControlFlow::Error(err) => {
+                    let type_id = self.materialize_active_exception_from_runtime_error(&err);
+                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                        self.frames[self.current_frame_idx].ip = handler_entry;
+                    } else {
+                        loop {
+                            if self.frames.len() <= stop_depth {
+                                return Err(err);
+                            }
+
+                            self.pop_top_frame_for_unwind();
+                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                                self.frames[self.current_frame_idx].ip = handler_entry;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_source_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
+        if let Some(module) = self.import_resolver.get_cached(name) {
+            return Ok(module);
+        }
+
+        let Some(location) = self.import_resolver.resolve_source_location(name) else {
+            return Err(Self::import_error_to_runtime(ImportError::ModuleNotFound {
+                module: Arc::from(name),
+            }));
+        };
+
+        let source = std::fs::read_to_string(&location.path).map_err(|err| {
+            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
+                module: Arc::from(name),
+                message: Arc::from(format!(
+                    "failed to read '{}': {}",
+                    location.path.display(),
+                    err
+                )),
+            })
+        })?;
+        let filename: Arc<str> = Arc::from(location.path.to_string_lossy().into_owned());
+        let package_name: Arc<str> = if location.is_package {
+            Arc::from(name)
+        } else if let Some((package, _)) = name.rsplit_once('.') {
+            Arc::from(package)
+        } else {
+            Arc::from("")
+        };
+        let module = Arc::new(ModuleObject::with_metadata(
+            Arc::from(name),
+            None,
+            Some(Arc::clone(&filename)),
+            Some(package_name),
+        ));
+
+        self.import_resolver
+            .insert_module(name, Arc::clone(&module));
+        let code = self.compile_source_module(name, &source, filename.as_ref());
+        let caller_depth = self.frames.len();
+
+        let code = match code {
+            Ok(code) => code,
+            Err(err) => {
+                self.import_resolver.remove_module(name);
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = self.push_frame_internal(code, 0, None, Some(Arc::clone(&module)), false)
+        {
+            self.import_resolver.remove_module(name);
+            return Err(err);
+        }
+
+        if self.frames.len() > caller_depth
+            && let Err(err) = self.run_nested_module_until_depth(caller_depth)
+        {
+            self.import_resolver.remove_module(name);
+            return Err(err);
+        }
+
+        Ok(module)
+    }
+
+    pub fn import_module_named(&mut self, raw_name: &str) -> VmResult<Arc<ModuleObject>> {
+        let absolute_name = self.resolve_import_name(raw_name)?;
+
+        if let Some(module) = self.import_resolver.get_cached(&absolute_name) {
+            return Ok(module);
+        }
+
+        if !absolute_name.contains('.') {
+            return match self.import_resolver.import_module(&absolute_name) {
+                Ok(module) => Ok(module),
+                Err(ImportError::ModuleNotFound { .. }) => self.load_source_module(&absolute_name),
+                Err(err) => Err(Self::import_error_to_runtime(err)),
+            };
+        }
+
+        let mut segments = absolute_name.split('.');
+        let top_level = segments
+            .next()
+            .expect("dotted import missing top-level segment");
+        let mut current = self.import_module_named(top_level)?;
+        let mut prefix = top_level.to_string();
+
+        for segment in segments {
+            prefix.push('.');
+            prefix.push_str(segment);
+
+            if let Some(module) = self.import_resolver.get_cached(&prefix) {
+                current.set_attr(
+                    segment,
+                    Value::object_ptr(Arc::as_ptr(&module) as *const ()),
+                );
+                current = module;
+                continue;
+            }
+
+            let next = match self.import_resolver.import_module(&prefix) {
+                Ok(module) => module,
+                Err(ImportError::ModuleNotFound { .. }) => {
+                    if let Some(value) = current.get_attr(segment)
+                        && let Some(module_ptr) = value.as_object_ptr()
+                        && let Some(module) = self.import_resolver.module_from_ptr(module_ptr)
+                    {
+                        self.import_resolver
+                            .insert_module(&prefix, Arc::clone(&module));
+                        module
+                    } else {
+                        self.load_source_module(&prefix)?
+                    }
+                }
+                Err(err) => return Err(Self::import_error_to_runtime(err)),
+            };
+
+            current.set_attr(segment, Value::object_ptr(Arc::as_ptr(&next) as *const ()));
+            current = next;
+        }
+
+        Ok(current)
+    }
+
     /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
         Self {
@@ -129,6 +562,7 @@ impl VirtualMachine {
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
+            compiler_optimization: OptimizationLevel::None,
         }
     }
 
@@ -154,6 +588,7 @@ impl VirtualMachine {
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
+            compiler_optimization: OptimizationLevel::None,
         }
     }
 
@@ -184,6 +619,7 @@ impl VirtualMachine {
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
+            compiler_optimization: OptimizationLevel::None,
         }
     }
 
@@ -209,6 +645,7 @@ impl VirtualMachine {
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
             import_resolver: ImportResolver::new(),
+            compiler_optimization: OptimizationLevel::None,
         }
     }
 
@@ -251,19 +688,7 @@ impl VirtualMachine {
 
     /// Execute a code object and return the result.
     pub fn execute(&mut self, code: Arc<CodeObject>) -> PrismResult<Value> {
-        // Push the initial frame (may execute via JIT)
-        self.push_frame(code, 0)?;
-
-        // If JIT handled everything and no frame was pushed, return the result
-        // from the JIT return value register (which is stored in our temp location)
-        if self.frames.is_empty() {
-            // JIT executed successfully without pushing a frame
-            // The return value was stored in jit_return_value by push_frame
-            return Ok(self.jit_return_value.take().unwrap_or_else(Value::none));
-        }
-
-        // Run the main dispatch loop
-        self.run_loop()
+        self.execute_in_module(code, Arc::new(ModuleObject::new("__main__")))
     }
 
     /// Main dispatch loop.
@@ -639,7 +1064,13 @@ impl VirtualMachine {
         let caller_depth = self.frames.len();
         let caller_scratch_255 = self.frames[caller_idx].get_reg(255);
 
-        let mut frame = Frame::new(Arc::clone(generator.code()), Some(caller_idx as u32), 255);
+        let generator_module = self.module_from_globals_ptr(generator.module_ptr());
+        let mut frame = Frame::new_with_module(
+            Arc::clone(generator.code()),
+            Some(caller_idx as u32),
+            255,
+            generator_module,
+        );
         frame.ip = if prev_state == RuntimeGeneratorState::Suspended {
             generator.ip()
         } else {
@@ -701,7 +1132,9 @@ impl VirtualMachine {
                     frame.ip = new_ip.max(0) as u32;
                 }
                 ControlFlow::Call { code, return_reg } => {
-                    if let Err(e) = self.push_frame(code, return_reg) {
+                    if let Err(e) =
+                        self.push_frame_with_module(code, return_reg, self.current_module_cloned())
+                    {
                         failure = Some(e);
                         break 'exec;
                     }
@@ -831,7 +1264,16 @@ impl VirtualMachine {
     /// 4. On deopt, create frame and resume interpreter
     /// 5. On miss, fall through to interpreter
     pub fn push_frame(&mut self, code: Arc<CodeObject>, return_reg: u8) -> VmResult<()> {
-        self.push_frame_internal(code, return_reg, None, true)
+        self.push_frame_internal(code, return_reg, None, self.current_module_cloned(), true)
+    }
+
+    pub fn push_frame_with_module(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_reg: u8,
+        module: Option<Arc<ModuleObject>>,
+    ) -> VmResult<()> {
+        self.push_frame_internal(code, return_reg, None, module, true)
     }
 
     /// Push a new frame with an optional captured closure environment.
@@ -844,7 +1286,22 @@ impl VirtualMachine {
         return_reg: u8,
         closure: Option<Arc<crate::frame::ClosureEnv>>,
     ) -> VmResult<()> {
-        self.push_frame_internal(code, return_reg, closure, false)
+        self.push_frame_with_closure_and_module(
+            code,
+            return_reg,
+            closure,
+            self.current_module_cloned(),
+        )
+    }
+
+    pub fn push_frame_with_closure_and_module(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_reg: u8,
+        closure: Option<Arc<crate::frame::ClosureEnv>>,
+        module: Option<Arc<ModuleObject>>,
+    ) -> VmResult<()> {
+        self.push_frame_internal(code, return_reg, closure, module, false)
     }
 
     fn push_frame_internal(
@@ -852,6 +1309,7 @@ impl VirtualMachine {
         code: Arc<CodeObject>,
         return_reg: u8,
         closure: Option<Arc<crate::frame::ClosureEnv>>,
+        module: Option<Arc<ModuleObject>>,
         allow_jit: bool,
     ) -> VmResult<()> {
         // Check recursion limit
@@ -884,7 +1342,12 @@ impl VirtualMachine {
                     } else {
                         Some(self.current_frame_idx as u32)
                     };
-                    let mut jit_frame = Frame::new(Arc::clone(&code), return_frame_idx, return_reg);
+                    let mut jit_frame = Frame::new_with_module(
+                        Arc::clone(&code),
+                        return_frame_idx,
+                        return_reg,
+                        module.clone(),
+                    );
 
                     // Execute compiled code
                     match jit.try_execute(code_ptr_id, &mut jit_frame) {
@@ -935,8 +1398,10 @@ impl VirtualMachine {
         };
 
         let frame = match closure {
-            Some(closure_env) => Frame::with_closure(code, return_frame, return_reg, closure_env),
-            None => Frame::new(code, return_frame, return_reg),
+            Some(closure_env) => {
+                Frame::with_closure_and_module(code, return_frame, return_reg, closure_env, module)
+            }
+            None => Frame::new_with_module(code, return_frame, return_reg, module),
         };
         self.frames.push(frame);
         self.set_current_frame_idx(self.frames.len() - 1);

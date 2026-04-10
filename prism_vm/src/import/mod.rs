@@ -30,4 +30,4 @@ mod tests;
 
 pub use module_object::ModuleObject;
 pub use package::{DottedName, resolve_relative_import};
-pub use resolver::{ImportError, ImportResolver};
+pub use resolver::{ImportError, ImportResolver, SourceModuleLocation};

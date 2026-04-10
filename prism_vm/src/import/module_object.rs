@@ -105,6 +105,18 @@ impl ModuleObject {
         &self.name
     }
 
+    /// Get the backing module file path, if any.
+    #[inline]
+    pub fn file_path(&self) -> Option<&str> {
+        self.file.as_deref()
+    }
+
+    /// Get the importing package name used for relative imports.
+    #[inline]
+    pub fn package_name(&self) -> Option<&str> {
+        self.package.as_deref()
+    }
+
     /// Get an attribute from the module.
     ///
     /// Returns `None` if the attribute doesn't exist.

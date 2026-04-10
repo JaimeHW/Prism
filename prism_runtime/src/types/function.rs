@@ -205,6 +205,21 @@ impl FunctionObject {
     pub fn get_closure_value(&self, index: usize) -> Option<Value> {
         self.closure.as_ref()?.get(index)
     }
+
+    /// Get the raw module globals pointer captured when the function was defined.
+    #[inline]
+    pub fn globals_ptr(&self) -> *const () {
+        self.globals_ptr
+    }
+
+    /// Update the function's module globals pointer.
+    ///
+    /// # Safety
+    /// The pointer must remain valid for the lifetime of the function object.
+    #[inline]
+    pub unsafe fn set_globals_ptr(&mut self, globals_ptr: *const ()) {
+        self.globals_ptr = globals_ptr;
+    }
 }
 
 impl PyObject for FunctionObject {

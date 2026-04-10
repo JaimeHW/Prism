@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 prism_core.workspace = true
 prism_compiler.workspace = true
+prism_parser.workspace = true
 prism_runtime.workspace = true
 prism_gc.workspace = true
 prism_jit.workspace = true
@@ -32,7 +33,6 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
-prism_parser.workspace = true
 
 [[bench]]
 name = "speculation"

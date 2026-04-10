@@ -43,6 +43,26 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
     unsafe { (*header_ptr).type_id }
 }
 
+#[inline]
+fn function_module_ptr(vm: &VirtualMachine, func: &FunctionObject) -> *const () {
+    if func.globals_ptr().is_null() {
+        vm.current_module_cloned()
+            .map(|module| Arc::as_ptr(&module) as *const ())
+            .unwrap_or(std::ptr::null())
+    } else {
+        func.globals_ptr()
+    }
+}
+
+#[inline]
+fn resolve_function_module(
+    vm: &VirtualMachine,
+    func: &FunctionObject,
+) -> Option<Arc<crate::import::ModuleObject>> {
+    vm.module_from_globals_ptr(function_module_ptr(vm, func))
+        .or_else(|| vm.current_module_cloned())
+}
+
 pub(crate) fn invoke_builtin(
     vm: &mut VirtualMachine,
     builtin: &BuiltinFunctionObject,
@@ -140,12 +160,24 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     && argc == code.arg_count as usize;
 
                 if is_generator_function && simple_positional {
-                    create_generator_from_simple_call(vm, code, dst_reg, argc)
+                    create_generator_from_simple_call(
+                        vm,
+                        code,
+                        dst_reg,
+                        argc,
+                        function_module_ptr(vm, func),
+                    )
                 } else if simple_positional {
                     let closure = vm.lookup_function_closure(ptr);
+                    let module = resolve_function_module(vm, func);
                     let caller_frame_idx = vm.call_depth() - 1;
 
-                    if let Err(e) = vm.push_frame_with_closure(Arc::clone(code), dst_reg, closure) {
+                    if let Err(e) = vm.push_frame_with_closure_and_module(
+                        Arc::clone(code),
+                        dst_reg,
+                        closure,
+                        module,
+                    ) {
                         return ControlFlow::Error(e);
                     }
 
@@ -289,6 +321,7 @@ fn call_kw_user_function(
     let func = unsafe { &*(ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
     let closure = vm.lookup_function_closure(ptr);
+    let module = resolve_function_module(vm, func);
 
     // Extract function signature metadata
     let arg_count = code.arg_count as usize;
@@ -541,6 +574,7 @@ fn call_kw_user_function(
         }
 
         let mut generator = GeneratorObject::from_code(Arc::clone(&code));
+        generator.set_module_ptr(function_module_ptr(vm, func));
         generator.seed_locals(&locals, prefix_liveness(local_idx));
         let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
         vm.current_frame_mut()
@@ -548,7 +582,9 @@ fn call_kw_user_function(
         return ControlFlow::Continue;
     }
 
-    if let Err(e) = vm.push_frame_with_closure(Arc::clone(&code), dst_reg, closure) {
+    if let Err(e) =
+        vm.push_frame_with_closure_and_module(Arc::clone(&code), dst_reg, closure, module)
+    {
         return ControlFlow::Error(e);
     }
 
@@ -601,6 +637,7 @@ fn create_generator_from_simple_call(
     code: &Arc<CodeObject>,
     dst_reg: u8,
     argc: usize,
+    module_ptr: *const (),
 ) -> ControlFlow {
     let caller_frame_idx = vm.call_depth() - 1;
     let mut locals = [Value::none(); 256];
@@ -609,6 +646,7 @@ fn create_generator_from_simple_call(
     }
 
     let mut generator = GeneratorObject::from_code(Arc::clone(code));
+    generator.set_module_ptr(module_ptr);
     generator.seed_locals(&locals, prefix_liveness(argc));
     let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
     vm.current_frame_mut()
@@ -906,10 +944,17 @@ pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     };
 
     // Create FunctionObject
-    let func = FunctionObject::new(
+    let mut func = FunctionObject::new(
         code_clone, qualname, None, // defaults - TODO: handle function defaults
         None, // closure - TODO: handle captured variables (use MakeClosure for that)
     );
+    let globals_ptr = vm
+        .current_module_cloned()
+        .map(|module| Arc::as_ptr(&module) as *const ())
+        .unwrap_or(std::ptr::null());
+    unsafe {
+        func.set_globals_ptr(globals_ptr);
+    }
 
     // Allocate on GC heap
     let func_ptr = match vm.allocator().alloc(func) {
@@ -964,10 +1009,17 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     };
 
     // Create FunctionObject
-    let func = FunctionObject::new(
+    let mut func = FunctionObject::new(
         code_clone, qualname, None, // defaults - TODO: handle function defaults
         None,
     );
+    let globals_ptr = vm
+        .current_module_cloned()
+        .map(|module| Arc::as_ptr(&module) as *const ())
+        .unwrap_or(std::ptr::null());
+    unsafe {
+        func.set_globals_ptr(globals_ptr);
+    }
 
     // Allocate on GC heap
     let func_ptr = match vm.allocator().alloc(func) {

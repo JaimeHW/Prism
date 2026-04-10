@@ -103,6 +103,10 @@ impl StdlibRegistry {
 
         // Register os module
         modules.insert(Arc::from("os"), Box::new(os::OsModule::new()));
+        modules.insert(
+            Arc::from("os.path"),
+            Box::new(os::path::OsPathModule::new()),
+        );
 
         // Register sys module
         let sys_module = match sys_args {

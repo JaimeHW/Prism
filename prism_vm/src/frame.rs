@@ -4,6 +4,7 @@
 //! It uses a stack-allocated register file for maximum performance.
 
 use crate::exception::InlineHandlerCache;
+use crate::import::ModuleObject;
 use prism_compiler::bytecode::CodeObject;
 use prism_core::Value;
 use std::sync::Arc;
@@ -43,6 +44,9 @@ pub struct Frame {
 
     /// Register in the caller frame where the return value should be stored.
     pub return_reg: u8,
+
+    /// Module globals backing this frame.
+    pub module: Option<Arc<ModuleObject>>,
 
     /// Closure environment for captured variables.
     /// Only set for closures, None for regular functions.
@@ -234,11 +238,23 @@ impl Frame {
     /// * `return_reg` - Register in caller to store return value
     #[inline]
     pub fn new(code: Arc<CodeObject>, return_frame: Option<u32>, return_reg: u8) -> Self {
+        Self::new_with_module(code, return_frame, return_reg, None)
+    }
+
+    /// Create a new frame with an explicit module context.
+    #[inline]
+    pub fn new_with_module(
+        code: Arc<CodeObject>,
+        return_frame: Option<u32>,
+        return_reg: u8,
+        module: Option<Arc<ModuleObject>>,
+    ) -> Self {
         Self {
             code,
             ip: 0,
             return_frame,
             return_reg,
+            module,
             closure: None,
             // Initialize all registers to None for safety
             registers: [Value::none(); REGISTER_COUNT],
@@ -255,11 +271,24 @@ impl Frame {
         return_reg: u8,
         closure: Arc<ClosureEnv>,
     ) -> Self {
+        Self::with_closure_and_module(code, return_frame, return_reg, closure, None)
+    }
+
+    /// Create a frame with a closure environment and explicit module context.
+    #[inline]
+    pub fn with_closure_and_module(
+        code: Arc<CodeObject>,
+        return_frame: Option<u32>,
+        return_reg: u8,
+        closure: Arc<ClosureEnv>,
+        module: Option<Arc<ModuleObject>>,
+    ) -> Self {
         Self {
             code,
             ip: 0,
             return_frame,
             return_reg,
+            module,
             closure: Some(closure),
             registers: [Value::none(); REGISTER_COUNT],
             yield_point: 0,

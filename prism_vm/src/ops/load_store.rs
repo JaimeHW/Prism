@@ -90,7 +90,7 @@ pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let name = frame.get_name(inst.imm16()).clone();
 
-    match vm.globals.get_arc(&name) {
+    match vm.module_scope_value(&name) {
         Some(value) => {
             vm.current_frame_mut().set_reg(inst.dst().0, value);
             ControlFlow::Continue
@@ -117,7 +117,7 @@ pub fn store_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // in the dst field and imm16 is the name index.
     let value = frame.get_reg(inst.dst().0);
 
-    vm.globals.set(name, value);
+    vm.set_module_scope_value(name, value);
     ControlFlow::Continue
 }
 
@@ -127,7 +127,7 @@ pub fn delete_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     let frame = vm.current_frame();
     let name = frame.get_name(inst.imm16()).clone();
 
-    match vm.globals.delete(&name) {
+    match vm.delete_module_scope_value(&name) {
         Some(_) => ControlFlow::Continue,
         None => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
     }
