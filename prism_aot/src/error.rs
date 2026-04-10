@@ -39,6 +39,14 @@ pub enum AotError {
     /// An AOT artifact could not be encoded or decoded.
     #[error("{message}")]
     InvalidArtifact { message: String },
+
+    /// The requested target is not supported by the selected emit step.
+    #[error("target '{target}' does not support {feature} yet")]
+    UnsupportedTarget { target: String, feature: String },
+
+    /// A native object or linker-facing artifact could not be emitted.
+    #[error("failed to emit {artifact}: {message}")]
+    EmitArtifact { artifact: String, message: String },
 }
 
 impl AotError {
