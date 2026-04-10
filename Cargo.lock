@@ -439,6 +439,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism_aot"
+version = "0.1.0"
+dependencies = [
+ "prism_compiler",
+ "prism_parser",
+ "prism_vm",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "prism_builtins"
 version = "0.1.0"
 dependencies = [
@@ -450,6 +462,7 @@ dependencies = [
 name = "prism_cli"
 version = "0.1.0"
 dependencies = [
+ "prism_aot",
  "prism_compiler",
  "prism_core",
  "prism_parser",
