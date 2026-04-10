@@ -870,7 +870,9 @@ mod tests {
 
         let builder = GraphBuilder::new(12, 2);
         let translator = BytecodeTranslator::new(builder, &code);
-        let graph = translator.translate().expect("typed opcode translation should succeed");
+        let graph = translator
+            .translate()
+            .expect("typed opcode translation should succeed");
 
         let has_op = |pred: fn(Operator) -> bool| graph.iter().any(|(_, node)| pred(node.op));
         assert!(has_op(|op| op == Operator::IntOp(ArithOp::FloorDiv)));

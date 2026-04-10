@@ -1468,8 +1468,13 @@ impl<'a> InstructionSelector<'a> {
 
                 // Remainder is negative: adjust only when divisor is positive.
                 self.mfunc.push(
-                    MachineInst::binary(MachineOp::Cmp, MachineOperand::None, rhs, MachineOperand::Imm(0))
-                        .with_origin(node_id),
+                    MachineInst::binary(
+                        MachineOp::Cmp,
+                        MachineOperand::None,
+                        rhs,
+                        MachineOperand::Imm(0),
+                    )
+                    .with_origin(node_id),
                 );
                 self.mfunc
                     .push(MachineInst::jcc(CondCode::L, done_label).with_origin(node_id));
@@ -1494,8 +1499,13 @@ impl<'a> InstructionSelector<'a> {
                 self.mfunc.add_label(rem_positive_label);
                 // Remainder is positive: adjust only when divisor is negative.
                 self.mfunc.push(
-                    MachineInst::binary(MachineOp::Cmp, MachineOperand::None, rhs, MachineOperand::Imm(0))
-                        .with_origin(node_id),
+                    MachineInst::binary(
+                        MachineOp::Cmp,
+                        MachineOperand::None,
+                        rhs,
+                        MachineOperand::Imm(0),
+                    )
+                    .with_origin(node_id),
                 );
                 self.mfunc
                     .push(MachineInst::jcc(CondCode::G, done_label).with_origin(node_id));
@@ -1959,8 +1969,10 @@ impl<'a> InstructionSelector<'a> {
             }
             MachineOperand::Imm(imm) => {
                 let scratch = MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR);
-                self.mfunc
-                    .push(MachineInst::new(MachineOp::Mov, scratch, MachineOperand::Imm(imm)).with_origin(node_id));
+                self.mfunc.push(
+                    MachineInst::new(MachineOp::Mov, scratch, MachineOperand::Imm(imm))
+                        .with_origin(node_id),
+                );
                 Ok(scratch)
             }
             other => Err(format!(
@@ -2355,14 +2367,18 @@ mod tests {
         let mfunc = InstructionSelector::select(&graph, &alloc_map)
             .expect("float neg lowering should succeed");
 
-        assert!(mfunc
-            .insts
-            .iter()
-            .any(|inst| inst.origin == Some(neg) && inst.op == MachineOp::Xorpd));
-        assert!(mfunc
-            .insts
-            .iter()
-            .any(|inst| inst.origin == Some(neg) && inst.op == MachineOp::Subsd));
+        assert!(
+            mfunc
+                .insts
+                .iter()
+                .any(|inst| inst.origin == Some(neg) && inst.op == MachineOp::Xorpd)
+        );
+        assert!(
+            mfunc
+                .insts
+                .iter()
+                .any(|inst| inst.origin == Some(neg) && inst.op == MachineOp::Subsd)
+        );
     }
 
     #[test]

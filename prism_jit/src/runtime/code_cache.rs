@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::gc::{StackMap, StackMapRegistry};
 use crate::gc::stackmap::StackMapRef;
+use crate::gc::{StackMap, StackMapRegistry};
 use crate::tier2::osr::OsrCompiledCode;
 
 // =============================================================================
@@ -215,7 +215,9 @@ impl CompiledEntry {
     /// Lookup deopt resume offset by deopt-site index.
     #[inline]
     pub fn lookup_deopt_bc_offset_by_index(&self, index: u32) -> Option<u32> {
-        self.deopt_sites.get(index as usize).map(|site| site.bc_offset)
+        self.deopt_sites
+            .get(index as usize)
+            .map(|site| site.bc_offset)
     }
 
     /// Increment call count and return the new value.

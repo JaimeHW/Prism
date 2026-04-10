@@ -852,8 +852,12 @@ mod tests {
         let mut mfunc = MachineFunction::new();
         mfunc.node_bc_offsets = vec![None, Some(37)];
         mfunc.push(
-            MachineInst::new(MachineOp::Call, MachineOperand::Imm(0x1234), MachineOperand::None)
-                .with_origin(NodeId::new(1)),
+            MachineInst::new(
+                MachineOp::Call,
+                MachineOperand::Imm(0x1234),
+                MachineOperand::None,
+            )
+            .with_origin(NodeId::new(1)),
         );
         mfunc.push(MachineInst::nullary(MachineOp::Ret));
 
@@ -882,12 +886,11 @@ mod tests {
             !code.stack_maps.is_empty(),
             "loop back-edge should produce at least one safepoint poll"
         );
-        assert!(code
-            .stack_maps
-            .iter()
-            .all(|entry| {
-                entry.gc_slots == vec![-32] && entry.gc_regs == vec![Gpr::R13] && entry.bc_offset.is_none()
-            }));
+        assert!(code.stack_maps.iter().all(|entry| {
+            entry.gc_slots == vec![-32]
+                && entry.gc_regs == vec![Gpr::R13]
+                && entry.bc_offset.is_none()
+        }));
     }
 
     #[test]
