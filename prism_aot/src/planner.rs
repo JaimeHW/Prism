@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use prism_compiler::{Compiler, OptimizationLevel};
 use prism_vm::stdlib::StdlibRegistry;
 
+use crate::bundle::CodeImage;
 use crate::error::AotError;
 use crate::imports::collect_static_imports;
 
@@ -86,6 +87,8 @@ pub struct PlannedModule {
     pub static_imports: Vec<String>,
     /// Candidate submodules referenced by `from ... import ...`.
     pub from_import_candidates: Vec<String>,
+    /// Deterministic serialized code image for future native lowering.
+    pub code_image: Option<CodeImage>,
 }
 
 /// Entire build plan for a standalone native executable.
@@ -186,6 +189,7 @@ impl BuildPlanner {
                         nested_code_object_count: None,
                         static_imports: Vec::new(),
                         from_import_candidates: Vec::new(),
+                        code_image: None,
                     },
                 );
                 continue;
@@ -406,6 +410,7 @@ impl BuildPlanner {
             message: err.to_string(),
         })?;
         let static_imports = collect_static_imports(&parsed, &resolved.package_name)?;
+        let code_image = CodeImage::from_code_object(&resolved.module_name, &code)?;
 
         Ok(PlannedModule {
             name: resolved.module_name.clone(),
@@ -418,6 +423,7 @@ impl BuildPlanner {
             nested_code_object_count: Some(code.nested_code_objects.len()),
             static_imports: static_imports.required_modules,
             from_import_candidates: static_imports.from_import_candidates,
+            code_image: Some(code_image),
         })
     }
 

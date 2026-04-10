@@ -443,6 +443,7 @@ name = "prism_aot"
 version = "0.1.0"
 dependencies = [
  "prism_compiler",
+ "prism_core",
  "prism_parser",
  "prism_vm",
  "serde",

@@ -35,6 +35,10 @@ pub enum AotError {
     /// The requested entrypoint is not valid.
     #[error("{message}")]
     InvalidEntrypoint { message: String },
+
+    /// An AOT artifact could not be encoded or decoded.
+    #[error("{message}")]
+    InvalidArtifact { message: String },
 }
 
 impl AotError {

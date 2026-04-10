@@ -1,6 +1,6 @@
 //! Dedicated compiler driver for Prism's standalone AOT pipeline.
 
-use prism_aot::{BuildEntry, BuildManifest, BuildOptions, BuildPlanner};
+use prism_aot::{BuildEntry, BuildManifest, BuildOptions, BuildPlanner, FrozenModuleBundle};
 use prism_compiler::OptimizationLevel;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,6 +9,7 @@ use std::process::ExitCode;
 struct CompilerArgs {
     entry: BuildEntry,
     output: PathBuf,
+    bundle_output: PathBuf,
     optimize: OptimizationLevel,
     search_paths: Vec<PathBuf>,
 }
@@ -40,11 +41,24 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let bundle = match FrozenModuleBundle::from_build_plan(&plan) {
+        Ok(bundle) => bundle,
+        Err(err) => {
+            eprintln!("prismc: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(err) = bundle.write_to_path(&parsed.bundle_output) {
+        eprintln!("prismc: {err}");
+        return ExitCode::from(1);
+    }
+
     println!(
-        "planned {} modules for target {} -> {}",
+        "planned {} modules for target {} -> {} ({})",
         plan.modules.len(),
         plan.target,
-        parsed.output.display()
+        parsed.output.display(),
+        parsed.bundle_output.display()
     );
     ExitCode::SUCCESS
 }
@@ -61,6 +75,7 @@ fn parse_args(args: &[String]) -> Result<CompilerArgs, String> {
     let mut entry_value: Option<String> = None;
     let mut module_mode = false;
     let mut output: Option<PathBuf> = None;
+    let mut bundle_output: Option<PathBuf> = None;
     let mut optimize = OptimizationLevel::None;
     let mut search_paths = Vec::new();
 
@@ -77,6 +92,14 @@ fn parse_args(args: &[String]) -> Result<CompilerArgs, String> {
                     return Err("expected path after --output".to_string());
                 };
                 output = Some(PathBuf::from(value));
+                index += 1;
+            }
+            "--emit-bundle" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("expected path after --emit-bundle".to_string());
+                };
+                bundle_output = Some(PathBuf::from(value));
                 index += 1;
             }
             "-I" => {
@@ -115,17 +138,19 @@ fn parse_args(args: &[String]) -> Result<CompilerArgs, String> {
         BuildEntry::Script(PathBuf::from(entry_value))
     };
     let output = output.unwrap_or_else(|| PathBuf::from("prism-build").join("build-plan.json"));
+    let bundle_output = bundle_output.unwrap_or_else(|| default_bundle_output(&output));
 
     Ok(CompilerArgs {
         entry,
         output,
+        bundle_output,
         optimize,
         search_paths,
     })
 }
 
 fn help_text() -> &'static str {
-    "Usage: prismc build [-m|--module] <entry> [-o <file>] [-I <path>] [-O|-OO]"
+    "Usage: prismc build [-m|--module] <entry> [-o <file>] [--emit-bundle <file>] [-I <path>] [-O|-OO]"
 }
 
 fn build_options(args: &CompilerArgs) -> BuildOptions {
@@ -141,6 +166,17 @@ fn build_options(args: &CompilerArgs) -> BuildOptions {
     }
 
     options
+}
+
+fn default_bundle_output(manifest_output: &std::path::Path) -> PathBuf {
+    if let Some(parent) = manifest_output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        parent.join("frozen-modules.prism")
+    } else {
+        PathBuf::from("frozen-modules.prism")
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +196,7 @@ mod tests {
 
         assert_eq!(parsed.entry, BuildEntry::Script(PathBuf::from("app.py")));
         assert_eq!(parsed.output, PathBuf::from("out.json"));
+        assert_eq!(parsed.bundle_output, PathBuf::from("frozen-modules.prism"));
         assert_eq!(parsed.optimize, OptimizationLevel::Basic);
     }
 
@@ -180,6 +217,10 @@ mod tests {
             parsed.output,
             PathBuf::from("prism-build").join("build-plan.json")
         );
+        assert_eq!(
+            parsed.bundle_output,
+            PathBuf::from("prism-build").join("frozen-modules.prism")
+        );
     }
 
     #[test]
@@ -190,10 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_bundle_output_override() {
+        let parsed = parse_args(&[
+            "build".to_string(),
+            "app.py".to_string(),
+            "--emit-bundle".to_string(),
+            "bundle.prism".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        assert_eq!(parsed.bundle_output, PathBuf::from("bundle.prism"));
+    }
+
+    #[test]
     fn test_build_options_extend_default_search_paths() {
         let args = CompilerArgs {
             entry: BuildEntry::Module("pkg.tool".to_string()),
             output: PathBuf::from("out.json"),
+            bundle_output: PathBuf::from("bundle.prism"),
             optimize: OptimizationLevel::Full,
             search_paths: vec![PathBuf::from("vendor")],
         };
