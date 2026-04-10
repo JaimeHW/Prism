@@ -16,6 +16,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod aot;
 pub mod error;
 pub mod intern;
 pub mod small_int_cache;
@@ -23,6 +24,12 @@ pub mod span;
 pub mod speculation;
 pub mod value;
 
+pub use aot::{
+    AOT_IMPORT_FROM_SYMBOL, AOT_IMPORT_MODULE_SYMBOL, AOT_NATIVE_INIT_TABLE_END_SYMBOL,
+    AOT_NATIVE_INIT_TABLE_START_SYMBOL, AOT_STORE_EXPR_SYMBOL, AotImmediate, AotImmediateKind,
+    AotImportBinding, AotImportFromOp, AotImportModuleOp, AotNativeModuleInitEntry, AotOpStatus,
+    AotOperand, AotOperandKind, AotStoreExprKind, AotStoreExprOp, AotStringRef,
+};
 pub use error::{PrismError, PrismResult};
 pub use intern::{InternedString, StringInterner};
 pub use small_int_cache::SmallIntCache;
