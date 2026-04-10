@@ -101,6 +101,30 @@ Start the interactive REPL:
 prism
 ```
 
+## CPython Suite Harness
+
+Run Prism against the CPython 3.12 regression tests with the dedicated harness:
+
+```bash
+cargo run -p prism_cli --bin prism-test -- --cpython-root C:\Users\James\Desktop\cpython-3.12 --list-tests test_grammar
+```
+
+Execute a focused smoke test:
+
+```bash
+cargo run -p prism_cli --bin prism-test -- --cpython-root C:\Users\James\Desktop\cpython-3.12 --runner import --timeout 30 test_grammar
+```
+
+Write a machine-readable report for CI or compatibility tracking:
+
+```bash
+cargo run -p prism_cli --bin prism-test -- --cpython-root C:\Users\James\Desktop\cpython-3.12 --json-report artifacts/cpython-smoke.json test_grammar test_math
+```
+
+The harness mirrors CPython-style test discovery, expands split test packages such as
+`test_asyncio`, creates isolated per-test work directories, and records structured
+results so Prism compatibility gaps can be tracked over time.
+
 ## Architecture
 
 Prism is organized as a modular Rust workspace:
