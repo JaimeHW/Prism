@@ -489,9 +489,12 @@ pub(crate) fn compile_tier2_entry(code: &Arc<CodeObject>) -> Result<CompiledEntr
         .with_tier(2)
         .with_return_abi(ReturnAbi::RawValueBits);
 
-    if let Some(stack_map) =
-        build_stack_map_for_entry(entry.code_ptr() as usize, entry.code_size(), frame_size, &stack_maps)?
-    {
+    if let Some(stack_map) = build_stack_map_for_entry(
+        entry.code_ptr() as usize,
+        entry.code_size(),
+        frame_size,
+        &stack_maps,
+    )? {
         entry = entry.with_stack_map(stack_map);
     }
 
@@ -526,10 +529,7 @@ fn build_stack_map_for_entry(
     }
 
     Ok(Some(StackMap::new(
-        code_start,
-        code_size,
-        frame_size,
-        safepoints,
+        code_start, code_size, frame_size, safepoints,
     )))
 }
 
@@ -841,8 +841,13 @@ mod tests {
         assert_eq!(map.frame_size, 48);
         assert_eq!(map.safepoint_count(), 3);
 
-        let sp = map.lookup_offset(0x10).expect("safepoint should be present");
-        assert_eq!(sp.register_bitmap, (1 << Gpr::Rbx.encoding()) | (1 << Gpr::R12.encoding()));
+        let sp = map
+            .lookup_offset(0x10)
+            .expect("safepoint should be present");
+        assert_eq!(
+            sp.register_bitmap,
+            (1 << Gpr::Rbx.encoding()) | (1 << Gpr::R12.encoding())
+        );
         assert_eq!(sp.stack_bitmap, 0b101);
 
         let deopt_sites = collect_deopt_sites(&entries);

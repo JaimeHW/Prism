@@ -349,10 +349,9 @@ impl JitExecutor {
         self.frame_state.num_registers = frame.code.register_count;
         self.frame_state.bc_offset = frame.ip;
         self.frame_state.const_pool = frame.code.constants.as_ptr() as *const u64;
-        self.frame_state.closure_env = frame
-            .closure
-            .as_ref()
-            .map_or(std::ptr::null(), |closure| Arc::as_ptr(closure) as *const u64);
+        self.frame_state.closure_env = frame.closure.as_ref().map_or(std::ptr::null(), |closure| {
+            Arc::as_ptr(closure) as *const u64
+        });
         // Global scope would be passed via VM reference
         self.frame_state.global_scope = std::ptr::null();
     }
