@@ -74,7 +74,7 @@ fn execute_build(args: &CompilerArgs) -> Result<BuildOutputs, prism_aot::AotErro
     bundle.write_to_path(&args.bundle_output)?;
 
     if let Some(object_output) = &args.object_output {
-        let artifact = LinkableBundleArtifact::from_bundle(&bundle)?;
+        let artifact = LinkableBundleArtifact::from_build_plan(&plan)?;
         artifact.write_to_path(object_output)?;
     }
 
@@ -248,6 +248,7 @@ fn default_target() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object::{Object as _, ObjectSymbol as _};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -470,6 +471,34 @@ mod tests {
                 .len()
                 > 0
         );
+
+        let manifest_json =
+            std::fs::read_to_string(&manifest_output).expect("manifest output should exist");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&manifest_json).expect("manifest should be valid JSON");
+        let entry_module = manifest["modules"]
+            .as_array()
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .find(|module| module["name"].as_str() == Some("__main__"))
+            })
+            .expect("manifest should contain the entry module");
+        let expected_symbol = prism_aot::native_init_symbol("__main__");
+        assert_eq!(entry_module["nativeInitSupported"], true);
+        assert_eq!(
+            entry_module["nativeInitSymbol"].as_str(),
+            Some(expected_symbol.as_str())
+        );
+
+        let object_bytes = std::fs::read(&object_output).expect("object output should exist");
+        let object_file =
+            object::File::parse(object_bytes.as_slice()).expect("object output should parse");
+        let symbol_names = object_file
+            .symbols()
+            .filter_map(|symbol| symbol.name().ok().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(symbol_names.iter().any(|name| name == &expected_symbol));
     }
 
     #[test]

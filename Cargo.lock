@@ -550,11 +550,13 @@ dependencies = [
 name = "prism_cli"
 version = "0.1.0"
 dependencies = [
+ "object",
  "prism_aot",
  "prism_compiler",
  "prism_core",
  "prism_parser",
  "prism_vm",
+ "serde_json",
 ]
 
 [[package]]
