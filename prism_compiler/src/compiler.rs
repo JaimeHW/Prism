@@ -704,84 +704,89 @@ impl Compiler {
                 //   1. Emit ImportName to load the module
                 //   2. Store in the target name (alias if present, else module name)
                 for alias in aliases {
-                    // Use asname if present, otherwise use the module name
-                    // For `import foo.bar`, Python stores the top-level module `foo`
+                    // Use asname if present, otherwise use the module name.
+                    // For `import foo.bar`, CPython stores the top-level module `foo`
+                    // while still importing the full dotted chain for side effects.
                     let local_name = alias.asname.as_ref().unwrap_or(&alias.name);
 
-                    // For dotted imports like `import foo.bar`, we need to store the
-                    // top-level module name. Get just the first component.
                     let store_name = if alias.asname.is_some() {
                         local_name.as_str()
                     } else {
                         alias.name.split('.').next().unwrap_or(&alias.name)
                     };
 
-                    // Add the full module name to the names table for importing
                     let module_name_idx = self.builder.add_name(alias.name.clone());
                     let store_name_idx = self.builder.add_name(store_name.to_string());
 
-                    // Emit ImportName: reg = import(module_name)
-                    let reg = self.builder.alloc_register();
-                    self.builder.emit_import_name(reg, module_name_idx);
+                    // Always import the full dotted name so parent packages and leaf
+                    // modules are initialized and cached.
+                    let imported_reg = self.builder.alloc_register();
+                    self.builder.emit_import_name(imported_reg, module_name_idx);
+
+                    // `import foo.bar` without `as` binds `foo`, not `foo.bar`.
+                    // Re-importing the top-level name is effectively free after the
+                    // cache-warming import above and keeps the lowering simple/correct.
+                    let value_reg = if alias.asname.is_none() && alias.name.contains('.') {
+                        let top_level_idx = self.builder.add_name(store_name.to_string());
+                        let top_level_reg = self.builder.alloc_register();
+                        self.builder.emit_import_name(top_level_reg, top_level_idx);
+                        top_level_reg
+                    } else {
+                        imported_reg
+                    };
 
                     // Store the module in the appropriate scope
                     match self.resolve_variable(store_name) {
                         VarLocation::Local(slot) => {
                             self.builder
-                                .emit_store_local(LocalSlot::new(slot as u16), reg);
+                                .emit_store_local(LocalSlot::new(slot as u16), value_reg);
                         }
                         VarLocation::Closure(slot) => {
-                            self.builder.emit_store_closure(slot, reg);
+                            self.builder.emit_store_closure(slot, value_reg);
                         }
                         VarLocation::Global => {
-                            self.builder.emit_store_global(store_name_idx, reg);
+                            self.builder.emit_store_global(store_name_idx, value_reg);
                         }
                     }
 
-                    self.builder.free_register(reg);
+                    if value_reg != imported_reg {
+                        self.builder.free_register(value_reg);
+                    }
+                    self.builder.free_register(imported_reg);
                 }
             }
 
             StmtKind::ImportFrom {
                 module,
                 names,
-                level: _,
+                level,
             } => {
                 // from module import name1, name2 as alias, ...
                 // 1. Import the source module first
                 // 2. For each name, import the attribute
+                let module_spec = format!(
+                    "{}{}",
+                    ".".repeat(*level as usize),
+                    module.as_deref().unwrap_or("")
+                );
 
                 // Handle `from module import *` case
                 let is_star = names.len() == 1 && names[0].name == "*";
 
                 if is_star {
                     // from module import *
-                    if let Some(mod_name) = module {
-                        let mod_name_idx = self.builder.add_name(mod_name.clone());
-                        let mod_reg = self.builder.alloc_register();
+                    let mod_name_idx = self.builder.add_name(module_spec.clone());
+                    let mod_reg = self.builder.alloc_register();
 
-                        // Import the module
-                        self.builder.emit_import_name(mod_reg, mod_name_idx);
+                    self.builder.emit_import_name(mod_reg, mod_name_idx);
+                    self.builder.emit_import_star(Register::new(0), mod_reg);
 
-                        // Emit ImportStar to inject all public names
-                        self.builder.emit_import_star(Register::new(0), mod_reg);
-
-                        self.builder.free_register(mod_reg);
-                    }
+                    self.builder.free_register(mod_reg);
                 } else {
                     // from module import name1, name2, ...
-                    let mod_reg = if let Some(mod_name) = module {
-                        let mod_name_idx = self.builder.add_name(mod_name.clone());
-                        let reg = self.builder.alloc_register();
-                        self.builder.emit_import_name(reg, mod_name_idx);
-                        reg
-                    } else {
-                        // Relative import with no module (e.g., `from . import x`)
-                        // For now, emit LoadNone as placeholder
-                        let reg = self.builder.alloc_register();
-                        self.builder.emit_load_none(reg);
-                        reg
-                    };
+                    let mod_name_idx = self.builder.add_name(module_spec);
+                    let mod_reg = self.builder.alloc_register();
+                    self.builder.emit_import_name(mod_reg, mod_name_idx);
 
                     for alias in names {
                         let local_name = alias.asname.as_ref().unwrap_or(&alias.name);
@@ -4277,6 +4282,68 @@ mod tests {
     fn test_compile_function_call() {
         let code = compile("print(42)");
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_dotted_import_binds_top_level_name() {
+        let code = compile("import pkg.helper");
+        let import_name_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::ImportName as u8)
+            .count();
+
+        assert_eq!(import_name_count, 2);
+        assert!(code.names.iter().any(|name| name.as_ref() == "pkg.helper"));
+        assert!(code.names.iter().any(|name| name.as_ref() == "pkg"));
+    }
+
+    #[test]
+    fn test_compile_relative_import_from_submodule_preserves_level() {
+        let code = compile("from .helper import VALUE");
+        let import_name_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::ImportName as u8)
+            .count();
+        let import_from_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::ImportFrom as u8)
+            .count();
+
+        assert_eq!(import_name_count, 1);
+        assert_eq!(import_from_count, 1);
+        assert!(code.names.iter().any(|name| name.as_ref() == ".helper"));
+        assert!(code.names.iter().any(|name| name.as_ref() == "VALUE"));
+    }
+
+    #[test]
+    fn test_compile_relative_import_without_module_preserves_level() {
+        let code = compile("from . import helper");
+
+        assert!(
+            code.names.iter().any(|name| name.as_ref() == "."),
+            "expected bare relative import to encode its level"
+        );
+        assert!(code.names.iter().any(|name| name.as_ref() == "helper"));
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::ImportFrom as u8)
+        );
+    }
+
+    #[test]
+    fn test_compile_relative_star_import_preserves_parent_level() {
+        let code = compile("from ..pkg import *");
+
+        assert!(code.names.iter().any(|name| name.as_ref() == "..pkg"));
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::ImportStar as u8)
+        );
     }
 
     #[test]
