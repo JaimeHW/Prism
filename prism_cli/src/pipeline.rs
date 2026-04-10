@@ -11,6 +11,29 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+struct ModuleExecutionSpec {
+    module_name: Arc<str>,
+    package_name: Arc<str>,
+    filename: Arc<str>,
+}
+
+impl ModuleExecutionSpec {
+    fn main(filename: impl Into<Arc<str>>) -> Self {
+        Self {
+            module_name: Arc::from("__main__"),
+            package_name: Arc::from(""),
+            filename: filename.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedModuleEntry {
+    path: PathBuf,
+    package_name: Arc<str>,
+}
+
 // =============================================================================
 // Public Pipeline Functions
 // =============================================================================
@@ -42,7 +65,14 @@ pub fn run_file_with_args(path: &Path, config: &RuntimeConfig, script_args: &[St
         }
     };
 
-    execute_source_with_args(&source, &filename, config, script_args)
+    let search_paths = script_search_paths(path);
+    execute_source_entry(
+        &source,
+        config,
+        script_args,
+        &search_paths,
+        ModuleExecutionSpec::main(filename),
+    )
 }
 
 /// Run a command string (from `-c` flag).
@@ -59,7 +89,14 @@ pub fn run_string_with_args(
     config: &RuntimeConfig,
     script_args: &[String],
 ) -> ExitCode {
-    execute_source_with_args(code, "<string>", config, script_args)
+    let search_paths = module_search_paths();
+    execute_source_entry(
+        code,
+        config,
+        script_args,
+        &search_paths,
+        ModuleExecutionSpec::main("<string>"),
+    )
 }
 
 /// Run from stdin.
@@ -77,7 +114,14 @@ pub fn run_stdin_with_args(config: &RuntimeConfig, script_args: &[String]) -> Ex
         eprintln!("prism: error reading stdin: {}", e);
         return ExitCode::from(error::EXIT_ERROR);
     }
-    execute_source_with_args(&source, "<stdin>", config, script_args)
+    let search_paths = module_search_paths();
+    execute_source_entry(
+        &source,
+        config,
+        script_args,
+        &search_paths,
+        ModuleExecutionSpec::main("<stdin>"),
+    )
 }
 
 /// Run a module by dotted name (from `-m` flag).
@@ -118,22 +162,41 @@ fn execute_source_with_args(
     config: &RuntimeConfig,
     script_args: &[String],
 ) -> ExitCode {
+    let search_paths = module_search_paths();
+    execute_source_entry(
+        source,
+        config,
+        script_args,
+        &search_paths,
+        ModuleExecutionSpec::main(filename),
+    )
+}
+
+fn execute_source_entry(
+    source: &str,
+    config: &RuntimeConfig,
+    script_args: &[String],
+    search_paths: &[PathBuf],
+    main_module: ModuleExecutionSpec,
+) -> ExitCode {
     // Phase 1: Parse.
     let module = match prism_parser::parse(source) {
         Ok(m) => m,
         Err(e) => {
-            return error::format_prism_error(&e, Some(source), filename);
+            return error::format_prism_error(&e, Some(source), main_module.filename.as_ref());
         }
     };
 
     // Phase 2: Compile.
     let optimize = compiler_optimization_level(config.optimize);
     let code = match prism_compiler::Compiler::compile_module_with_optimization(
-        &module, filename, optimize,
+        &module,
+        main_module.filename.as_ref(),
+        optimize,
     ) {
         Ok(c) => c,
         Err(e) => {
-            return error::format_compile_error(&e, Some(source), filename);
+            return error::format_compile_error(&e, Some(source), main_module.filename.as_ref());
         }
     };
 
@@ -144,13 +207,23 @@ fn execute_source_with_args(
     } else {
         prism_vm::VirtualMachine::new()
     };
-    if !script_args.is_empty() {
-        vm.import_resolver = prism_vm::import::ImportResolver::with_sys_args(script_args.to_vec());
+    vm.set_compiler_optimization(optimize);
+    vm.import_resolver = prism_vm::import::ImportResolver::with_sys_args(script_args.to_vec());
+    for search_path in search_paths {
+        vm.import_resolver
+            .add_search_path(Arc::from(search_path.to_string_lossy().into_owned()));
     }
+    let filename_for_errors = Arc::clone(&main_module.filename);
+    let main_module = Arc::new(prism_vm::import::ModuleObject::with_metadata(
+        Arc::clone(&main_module.module_name),
+        None,
+        Some(Arc::clone(&main_module.filename)),
+        Some(Arc::clone(&main_module.package_name)),
+    ));
 
-    match vm.execute(code) {
+    match vm.execute_in_module(code, main_module) {
         Ok(_) => ExitCode::from(error::EXIT_SUCCESS),
-        Err(e) => error::format_prism_error(&e, Some(source), filename),
+        Err(e) => error::format_prism_error(&e, Some(source), filename_for_errors.as_ref()),
     }
 }
 
@@ -168,10 +241,33 @@ fn run_module_with_search_paths_with_args(
     search_paths: &[PathBuf],
     script_args: &[String],
 ) -> ExitCode {
-    match resolve_module_path_in_search_paths(module, search_paths) {
-        Some(path) => {
-            let module_argv = build_module_argv(&path, script_args);
-            run_file_with_args(&path, config, &module_argv)
+    match resolve_module_entry_in_search_paths(module, search_paths) {
+        Some(entry) => {
+            let module_argv = build_module_argv(&entry.path, script_args);
+            let source = match std::fs::read_to_string(&entry.path) {
+                Ok(source) => source,
+                Err(err) => {
+                    eprintln!(
+                        "prism: can't open file '{}': [Errno {}] {}",
+                        entry.path.display(),
+                        err.raw_os_error().unwrap_or(0),
+                        err,
+                    );
+                    return ExitCode::from(error::EXIT_USAGE_ERROR);
+                }
+            };
+
+            execute_source_entry(
+                &source,
+                config,
+                &module_argv,
+                search_paths,
+                ModuleExecutionSpec {
+                    module_name: Arc::from("__main__"),
+                    package_name: entry.package_name,
+                    filename: Arc::from(entry.path.display().to_string()),
+                },
+            )
         }
         None => {
             eprintln!("prism: No module named '{}'", module);
@@ -212,7 +308,27 @@ fn module_search_paths() -> Vec<PathBuf> {
     paths
 }
 
+fn script_search_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(parent) = path.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    for search_path in module_search_paths() {
+        if !paths.iter().any(|existing| existing == &search_path) {
+            paths.push(search_path);
+        }
+    }
+    paths
+}
+
 fn resolve_module_path_in_search_paths(module: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
+    resolve_module_entry_in_search_paths(module, search_paths).map(|entry| entry.path)
+}
+
+fn resolve_module_entry_in_search_paths(
+    module: &str,
+    search_paths: &[PathBuf],
+) -> Option<ResolvedModuleEntry> {
     let parts: Vec<&str> = module.split('.').collect();
     if parts.is_empty()
         || parts
@@ -230,12 +346,19 @@ fn resolve_module_path_in_search_paths(module: &str, search_paths: &[PathBuf]) -
 
         let module_file = module_base.with_extension("py");
         if module_file.is_file() {
-            return Some(module_file);
+            let package_name = parts[..parts.len().saturating_sub(1)].join(".");
+            return Some(ResolvedModuleEntry {
+                path: module_file,
+                package_name: Arc::from(package_name),
+            });
         }
 
         let package_main = module_base.join("__main__.py");
         if package_main.is_file() {
-            return Some(package_main);
+            return Some(ResolvedModuleEntry {
+                path: package_main,
+                package_name: Arc::from(module),
+            });
         }
     }
 
@@ -628,6 +751,37 @@ mod tests {
     }
 
     #[test]
+    fn test_run_file_supports_sibling_source_imports() {
+        let temp = TestTempDir::new();
+        let main_path = temp.path.join("main.py");
+        write_file(&temp.path.join("helper.py"), "VALUE = 123\n");
+        write_file(
+            &main_path,
+            "import helper\nfrom helper import VALUE\nassert helper.VALUE == 123\nassert VALUE == 123\n",
+        );
+
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_file_with_args(&main_path, &config, &[main_path.display().to_string()]);
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
+    fn test_run_file_supports_source_packages_and_submodules() {
+        let temp = TestTempDir::new();
+        let main_path = temp.path.join("main.py");
+        write_file(&temp.path.join("pkg").join("__init__.py"), "VALUE = 5\n");
+        write_file(&temp.path.join("pkg").join("helper.py"), "VALUE = 7\n");
+        write_file(
+            &main_path,
+            "import pkg\nimport pkg.helper\nfrom pkg import helper\nassert pkg.VALUE == 5\nassert pkg.helper.VALUE == 7\nassert helper.VALUE == 7\n",
+        );
+
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_file_with_args(&main_path, &config, &[main_path.display().to_string()]);
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
     fn test_run_module_with_args_sets_argv0_to_module_path() {
         let temp = TestTempDir::new();
         let module_path = temp.path.join("mymodule.py");
@@ -644,6 +798,60 @@ mod tests {
             std::slice::from_ref(&temp.path),
             &module_args,
         );
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
+    fn test_run_module_supports_relative_imports() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("pkg").join("__init__.py"), "");
+        write_file(&temp.path.join("pkg").join("helper.py"), "VALUE = 41\n");
+        write_file(
+            &temp.path.join("pkg").join("main.py"),
+            "from .helper import VALUE\nfrom . import helper\nassert VALUE == 41\nassert helper.VALUE == 41\n",
+        );
+
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code =
+            run_module_with_search_paths("pkg.main", &config, std::slice::from_ref(&temp.path));
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
+    fn test_run_module_supports_parent_relative_imports() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("pkg").join("__init__.py"), "");
+        write_file(&temp.path.join("pkg").join("helper.py"), "VALUE = 99\n");
+        write_file(
+            &temp.path.join("pkg").join("subpkg").join("__init__.py"),
+            "",
+        );
+        write_file(
+            &temp.path.join("pkg").join("subpkg").join("main.py"),
+            "from ..helper import VALUE\nassert VALUE == 99\n",
+        );
+
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_module_with_search_paths(
+            "pkg.subpkg.main",
+            &config,
+            std::slice::from_ref(&temp.path),
+        );
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
+    fn test_run_module_package_entrypoint_sets_package_context() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("pkg").join("__init__.py"), "");
+        write_file(&temp.path.join("pkg").join("helper.py"), "VALUE = 7\n");
+        write_file(
+            &temp.path.join("pkg").join("__main__.py"),
+            "from .helper import VALUE\nimport sys\nassert VALUE == 7\nassert len(sys.argv) == 1\nassert len(sys.argv[0]) > 0\n",
+        );
+
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_module_with_search_paths("pkg", &config, std::slice::from_ref(&temp.path));
         assert_eq!(code, ExitCode::from(0));
     }
 
@@ -689,6 +897,16 @@ mod tests {
     fn test_run_string_defaults_sys_argv0_to_dash_c() {
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
         let code = run_string("import sys\nassert len(sys.argv[0]) == 2\n", &config);
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
+    fn test_run_string_supports_dotted_import_binding_top_level_module() {
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_string(
+            "import os.path\nfrom os import path\nassert os.path is not None\nassert path is not None\n",
+            &config,
+        );
         assert_eq!(code, ExitCode::from(0));
     }
 
