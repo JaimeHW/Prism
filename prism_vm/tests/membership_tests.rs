@@ -7,8 +7,16 @@
 //! These tests focus on the underlying type methods that the VM's
 //! `contains_value` function dispatches to.
 
+use prism_runtime::types::int::value_to_i64;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::string::StringObject;
+
+fn collect_range(range: &RangeObject) -> Vec<i64> {
+    range
+        .iter()
+        .map(|value| value_to_i64(value).expect("range item should fit in i64"))
+        .collect()
+}
 
 // =============================================================================
 // String Containment Tests (SIMD-accelerated)
@@ -249,14 +257,14 @@ fn test_range_len() {
 #[test]
 fn test_range_iter() {
     let range = RangeObject::new(0, 10, 2);
-    let values: Vec<i64> = range.iter().collect();
+    let values = collect_range(&range);
     assert_eq!(values, vec![0, 2, 4, 6, 8]);
 }
 
 #[test]
 fn test_range_iter_reverse() {
     let range = RangeObject::new(10, 0, -2);
-    let values: Vec<i64> = range.iter().collect();
+    let values = collect_range(&range);
     assert_eq!(values, vec![10, 8, 6, 4, 2]);
 }
 

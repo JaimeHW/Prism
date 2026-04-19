@@ -15,6 +15,16 @@ pub const MAX_RECURSION_DEPTH: usize = 1000;
 /// Number of registers per frame.
 pub const REGISTER_COUNT: usize = 256;
 
+#[derive(Clone, Copy)]
+pub struct FrameStateSnapshot {
+    ip: u32,
+    registers: [Value; REGISTER_COUNT],
+    written_registers: [u64; REGISTER_COUNT / 64],
+    locals_mapping: Option<Value>,
+    yield_point: u32,
+    handler_cache: InlineHandlerCache,
+}
+
 /// A call frame representing a function invocation.
 ///
 /// The frame contains:
@@ -56,6 +66,16 @@ pub struct Frame {
     /// Registers r0-r255 used for local computation.
     /// Parameters are passed in r0, r1, r2, ...
     pub registers: [Value; REGISTER_COUNT],
+
+    /// Bitset tracking which registers have been explicitly written.
+    ///
+    /// This lets the VM distinguish "never assigned" from an explicit
+    /// `None` value for local-slot backed namespaces such as class bodies.
+    written_registers: [u64; REGISTER_COUNT / 64],
+
+    /// Optional live locals mapping for scopes that execute against a custom
+    /// namespace object, such as metaclass `__prepare__` class bodies.
+    locals_mapping: Option<Value>,
 
     // =========================================================================
     // Generator Support
@@ -258,6 +278,8 @@ impl Frame {
             closure: None,
             // Initialize all registers to None for safety
             registers: [Value::none(); REGISTER_COUNT],
+            written_registers: [0; REGISTER_COUNT / 64],
+            locals_mapping: None,
             yield_point: 0,
             handler_cache: InlineHandlerCache::new(),
         }
@@ -291,6 +313,8 @@ impl Frame {
             module,
             closure: Some(closure),
             registers: [Value::none(); REGISTER_COUNT],
+            written_registers: [0; REGISTER_COUNT / 64],
+            locals_mapping: None,
             yield_point: 0,
             handler_cache: InlineHandlerCache::new(),
         }
@@ -311,7 +335,64 @@ impl Frame {
     #[inline(always)]
     pub fn set_reg(&mut self, reg: u8, value: Value) {
         // Safety: reg is u8, so always in bounds for 256-element array
-        unsafe { *self.registers.get_unchecked_mut(reg as usize) = value }
+        let reg_idx = reg as usize;
+        unsafe { *self.registers.get_unchecked_mut(reg_idx) = value };
+        let word = reg_idx / 64;
+        let bit = reg_idx % 64;
+        self.written_registers[word] |= 1u64 << bit;
+    }
+
+    /// Clear a register and mark it as logically unassigned.
+    #[inline(always)]
+    pub fn clear_reg(&mut self, reg: u8) {
+        let reg_idx = reg as usize;
+        unsafe { *self.registers.get_unchecked_mut(reg_idx) = Value::none() };
+        let word = reg_idx / 64;
+        let bit = reg_idx % 64;
+        self.written_registers[word] &= !(1u64 << bit);
+    }
+
+    #[inline(always)]
+    pub fn snapshot_state(&self) -> FrameStateSnapshot {
+        FrameStateSnapshot {
+            ip: self.ip,
+            registers: self.registers,
+            written_registers: self.written_registers,
+            locals_mapping: self.locals_mapping,
+            yield_point: self.yield_point,
+            handler_cache: self.handler_cache,
+        }
+    }
+
+    #[inline(always)]
+    pub fn restore_state(&mut self, snapshot: FrameStateSnapshot) {
+        self.ip = snapshot.ip;
+        self.registers = snapshot.registers;
+        self.written_registers = snapshot.written_registers;
+        self.locals_mapping = snapshot.locals_mapping;
+        self.yield_point = snapshot.yield_point;
+        self.handler_cache = snapshot.handler_cache;
+    }
+
+    /// Check whether a register has been explicitly written.
+    #[inline(always)]
+    pub fn reg_is_written(&self, reg: u8) -> bool {
+        let reg_idx = reg as usize;
+        let word = reg_idx / 64;
+        let bit = reg_idx % 64;
+        (self.written_registers[word] & (1u64 << bit)) != 0
+    }
+
+    /// Return the live locals mapping for this frame, when one is active.
+    #[inline(always)]
+    pub fn locals_mapping(&self) -> Option<Value> {
+        self.locals_mapping
+    }
+
+    /// Install or clear the live locals mapping for this frame.
+    #[inline(always)]
+    pub fn set_locals_mapping(&mut self, mapping: Option<Value>) {
+        self.locals_mapping = mapping;
     }
 
     /// Get two register values (common for binary ops).

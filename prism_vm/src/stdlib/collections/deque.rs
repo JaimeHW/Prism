@@ -31,8 +31,214 @@
 //! When full, the buffer doubles in size (minimum 16 elements).
 //! This gives O(1) amortized insertion cost.
 
+use crate::VirtualMachine;
+use crate::builtins::{BuiltinError, get_iterator_mut, value_to_iterator};
 use prism_core::Value;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::{ObjectHeader, PyObject};
 use std::ops::{Index, IndexMut};
+
+// =============================================================================
+// Native Deque Object
+// =============================================================================
+
+/// Heap object wrapper for the native deque implementation.
+#[repr(C)]
+#[derive(Debug)]
+pub struct DequeObject {
+    header: ObjectHeader,
+    deque: Deque,
+}
+
+impl DequeObject {
+    #[inline]
+    pub fn new() -> Self {
+        Self::from_deque(Deque::new())
+    }
+
+    #[inline]
+    pub fn from_deque(deque: Deque) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::DEQUE),
+            deque,
+        }
+    }
+
+    #[inline]
+    pub fn deque(&self) -> &Deque {
+        &self.deque
+    }
+
+    #[inline]
+    pub fn deque_mut(&mut self) -> &mut Deque {
+        &mut self.deque
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.deque.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.deque.is_empty()
+    }
+}
+
+impl PyObject for DequeObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[inline]
+pub fn value_as_deque(value: &Value) -> Option<&'static DequeObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::DEQUE {
+        return None;
+    }
+    Some(unsafe { &*(ptr as *const DequeObject) })
+}
+
+#[inline]
+pub fn value_as_deque_mut(value: Value) -> Option<&'static mut DequeObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::DEQUE {
+        return None;
+    }
+    Some(unsafe { &mut *(ptr as *mut DequeObject) })
+}
+
+/// Native constructor for `collections.deque`.
+pub fn builtin_deque(args: &[Value]) -> Result<Value, BuiltinError> {
+    build_deque(None, args, &[])
+}
+
+/// VM-aware native constructor for `collections.deque`.
+pub fn builtin_deque_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    build_deque(Some(vm), args, &[])
+}
+
+/// Keyword-aware constructor for builtin deque type objects.
+pub fn builtin_deque_kw(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    build_deque(None, positional, keywords)
+}
+
+fn build_deque(
+    vm: Option<&mut VirtualMachine>,
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if positional.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "deque() takes at most 2 arguments ({} given)",
+            positional.len()
+        )));
+    }
+
+    let mut iterable = positional.first().copied();
+    let mut maxlen = positional.get(1).copied();
+
+    for &(name, value) in keywords {
+        match name {
+            "iterable" => {
+                if iterable.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "deque() got multiple values for argument 'iterable'".to_string(),
+                    ));
+                }
+                iterable = Some(value);
+            }
+            "maxlen" => {
+                if maxlen.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "deque() got multiple values for argument 'maxlen'".to_string(),
+                    ));
+                }
+                maxlen = Some(value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "deque() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    let maxlen = normalize_maxlen(maxlen)?;
+    let mut deque = maxlen.map_or_else(Deque::new, Deque::with_maxlen);
+
+    if let Some(iterable_value) = iterable {
+        let values = if let Some(vm) = vm {
+            collect_iterable_values_with_vm(vm, iterable_value)?
+        } else {
+            collect_iterable_values_static(iterable_value)?
+        };
+        deque.extend(values);
+    }
+
+    Ok(leak_deque_value(DequeObject::from_deque(deque)))
+}
+
+#[inline]
+fn leak_deque_value(object: DequeObject) -> Value {
+    let ptr = Box::into_raw(Box::new(object)) as *const ();
+    Value::object_ptr(ptr)
+}
+
+fn collect_iterable_values_static(value: Value) -> Result<Vec<Value>, BuiltinError> {
+    if let Some(iterator) = get_iterator_mut(&value) {
+        return Ok(iterator.collect_remaining());
+    }
+
+    let mut iterator = value_to_iterator(&value).map_err(BuiltinError::from)?;
+    Ok(iterator.collect_remaining())
+}
+
+fn collect_iterable_values_with_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Vec<Value>, BuiltinError> {
+    crate::ops::iteration::collect_iterable_values(vm, value)
+        .map_err(|err| BuiltinError::TypeError(err.to_string()))
+}
+
+fn normalize_maxlen(value: Option<Value>) -> Result<Option<usize>, BuiltinError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    let raw = value
+        .as_int()
+        .or_else(|| value.as_bool().map(|flag| if flag { 1 } else { 0 }))
+        .ok_or_else(|| BuiltinError::TypeError("an integer is required".to_string()))?;
+
+    if raw < 0 {
+        return Err(BuiltinError::ValueError(
+            "maxlen must be non-negative".to_string(),
+        ));
+    }
+
+    usize::try_from(raw)
+        .map(Some)
+        .map_err(|_| BuiltinError::OverflowError("maxlen is too large".to_string()))
+}
 
 // =============================================================================
 // Constants
@@ -684,6 +890,7 @@ impl DoubleEndedIterator for DequeIntoIter {
 #[cfg(test)]
 mod deque_tests {
     use super::*;
+    use prism_runtime::types::list::ListObject;
 
     // =========================================================================
     // Construction Tests
@@ -725,6 +932,44 @@ mod deque_tests {
         assert_eq!(d.len(), 3);
         assert_eq!(d.get(0).and_then(|v| v.as_int()), Some(1));
         assert_eq!(d.get(2).and_then(|v| v.as_int()), Some(3));
+    }
+
+    #[test]
+    fn test_builtin_deque_constructs_empty_native_object() {
+        let value = builtin_deque(&[]).expect("deque() should succeed");
+        let deque = value_as_deque(&value).expect("deque() should return native deque");
+        assert!(deque.is_empty());
+        assert_eq!(deque.len(), 0);
+    }
+
+    #[test]
+    fn test_builtin_deque_consumes_iterable_and_maxlen() {
+        let iterable = Value::object_ptr(Box::into_raw(Box::new(ListObject::from_slice(&[
+            Value::int_unchecked(1),
+            Value::int_unchecked(2),
+            Value::int_unchecked(3),
+        ]))) as *const ());
+
+        let value = builtin_deque(&[iterable, Value::int_unchecked(2)])
+            .expect("deque(iterable, maxlen) should succeed");
+        let deque = value_as_deque(&value).expect("constructor should return deque");
+        assert_eq!(deque.len(), 2);
+        assert_eq!(
+            deque.deque().front().and_then(|value| value.as_int()),
+            Some(2)
+        );
+        assert_eq!(
+            deque.deque().back().and_then(|value| value.as_int()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_builtin_deque_kw_accepts_maxlen_keyword() {
+        let value = builtin_deque_kw(&[], &[("maxlen", Value::int_unchecked(4))])
+            .expect("deque(maxlen=...) should succeed");
+        let deque = value_as_deque(&value).expect("keyword constructor should return deque");
+        assert_eq!(deque.deque().maxlen(), Some(4));
     }
 
     // =========================================================================

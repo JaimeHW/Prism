@@ -34,6 +34,8 @@
 //! - Identical to calling a regular function
 
 use super::{Descriptor, DescriptorFlags, DescriptorKind};
+use crate::object::type_obj::TypeId;
+use crate::object::{ObjectHeader, PyObject};
 use prism_core::{PrismResult, Value};
 
 // =============================================================================
@@ -44,8 +46,11 @@ use prism_core::{PrismResult, Value};
 ///
 /// StaticMethods return the underlying function unchanged, regardless
 /// of whether accessed through a class or instance.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[repr(C)]
 pub struct StaticMethodDescriptor {
+    /// Object header for heap storage and fast type dispatch.
+    pub header: ObjectHeader,
     /// The underlying function.
     function: Value,
 }
@@ -53,7 +58,10 @@ pub struct StaticMethodDescriptor {
 impl StaticMethodDescriptor {
     /// Create a new staticmethod descriptor.
     pub fn new(function: Value) -> Self {
-        Self { function }
+        Self {
+            header: ObjectHeader::new(TypeId::STATICMETHOD),
+            function,
+        }
     }
 
     /// Get the underlying function.
@@ -79,6 +87,16 @@ impl Descriptor for StaticMethodDescriptor {
     }
 }
 
+impl PyObject for StaticMethodDescriptor {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -93,6 +111,7 @@ mod tests {
         let sm = StaticMethodDescriptor::new(func);
 
         assert_eq!(sm.function(), func);
+        assert_eq!(sm.header.type_id, TypeId::STATICMETHOD);
     }
 
     #[test]
@@ -179,7 +198,9 @@ mod tests {
 
     #[test]
     fn test_staticmethod_size() {
-        // StaticMethodDescriptor should be small (just a Value = 8 bytes)
-        assert_eq!(std::mem::size_of::<StaticMethodDescriptor>(), 8);
+        assert_eq!(
+            std::mem::size_of::<StaticMethodDescriptor>(),
+            std::mem::size_of::<ObjectHeader>() + std::mem::size_of::<Value>()
+        );
     }
 }

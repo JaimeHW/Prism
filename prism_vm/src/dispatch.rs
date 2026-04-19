@@ -240,6 +240,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::IsCallable as usize] = objects::is_callable;
     table[Opcode::LoadMethod as usize] = method_dispatch::load_method;
     table[Opcode::BuildClass as usize] = class::build_class;
+    table[Opcode::BuildClassWithMeta as usize] = class::build_class_with_metaclass;
 
     // Function Calls (0x70-0x7F)
     table[Opcode::Call as usize] = calls::call;

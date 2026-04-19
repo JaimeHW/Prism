@@ -49,6 +49,30 @@ impl TypeId {
     pub const MODULE_OBJECT: Self = Self(26);
     pub const EXCEPTION_TYPE: Self = Self(27);
     pub const BYTEARRAY: Self = Self(28);
+    pub const CLASSMETHOD: Self = Self(29);
+    pub const STATICMETHOD: Self = Self(30);
+    pub const PROPERTY: Self = Self(31);
+    pub const CELL_VIEW: Self = Self(32);
+    pub const GENERIC_ALIAS: Self = Self(33);
+    pub const UNION: Self = Self(34);
+    pub const MAPPING_PROXY: Self = Self(35);
+    pub const WRAPPER_DESCRIPTOR: Self = Self(36);
+    pub const METHOD_WRAPPER: Self = Self(37);
+    pub const METHOD_DESCRIPTOR: Self = Self(38);
+    pub const CLASSMETHOD_DESCRIPTOR: Self = Self(39);
+    pub const GETSET_DESCRIPTOR: Self = Self(40);
+    pub const MEMBER_DESCRIPTOR: Self = Self(41);
+    pub const TRACEBACK: Self = Self(42);
+    pub const FRAME: Self = Self(43);
+    pub const ELLIPSIS: Self = Self(44);
+    pub const NOT_IMPLEMENTED: Self = Self(45);
+    pub const DICT_KEYS: Self = Self(46);
+    pub const DICT_VALUES: Self = Self(47);
+    pub const DICT_ITEMS: Self = Self(48);
+    pub const MEMORYVIEW: Self = Self(49);
+    pub const DEQUE: Self = Self(50);
+    pub const REGEX_PATTERN: Self = Self(51);
+    pub const REGEX_MATCH: Self = Self(52);
 
     /// First ID available for user-defined types.
     pub const FIRST_USER_TYPE: u32 = 256;
@@ -103,6 +127,30 @@ impl TypeId {
             26 => "module",
             27 => "exception_type",
             28 => "bytearray",
+            29 => "classmethod",
+            30 => "staticmethod",
+            31 => "property",
+            32 => "cell",
+            33 => "generic_alias",
+            34 => "union",
+            35 => "mappingproxy",
+            36 => "wrapper_descriptor",
+            37 => "method-wrapper",
+            38 => "method_descriptor",
+            39 => "classmethod_descriptor",
+            40 => "getset_descriptor",
+            41 => "member_descriptor",
+            42 => "traceback",
+            43 => "frame",
+            44 => "ellipsis",
+            45 => "NotImplementedType",
+            46 => "dict_keys",
+            47 => "dict_values",
+            48 => "dict_items",
+            49 => "memoryview",
+            50 => "deque",
+            51 => "Pattern",
+            52 => "Match",
             _ => "<unknown>",
         }
     }
@@ -379,6 +427,28 @@ mod tests {
         assert_eq!(TypeId::INT.name(), "int");
         assert_eq!(TypeId::LIST.name(), "list");
         assert_eq!(TypeId::FUNCTION.name(), "function");
+        assert_eq!(TypeId::CELL_VIEW.name(), "cell");
+        assert_eq!(TypeId::GENERIC_ALIAS.name(), "generic_alias");
+        assert_eq!(TypeId::UNION.name(), "union");
+        assert_eq!(TypeId::MAPPING_PROXY.name(), "mappingproxy");
+        assert_eq!(TypeId::WRAPPER_DESCRIPTOR.name(), "wrapper_descriptor");
+        assert_eq!(TypeId::METHOD_WRAPPER.name(), "method-wrapper");
+        assert_eq!(TypeId::METHOD_DESCRIPTOR.name(), "method_descriptor");
+        assert_eq!(
+            TypeId::CLASSMETHOD_DESCRIPTOR.name(),
+            "classmethod_descriptor"
+        );
+        assert_eq!(TypeId::GETSET_DESCRIPTOR.name(), "getset_descriptor");
+        assert_eq!(TypeId::MEMBER_DESCRIPTOR.name(), "member_descriptor");
+        assert_eq!(TypeId::TRACEBACK.name(), "traceback");
+        assert_eq!(TypeId::FRAME.name(), "frame");
+        assert_eq!(TypeId::ELLIPSIS.name(), "ellipsis");
+        assert_eq!(TypeId::NOT_IMPLEMENTED.name(), "NotImplementedType");
+        assert_eq!(TypeId::DICT_KEYS.name(), "dict_keys");
+        assert_eq!(TypeId::DICT_VALUES.name(), "dict_values");
+        assert_eq!(TypeId::DICT_ITEMS.name(), "dict_items");
+        assert_eq!(TypeId::MEMORYVIEW.name(), "memoryview");
+        assert_eq!(TypeId::DEQUE.name(), "deque");
     }
 
     #[test]

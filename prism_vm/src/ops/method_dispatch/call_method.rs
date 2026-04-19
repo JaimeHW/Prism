@@ -28,15 +28,13 @@ use crate::VirtualMachine;
 use crate::builtins::BuiltinFunctionObject;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::ops::calls::invoke_builtin;
+use crate::ops::calls::{call_user_function_from_values, invoke_builtin, invoke_callable_value};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::descriptor::BoundMethod;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::function::FunctionObject;
 use smallvec::SmallVec;
-use std::sync::Arc;
 
 // =============================================================================
 // CallMethod Handler
@@ -80,6 +78,10 @@ pub fn call_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             call_builtin_function(vm, ptr, implicit_self, dst, method_reg, argc)
         }
         TypeId::METHOD => call_bound_method(vm, ptr, dst, method_reg, argc),
+        TypeId::TYPE => call_generic_callable(vm, method, implicit_self, dst, method_reg, argc),
+        _ if crate::ops::calls::value_supports_call_protocol(method) => {
+            call_generic_callable(vm, method, implicit_self, dst, method_reg, argc)
+        }
         _ => ControlFlow::Error(RuntimeError::type_error(format!(
             "'{}' object is not callable",
             type_id.name()
@@ -117,30 +119,19 @@ fn call_user_function(
     method_reg: u8,
     argc: usize,
 ) -> ControlFlow {
-    let func = unsafe { &*(func_ptr as *const FunctionObject) };
-    let code = Arc::clone(&func.code);
+    let caller_frame = &vm.frames[vm.call_depth() - 1];
+    let mut args: SmallVec<[Value; 8]> =
+        SmallVec::with_capacity(argc + implicit_self.is_some() as usize);
 
-    // Push new frame for function execution
-    if let Err(e) = vm.push_frame(Arc::clone(&code), dst) {
-        return ControlFlow::Error(e);
-    }
-
-    // Get caller frame index (now -2 since we pushed a new frame)
-    let caller_frame_idx = vm.call_depth() - 2;
-
-    let mut arg_dst = 0u8;
     if let Some(self_val) = implicit_self {
-        vm.current_frame_mut().set_reg(0, self_val);
-        arg_dst = 1;
+        args.push(self_val);
     }
 
-    // Copy explicit arguments.
     for i in 0..argc {
-        let arg = vm.frames[caller_frame_idx].get_reg(method_reg + 2 + i as u8);
-        vm.current_frame_mut().set_reg(arg_dst + i as u8, arg);
+        args.push(caller_frame.get_reg(method_reg + 2 + i as u8));
     }
 
-    ControlFlow::Continue
+    call_user_function_from_values(vm, func_ptr, dst, &args, &[])
 }
 
 /// Call a builtin function with optional implicit self + args.
@@ -221,6 +212,35 @@ fn call_bound_method(
             "bound method wraps non-callable '{}' object",
             type_id.name()
         ))),
+    }
+}
+
+#[inline]
+fn call_generic_callable(
+    vm: &mut VirtualMachine,
+    callable: Value,
+    implicit_self: Option<Value>,
+    dst: u8,
+    method_reg: u8,
+    argc: usize,
+) -> ControlFlow {
+    let caller_frame = &vm.frames[vm.call_depth() - 1];
+    let mut args: SmallVec<[Value; 8]> =
+        SmallVec::with_capacity(argc + implicit_self.is_some() as usize);
+    if let Some(self_val) = implicit_self {
+        args.push(self_val);
+    }
+
+    for i in 0..argc {
+        args.push(caller_frame.get_reg(method_reg + 2 + i as u8));
+    }
+
+    match invoke_callable_value(vm, callable, &args) {
+        Ok(result) => {
+            vm.current_frame_mut().set_reg(dst, result);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -405,5 +425,28 @@ mod tests {
         unsafe {
             drop(Box::from_raw(builtin_ptr));
         }
+    }
+
+    #[test]
+    fn test_call_method_supports_type_objects_without_implicit_self() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, "caller");
+
+        vm.current_frame_mut().set_reg(
+            1,
+            crate::builtins::builtin_type_object_for_type_id(TypeId::DICT),
+        );
+        vm.current_frame_mut().set_reg(2, Value::none());
+
+        let inst = Instruction::new(Opcode::CallMethod, 0, 1, 0);
+        let control = call_method(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+
+        let result_ptr = vm
+            .current_frame()
+            .get_reg(0)
+            .as_object_ptr()
+            .expect("dict() should return a heap object");
+        assert_eq!(extract_type_id(result_ptr), TypeId::DICT);
     }
 }

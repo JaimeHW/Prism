@@ -46,12 +46,20 @@
 //! ```
 
 use crate::builtins::BuiltinError;
-use crate::builtins::exception_value::{ExceptionValue, create_exception_with_args};
+use crate::builtins::exception_value::{create_exception, create_exception_with_args};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
+use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::class::{ClassDict, PyClassObject};
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::{
+    global_class_registry, register_global_class, type_new,
+};
 use prism_runtime::object::type_obj::TypeId;
-use std::sync::Arc;
+use prism_runtime::types::tuple::TupleObject;
+use rustc_hash::FxHashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 // =============================================================================
 // Type ID Extension
@@ -59,6 +67,11 @@ use std::sync::Arc;
 
 /// TypeId for exception type objects (callable that constructs exceptions).
 pub const EXCEPTION_TYPE_ID: TypeId = TypeId(27);
+
+static EXCEPTION_PROXY_CLASSES: LazyLock<Mutex<FxHashMap<u16, Arc<PyClassObject>>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+static EXCEPTION_TYPE_IDS_BY_PROXY_CLASS: LazyLock<Mutex<FxHashMap<u32, u16>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 // =============================================================================
 // Exception Type Flags
@@ -310,18 +323,11 @@ impl ExceptionTypeObject {
         let type_id = ExceptionTypeId::from_u8(self.exception_type_id as u8)
             .unwrap_or(ExceptionTypeId::Exception);
 
-        // Extract message from first arg if present
-        let message = if args.is_empty() {
-            None
-        } else {
-            // For now, use type name as placeholder until string extraction is implemented
-            Some(Arc::from(self.name.as_ref()))
-        };
+        if args.is_empty() {
+            return create_exception(type_id, None);
+        }
 
-        // Convert args to boxed slice
-        let boxed_args: Box<[Value]> = args.to_vec().into_boxed_slice();
-
-        create_exception_with_args(type_id, message, boxed_args)
+        create_exception_with_args(type_id, None, args.to_vec().into_boxed_slice())
     }
 
     /// Call the exception type as a constructor (for builtins integration).
@@ -685,6 +691,194 @@ pub fn get_exception_type_by_id(type_id: u16) -> Option<&'static ExceptionTypeOb
     })
 }
 
+#[inline]
+fn exception_type_value(exception_type: &'static ExceptionTypeObject) -> Value {
+    Value::object_ptr(exception_type as *const ExceptionTypeObject as *const ())
+}
+
+#[inline]
+pub(crate) fn exception_type_value_for_id(type_id: u16) -> Option<Value> {
+    Some(exception_type_value(get_exception_type_by_id(type_id)?))
+}
+
+#[inline]
+fn boxed_tuple_value(items: Vec<Value>) -> Value {
+    Value::object_ptr(Box::into_raw(Box::new(TupleObject::from_vec(items))) as *const ())
+}
+
+#[inline]
+fn exception_type_base_value(exception_type: &ExceptionTypeObject) -> Value {
+    match exception_type.exception_type() {
+        Some(ExceptionTypeId::BaseException) => {
+            crate::builtins::builtin_type_object_for_type_id(TypeId::OBJECT)
+        }
+        _ => get_exception_type_by_id(exception_type.base_type_id())
+            .map(exception_type_value)
+            .unwrap_or_else(Value::none),
+    }
+}
+
+#[inline]
+fn exception_type_bases_tuple_value(exception_type: &ExceptionTypeObject) -> Value {
+    let base = exception_type_base_value(exception_type);
+    if base.is_none() {
+        boxed_tuple_value(Vec::new())
+    } else {
+        boxed_tuple_value(vec![base])
+    }
+}
+
+#[inline]
+fn exception_type_mro_tuple_value(exception_type: &'static ExceptionTypeObject) -> Value {
+    let mut mro = vec![exception_type_value(exception_type)];
+    let mut current = exception_type.exception_type();
+
+    while let Some(parent) = current.and_then(|kind| kind.parent()) {
+        let parent_type = get_exception_type_by_id(parent as u16)
+            .expect("parent exception type should always be registered");
+        mro.push(exception_type_value(parent_type));
+        current = Some(parent);
+    }
+
+    mro.push(crate::builtins::builtin_type_object_for_type_id(
+        TypeId::OBJECT,
+    ));
+    boxed_tuple_value(mro)
+}
+
+pub(crate) fn exception_type_attribute_value(
+    exception_type: &'static ExceptionTypeObject,
+    name: &InternedString,
+) -> Option<Value> {
+    match name.as_str() {
+        "__name__" | "__qualname__" => Some(Value::string(intern(exception_type.name()))),
+        "__module__" => Some(Value::string(intern("builtins"))),
+        "__bases__" => Some(exception_type_bases_tuple_value(exception_type)),
+        "__base__" => Some(exception_type_base_value(exception_type)),
+        "__mro__" => Some(exception_type_mro_tuple_value(exception_type)),
+        _ => None,
+    }
+}
+
+fn build_exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClassObject> {
+    let bases = exception_type_id
+        .parent()
+        .map(|parent| vec![exception_proxy_class(parent).class_id()])
+        .unwrap_or_default();
+    let namespace = ClassDict::new();
+    let name = intern(
+        get_exception_type_by_id(exception_type_id as u16)
+            .expect("every ExceptionTypeId should resolve to a registered exception type")
+            .name(),
+    );
+    let result = type_new(name, &bases, &namespace, global_class_registry())
+        .expect("built-in exception proxy classes should always construct successfully");
+    register_global_class(result.class.clone(), result.bitmap);
+    result.class
+}
+
+pub(crate) fn exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClassObject> {
+    {
+        let cache = EXCEPTION_PROXY_CLASSES
+            .lock()
+            .expect("exception proxy cache lock poisoned");
+        if let Some(class) = cache.get(&(exception_type_id as u16)) {
+            return class.clone();
+        }
+    }
+
+    if let Some(parent) = exception_type_id.parent() {
+        let _ = exception_proxy_class(parent);
+    }
+
+    let class = build_exception_proxy_class(exception_type_id);
+    let class_id = class.class_id().0;
+
+    let mut cache = EXCEPTION_PROXY_CLASSES
+        .lock()
+        .expect("exception proxy cache lock poisoned");
+    if let Some(existing) = cache.get(&(exception_type_id as u16)) {
+        return existing.clone();
+    }
+    cache.insert(exception_type_id as u16, class.clone());
+
+    EXCEPTION_TYPE_IDS_BY_PROXY_CLASS
+        .lock()
+        .expect("exception proxy reverse cache lock poisoned")
+        .insert(class_id, exception_type_id as u16);
+
+    class
+}
+
+#[inline]
+pub(crate) fn exception_proxy_class_id(exception_type_id: u16) -> Option<ClassId> {
+    let exception_type = ExceptionTypeId::from_u8(exception_type_id as u8)?;
+    Some(exception_proxy_class(exception_type).class_id())
+}
+
+#[inline]
+pub(crate) fn exception_proxy_class_id_from_ptr(ptr: *const ()) -> Option<ClassId> {
+    let exc_type = unsafe { &*(ptr as *const ExceptionTypeObject) };
+    exception_proxy_class_id(exc_type.exception_type_id)
+}
+
+#[inline]
+pub(crate) fn exception_type_value_for_proxy_class_id(class_id: ClassId) -> Option<Value> {
+    let exception_type_id = EXCEPTION_TYPE_IDS_BY_PROXY_CLASS
+        .lock()
+        .expect("exception proxy reverse cache lock poisoned")
+        .get(&class_id.0)
+        .copied()?;
+    Some(exception_type_value(get_exception_type_by_id(
+        exception_type_id,
+    )?))
+}
+
+fn build_builtin_warning_category_class(name: &'static str) -> Arc<PyClassObject> {
+    let warning_base = exception_proxy_class(ExceptionTypeId::Warning).class_id();
+    let namespace = ClassDict::new();
+    let result = type_new(
+        intern(name),
+        &[warning_base],
+        &namespace,
+        global_class_registry(),
+    )
+    .expect("built-in warning category classes should always construct successfully");
+    register_global_class(result.class.clone(), result.bitmap);
+    result.class
+}
+
+static BYTES_WARNING_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_builtin_warning_category_class("BytesWarning"));
+static FUTURE_WARNING_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_builtin_warning_category_class("FutureWarning"));
+static IMPORT_WARNING_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_builtin_warning_category_class("ImportWarning"));
+static RESOURCE_WARNING_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_builtin_warning_category_class("ResourceWarning"));
+static UNICODE_WARNING_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_builtin_warning_category_class("UnicodeWarning"));
+static ENCODING_WARNING_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_builtin_warning_category_class("EncodingWarning"));
+
+pub static SUPPLEMENTAL_EXCEPTION_CLASS_TABLE: &[(&str, &LazyLock<Arc<PyClassObject>>)] = &[
+    ("BytesWarning", &BYTES_WARNING_CLASS),
+    ("FutureWarning", &FUTURE_WARNING_CLASS),
+    ("ImportWarning", &IMPORT_WARNING_CLASS),
+    ("ResourceWarning", &RESOURCE_WARNING_CLASS),
+    ("UnicodeWarning", &UNICODE_WARNING_CLASS),
+    ("EncodingWarning", &ENCODING_WARNING_CLASS),
+];
+
+#[inline]
+#[cfg(test)]
+pub(crate) fn supplemental_exception_class(name: &str) -> Option<&'static Arc<PyClassObject>> {
+    SUPPLEMENTAL_EXCEPTION_CLASS_TABLE
+        .iter()
+        .find(|(registered_name, _)| *registered_name == name)
+        .map(|(_, class)| &***class)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -692,6 +886,7 @@ pub fn get_exception_type_by_id(type_id: u16) -> Option<&'static ExceptionTypeOb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::ExceptionValue;
 
     // ════════════════════════════════════════════════════════════════════════
     // Memory Layout Tests
@@ -875,6 +1070,21 @@ mod tests {
     }
 
     #[test]
+    fn test_construct_with_string_arg_preserves_original_args() {
+        let exc_type = ExceptionTypeObject::new(ExceptionTypeId::ValueError, "ValueError");
+        let exc = exc_type.construct(&[Value::string(intern("boom"))]);
+        let exc = unsafe { ExceptionValue::from_value(exc).expect("exception instance") };
+
+        assert!(exc.message().is_none());
+        let args = exc
+            .args
+            .as_deref()
+            .expect("constructor should preserve args");
+        assert_eq!(args.len(), 1);
+        assert!(args[0].is_string());
+    }
+
+    #[test]
     fn test_call_returns_ok() {
         let exc_type = ExceptionTypeObject::new(ExceptionTypeId::TypeError, "TypeError");
         let result = exc_type.call(&[]);
@@ -973,9 +1183,136 @@ mod tests {
         assert!(exc_type.is_none());
     }
 
+    #[test]
+    fn test_exception_proxy_class_bridge_preserves_exception_hierarchy() {
+        let exception_id =
+            exception_proxy_class_id(ExceptionTypeId::Exception as u16).expect("Exception proxy");
+        let runtime_error_id = exception_proxy_class_id(ExceptionTypeId::RuntimeError as u16)
+            .expect("RuntimeError proxy");
+        let warning_id =
+            exception_proxy_class_id(ExceptionTypeId::Warning as u16).expect("Warning proxy");
+
+        let runtime_error_bitmap =
+            prism_runtime::object::type_builtins::global_class_bitmap(runtime_error_id)
+                .expect("RuntimeError proxy should be registered");
+        let warning_bitmap = prism_runtime::object::type_builtins::global_class_bitmap(warning_id)
+            .expect("Warning proxy should be registered");
+
+        assert!(runtime_error_bitmap.is_subclass_of(TypeId::from_raw(exception_id.0)));
+        assert!(!runtime_error_bitmap.is_subclass_of(TypeId::from_raw(warning_id.0)));
+        assert!(warning_bitmap.is_subclass_of(TypeId::from_raw(exception_id.0)));
+    }
+
+    #[test]
+    fn test_exception_proxy_class_id_round_trips_to_builtin_exception_value() {
+        let runtime_error_id = exception_proxy_class_id(ExceptionTypeId::RuntimeError as u16)
+            .expect("RuntimeError proxy");
+        let value = exception_type_value_for_proxy_class_id(runtime_error_id)
+            .expect("RuntimeError proxy should map back to builtin exception type value");
+        let ptr = value
+            .as_object_ptr()
+            .expect("builtin exception type should be a heap object");
+        let exc_type = unsafe { &*(ptr as *const ExceptionTypeObject) };
+
+        assert_eq!(
+            exc_type.exception_type_id,
+            ExceptionTypeId::RuntimeError as u16
+        );
+    }
+
+    #[test]
+    fn test_exception_type_attribute_value_exposes_class_metadata() {
+        let warning = get_exception_type("Warning").expect("Warning type should exist");
+
+        let name = exception_type_attribute_value(warning, &intern("__name__"))
+            .expect("__name__ should exist");
+        let name_ptr = name
+            .as_string_object_ptr()
+            .expect("__name__ should be an interned string");
+        assert_eq!(
+            prism_core::intern::interned_by_ptr(name_ptr as *const u8)
+                .unwrap()
+                .as_str(),
+            "Warning"
+        );
+
+        let bases = exception_type_attribute_value(warning, &intern("__bases__"))
+            .expect("__bases__ should exist");
+        let bases_ptr = bases
+            .as_object_ptr()
+            .expect("__bases__ should be a tuple object");
+        let bases = unsafe { &*(bases_ptr as *const TupleObject) };
+        assert_eq!(bases.len(), 1);
+
+        let base_ptr = bases.as_slice()[0]
+            .as_object_ptr()
+            .expect("base should be an exception type object");
+        let base = unsafe { &*(base_ptr as *const ExceptionTypeObject) };
+        assert_eq!(base.name(), "Exception");
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // Table Completeness Tests
     // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_supplemental_warning_category_table_contains_python_builtin_names() {
+        let names: Vec<_> = SUPPLEMENTAL_EXCEPTION_CLASS_TABLE
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+
+        assert!(names.contains(&"BytesWarning"));
+        assert!(names.contains(&"ImportWarning"));
+        assert!(names.contains(&"ResourceWarning"));
+        assert!(names.contains(&"EncodingWarning"));
+    }
+
+    #[test]
+    fn test_supplemental_warning_categories_inherit_warning_proxy_class() {
+        let warning_id =
+            exception_proxy_class_id(ExceptionTypeId::Warning as u16).expect("Warning proxy");
+
+        for name in [
+            "BytesWarning",
+            "FutureWarning",
+            "ImportWarning",
+            "ResourceWarning",
+            "UnicodeWarning",
+            "EncodingWarning",
+        ] {
+            let class = supplemental_exception_class(name)
+                .unwrap_or_else(|| panic!("missing supplemental warning category {name}"));
+            assert!(
+                prism_runtime::object::type_builtins::issubclass(
+                    class.class_id(),
+                    warning_id,
+                    prism_runtime::object::type_builtins::global_class_bitmap,
+                ),
+                "{name} should inherit from Warning",
+            );
+        }
+    }
+
+    #[test]
+    fn test_supplemental_warning_categories_are_type_objects() {
+        for name in [
+            "BytesWarning",
+            "FutureWarning",
+            "ImportWarning",
+            "ResourceWarning",
+            "UnicodeWarning",
+            "EncodingWarning",
+        ] {
+            let class = supplemental_exception_class(name)
+                .unwrap_or_else(|| panic!("missing supplemental warning category {name}"));
+            assert_eq!(
+                class.header.type_id,
+                TypeId::TYPE,
+                "{name} should be a type"
+            );
+        }
+    }
 
     #[test]
     fn test_exception_type_table_length() {

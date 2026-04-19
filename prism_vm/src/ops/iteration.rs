@@ -3,6 +3,8 @@
 use crate::VirtualMachine;
 use crate::builtins::{iterator_to_value, value_to_iterator};
 use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::generators::GeneratorObject;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
@@ -19,7 +21,10 @@ pub(crate) enum IterStep {
 }
 
 /// Convert a value to an iterator object value following Python `iter()` rules.
-pub(crate) fn ensure_iterator_value(value: Value) -> Result<Value, RuntimeError> {
+pub(crate) fn ensure_iterator_value(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Value, RuntimeError> {
     if let Some(ptr) = value.as_object_ptr() {
         let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
         if matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR) {
@@ -27,9 +32,22 @@ pub(crate) fn ensure_iterator_value(value: Value) -> Result<Value, RuntimeError>
         }
     }
 
-    let iter =
-        value_to_iterator(&value).map_err(|err| RuntimeError::type_error(err.to_string()))?;
-    Ok(iterator_to_value(iter))
+    if let Ok(iter) = value_to_iterator(&value) {
+        return Ok(iterator_to_value(iter));
+    }
+
+    let bound = resolve_special_method(value, "__iter__").map_err(|_| {
+        RuntimeError::type_error(format!("'{}' object is not iterable", value.type_name()))
+    })?;
+    let iterator = call_bound_method_target(vm, bound)?;
+
+    if supports_next_protocol(iterator) {
+        Ok(iterator)
+    } else {
+        Err(RuntimeError::type_error(
+            "__iter__ returned non-iterator".to_string(),
+        ))
+    }
 }
 
 /// Advance a VM-visible iterator or generator by one step.
@@ -48,10 +66,15 @@ pub(crate) fn next_step(
     match type_id {
         TypeId::ITERATOR => {
             let iter = unsafe { &mut *(ptr as *mut IteratorObject) };
-            Ok(match iter.next() {
-                Some(value) => IterStep::Yielded(value),
-                None => IterStep::Exhausted,
-            })
+            Ok(
+                match iter.next_with(
+                    &mut |callable, args| invoke_callable_value(vm, callable, args),
+                    &mut |value| Ok(crate::truthiness::is_truthy(value)),
+                )? {
+                    Some(value) => IterStep::Yielded(value),
+                    None => IterStep::Exhausted,
+                },
+            )
         }
         TypeId::GENERATOR => {
             let generator = GeneratorObject::from_value_mut(iterator)
@@ -67,9 +90,53 @@ pub(crate) fn next_step(
                 Err(err) => Err(err),
             }
         }
-        _ => Err(RuntimeError::type_error(format!(
-            "'{}' object is not an iterator",
-            type_id.name()
-        ))),
+        _ => {
+            let bound = resolve_special_method(iterator, "__next__").map_err(|_| {
+                RuntimeError::type_error(format!("'{}' object is not an iterator", type_id.name()))
+            })?;
+            match call_bound_method_target(vm, bound) {
+                Ok(value) => Ok(IterStep::Yielded(value)),
+                Err(err) if matches!(err.kind, RuntimeErrorKind::StopIteration) => {
+                    Ok(IterStep::Exhausted)
+                }
+                Err(err) => Err(err),
+            }
+        }
     }
+}
+
+/// Collect all remaining values from an iterable using full VM iterator semantics.
+pub(crate) fn collect_iterable_values(
+    vm: &mut VirtualMachine,
+    iterable: Value,
+) -> Result<Vec<Value>, RuntimeError> {
+    let iterator = ensure_iterator_value(vm, iterable)?;
+    let mut values = Vec::new();
+
+    loop {
+        match next_step(vm, iterator)? {
+            IterStep::Yielded(value) => values.push(value),
+            IterStep::Exhausted => return Ok(values),
+        }
+    }
+}
+
+fn call_bound_method_target(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, RuntimeError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+}
+
+fn supports_next_protocol(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR)
+        || resolve_special_method(value, "__next__").is_ok()
 }

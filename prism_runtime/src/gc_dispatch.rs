@@ -29,9 +29,14 @@
 //! and read-only thereafter, making it safe for concurrent access during GC.
 
 use crate::object::type_obj::TypeId;
+use crate::object::views::{
+    CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, GenericAliasObject,
+    MappingProxyObject, MethodWrapperObject, UnionTypeObject,
+};
 use crate::types::bytes::BytesObject;
 use crate::types::dict::DictObject;
 use crate::types::function::FunctionObject;
+use crate::types::int::IntObject;
 use crate::types::iter::IteratorObject;
 use crate::types::list::ListObject;
 use crate::types::range::RangeObject;
@@ -148,6 +153,15 @@ fn init_dispatch_table() -> DispatchTable {
 
     // Register all built-in types
     table.register(
+        TypeId::INT,
+        DispatchEntry {
+            trace: trace_int,
+            size: size_int,
+            finalize: finalize_int,
+        },
+    );
+
+    table.register(
         TypeId::STR,
         DispatchEntry {
             trace: trace_string,
@@ -216,6 +230,132 @@ fn init_dispatch_table() -> DispatchTable {
             trace: trace_function,
             size: size_function,
             finalize: finalize_function,
+        },
+    );
+
+    table.register(
+        TypeId::CODE,
+        DispatchEntry {
+            trace: trace_code_view,
+            size: size_code_view,
+            finalize: finalize_code_view,
+        },
+    );
+
+    table.register(
+        TypeId::CELL_VIEW,
+        DispatchEntry {
+            trace: trace_cell_view,
+            size: size_cell_view,
+            finalize: finalize_cell_view,
+        },
+    );
+
+    table.register(
+        TypeId::GENERIC_ALIAS,
+        DispatchEntry {
+            trace: trace_generic_alias,
+            size: size_generic_alias,
+            finalize: finalize_generic_alias,
+        },
+    );
+
+    table.register(
+        TypeId::UNION,
+        DispatchEntry {
+            trace: trace_union_type,
+            size: size_union_type,
+            finalize: finalize_union_type,
+        },
+    );
+
+    table.register(
+        TypeId::MAPPING_PROXY,
+        DispatchEntry {
+            trace: trace_mapping_proxy,
+            size: size_mapping_proxy,
+            finalize: finalize_mapping_proxy,
+        },
+    );
+
+    table.register(
+        TypeId::DICT_KEYS,
+        DispatchEntry {
+            trace: trace_dict_view,
+            size: size_dict_view,
+            finalize: finalize_dict_view,
+        },
+    );
+
+    table.register(
+        TypeId::DICT_VALUES,
+        DispatchEntry {
+            trace: trace_dict_view,
+            size: size_dict_view,
+            finalize: finalize_dict_view,
+        },
+    );
+
+    table.register(
+        TypeId::DICT_ITEMS,
+        DispatchEntry {
+            trace: trace_dict_view,
+            size: size_dict_view,
+            finalize: finalize_dict_view,
+        },
+    );
+
+    table.register(
+        TypeId::WRAPPER_DESCRIPTOR,
+        DispatchEntry {
+            trace: trace_descriptor_view,
+            size: size_descriptor_view,
+            finalize: finalize_descriptor_view,
+        },
+    );
+
+    table.register(
+        TypeId::METHOD_DESCRIPTOR,
+        DispatchEntry {
+            trace: trace_descriptor_view,
+            size: size_descriptor_view,
+            finalize: finalize_descriptor_view,
+        },
+    );
+
+    table.register(
+        TypeId::CLASSMETHOD_DESCRIPTOR,
+        DispatchEntry {
+            trace: trace_descriptor_view,
+            size: size_descriptor_view,
+            finalize: finalize_descriptor_view,
+        },
+    );
+
+    table.register(
+        TypeId::GETSET_DESCRIPTOR,
+        DispatchEntry {
+            trace: trace_descriptor_view,
+            size: size_descriptor_view,
+            finalize: finalize_descriptor_view,
+        },
+    );
+
+    table.register(
+        TypeId::MEMBER_DESCRIPTOR,
+        DispatchEntry {
+            trace: trace_descriptor_view,
+            size: size_descriptor_view,
+            finalize: finalize_descriptor_view,
+        },
+    );
+
+    table.register(
+        TypeId::METHOD_WRAPPER,
+        DispatchEntry {
+            trace: trace_method_wrapper,
+            size: size_method_wrapper,
+            finalize: finalize_method_wrapper,
         },
     );
 
@@ -442,6 +582,112 @@ unsafe fn finalize_function(ptr: *mut ()) {
     unsafe { std::ptr::drop_in_place(ptr as *mut FunctionObject) };
 }
 
+unsafe fn trace_code_view(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const CodeObjectView) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_code_view(_ptr: *const ()) -> usize {
+    mem::size_of::<CodeObjectView>()
+}
+
+unsafe fn finalize_code_view(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut CodeObjectView) };
+}
+
+unsafe fn trace_cell_view(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const CellViewObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_cell_view(_ptr: *const ()) -> usize {
+    mem::size_of::<CellViewObject>()
+}
+
+unsafe fn finalize_cell_view(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut CellViewObject) };
+}
+
+unsafe fn trace_generic_alias(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const GenericAliasObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_generic_alias(ptr: *const ()) -> usize {
+    let obj = unsafe { &*(ptr as *const GenericAliasObject) };
+    obj.size_of()
+}
+
+unsafe fn finalize_generic_alias(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut GenericAliasObject) };
+}
+
+unsafe fn trace_union_type(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const UnionTypeObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_union_type(ptr: *const ()) -> usize {
+    let obj = unsafe { &*(ptr as *const UnionTypeObject) };
+    obj.size_of()
+}
+
+unsafe fn finalize_union_type(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut UnionTypeObject) };
+}
+
+unsafe fn trace_mapping_proxy(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const MappingProxyObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_mapping_proxy(_ptr: *const ()) -> usize {
+    mem::size_of::<MappingProxyObject>()
+}
+
+unsafe fn finalize_mapping_proxy(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut MappingProxyObject) };
+}
+
+unsafe fn trace_dict_view(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const DictViewObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_dict_view(_ptr: *const ()) -> usize {
+    mem::size_of::<DictViewObject>()
+}
+
+unsafe fn finalize_dict_view(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut DictViewObject) };
+}
+
+unsafe fn trace_descriptor_view(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const DescriptorViewObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_descriptor_view(_ptr: *const ()) -> usize {
+    mem::size_of::<DescriptorViewObject>()
+}
+
+unsafe fn finalize_descriptor_view(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut DescriptorViewObject) };
+}
+
+unsafe fn trace_method_wrapper(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const MethodWrapperObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_method_wrapper(_ptr: *const ()) -> usize {
+    mem::size_of::<MethodWrapperObject>()
+}
+
+unsafe fn finalize_method_wrapper(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut MethodWrapperObject) };
+}
+
 // =============================================================================
 // RangeObject Dispatch
 // =============================================================================
@@ -459,6 +705,25 @@ unsafe fn size_range(_ptr: *const ()) -> usize {
 unsafe fn finalize_range(ptr: *mut ()) {
     // SAFETY: Caller guarantees ptr points to valid RangeObject
     unsafe { std::ptr::drop_in_place(ptr as *mut RangeObject) };
+}
+
+// =============================================================================
+// IntObject Dispatch
+// =============================================================================
+
+unsafe fn trace_int(ptr: *const (), tracer: &mut dyn Tracer) {
+    // SAFETY: Caller guarantees ptr points to valid IntObject
+    let obj = unsafe { &*(ptr as *const IntObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_int(_ptr: *const ()) -> usize {
+    mem::size_of::<IntObject>()
+}
+
+unsafe fn finalize_int(ptr: *mut ()) {
+    // SAFETY: Caller guarantees ptr points to valid IntObject
+    unsafe { std::ptr::drop_in_place(ptr as *mut IntObject) };
 }
 
 // =============================================================================

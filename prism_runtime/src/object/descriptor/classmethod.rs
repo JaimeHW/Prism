@@ -39,6 +39,8 @@
 
 use super::method::BoundMethod;
 use super::{Descriptor, DescriptorFlags, DescriptorKind};
+use crate::object::type_obj::TypeId;
+use crate::object::{ObjectHeader, PyObject};
 use prism_core::{PrismResult, Value};
 
 // =============================================================================
@@ -49,8 +51,11 @@ use prism_core::{PrismResult, Value};
 ///
 /// When accessed, binds the function to the class (or instance's class)
 /// rather than the instance itself.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[repr(C)]
 pub struct ClassMethodDescriptor {
+    /// Object header for heap storage and fast type dispatch.
+    pub header: ObjectHeader,
     /// The underlying function.
     function: Value,
 }
@@ -58,7 +63,10 @@ pub struct ClassMethodDescriptor {
 impl ClassMethodDescriptor {
     /// Create a new classmethod descriptor.
     pub fn new(function: Value) -> Self {
-        Self { function }
+        Self {
+            header: ObjectHeader::new(TypeId::CLASSMETHOD),
+            function,
+        }
     }
 
     /// Get the underlying function.
@@ -71,6 +79,13 @@ impl ClassMethodDescriptor {
     #[inline]
     pub fn bind(&self, class: Value) -> BoundMethod {
         BoundMethod::new(self.function, class)
+    }
+
+    /// Create a heap-allocated bound-method value bound to `class`.
+    #[inline]
+    pub fn bind_value(&self, class: Value) -> Value {
+        let bound = Box::new(self.bind(class));
+        Value::object_ptr(Box::into_raw(bound) as *const ())
     }
 }
 
@@ -86,12 +101,17 @@ impl Descriptor for ClassMethodDescriptor {
     fn get(&self, _obj: Option<Value>, objtype: Value) -> PrismResult<Value> {
         // For classmethod, we always bind to objtype (the class)
         // regardless of whether accessed through instance or class
-        let bound = self.bind(objtype);
+        Ok(self.bind_value(objtype))
+    }
+}
 
-        // In a full implementation, we'd wrap the bound method as a Value
-        // For now, return the function (the bound method creation would happen)
-        let _ = bound;
-        Ok(self.function)
+impl PyObject for ClassMethodDescriptor {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
     }
 }
 
@@ -146,6 +166,12 @@ mod tests {
     }
 
     #[test]
+    fn test_classmethod_header_type() {
+        let cm = ClassMethodDescriptor::new(Value::int_unchecked(1));
+        assert_eq!(cm.header.type_id, TypeId::CLASSMETHOD);
+    }
+
+    #[test]
     fn test_classmethod_get_through_class() {
         let func = Value::int_unchecked(100);
         let class = Value::int_unchecked(200);
@@ -154,6 +180,10 @@ mod tests {
         // Access through class (obj=None, objtype=class)
         let result = cm.get(None, class);
         assert!(result.is_ok());
+        let ptr = result.unwrap().as_object_ptr().unwrap();
+        let bound = unsafe { &*(ptr as *const BoundMethod) };
+        assert_eq!(bound.function(), func);
+        assert_eq!(bound.instance(), class);
     }
 
     #[test]
@@ -166,6 +196,10 @@ mod tests {
         // Access through instance (obj=instance, objtype=class)
         let result = cm.get(Some(instance), class);
         assert!(result.is_ok());
+        let ptr = result.unwrap().as_object_ptr().unwrap();
+        let bound = unsafe { &*(ptr as *const BoundMethod) };
+        assert_eq!(bound.function(), func);
+        assert_eq!(bound.instance(), class);
     }
 
     #[test]

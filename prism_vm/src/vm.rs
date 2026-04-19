@@ -8,7 +8,7 @@ use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
 use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
-use crate::frame::{Frame, MAX_RECURSION_DEPTH};
+use crate::frame::{ClosureEnv, Frame, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
@@ -16,16 +16,31 @@ use crate::import::{ImportError, ImportResolver, ModuleObject, resolve_relative_
 use crate::inline_cache::InlineCacheStore;
 use crate::jit_context::{JitConfig, JitContext};
 use crate::jit_executor::ExecutionResult;
+use crate::ops::calls::{capture_closure_environment, initialize_closure_cellvars_from_locals};
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
 use crate::speculative::SpeculationCache;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
 use prism_compiler::{OptimizationLevel, bytecode::CodeObject};
+use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
 use prism_parser::parse as parse_module_source;
+use prism_runtime::object::class::ClassDict;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+fn standard_runtime_builtins_and_import_resolver(
+    sys_args: Option<Vec<String>>,
+) -> (BuiltinRegistry, ImportResolver) {
+    let builtins = BuiltinRegistry::with_standard_builtins();
+    let import_resolver = match sys_args {
+        Some(args) => ImportResolver::with_sys_args_and_builtins(args, builtins.clone()),
+        None => ImportResolver::new_with_builtins(builtins.clone()),
+    };
+
+    (builtins, import_resolver)
+}
 
 /// Result of driving a generator frame for a single send()/next() step.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,12 +51,83 @@ pub(crate) enum GeneratorResumeOutcome {
     Returned(Value),
 }
 
+#[derive(Clone)]
+pub(crate) struct NamespaceExecutionResult {
+    pub namespace: ClassDict,
+    pub closure: Option<Arc<ClosureEnv>>,
+}
+
 /// Active `except` handler context that must survive nested handlers.
 #[derive(Debug, Clone, Copy)]
 struct ActiveExceptHandler {
     frame_id: u32,
     value: Value,
     type_id: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NestedTargetFrameOutcome {
+    Returned(Value),
+    ControlTransferred,
+}
+
+/// Snapshot of caller-visible exception bookkeeping around a synchronous
+/// Rust-to-Python callback boundary.
+///
+/// Successful nested callback execution must not leak handler-local exception
+/// state, active exceptions, or auxiliary exception metadata back into the
+/// caller. Restoring this snapshot after a successful direct invocation keeps
+/// callback semantics aligned with ordinary Python calls.
+#[derive(Clone)]
+pub(crate) struct ExceptionContextSnapshot {
+    exc_state: ExceptionState,
+    handler_stack: HandlerStack,
+    active_exception: Option<Value>,
+    active_exception_type_id: Option<u16>,
+    exc_info_stack: ExcInfoStack,
+    active_except_handlers: Vec<ActiveExceptHandler>,
+}
+
+/// Deterministic interpreter execution budget.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExecutionBudget {
+    step_limit: Option<u64>,
+    steps_executed: u64,
+}
+
+impl ExecutionBudget {
+    #[inline]
+    fn set_step_limit(&mut self, limit: Option<u64>) {
+        self.step_limit = limit.filter(|value| *value > 0);
+        self.steps_executed = 0;
+    }
+
+    #[inline]
+    fn reset_counter(&mut self) {
+        self.steps_executed = 0;
+    }
+
+    #[inline]
+    fn step_limit(&self) -> Option<u64> {
+        self.step_limit
+    }
+
+    #[inline]
+    fn steps_executed(&self) -> u64 {
+        self.steps_executed
+    }
+
+    #[inline]
+    fn consume_step(&mut self) -> VmResult<()> {
+        if let Some(limit) = self.step_limit {
+            if self.steps_executed >= limit {
+                return Err(RuntimeError::execution_limit_exceeded(limit));
+            }
+            self.steps_executed += 1;
+        }
+
+        Ok(())
+    }
 }
 
 /// The Prism virtual machine.
@@ -105,8 +191,12 @@ pub struct VirtualMachine {
     active_except_handlers: Vec<ActiveExceptHandler>,
     /// Import resolver for module imports.
     pub import_resolver: ImportResolver,
+    /// CPython-style import tracing verbosity (`-v`, `-vv`, ...).
+    import_verbosity: u32,
     /// Optimization level used when compiling imported source modules.
     compiler_optimization: OptimizationLevel,
+    /// Deterministic interpreter execution budget.
+    execution_budget: ExecutionBudget,
     /// Most recent runtime error reported by a native AOT helper call.
     last_aot_error: Option<RuntimeError>,
 }
@@ -224,6 +314,9 @@ impl VirtualMachine {
         code: Arc<CodeObject>,
         module: Arc<ModuleObject>,
     ) -> PrismResult<Value> {
+        if self.frames.is_empty() {
+            self.execution_budget.reset_counter();
+        }
         self.bind_module(Arc::clone(&module));
 
         self.push_frame_with_module(code, 0, Some(module))?;
@@ -252,19 +345,42 @@ impl VirtualMachine {
         self.last_aot_error.take()
     }
 
-    fn import_error_to_runtime(err: ImportError) -> RuntimeError {
-        let module = match &err {
-            ImportError::ModuleNotFound { module }
-            | ImportError::CircularImport { module }
+    #[inline]
+    pub fn set_execution_step_limit(&mut self, limit: Option<u64>) {
+        self.execution_budget.set_step_limit(limit);
+    }
+
+    #[inline]
+    pub fn set_import_verbosity(&mut self, verbosity: u32) {
+        self.import_verbosity = verbosity;
+    }
+
+    #[inline]
+    pub fn import_verbosity(&self) -> u32 {
+        self.import_verbosity
+    }
+
+    #[inline]
+    pub fn execution_step_limit(&self) -> Option<u64> {
+        self.execution_budget.step_limit()
+    }
+
+    #[inline]
+    pub fn executed_steps(&self) -> u64 {
+        self.execution_budget.steps_executed()
+    }
+
+    pub(crate) fn import_error_to_runtime(err: ImportError) -> RuntimeError {
+        let rendered = Arc::from(err.to_string());
+        match err {
+            ImportError::ModuleNotFound { module } => RuntimeError::module_not_found(module),
+            ImportError::CircularImport { module }
             | ImportError::LoadError { module, .. }
             | ImportError::ExecutionError { module, .. }
-            | ImportError::ImportFromError { module, .. } => Arc::clone(module),
-        };
-
-        RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
-            module,
-            message: Arc::from(err.to_string()),
-        })
+            | ImportError::ImportFromError { module, .. } => {
+                RuntimeError::import_error(module, rendered)
+            }
+        }
     }
 
     fn resolve_import_name_with_context(
@@ -278,10 +394,7 @@ impl VirtualMachine {
         }
 
         let current_module = current_module.ok_or_else(|| {
-            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
-                module: Arc::from(raw_name),
-                message: Arc::from("relative import outside of module execution"),
-            })
+            RuntimeError::import_error(raw_name, "relative import outside of module execution")
         })?;
         let package = current_module.package_name().unwrap_or("");
         resolve_relative_import(&raw_name[level as usize..], level, package)
@@ -298,12 +411,8 @@ impl VirtualMachine {
         source: &str,
         filename: &str,
     ) -> VmResult<Arc<CodeObject>> {
-        let parsed = parse_module_source(source).map_err(|err| {
-            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
-                module: Arc::from(module_name),
-                message: Arc::from(err.to_string()),
-            })
-        })?;
+        let parsed = parse_module_source(source)
+            .map_err(|err| RuntimeError::import_error(module_name, Arc::from(err.to_string())))?;
 
         prism_compiler::Compiler::compile_module_with_optimization(
             &parsed,
@@ -311,12 +420,7 @@ impl VirtualMachine {
             self.compiler_optimization,
         )
         .map(Arc::new)
-        .map_err(|err| {
-            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
-                module: Arc::from(module_name),
-                message: Arc::from(err.to_string()),
-            })
-        })
+        .map_err(|err| RuntimeError::import_error(module_name, Arc::from(err.to_string())))
     }
 
     fn run_nested_module_until_depth(&mut self, stop_depth: usize) -> VmResult<()> {
@@ -325,10 +429,20 @@ impl VirtualMachine {
                 return Ok(());
             }
 
+            self.execution_budget.consume_step()?;
+
             let inst = {
                 let frame = &mut self.frames[self.current_frame_idx];
 
                 if frame.ip as usize >= frame.code.instructions.len() {
+                    if self.frames.len() == stop_depth + 1 {
+                        let emptied_stack = self.pop_frame_discarding_return()?;
+                        if emptied_stack || self.frames.len() <= stop_depth {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
                     match self.pop_frame(Value::none())? {
                         Some(_) => return Ok(()),
                         None => {
@@ -354,24 +468,30 @@ impl VirtualMachine {
                 ControlFlow::Call { code, return_reg } => {
                     self.push_frame(code, return_reg)?;
                 }
-                ControlFlow::Return(value) => match self.pop_frame(value)? {
-                    Some(_) => return Ok(()),
-                    None => {
-                        if self.frames.len() <= stop_depth {
+                ControlFlow::Return(value) => {
+                    if self.frames.len() == stop_depth + 1 {
+                        let emptied_stack = self.pop_frame_discarding_return()?;
+                        if emptied_stack || self.frames.len() <= stop_depth {
                             return Ok(());
                         }
+                    } else {
+                        match self.pop_frame(value)? {
+                            Some(_) => return Ok(()),
+                            None => {
+                                if self.frames.len() <= stop_depth {
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
-                },
+                }
                 ControlFlow::Exception { type_id, .. } => {
                     if let Some(handler_entry) = self.find_exception_handler(type_id) {
                         self.frames[self.current_frame_idx].ip = handler_entry;
                     } else {
                         loop {
                             if self.frames.len() <= stop_depth {
-                                return Err(RuntimeError::exception(
-                                    type_id,
-                                    format!("Uncaught exception (type_id={})", type_id),
-                                ));
+                                return Err(self.uncaught_exception_error(type_id));
                             }
 
                             self.pop_top_frame_for_unwind();
@@ -402,10 +522,7 @@ impl VirtualMachine {
                     } else {
                         loop {
                             if self.frames.len() <= stop_depth {
-                                return Err(RuntimeError::exception(
-                                    type_id,
-                                    "Uncaught re-raised exception",
-                                ));
+                                return Err(self.uncaught_reraised_exception_error(type_id));
                             }
 
                             self.pop_top_frame_for_unwind();
@@ -455,6 +572,457 @@ impl VirtualMachine {
         }
     }
 
+    fn collect_frame_locals_namespace(frame: &Frame) -> ClassDict {
+        if frame.locals_mapping().is_some() {
+            return ClassDict::new();
+        }
+
+        let namespace = ClassDict::new();
+        for (slot, name) in frame.code.locals.iter().enumerate() {
+            let slot = slot as u8;
+            if frame.reg_is_written(slot) {
+                namespace.set(intern(name.as_ref()), frame.get_reg(slot));
+            }
+        }
+        namespace
+    }
+
+    #[inline]
+    fn route_nested_exception(&mut self, stop_depth: usize, type_id: u16) -> VmResult<()> {
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
+        loop {
+            if self.frames.len() <= stop_depth {
+                return Err(self.uncaught_exception_error(type_id));
+            }
+
+            self.pop_top_frame_for_unwind();
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.frames[self.current_frame_idx].ip = handler_entry;
+                return Ok(());
+            }
+        }
+    }
+
+    #[inline]
+    fn route_nested_reraise(&mut self, stop_depth: usize, type_id: u16) -> VmResult<()> {
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
+        loop {
+            if self.frames.len() <= stop_depth {
+                return Err(self.uncaught_reraised_exception_error(type_id));
+            }
+
+            self.pop_top_frame_for_unwind();
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.frames[self.current_frame_idx].ip = handler_entry;
+                return Ok(());
+            }
+        }
+    }
+
+    #[inline]
+    fn route_nested_runtime_error(&mut self, stop_depth: usize, err: RuntimeError) -> VmResult<()> {
+        let type_id = self.materialize_active_exception_from_runtime_error(&err);
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
+        loop {
+            if self.frames.len() <= stop_depth {
+                return Err(err);
+            }
+
+            self.pop_top_frame_for_unwind();
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.frames[self.current_frame_idx].ip = handler_entry;
+                return Ok(());
+            }
+        }
+    }
+
+    #[inline]
+    fn apply_nested_handler_control_flow(&mut self, control: ControlFlow) -> VmResult<()> {
+        match control {
+            ControlFlow::EnterHandler { handler_pc, .. } => {
+                self.frames[self.current_frame_idx].ip = handler_pc;
+                Ok(())
+            }
+            ControlFlow::EnterFinally { finally_pc, .. } => {
+                self.frames[self.current_frame_idx].ip = finally_pc;
+                Ok(())
+            }
+            ControlFlow::ExitHandler => {
+                self.pop_exception_handler();
+                Ok(())
+            }
+            _ => Err(RuntimeError::internal(
+                "apply_nested_handler_control_flow called with non-handler control flow",
+            )),
+        }
+    }
+
+    pub(crate) fn execute_until_stack_depth_restored(
+        &mut self,
+        stop_depth: usize,
+        return_reg: u8,
+    ) -> VmResult<Value> {
+        if stop_depth == 0 {
+            return Err(RuntimeError::internal(
+                "nested execution requires a caller frame",
+            ));
+        }
+
+        loop {
+            if self.frames.len() == stop_depth {
+                return Ok(self.frames[self.current_frame_idx].get_reg(return_reg));
+            }
+
+            if self.frames.len() < stop_depth {
+                return Err(RuntimeError::internal(
+                    "nested execution unwound below caller frame",
+                ));
+            }
+
+            let inst = {
+                let current_frame_idx = self.current_frame_idx;
+                let frame = &mut self.frames[current_frame_idx];
+
+                if frame.ip as usize >= frame.code.instructions.len() {
+                    match self.pop_frame(Value::none())? {
+                        Some(_) => {
+                            return Err(RuntimeError::internal(
+                                "nested execution unwound to empty frame stack",
+                            ));
+                        }
+                        None => {
+                            if self.frames.len() == stop_depth {
+                                return Ok(self.frames[self.current_frame_idx].get_reg(return_reg));
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                frame.fetch()
+            };
+
+            let control = get_handler(inst.opcode())(self, inst);
+            match control {
+                ControlFlow::Continue => {}
+                ControlFlow::Jump(offset) => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    let new_ip = (frame.ip as i32) + (offset as i32);
+                    frame.ip = new_ip.max(0) as u32;
+                }
+                ControlFlow::Call { code, return_reg } => {
+                    self.push_frame(code, return_reg)?;
+                }
+                ControlFlow::Return(value) => match self.pop_frame(value)? {
+                    Some(_) => {
+                        return Err(RuntimeError::internal(
+                            "nested execution unwound to empty frame stack",
+                        ));
+                    }
+                    None => {
+                        if self.frames.len() == stop_depth {
+                            return Ok(self.frames[self.current_frame_idx].get_reg(return_reg));
+                        }
+                    }
+                },
+                ControlFlow::Exception { type_id, .. } => {
+                    self.route_nested_exception(stop_depth, type_id)?;
+                }
+                ControlFlow::Reraise => {
+                    let type_id = if let Some(tid) = self.get_active_exception_type_id() {
+                        tid
+                    } else if let Some(exc_info) = self.exc_info_stack().peek() {
+                        exc_info.type_id()
+                    } else {
+                        return Err(RuntimeError::type_error("No active exception to re-raise"));
+                    };
+
+                    if type_id == 0 {
+                        return Err(RuntimeError::internal(
+                            "Reraise without active exception type",
+                        ));
+                    }
+
+                    self.route_nested_reraise(stop_depth, type_id)?;
+                }
+                ControlFlow::Error(err) => {
+                    self.route_nested_runtime_error(stop_depth, err)?;
+                }
+                ControlFlow::Yield { .. } | ControlFlow::Resume { .. } => {
+                    return Err(RuntimeError::type_error(
+                        "nested execution cannot suspend or yield",
+                    ));
+                }
+                ControlFlow::EnterHandler { .. }
+                | ControlFlow::EnterFinally { .. }
+                | ControlFlow::ExitHandler => {
+                    self.apply_nested_handler_control_flow(control)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn execute_until_target_frame_returns(
+        &mut self,
+        stop_depth: usize,
+        target_frame_id: u32,
+    ) -> VmResult<Value> {
+        match self.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)? {
+            NestedTargetFrameOutcome::Returned(value) => Ok(value),
+            NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::internal(
+                "nested execution target frame returned without a result",
+            )),
+        }
+    }
+
+    pub(crate) fn execute_until_target_frame_returns_with_outcome(
+        &mut self,
+        stop_depth: usize,
+        target_frame_id: u32,
+    ) -> VmResult<NestedTargetFrameOutcome> {
+        if stop_depth == 0 {
+            return Err(RuntimeError::internal(
+                "nested execution requires a caller frame",
+            ));
+        }
+
+        loop {
+            if self.frames.len() < stop_depth {
+                return Err(RuntimeError::internal(
+                    "nested execution unwound below caller frame",
+                ));
+            }
+
+            if self.frames.len() == stop_depth {
+                // The target frame unwound into the caller, typically because the caller
+                // handled an exception raised by the nested call.
+                return Ok(NestedTargetFrameOutcome::ControlTransferred);
+            }
+
+            let inst = {
+                let current_frame_idx = self.current_frame_idx;
+                let frame = &mut self.frames[current_frame_idx];
+
+                if frame.ip as usize >= frame.code.instructions.len() {
+                    if current_frame_idx as u32 == target_frame_id {
+                        match self.pop_frame(Value::none())? {
+                            Some(_) => {
+                                return Err(RuntimeError::internal(
+                                    "nested execution unwound to empty frame stack",
+                                ));
+                            }
+                            None => return Ok(NestedTargetFrameOutcome::Returned(Value::none())),
+                        }
+                    }
+
+                    match self.pop_frame(Value::none())? {
+                        Some(_) => {
+                            return Err(RuntimeError::internal(
+                                "nested execution unwound to empty frame stack",
+                            ));
+                        }
+                        None => continue,
+                    }
+                }
+
+                frame.fetch()
+            };
+
+            let control = get_handler(inst.opcode())(self, inst);
+            match control {
+                ControlFlow::Continue => {}
+                ControlFlow::Jump(offset) => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    let new_ip = (frame.ip as i32) + (offset as i32);
+                    frame.ip = new_ip.max(0) as u32;
+                }
+                ControlFlow::Call { code, return_reg } => {
+                    self.push_frame(code, return_reg)?;
+                }
+                ControlFlow::Return(value) => {
+                    if self.current_frame_id() == target_frame_id {
+                        match self.pop_frame(value)? {
+                            Some(_) => {
+                                return Err(RuntimeError::internal(
+                                    "nested execution unwound to empty frame stack",
+                                ));
+                            }
+                            None => return Ok(NestedTargetFrameOutcome::Returned(value)),
+                        }
+                    }
+
+                    match self.pop_frame(value)? {
+                        Some(_) => {
+                            return Err(RuntimeError::internal(
+                                "nested execution unwound to empty frame stack",
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+                ControlFlow::Exception { type_id, .. } => {
+                    self.route_nested_exception(stop_depth, type_id)?;
+                }
+                ControlFlow::Reraise => {
+                    let type_id = if let Some(tid) = self.get_active_exception_type_id() {
+                        tid
+                    } else if let Some(exc_info) = self.exc_info_stack().peek() {
+                        exc_info.type_id()
+                    } else {
+                        return Err(RuntimeError::type_error("No active exception to re-raise"));
+                    };
+
+                    if type_id == 0 {
+                        return Err(RuntimeError::internal(
+                            "Reraise without active exception type",
+                        ));
+                    }
+
+                    self.route_nested_reraise(stop_depth, type_id)?;
+                }
+                ControlFlow::Error(err) => {
+                    self.route_nested_runtime_error(stop_depth, err)?;
+                }
+                ControlFlow::Yield { .. } | ControlFlow::Resume { .. } => {
+                    return Err(RuntimeError::type_error(
+                        "nested execution cannot suspend or yield",
+                    ));
+                }
+                ControlFlow::EnterHandler { .. }
+                | ControlFlow::EnterFinally { .. }
+                | ControlFlow::ExitHandler => {
+                    self.apply_nested_handler_control_flow(control)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn execute_code_collect_locals_namespace(
+        &mut self,
+        code: Arc<CodeObject>,
+    ) -> VmResult<NamespaceExecutionResult> {
+        self.execute_code_collect_locals_namespace_with_mapping(code, None)
+    }
+
+    pub(crate) fn execute_code_collect_locals_namespace_with_mapping(
+        &mut self,
+        code: Arc<CodeObject>,
+        locals_mapping: Option<Value>,
+    ) -> VmResult<NamespaceExecutionResult> {
+        let stop_depth = self.frames.len();
+        let module = self.current_module_cloned();
+        let closure = if code.cellvars.is_empty() && code.freevars.is_empty() {
+            None
+        } else {
+            Some(capture_closure_environment(self.current_frame(), &code)?)
+        };
+        self.push_frame_with_closure_and_module(code, 0, closure.clone(), module)?;
+        if locals_mapping.is_some() {
+            self.current_frame_mut().set_locals_mapping(locals_mapping);
+        }
+        let target_frame_id = self.current_frame_id();
+
+        loop {
+            let inst = {
+                let current_frame_idx = self.current_frame_idx;
+                let frame = &mut self.frames[current_frame_idx];
+
+                if frame.ip as usize >= frame.code.instructions.len() {
+                    if current_frame_idx as u32 == target_frame_id {
+                        let namespace = Self::collect_frame_locals_namespace(frame);
+                        let _ = self.pop_frame_discarding_return()?;
+                        return Ok(NamespaceExecutionResult { namespace, closure });
+                    }
+
+                    match self.pop_frame(Value::none())? {
+                        Some(_) => {
+                            return Err(RuntimeError::internal(
+                                "namespace execution unwound to empty frame stack",
+                            ));
+                        }
+                        None => continue,
+                    }
+                }
+
+                frame.fetch()
+            };
+
+            let control = get_handler(inst.opcode())(self, inst);
+            match control {
+                ControlFlow::Continue => {}
+                ControlFlow::Jump(offset) => {
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    let new_ip = (frame.ip as i32) + (offset as i32);
+                    frame.ip = new_ip.max(0) as u32;
+                }
+                ControlFlow::Call { code, return_reg } => {
+                    self.push_frame(code, return_reg)?;
+                }
+                ControlFlow::Return(value) => {
+                    if self.current_frame_id() == target_frame_id {
+                        let namespace = Self::collect_frame_locals_namespace(self.current_frame());
+                        let _ = self.pop_frame_discarding_return()?;
+                        return Ok(NamespaceExecutionResult { namespace, closure });
+                    }
+
+                    match self.pop_frame(value)? {
+                        Some(_) => {
+                            return Err(RuntimeError::internal(
+                                "namespace execution unwound to empty frame stack",
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+                ControlFlow::Exception { type_id, .. } => {
+                    self.route_nested_exception(stop_depth, type_id)?;
+                }
+                ControlFlow::Reraise => {
+                    let type_id = if let Some(tid) = self.get_active_exception_type_id() {
+                        tid
+                    } else if let Some(exc_info) = self.exc_info_stack().peek() {
+                        exc_info.type_id()
+                    } else {
+                        return Err(RuntimeError::type_error("No active exception to re-raise"));
+                    };
+
+                    if type_id == 0 {
+                        return Err(RuntimeError::internal(
+                            "Reraise without active exception type",
+                        ));
+                    }
+
+                    self.route_nested_reraise(stop_depth, type_id)?;
+                }
+                ControlFlow::Error(err) => {
+                    self.route_nested_runtime_error(stop_depth, err)?;
+                }
+                ControlFlow::Yield { .. } | ControlFlow::Resume { .. } => {
+                    return Err(RuntimeError::type_error(
+                        "class body execution cannot suspend or yield",
+                    ));
+                }
+                ControlFlow::EnterHandler { .. }
+                | ControlFlow::EnterFinally { .. }
+                | ControlFlow::ExitHandler => {
+                    self.apply_nested_handler_control_flow(control)?;
+                }
+            }
+        }
+    }
+
     fn load_source_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
         if let Some(module) = self.import_resolver.get_cached(name) {
             return Ok(module);
@@ -466,15 +1034,19 @@ impl VirtualMachine {
             }));
         };
 
+        if self.import_verbosity > 0 {
+            eprintln!("import {} # from {}", name, location.path.display());
+        }
+
         let source = std::fs::read_to_string(&location.path).map_err(|err| {
-            RuntimeError::new(crate::error::RuntimeErrorKind::ImportError {
-                module: Arc::from(name),
-                message: Arc::from(format!(
+            RuntimeError::import_error(
+                name,
+                Arc::<str>::from(format!(
                     "failed to read '{}': {}",
                     location.path.display(),
                     err
                 )),
-            })
+            )
         })?;
         let filename: Arc<str> = Arc::from(location.path.to_string_lossy().into_owned());
         let code = self.compile_source_module(name, &source, filename.as_ref());
@@ -503,6 +1075,10 @@ impl VirtualMachine {
             }));
         };
 
+        if self.import_verbosity > 0 {
+            eprintln!("import {} # frozen", name);
+        }
+
         self.execute_loaded_module(
             name,
             Arc::clone(&frozen.code),
@@ -529,8 +1105,7 @@ impl VirtualMachine {
             .insert_module(name, Arc::clone(&module));
         let caller_depth = self.frames.len();
 
-        if let Err(err) =
-            self.push_frame_internal(code, 0, None, Some(Arc::clone(&module)), false)
+        if let Err(err) = self.push_frame_internal(code, 0, None, Some(Arc::clone(&module)), false)
         {
             self.import_resolver.remove_module(name);
             return Err(err);
@@ -567,6 +1142,13 @@ impl VirtualMachine {
         }
 
         if !absolute_name.contains('.') {
+            if self
+                .import_resolver
+                .should_load_from_source_first(&absolute_name)
+            {
+                return self.load_non_stdlib_module(&absolute_name);
+            }
+
             return match self.import_resolver.import_module(&absolute_name) {
                 Ok(module) => Ok(module),
                 Err(ImportError::ModuleNotFound { .. }) => {
@@ -593,6 +1175,13 @@ impl VirtualMachine {
                     Value::object_ptr(Arc::as_ptr(&module) as *const ()),
                 );
                 current = module;
+                continue;
+            }
+
+            if self.import_resolver.should_load_from_source_first(&prefix) {
+                let next = self.load_non_stdlib_module(&prefix)?;
+                current.set_attr(segment, Value::object_ptr(Arc::as_ptr(&next) as *const ()));
+                current = next;
                 continue;
             }
 
@@ -639,11 +1228,12 @@ impl VirtualMachine {
 
     /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
+        let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
             globals: GlobalScope::new(),
-            builtins: BuiltinRegistry::with_standard_builtins(),
+            builtins,
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
@@ -658,19 +1248,22 @@ impl VirtualMachine {
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
-            import_resolver: ImportResolver::new(),
+            import_resolver,
+            import_verbosity: 0,
             compiler_optimization: OptimizationLevel::None,
+            execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
     }
 
     /// Create a new virtual machine with JIT compilation enabled.
     pub fn with_jit() -> Self {
+        let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
             globals: GlobalScope::new(),
-            builtins: BuiltinRegistry::with_standard_builtins(),
+            builtins,
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
@@ -685,8 +1278,10 @@ impl VirtualMachine {
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
-            import_resolver: ImportResolver::new(),
+            import_resolver,
+            import_verbosity: 0,
             compiler_optimization: OptimizationLevel::None,
+            execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
     }
@@ -698,11 +1293,12 @@ impl VirtualMachine {
         } else {
             None
         };
+        let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
             globals: GlobalScope::new(),
-            builtins: BuiltinRegistry::with_standard_builtins(),
+            builtins,
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
@@ -717,19 +1313,22 @@ impl VirtualMachine {
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
-            import_resolver: ImportResolver::new(),
+            import_resolver,
+            import_verbosity: 0,
             compiler_optimization: OptimizationLevel::None,
+            execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
     }
 
     /// Create with pre-populated globals.
     pub fn with_globals(globals: GlobalScope) -> Self {
+        let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
             globals,
-            builtins: BuiltinRegistry::with_standard_builtins(),
+            builtins,
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
@@ -744,8 +1343,10 @@ impl VirtualMachine {
             active_exception_type_id: None,
             exc_info_stack: ExcInfoStack::new(),
             active_except_handlers: Vec::new(),
-            import_resolver: ImportResolver::new(),
+            import_resolver,
+            import_verbosity: 0,
             compiler_optimization: OptimizationLevel::None,
+            execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
     }
@@ -783,6 +1384,28 @@ impl VirtualMachine {
         }
     }
 
+    #[inline]
+    pub(crate) fn capture_exception_context(&self) -> ExceptionContextSnapshot {
+        ExceptionContextSnapshot {
+            exc_state: self.exc_state,
+            handler_stack: self.handler_stack.clone(),
+            active_exception: self.active_exception,
+            active_exception_type_id: self.active_exception_type_id,
+            exc_info_stack: self.exc_info_stack.clone(),
+            active_except_handlers: self.active_except_handlers.clone(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn restore_exception_context(&mut self, snapshot: ExceptionContextSnapshot) {
+        self.exc_state = snapshot.exc_state;
+        self.handler_stack = snapshot.handler_stack;
+        self.active_exception = snapshot.active_exception;
+        self.active_exception_type_id = snapshot.active_exception_type_id;
+        self.exc_info_stack = snapshot.exc_info_stack;
+        self.active_except_handlers = snapshot.active_except_handlers;
+    }
+
     // =========================================================================
     // Execution
     // =========================================================================
@@ -796,6 +1419,8 @@ impl VirtualMachine {
     #[inline(never)] // Prevent inlining for better branch prediction
     fn run_loop(&mut self) -> PrismResult<Value> {
         loop {
+            self.execution_budget.consume_step()?;
+
             // Fetch instruction
             let inst = {
                 let frame = &mut self.frames[self.current_frame_idx];
@@ -862,11 +1487,7 @@ impl VirtualMachine {
                             // Pop current frame
                             if self.frames.len() <= 1 {
                                 // No more frames - return as uncaught exception
-                                return Err(RuntimeError::exception(
-                                    type_id,
-                                    format!("Uncaught exception (type_id={})", type_id),
-                                )
-                                .into());
+                                return Err(self.uncaught_exception_error(type_id).into());
                             }
 
                             self.pop_top_frame_for_unwind();
@@ -910,11 +1531,7 @@ impl VirtualMachine {
                         // Unwind and propagate
                         loop {
                             if self.frames.len() <= 1 {
-                                return Err(RuntimeError::exception(
-                                    type_id,
-                                    "Uncaught re-raised exception".to_string(),
-                                )
-                                .into());
+                                return Err(self.uncaught_reraised_exception_error(type_id).into());
                             }
 
                             self.pop_top_frame_for_unwind();
@@ -1065,7 +1682,16 @@ impl VirtualMachine {
             RuntimeErrorKind::RecursionError { .. } => {
                 ExceptionTypeId::RecursionError.as_u8() as u16
             }
-            RuntimeErrorKind::ImportError { .. } => ExceptionTypeId::ImportError.as_u8() as u16,
+            RuntimeErrorKind::ExecutionLimitExceeded { .. } => {
+                ExceptionTypeId::RuntimeError.as_u8() as u16
+            }
+            RuntimeErrorKind::ImportError { missing, .. } => {
+                if *missing {
+                    ExceptionTypeId::ModuleNotFoundError.as_u8() as u16
+                } else {
+                    ExceptionTypeId::ImportError.as_u8() as u16
+                }
+            }
             RuntimeErrorKind::InvalidOpcode { .. } => ExceptionTypeId::SystemError.as_u8() as u16,
             RuntimeErrorKind::InternalError { .. } => ExceptionTypeId::RuntimeError.as_u8() as u16,
             RuntimeErrorKind::Exception { type_id, .. } => *type_id,
@@ -1080,11 +1706,26 @@ impl VirtualMachine {
         let type_id = Self::runtime_error_exception_type_id(&err.kind);
         let exc_type_id_enum =
             ExceptionTypeId::from_u8(type_id as u8).unwrap_or(ExceptionTypeId::RuntimeError);
-        let error_message = err.to_string();
-        let exc_value = crate::builtins::create_exception(
-            exc_type_id_enum,
-            Some(Arc::from(error_message.as_str())),
-        );
+        let exc_value = match &err.kind {
+            crate::error::RuntimeErrorKind::ImportError {
+                message,
+                name,
+                path,
+                ..
+            } => crate::builtins::create_exception_with_import_details(
+                exc_type_id_enum,
+                Some(Arc::clone(message)),
+                name.clone(),
+                path.clone(),
+            ),
+            _ => {
+                let error_message = err.to_string();
+                crate::builtins::create_exception(
+                    exc_type_id_enum,
+                    Some(Arc::from(error_message.as_str())),
+                )
+            }
+        };
         self.set_active_exception_with_type(exc_value, type_id);
         type_id
     }
@@ -1166,12 +1807,22 @@ impl VirtualMachine {
         let caller_scratch_255 = self.frames[caller_idx].get_reg(255);
 
         let generator_module = self.module_from_globals_ptr(generator.module_ptr());
-        let mut frame = Frame::new_with_module(
-            Arc::clone(generator.code()),
-            Some(caller_idx as u32),
-            255,
-            generator_module,
-        );
+        let mut frame = if let Some(closure) = generator.closure().cloned() {
+            Frame::with_closure_and_module(
+                Arc::clone(generator.code()),
+                Some(caller_idx as u32),
+                255,
+                closure,
+                generator_module,
+            )
+        } else {
+            Frame::new_with_module(
+                Arc::clone(generator.code()),
+                Some(caller_idx as u32),
+                255,
+                generator_module,
+            )
+        };
         frame.ip = if prev_state == RuntimeGeneratorState::Suspended {
             generator.ip()
         } else {
@@ -1180,6 +1831,12 @@ impl VirtualMachine {
 
         // Restore captured live state (or seeded locals for first start).
         generator.restore(&mut frame.registers);
+        if prev_state == RuntimeGeneratorState::Created {
+            initialize_closure_cellvars_from_locals(
+                &mut frame,
+                generator.liveness().count() as usize,
+            );
+        }
 
         if prev_state == RuntimeGeneratorState::Suspended {
             let resume_reg = u8::try_from(generator.resume_index())
@@ -1195,6 +1852,11 @@ impl VirtualMachine {
         let mut failure: Option<RuntimeError> = None;
 
         'exec: loop {
+            if let Err(err) = self.execution_budget.consume_step() {
+                failure = Some(err);
+                break 'exec;
+            }
+
             let inst = {
                 let frame = &mut self.frames[self.current_frame_idx];
 
@@ -1290,10 +1952,7 @@ impl VirtualMachine {
                 }
                 ControlFlow::Exception { type_id, .. } => {
                     if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
-                        failure = Some(RuntimeError::exception(
-                            type_id,
-                            format!("Uncaught exception (type_id={})", type_id),
-                        ));
+                        failure = Some(self.uncaught_exception_error(type_id));
                         break 'exec;
                     }
                 }
@@ -1315,10 +1974,7 @@ impl VirtualMachine {
                     }
 
                     if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
-                        failure = Some(RuntimeError::exception(
-                            type_id,
-                            "Uncaught re-raised exception",
-                        ));
+                        failure = Some(self.uncaught_reraised_exception_error(type_id));
                         break 'exec;
                     }
                 }
@@ -1423,7 +2079,7 @@ impl VirtualMachine {
         self.profiler.record_call(code_id);
 
         // Handle JIT: check for compiled code, handle tier-up, and try execution
-        if allow_jit && closure.is_none() {
+        if allow_jit && closure.is_none() && self.execution_budget.step_limit().is_none() {
             if let Some(jit) = &mut self.jit {
                 let tier_decision = jit.check_tier_up(&self.profiler, code_id);
 
@@ -1520,6 +2176,29 @@ impl VirtualMachine {
         self.discard_except_handlers_for_frame(top_idx as u32);
         self.frames.pop();
         self.set_current_frame_idx(self.frames.len().saturating_sub(1));
+    }
+
+    /// Pop the current frame without writing its return value into the caller.
+    ///
+    /// Internal execution paths such as imported-module initialization and
+    /// class-body namespace collection do not semantically return a value to
+    /// their caller. Discarding the frame result here prevents clobbering live
+    /// caller registers while still restoring the correct caller frame.
+    #[inline]
+    fn pop_frame_discarding_return(&mut self) -> VmResult<bool> {
+        let top_idx = self.frames.len() - 1;
+        self.handler_stack.pop_frame_handlers(top_idx as u32);
+        self.discard_except_handlers_for_frame(top_idx as u32);
+        let frame = self.frames.pop().expect("no frame to pop");
+
+        if self.frames.is_empty() {
+            self.set_current_frame_idx(0);
+            Ok(true)
+        } else {
+            let return_frame_idx = frame.return_frame.unwrap_or(0) as usize;
+            self.set_current_frame_idx(return_frame_idx);
+            Ok(false)
+        }
     }
 
     /// Pop the current frame and return to caller.
@@ -1721,6 +2400,36 @@ impl VirtualMachine {
     #[inline]
     pub fn get_active_exception_type_id(&self) -> Option<u16> {
         self.active_exception_type_id
+    }
+
+    #[inline]
+    fn active_exception_message(&self) -> Option<String> {
+        let active = *self.get_active_exception()?;
+        let exception = unsafe { crate::builtins::ExceptionValue::from_value(active) }?;
+        let message = exception.display_text();
+        if !message.is_empty() {
+            return Some(message);
+        }
+
+        Some(exception.repr_text())
+    }
+
+    #[inline]
+    fn uncaught_exception_error(&self, type_id: u16) -> RuntimeError {
+        RuntimeError::exception(
+            type_id,
+            self.active_exception_message()
+                .unwrap_or_else(|| format!("Uncaught exception (type_id={type_id})")),
+        )
+    }
+
+    #[inline]
+    fn uncaught_reraised_exception_error(&self, type_id: u16) -> RuntimeError {
+        RuntimeError::exception(
+            type_id,
+            self.active_exception_message()
+                .unwrap_or_else(|| "Uncaught re-raised exception".to_string()),
+        )
     }
 
     /// Enter an `except` handler and preserve its exception for nested handlers.
@@ -1999,12 +2708,57 @@ fn module_package_name(name: &str, is_package: bool) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import::FrozenModuleSource;
+    use crate::builtins::builtin_getattr;
     use crate::exception::HandlerFrame;
+    use crate::import::FrozenModuleSource;
     use prism_compiler::bytecode::{CodeFlags, CodeObject, ExceptionEntry};
     use prism_compiler::{Compiler, OptimizationLevel};
+    use prism_core::intern::intern;
     use prism_parser::parse;
+    use prism_runtime::object::class::PyClassObject;
+    use prism_runtime::object::type_obj::TypeId;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos();
+
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "prism_vm_tests_{}_{}_{}",
+                std::process::id(),
+                nanos,
+                unique
+            ));
+            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_file(path: &std::path::Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("failed to create parent dir");
+        }
+        std::fs::write(path, content).expect("failed to write file");
+    }
 
     fn empty_code(name: &str) -> Arc<CodeObject> {
         Arc::new(CodeObject {
@@ -2082,6 +2836,14 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_import_verbosity_configuration_round_trips() {
+        let mut vm = VirtualMachine::new();
+        assert_eq!(vm.import_verbosity(), 0);
+        vm.set_import_verbosity(2);
+        assert_eq!(vm.import_verbosity(), 2);
+    }
+
+    #[test]
     fn test_vm_with_globals() {
         let mut globals = GlobalScope::new();
         globals.set("x".into(), Value::int(42).unwrap());
@@ -2091,11 +2853,595 @@ mod tests {
     }
 
     #[test]
+    fn test_imported_source_module_can_read_sys_prefix_family() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("probe.py"),
+            "import sys\nVALUE = (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix)\n",
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("probe")
+            .expect("probe module should import successfully");
+        let value = module
+            .get_attr("VALUE")
+            .expect("probe module should publish VALUE");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("VALUE should be stored as tuple object");
+        let tuple = unsafe { &*(tuple_ptr as *const prism_runtime::types::tuple::TupleObject) };
+
+        assert_eq!(tuple.len(), 4, "prefix family should expose four entries");
+        for entry in tuple.iter() {
+            let string_ptr = entry
+                .as_string_object_ptr()
+                .expect("prefix entry should be an interned string")
+                as *const u8;
+            let resolved = prism_core::intern::interned_by_ptr(string_ptr)
+                .expect("prefix entry should resolve");
+            assert!(
+                !resolved.as_ref().is_empty(),
+                "prefix entry should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_imported_source_module_can_use_builtin_warning_categories() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("warning_probe.py"),
+            concat!(
+                "VALUE = (\n",
+                "    BytesWarning.__name__,\n",
+                "    issubclass(BytesWarning, Warning),\n",
+                "    issubclass(ResourceWarning, Warning),\n",
+                "    issubclass(ImportWarning, Warning),\n",
+                ")\n",
+            ),
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("warning_probe")
+            .expect("warning probe should import successfully");
+        let value = module
+            .get_attr("VALUE")
+            .expect("warning probe should publish VALUE");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("VALUE should be stored as tuple object");
+        let tuple = unsafe { &*(tuple_ptr as *const prism_runtime::types::tuple::TupleObject) };
+
+        assert_eq!(tuple.len(), 4, "warning probe should expose four entries");
+
+        let name_ptr = tuple.as_slice()[0]
+            .as_string_object_ptr()
+            .expect("first tuple entry should be an interned string")
+            as *const u8;
+        let resolved = prism_core::intern::interned_by_ptr(name_ptr)
+            .expect("warning category name should resolve");
+        assert_eq!(resolved.as_ref(), "BytesWarning");
+
+        for entry in &tuple.as_slice()[1..] {
+            assert_eq!(
+                entry.as_bool(),
+                Some(true),
+                "warning category relationship should be true",
+            );
+        }
+    }
+
+    #[test]
+    fn test_imported_source_module_supports_metaclass_prepare_dict_subclasses() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("prepare_probe.py"),
+            concat!(
+                "class Namespace(dict):\n",
+                "    def __setitem__(self, key, value):\n",
+                "        dict.__setitem__(self, key, value)\n",
+                "\n",
+                "class Meta(type):\n",
+                "    @classmethod\n",
+                "    def __prepare__(mcls, name, bases):\n",
+                "        return Namespace()\n",
+                "\n",
+                "class Target(metaclass=Meta):\n",
+                "    answer = 42\n",
+                "    label = 'ready'\n",
+                "\n",
+                "RESULT = (Target.answer, Target.label)\n",
+            ),
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("prepare_probe")
+            .expect("prepare probe should import successfully");
+        let value = module
+            .get_attr("RESULT")
+            .expect("prepare probe should publish RESULT");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("RESULT should be stored as tuple object");
+        let tuple = unsafe { &*(tuple_ptr as *const prism_runtime::types::tuple::TupleObject) };
+
+        assert_eq!(tuple.len(), 2);
+        assert_eq!(tuple.as_slice()[0].as_int(), Some(42));
+        let label_ptr = tuple.as_slice()[1]
+            .as_string_object_ptr()
+            .expect("label should be an interned string") as *const u8;
+        let label =
+            prism_core::intern::interned_by_ptr(label_ptr).expect("label string should resolve");
+        assert_eq!(label.as_ref(), "ready");
+    }
+
+    #[test]
+    fn test_imported_source_module_inherits_metaclass_prepare_dict_subclasses() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("prepare_inherit_probe.py"),
+            concat!(
+                "class Namespace(dict):\n",
+                "    def __setitem__(self, key, value):\n",
+                "        dict.__setitem__(self, key, value)\n",
+                "\n",
+                "class Meta(type):\n",
+                "    @classmethod\n",
+                "    def __prepare__(mcls, name, bases):\n",
+                "        return Namespace()\n",
+                "\n",
+                "class Base(metaclass=Meta):\n",
+                "    base = 'ok'\n",
+                "\n",
+                "class Derived(Base):\n",
+                "    answer = 42\n",
+                "\n",
+                "RESULT = (Base.base, Derived.answer)\n",
+            ),
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("prepare_inherit_probe")
+            .expect("prepare inherit probe should import successfully");
+        let value = module
+            .get_attr("RESULT")
+            .expect("prepare inherit probe should publish RESULT");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("RESULT should be stored as tuple object");
+        let tuple = unsafe { &*(tuple_ptr as *const prism_runtime::types::tuple::TupleObject) };
+
+        assert_eq!(tuple.len(), 2);
+        let base_ptr = tuple.as_slice()[0]
+            .as_string_object_ptr()
+            .expect("base marker should be an interned string") as *const u8;
+        let base = prism_core::intern::interned_by_ptr(base_ptr)
+            .expect("base marker string should resolve");
+        assert_eq!(base.as_ref(), "ok");
+        assert_eq!(tuple.as_slice()[1].as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_builtin_type_new_with_vm_preserves_class_result_after_handled_set_name_exception() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("__main__"));
+
+        vm.execute_in_module(
+            compile_module(
+                concat!(
+                    "class Descriptor:\n",
+                    "    def __set_name__(self, owner, name):\n",
+                    "        try:\n",
+                    "            {}['missing']\n",
+                    "        except KeyError:\n",
+                    "            pass\n",
+                    "        owner.marker = name\n",
+                    "\n",
+                    "class Meta(type):\n",
+                    "    pass\n",
+                    "\n",
+                    "DESCRIPTOR = Descriptor()\n",
+                ),
+                "<type-new-vm-probe>",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("probe module should execute");
+
+        let metaclass = module.get_attr("Meta").expect("Meta should be exported");
+        let descriptor = module
+            .get_attr("DESCRIPTOR")
+            .expect("descriptor instance should be exported");
+
+        let namespace_ptr = Box::into_raw(Box::new(prism_runtime::types::dict::DictObject::new()));
+        unsafe {
+            (*namespace_ptr).set(Value::string(intern("field")), descriptor);
+        }
+        let namespace_value = Value::object_ptr(namespace_ptr as *const ());
+
+        let bases_ptr = Box::into_raw(Box::new(prism_runtime::types::tuple::TupleObject::empty()));
+        let bases_value = Value::object_ptr(bases_ptr as *const ());
+
+        vm.push_frame_with_module(
+            empty_code("type_new_vm_probe"),
+            0,
+            Some(Arc::clone(&module)),
+        )
+        .expect("caller frame push should succeed");
+
+        let result = crate::builtins::builtin_type_new_with_vm(
+            &mut vm,
+            &[
+                metaclass,
+                Value::string(intern("Example")),
+                bases_value,
+                namespace_value,
+            ],
+        )
+        .expect("type.__new__ vm builtin should succeed");
+
+        assert_ne!(
+            result, namespace_value,
+            "type.__new__ should not leak the namespace mapping as its result"
+        );
+
+        let result_ptr = result
+            .as_object_ptr()
+            .expect("type.__new__ should return an object-backed class");
+        assert_eq!(
+            crate::ops::objects::extract_type_id(result_ptr),
+            TypeId::TYPE,
+            "type.__new__ should return a class object, not a transient callback value",
+        );
+
+        let class = unsafe { &*(result_ptr as *const PyClassObject) };
+        assert_eq!(
+            class.metaclass(),
+            metaclass,
+            "type.__new__ should preserve the explicit heap metaclass",
+        );
+
+        let marker = class
+            .get_attr(&intern("marker"))
+            .expect("descriptor callback should publish marker attribute");
+        let marker_ptr = marker
+            .as_string_object_ptr()
+            .expect("marker should be stored as an interned string")
+            as *const u8;
+        let marker_text =
+            prism_core::intern::interned_by_ptr(marker_ptr).expect("marker should resolve");
+        assert_eq!(
+            marker_text.as_ref(),
+            "field",
+            "__set_name__ should still run against the created class",
+        );
+
+        vm.clear_frames();
+        unsafe {
+            drop(Box::from_raw(namespace_ptr));
+            drop(Box::from_raw(bases_ptr));
+        }
+    }
+
+    #[test]
+    fn test_imported_source_module_supports_enum_style_metaclass_isinstance_checks() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("enum_meta_probe.py"),
+            concat!(
+                "class EnumType(type):\n",
+                "    @classmethod\n",
+                "    def __prepare__(metacls, cls, bases, **kwds):\n",
+                "        if bases and not isinstance(bases[-1], EnumType):\n",
+                "            raise TypeError('bad enum base')\n",
+                "        return {}\n",
+                "\n",
+                "class Enum(metaclass=EnumType):\n",
+                "    pass\n",
+                "\n",
+                "class ReprEnum(Enum):\n",
+                "    pass\n",
+                "\n",
+                "RESULT = (isinstance(Enum, EnumType), isinstance(ReprEnum, EnumType))\n",
+            ),
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("enum_meta_probe")
+            .expect("enum meta probe should import successfully");
+        let value = module
+            .get_attr("RESULT")
+            .expect("enum meta probe should publish RESULT");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("RESULT should be stored as tuple object");
+        let tuple = unsafe { &*(tuple_ptr as *const prism_runtime::types::tuple::TupleObject) };
+
+        assert_eq!(tuple.len(), 2);
+        assert_eq!(tuple.as_slice()[0].as_bool(), Some(true));
+        assert_eq!(tuple.as_slice()[1].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_imported_source_module_can_use_str_replace() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("replace_probe.py"),
+            concat!(
+                "VALUE = (\n",
+                "    'banana'.replace('na', 'NA'),\n",
+                "    'banana'.replace('na', 'NA', 1),\n",
+                "    'abc'.replace('', '-', 3),\n",
+                ")\n",
+            ),
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("replace_probe")
+            .expect("replace probe should import successfully");
+        let value = module
+            .get_attr("VALUE")
+            .expect("replace probe should publish VALUE");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("replace probe value should be a tuple");
+        let tuple = unsafe { &*(tuple_ptr as *const prism_runtime::types::tuple::TupleObject) };
+        let string_entry = |index: usize| {
+            let ptr = tuple
+                .get(i64::try_from(index).expect("tuple index should fit into i64"))
+                .and_then(|entry| entry.as_string_object_ptr())
+                .expect("tuple entry should be an interned string")
+                as *const u8;
+            prism_core::intern::interned_by_ptr(ptr)
+                .expect("tuple entry should resolve")
+                .as_ref()
+                .to_string()
+        };
+
+        assert_eq!(tuple.len(), 3);
+        assert_eq!(string_entry(0), "baNANA");
+        assert_eq!(string_entry(1), "baNAna");
+        assert_eq!(string_entry(2), "-a-b-c");
+    }
+
+    #[test]
     fn test_builtins_available() {
         let vm = VirtualMachine::new();
         assert!(vm.builtins.get("None").is_some());
         assert!(vm.builtins.get("True").is_some());
         assert!(vm.builtins.get("False").is_some());
+    }
+
+    #[test]
+    fn test_execution_step_limit_interrupts_infinite_loop() {
+        let mut vm = VirtualMachine::new();
+        vm.set_execution_step_limit(Some(128));
+
+        let err = vm
+            .execute_in_module(
+                compile_module("while True:\n    pass\n", "<step-limit>"),
+                Arc::new(ModuleObject::new("__main__")),
+            )
+            .expect_err("infinite loop should hit execution limit");
+
+        assert!(
+            err.to_string()
+                .contains("execution step limit exceeded (128)")
+        );
+        assert_eq!(vm.executed_steps(), 128);
+    }
+
+    #[test]
+    fn test_execution_step_limit_resets_between_top_level_runs() {
+        let mut vm = VirtualMachine::new();
+        vm.set_execution_step_limit(Some(64));
+
+        let module = Arc::new(ModuleObject::new("__main__"));
+        vm.execute_in_module(
+            compile_module("value = 1\n", "<first-run>"),
+            Arc::clone(&module),
+        )
+        .expect("first run should succeed");
+        let first_steps = vm.executed_steps();
+        assert!(first_steps > 0);
+
+        vm.execute_in_module(
+            compile_module("value = 1\n", "<second-run>"),
+            Arc::new(ModuleObject::new("__main__")),
+        )
+        .expect("second run should succeed");
+
+        assert_eq!(vm.executed_steps(), first_steps);
+    }
+
+    #[test]
+    fn test_execution_step_limit_disables_jit_fast_path_for_bounded_runs() {
+        let mut vm = VirtualMachine::with_jit();
+        vm.set_execution_step_limit(Some(128));
+
+        let err = vm
+            .execute_in_module(
+                compile_module("while True:\n    pass\n", "<bounded-jit>"),
+                Arc::new(ModuleObject::new("__main__")),
+            )
+            .expect_err("bounded run should not bypass the step limit via JIT");
+
+        assert!(
+            err.to_string()
+                .contains("execution step limit exceeded (128)")
+        );
+    }
+
+    #[test]
+    fn test_imported_builtins_module_shares_runtime_builtin_objects() {
+        let mut vm = VirtualMachine::new();
+        let builtins_module = vm
+            .import_module_named("builtins")
+            .expect("builtins module should import");
+
+        let imported_open = builtins_module
+            .get_attr("open")
+            .and_then(|value| value.as_object_ptr())
+            .expect("builtins.open should be callable");
+        let runtime_open = vm
+            .builtins
+            .get("open")
+            .and_then(|value| value.as_object_ptr())
+            .expect("open should exist in the builtin registry");
+
+        assert_eq!(imported_open, runtime_open);
+    }
+
+    #[test]
+    fn test_execute_in_module_sets_function_identity_metadata_for_getattr() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("pkg.mod"));
+
+        vm.execute_in_module(
+            compile_module("def f():\n    return 1\n", "<function-metadata>"),
+            Arc::clone(&module),
+        )
+        .expect("module execution should succeed");
+
+        let func = module.get_attr("f").expect("function should be exported");
+        assert_eq!(
+            builtin_getattr(&[func, Value::string(intern("__name__"))]).unwrap(),
+            Value::string(intern("f"))
+        );
+        assert_eq!(
+            builtin_getattr(&[func, Value::string(intern("__qualname__"))]).unwrap(),
+            Value::string(intern("f"))
+        );
+        assert_eq!(
+            builtin_getattr(&[func, Value::string(intern("__module__"))]).unwrap(),
+            Value::string(intern("pkg.mod"))
+        );
+        assert!(
+            builtin_getattr(&[func, Value::string(intern("__doc__"))])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_execute_in_module_sets_nested_function_name_and_module_for_getattr() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("__main__"));
+
+        vm.execute_in_module(
+            compile_module(
+                "def outer():\n    def inner():\n        return 1\n    return inner\ninner = outer()\n",
+                "<nested-function-metadata>",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("nested function module should execute");
+
+        let inner = module
+            .get_attr("inner")
+            .expect("outer() should publish the nested function");
+        assert_eq!(
+            builtin_getattr(&[inner, Value::string(intern("__name__"))]).unwrap(),
+            Value::string(intern("inner"))
+        );
+        assert_eq!(
+            builtin_getattr(&[inner, Value::string(intern("__module__"))]).unwrap(),
+            Value::string(intern("__main__"))
+        );
+    }
+
+    #[test]
+    fn test_import_error_to_runtime_preserves_module_not_found_metadata() {
+        let err = VirtualMachine::import_error_to_runtime(ImportError::ModuleNotFound {
+            module: Arc::from("pkg.missing"),
+        });
+        let mut vm = VirtualMachine::new();
+        let type_id = vm.materialize_active_exception_from_runtime_error(&err);
+        assert_eq!(
+            type_id,
+            crate::stdlib::exceptions::ExceptionTypeId::ModuleNotFoundError.as_u8() as u16
+        );
+
+        let active = *vm
+            .get_active_exception()
+            .expect("materialized import error should be active");
+        let exc = unsafe {
+            crate::builtins::ExceptionValue::from_value(active)
+                .expect("active import error should be an ExceptionValue")
+        };
+        assert_eq!(exc.import_name.as_deref(), Some("pkg.missing"));
+        assert!(exc.import_path.is_none());
+    }
+
+    #[test]
+    fn test_uncaught_exception_error_preserves_active_exception_message() {
+        let mut vm = VirtualMachine::new();
+        let exc = crate::builtins::create_exception(
+            crate::stdlib::exceptions::ExceptionTypeId::TypeError,
+            Some(Arc::from("real uncaught message")),
+        );
+        vm.set_active_exception_with_type(
+            exc,
+            crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16,
+        );
+
+        let err = vm.uncaught_exception_error(
+            crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16,
+        );
+
+        match err.kind {
+            crate::error::RuntimeErrorKind::Exception { type_id, message } => {
+                assert_eq!(
+                    type_id,
+                    crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16
+                );
+                assert_eq!(&*message, "real uncaught message");
+            }
+            other => panic!("expected exception runtime error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_uncaught_exception_error_falls_back_without_active_exception() {
+        let vm = VirtualMachine::new();
+        let err = vm.uncaught_exception_error(
+            crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16,
+        );
+
+        match err.kind {
+            crate::error::RuntimeErrorKind::Exception { type_id, message } => {
+                assert_eq!(
+                    type_id,
+                    crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16
+                );
+                assert_eq!(&*message, "Uncaught exception (type_id=52)");
+            }
+            other => panic!("expected exception runtime error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2392,7 +3738,10 @@ mod tests {
         let helper = vm
             .import_module_named("helper")
             .expect("frozen helper should import");
-        assert_eq!(helper.get_attr("VALUE").and_then(|value| value.as_int()), Some(123));
+        assert_eq!(
+            helper.get_attr("VALUE").and_then(|value| value.as_int()),
+            Some(123)
+        );
         assert!(vm.import_resolver.get_cached("helper").is_some());
     }
 

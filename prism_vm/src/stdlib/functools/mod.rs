@@ -33,7 +33,13 @@ pub mod wraps;
 mod tests;
 
 use super::{Module, ModuleError, ModuleResult};
+use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+use prism_core::Value;
+use prism_core::intern::intern;
+use prism_runtime::types::tuple::TupleObject;
 
 // Re-export core types
 pub use cached_property::CachedProperty;
@@ -42,6 +48,35 @@ pub use lru_cache::{CacheInfo, LruCache};
 pub use partial::Partial;
 pub use reduce::{ReduceError, accumulate, reduce, reduce_fallible};
 pub use wraps::{WRAPPER_ASSIGNMENTS, WRAPPER_UPDATES, WrapperMetadata};
+
+static WRAPS_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("functools.wraps"), builtin_wraps));
+static UPDATE_WRAPPER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("functools.update_wrapper"),
+        builtin_update_wrapper,
+    )
+});
+static WRAPS_DECORATOR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("functools._identity_decorator"),
+        builtin_identity_decorator,
+    )
+});
+static WRAPPER_ASSIGNMENTS_VALUE: LazyLock<TupleObject> = LazyLock::new(|| {
+    TupleObject::from_iter(
+        WRAPPER_ASSIGNMENTS
+            .iter()
+            .map(|name| Value::string(intern(name))),
+    )
+});
+static WRAPPER_UPDATES_VALUE: LazyLock<TupleObject> = LazyLock::new(|| {
+    TupleObject::from_iter(
+        WRAPPER_UPDATES
+            .iter()
+            .map(|name| Value::string(intern(name))),
+    )
+});
 
 // =============================================================================
 // Functools Module
@@ -88,6 +123,10 @@ impl Module for FunctoolsModule {
 
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
+            "wraps" => Ok(builtin_value(&WRAPS_FUNCTION)),
+            "update_wrapper" => Ok(builtin_value(&UPDATE_WRAPPER_FUNCTION)),
+            "WRAPPER_ASSIGNMENTS" => Ok(tuple_value(&WRAPPER_ASSIGNMENTS_VALUE)),
+            "WRAPPER_UPDATES" => Ok(tuple_value(&WRAPPER_UPDATES_VALUE)),
             "reduce"
             | "partial"
             | "partialmethod"
@@ -96,24 +135,11 @@ impl Module for FunctoolsModule {
             | "cached_property"
             | "cmp_to_key"
             | "total_ordering"
-            | "update_wrapper"
-            | "wraps"
             | "singledispatch"
-            | "singledispatchmethod" => {
-                // TODO: Return actual callable objects when the VM function protocol is ready
-                Err(ModuleError::AttributeError(format!(
-                    "functools.{} is not yet available as a callable object",
-                    name
-                )))
-            }
-            "WRAPPER_ASSIGNMENTS" | "WRAPPER_UPDATES" => {
-                // These are tuple constants in Python; return as None placeholder
-                // TODO: Return actual tuples when the VM tuple type is ready
-                Err(ModuleError::AttributeError(format!(
-                    "functools.{} is not yet available as a constant",
-                    name
-                )))
-            }
+            | "singledispatchmethod" => Err(ModuleError::AttributeError(format!(
+                "functools.{} is not yet available as a callable object",
+                name
+            ))),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'functools' has no attribute '{}'",
                 name
@@ -133,4 +159,92 @@ impl Module for FunctoolsModule {
 /// Create a new functools module instance.
 pub fn create_module() -> FunctoolsModule {
     FunctoolsModule::new()
+}
+
+#[inline]
+fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
+    Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+#[inline]
+fn tuple_value(tuple: &'static TupleObject) -> Value {
+    Value::object_ptr(tuple as *const TupleObject as *const ())
+}
+
+fn builtin_wraps(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "wraps() takes from 1 to 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(builtin_value(&WRAPS_DECORATOR))
+}
+
+fn builtin_update_wrapper(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "update_wrapper() takes from 2 to 4 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(args[0])
+}
+
+fn builtin_identity_decorator(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "decorator() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(args[0])
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    #[test]
+    fn test_get_attr_exposes_wraps_update_wrapper_and_constants() {
+        let module = FunctoolsModule::new();
+
+        assert!(module.get_attr("wraps").unwrap().as_object_ptr().is_some());
+        assert!(
+            module
+                .get_attr("update_wrapper")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+
+        let assignments = module.get_attr("WRAPPER_ASSIGNMENTS").unwrap();
+        let assignments_ptr = assignments.as_object_ptr().expect("tuple should be object");
+        let assignments_tuple = unsafe { &*(assignments_ptr as *const TupleObject) };
+        assert_eq!(assignments_tuple.len(), WRAPPER_ASSIGNMENTS.len());
+    }
+
+    #[test]
+    fn test_wraps_returns_identity_decorator() {
+        let decorator = builtin_wraps(&[Value::none()]).expect("wraps should succeed");
+        let decorator_ptr = decorator
+            .as_object_ptr()
+            .expect("decorator should be builtin function");
+        let builtin = unsafe { &*(decorator_ptr as *const BuiltinFunctionObject) };
+        let wrapped = Value::int(7).unwrap();
+        assert_eq!(builtin.call(&[wrapped]).unwrap(), wrapped);
+    }
+
+    #[test]
+    fn test_update_wrapper_returns_wrapper_argument() {
+        let wrapper = Value::int(11).unwrap();
+        let wrapped = Value::int(12).unwrap();
+        assert_eq!(
+            builtin_update_wrapper(&[wrapper, wrapped]).unwrap(),
+            wrapper
+        );
+    }
 }

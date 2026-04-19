@@ -23,6 +23,8 @@
 //! Read path is lock-free after first access via `RwLock::read()`.
 
 use prism_core::Value;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class_bitmap;
 use prism_runtime::object::type_obj::TypeId;
 use rustc_hash::FxHashMap;
 use std::sync::RwLock;
@@ -193,6 +195,21 @@ impl MethodCache {
     pub fn invalidate_type(&self, type_id: TypeId) {
         if let Ok(mut guard) = self.cache.write() {
             guard.retain(|(tid, _), _| *tid != type_id);
+            self.invalidations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Invalidate cache entries for a type and all of its subclasses.
+    ///
+    /// This preserves correctness when a class dictionary changes, since any
+    /// subclass may inherit the mutated attribute through its MRO.
+    pub fn invalidate_type_hierarchy(&self, type_id: TypeId) {
+        if let Ok(mut guard) = self.cache.write() {
+            guard.retain(|(cached_type, _), _| {
+                global_class_bitmap(ClassId(cached_type.raw()))
+                    .map(|bitmap| !bitmap.is_subclass_of(type_id))
+                    .unwrap_or(*cached_type != type_id)
+            });
             self.invalidations.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -368,6 +385,22 @@ mod tests {
         // OBJECT should be gone, STR should remain
         assert!(cache.get(TypeId::OBJECT, name_ptr).is_none());
         assert!(cache.get(TypeId::STR, name_ptr).is_some());
+    }
+
+    #[test]
+    fn test_invalidate_type_hierarchy_removes_builtin_subclasses() {
+        let cache = MethodCache::new();
+        let name_ptr = 0x12345678u64;
+
+        cache.insert(TypeId::INT, name_ptr, CachedMethod::simple(Value::none()));
+        cache.insert(TypeId::BOOL, name_ptr, CachedMethod::simple(Value::none()));
+        cache.insert(TypeId::FLOAT, name_ptr, CachedMethod::simple(Value::none()));
+
+        cache.invalidate_type_hierarchy(TypeId::INT);
+
+        assert!(cache.get(TypeId::INT, name_ptr).is_none());
+        assert!(cache.get(TypeId::BOOL, name_ptr).is_none());
+        assert!(cache.get(TypeId::FLOAT, name_ptr).is_some());
     }
 
     #[test]

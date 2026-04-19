@@ -12,8 +12,10 @@
 
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
+use prism_core::intern::interned_by_ptr;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::string::StringObject;
 use std::sync::Arc;
 
 // =============================================================================
@@ -57,12 +59,21 @@ pub struct ExceptionValue {
     /// Lazily allocated - most exceptions only use message.
     pub args: Option<Box<[Value]>>,
 
+    /// ImportError / ModuleNotFoundError `.name` payload.
+    pub import_name: Option<Arc<str>>,
+
+    /// ImportError / ModuleNotFoundError `.path` payload.
+    pub import_path: Option<Arc<str>>,
+
     /// Explicit cause (from `raise X from Y`).
     /// Uses raw pointer to avoid recursive Box issues.
     pub cause: Option<*const ExceptionValue>,
 
     /// Implicit context (exception being handled when this was raised).
     pub context: Option<*const ExceptionValue>,
+
+    /// Python-visible traceback view attached to the exception.
+    pub traceback: Option<Value>,
 
     /// Traceback reference (index into traceback table).
     pub traceback_id: u32,
@@ -133,8 +144,11 @@ impl ExceptionValue {
             _pad: [0; 4],
             message,
             args: None,
+            import_name: None,
+            import_path: None,
             cause: None,
             context: None,
+            traceback: None,
             traceback_id: 0,
             _reserved: 0,
         }
@@ -153,8 +167,11 @@ impl ExceptionValue {
             _pad: [0; 4],
             message,
             args: Some(args),
+            import_name: None,
+            import_path: None,
             cause: None,
             context: None,
+            traceback: None,
             traceback_id: 0,
             _reserved: 0,
         }
@@ -178,6 +195,46 @@ impl ExceptionValue {
         self.message.as_deref()
     }
 
+    /// Render the exception payload using Python's `str(exception)` semantics.
+    pub fn display_text(&self) -> String {
+        if let Some(args) = self.args.as_deref() {
+            return match args {
+                [] => self.message.as_deref().unwrap_or("").to_string(),
+                [value] => exception_arg_display_text(*value),
+                values => {
+                    let joined = values
+                        .iter()
+                        .map(|value| exception_arg_repr_text(*value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({joined})")
+                }
+            };
+        }
+
+        self.message.as_deref().unwrap_or("").to_string()
+    }
+
+    /// Render the exception using Python's `repr(exception)` style.
+    pub fn repr_text(&self) -> String {
+        if let Some(args) = self.args.as_deref()
+            && !args.is_empty()
+        {
+            let joined = args
+                .iter()
+                .map(|value| exception_arg_repr_text(*value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("{}({joined})", self.type_name());
+        }
+
+        if let Some(message) = self.message() {
+            return format!("{}({})", self.type_name(), quote_python_string(message));
+        }
+
+        format!("{}()", self.type_name())
+    }
+
     /// Set the cause (from `raise X from Y`).
     pub fn set_cause(&mut self, cause: *const ExceptionValue) {
         self.cause = Some(cause);
@@ -194,10 +251,42 @@ impl ExceptionValue {
         self.flags = self.flags.with(ExceptionFlags::SUPPRESS_CONTEXT);
     }
 
+    /// Get the Python-visible traceback value.
+    #[inline]
+    pub fn traceback(&self) -> Option<Value> {
+        self.traceback
+    }
+
+    /// Attach a Python-visible traceback value.
+    #[inline]
+    pub fn set_traceback(&mut self, traceback: Value) {
+        self.traceback = Some(traceback);
+        self.traceback_id = self.traceback_id.max(1);
+    }
+
+    /// Clear any attached traceback value.
+    #[inline]
+    pub fn clear_traceback(&mut self) {
+        self.traceback = None;
+        self.traceback_id = 0;
+    }
+
     /// Check if this is a subclass of another exception type.
     #[inline]
     pub fn is_subclass_of(&self, base: ExceptionTypeId) -> bool {
         self.type_id().is_subclass_of(base)
+    }
+
+    /// Attach ImportError / ModuleNotFoundError metadata.
+    #[inline]
+    pub fn with_import_details(
+        mut self,
+        import_name: Option<Arc<str>>,
+        import_path: Option<Arc<str>>,
+    ) -> Self {
+        self.import_name = import_name;
+        self.import_path = import_path;
+        self
     }
 
     /// Convert to a Value (object pointer).
@@ -242,6 +331,8 @@ impl std::fmt::Debug for ExceptionValue {
         f.debug_struct("ExceptionValue")
             .field("type", &self.type_name())
             .field("message", &self.message)
+            .field("import_name", &self.import_name)
+            .field("import_path", &self.import_path)
             .field("flags", &self.flags)
             .finish()
     }
@@ -249,17 +340,116 @@ impl std::fmt::Debug for ExceptionValue {
 
 impl std::fmt::Display for ExceptionValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(msg) = &self.message {
-            write!(f, "{}: {}", self.type_name(), msg)
-        } else {
-            write!(f, "{}", self.type_name())
-        }
+        f.write_str(&self.display_text())
     }
 }
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+#[inline]
+fn owned_string_value(value: Value) -> Option<String> {
+    if value.is_string() {
+        let ptr = value.as_string_object_ptr()?;
+        let interned = interned_by_ptr(ptr as *const u8)?;
+        return Some(interned.as_str().to_string());
+    }
+
+    let ptr = value.as_object_ptr()?;
+    if unsafe { (*(ptr as *const ObjectHeader)).type_id } != TypeId::STR {
+        return None;
+    }
+
+    Some(
+        unsafe { &*(ptr as *const StringObject) }
+            .as_str()
+            .to_string(),
+    )
+}
+
+#[inline]
+fn exception_arg_display_text(value: Value) -> String {
+    if let Some(text) = owned_string_value(value) {
+        return text;
+    }
+    if value.is_none() {
+        return "None".to_string();
+    }
+    if let Some(boolean) = value.as_bool() {
+        return if boolean { "True" } else { "False" }.to_string();
+    }
+    if let Some(integer) = value.as_int() {
+        return integer.to_string();
+    }
+    if let Some(float) = value.as_float() {
+        if float.fract() == 0.0 && float.is_finite() {
+            return format!("{float:.1}");
+        }
+        return float.to_string();
+    }
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return exception.display_text();
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return "<object>".to_string();
+    };
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    format!("<{} object at 0x{:x}>", type_id.name(), ptr as usize)
+}
+
+#[inline]
+fn exception_arg_repr_text(value: Value) -> String {
+    if let Some(text) = owned_string_value(value) {
+        return quote_python_string(&text);
+    }
+    if value.is_none() {
+        return "None".to_string();
+    }
+    if let Some(boolean) = value.as_bool() {
+        return if boolean { "True" } else { "False" }.to_string();
+    }
+    if let Some(integer) = value.as_int() {
+        return integer.to_string();
+    }
+    if let Some(float) = value.as_float() {
+        if float.fract() == 0.0 && float.is_finite() {
+            return format!("{float:.1}");
+        }
+        return float.to_string();
+    }
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return exception.repr_text();
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return "<object>".to_string();
+    };
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    format!("<{} object at 0x{:x}>", type_id.name(), ptr as usize)
+}
+
+fn quote_python_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('\'');
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if other.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\x{:02x}", other as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
 
 /// Create a boxed exception value and return as Value.
 ///
@@ -276,6 +466,18 @@ pub fn create_exception_with_args(
     args: Box<[Value]>,
 ) -> Value {
     ExceptionValue::with_args(type_id, message, args).into_value()
+}
+
+/// Create an import-related exception with `.name` / `.path` metadata.
+pub fn create_exception_with_import_details(
+    type_id: ExceptionTypeId,
+    message: Option<Arc<str>>,
+    import_name: Option<Arc<str>>,
+    import_path: Option<Arc<str>>,
+) -> Value {
+    ExceptionValue::new(type_id, message)
+        .with_import_details(import_name, import_path)
+        .into_value()
 }
 
 // =============================================================================
@@ -303,6 +505,17 @@ mod tests {
         let exc = ExceptionValue::new(ExceptionTypeId::TypeError, None);
         assert_eq!(exc.type_id(), ExceptionTypeId::TypeError);
         assert!(exc.message().is_none());
+    }
+
+    #[test]
+    fn test_exception_value_import_details_round_trip() {
+        let exc = ExceptionValue::new(
+            ExceptionTypeId::ModuleNotFoundError,
+            Some(Arc::from("No module named 'pkg.missing'")),
+        )
+        .with_import_details(Some(Arc::from("pkg.missing")), None);
+        assert_eq!(exc.import_name.as_deref(), Some("pkg.missing"));
+        assert!(exc.import_path.is_none());
     }
 
     #[test]
@@ -384,6 +597,20 @@ mod tests {
         let mut exc = ExceptionValue::new(ExceptionTypeId::ValueError, None);
         exc.suppress_context();
         assert!(exc.flags.has(ExceptionFlags::SUPPRESS_CONTEXT));
+    }
+
+    #[test]
+    fn test_exception_set_traceback_value() {
+        let mut exc = ExceptionValue::new(ExceptionTypeId::ValueError, None);
+        let traceback = Value::int(7).unwrap();
+        exc.set_traceback(traceback);
+
+        assert_eq!(exc.traceback(), Some(traceback));
+        assert_ne!(exc.traceback_id, 0);
+
+        exc.clear_traceback();
+        assert!(exc.traceback().is_none());
+        assert_eq!(exc.traceback_id, 0);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -510,6 +737,35 @@ mod tests {
         let exc = unsafe { ExceptionValue::from_value(value).unwrap() };
         assert_eq!(exc.type_id(), ExceptionTypeId::SystemExit);
         assert!(exc.args.is_some());
+    }
+
+    #[test]
+    fn test_create_exception_with_import_details() {
+        let value = create_exception_with_import_details(
+            ExceptionTypeId::ModuleNotFoundError,
+            Some(Arc::from("No module named 'pkg.missing'")),
+            Some(Arc::from("pkg.missing")),
+            None,
+        );
+
+        let exc = unsafe { ExceptionValue::from_value(value).unwrap() };
+        assert_eq!(exc.type_id(), ExceptionTypeId::ModuleNotFoundError);
+        assert_eq!(exc.import_name.as_deref(), Some("pkg.missing"));
+        assert!(exc.import_path.is_none());
+    }
+
+    #[test]
+    fn test_display_text_prefers_single_string_arg() {
+        let args = vec![Value::string(prism_core::intern::intern("boom"))].into_boxed_slice();
+        let exc = ExceptionValue::with_args(ExceptionTypeId::ValueError, None, args);
+        assert_eq!(exc.display_text(), "boom");
+    }
+
+    #[test]
+    fn test_repr_text_uses_exception_type_and_args() {
+        let args = vec![Value::string(prism_core::intern::intern("boom"))].into_boxed_slice();
+        let exc = ExceptionValue::with_args(ExceptionTypeId::ValueError, None, args);
+        assert_eq!(exc.repr_text(), "ValueError('boom')");
     }
 
     // ════════════════════════════════════════════════════════════════════════

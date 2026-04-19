@@ -53,7 +53,7 @@ pub fn jump_if_false(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     let frame = vm.current_frame();
     let value = frame.get_reg(inst.dst().0);
 
-    if !value.is_truthy() {
+    if !crate::truthiness::is_truthy(value) {
         let offset = inst.imm16() as i16;
         ControlFlow::Jump(offset)
     } else {
@@ -67,7 +67,7 @@ pub fn jump_if_true(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let value = frame.get_reg(inst.dst().0);
 
-    if value.is_truthy() {
+    if crate::truthiness::is_truthy(value) {
         let offset = inst.imm16() as i16;
         ControlFlow::Jump(offset)
     } else {

@@ -47,8 +47,8 @@
 #![allow(clippy::new_without_default)]
 
 // Core modules
-pub mod aot_abi;
 pub mod allocator;
+pub mod aot_abi;
 pub mod error;
 pub mod frame;
 pub mod gc_integration;
@@ -63,6 +63,7 @@ pub mod inline_cache;
 pub mod osr_trigger;
 pub mod profiler;
 pub mod speculative;
+pub mod truthiness;
 pub mod type_feedback;
 
 // JIT integration

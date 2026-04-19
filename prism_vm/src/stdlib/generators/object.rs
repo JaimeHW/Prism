@@ -22,6 +22,7 @@
 //! └───────────────────────────────────────────────────────────────┘
 //! ```
 
+use crate::frame::ClosureEnv;
 use prism_compiler::bytecode::{CodeFlags, CodeObject};
 use prism_core::Value;
 use prism_gc::Trace;
@@ -140,6 +141,9 @@ pub struct GeneratorObject {
     /// Value received via send() or throw().
     receive_value: Option<Value>,
 
+    /// Captured closure environment, if this generator was created from a closure.
+    closure: Option<Arc<ClosureEnv>>,
+
     /// Module globals backing this generator's code.
     module_ptr: *const (),
 }
@@ -161,6 +165,7 @@ impl GeneratorObject {
             liveness_bits: 0,
             storage: FrameStorage::new(),
             receive_value: None,
+            closure: None,
             module_ptr: std::ptr::null(),
         }
     }
@@ -178,6 +183,7 @@ impl GeneratorObject {
             liveness_bits: 0,
             storage: FrameStorage::new(),
             receive_value: None,
+            closure: None,
             module_ptr: std::ptr::null(),
         }
     }
@@ -374,6 +380,19 @@ impl GeneratorObject {
         self.module_ptr
     }
 
+    /// Record the closure environment that should be restored on resume.
+    #[inline]
+    pub fn set_closure(&mut self, closure: Arc<ClosureEnv>) {
+        self.flags |= GeneratorFlags::HAS_CLOSURE;
+        self.closure = Some(closure);
+    }
+
+    /// Get the closure environment captured for this generator, if any.
+    #[inline]
+    pub fn closure(&self) -> Option<&Arc<ClosureEnv>> {
+        self.closure.as_ref()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Flag Manipulation
     // ═══════════════════════════════════════════════════════════════════════
@@ -415,6 +434,7 @@ impl Clone for GeneratorObject {
             liveness_bits: self.liveness_bits,
             storage: self.storage.clone(),
             receive_value: self.receive_value,
+            closure: self.closure.clone(),
             module_ptr: self.module_ptr,
         }
     }
@@ -427,6 +447,7 @@ impl fmt::Debug for GeneratorObject {
             .field("resume_index", &self.resume_index())
             .field("ip", &self.ip)
             .field("flags", &self.flags)
+            .field("has_closure", &self.closure.is_some())
             .field("storage_len", &self.storage.len())
             .finish()
     }
@@ -442,6 +463,13 @@ unsafe impl Trace for GeneratorObject {
             self.storage.get(idx).trace(tracer);
         }
         self.receive_value.trace(tracer);
+        if let Some(closure) = &self.closure {
+            for idx in 0..closure.len() {
+                if let Some(value) = closure.get_cell(idx).get() {
+                    value.trace(tracer);
+                }
+            }
+        }
     }
 }
 
@@ -548,6 +576,21 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
     // Lifecycle Tests
     // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_generator_closure_round_trips_through_object_state() {
+        let mut generator = GeneratorObject::new(test_code());
+        let closure = Arc::new(crate::frame::ClosureEnv::with_unbound_cells(1));
+
+        generator.set_closure(Arc::clone(&closure));
+
+        assert!(generator.flags().contains(GeneratorFlags::HAS_CLOSURE));
+        assert!(generator.closure().is_some());
+        assert!(Arc::ptr_eq(
+            generator.closure().expect("closure should be present"),
+            &closure
+        ));
+    }
 
     #[test]
     fn test_generator_start() {

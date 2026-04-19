@@ -80,6 +80,8 @@ bitflags::bitflags! {
         const HAS_EQ = 1 << 8;
         /// Class defines `__del__`.
         const HAS_FINALIZER = 1 << 9;
+        /// Class can itself be used as a metaclass.
+        const METACLASS = 1 << 10;
     }
 }
 
@@ -123,55 +125,68 @@ pub enum InstantiationHint {
 /// Values are boxed Python objects (methods, descriptors, etc.).
 #[derive(Debug, Default)]
 pub struct ClassDict {
-    /// The underlying dictionary.
-    attrs: RwLock<FxHashMap<InternedString, Value>>,
+    entries: RwLock<ClassDictEntries>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ClassDictEntries {
+    attrs: FxHashMap<InternedString, Value>,
+    order: Vec<InternedString>,
 }
 
 impl ClassDict {
     /// Create a new empty class dict.
     pub fn new() -> Self {
         Self {
-            attrs: RwLock::new(FxHashMap::default()),
+            entries: RwLock::new(ClassDictEntries::default()),
         }
     }
 
     /// Get an attribute.
     #[inline]
     pub fn get(&self, name: &InternedString) -> Option<Value> {
-        self.attrs.read().unwrap().get(name).copied()
+        self.entries.read().unwrap().attrs.get(name).copied()
     }
 
     /// Set an attribute.
     #[inline]
     pub fn set(&self, name: InternedString, value: Value) {
-        self.attrs.write().unwrap().insert(name, value);
+        let mut entries = self.entries.write().unwrap();
+        if entries.attrs.insert(name.clone(), value).is_none() {
+            entries.order.push(name);
+        }
     }
 
     /// Delete an attribute.
     #[inline]
     pub fn delete(&self, name: &InternedString) -> Option<Value> {
-        self.attrs.write().unwrap().remove(name)
+        let mut entries = self.entries.write().unwrap();
+        let removed = entries.attrs.remove(name);
+        if removed.is_some() {
+            entries.order.retain(|existing| existing != name);
+        }
+        removed
     }
 
     /// Check if attribute exists.
     #[inline]
     pub fn contains(&self, name: &InternedString) -> bool {
-        self.attrs.read().unwrap().contains_key(name)
+        self.entries.read().unwrap().attrs.contains_key(name)
     }
 
     /// Get all attribute names.
     pub fn keys(&self) -> Vec<InternedString> {
-        self.attrs.read().unwrap().keys().cloned().collect()
+        self.entries.read().unwrap().order.clone()
     }
 
     /// Number of attributes.
     pub fn len(&self) -> usize {
-        self.attrs.read().unwrap().len()
+        self.entries.read().unwrap().attrs.len()
     }
 
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
-        self.attrs.read().unwrap().is_empty()
+        self.entries.read().unwrap().attrs.is_empty()
     }
 
     /// Iterate over all attributes.
@@ -179,9 +194,14 @@ impl ClassDict {
     where
         F: FnMut(&InternedString, Value),
     {
-        let attrs = self.attrs.read().unwrap();
-        for (name, value) in attrs.iter() {
-            f(name, *value);
+        let entries = self.entries.read().unwrap();
+        for name in &entries.order {
+            let value = entries
+                .attrs
+                .get(name)
+                .copied()
+                .expect("class dict order must stay in sync with attributes");
+            f(name, value);
         }
     }
 }
@@ -189,7 +209,7 @@ impl ClassDict {
 impl Clone for ClassDict {
     fn clone(&self) -> Self {
         Self {
-            attrs: RwLock::new(self.attrs.read().unwrap().clone()),
+            entries: RwLock::new(self.entries.read().unwrap().clone()),
         }
     }
 }
@@ -232,6 +252,7 @@ pub struct MethodSlot {
 ///
 /// The class dictionary uses RwLock for safe concurrent access.
 /// MRO and bases are immutable after construction.
+#[repr(C)]
 #[derive(Debug)]
 pub struct PyClassObject {
     /// Object header.
@@ -251,6 +272,11 @@ pub struct PyClassObject {
 
     /// Class flags.
     flags: ClassFlags,
+
+    /// Metaclass for this class object.
+    ///
+    /// `Value::none()` denotes the default builtin `type` metaclass.
+    metaclass: Value,
 
     /// Class attributes (methods, class variables).
     dict: ClassDict,
@@ -297,6 +323,7 @@ impl PyClassObject {
             bases: bases_vec,
             mro,
             flags: ClassFlags::empty(),
+            metaclass: Value::none(),
             dict: ClassDict::new(),
             slots: TypeSlots::default(),
             instance_shape: Shape::empty(),
@@ -321,6 +348,7 @@ impl PyClassObject {
             bases: SmallVec::new(),
             mro,
             flags: ClassFlags::empty(),
+            metaclass: Value::none(),
             dict: ClassDict::new(),
             slots: TypeSlots::default(),
             instance_shape: Shape::empty(),
@@ -368,6 +396,14 @@ impl PyClassObject {
         self.flags
     }
 
+    /// Get the metaclass value for this class.
+    ///
+    /// `Value::none()` denotes the builtin `type` metaclass.
+    #[inline]
+    pub fn metaclass(&self) -> Value {
+        self.metaclass
+    }
+
     /// Get type slots.
     #[inline]
     pub fn slots(&self) -> &TypeSlots {
@@ -402,6 +438,12 @@ impl PyClassObject {
         self.dict.set(name, value);
     }
 
+    /// Set the metaclass value for this class.
+    #[inline]
+    pub fn set_metaclass(&mut self, metaclass: Value) {
+        self.metaclass = metaclass;
+    }
+
     /// Delete a class attribute.
     #[inline]
     pub fn del_attr(&self, name: &InternedString) -> Option<Value> {
@@ -412,6 +454,14 @@ impl PyClassObject {
     #[inline]
     pub fn has_attr(&self, name: &InternedString) -> bool {
         self.dict.contains(name)
+    }
+
+    /// Visit each attribute stored directly on this class.
+    pub fn for_each_attr<F>(&self, f: F)
+    where
+        F: FnMut(&InternedString, Value),
+    {
+        self.dict.for_each(f);
     }
 
     // =========================================================================
@@ -620,6 +670,11 @@ mod tests {
     }
 
     #[test]
+    fn test_header_is_first_field() {
+        assert_eq!(std::mem::offset_of!(PyClassObject, header), 0);
+    }
+
+    #[test]
     fn test_class_type_id_uniqueness() {
         let class1 = PyClassObject::new_simple(intern("Class1"));
         let class2 = PyClassObject::new_simple(intern("Class2"));
@@ -651,6 +706,53 @@ mod tests {
         let deleted = class.del_attr(&attr_name);
         assert_eq!(deleted, Some(Value::int_unchecked(42)));
         assert!(!class.has_attr(&attr_name));
+    }
+
+    #[test]
+    fn test_class_dict_preserves_insertion_order() {
+        let namespace = ClassDict::new();
+        let alpha = intern("alpha");
+        let beta = intern("beta");
+        let gamma = intern("gamma");
+
+        namespace.set(alpha.clone(), Value::int_unchecked(1));
+        namespace.set(beta.clone(), Value::int_unchecked(2));
+        namespace.set(gamma.clone(), Value::int_unchecked(3));
+
+        assert_eq!(
+            namespace.keys(),
+            vec![alpha.clone(), beta.clone(), gamma.clone()]
+        );
+
+        let mut seen = Vec::new();
+        namespace.for_each(|name, _| seen.push(name.clone()));
+        assert_eq!(seen, vec![alpha, beta, gamma]);
+    }
+
+    #[test]
+    fn test_class_dict_delete_and_reinsert_moves_name_to_end() {
+        let namespace = ClassDict::new();
+        let alpha = intern("alpha");
+        let beta = intern("beta");
+        let gamma = intern("gamma");
+
+        namespace.set(alpha.clone(), Value::int_unchecked(1));
+        namespace.set(beta.clone(), Value::int_unchecked(2));
+        namespace.set(gamma.clone(), Value::int_unchecked(3));
+        assert_eq!(namespace.delete(&beta), Some(Value::int_unchecked(2)));
+        namespace.set(beta.clone(), Value::int_unchecked(4));
+
+        assert_eq!(
+            namespace.keys(),
+            vec![alpha.clone(), gamma.clone(), beta.clone()]
+        );
+
+        let mut seen = Vec::new();
+        namespace.for_each(|name, value| seen.push((name.clone(), value.as_int())));
+        assert_eq!(
+            seen,
+            vec![(alpha, Some(1)), (gamma, Some(3)), (beta, Some(4))]
+        );
     }
 
     #[test]

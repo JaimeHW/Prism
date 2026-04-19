@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use prism_core::Value;
 use prism_core::aot::{
     AOT_IMPORT_FROM_SYMBOL, AOT_IMPORT_MODULE_SYMBOL, AOT_STORE_EXPR_SYMBOL, AotImmediate,
     AotImmediateKind, AotImportBinding, AotImportFromOp, AotImportModuleOp, AotOpStatus,
     AotOperand, AotOperandKind, AotStoreExprKind, AotStoreExprOp, AotStringRef,
 };
 use prism_core::intern::{intern, intern_owned, interned_by_ptr};
-use prism_core::Value;
 
 use crate::error::RuntimeError;
 use crate::import::ModuleObject;
@@ -56,15 +56,17 @@ fn add_values(lhs: Value, rhs: Value) -> Result<Value, RuntimeError> {
         let sum = left
             .checked_add(right)
             .ok_or_else(|| RuntimeError::value_error("integer overflow in native AOT add"))?;
-        return Value::int(sum)
-            .ok_or_else(|| RuntimeError::value_error("integer result does not fit Prism inline representation"));
+        return Value::int(sum).ok_or_else(|| {
+            RuntimeError::value_error("integer result does not fit Prism inline representation")
+        });
     }
 
     if let (Some(left), Some(right)) = (lhs.as_float_coerce(), rhs.as_float_coerce()) {
         return Ok(Value::float(left + right));
     }
 
-    if let (Some(left_ptr), Some(right_ptr)) = (lhs.as_string_object_ptr(), rhs.as_string_object_ptr())
+    if let (Some(left_ptr), Some(right_ptr)) =
+        (lhs.as_string_object_ptr(), rhs.as_string_object_ptr())
     {
         let left = interned_by_ptr(left_ptr as *const u8).ok_or_else(|| {
             RuntimeError::internal("left AOT string operand is not present in the global interner")
@@ -234,7 +236,12 @@ mod tests {
     #[test]
     fn test_store_expr_op_writes_immediate_and_add_result() {
         let mut vm = VirtualMachine::new();
-        let module = Arc::new(ModuleObject::with_metadata("__main__", None, None, Some("".into())));
+        let module = Arc::new(ModuleObject::with_metadata(
+            "__main__",
+            None,
+            None,
+            Some("".into()),
+        ));
         vm.bind_module(Arc::clone(&module));
 
         let store_value = AotStoreExprOp {
@@ -265,7 +272,10 @@ mod tests {
             AotOpStatus::Ok
         );
 
-        assert_eq!(module.get_attr("VALUE").and_then(|value| value.as_int()), Some(37));
+        assert_eq!(
+            module.get_attr("VALUE").and_then(|value| value.as_int()),
+            Some(37)
+        );
         assert_eq!(
             module.get_attr("RESULT").and_then(|value| value.as_int()),
             Some(42)
@@ -276,7 +286,12 @@ mod tests {
     #[test]
     fn test_import_module_op_binds_top_level_package_for_dotted_imports() {
         let mut vm = VirtualMachine::new();
-        let module = Arc::new(ModuleObject::with_metadata("__main__", None, None, Some("".into())));
+        let module = Arc::new(ModuleObject::with_metadata(
+            "__main__",
+            None,
+            None,
+            Some("".into()),
+        ));
         vm.bind_module(Arc::clone(&module));
 
         let op = AotImportModuleOp {
@@ -351,7 +366,12 @@ mod tests {
     #[test]
     fn test_store_expr_op_records_runtime_error() {
         let mut vm = VirtualMachine::new();
-        let module = Arc::new(ModuleObject::with_metadata("__main__", None, None, Some("".into())));
+        let module = Arc::new(ModuleObject::with_metadata(
+            "__main__",
+            None,
+            None,
+            Some("".into()),
+        ));
         vm.bind_module(Arc::clone(&module));
 
         let op = AotStoreExprOp {
@@ -370,6 +390,9 @@ mod tests {
         let err = vm
             .take_last_aot_error()
             .expect("failing AOT helper should record an error");
-        assert!(matches!(err.kind, crate::error::RuntimeErrorKind::NameError { .. }));
+        assert!(matches!(
+            err.kind,
+            crate::error::RuntimeErrorKind::NameError { .. }
+        ));
     }
 }

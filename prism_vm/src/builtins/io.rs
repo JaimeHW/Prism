@@ -33,8 +33,8 @@ fn format_value(value: Value) -> String {
         } else {
             format!("{}", f)
         }
-    } else if let Ok(repr) = super::functions::builtin_repr(&[value]) {
-        value_to_string(repr).unwrap_or_else(|| "<object>".to_string())
+    } else if let Ok(text) = super::types::builtin_str(&[value]) {
+        value_to_string(text).unwrap_or_else(|| "<object>".to_string())
     } else {
         "<object>".to_string()
     }
@@ -122,14 +122,21 @@ fn value_to_string(value: Value) -> Option<String> {
 mod tests {
     use super::*;
     use prism_core::intern::{intern, interned_by_ptr};
+    use prism_runtime::types::string::StringObject;
     use std::io::Cursor;
 
     fn value_to_rust_string(value: Value) -> String {
+        if let Some(ptr) = value.as_string_object_ptr() {
+            let interned =
+                interned_by_ptr(ptr as *const u8).expect("interned pointer should resolve");
+            return interned.as_str().to_string();
+        }
+
         let ptr = value
-            .as_string_object_ptr()
-            .expect("input()/print() tests expect tagged interned strings");
-        let interned = interned_by_ptr(ptr as *const u8).expect("interned pointer should resolve");
-        interned.as_str().to_string()
+            .as_object_ptr()
+            .expect("print()/input() tests expect string values");
+        let string = unsafe { &*(ptr as *const StringObject) };
+        string.as_str().to_string()
     }
 
     #[test]
@@ -144,6 +151,18 @@ mod tests {
             &mut out,
         );
         assert_eq!(String::from_utf8(out).unwrap(), "hello 3 True\n");
+    }
+
+    #[test]
+    fn test_print_uses_exception_display_text() {
+        let exc = crate::builtins::get_exception_type("ValueError")
+            .expect("ValueError should exist")
+            .construct(&[Value::string(intern("boom"))]);
+        let mut out = Vec::new();
+
+        write_print(&[exc], &mut out);
+
+        assert_eq!(String::from_utf8(out).unwrap(), "boom\n");
     }
 
     #[test]

@@ -1,0 +1,1657 @@
+use crate::VirtualMachine;
+use crate::builtins::BuiltinFunctionObject;
+use crate::error::RuntimeError;
+use prism_core::Value;
+use prism_core::intern::{InternedString, intern, interned_by_ptr};
+use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::{builtin_class_mro, class_id_to_type_id, global_class};
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::{DescriptorViewObject, MappingProxyObject, MethodWrapperObject};
+use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
+use std::sync::{Arc, LazyLock};
+
+static DICT_FROMKEYS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("dict.fromkeys"),
+        super::types::builtin_dict_fromkeys,
+    )
+});
+static STR_MAKETRANS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("str.maketrans"),
+        super::types::builtin_str_maketrans,
+    )
+});
+static OBJECT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("object.__new__"),
+        super::types::builtin_object_new,
+    )
+});
+static OBJECT_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("object.__init__"),
+        super::types::builtin_object_init,
+    )
+});
+static TYPE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("type.__new__"),
+        super::types::builtin_type_new_with_vm,
+    )
+});
+static TUPLE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("tuple.__new__"), super::types::builtin_tuple_new)
+});
+static INT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("int.__new__"), super::types::builtin_int_new)
+});
+static FLOAT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("float.__new__"), super::types::builtin_float_new)
+});
+static STR_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("str.__new__"), super::types::builtin_str_new)
+});
+static BOOL_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bool.__new__"), super::types::builtin_bool_new)
+});
+static LIST_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("list.__new__"), super::types::builtin_list_new)
+});
+static DICT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("dict.__new__"), super::types::builtin_dict_new)
+});
+static SET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("set.__new__"), super::types::builtin_set_new)
+});
+static FROZENSET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("frozenset.__new__"),
+        super::types::builtin_frozenset_new,
+    )
+});
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReflectedValueKind {
+    DictProxy,
+    MroTuple,
+    BasesTuple,
+    BaseValue,
+    NameString,
+    QualNameString,
+    ModuleString,
+    WrapperDescriptor,
+    MethodDescriptor,
+    ClassMethodDescriptor,
+    GetSetDescriptor,
+    MemberDescriptor,
+}
+
+#[derive(Clone, Copy)]
+struct AttrSpec {
+    name: &'static str,
+    kind: ReflectedValueKind,
+}
+
+const NEW_WRAPPER_ATTR: AttrSpec = AttrSpec {
+    name: "__new__",
+    kind: ReflectedValueKind::WrapperDescriptor,
+};
+
+const TYPE_ATTRS: &[AttrSpec] = &[
+    AttrSpec {
+        name: "__dict__",
+        kind: ReflectedValueKind::DictProxy,
+    },
+    NEW_WRAPPER_ATTR,
+];
+
+const OBJECT_TYPE_ATTRS: &[AttrSpec] = &[
+    NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__dict__",
+        kind: ReflectedValueKind::DictProxy,
+    },
+    AttrSpec {
+        name: "__init__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+];
+
+const INT_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const FLOAT_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const STR_TYPE_ATTRS: &[AttrSpec] = &[
+    NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__dict__",
+        kind: ReflectedValueKind::DictProxy,
+    },
+    AttrSpec {
+        name: "maketrans",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+    AttrSpec {
+        name: "join",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+];
+
+const BOOL_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const LIST_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const TUPLE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const DICT_TYPE_ATTRS: &[AttrSpec] = &[
+    NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__dict__",
+        kind: ReflectedValueKind::DictProxy,
+    },
+    AttrSpec {
+        name: "fromkeys",
+        kind: ReflectedValueKind::ClassMethodDescriptor,
+    },
+];
+
+const SET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const FROZENSET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const FUNCTION_TYPE_ATTRS: &[AttrSpec] = &[
+    AttrSpec {
+        name: "__dict__",
+        kind: ReflectedValueKind::DictProxy,
+    },
+    AttrSpec {
+        name: "__code__",
+        kind: ReflectedValueKind::GetSetDescriptor,
+    },
+    AttrSpec {
+        name: "__globals__",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "__get__",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+];
+
+const DEQUE_METHOD_NAMES: &[&str] = &["append", "appendleft", "pop", "popleft"];
+const DICT_METHOD_NAMES: &[&str] = &[
+    "__len__",
+    "__contains__",
+    "__getitem__",
+    "__setitem__",
+    "__delitem__",
+    "keys",
+    "get",
+    "values",
+    "items",
+    "pop",
+    "setdefault",
+    "clear",
+    "update",
+    "copy",
+];
+const OBJECT_METHOD_NAMES: &[&str] = &["__eq__", "__ne__"];
+const STR_METHOD_NAMES: &[&str] = &[
+    "upper",
+    "replace",
+    "join",
+    "isidentifier",
+    "startswith",
+    "endswith",
+];
+const SET_METHOD_NAMES: &[&str] = &["add", "copy", "__contains__"];
+const FROZENSET_METHOD_NAMES: &[&str] = &["copy", "__contains__"];
+const BYTEARRAY_METHOD_NAMES: &[&str] = &["copy"];
+const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
+const PROPERTY_METHOD_NAMES: &[&str] = &["getter", "setter", "deleter"];
+const REGEX_PATTERN_METHOD_NAMES: &[&str] = &["match", "search", "fullmatch"];
+const REGEX_MATCH_METHOD_NAMES: &[&str] = &["group", "start", "end", "span"];
+
+#[inline]
+fn builtin_type_attr_specs(type_id: TypeId) -> &'static [AttrSpec] {
+    match type_id {
+        TypeId::TYPE => TYPE_ATTRS,
+        TypeId::OBJECT => OBJECT_TYPE_ATTRS,
+        TypeId::INT => INT_TYPE_ATTRS,
+        TypeId::FLOAT => FLOAT_TYPE_ATTRS,
+        TypeId::STR => STR_TYPE_ATTRS,
+        TypeId::BOOL => BOOL_TYPE_ATTRS,
+        TypeId::LIST => LIST_TYPE_ATTRS,
+        TypeId::TUPLE => TUPLE_TYPE_ATTRS,
+        TypeId::DICT => DICT_TYPE_ATTRS,
+        TypeId::SET => SET_TYPE_ATTRS,
+        TypeId::FROZENSET => FROZENSET_TYPE_ATTRS,
+        TypeId::FUNCTION => FUNCTION_TYPE_ATTRS,
+        _ => &[],
+    }
+}
+
+#[inline]
+fn find_attr_spec(type_id: TypeId, name: &InternedString) -> Option<ReflectedValueKind> {
+    builtin_type_attr_specs(type_id)
+        .iter()
+        .find(|spec| spec.name == name.as_str())
+        .map(|spec| spec.kind)
+}
+
+#[inline]
+fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
+    match type_id {
+        TypeId::DEQUE => DEQUE_METHOD_NAMES,
+        TypeId::DICT => DICT_METHOD_NAMES,
+        TypeId::OBJECT => OBJECT_METHOD_NAMES,
+        TypeId::STR => STR_METHOD_NAMES,
+        TypeId::SET => SET_METHOD_NAMES,
+        TypeId::FROZENSET => FROZENSET_METHOD_NAMES,
+        TypeId::BYTEARRAY => BYTEARRAY_METHOD_NAMES,
+        TypeId::GENERATOR => GENERATOR_METHOD_NAMES,
+        TypeId::PROPERTY => PROPERTY_METHOD_NAMES,
+        TypeId::REGEX_PATTERN => REGEX_PATTERN_METHOD_NAMES,
+        TypeId::REGEX_MATCH => REGEX_MATCH_METHOD_NAMES,
+        _ => &[],
+    }
+}
+
+#[inline]
+fn builtin_mapping_proxy_names(owner: TypeId) -> Vec<InternedString> {
+    let mut names = Vec::with_capacity(
+        builtin_type_attr_specs(owner).len() + builtin_reflected_method_names(owner).len(),
+    );
+
+    for spec in builtin_type_attr_specs(owner) {
+        names.push(intern(spec.name));
+    }
+
+    for &name in builtin_reflected_method_names(owner) {
+        let name = intern(name);
+        if !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+
+    names
+}
+
+#[inline]
+fn synthesized_builtin_method_kind(
+    type_id: TypeId,
+    name: &InternedString,
+) -> Option<ReflectedValueKind> {
+    crate::ops::method_dispatch::resolve_builtin_instance_method(type_id, name.as_str()).map(|_| {
+        if name.as_str().starts_with("__") {
+            ReflectedValueKind::WrapperDescriptor
+        } else {
+            ReflectedValueKind::MethodDescriptor
+        }
+    })
+}
+
+#[inline]
+fn reflected_builtin_attr_kind(
+    type_id: TypeId,
+    name: &InternedString,
+) -> Option<ReflectedValueKind> {
+    find_attr_spec(type_id, name).or_else(|| synthesized_builtin_method_kind(type_id, name))
+}
+
+#[inline]
+fn reflected_type_attr_kind(name: &InternedString) -> Option<ReflectedValueKind> {
+    match name.as_str() {
+        "__dict__" => Some(ReflectedValueKind::DictProxy),
+        "__mro__" => Some(ReflectedValueKind::MroTuple),
+        "__bases__" => Some(ReflectedValueKind::BasesTuple),
+        "__base__" => Some(ReflectedValueKind::BaseValue),
+        "__name__" => Some(ReflectedValueKind::NameString),
+        "__qualname__" => Some(ReflectedValueKind::QualNameString),
+        "__module__" => Some(ReflectedValueKind::ModuleString),
+        _ => None,
+    }
+}
+
+#[inline]
+fn alloc_view<T>(
+    vm: &mut VirtualMachine,
+    object: T,
+    context: &'static str,
+) -> Result<Value, RuntimeError>
+where
+    T: prism_runtime::Trace,
+{
+    vm.allocator()
+        .alloc(object)
+        .map(|ptr| Value::object_ptr(ptr as *const ()))
+        .ok_or_else(|| {
+            RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
+        })
+}
+
+#[inline]
+fn leak_object_value<T>(object: T) -> Value {
+    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+}
+
+#[inline]
+fn descriptor_type_id(kind: ReflectedValueKind) -> Option<TypeId> {
+    match kind {
+        ReflectedValueKind::WrapperDescriptor => Some(TypeId::WRAPPER_DESCRIPTOR),
+        ReflectedValueKind::MethodDescriptor => Some(TypeId::METHOD_DESCRIPTOR),
+        ReflectedValueKind::ClassMethodDescriptor => Some(TypeId::CLASSMETHOD_DESCRIPTOR),
+        ReflectedValueKind::GetSetDescriptor => Some(TypeId::GETSET_DESCRIPTOR),
+        ReflectedValueKind::MemberDescriptor => Some(TypeId::MEMBER_DESCRIPTOR),
+        ReflectedValueKind::DictProxy
+        | ReflectedValueKind::MroTuple
+        | ReflectedValueKind::BasesTuple
+        | ReflectedValueKind::BaseValue
+        | ReflectedValueKind::NameString
+        | ReflectedValueKind::QualNameString
+        | ReflectedValueKind::ModuleString => None,
+    }
+}
+
+#[inline(always)]
+fn builtin_method_value(method: &'static BuiltinFunctionObject) -> Value {
+    Value::object_ptr(method as *const BuiltinFunctionObject as *const ())
+}
+
+#[inline]
+pub(crate) fn builtin_type_method_value(owner: TypeId, name: &str) -> Option<Value> {
+    crate::ops::method_dispatch::resolve_builtin_instance_method(owner, name)
+        .map(|cached| cached.method)
+        .or_else(|| match (owner, name) {
+            (TypeId::TYPE, "__new__") => Some(builtin_method_value(&TYPE_NEW_METHOD)),
+            (TypeId::INT, "__new__") => Some(builtin_method_value(&INT_NEW_METHOD)),
+            (TypeId::FLOAT, "__new__") => Some(builtin_method_value(&FLOAT_NEW_METHOD)),
+            (TypeId::STR, "maketrans") => Some(builtin_method_value(&STR_MAKETRANS_METHOD)),
+            (TypeId::STR, "__new__") => Some(builtin_method_value(&STR_NEW_METHOD)),
+            (TypeId::BOOL, "__new__") => Some(builtin_method_value(&BOOL_NEW_METHOD)),
+            (TypeId::LIST, "__new__") => Some(builtin_method_value(&LIST_NEW_METHOD)),
+            (TypeId::DICT, "__new__") => Some(builtin_method_value(&DICT_NEW_METHOD)),
+            (TypeId::SET, "__new__") => Some(builtin_method_value(&SET_NEW_METHOD)),
+            (TypeId::FROZENSET, "__new__") => Some(builtin_method_value(&FROZENSET_NEW_METHOD)),
+            (TypeId::OBJECT, "__new__") => Some(builtin_method_value(&OBJECT_NEW_METHOD)),
+            (TypeId::TUPLE, "__new__") => Some(builtin_method_value(&TUPLE_NEW_METHOD)),
+            _ => None,
+        })
+}
+
+#[inline]
+fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
+    match (owner, name) {
+        (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn builtin_type_class_method_value(owner: TypeId, name: &str) -> Option<Value> {
+    match (owner, name) {
+        (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
+        _ => None,
+    }
+}
+
+pub(crate) fn reflected_descriptor_callable_value(
+    descriptor_type: TypeId,
+    owner: TypeId,
+    name: &InternedString,
+) -> Option<Value> {
+    match descriptor_type {
+        TypeId::WRAPPER_DESCRIPTOR => match (owner, name.as_str()) {
+            (TypeId::OBJECT, "__init__") => Some(builtin_method_value(&OBJECT_INIT_METHOD)),
+            _ => builtin_type_method_value(owner, name.as_str()),
+        },
+        TypeId::METHOD_DESCRIPTOR => builtin_type_method_value(owner, name.as_str()),
+        TypeId::CLASSMETHOD_DESCRIPTOR => builtin_type_class_method_value(owner, name.as_str()),
+        _ => None,
+    }
+}
+
+fn materialize_attr_value(
+    vm: &mut VirtualMachine,
+    owner: TypeId,
+    name: &InternedString,
+    kind: ReflectedValueKind,
+) -> Result<Value, RuntimeError> {
+    match kind {
+        ReflectedValueKind::DictProxy => alloc_view(
+            vm,
+            MappingProxyObject::for_builtin_type(owner),
+            "mapping proxy view",
+        ),
+        ReflectedValueKind::MroTuple => alloc_view(
+            vm,
+            TupleObject::from_vec(
+                builtin_class_mro(owner)
+                    .into_iter()
+                    .map(class_id_to_type_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            "type mro tuple",
+        ),
+        ReflectedValueKind::BasesTuple => alloc_view(
+            vm,
+            TupleObject::from_vec(
+                builtin_direct_bases(owner)
+                    .into_iter()
+                    .map(class_id_to_type_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            "type bases tuple",
+        ),
+        ReflectedValueKind::BaseValue => builtin_base_value(owner),
+        ReflectedValueKind::NameString => Ok(Value::string(intern(owner.name()))),
+        ReflectedValueKind::QualNameString => Ok(Value::string(intern(owner.name()))),
+        ReflectedValueKind::ModuleString => Ok(Value::string(intern(match owner {
+            TypeId::DEQUE => "collections",
+            _ => "builtins",
+        }))),
+        other => {
+            let type_id = descriptor_type_id(other)
+                .expect("descriptor type id required for non-mapping-proxy reflection");
+            alloc_view(
+                vm,
+                DescriptorViewObject::new(type_id, owner, name.clone()),
+                "descriptor view",
+            )
+        }
+    }
+}
+
+fn materialize_attr_value_static(
+    owner: TypeId,
+    name: &InternedString,
+    kind: ReflectedValueKind,
+) -> Result<Value, RuntimeError> {
+    match kind {
+        ReflectedValueKind::DictProxy => Ok(leak_object_value(
+            MappingProxyObject::for_builtin_type(owner),
+        )),
+        ReflectedValueKind::MroTuple => Ok(leak_object_value(TupleObject::from_vec(
+            builtin_class_mro(owner)
+                .into_iter()
+                .map(class_id_to_type_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        ReflectedValueKind::BasesTuple => Ok(leak_object_value(TupleObject::from_vec(
+            builtin_direct_bases(owner)
+                .into_iter()
+                .map(class_id_to_type_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        ReflectedValueKind::BaseValue => builtin_base_value(owner),
+        ReflectedValueKind::NameString => Ok(Value::string(intern(owner.name()))),
+        ReflectedValueKind::QualNameString => Ok(Value::string(intern(owner.name()))),
+        ReflectedValueKind::ModuleString => Ok(Value::string(intern(match owner {
+            TypeId::DEQUE => "collections",
+            _ => "builtins",
+        }))),
+        other => {
+            let type_id = descriptor_type_id(other)
+                .expect("descriptor type id required for non-mapping-proxy reflection");
+            Ok(leak_object_value(DescriptorViewObject::new(
+                type_id,
+                owner,
+                name.clone(),
+            )))
+        }
+    }
+}
+
+#[inline]
+fn builtin_direct_bases(owner: TypeId) -> Vec<ClassId> {
+    let mro = builtin_class_mro(owner);
+    if mro.len() <= 1 {
+        Vec::new()
+    } else {
+        vec![mro[1]]
+    }
+}
+
+#[inline]
+fn builtin_base_value(owner: TypeId) -> Result<Value, RuntimeError> {
+    builtin_direct_bases(owner)
+        .into_iter()
+        .next()
+        .map(class_id_to_type_value)
+        .transpose()
+        .map(|value| value.unwrap_or_else(Value::none))
+}
+
+fn class_id_to_type_value(class_id: ClassId) -> Result<Value, RuntimeError> {
+    if class_id == ClassId::OBJECT {
+        return Ok(crate::builtins::builtin_type_object_for_type_id(
+            TypeId::OBJECT,
+        ));
+    }
+
+    if class_id.0 < TypeId::FIRST_USER_TYPE {
+        return Ok(crate::builtins::builtin_type_object_for_type_id(
+            class_id_to_type_id(class_id),
+        ));
+    }
+
+    if let Some(value) = super::exception_type::exception_type_value_for_proxy_class_id(class_id) {
+        return Ok(value);
+    }
+
+    let class = global_class(class_id).ok_or_else(|| {
+        RuntimeError::internal(format!(
+            "missing heap type for reflected class id {}",
+            class_id.0
+        ))
+    })?;
+    Ok(Value::object_ptr(Arc::as_ptr(&class) as *const ()))
+}
+
+#[inline]
+fn class_id_to_type_value_for_owner(
+    class_id: ClassId,
+    owner: &PyClassObject,
+    owner_value: Value,
+) -> Result<Value, RuntimeError> {
+    if class_id == owner.class_id() {
+        return Ok(owner_value);
+    }
+
+    class_id_to_type_value(class_id)
+}
+
+#[inline(always)]
+fn heap_type_owner_value(class_ptr: *const PyClassObject) -> Value {
+    Value::object_ptr(class_ptr as *const ())
+}
+
+#[inline]
+fn user_type_direct_bases(class: &PyClassObject) -> Vec<ClassId> {
+    if class.bases().is_empty() {
+        vec![ClassId::OBJECT]
+    } else {
+        class.bases().to_vec()
+    }
+}
+
+#[inline]
+fn resolve_heap_type_mro_value(
+    class: &PyClassObject,
+    name: &InternedString,
+    owner_value: Value,
+    mut resolve_builtin: impl FnMut(TypeId) -> Result<Option<Value>, RuntimeError>,
+) -> Result<Option<Value>, RuntimeError> {
+    for &class_id in class.mro() {
+        if class_id == class.class_id() {
+            if let Some(value) = class.get_attr(name) {
+                return Ok(Some(crate::ops::objects::resolve_class_attribute(
+                    value,
+                    owner_value,
+                )));
+            }
+            continue;
+        }
+
+        if class_id.0 < TypeId::FIRST_USER_TYPE {
+            if let Some(value) = resolve_builtin(class_id_to_type_id(class_id))? {
+                return Ok(Some(value));
+            }
+            continue;
+        }
+
+        if let Some(parent) = global_class(class_id) {
+            if let Some(value) = parent.get_attr(name) {
+                return Ok(Some(crate::ops::objects::resolve_class_attribute(
+                    value,
+                    owner_value,
+                )));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn user_type_attribute_value(
+    vm: &mut VirtualMachine,
+    class: &PyClassObject,
+    class_ptr: *const PyClassObject,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let owner_value = heap_type_owner_value(class_ptr);
+    match reflected_type_attr_kind(name) {
+        Some(ReflectedValueKind::DictProxy) => alloc_view(
+            vm,
+            MappingProxyObject::for_user_class(class_ptr),
+            "heap type mapping proxy view",
+        )
+        .map(Some),
+        Some(ReflectedValueKind::MroTuple) => alloc_view(
+            vm,
+            TupleObject::from_vec(
+                class
+                    .mro()
+                    .iter()
+                    .copied()
+                    .map(|class_id| class_id_to_type_value_for_owner(class_id, class, owner_value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            "heap type mro tuple",
+        )
+        .map(Some),
+        Some(ReflectedValueKind::BasesTuple) => alloc_view(
+            vm,
+            TupleObject::from_vec(
+                user_type_direct_bases(class)
+                    .into_iter()
+                    .map(class_id_to_type_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            "heap type bases tuple",
+        )
+        .map(Some),
+        Some(ReflectedValueKind::BaseValue) => user_type_direct_bases(class)
+            .into_iter()
+            .next()
+            .map(class_id_to_type_value)
+            .transpose()
+            .map(|value| Some(value.unwrap_or_else(Value::none))),
+        Some(ReflectedValueKind::NameString) => Ok(Some(Value::string(class.name().clone()))),
+        Some(ReflectedValueKind::QualNameString) => Ok(Some(
+            class
+                .get_attr(&intern("__qualname__"))
+                .unwrap_or_else(|| Value::string(class.name().clone())),
+        )),
+        Some(ReflectedValueKind::ModuleString) => Ok(Some(
+            class
+                .get_attr(&intern("__module__"))
+                .unwrap_or_else(|| Value::string(intern("__main__"))),
+        )),
+        _ => resolve_heap_type_mro_value(class, name, owner_value, |owner| {
+            builtin_bound_type_attribute_value(vm, owner, owner_value, name)
+        }),
+    }
+}
+
+fn user_type_attribute_value_static(
+    class: &PyClassObject,
+    class_ptr: *const PyClassObject,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let owner_value = heap_type_owner_value(class_ptr);
+    match reflected_type_attr_kind(name) {
+        Some(ReflectedValueKind::DictProxy) => Ok(Some(leak_object_value(
+            MappingProxyObject::for_user_class(class_ptr),
+        ))),
+        Some(ReflectedValueKind::MroTuple) => Ok(Some(leak_object_value(TupleObject::from_vec(
+            class
+                .mro()
+                .iter()
+                .copied()
+                .map(|class_id| class_id_to_type_value_for_owner(class_id, class, owner_value))
+                .collect::<Result<Vec<_>, _>>()?,
+        )))),
+        Some(ReflectedValueKind::BasesTuple) => Ok(Some(leak_object_value(TupleObject::from_vec(
+            user_type_direct_bases(class)
+                .into_iter()
+                .map(class_id_to_type_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        )))),
+        Some(ReflectedValueKind::BaseValue) => user_type_direct_bases(class)
+            .into_iter()
+            .next()
+            .map(class_id_to_type_value)
+            .transpose()
+            .map(|value| Some(value.unwrap_or_else(Value::none))),
+        Some(ReflectedValueKind::NameString) => Ok(Some(Value::string(class.name().clone()))),
+        Some(ReflectedValueKind::QualNameString) => Ok(Some(
+            class
+                .get_attr(&intern("__qualname__"))
+                .unwrap_or_else(|| Value::string(class.name().clone())),
+        )),
+        Some(ReflectedValueKind::ModuleString) => Ok(Some(
+            class
+                .get_attr(&intern("__module__"))
+                .unwrap_or_else(|| Value::string(intern("__main__"))),
+        )),
+        _ => resolve_heap_type_mro_value(class, name, owner_value, |owner| {
+            builtin_bound_type_attribute_value_static(owner, owner_value, name)
+        }),
+    }
+}
+
+#[inline]
+fn user_type_has_attribute(class: &PyClassObject, name: &InternedString) -> bool {
+    if reflected_type_attr_kind(name).is_some() {
+        return true;
+    }
+
+    for &class_id in class.mro() {
+        if class_id == class.class_id() {
+            if class.has_attr(name) {
+                return true;
+            }
+            continue;
+        }
+
+        if class_id.0 < TypeId::FIRST_USER_TYPE {
+            if builtin_type_has_attribute(class_id_to_type_id(class_id), name) {
+                return true;
+            }
+            continue;
+        }
+
+        if let Some(parent) = global_class(class_id) {
+            if parent.has_attr(name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[inline]
+fn builtin_mapping_proxy_attribute_value(
+    vm: &mut VirtualMachine,
+    owner: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(kind) = reflected_builtin_attr_kind(owner, name) else {
+        return Ok(None);
+    };
+    materialize_attr_value(vm, owner, name, kind).map(Some)
+}
+
+fn builtin_mapping_proxy_attribute_value_static(
+    owner: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(kind) = reflected_builtin_attr_kind(owner, name) else {
+        return Ok(None);
+    };
+    materialize_attr_value_static(owner, name, kind).map(Some)
+}
+
+fn key_to_name(key: Value) -> Result<InternedString, RuntimeError> {
+    if key.is_string() {
+        let ptr = key
+            .as_string_object_ptr()
+            .ok_or_else(|| RuntimeError::type_error("mappingproxy keys must be strings"))?;
+        return interned_by_ptr(ptr as *const u8)
+            .or_else(|| {
+                let string = unsafe { &*(ptr as *const StringObject) };
+                Some(intern(string.as_str()))
+            })
+            .ok_or_else(|| RuntimeError::type_error("mappingproxy keys must be strings"));
+    }
+
+    let Some(ptr) = key.as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "mappingproxy keys must be strings",
+        ));
+    };
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::STR {
+        return Err(RuntimeError::type_error(
+            "mappingproxy keys must be strings",
+        ));
+    }
+
+    let string = unsafe { &*(ptr as *const StringObject) };
+    Ok(intern(string.as_str()))
+}
+
+pub(crate) fn builtin_type_attribute_value(
+    vm: &mut VirtualMachine,
+    owner: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(kind) = reflected_type_attr_kind(name) {
+        return materialize_attr_value(vm, owner, name, kind).map(Some);
+    }
+
+    builtin_mapping_proxy_attribute_value(vm, owner, name)
+}
+
+pub(crate) fn builtin_type_attribute_value_static(
+    owner: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(kind) = reflected_type_attr_kind(name) {
+        return materialize_attr_value_static(owner, name, kind).map(Some);
+    }
+
+    builtin_mapping_proxy_attribute_value_static(owner, name)
+}
+
+pub(crate) fn builtin_bound_type_attribute_value(
+    vm: &mut VirtualMachine,
+    owner: TypeId,
+    owner_value: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if owner == TypeId::OBJECT && name.as_str() == "__new__" {
+        return Ok(builtin_type_method_value(owner, name.as_str()));
+    }
+
+    if let Some(method) = builtin_type_bound_method_value(owner, name.as_str()) {
+        let ptr = method
+            .as_object_ptr()
+            .expect("builtin type method values must be heap-allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let bound = Box::leak(Box::new(builtin.bind(owner_value)));
+        return Ok(Some(Value::object_ptr(
+            bound as *mut BuiltinFunctionObject as *const (),
+        )));
+    }
+
+    if let Some(method) = builtin_type_method_value(owner, name.as_str()) {
+        return Ok(Some(bind_builtin_type_method_if_needed(
+            method,
+            owner_value,
+        )));
+    }
+
+    let Some(value) = builtin_type_attribute_value(vm, owner, name)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(bind_reflected_descriptor_if_needed(
+        value,
+        owner,
+        owner_value,
+        name,
+    )))
+}
+
+pub(crate) fn builtin_bound_type_attribute_value_static(
+    owner: TypeId,
+    owner_value: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if owner == TypeId::OBJECT && name.as_str() == "__new__" {
+        return Ok(builtin_type_method_value(owner, name.as_str()));
+    }
+
+    if let Some(method) = builtin_type_bound_method_value(owner, name.as_str()) {
+        let ptr = method
+            .as_object_ptr()
+            .expect("builtin type method values must be heap-allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let bound = Box::leak(Box::new(builtin.bind(owner_value)));
+        return Ok(Some(Value::object_ptr(
+            bound as *mut BuiltinFunctionObject as *const (),
+        )));
+    }
+
+    if let Some(method) = builtin_type_method_value(owner, name.as_str()) {
+        return Ok(Some(bind_builtin_type_method_if_needed(
+            method,
+            owner_value,
+        )));
+    }
+
+    let Some(value) = builtin_type_attribute_value_static(owner, name)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(bind_reflected_descriptor_if_needed(
+        value,
+        owner,
+        owner_value,
+        name,
+    )))
+}
+
+#[inline]
+fn bind_builtin_type_method_if_needed(method: Value, owner_value: Value) -> Value {
+    if should_bind_builtin_type_callable(owner_value) {
+        crate::ops::objects::bind_instance_attribute(method, owner_value)
+    } else {
+        method
+    }
+}
+
+#[inline]
+fn bind_reflected_descriptor_if_needed(
+    value: Value,
+    owner: TypeId,
+    owner_value: Value,
+    name: &InternedString,
+) -> Value {
+    if !should_bind_builtin_type_callable(owner_value) {
+        return value;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return value;
+    };
+    let descriptor_type = crate::ops::objects::extract_type_id(ptr);
+    let Some(target) = reflected_descriptor_callable_value(descriptor_type, owner, name) else {
+        return value;
+    };
+
+    crate::ops::objects::bind_instance_attribute(target, owner_value)
+}
+
+#[inline]
+fn should_bind_builtin_type_callable(owner_value: Value) -> bool {
+    owner_value
+        .as_object_ptr()
+        .is_some_and(|ptr| crate::ops::objects::extract_type_id(ptr) != TypeId::TYPE)
+}
+
+#[inline]
+pub(crate) fn builtin_type_has_attribute(owner: TypeId, name: &InternedString) -> bool {
+    reflected_type_attr_kind(name).is_some() || reflected_builtin_attr_kind(owner, name).is_some()
+}
+
+pub(crate) fn heap_type_attribute_value(
+    vm: &mut VirtualMachine,
+    class_ptr: *const PyClassObject,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let class = unsafe { &*class_ptr };
+    user_type_attribute_value(vm, class, class_ptr, name)
+}
+
+pub(crate) fn heap_type_attribute_value_static(
+    class_ptr: *const PyClassObject,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let class = unsafe { &*class_ptr };
+    user_type_attribute_value_static(class, class_ptr, name)
+}
+
+#[inline]
+pub(crate) fn heap_type_has_attribute(
+    class_ptr: *const PyClassObject,
+    name: &InternedString,
+) -> bool {
+    user_type_has_attribute(unsafe { &*class_ptr }, name)
+}
+
+pub(crate) fn builtin_mapping_proxy_get_item(
+    vm: &mut VirtualMachine,
+    proxy: &MappingProxyObject,
+    key: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let name = key_to_name(key)?;
+    match proxy.source() {
+        prism_runtime::object::views::MappingProxySource::BuiltinType(owner) => {
+            builtin_mapping_proxy_attribute_value(vm, owner, &name)
+        }
+        prism_runtime::object::views::MappingProxySource::UserClass(class_ptr) => {
+            Ok(unsafe { &*(class_ptr as *const PyClassObject) }.get_attr(&name))
+        }
+    }
+}
+
+pub(crate) fn builtin_mapping_proxy_get_item_static(
+    proxy: &MappingProxyObject,
+    key: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let name = key_to_name(key)?;
+    match proxy.source() {
+        prism_runtime::object::views::MappingProxySource::BuiltinType(owner) => {
+            builtin_mapping_proxy_attribute_value_static(owner, &name)
+        }
+        prism_runtime::object::views::MappingProxySource::UserClass(class_ptr) => {
+            Ok(unsafe { &*(class_ptr as *const PyClassObject) }.get_attr(&name))
+        }
+    }
+}
+
+pub(crate) fn builtin_mapping_proxy_contains_key(
+    proxy: &MappingProxyObject,
+    key: Value,
+) -> Result<bool, RuntimeError> {
+    let name = key_to_name(key)?;
+    match proxy.source() {
+        prism_runtime::object::views::MappingProxySource::BuiltinType(owner) => {
+            Ok(reflected_builtin_attr_kind(owner, &name).is_some())
+        }
+        prism_runtime::object::views::MappingProxySource::UserClass(class_ptr) => {
+            Ok(unsafe { &*(class_ptr as *const PyClassObject) }.has_attr(&name))
+        }
+    }
+}
+
+pub(crate) fn builtin_mapping_proxy_entries_static(
+    proxy: &MappingProxyObject,
+) -> Result<Vec<(Value, Value)>, RuntimeError> {
+    match proxy.source() {
+        prism_runtime::object::views::MappingProxySource::BuiltinType(owner) => {
+            let names = builtin_mapping_proxy_names(owner);
+            let mut entries = Vec::with_capacity(names.len());
+            for name in names {
+                if let Some(value) = builtin_mapping_proxy_attribute_value_static(owner, &name)? {
+                    entries.push((Value::string(name), value));
+                }
+            }
+            Ok(entries)
+        }
+        prism_runtime::object::views::MappingProxySource::UserClass(class_ptr) => {
+            let class = unsafe { &*(class_ptr as *const PyClassObject) };
+            let mut entries = Vec::new();
+            class.for_each_attr(|name, value| entries.push((Value::string(name.clone()), value)));
+            Ok(entries)
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn builtin_mapping_proxy_keys(
+    proxy: &MappingProxyObject,
+) -> Result<Vec<Value>, RuntimeError> {
+    builtin_mapping_proxy_entries_static(proxy)
+        .map(|entries| entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>())
+}
+
+#[inline]
+pub(crate) fn builtin_mapping_proxy_len(proxy: &MappingProxyObject) -> Result<usize, RuntimeError> {
+    builtin_mapping_proxy_entries_static(proxy).map(|entries| entries.len())
+}
+
+pub(crate) fn builtin_instance_attribute_value(
+    vm: &mut VirtualMachine,
+    type_id: TypeId,
+    receiver: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    match (type_id, name.as_str()) {
+        (TypeId::OBJECT, "__str__") => alloc_view(
+            vm,
+            MethodWrapperObject::new(TypeId::OBJECT, name.clone(), receiver),
+            "method wrapper view",
+        )
+        .map(Some),
+        _ => Ok(None),
+    }
+}
+
+#[inline]
+pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedString) -> bool {
+    matches!((type_id, name.as_str()), (TypeId::OBJECT, "__str__"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtins::builtin_type_object_for_type_id;
+    use prism_core::intern::intern;
+    use prism_runtime::object::PyObject;
+    use prism_runtime::object::class::PyClassObject;
+    use prism_runtime::object::type_builtins::{
+        SubclassBitmap, register_global_class, unregister_global_class,
+    };
+    use prism_runtime::object::views::{
+        DescriptorViewObject, MappingProxyObject, MethodWrapperObject,
+    };
+    use prism_runtime::types::dict::DictObject;
+    use prism_runtime::types::tuple::TupleObject;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_builtin_type_attr_registry_covers_types_module_surface() {
+        assert!(builtin_type_has_attribute(
+            TypeId::TYPE,
+            &intern("__dict__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::DICT,
+            &intern("__name__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::DICT,
+            &intern("__bases__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::GENERATOR,
+            &intern("__mro__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::OBJECT,
+            &intern("__init__")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::TYPE, &intern("__new__")));
+        assert!(builtin_type_has_attribute(
+            TypeId::OBJECT,
+            &intern("__new__")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::INT, &intern("__new__")));
+        assert!(builtin_type_has_attribute(
+            TypeId::FLOAT,
+            &intern("__new__")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::STR, &intern("__new__")));
+        assert!(builtin_type_has_attribute(TypeId::BOOL, &intern("__new__")));
+        assert!(builtin_type_has_attribute(TypeId::LIST, &intern("__new__")));
+        assert!(builtin_type_has_attribute(
+            TypeId::TUPLE,
+            &intern("__new__")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::DICT, &intern("__new__")));
+        assert!(builtin_type_has_attribute(TypeId::SET, &intern("__new__")));
+        assert!(builtin_type_has_attribute(
+            TypeId::FROZENSET,
+            &intern("__new__")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::STR, &intern("join")));
+        assert!(builtin_type_has_attribute(TypeId::STR, &intern("replace")));
+        assert!(builtin_type_has_attribute(
+            TypeId::STR,
+            &intern("maketrans")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::DICT,
+            &intern("fromkeys")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::DICT,
+            &intern("__setitem__")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::DICT, &intern("pop")));
+        assert!(builtin_type_has_attribute(
+            TypeId::FUNCTION,
+            &intern("__code__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::FUNCTION,
+            &intern("__globals__")
+        ));
+    }
+
+    #[test]
+    fn test_builtin_instance_attr_registry_covers_method_wrapper_surface() {
+        assert!(builtin_instance_has_attribute(
+            TypeId::OBJECT,
+            &intern("__str__")
+        ));
+        assert!(!builtin_instance_has_attribute(
+            TypeId::OBJECT,
+            &intern("__repr__")
+        ));
+    }
+
+    #[test]
+    fn test_mapping_proxy_source_round_trip() {
+        let proxy = MappingProxyObject::for_builtin_type(TypeId::DICT);
+        assert_eq!(
+            proxy.source(),
+            prism_runtime::object::views::MappingProxySource::BuiltinType(TypeId::DICT)
+        );
+    }
+
+    #[test]
+    fn test_mapping_proxy_supports_heap_class_source() {
+        let class = Arc::new(PyClassObject::new_simple(intern("ProxyClass")));
+        let proxy = MappingProxyObject::for_user_class(Arc::as_ptr(&class));
+        assert_eq!(
+            proxy.source(),
+            prism_runtime::object::views::MappingProxySource::UserClass(
+                Arc::as_ptr(&class) as usize
+            )
+        );
+    }
+
+    #[test]
+    fn test_mapping_proxy_entry_helpers_cover_heap_class_contents() {
+        let class = Arc::new(PyClassObject::new_simple(intern("ProxyEntries")));
+        class.set_attr(intern("token"), Value::int(7).unwrap());
+        class.set_attr(intern("label"), Value::string(intern("ready")));
+        let proxy = MappingProxyObject::for_user_class(Arc::as_ptr(&class));
+
+        let mut keys = builtin_mapping_proxy_keys(&proxy)
+            .expect("keys should materialize")
+            .into_iter()
+            .map(|value| {
+                let ptr = value
+                    .as_string_object_ptr()
+                    .expect("mappingproxy keys should be interned strings");
+                interned_by_ptr(ptr as *const u8)
+                    .expect("interned string pointer should resolve")
+                    .as_str()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["label".to_string(), "token".to_string()]);
+
+        let entries = builtin_mapping_proxy_entries_static(&proxy).expect("entries should exist");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            builtin_mapping_proxy_len(&proxy).expect("len should succeed"),
+            2
+        );
+    }
+
+    #[test]
+    fn test_builtin_mapping_proxy_exposes_core_new_descriptors() {
+        for owner in [
+            TypeId::TYPE,
+            TypeId::OBJECT,
+            TypeId::INT,
+            TypeId::FLOAT,
+            TypeId::STR,
+            TypeId::BOOL,
+            TypeId::LIST,
+            TypeId::TUPLE,
+            TypeId::DICT,
+            TypeId::SET,
+            TypeId::FROZENSET,
+        ] {
+            let proxy = MappingProxyObject::for_builtin_type(owner);
+            assert!(
+                builtin_mapping_proxy_contains_key(&proxy, Value::string(intern("__new__")))
+                    .expect("membership should succeed"),
+                "{owner:?}.__dict__ should expose __new__"
+            );
+
+            let value =
+                builtin_mapping_proxy_get_item_static(&proxy, Value::string(intern("__new__")))
+                    .expect("subscript should succeed")
+                    .expect("__new__ should exist");
+            let ptr = value
+                .as_object_ptr()
+                .expect("__new__ should materialize as a descriptor");
+            let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+            assert_eq!(header.type_id, TypeId::WRAPPER_DESCRIPTOR);
+        }
+    }
+
+    #[test]
+    fn test_descriptor_view_uses_expected_runtime_type_ids() {
+        let method =
+            DescriptorViewObject::new(TypeId::METHOD_DESCRIPTOR, TypeId::STR, intern("join"));
+        let classmethod = DescriptorViewObject::new(
+            TypeId::CLASSMETHOD_DESCRIPTOR,
+            TypeId::DICT,
+            intern("fromkeys"),
+        );
+        assert_eq!(method.header().type_id, TypeId::METHOD_DESCRIPTOR);
+        assert_eq!(classmethod.header().type_id, TypeId::CLASSMETHOD_DESCRIPTOR);
+    }
+
+    #[test]
+    fn test_method_wrapper_uses_expected_runtime_type_id() {
+        let wrapper = MethodWrapperObject::new(
+            TypeId::OBJECT,
+            intern("__str__"),
+            builtin_type_object_for_type_id(TypeId::OBJECT),
+        );
+        assert_eq!(wrapper.header().type_id, TypeId::METHOD_WRAPPER);
+    }
+
+    #[test]
+    fn test_builtin_type_method_value_exposes_dict_fromkeys_callable() {
+        let value = builtin_type_method_value(TypeId::DICT, "fromkeys")
+            .expect("dict.fromkeys should resolve");
+        let ptr = value
+            .as_object_ptr()
+            .expect("method should be heap allocated");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
+    }
+
+    #[test]
+    fn test_builtin_type_method_value_exposes_str_maketrans_callable() {
+        let value = builtin_type_method_value(TypeId::STR, "maketrans")
+            .expect("str.maketrans should resolve");
+        let ptr = value
+            .as_object_ptr()
+            .expect("method should be heap allocated");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
+    }
+
+    #[test]
+    fn test_builtin_type_method_value_exposes_unbound_dict_setitem_callable() {
+        let value = builtin_type_method_value(TypeId::DICT, "__setitem__")
+            .expect("dict.__setitem__ should resolve");
+        let ptr = value
+            .as_object_ptr()
+            .expect("method should be heap allocated");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
+    }
+
+    #[test]
+    fn test_builtin_type_method_value_exposes_core_new_callables() {
+        for owner in [
+            TypeId::TYPE,
+            TypeId::OBJECT,
+            TypeId::INT,
+            TypeId::FLOAT,
+            TypeId::STR,
+            TypeId::BOOL,
+            TypeId::LIST,
+            TypeId::TUPLE,
+            TypeId::DICT,
+            TypeId::SET,
+            TypeId::FROZENSET,
+        ] {
+            let value = builtin_type_method_value(owner, "__new__")
+                .unwrap_or_else(|| panic!("{owner:?}.__new__ should resolve"));
+            let ptr = value
+                .as_object_ptr()
+                .expect("method should be heap allocated");
+            let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+            assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
+        }
+    }
+
+    #[test]
+    fn test_reflected_descriptor_callable_value_exposes_object_init_builtin() {
+        let value = reflected_descriptor_callable_value(
+            TypeId::WRAPPER_DESCRIPTOR,
+            TypeId::OBJECT,
+            &intern("__init__"),
+        )
+        .expect("object.__init__ descriptor should resolve to a callable");
+        let ptr = value
+            .as_object_ptr()
+            .expect("callable should be heap allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "object.__init__");
+    }
+
+    #[test]
+    fn test_builtin_bound_type_attribute_value_binds_dict_fromkeys_receiver() {
+        let mut vm = VirtualMachine::new();
+        let dict_type = builtin_type_object_for_type_id(TypeId::DICT);
+        let method = builtin_bound_type_attribute_value(
+            &mut vm,
+            TypeId::DICT,
+            dict_type,
+            &intern("fromkeys"),
+        )
+        .expect("binding should succeed")
+        .expect("bound method should exist");
+
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("bound method should be allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        let keys_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ])));
+        let result = builtin
+            .call(&[Value::object_ptr(keys_ptr as *const ())])
+            .expect("bound dict.fromkeys should be callable");
+        let result_ptr = result.as_object_ptr().expect("result should be a dict");
+        let dict = unsafe { &*(result_ptr as *const DictObject) };
+        assert!(dict.get(Value::int(1).unwrap()).unwrap().is_none());
+        assert!(dict.get(Value::int(2).unwrap()).unwrap().is_none());
+
+        unsafe {
+            drop(Box::from_raw(result_ptr as *mut DictObject));
+            drop(Box::from_raw(keys_ptr));
+        }
+    }
+
+    #[test]
+    fn test_builtin_bound_type_attribute_value_returns_unbound_dict_setitem() {
+        let mut vm = VirtualMachine::new();
+        let dict_type = builtin_type_object_for_type_id(TypeId::DICT);
+        let method = builtin_bound_type_attribute_value(
+            &mut vm,
+            TypeId::DICT,
+            dict_type,
+            &intern("__setitem__"),
+        )
+        .expect("lookup should succeed")
+        .expect("method should exist");
+
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("method should be heap allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+
+        let dict_ptr = Box::into_raw(Box::new(DictObject::new()));
+        let dict_value = Value::object_ptr(dict_ptr as *const ());
+        let key = Value::string(intern("ready"));
+        builtin
+            .call(&[dict_value, key, Value::int(1).unwrap()])
+            .expect("dict.__setitem__ should accept an explicit receiver");
+
+        let dict = unsafe { &*(dict_ptr as *const DictObject) };
+        assert_eq!(dict.get(key).unwrap().as_int(), Some(1));
+
+        unsafe {
+            drop(Box::from_raw(dict_ptr));
+        }
+    }
+
+    #[test]
+    fn test_builtin_bound_type_attribute_value_binds_reflected_object_init_for_instances() {
+        let mut vm = VirtualMachine::new();
+        let instance = crate::builtins::builtin_object(&[]).expect("object() should succeed");
+        let method = builtin_bound_type_attribute_value(
+            &mut vm,
+            TypeId::OBJECT,
+            instance,
+            &intern("__init__"),
+        )
+        .expect("lookup should succeed")
+        .expect("object.__init__ should exist");
+
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("bound method should be heap allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "object.__init__");
+        assert_eq!(builtin.bound_self(), Some(instance));
+        assert!(
+            builtin
+                .call(&[])
+                .expect("bound object.__init__ should execute")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_builtin_type_attribute_value_materializes_mro_tuple() {
+        let mut vm = VirtualMachine::new();
+        let value = builtin_type_attribute_value(&mut vm, TypeId::BOOL, &intern("__mro__"))
+            .expect("lookup should succeed")
+            .expect("__mro__ should exist");
+        let tuple_ptr = value.as_object_ptr().expect("mro should be a tuple object");
+        let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+        assert_eq!(tuple.len(), 3);
+        assert_eq!(
+            tuple.as_slice()[0],
+            builtin_type_object_for_type_id(TypeId::BOOL)
+        );
+        assert_eq!(
+            tuple.as_slice()[1],
+            builtin_type_object_for_type_id(TypeId::INT)
+        );
+        assert_eq!(
+            tuple.as_slice()[2],
+            builtin_type_object_for_type_id(TypeId::OBJECT)
+        );
+    }
+
+    #[test]
+    fn test_builtin_type_attribute_value_materializes_name_and_bases() {
+        let mut vm = VirtualMachine::new();
+
+        let name_value = builtin_type_attribute_value(&mut vm, TypeId::DICT, &intern("__name__"))
+            .expect("lookup should succeed")
+            .expect("__name__ should exist");
+        let name_ptr = name_value
+            .as_string_object_ptr()
+            .expect("__name__ should be an interned string");
+        assert_eq!(
+            interned_by_ptr(name_ptr as *const u8).unwrap().as_str(),
+            "dict"
+        );
+
+        let bases_value = builtin_type_attribute_value(&mut vm, TypeId::BOOL, &intern("__bases__"))
+            .expect("lookup should succeed")
+            .expect("__bases__ should exist");
+        let bases_ptr = bases_value
+            .as_object_ptr()
+            .expect("__bases__ should be a tuple object");
+        let bases = unsafe { &*(bases_ptr as *const TupleObject) };
+        assert_eq!(bases.len(), 1);
+        assert_eq!(
+            bases.as_slice()[0],
+            builtin_type_object_for_type_id(TypeId::INT)
+        );
+    }
+
+    #[test]
+    fn test_heap_type_attribute_value_materializes_mro_tuple_and_dict_proxy() {
+        let class = Arc::new(PyClassObject::new_simple(intern("HeapReflect")));
+        class.set_attr(intern("token"), Value::int(7).unwrap());
+
+        let mut bitmap = SubclassBitmap::new();
+        bitmap.set_bit(TypeId::OBJECT);
+        bitmap.set_bit(class.class_type_id());
+        register_global_class(Arc::clone(&class), bitmap);
+
+        let class_ptr = Arc::as_ptr(&class);
+        let mut vm = VirtualMachine::new();
+
+        let mro_value = heap_type_attribute_value(&mut vm, class_ptr, &intern("__mro__"))
+            .expect("lookup should succeed")
+            .expect("__mro__ should exist");
+        let mro_ptr = mro_value.as_object_ptr().expect("mro should be a tuple");
+        let mro = unsafe { &*(mro_ptr as *const TupleObject) };
+        assert_eq!(mro.len(), 2);
+        assert_eq!(mro.as_slice()[0], Value::object_ptr(class_ptr as *const ()));
+        assert_eq!(
+            mro.as_slice()[1],
+            builtin_type_object_for_type_id(TypeId::OBJECT)
+        );
+
+        let dict_value = heap_type_attribute_value(&mut vm, class_ptr, &intern("__dict__"))
+            .expect("lookup should succeed")
+            .expect("__dict__ should exist");
+        let dict_ptr = dict_value
+            .as_object_ptr()
+            .expect("__dict__ should be a proxy");
+        let proxy = unsafe { &*(dict_ptr as *const MappingProxyObject) };
+        let token = builtin_mapping_proxy_get_item(&mut vm, proxy, Value::string(intern("token")))
+            .expect("subscript should succeed")
+            .expect("token should exist");
+        assert_eq!(token.as_int(), Some(7));
+        let token_static =
+            builtin_mapping_proxy_get_item_static(proxy, Value::string(intern("token")))
+                .expect("static subscript should succeed")
+                .expect("token should exist");
+        assert_eq!(token_static.as_int(), Some(7));
+        assert!(
+            builtin_mapping_proxy_contains_key(proxy, Value::string(intern("token")))
+                .expect("membership should succeed")
+        );
+    }
+
+    #[test]
+    fn test_heap_type_attribute_value_materializes_mro_tuple_when_owner_registry_entry_is_absent() {
+        let class = Arc::new(PyClassObject::new_simple(intern("HeapReflectDetached")));
+
+        let mut bitmap = SubclassBitmap::new();
+        bitmap.set_bit(TypeId::OBJECT);
+        bitmap.set_bit(class.class_type_id());
+        register_global_class(Arc::clone(&class), bitmap);
+        unregister_global_class(class.class_id());
+
+        let class_ptr = Arc::as_ptr(&class);
+        let mut vm = VirtualMachine::new();
+
+        let mro_value = heap_type_attribute_value(&mut vm, class_ptr, &intern("__mro__"))
+            .expect("lookup should succeed")
+            .expect("__mro__ should exist");
+        let mro_ptr = mro_value.as_object_ptr().expect("mro should be a tuple");
+        let mro = unsafe { &*(mro_ptr as *const TupleObject) };
+        assert_eq!(mro.len(), 2);
+        assert_eq!(mro.as_slice()[0], Value::object_ptr(class_ptr as *const ()));
+        assert_eq!(
+            mro.as_slice()[1],
+            builtin_type_object_for_type_id(TypeId::OBJECT)
+        );
+    }
+
+    #[test]
+    fn test_heap_type_attribute_value_inherits_builtin_object_ne() {
+        let class = Arc::new(PyClassObject::new_simple(intern("HeapComparable")));
+
+        let mut bitmap = SubclassBitmap::new();
+        bitmap.set_bit(TypeId::OBJECT);
+        bitmap.set_bit(class.class_type_id());
+        register_global_class(Arc::clone(&class), bitmap);
+
+        let class_ptr = Arc::as_ptr(&class);
+        let mut vm = VirtualMachine::new();
+        let value = heap_type_attribute_value(&mut vm, class_ptr, &intern("__ne__"))
+            .expect("lookup should succeed")
+            .expect("__ne__ should resolve from object");
+
+        let ptr = value
+            .as_object_ptr()
+            .expect("object.__ne__ should be materialized as a builtin");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "object.__ne__");
+    }
+
+    #[test]
+    fn test_heap_type_attribute_value_materializes_type_metadata() {
+        let class = Arc::new(PyClassObject::new_simple(intern("HeapMetadata")));
+        class.set_attr(intern("__module__"), Value::string(intern("pkg.runtime")));
+        class.set_attr(
+            intern("__qualname__"),
+            Value::string(intern("pkg.runtime.HeapMetadata")),
+        );
+
+        let mut bitmap = SubclassBitmap::new();
+        bitmap.set_bit(TypeId::OBJECT);
+        bitmap.set_bit(class.class_type_id());
+        register_global_class(Arc::clone(&class), bitmap);
+
+        let class_ptr = Arc::as_ptr(&class);
+        let mut vm = VirtualMachine::new();
+
+        let name = heap_type_attribute_value(&mut vm, class_ptr, &intern("__name__"))
+            .expect("lookup should succeed")
+            .expect("__name__ should exist");
+        let name_ptr = name
+            .as_string_object_ptr()
+            .expect("__name__ should be an interned string");
+        assert_eq!(
+            interned_by_ptr(name_ptr as *const u8).unwrap().as_str(),
+            "HeapMetadata"
+        );
+
+        let module = heap_type_attribute_value(&mut vm, class_ptr, &intern("__module__"))
+            .expect("lookup should succeed")
+            .expect("__module__ should exist");
+        let module_ptr = module
+            .as_string_object_ptr()
+            .expect("__module__ should be an interned string");
+        assert_eq!(
+            interned_by_ptr(module_ptr as *const u8).unwrap().as_str(),
+            "pkg.runtime"
+        );
+
+        let bases = heap_type_attribute_value(&mut vm, class_ptr, &intern("__bases__"))
+            .expect("lookup should succeed")
+            .expect("__bases__ should exist");
+        let bases_ptr = bases
+            .as_object_ptr()
+            .expect("__bases__ should be a tuple object");
+        let bases = unsafe { &*(bases_ptr as *const TupleObject) };
+        assert_eq!(bases.len(), 1);
+        assert_eq!(
+            bases.as_slice()[0],
+            builtin_type_object_for_type_id(TypeId::OBJECT)
+        );
+    }
+}

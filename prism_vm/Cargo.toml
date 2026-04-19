@@ -11,6 +11,9 @@ prism_parser.workspace = true
 prism_runtime.workspace = true
 prism_gc.workspace = true
 prism_jit.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+unicode-xid.workspace = true
 
 # High-performance collections
 rustc-hash = "2.0"

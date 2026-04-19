@@ -31,6 +31,8 @@
 use crate::ic_manager::{ICManager, ICSiteId};
 use crate::profiler::CodeId;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 
 // =============================================================================
 // Operand Type Classification
@@ -87,10 +89,19 @@ impl OperandType {
             OperandType::Bool
         } else if value.is_none() {
             OperandType::None
+        } else if value.is_string() {
+            OperandType::String
+        } else if let Some(ptr) = value.as_object_ptr() {
+            let header = unsafe { &*(ptr as *const ObjectHeader) };
+            match header.type_id {
+                TypeId::STR => OperandType::String,
+                TypeId::LIST => OperandType::List,
+                TypeId::TUPLE => OperandType::Tuple,
+                TypeId::DICT => OperandType::Dict,
+                _ => OperandType::Object,
+            }
         } else {
-            // Heap object - need to inspect type tag
-            // For now, classify as Object; future: read type from header
-            OperandType::Object
+            OperandType::Unknown
         }
     }
 
@@ -341,6 +352,8 @@ pub enum Specialization {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::intern;
+    use prism_runtime::types::list::ListObject;
 
     #[test]
     fn test_operand_type_classify() {
@@ -376,6 +389,29 @@ mod tests {
         let pair = OperandPair::from_values(Value::int(1).unwrap(), Value::int(2).unwrap());
         assert!(pair.is_int_int());
         assert!(pair.is_numeric());
+    }
+
+    #[test]
+    fn test_operand_pair_from_tagged_strings() {
+        let pair = OperandPair::from_values(Value::string(intern("a")), Value::string(intern("b")));
+        assert_eq!(pair, OperandPair::STR_STR);
+    }
+
+    #[test]
+    fn test_operand_pair_from_lists() {
+        let left = Box::into_raw(Box::new(ListObject::new()));
+        let right = Box::into_raw(Box::new(ListObject::new()));
+
+        let pair = OperandPair::from_values(
+            Value::object_ptr(left as *const ()),
+            Value::object_ptr(right as *const ()),
+        );
+        assert_eq!(pair, OperandPair::LIST_LIST);
+
+        unsafe {
+            drop(Box::from_raw(left));
+            drop(Box::from_raw(right));
+        }
     }
 
     #[test]

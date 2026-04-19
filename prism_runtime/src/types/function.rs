@@ -4,9 +4,14 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::dict::DictObject;
 use prism_compiler::bytecode::CodeObject;
 use prism_core::Value;
+use prism_core::intern::InternedString;
+use rustc_hash::FxHashMap;
+use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 // =============================================================================
 // Closure Environment
@@ -90,6 +95,99 @@ impl ClosureEnv {
 /// Python function object.
 ///
 /// Represents a compiled function with its code, defaults, and closure.
+#[derive(Default)]
+struct FunctionAttrs {
+    inline: FxHashMap<InternedString, Value>,
+    dict_ptr: Option<NonNull<DictObject>>,
+}
+
+impl FunctionAttrs {
+    #[inline]
+    fn get(&self, name: &InternedString) -> Option<Value> {
+        match self.dict_ptr {
+            Some(ptr) => unsafe { ptr.as_ref() }.get(Value::string(name.clone())),
+            None => self.inline.get(name).copied(),
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, name: InternedString, value: Value) {
+        match self.dict_ptr {
+            Some(mut ptr) => unsafe { ptr.as_mut() }.set(Value::string(name), value),
+            None => {
+                self.inline.insert(name, value);
+            }
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, name: &InternedString) -> Option<Value> {
+        match self.dict_ptr {
+            Some(mut ptr) => unsafe { ptr.as_mut() }.remove(Value::string(name.clone())),
+            None => self.inline.remove(name),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, name: &InternedString) -> bool {
+        match self.dict_ptr {
+            Some(ptr) => unsafe { ptr.as_ref() }.contains_key(Value::string(name.clone())),
+            None => self.inline.contains_key(name),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self.dict_ptr {
+            Some(ptr) => unsafe { ptr.as_ref() }.len(),
+            None => self.inline.len(),
+        }
+    }
+
+    #[inline]
+    fn dict_ptr(&self) -> Option<*mut DictObject> {
+        self.dict_ptr.map(NonNull::as_ptr)
+    }
+
+    fn materialize_dict<E, F>(&mut self, alloc: F) -> Result<*mut DictObject, E>
+    where
+        F: FnOnce(DictObject) -> Result<*mut DictObject, E>,
+    {
+        if let Some(ptr) = self.dict_ptr() {
+            return Ok(ptr);
+        }
+
+        let mut dict = DictObject::with_capacity(self.inline.len());
+        for (name, value) in &self.inline {
+            dict.set(Value::string(name.clone()), *value);
+        }
+
+        let ptr = alloc(dict)?;
+        let ptr = NonNull::new(ptr).expect("function attribute dict pointer must not be null");
+        self.inline.clear();
+        self.dict_ptr = Some(ptr);
+        Ok(ptr.as_ptr())
+    }
+
+    fn for_each_value<F>(&self, mut f: F)
+    where
+        F: FnMut(Value),
+    {
+        match self.dict_ptr {
+            Some(ptr) => {
+                for value in unsafe { ptr.as_ref() }.values() {
+                    f(value);
+                }
+            }
+            None => {
+                for value in self.inline.values() {
+                    f(*value);
+                }
+            }
+        }
+    }
+}
+
 #[repr(C)]
 pub struct FunctionObject {
     /// Object header.
@@ -108,6 +206,8 @@ pub struct FunctionObject {
     /// This is a raw pointer to avoid Arc overhead on every call.
     /// The globals must outlive the function.
     globals_ptr: *const (),
+    /// Lazily populated custom function attributes and optional live __dict__.
+    attrs: RwLock<FunctionAttrs>,
 }
 
 // Safety: FunctionObject is Send + Sync because:
@@ -132,6 +232,7 @@ impl FunctionObject {
             kwdefaults: None,
             closure,
             globals_ptr: std::ptr::null(),
+            attrs: RwLock::new(FunctionAttrs::default()),
         }
     }
 
@@ -152,6 +253,7 @@ impl FunctionObject {
             kwdefaults: None,
             closure: None,
             globals_ptr,
+            attrs: RwLock::new(FunctionAttrs::default()),
         }
     }
 
@@ -210,6 +312,58 @@ impl FunctionObject {
     #[inline]
     pub fn globals_ptr(&self) -> *const () {
         self.globals_ptr
+    }
+
+    /// Get a custom function attribute.
+    #[inline]
+    pub fn get_attr(&self, name: &InternedString) -> Option<Value> {
+        self.attrs.read().unwrap().get(name)
+    }
+
+    /// Set a custom function attribute.
+    #[inline]
+    pub fn set_attr(&self, name: InternedString, value: Value) {
+        self.attrs.write().unwrap().set(name, value);
+    }
+
+    /// Delete a custom function attribute.
+    #[inline]
+    pub fn del_attr(&self, name: &InternedString) -> Option<Value> {
+        self.attrs.write().unwrap().remove(name)
+    }
+
+    /// Check whether a custom function attribute exists.
+    #[inline]
+    pub fn has_attr(&self, name: &InternedString) -> bool {
+        self.attrs.read().unwrap().contains(name)
+    }
+
+    /// Return the live function attribute dictionary if it has been materialized.
+    #[inline]
+    pub fn attr_dict_ptr(&self) -> Option<*mut DictObject> {
+        self.attrs.read().unwrap().dict_ptr()
+    }
+
+    /// Materialize and return the live function attribute dictionary.
+    pub fn ensure_attr_dict<E, F>(&self, alloc: F) -> Result<*mut DictObject, E>
+    where
+        F: FnOnce(DictObject) -> Result<*mut DictObject, E>,
+    {
+        self.attrs.write().unwrap().materialize_dict(alloc)
+    }
+
+    /// Visit each custom function attribute value.
+    pub fn for_each_attr_value<F>(&self, mut f: F)
+    where
+        F: FnMut(Value),
+    {
+        self.attrs.read().unwrap().for_each_value(|value| f(value));
+    }
+
+    /// Number of custom function attributes.
+    #[inline]
+    pub fn attr_len(&self) -> usize {
+        self.attrs.read().unwrap().len()
     }
 
     /// Update the function's module globals pointer.
@@ -271,6 +425,7 @@ impl PyObject for BoundMethodObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::intern;
 
     fn make_test_code() -> Arc<CodeObject> {
         let mut code = CodeObject::new("test", "test.py");
@@ -306,5 +461,38 @@ mod tests {
 
         assert_eq!(inner_env.get_chain(0, 0).unwrap().as_int(), Some(2));
         assert_eq!(inner_env.get_chain(1, 0).unwrap().as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_function_attr_dict_materialization_preserves_existing_attrs() {
+        let func = FunctionObject::new(make_test_code(), "dict_func".into(), None, None);
+        func.set_attr(intern("copied"), Value::int(7).unwrap());
+
+        let dict_ptr = func
+            .ensure_attr_dict(|dict| Ok::<*mut DictObject, ()>(Box::into_raw(Box::new(dict))))
+            .expect("dict allocation should succeed");
+        let dict = unsafe { &*dict_ptr };
+
+        assert_eq!(
+            dict.get(Value::string(intern("copied"))).unwrap().as_int(),
+            Some(7)
+        );
+        assert_eq!(func.get_attr(&intern("copied")).unwrap().as_int(), Some(7));
+    }
+
+    #[test]
+    fn test_function_attr_reads_follow_materialized_dict_mutations() {
+        let func = FunctionObject::new(make_test_code(), "dict_func".into(), None, None);
+        let dict_ptr = func
+            .ensure_attr_dict(|dict| Ok::<*mut DictObject, ()>(Box::into_raw(Box::new(dict))))
+            .expect("dict allocation should succeed");
+
+        unsafe { &mut *dict_ptr }.set(Value::string(intern("dynamic")), Value::int(11).unwrap());
+
+        assert_eq!(
+            func.get_attr(&intern("dynamic")).unwrap().as_int(),
+            Some(11)
+        );
+        assert!(func.has_attr(&intern("dynamic")));
     }
 }

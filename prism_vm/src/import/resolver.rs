@@ -6,9 +6,11 @@
 //! 3. File system (future: .py/.pyc loading)
 
 use super::{FrozenModuleSource, ModuleObject};
+use crate::builtins::BuiltinRegistry;
 use crate::stdlib::{Module, ModuleError, StdlibRegistry};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
+use prism_runtime::types::dict::DictObject;
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -163,6 +165,9 @@ pub struct ImportResolver {
     /// Uses InternedString keys for O(1) lookup.
     sys_modules: RwLock<FxHashMap<InternedString, Arc<ModuleObject>>>,
 
+    /// Python-visible `sys.modules` mapping shared with imported `sys`.
+    sys_modules_value: Value,
+
     /// Stdlib registry for built-in modules (math, os, sys, etc.).
     stdlib: StdlibRegistry,
 
@@ -196,6 +201,19 @@ impl ImportResolver {
         Self::with_stdlib_and_paths(StdlibRegistry::with_sys_args(args), Vec::new())
     }
 
+    /// Create a new import resolver sharing an explicit builtin registry.
+    pub fn new_with_builtins(builtins: BuiltinRegistry) -> Self {
+        Self::with_stdlib_and_paths(StdlibRegistry::with_builtins(builtins), Vec::new())
+    }
+
+    /// Create a new resolver with explicit `sys.argv` and shared builtin state.
+    pub fn with_sys_args_and_builtins(args: Vec<String>, builtins: BuiltinRegistry) -> Self {
+        Self::with_stdlib_and_paths(
+            StdlibRegistry::with_sys_args_and_builtins(args, builtins),
+            Vec::new(),
+        )
+    }
+
     /// Create a resolver with custom search paths.
     pub fn with_paths(paths: Vec<Arc<str>>) -> Self {
         Self::with_stdlib_and_paths(StdlibRegistry::new(), paths)
@@ -204,6 +222,10 @@ impl ImportResolver {
     fn with_stdlib_and_paths(stdlib: StdlibRegistry, paths: Vec<Arc<str>>) -> Self {
         Self {
             sys_modules: RwLock::new(FxHashMap::default()),
+            sys_modules_value: {
+                let ptr = Box::into_raw(Box::new(DictObject::new())) as *const ();
+                Value::object_ptr(ptr)
+            },
             stdlib,
             search_paths: RwLock::new(paths),
             frozen_modules: RwLock::new(FxHashMap::default()),
@@ -230,8 +252,8 @@ impl ImportResolver {
         let key = intern(name);
 
         // 1. Check sys.modules cache (fast path)
-        if let Some(module) = self.sys_modules.read().unwrap().get(&key) {
-            return Ok(Arc::clone(module));
+        if let Some(module) = self.get_cached(name) {
+            return Ok(module);
         }
 
         // 2. Atomically check if module is being imported OR insert our ImportState
@@ -262,8 +284,8 @@ impl ImportResolver {
             state.wait();
 
             // After waiting, the module should be cached - retrieve it
-            if let Some(module) = self.sys_modules.read().unwrap().get(&key) {
-                return Ok(Arc::clone(module));
+            if let Some(module) = self.get_cached(name) {
+                return Ok(module);
             } else {
                 // Import failed in the other thread
                 return Err(ImportError::ModuleNotFound {
@@ -288,11 +310,7 @@ impl ImportResolver {
 
         // 7. Cache successful imports BEFORE signaling waiters
         if let Ok(ref module) = result {
-            self.sys_modules
-                .write()
-                .unwrap()
-                .insert(key.clone(), Arc::clone(module));
-            self.register_module_ptr(module);
+            self.cache_module(name, module);
         }
 
         // 8. Signal waiting threads that import is complete
@@ -325,9 +343,8 @@ impl ImportResolver {
         use super::package::DottedName;
 
         // Fast path: check cache first
-        let key = intern(name);
-        if let Some(module) = self.sys_modules.read().unwrap().get(&key) {
-            return Ok(Arc::clone(module));
+        if let Some(module) = self.get_cached(name) {
+            return Ok(module);
         }
 
         // Parse the dotted name
@@ -349,22 +366,17 @@ impl ImportResolver {
             let part = &dotted.parts()[depth - 1];
 
             // Check if this dotted name is already cached
-            let cached_key = intern(&full_name);
-            if let Some(module) = self.sys_modules.read().unwrap().get(&cached_key) {
-                current = Arc::clone(module);
+            if let Some(module) = self.get_cached(&full_name) {
+                current = module;
                 continue;
             }
 
             // Try to import it as a stdlib submodule (e.g., "os.path")
             if let Some(stdlib_module) = self.stdlib.get(&full_name) {
                 let module = self.load_stdlib_module(&full_name, stdlib_module)?;
-                self.sys_modules
-                    .write()
-                    .unwrap()
-                    .insert(cached_key, Arc::clone(&module));
+                self.cache_module(&full_name, &module);
                 // Also set as attribute on parent
                 // (deferred — the parent module should already expose it)
-                self.register_module_ptr(&module);
                 current.set_attr(part, Value::object_ptr(Arc::as_ptr(&module) as *const ()));
                 current = module;
                 continue;
@@ -375,10 +387,7 @@ impl ImportResolver {
                 && let Some(module_ptr) = value.as_object_ptr()
                 && let Some(module) = self.module_from_ptr(module_ptr)
             {
-                self.sys_modules
-                    .write()
-                    .unwrap()
-                    .insert(cached_key, Arc::clone(&module));
+                self.cache_module(&full_name, &module);
                 current = module;
                 continue;
             }
@@ -445,6 +454,10 @@ impl ImportResolver {
             }
         }
 
+        if name == "sys" {
+            module.set_attr("modules", self.sys_modules_value);
+        }
+
         Ok(Arc::new(module))
     }
 
@@ -486,24 +499,68 @@ impl ImportResolver {
         Ok(module.public_attrs())
     }
 
+    #[inline]
+    fn public_sys_modules(&self) -> &DictObject {
+        let ptr = self
+            .sys_modules_value
+            .as_object_ptr()
+            .expect("sys.modules should always be a dict object");
+        unsafe { &*(ptr as *const DictObject) }
+    }
+
+    #[inline]
+    fn public_sys_modules_mut(&self) -> &mut DictObject {
+        let ptr = self
+            .sys_modules_value
+            .as_object_ptr()
+            .expect("sys.modules should always be a dict object");
+        unsafe { &mut *(ptr as *mut DictObject) }
+    }
+
+    fn sync_public_sys_modules_entry(&self, name: &str, module: &Arc<ModuleObject>) {
+        self.public_sys_modules_mut().set(
+            Value::string(intern(name)),
+            Value::object_ptr(Arc::as_ptr(module) as *const ()),
+        );
+    }
+
+    fn lookup_public_sys_modules(&self, name: &str) -> Option<Arc<ModuleObject>> {
+        let value = self.public_sys_modules().get(Value::string(intern(name)))?;
+        let module_ptr = value.as_object_ptr()?;
+        let module = self.module_from_ptr(module_ptr)?;
+        self.sys_modules
+            .write()
+            .unwrap()
+            .insert(intern(name), Arc::clone(&module));
+        Some(module)
+    }
+
+    fn cache_module(&self, name: &str, module: &Arc<ModuleObject>) {
+        self.sys_modules
+            .write()
+            .unwrap()
+            .insert(intern(name), Arc::clone(module));
+        self.register_module_ptr(module);
+        self.sync_public_sys_modules_entry(name, module);
+    }
+
     /// Get a module from sys.modules cache.
     ///
     /// Returns `None` if the module hasn't been imported yet.
     pub fn get_cached(&self, name: &str) -> Option<Arc<ModuleObject>> {
         let key = intern(name);
-        self.sys_modules.read().unwrap().get(&key).cloned()
+        if let Some(module) = self.sys_modules.read().unwrap().get(&key) {
+            return Some(Arc::clone(module));
+        }
+
+        self.lookup_public_sys_modules(name)
     }
 
     /// Insert a module directly into sys.modules.
     ///
     /// This is useful for injecting modules programmatically.
     pub fn insert_module(&self, name: &str, module: Arc<ModuleObject>) {
-        let key = intern(name);
-        self.sys_modules
-            .write()
-            .unwrap()
-            .insert(key, Arc::clone(&module));
-        self.register_module_ptr(&module);
+        self.cache_module(name, &module);
     }
 
     /// Remove a module from sys.modules.
@@ -512,6 +569,8 @@ impl ImportResolver {
     pub fn remove_module(&self, name: &str) -> Option<Arc<ModuleObject>> {
         let key = intern(name);
         let removed = self.sys_modules.write().unwrap().remove(&key);
+        self.public_sys_modules_mut()
+            .remove(Value::string(intern(name)));
         if let Some(ref module) = removed {
             self.unregister_module_ptr(module);
         }
@@ -582,6 +641,14 @@ impl ImportResolver {
         Some(SourceModuleLocation { path, is_package })
     }
 
+    /// Returns true when Prism has a native fallback for `name`, but the active
+    /// search path also provides a source module/package that should be loaded
+    /// first for better compatibility.
+    pub fn should_load_from_source_first(&self, name: &str) -> bool {
+        self.stdlib.prefers_source_when_available(name)
+            && self.resolve_source_location(name).is_some()
+    }
+
     /// Check whether a module name is provided by Prism's built-in stdlib.
     #[inline]
     pub fn is_stdlib_module(&self, name: &str) -> bool {
@@ -634,7 +701,8 @@ impl Default for ImportResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_core::intern::interned_by_ptr;
+    use prism_core::intern::{intern, interned_by_ptr};
+    use prism_runtime::types::dict::DictObject;
     use prism_runtime::types::list::ListObject;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -702,6 +770,18 @@ mod tests {
 
         let module = result.unwrap();
         assert_eq!(module.name(), "os");
+    }
+
+    #[test]
+    fn test_import_stdlib_builtins() {
+        let resolver = ImportResolver::new();
+        let module = resolver
+            .import_module("builtins")
+            .expect("builtins import should succeed");
+
+        assert_eq!(module.name(), "builtins");
+        assert!(module.get_attr("open").is_some());
+        assert!(module.get_attr("len").is_some());
     }
 
     #[test]
@@ -799,8 +879,7 @@ mod tests {
     fn test_frozen_module_registry() {
         let resolver = ImportResolver::new();
         let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
-            "<module>",
-            "<frozen>",
+            "<module>", "<frozen>",
         ));
 
         resolver.insert_frozen_module(
@@ -838,6 +917,19 @@ mod tests {
         } else {
             panic!("Expected float value for pi");
         }
+    }
+
+    #[test]
+    fn test_import_from_builtins() {
+        let resolver = ImportResolver::new();
+        let builtins = resolver
+            .import_module("builtins")
+            .expect("builtins import should succeed");
+
+        let open = resolver
+            .import_from(&builtins, "open")
+            .expect("from builtins import open should succeed");
+        assert!(open.as_object_ptr().is_some());
     }
 
     #[test]
@@ -936,6 +1028,24 @@ mod tests {
     }
 
     #[test]
+    fn test_source_first_policy_for_fallback_stdlib_module() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("re.py"), "VALUE = 1\n");
+        write_file(&temp.path.join("os").join("__init__.py"), "");
+        write_file(&temp.path.join("os").join("path.py"), "VALUE = 2\n");
+        write_file(&temp.path.join("sys.py"), "VALUE = 3\n");
+
+        let resolver =
+            ImportResolver::with_paths(vec![Arc::from(temp.path.to_string_lossy().into_owned())]);
+
+        assert!(resolver.should_load_from_source_first("re"));
+        assert!(resolver.should_load_from_source_first("os"));
+        assert!(resolver.should_load_from_source_first("os.path"));
+        assert!(!resolver.should_load_from_source_first("sys"));
+        assert!(!resolver.should_load_from_source_first("math"));
+    }
+
+    #[test]
     fn test_with_sys_args_populates_imported_sys_argv() {
         let resolver =
             ImportResolver::with_sys_args(vec!["prog.py".to_string(), "--fast".to_string()]);
@@ -972,6 +1082,62 @@ mod tests {
                 .as_ref(),
             "--fast"
         );
+    }
+
+    #[test]
+    fn test_imported_sys_exposes_live_modules_dict() {
+        let resolver = ImportResolver::new();
+        let sys = resolver
+            .import_module("sys")
+            .expect("sys import should succeed");
+        let modules = sys
+            .get_attr("modules")
+            .expect("sys.modules should be injected");
+        let modules_ptr = modules
+            .as_object_ptr()
+            .expect("sys.modules should be represented as dict object");
+
+        let math = resolver
+            .import_module("math")
+            .expect("math import should succeed");
+        let dict = unsafe { &*(modules_ptr as *const DictObject) };
+        let value = dict
+            .get(Value::string(intern("math")))
+            .expect("math should appear in sys.modules");
+
+        assert_eq!(value.as_object_ptr(), Some(Arc::as_ptr(&math) as *const ()));
+    }
+
+    #[test]
+    fn test_public_sys_modules_aliases_are_visible_to_cache_and_imports() {
+        let resolver = ImportResolver::new();
+        let sys = resolver
+            .import_module("sys")
+            .expect("sys import should succeed");
+        let alias_target = Arc::new(ModuleObject::new("ntpath"));
+        resolver.insert_module("ntpath", Arc::clone(&alias_target));
+
+        let modules = sys
+            .get_attr("modules")
+            .expect("sys.modules should be injected");
+        let modules_ptr = modules
+            .as_object_ptr()
+            .expect("sys.modules should be represented as dict object");
+        let dict = unsafe { &mut *(modules_ptr as *mut DictObject) };
+        dict.set(
+            Value::string(intern("os.path")),
+            Value::object_ptr(Arc::as_ptr(&alias_target) as *const ()),
+        );
+
+        let cached = resolver
+            .get_cached("os.path")
+            .expect("sys.modules alias should resolve");
+        assert!(Arc::ptr_eq(&cached, &alias_target));
+
+        let imported = resolver
+            .import_dotted("os.path")
+            .expect("import_dotted should honor sys.modules alias");
+        assert!(Arc::ptr_eq(&imported, &alias_target));
     }
 
     #[test]

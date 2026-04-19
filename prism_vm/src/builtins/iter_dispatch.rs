@@ -42,9 +42,15 @@
 //! ```
 
 use super::BuiltinError;
+use crate::stdlib::collections::deque::DequeObject;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
+#[cfg(test)]
+use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
+#[cfg(test)]
+use prism_runtime::object::{shape::Shape, shaped_object::ShapedObject};
 #[cfg(test)]
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
@@ -121,10 +127,24 @@ fn value_as_range(value: &Value) -> Option<&RangeObject> {
 
 /// Extract DictObject from Value.
 #[inline(always)]
-fn value_as_dict(value: &Value) -> Option<&DictObject> {
+fn value_as_dict(value: &Value) -> Option<&'static DictObject> {
     let ptr = value.as_object_ptr()?;
-    // SAFETY: Caller verified TypeId::DICT
-    Some(unsafe { &*(ptr as *const DictObject) })
+    crate::ops::objects::dict_storage_ref_from_ptr(ptr)
+}
+
+/// Extract DictViewObject from Value.
+#[inline(always)]
+fn value_as_dict_view(value: &Value) -> Option<&DictViewObject> {
+    let ptr = value.as_object_ptr()?;
+    // SAFETY: Caller verified one of the dict view type ids
+    Some(unsafe { &*(ptr as *const DictViewObject) })
+}
+
+/// Extract MappingProxyObject from Value.
+#[inline(always)]
+fn value_as_mapping_proxy(value: &Value) -> Option<&MappingProxyObject> {
+    let ptr = value.as_object_ptr()?;
+    Some(unsafe { &*(ptr as *const MappingProxyObject) })
 }
 
 /// Extract SetObject from Value.
@@ -133,6 +153,13 @@ fn value_as_set(value: &Value) -> Option<&SetObject> {
     let ptr = value.as_object_ptr()?;
     // SAFETY: Caller verified TypeId::SET
     Some(unsafe { &*(ptr as *const SetObject) })
+}
+
+/// Extract DequeObject from Value.
+#[inline(always)]
+fn value_as_deque(value: &Value) -> Option<&DequeObject> {
+    let ptr = value.as_object_ptr()?;
+    Some(unsafe { &*(ptr as *const DequeObject) })
 }
 
 /// Extract IteratorObject from Value (mutable).
@@ -191,6 +218,10 @@ pub fn is_iterator(value: &Value) -> bool {
 /// }
 /// ```
 pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
+    if value.is_string() {
+        return Ok(IteratorObject::from_string_chars(*value));
+    }
+
     // Fast path: Check if already an iterator
     if let Some(type_id) = get_type_id(value) {
         if type_id == TypeId::ITERATOR {
@@ -242,9 +273,66 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             Ok(IteratorObject::from_values(keys))
         }
 
+        TypeId::MAPPING_PROXY => {
+            let proxy = value_as_mapping_proxy(value).ok_or(IterError::InvalidObject)?;
+            let keys = crate::builtins::builtin_mapping_proxy_keys(proxy)
+                .map_err(|_| IterError::InvalidObject)?;
+            Ok(IteratorObject::from_values(keys))
+        }
+
+        TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => {
+            let view = value_as_dict_view(value).ok_or(IterError::InvalidObject)?;
+            let dict_value = view.dict();
+            let values = if let Some(dict) = value_as_dict(&dict_value) {
+                match view.kind() {
+                    DictViewKind::Keys => dict.keys().collect(),
+                    DictViewKind::Values => dict.values().collect(),
+                    DictViewKind::Items => dict
+                        .iter()
+                        .map(|(key, value)| {
+                            let tuple =
+                                prism_runtime::types::tuple::TupleObject::from_slice(&[key, value]);
+                            let ptr = Box::leak(Box::new(tuple))
+                                as *mut prism_runtime::types::tuple::TupleObject
+                                as *const ();
+                            Value::object_ptr(ptr)
+                        })
+                        .collect(),
+                }
+            } else if matches!(get_type_id(&dict_value), Some(TypeId::MAPPING_PROXY)) {
+                let proxy = value_as_mapping_proxy(&dict_value).ok_or(IterError::InvalidObject)?;
+                let entries = crate::builtins::builtin_mapping_proxy_entries_static(proxy)
+                    .map_err(|_| IterError::InvalidObject)?;
+                match view.kind() {
+                    DictViewKind::Keys => entries.into_iter().map(|(key, _)| key).collect(),
+                    DictViewKind::Values => entries.into_iter().map(|(_, value)| value).collect(),
+                    DictViewKind::Items => entries
+                        .into_iter()
+                        .map(|(key, value)| {
+                            let tuple =
+                                prism_runtime::types::tuple::TupleObject::from_slice(&[key, value]);
+                            let ptr = Box::leak(Box::new(tuple))
+                                as *mut prism_runtime::types::tuple::TupleObject
+                                as *const ();
+                            Value::object_ptr(ptr)
+                        })
+                        .collect(),
+                }
+            } else {
+                return Err(IterError::InvalidObject);
+            };
+            Ok(IteratorObject::from_values(values))
+        }
+
         TypeId::SET | TypeId::FROZENSET => {
             let set = value_as_set(value).ok_or(IterError::InvalidObject)?;
             let values: Vec<Value> = set.iter().collect();
+            Ok(IteratorObject::from_values(values))
+        }
+
+        TypeId::DEQUE => {
+            let deque = value_as_deque(value).ok_or(IterError::InvalidObject)?;
+            let values: Vec<Value> = deque.deque().iter().copied().collect();
             Ok(IteratorObject::from_values(values))
         }
 
@@ -545,6 +633,17 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
+    #[test]
+    fn test_iter_tagged_interned_string_unicode_chars() {
+        let value = Value::string(prism_core::intern::intern("aé🙂"));
+
+        let mut iter = value_to_iterator(&value).expect("tagged string should be iterable");
+        assert_interned_string(iter.next().unwrap(), "a");
+        assert_interned_string(iter.next().unwrap(), "é");
+        assert_interned_string(iter.next().unwrap(), "🙂");
+        assert!(iter.next().is_none());
+    }
+
     // -------------------------------------------------------------------------
     // Range Iterator Tests
     // -------------------------------------------------------------------------
@@ -636,6 +735,273 @@ mod tests {
         }
         keys.sort(); // Order not guaranteed
         assert_eq!(keys, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_iter_dict_view_variants_yield_backing_dict_contents() {
+        let mut dict = DictObject::new();
+        dict.set(Value::int(3).unwrap(), Value::int(30).unwrap());
+        dict.set(Value::int(4).unwrap(), Value::int(40).unwrap());
+        let dict_ptr = Box::into_raw(Box::new(dict));
+        let dict_value = Value::object_ptr(dict_ptr as *const ());
+        let views = [
+            (
+                DictViewObject::new(DictViewKind::Keys, dict_value),
+                vec![3, 4],
+            ),
+            (
+                DictViewObject::new(DictViewKind::Values, dict_value),
+                vec![30, 40],
+            ),
+        ];
+
+        for (view, expected) in views {
+            let view_ptr = Box::into_raw(Box::new(view));
+            let view_value = Value::object_ptr(view_ptr as *const ());
+            let mut iter = value_to_iterator(&view_value).expect("dict view should be iterable");
+            let mut ints = Vec::new();
+            while let Some(value) = iter.next() {
+                ints.push(value.as_int().expect("dict view should yield ints"));
+            }
+            ints.sort_unstable();
+            assert_eq!(ints, expected);
+
+            unsafe {
+                drop(Box::from_raw(view_ptr));
+            }
+        }
+
+        let items_view_ptr = Box::into_raw(Box::new(DictViewObject::new(
+            DictViewKind::Items,
+            dict_value,
+        )));
+        let items_view_value = Value::object_ptr(items_view_ptr as *const ());
+        let mut iter =
+            value_to_iterator(&items_view_value).expect("dict items view should be iterable");
+        let mut pairs = Vec::new();
+        while let Some(value) = iter.next() {
+            let tuple_ptr = value
+                .as_object_ptr()
+                .expect("dict items should yield tuple objects");
+            let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+            pairs.push((
+                tuple.as_slice()[0].as_int().expect("key should be an int"),
+                tuple.as_slice()[1]
+                    .as_int()
+                    .expect("value should be an int"),
+            ));
+            unsafe {
+                drop(Box::from_raw(tuple_ptr as *mut TupleObject));
+            }
+        }
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(3, 30), (4, 40)]);
+
+        unsafe {
+            drop(Box::from_raw(items_view_ptr));
+            drop(Box::from_raw(dict_ptr));
+        }
+    }
+
+    #[test]
+    fn test_iter_dict_view_variants_support_heap_dict_subclass_backing() {
+        let mut instance = ShapedObject::new_dict_backed(TypeId::from_raw(600), Shape::empty());
+        instance
+            .dict_backing_mut()
+            .expect("dict backing should exist")
+            .set(Value::int(5).unwrap(), Value::int(50).unwrap());
+        instance
+            .dict_backing_mut()
+            .expect("dict backing should exist")
+            .set(Value::int(6).unwrap(), Value::int(60).unwrap());
+
+        let instance_ptr = Box::into_raw(Box::new(instance));
+        let instance_value = Value::object_ptr(instance_ptr as *const ());
+        let views = [
+            (
+                DictViewObject::new(DictViewKind::Keys, instance_value),
+                vec![5, 6],
+            ),
+            (
+                DictViewObject::new(DictViewKind::Values, instance_value),
+                vec![50, 60],
+            ),
+        ];
+
+        for (view, expected) in views {
+            let view_ptr = Box::into_raw(Box::new(view));
+            let view_value = Value::object_ptr(view_ptr as *const ());
+            let mut iter =
+                value_to_iterator(&view_value).expect("dict subclass view should be iterable");
+            let mut ints = Vec::new();
+            while let Some(value) = iter.next() {
+                ints.push(
+                    value
+                        .as_int()
+                        .expect("dict subclass view should yield ints"),
+                );
+            }
+            ints.sort_unstable();
+            assert_eq!(ints, expected);
+
+            unsafe {
+                drop(Box::from_raw(view_ptr));
+            }
+        }
+
+        let items_view_ptr = Box::into_raw(Box::new(DictViewObject::new(
+            DictViewKind::Items,
+            instance_value,
+        )));
+        let items_view_value = Value::object_ptr(items_view_ptr as *const ());
+        let mut iter = value_to_iterator(&items_view_value)
+            .expect("dict subclass items view should be iterable");
+        let mut pairs = Vec::new();
+        while let Some(value) = iter.next() {
+            let tuple_ptr = value
+                .as_object_ptr()
+                .expect("dict items should yield tuple objects");
+            let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+            pairs.push((
+                tuple.as_slice()[0].as_int().expect("key should be an int"),
+                tuple.as_slice()[1]
+                    .as_int()
+                    .expect("value should be an int"),
+            ));
+            unsafe {
+                drop(Box::from_raw(tuple_ptr as *mut TupleObject));
+            }
+        }
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(5, 50), (6, 60)]);
+
+        unsafe {
+            drop(Box::from_raw(items_view_ptr));
+            drop(Box::from_raw(instance_ptr));
+        }
+    }
+
+    #[test]
+    fn test_iter_mappingproxy_yields_heap_class_keys() {
+        let class = std::sync::Arc::new(PyClassObject::new_simple(prism_core::intern::intern(
+            "IterProxy",
+        )));
+        class.set_attr(prism_core::intern::intern("alpha"), Value::int(1).unwrap());
+        class.set_attr(prism_core::intern::intern("beta"), Value::int(2).unwrap());
+
+        let proxy_ptr = Box::into_raw(Box::new(MappingProxyObject::for_user_class(
+            std::sync::Arc::as_ptr(&class),
+        )));
+        let proxy_value = Value::object_ptr(proxy_ptr as *const ());
+
+        let mut iter = value_to_iterator(&proxy_value).expect("mappingproxy should be iterable");
+        let mut keys = Vec::new();
+        while let Some(value) = iter.next() {
+            let ptr = value
+                .as_string_object_ptr()
+                .expect("mappingproxy keys should be interned strings");
+            keys.push(
+                prism_core::intern::interned_by_ptr(ptr as *const u8)
+                    .expect("interned string pointer should resolve")
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["alpha".to_string(), "beta".to_string()]);
+
+        unsafe {
+            drop(Box::from_raw(proxy_ptr));
+        }
+    }
+
+    #[test]
+    fn test_iter_dict_view_variants_support_mappingproxy_backing() {
+        let class = std::sync::Arc::new(PyClassObject::new_simple(prism_core::intern::intern(
+            "ProxyBackedViews",
+        )));
+        class.set_attr(prism_core::intern::intern("token"), Value::int(11).unwrap());
+        class.set_attr(prism_core::intern::intern("count"), Value::int(22).unwrap());
+
+        let proxy_ptr = Box::into_raw(Box::new(MappingProxyObject::for_user_class(
+            std::sync::Arc::as_ptr(&class),
+        )));
+        let proxy_value = Value::object_ptr(proxy_ptr as *const ());
+
+        let keys_view_ptr = Box::into_raw(Box::new(DictViewObject::new(
+            DictViewKind::Keys,
+            proxy_value,
+        )));
+        let values_view_ptr = Box::into_raw(Box::new(DictViewObject::new(
+            DictViewKind::Values,
+            proxy_value,
+        )));
+        let items_view_ptr = Box::into_raw(Box::new(DictViewObject::new(
+            DictViewKind::Items,
+            proxy_value,
+        )));
+
+        let mut key_iter = value_to_iterator(&Value::object_ptr(keys_view_ptr as *const ()))
+            .expect("mappingproxy keys view should be iterable");
+        let mut keys = Vec::new();
+        while let Some(value) = key_iter.next() {
+            let ptr = value
+                .as_string_object_ptr()
+                .expect("mappingproxy keys view should yield strings");
+            keys.push(
+                prism_core::intern::interned_by_ptr(ptr as *const u8)
+                    .expect("interned string pointer should resolve")
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["count".to_string(), "token".to_string()]);
+
+        let mut value_iter = value_to_iterator(&Value::object_ptr(values_view_ptr as *const ()))
+            .expect("mappingproxy values view should be iterable");
+        let mut values = Vec::new();
+        while let Some(value) = value_iter.next() {
+            values.push(value.as_int().expect("mappingproxy values should be ints"));
+        }
+        values.sort_unstable();
+        assert_eq!(values, vec![11, 22]);
+
+        let mut item_iter = value_to_iterator(&Value::object_ptr(items_view_ptr as *const ()))
+            .expect("mappingproxy items view should be iterable");
+        let mut pairs = Vec::new();
+        while let Some(value) = item_iter.next() {
+            let tuple_ptr = value
+                .as_object_ptr()
+                .expect("mappingproxy items should yield tuple objects");
+            let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+            let key_ptr = tuple.as_slice()[0]
+                .as_string_object_ptr()
+                .expect("tuple key should be a string");
+            let key = prism_core::intern::interned_by_ptr(key_ptr as *const u8)
+                .expect("interned string pointer should resolve")
+                .as_str()
+                .to_string();
+            let value = tuple.as_slice()[1]
+                .as_int()
+                .expect("tuple value should be an int");
+            pairs.push((key, value));
+            unsafe {
+                drop(Box::from_raw(tuple_ptr as *mut TupleObject));
+            }
+        }
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![("count".to_string(), 22), ("token".to_string(), 11)]
+        );
+
+        unsafe {
+            drop(Box::from_raw(keys_view_ptr));
+            drop(Box::from_raw(values_view_ptr));
+            drop(Box::from_raw(items_view_ptr));
+            drop(Box::from_raw(proxy_ptr));
+        }
     }
 
     // -------------------------------------------------------------------------

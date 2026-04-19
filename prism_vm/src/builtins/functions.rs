@@ -1,15 +1,21 @@
 //! Core builtin functions (len, abs, min, max, sum, pow, etc.).
 
 use super::BuiltinError;
+use crate::VirtualMachine;
+use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
+use crate::stdlib::collections::deque::DequeObject;
 use prism_core::Value;
-use prism_core::intern::{intern, interned_by_ptr, interned_len_by_ptr};
+use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::MappingProxyObject;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::int_value_to_string;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
+use prism_runtime::types::string::{object_ptr_as_string_ref, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
 use std::hash::{Hash, Hasher};
 
@@ -30,14 +36,8 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let obj = args[0];
 
-    // Tagged interned strings (Value::string) are not object pointers.
-    if obj.is_string() {
-        let ptr = obj
-            .as_string_object_ptr()
-            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
-        let len = interned_len_by_ptr(ptr as *const u8)
-            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
-        return len_to_value(len, "str");
+    if let Some(string) = value_as_string_ref(obj) {
+        return len_to_value(string.len(), "str");
     }
 
     // Heap objects (list/tuple/dict/set/str/range).
@@ -58,6 +58,12 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
                 let dict = unsafe { &*(ptr as *const DictObject) };
                 len_to_value(dict.len(), "dict")
             }
+            TypeId::MAPPING_PROXY => {
+                let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+                let len = crate::builtins::builtin_mapping_proxy_len(proxy)
+                    .map_err(|err| BuiltinError::TypeError(err.to_string()))?;
+                len_to_value(len, "mappingproxy")
+            }
             TypeId::SET => {
                 let set = unsafe { &*(ptr as *const SetObject) };
                 len_to_value(set.len(), "set")
@@ -74,13 +80,16 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
                 len_to_value(bytes.len(), "bytearray")
             }
-            TypeId::STR => {
-                let string = unsafe { &*(ptr as *const StringObject) };
-                len_to_value(string.len(), "str")
+            TypeId::DEQUE => {
+                let deque = unsafe { &*(ptr as *const DequeObject) };
+                len_to_value(deque.len(), "deque")
             }
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
-                len_to_value(range.len(), "range")
+                let len = range.try_len().ok_or_else(|| {
+                    BuiltinError::OverflowError("range length overflow".to_string())
+                })?;
+                len_to_value(len, "range")
             }
             _ => Err(BuiltinError::TypeError(format!(
                 "object of type '{}' has no len()",
@@ -263,6 +272,31 @@ pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
     acc.into_value()
 }
 
+/// VM-aware sum builtin.
+pub fn builtin_sum_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "sum expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let mut acc = if args.len() == 2 {
+        NumericAccumulator::from_start(args[1])?
+    } else {
+        NumericAccumulator::Int(0)
+    };
+
+    let iterator =
+        ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
+    loop {
+        match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
+            IterStep::Yielded(item) => acc.add(item)?,
+            IterStep::Exhausted => return acc.into_value(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NumericAccumulator {
     Int(i64),
@@ -359,10 +393,10 @@ impl NumericAccumulator {
 
 #[inline]
 fn is_str_object(value: Value) -> bool {
-    if let Some(ptr) = value.as_object_ptr() {
-        return crate::ops::objects::extract_type_id(ptr) == TypeId::STR;
-    }
-    false
+    value
+        .as_object_ptr()
+        .and_then(object_ptr_as_string_ref)
+        .is_some()
 }
 
 #[inline]
@@ -652,13 +686,8 @@ fn hash_value(value: Value) -> Result<u64, BuiltinError> {
         return Ok(hash_with_default_hasher(&value));
     }
 
-    if value.is_string() {
-        let ptr = value
-            .as_string_object_ptr()
-            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
-        let interned = interned_by_ptr(ptr as *const u8)
-            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
-        return Ok(hash_with_default_hasher(&interned.as_str()));
+    if let Some(string) = value_as_string_ref(value) {
+        return Ok(hash_with_default_hasher(&string.as_str()));
     }
 
     let ptr = value
@@ -670,10 +699,6 @@ fn hash_value(value: Value) -> Result<u64, BuiltinError> {
             "unhashable type: '{}'",
             type_id.name()
         ))),
-        TypeId::STR => {
-            let string = unsafe { &*(ptr as *const StringObject) };
-            Ok(hash_with_default_hasher(&string.as_str()))
-        }
         TypeId::TUPLE => {
             let tuple = unsafe { &*(ptr as *const TupleObject) };
             hash_tuple(tuple)
@@ -786,21 +811,9 @@ pub fn builtin_callable(args: &[Value]) -> Result<Value, BuiltinError> {
         return Ok(Value::bool(false));
     }
 
-    if let Some(ptr) = obj.as_object_ptr() {
-        let type_id = crate::ops::objects::extract_type_id(ptr);
-        let is_callable = matches!(
-            type_id,
-            TypeId::FUNCTION
-                | TypeId::METHOD
-                | TypeId::CLOSURE
-                | TypeId::TYPE
-                | TypeId::BUILTIN_FUNCTION
-                | TypeId::EXCEPTION_TYPE
-        );
-        return Ok(Value::bool(is_callable));
-    }
-
-    Ok(Value::bool(false))
+    Ok(Value::bool(
+        crate::ops::calls::value_supports_call_protocol(obj),
+    ))
 }
 
 // =============================================================================
@@ -855,8 +868,8 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
             "False".to_string()
         });
     }
-    if let Some(i) = value.as_int() {
-        return Ok(i.to_string());
+    if let Some(int_repr) = int_value_to_string(value) {
+        return Ok(int_repr);
     }
     if let Some(f) = value.as_float() {
         if f.fract() == 0.0 && f.is_finite() {
@@ -864,13 +877,8 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
         }
         return Ok(f.to_string());
     }
-    if value.is_string() {
-        let ptr = value
-            .as_string_object_ptr()
-            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
-        let interned = interned_by_ptr(ptr as *const u8)
-            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
-        return Ok(quote_python_string(interned.as_str()));
+    if let Some(string) = value_as_string_ref(value) {
+        return Ok(quote_python_string(string.as_str()));
     }
 
     let ptr = value
@@ -878,10 +886,6 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
         .ok_or_else(|| BuiltinError::TypeError("invalid object reference".to_string()))?;
     let type_id = crate::ops::objects::extract_type_id(ptr);
     match type_id {
-        TypeId::STR => {
-            let string = unsafe { &*(ptr as *const StringObject) };
-            Ok(quote_python_string(string.as_str()))
-        }
         TypeId::BYTES => {
             let bytes = unsafe { &*(ptr as *const BytesObject) };
             Ok(quote_python_bytes(bytes.as_bytes()))
@@ -960,14 +964,12 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
         }
         TypeId::RANGE => {
             let range = unsafe { &*(ptr as *const RangeObject) };
-            if range.step == 1 {
-                Ok(format!("range({}, {})", range.start, range.stop))
-            } else {
-                Ok(format!(
-                    "range({}, {}, {})",
-                    range.start, range.stop, range.step
-                ))
-            }
+            Ok(range.to_string())
+        }
+        TypeId::EXCEPTION => {
+            let exception = unsafe { crate::builtins::ExceptionValue::from_value(value) }
+                .ok_or_else(|| BuiltinError::TypeError("invalid exception object".to_string()))?;
+            Ok(exception.repr_text())
         }
         _ => Ok(format!(
             "<{} object at 0x{:x}>",
@@ -1061,9 +1063,12 @@ mod tests {
     use super::*;
     use crate::builtins::BuiltinFunctionObject;
     use crate::builtins::itertools::{builtin_iter, builtin_next};
+    use crate::import::ModuleObject;
     use prism_core::intern::intern;
     use prism_core::value::SMALL_INT_MAX;
     use prism_runtime::object::ObjectHeader;
+    use prism_runtime::object::class::PyClassObject;
+    use std::sync::Arc;
 
     fn boxed_value<T>(obj: T) -> (Value, *mut T) {
         let ptr = Box::into_raw(Box::new(obj));
@@ -1125,6 +1130,19 @@ mod tests {
         dict.set(Value::int(1).unwrap(), Value::int(11).unwrap());
         dict.set(Value::int(2).unwrap(), Value::int(22).unwrap());
         let (value, ptr) = boxed_value(dict);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(2));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_mappingproxy_object() {
+        let class = Arc::new(PyClassObject::new_simple(intern("SizedProxy")));
+        class.set_attr(intern("token"), Value::int(7).unwrap());
+        class.set_attr(intern("label"), Value::string(intern("ready")));
+
+        let proxy = MappingProxyObject::for_user_class(Arc::as_ptr(&class));
+        let (value, ptr) = boxed_value(proxy);
         let result = builtin_len(&[value]).unwrap();
         assert_eq!(result.as_int(), Some(2));
         unsafe { drop_boxed(ptr) };
@@ -1548,6 +1566,16 @@ mod tests {
     }
 
     #[test]
+    fn test_repr_exception_uses_exception_type_and_args() {
+        let exc = crate::builtins::get_exception_type("ValueError")
+            .expect("ValueError should exist")
+            .construct(&[Value::string(intern("boom"))]);
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[exc]).unwrap());
+
+        assert_eq!(repr, "ValueError('boom')");
+    }
+
+    #[test]
     fn test_ascii_non_ascii_escaping() {
         let tagged = Value::string(intern("hé"));
         let tagged_ascii = tagged_string_value_to_rust_string(builtin_ascii(&[tagged]).unwrap());
@@ -1595,6 +1623,14 @@ mod tests {
         let runtime = builtin_hash(&[runtime_value]).unwrap();
         assert_eq!(tagged.as_int(), runtime.as_int());
         unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_hash_module_object_uses_identity_hash() {
+        let module = Arc::new(ModuleObject::new("abc"));
+        let value = Value::object_ptr(Arc::as_ptr(&module) as *const ());
+        let hash = builtin_hash(&[value]).expect("module objects should be hashable");
+        assert!(hash.as_int().is_some());
     }
 
     #[test]

@@ -1,5 +1,9 @@
 use super::BuiltinError;
+use crate::VirtualMachine;
+use crate::ops::iteration::{IterStep, collect_iterable_values, ensure_iterator_value, next_step};
+use num_traits::{One, Zero};
 use prism_core::Value;
+use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::range::RangeObject;
 
 // =============================================================================
@@ -20,36 +24,30 @@ pub fn builtin_range(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
+    let parse_int = |value: Value, position: &'static str| {
+        value_to_bigint(value).ok_or_else(|| {
+            BuiltinError::TypeError(format!("range() integer {position} argument expected"))
+        })
+    };
+
     let (start, stop, step) = match args.len() {
         1 => {
             // range(stop)
-            let stop = args[0].as_int().ok_or_else(|| {
-                BuiltinError::TypeError("range() integer end argument expected".to_string())
-            })?;
-            (0i64, stop, 1i64)
+            let stop = parse_int(args[0], "end")?;
+            (num_bigint::BigInt::zero(), stop, num_bigint::BigInt::one())
         }
         2 => {
             // range(start, stop)
-            let start = args[0].as_int().ok_or_else(|| {
-                BuiltinError::TypeError("range() integer start argument expected".to_string())
-            })?;
-            let stop = args[1].as_int().ok_or_else(|| {
-                BuiltinError::TypeError("range() integer end argument expected".to_string())
-            })?;
-            (start, stop, 1i64)
+            let start = parse_int(args[0], "start")?;
+            let stop = parse_int(args[1], "end")?;
+            (start, stop, num_bigint::BigInt::one())
         }
         3 => {
             // range(start, stop, step)
-            let start = args[0].as_int().ok_or_else(|| {
-                BuiltinError::TypeError("range() integer start argument expected".to_string())
-            })?;
-            let stop = args[1].as_int().ok_or_else(|| {
-                BuiltinError::TypeError("range() integer end argument expected".to_string())
-            })?;
-            let step = args[2].as_int().ok_or_else(|| {
-                BuiltinError::TypeError("range() integer step argument expected".to_string())
-            })?;
-            if step == 0 {
+            let start = parse_int(args[0], "start")?;
+            let stop = parse_int(args[1], "end")?;
+            let step = parse_int(args[2], "step")?;
+            if step.is_zero() {
                 return Err(BuiltinError::ValueError(
                     "range() arg 3 must not be zero".to_string(),
                 ));
@@ -61,7 +59,7 @@ pub fn builtin_range(args: &[Value]) -> Result<Value, BuiltinError> {
 
     // Create RangeObject on heap and return as Value
     // TODO: Use GC allocator instead of Box::leak
-    let range_obj = Box::new(RangeObject::new(start, stop, step));
+    let range_obj = Box::new(RangeObject::from_bigints(start, stop, step));
     let ptr = Box::leak(range_obj) as *mut RangeObject as *const ();
     Ok(Value::object_ptr(ptr))
 }
@@ -106,6 +104,20 @@ pub fn builtin_iter(args: &[Value]) -> Result<Value, BuiltinError> {
                 "iter(callable, sentinel) not yet implemented".to_string(),
             ))
         }
+        _ => Err(BuiltinError::TypeError(format!(
+            "iter() expected 1 or 2 arguments, got {}",
+            args.len()
+        ))),
+    }
+}
+
+/// VM-aware iter builtin.
+pub fn builtin_iter_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    match args.len() {
+        1 => ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error),
+        2 => Err(BuiltinError::NotImplemented(
+            "iter(callable, sentinel) not yet implemented".to_string(),
+        )),
         _ => Err(BuiltinError::TypeError(format!(
             "iter() expected 1 or 2 arguments, got {}",
             args.len()
@@ -161,6 +173,25 @@ pub fn builtin_next(args: &[Value]) -> Result<Value, BuiltinError> {
     match iter_obj.next() {
         Some(value) => Ok(value),
         None => match default {
+            Some(d) => Ok(d),
+            None => Err(BuiltinError::StopIteration),
+        },
+    }
+}
+
+/// VM-aware next builtin.
+pub fn builtin_next_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "next() expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let default = args.get(1).copied();
+    match next_step(vm, args[0]).map_err(super::runtime_error_to_builtin_error)? {
+        IterStep::Yielded(value) => Ok(value),
+        IterStep::Exhausted => match default {
             Some(d) => Ok(d),
             None => Err(BuiltinError::StopIteration),
         },
@@ -426,6 +457,37 @@ pub fn builtin_sorted(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::object_ptr(ptr))
 }
 
+/// VM-aware sorted builtin.
+pub fn builtin_sorted_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "sorted expected 1 to 3 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let key_func = args.get(1).filter(|v| !v.is_none()).copied();
+    let reverse = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut values =
+        collect_iterable_values(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
+
+    if key_func.is_some() {
+        return Err(BuiltinError::NotImplemented(
+            "sorted() with key function requires VM integration".to_string(),
+        ));
+    }
+
+    values.sort_by(|a, b| compare_values(a, b));
+
+    if reverse {
+        values.reverse();
+    }
+
+    let list = prism_runtime::types::list::ListObject::from_slice(&values);
+    let ptr = Box::leak(Box::new(list)) as *mut prism_runtime::types::list::ListObject as *const ();
+    Ok(Value::object_ptr(ptr))
+}
+
 /// Compare two Values for sorting.
 ///
 /// # Comparison Order (Python semantics)
@@ -556,13 +618,36 @@ pub fn builtin_all(args: &[Value]) -> Result<Value, BuiltinError> {
 
     // Iterate with early exit on first falsy element
     while let Some(value) = iter.next() {
-        if !value.is_truthy() {
+        if !crate::truthiness::is_truthy(value) {
             return Ok(Value::bool(false));
         }
     }
 
     // All elements were truthy (or empty iterable - vacuous truth)
     Ok(Value::bool(true))
+}
+
+/// VM-aware all builtin.
+pub fn builtin_all_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "all expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+
+    let iterator =
+        ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
+    loop {
+        match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
+            IterStep::Yielded(value) => {
+                if !crate::truthiness::is_truthy(value) {
+                    return Ok(Value::bool(false));
+                }
+            }
+            IterStep::Exhausted => return Ok(Value::bool(true)),
+        }
+    }
 }
 
 /// Builtin any function.
@@ -596,13 +681,36 @@ pub fn builtin_any(args: &[Value]) -> Result<Value, BuiltinError> {
 
     // Iterate with early exit on first truthy element
     while let Some(value) = iter.next() {
-        if value.is_truthy() {
+        if crate::truthiness::is_truthy(value) {
             return Ok(Value::bool(true));
         }
     }
 
     // No truthy elements found
     Ok(Value::bool(false))
+}
+
+/// VM-aware any builtin.
+pub fn builtin_any_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "any expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+
+    let iterator =
+        ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
+    loop {
+        match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
+            IterStep::Yielded(value) => {
+                if crate::truthiness::is_truthy(value) {
+                    return Ok(Value::bool(true));
+                }
+            }
+            IterStep::Exhausted => return Ok(Value::bool(false)),
+        }
+    }
 }
 
 // =============================================================================
@@ -612,6 +720,8 @@ pub fn builtin_any(args: &[Value]) -> Result<Value, BuiltinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::iter_dispatch;
+    use prism_runtime::types::int::{bigint_to_value, value_to_i64};
     use prism_runtime::types::list::ListObject;
 
     #[test]
@@ -630,6 +740,19 @@ mod tests {
         // Non-integer should error
         let result = builtin_range(&[Value::float(3.14)]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_range_accepts_heap_backed_bigint_stop() {
+        let big_stop = bigint_to_value(num_bigint::BigInt::from(1_u8) << 1000_u32);
+        let range = builtin_range(&[big_stop]).expect("range should accept bigint stop");
+        let iter = builtin_iter(&[range]).expect("iter(range(bigint)) should succeed");
+
+        let mut iter = iter_dispatch::get_iterator_mut(&iter)
+            .expect("iter() should return an iterator object");
+        assert_eq!(value_to_i64(iter.next().unwrap()), Some(0));
+        assert_eq!(value_to_i64(iter.next().unwrap()), Some(1));
+        assert_eq!(value_to_i64(iter.next().unwrap()), Some(2));
     }
 
     // -------------------------------------------------------------------------

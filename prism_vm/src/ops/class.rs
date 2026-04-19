@@ -29,18 +29,28 @@
 //! - Future optimization: cache class objects for repeated module imports
 
 use crate::VirtualMachine;
+use crate::builtins::{builtin_type_object_for_type_id, builtin_type_object_type_id};
 use crate::dispatch::ControlFlow;
-use crate::error::RuntimeError;
-use prism_compiler::bytecode::{CodeObject, Instruction};
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
+use crate::ops::objects::get_attribute_value;
+use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
 use prism_core::Value;
 #[cfg(test)]
 use prism_core::intern::interned_by_ptr;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::class::{ClassDict, PyClassObject};
 use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::{
+    global_class, global_class_registry, register_global_class, type_new_with_metaclass,
+    unregister_global_class,
+};
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::dict::DictObject;
 #[cfg(test)]
 use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 // =============================================================================
@@ -77,16 +87,38 @@ use std::sync::Arc;
 /// - MRO computation failure (diamond inheritance conflicts)
 #[inline(always)]
 pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    build_class_impl(vm, inst, None)
+}
+
+/// Build a new class using an explicitly supplied metaclass value.
+#[inline(always)]
+pub fn build_class_with_metaclass(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    let base_count = inst.src2().0 as usize;
+    let metaclass_reg = inst.dst().0 + 1 + base_count as u8;
+    let explicit_metaclass = vm.current_frame().get_reg(metaclass_reg);
+    build_class_impl(vm, inst, Some(explicit_metaclass))
+}
+
+#[inline(always)]
+fn build_class_impl(
+    vm: &mut VirtualMachine,
+    inst: Instruction,
+    explicit_metaclass: Option<Value>,
+) -> ControlFlow {
     let dst_reg = inst.dst().0;
     let code_idx = inst.src1().0 as u16;
     let base_count = inst.src2().0 as usize;
+    let (kwargc, kwnames_idx) = match read_class_keyword_metadata(vm) {
+        Ok(metadata) => metadata,
+        Err(err) => return ControlFlow::Error(err),
+    };
 
-    // Resolve class name from class body code-object constant.
-    let class_name = {
+    // Resolve the class body code object and class name from the constant pool.
+    let class_body = {
         let frame = vm.current_frame();
         let code_const = frame.get_const(code_idx);
-        match extract_class_name_from_code_const(code_const, &frame.code.nested_code_objects) {
-            Some(name) => name,
+        match extract_class_body_from_code_const(code_const, &frame.code.nested_code_objects) {
+            Some(code) => code,
             None => {
                 return ControlFlow::Error(RuntimeError::type_error(
                     "class body must be a valid code object constant",
@@ -94,6 +126,7 @@ pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
         }
     };
+    let class_name = intern(class_body.name.as_ref());
 
     // Collect base classes from registers
     let frame = vm.current_frame();
@@ -114,39 +147,62 @@ pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
         }
     }
+    let class_keyword_args = match collect_class_keyword_args(
+        vm.current_frame(),
+        dst_reg,
+        base_count,
+        explicit_metaclass.is_some(),
+        kwargc,
+        kwnames_idx,
+    ) {
+        Ok(keyword_args) => keyword_args,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    let class_keyword_refs: SmallVec<[(&str, Value); 4]> = class_keyword_args
+        .iter()
+        .map(|(name, value)| (name.as_ref(), *value))
+        .collect();
 
-    // Create class namespace
-    // In a full implementation, we would:
-    // 1. Push a new frame with the class body CodeObject
-    // 2. Execute the class body
-    // 3. Collect locals as the class namespace
-    //
-    // For now, create an empty namespace (class body already compiled attributes)
-    let namespace = ClassDict::new();
-
-    // Create the class object
-    // For simple classes (no complex inheritance), use new_simple
-    let class = if base_class_ids.is_empty() {
-        // No explicit bases - inherit from object implicitly
-        PyClassObject::new_simple(class_name)
-    } else {
-        // Has bases - need MRO computation
-        // For now, use simple path and improve later with proper MRO lookup
-        match PyClassObject::new(class_name, &base_class_ids, |_| None) {
-            Ok(class) => class,
-            Err(e) => {
-                return ControlFlow::Error(RuntimeError::type_error(format!(
-                    "cannot create class: MRO error - {}",
-                    e
-                )));
-            }
-        }
+    let metaclass = match resolve_class_metaclass(&base_class_ids, explicit_metaclass) {
+        Ok(metaclass) => metaclass,
+        Err(err) => return ControlFlow::Error(err),
     };
 
-    // Box and convert to Value
-    let class = Arc::new(class);
-    let class_ptr = Arc::into_raw(class) as *const ();
-    let class_val = Value::object_ptr(class_ptr);
+    let prepared_namespace = match prepare_class_namespace(
+        vm,
+        class_name.clone(),
+        &base_class_ids,
+        metaclass,
+        &class_keyword_refs,
+    ) {
+        Ok(namespace) => namespace,
+        Err(err) => return ControlFlow::Error(err),
+    };
+
+    let class_body_result = match vm.execute_code_collect_locals_namespace_with_mapping(
+        Arc::clone(&class_body),
+        prepared_namespace,
+    ) {
+        Ok(result) => result,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    let namespace = class_body_result.namespace;
+
+    let class_val = match construct_class_value(
+        vm,
+        class_name,
+        &class_body,
+        &base_class_ids,
+        &namespace,
+        metaclass,
+        &class_keyword_refs,
+        prepared_namespace,
+    ) {
+        Ok(value) => value,
+        Err(err) => return ControlFlow::Error(err),
+    };
+
+    populate_class_cell(&class_body, class_body_result.closure.as_ref(), class_val);
 
     // Store result in destination register
     vm.current_frame_mut().set_reg(dst_reg, class_val);
@@ -155,6 +211,380 @@ pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // The compiler should emit a StoreGlobal after BuildClass if needed
 
     ControlFlow::Continue
+}
+
+#[inline]
+fn read_class_keyword_metadata(vm: &mut VirtualMachine) -> Result<(usize, u16), RuntimeError> {
+    let frame = vm.current_frame_mut();
+    let ip = frame.ip as usize;
+    let Some(ext_inst) = frame.code.instructions.get(ip).copied() else {
+        return Ok((0, 0));
+    };
+    if ext_inst.opcode() != Opcode::CallKwEx as u8 {
+        return Ok((0, 0));
+    }
+
+    frame.ip = (ip + 1) as u32;
+    let kwargc = ext_inst.dst().0 as usize;
+    let kwnames_idx = (ext_inst.src1().0 as u16) | ((ext_inst.src2().0 as u16) << 8);
+    Ok((kwargc, kwnames_idx))
+}
+
+fn collect_class_keyword_args(
+    frame: &crate::frame::Frame,
+    dst_reg: u8,
+    base_count: usize,
+    has_explicit_metaclass: bool,
+    kwargc: usize,
+    kwnames_idx: u16,
+) -> Result<SmallVec<[(Arc<str>, Value); 4]>, RuntimeError> {
+    if kwargc == 0 {
+        return Ok(SmallVec::new());
+    }
+
+    let kwnames_val = frame.get_const(kwnames_idx);
+    let Some(kwnames_ptr) = kwnames_val.as_object_ptr() else {
+        return Err(RuntimeError::internal(
+            "Invalid class keyword names in constant pool",
+        ));
+    };
+    let kwnames = unsafe { &*(kwnames_ptr as *const prism_compiler::bytecode::KwNamesTuple) };
+    let keyword_base = dst_reg + 1 + base_count as u8 + u8::from(has_explicit_metaclass);
+
+    let mut keyword_args: SmallVec<[(Arc<str>, Value); 4]> = SmallVec::with_capacity(kwargc);
+    for index in 0..kwargc {
+        let kw_name = kwnames
+            .get(index)
+            .ok_or_else(|| RuntimeError::internal("Invalid class keyword names tuple"))?;
+        let kw_val = frame.get_reg(keyword_base + index as u8);
+        keyword_args.push((Arc::clone(kw_name), kw_val));
+    }
+
+    Ok(keyword_args)
+}
+
+#[inline]
+fn populate_class_cell(
+    class_body: &Arc<CodeObject>,
+    closure: Option<&Arc<crate::frame::ClosureEnv>>,
+    class_value: Value,
+) {
+    let Some(closure) = closure else {
+        return;
+    };
+
+    let Some(slot) = class_body
+        .cellvars
+        .iter()
+        .position(|name| name.as_ref() == "__class__")
+    else {
+        return;
+    };
+
+    if slot < closure.len() {
+        closure.set(slot, class_value);
+    }
+}
+
+fn construct_class_value(
+    vm: &mut VirtualMachine,
+    class_name: InternedString,
+    class_body: &Arc<CodeObject>,
+    bases: &[ClassId],
+    namespace: &ClassDict,
+    metaclass: Value,
+    class_keywords: &[(&str, Value)],
+    prepared_namespace: Option<Value>,
+) -> Result<Value, RuntimeError> {
+    if class_keywords.is_empty() && should_use_native_type_new_fast_path(metaclass) {
+        let result = type_new_with_metaclass(
+            class_name,
+            bases,
+            namespace,
+            metaclass,
+            global_class_registry(),
+        )
+        .map_err(|err| RuntimeError::type_error(format!("cannot create class: {}", err)))?;
+        let class_value = Value::object_ptr(Arc::as_ptr(&result.class) as *const ());
+        let class_id = result.class.class_id();
+        register_global_class(result.class.clone(), result.bitmap);
+        if let Err(err) = invoke_descriptor_set_name_hooks(vm, class_value, namespace) {
+            unregister_global_class(class_id);
+            return Err(err);
+        }
+        return Ok(Value::object_ptr(Arc::into_raw(result.class) as *const ()));
+    }
+
+    let bases_value = alloc_heap_value(
+        vm,
+        TupleObject::from_vec(class_bases_to_values(bases)?),
+        "class bases tuple",
+    )?;
+    let namespace_value = match prepared_namespace {
+        // Class bodies with a prepared namespace write through the mapping
+        // during execution via locals_mapping-aware store/delete opcodes.
+        // Replaying the collected locals here would double-apply __setitem__
+        // side effects and break metaclass protocols such as enum's namespace
+        // guards for _generate_next_value_.
+        Some(mapping) => mapping,
+        None => alloc_heap_value(
+            vm,
+            class_namespace_to_dict(namespace),
+            "class namespace dict",
+        )?,
+    };
+    let class_args = [Value::string(class_name), bases_value, namespace_value];
+    let class_value = if class_keywords.is_empty() {
+        invoke_callable_value(vm, metaclass, &class_args)?
+    } else {
+        invoke_callable_value_with_keywords(vm, metaclass, &class_args, class_keywords)?
+    };
+
+    let Some(class_ptr) = class_value.as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "metaclass returned a non-type object",
+        ));
+    };
+    if extract_type_id(class_ptr) != TypeId::TYPE {
+        return Err(RuntimeError::type_error(format!(
+            "metaclass returned non-type '{}'",
+            extract_type_id(class_ptr).name()
+        )));
+    }
+
+    Ok(class_value)
+}
+
+pub(crate) fn invoke_descriptor_set_name_hooks(
+    vm: &mut VirtualMachine,
+    class_value: Value,
+    namespace: &ClassDict,
+) -> Result<(), RuntimeError> {
+    let set_name_attr = intern("__set_name__");
+    let mut entries = SmallVec::<[(InternedString, Value); 16]>::new();
+    namespace.for_each(|name, value| entries.push((name.clone(), value)));
+
+    for (name, descriptor) in entries {
+        let set_name = match get_attribute_value(vm, descriptor, &set_name_attr) {
+            Ok(value) => value,
+            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        invoke_callable_value(vm, set_name, &[class_value, Value::string(name)])?;
+    }
+
+    Ok(())
+}
+
+fn prepare_class_namespace(
+    vm: &mut VirtualMachine,
+    class_name: InternedString,
+    bases: &[ClassId],
+    metaclass: Value,
+    class_keywords: &[(&str, Value)],
+) -> Result<Option<Value>, RuntimeError> {
+    if class_keywords.is_empty() && should_use_native_type_new_fast_path(metaclass) {
+        return Ok(None);
+    }
+
+    let prepare_name = intern("__prepare__");
+    let prepare = match get_attribute_value(vm, metaclass, &prepare_name) {
+        Ok(value) => value,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+
+    let bases_value = alloc_heap_value(
+        vm,
+        TupleObject::from_vec(class_bases_to_values(bases)?),
+        "class bases tuple",
+    )?;
+    let prepare_args = [Value::string(class_name), bases_value];
+    let namespace = if class_keywords.is_empty() {
+        invoke_callable_value(vm, prepare, &prepare_args)?
+    } else {
+        invoke_callable_value_with_keywords(vm, prepare, &prepare_args, class_keywords)?
+    };
+    Ok(Some(namespace))
+}
+
+#[inline]
+fn should_use_native_type_new_fast_path(metaclass: Value) -> bool {
+    if metaclass.is_none() {
+        return true;
+    }
+
+    let Some(ptr) = metaclass.as_object_ptr() else {
+        return false;
+    };
+
+    builtin_type_object_type_id(ptr) == Some(TypeId::TYPE)
+}
+
+#[inline]
+fn alloc_heap_value<T>(
+    vm: &mut VirtualMachine,
+    object: T,
+    context: &'static str,
+) -> Result<Value, RuntimeError>
+where
+    T: prism_runtime::Trace,
+{
+    vm.allocator()
+        .alloc(object)
+        .map(|ptr| Value::object_ptr(ptr as *const ()))
+        .ok_or_else(|| {
+            RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
+        })
+}
+
+fn class_bases_to_values(bases: &[ClassId]) -> Result<Vec<Value>, RuntimeError> {
+    bases.iter().copied().map(class_id_to_value).collect()
+}
+
+fn class_id_to_value(class_id: ClassId) -> Result<Value, RuntimeError> {
+    if class_id == ClassId::OBJECT {
+        return Ok(builtin_type_object_for_type_id(TypeId::OBJECT));
+    }
+
+    if let Some(value) = crate::builtins::exception_type_value_for_proxy_class_id(class_id) {
+        return Ok(value);
+    }
+
+    if class_id.0 < TypeId::FIRST_USER_TYPE {
+        return Ok(builtin_type_object_for_type_id(TypeId::from_raw(
+            class_id.0,
+        )));
+    }
+
+    global_class(class_id)
+        .map(|class| Value::object_ptr(Arc::as_ptr(&class) as *const ()))
+        .ok_or_else(|| RuntimeError::internal("class base missing from global registry"))
+}
+
+fn class_namespace_to_dict(namespace: &ClassDict) -> DictObject {
+    let mut dict = DictObject::new();
+    namespace.for_each(|name, value| {
+        dict.set(Value::string(name.clone()), value);
+    });
+    dict
+}
+
+#[inline]
+fn resolve_class_metaclass(
+    base_class_ids: &[ClassId],
+    explicit_metaclass: Option<Value>,
+) -> Result<Value, RuntimeError> {
+    let mut winner = validate_metaclass_value(explicit_metaclass.unwrap_or(Value::none()))?;
+
+    for &base_id in base_class_ids {
+        let base_metaclass = base_class_metaclass_value(base_id);
+        winner = choose_more_derived_metaclass(winner, base_metaclass)?;
+    }
+
+    Ok(winner)
+}
+
+#[inline]
+fn validate_metaclass_value(value: Value) -> Result<Value, RuntimeError> {
+    if value.is_none() {
+        return Ok(Value::none());
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "metaclass must be a class object derived from type",
+        ));
+    };
+
+    if let Some(represented) = crate::builtins::builtin_type_object_type_id(ptr) {
+        return if represented == TypeId::TYPE {
+            Ok(Value::none())
+        } else {
+            Err(RuntimeError::type_error(
+                "metaclass must be a class object derived from type",
+            ))
+        };
+    }
+
+    if extract_type_id(ptr) != TypeId::TYPE {
+        return Err(RuntimeError::type_error(
+            "metaclass must be a class object derived from type",
+        ));
+    }
+
+    let class = unsafe { &*(ptr as *const PyClassObject) };
+    if !class
+        .flags()
+        .contains(prism_runtime::object::class::ClassFlags::METACLASS)
+    {
+        return Err(RuntimeError::type_error(
+            "metaclass must be a class object derived from type",
+        ));
+    }
+
+    Ok(value)
+}
+
+#[inline]
+fn base_class_metaclass_value(base_id: ClassId) -> Value {
+    if base_id.0 < TypeId::FIRST_USER_TYPE {
+        return Value::none();
+    }
+
+    global_class(base_id)
+        .map(|class| class.metaclass())
+        .unwrap_or_else(Value::none)
+}
+
+#[inline]
+fn choose_more_derived_metaclass(current: Value, candidate: Value) -> Result<Value, RuntimeError> {
+    if metaclass_is_subclass(candidate, current) {
+        return Ok(candidate);
+    }
+    if metaclass_is_subclass(current, candidate) {
+        return Ok(current);
+    }
+
+    Err(RuntimeError::type_error(
+        "metaclass conflict: metaclass hierarchy is incompatible",
+    ))
+}
+
+#[inline]
+fn metaclass_is_subclass(candidate: Value, target: Value) -> bool {
+    if target.is_none() {
+        return true;
+    }
+    if candidate.is_none() {
+        return target.is_none();
+    }
+    if candidate == target {
+        return true;
+    }
+
+    let Some(candidate_class) = class_object_from_value(candidate) else {
+        return false;
+    };
+    let Some(target_class) = class_object_from_value(target) else {
+        return false;
+    };
+
+    candidate_class
+        .mro()
+        .iter()
+        .any(|&class_id| class_id == target_class.class_id())
+}
+
+#[inline]
+fn class_object_from_value(value: Value) -> Option<&'static PyClassObject> {
+    let ptr = value.as_object_ptr()?;
+    if crate::builtins::builtin_type_object_type_id(ptr).is_some() {
+        return None;
+    }
+    (extract_type_id(ptr) == TypeId::TYPE).then(|| unsafe { &*(ptr as *const PyClassObject) })
 }
 
 // =============================================================================
@@ -188,11 +618,22 @@ fn extract_class_name_from_code_const(
     code_const: Value,
     nested_code_objects: &[Arc<CodeObject>],
 ) -> Option<InternedString> {
+    extract_class_body_from_code_const(code_const, nested_code_objects)
+        .map(|nested| intern(nested.name.as_ref()))
+}
+
+/// Resolve the class-body code object from a constant by pointer identity
+/// against the enclosing frame's nested code-object list.
+#[inline]
+fn extract_class_body_from_code_const(
+    code_const: Value,
+    nested_code_objects: &[Arc<CodeObject>],
+) -> Option<Arc<CodeObject>> {
     let code_ptr = code_const.as_object_ptr()? as *const CodeObject;
     nested_code_objects
         .iter()
         .find(|nested| Arc::as_ptr(nested) == code_ptr)
-        .map(|nested| intern(nested.name.as_ref()))
+        .cloned()
 }
 
 /// Extract ClassId from a class object Value.
@@ -202,10 +643,17 @@ fn extract_class_id(val: Value) -> Option<ClassId> {
         // Check if this is a PyClassObject
         let type_id = extract_type_id(ptr);
         if type_id == TypeId::TYPE {
+            if let Some(builtin_type_id) = crate::builtins::builtin_type_object_type_id(ptr) {
+                return Some(ClassId(builtin_type_id.raw()));
+            }
+
             // This is a class object - extract its class_id
             // SAFETY: We verified type_id is TYPE, so ptr points to PyClassObject
             let class_obj = unsafe { &*(ptr as *const PyClassObject) };
             return Some(class_obj.class_id());
+        }
+        if type_id == TypeId::EXCEPTION_TYPE {
+            return crate::builtins::exception_proxy_class_id_from_ptr(ptr);
         }
     }
     None
@@ -230,6 +678,7 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::builtin_type;
     use prism_core::intern::intern;
     use prism_runtime::object::class::PyClassObject;
 
@@ -272,6 +721,14 @@ mod tests {
         assert_eq!(extract_class_id(Value::none()), None);
         assert_eq!(extract_class_id(Value::bool(true)), None);
         assert_eq!(extract_class_id(Value::int_unchecked(42)), None);
+    }
+
+    #[test]
+    fn test_extract_class_id_supports_builtin_type_objects() {
+        let int_type =
+            builtin_type(&[Value::int(0).unwrap()]).expect("type(int_instance) should succeed");
+
+        assert_eq!(extract_class_id(int_type), Some(ClassId(TypeId::INT.raw())));
     }
 
     #[test]

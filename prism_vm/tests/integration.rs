@@ -4,12 +4,37 @@
 
 use prism_compiler::Compiler;
 use prism_core::Value;
+use prism_core::intern::interned_by_ptr;
 use prism_parser::parse;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::type_builtins::global_class;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::list::ListObject;
+use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
 use prism_vm::VirtualMachine;
+use prism_vm::import::ModuleObject;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Helper to run Python source code and return result.
 fn execute(source: &str) -> Result<Value, String> {
+    execute_with_search_paths(source, &[])
+}
+
+/// Helper to run Python source code with additional import search paths.
+fn execute_with_search_paths(source: &str, search_paths: &[&Path]) -> Result<Value, String> {
+    execute_with_search_paths_and_step_limit(source, search_paths, None)
+}
+
+fn execute_with_search_paths_and_step_limit(
+    source: &str,
+    search_paths: &[&Path],
+    step_limit: Option<u64>,
+) -> Result<Value, String> {
     // Parse
     let module = parse(source).map_err(|e| format!("Parse error: {:?}", e))?;
 
@@ -19,8 +44,101 @@ fn execute(source: &str) -> Result<Value, String> {
 
     // Execute
     let mut vm = VirtualMachine::new();
+    for path in search_paths {
+        let path = Arc::<str>::from(path.to_string_lossy().into_owned());
+        vm.import_resolver.add_search_path(path);
+    }
+    vm.set_execution_step_limit(step_limit);
     vm.execute(Arc::new(code))
         .map_err(|e| format!("Runtime error: {:?}", e))
+}
+
+fn cpython_lib_dir() -> std::path::PathBuf {
+    let root = std::env::var_os("PRISM_CPYTHON_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Users\James\Desktop\cpython-3.12"));
+    let lib_dir = root.join("Lib");
+    assert!(
+        lib_dir.is_dir(),
+        "CPython Lib directory not found at {}. Set PRISM_CPYTHON_ROOT to override.",
+        lib_dir.display()
+    );
+    lib_dir
+}
+
+fn execute_with_cpython_lib(source: &str) -> Result<Value, String> {
+    let lib_dir = cpython_lib_dir();
+    execute_with_search_paths(source, &[lib_dir.as_path()])
+}
+
+fn execute_with_cpython_lib_and_step_limit(source: &str, step_limit: u64) -> Result<Value, String> {
+    let lib_dir = cpython_lib_dir();
+    execute_with_search_paths_and_step_limit(source, &[lib_dir.as_path()], Some(step_limit))
+}
+
+fn execute_in_main_module_with_search_paths(
+    source: &str,
+    search_paths: &[&Path],
+) -> Result<(VirtualMachine, Arc<ModuleObject>), String> {
+    let module = parse(source).map_err(|e| format!("Parse error: {:?}", e))?;
+    let code = Compiler::compile_module(&module, "<test>")
+        .map_err(|e| format!("Compile error: {:?}", e))?;
+
+    let mut vm = VirtualMachine::new();
+    for path in search_paths {
+        let path = Arc::<str>::from(path.to_string_lossy().into_owned());
+        vm.import_resolver.add_search_path(path);
+    }
+
+    let main = Arc::new(ModuleObject::new("__main__"));
+    vm.execute_in_module(Arc::new(code), Arc::clone(&main))
+        .map_err(|e| format!("Runtime error: {:?}", e))?;
+    Ok((vm, main))
+}
+
+fn value_is_python_string(value: Value, expected: &str) -> bool {
+    if value.is_string() {
+        let Some(ptr) = value.as_string_object_ptr() else {
+            return false;
+        };
+        return interned_by_ptr(ptr as *const u8)
+            .is_some_and(|interned| interned.as_str() == expected);
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::STR {
+        return false;
+    }
+
+    let string = unsafe { &*(ptr as *const StringObject) };
+    string.as_str() == expected
+}
+
+fn python_string_value(value: Value) -> Option<String> {
+    if value.is_string() {
+        let ptr = value.as_string_object_ptr()?;
+        return interned_by_ptr(ptr as *const u8).map(|interned| interned.as_str().to_string());
+    }
+
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::STR {
+        return None;
+    }
+
+    let string = unsafe { &*(ptr as *const StringObject) };
+    Some(string.as_str().to_string())
+}
+
+fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("prism_{label}_{}_{}", std::process::id(), nonce))
 }
 
 // =============================================================================
@@ -74,6 +192,51 @@ fn test_compound_arithmetic() {
 #[test]
 fn test_float_division() {
     let result = execute("10.0 / 3.0");
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_string_addition() {
+    let result = execute(
+        r#"
+value = "hello" + " world"
+assert value == "hello world"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_string_repetition() {
+    let result = execute(
+        r#"
+value = "ab" * 3
+assert value == "ababab"
+assert "ab" * -1 == ""
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_function_descriptor_surface_matches_python_semantics() {
+    let result = execute(
+        r#"
+class Box:
+    pass
+
+box = Box()
+box.value = 41
+
+def method(self):
+    return self.value
+
+assert hasattr(method, "__get__")
+assert method.__get__(None, Box) is method
+bound = method.__get__(box, Box)
+assert bound() == 41
+"#,
+    );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
 
@@ -215,6 +378,3199 @@ fn test_parenthesized_expression() {
 }
 
 #[test]
+fn test_generator_lambda_creation_does_not_escape_yield_to_module_scope() {
+    let result = execute("generator_type = type((lambda: (yield))())");
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_explicit_metaclass_methods_are_visible_on_created_classes() {
+    let result = execute(
+        r#"
+class Meta(type):
+    def register(cls, value):
+        return value
+
+class Example(metaclass=Meta):
+    pass
+
+Example.register(1)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_metaclass_is_inherited_from_base_classes() {
+    let result = execute(
+        r#"
+class Meta(type):
+    def ping(cls):
+        return 1
+
+class Base(metaclass=Meta):
+    pass
+
+class Derived(Base):
+    pass
+
+Derived.ping()
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_type_new_builtin_survives_handled_descriptor_callback_exception() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+ERROR_TYPE = None
+ERROR_TEXT = None
+OBSERVED_RESULT_IS_NONE = None
+OBSERVED_RESULT_TYPE = None
+OBSERVED_MARKER = None
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        try:
+            {}["missing"]
+        except KeyError:
+            pass
+        owner.marker = name
+
+class Meta(type):
+    pass
+
+namespace = {"field": Descriptor()}
+
+try:
+    RESULT_CLASS = type.__new__(Meta, "Example", (), namespace)
+except Exception as exc:
+    ERROR_TYPE = type(exc).__name__
+    ERROR_TEXT = str(exc)
+else:
+    OBSERVED_RESULT_IS_NONE = RESULT_CLASS is None
+    OBSERVED_RESULT_TYPE = type(RESULT_CLASS).__name__
+    OBSERVED_MARKER = RESULT_CLASS.marker
+"#,
+        &[],
+    )
+    .expect("direct type.__new__ probe should execute");
+
+    assert_eq!(
+        main.get_attr("ERROR_TYPE").and_then(python_string_value),
+        None,
+        "direct type.__new__ should not fail, got {:?}: {:?}",
+        main.get_attr("ERROR_TYPE").and_then(python_string_value),
+        main.get_attr("ERROR_TEXT").and_then(python_string_value),
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_RESULT_IS_NONE")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "type.__new__ should produce a class object",
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_RESULT_TYPE")
+            .and_then(python_string_value),
+        Some("Meta".to_string()),
+        "direct type.__new__ should preserve the metaclass identity",
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_MARKER")
+            .and_then(python_string_value),
+        Some("field".to_string()),
+        "descriptor __set_name__ should run against the created class",
+    );
+}
+
+#[test]
+fn test_descriptor_set_name_handled_exception_does_not_poison_metaclass_super_new() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+ERROR_TYPE = None
+ERROR_TEXT = None
+OBSERVED_CLS_IS_NONE = None
+OBSERVED_CLS_TYPE = None
+OBSERVED_CLS_MARKER = None
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        try:
+            {}["missing"]
+        except KeyError:
+            pass
+        owner.marker = name
+
+class Meta(type):
+    observed_cls_is_none = None
+    observed_cls_type = None
+    observed_cls_marker = None
+
+    def __new__(metacls, name, bases, namespace):
+        cls = super().__new__(metacls, name, bases, namespace)
+        metacls.observed_cls_is_none = cls is None
+        metacls.observed_cls_type = type(cls).__name__
+        metacls.observed_cls_marker = getattr(cls, "marker", None)
+        return cls
+
+try:
+    class Example(metaclass=Meta):
+        field = Descriptor()
+except Exception as exc:
+    ERROR_TYPE = type(exc).__name__
+    ERROR_TEXT = str(exc)
+else:
+    RESULT_EXAMPLE = Example
+    OBSERVED_CLS_IS_NONE = Meta.observed_cls_is_none
+    OBSERVED_CLS_TYPE = Meta.observed_cls_type
+    OBSERVED_CLS_MARKER = Meta.observed_cls_marker
+"#,
+        &[],
+    )
+    .expect("descriptor callback probe should execute");
+
+    assert_eq!(
+        main.get_attr("ERROR_TYPE").and_then(python_string_value),
+        None,
+        "class creation should not fail, got {:?}: {:?}",
+        main.get_attr("ERROR_TYPE").and_then(python_string_value),
+        main.get_attr("ERROR_TEXT").and_then(python_string_value),
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_CLS_IS_NONE")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "metaclass super().__new__ should produce a class object",
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_CLS_TYPE")
+            .and_then(python_string_value),
+        Some("Meta".to_string()),
+        "metaclass result should preserve the heap metaclass identity",
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_CLS_MARKER")
+            .and_then(python_string_value),
+        Some("field".to_string()),
+        "descriptor __set_name__ should see the created owner class",
+    );
+}
+
+#[test]
+fn test_prepare_callback_with_keywords_restores_exception_context_after_success() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+ERROR_TYPE = None
+ERROR_TEXT = None
+OBSERVED_PREPARED_BOUNDARY = None
+OBSERVED_CLASS_BOUNDARY = None
+OBSERVED_DERIVED_IS_NONE = None
+OBSERVED_DERIVED_TYPE = None
+
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases, boundary=None):
+        try:
+            {}["missing"]
+        except KeyError:
+            pass
+        namespace = {}
+        namespace["prepared_boundary"] = boundary
+        return namespace
+
+    def __new__(mcls, name, bases, namespace, boundary=None):
+        cls = super().__new__(mcls, name, bases, namespace)
+        cls.boundary = boundary
+        return cls
+
+try:
+    class Derived(metaclass=Meta, boundary=7):
+        value = 1
+except Exception as exc:
+    ERROR_TYPE = type(exc).__name__
+    ERROR_TEXT = str(exc)
+else:
+    OBSERVED_DERIVED_IS_NONE = Derived is None
+    OBSERVED_DERIVED_TYPE = type(Derived).__name__
+    OBSERVED_PREPARED_BOUNDARY = Derived.prepared_boundary
+    OBSERVED_CLASS_BOUNDARY = Derived.boundary
+"#,
+        &[],
+    )
+    .expect("__prepare__ keyword callback probe should execute");
+
+    assert_eq!(
+        main.get_attr("ERROR_TYPE").and_then(python_string_value),
+        None,
+        "class creation via __prepare__ should not fail, got {:?}: {:?}",
+        main.get_attr("ERROR_TYPE").and_then(python_string_value),
+        main.get_attr("ERROR_TEXT").and_then(python_string_value),
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_PREPARED_BOUNDARY")
+            .and_then(|value| value.as_int()),
+        Some(7),
+        "__prepare__ keyword callback should preserve its namespace return",
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_DERIVED_IS_NONE")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "class statement should bind the created type object, got {:?}",
+        main.get_attr("OBSERVED_DERIVED_TYPE")
+            .and_then(python_string_value),
+    );
+    assert_eq!(
+        main.get_attr("OBSERVED_CLASS_BOUNDARY")
+            .and_then(|value| value.as_int()),
+        Some(7),
+        "metaclass __new__ should preserve keyword constructor state after callback success",
+    );
+}
+
+#[test]
+fn test_heap_type_reflection_exposes_mro_and_dict_to_python() {
+    let result = execute(
+        r#"
+class Base:
+    base_token = 1
+
+class Child(Base):
+    token = 7
+
+assert Child.__mro__[0] is Child
+assert Child.__mro__[1] is Base
+assert Child.__mro__[2] is object
+assert getattr(Child, "__mro__")[1] is Base
+assert "token" in Child.__dict__
+assert Child.__dict__["token"] == 7
+assert "token" in getattr(Child, "__dict__")
+assert getattr(Child, "__dict__")["token"] == 7
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_builtin_type_reflection_exposes_mro_and_mappingproxy_membership_to_python() {
+    let result = execute(
+        r#"
+assert getattr(bool, "__mro__")[0] is bool
+assert getattr(bool, "__mro__")[1] is int
+assert getattr(bool, "__mro__")[2] is object
+assert "fromkeys" in dict.__dict__
+assert dict.__dict__["fromkeys"] is not None
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_mappingproxy_methods_support_class_dict_access_and_update() {
+    let result = execute(
+        r#"
+class Sample:
+    token = 7
+    label = "ready"
+
+proxy = Sample.__dict__
+keys = list(proxy.keys())
+assert "token" in keys
+assert "label" in keys
+assert proxy.get("token") == 7
+assert proxy.get("missing", 11) == 11
+assert len(proxy) >= 2
+
+copied = {}
+copied.update(proxy)
+assert copied["token"] == 7
+assert copied["label"] == "ready"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_abc_abstractmethod_with_defaults_does_not_break_following_classmethod() {
+    let result = execute_with_cpython_lib(
+        r#"
+from abc import ABCMeta, abstractmethod
+
+class Example(metaclass=ABCMeta):
+    @abstractmethod
+    def trouble(self, value, fallback=None, extra=None):
+        return value
+
+    @classmethod
+    def hook(cls, arg):
+        return cls is Example and arg == 1
+
+assert Example.hook(1)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_async_abc_subclasshook_survives_abstractmethod_with_defaults() {
+    let result = execute_with_cpython_lib(
+        r#"
+from abc import ABCMeta, abstractmethod
+from types import GenericAlias
+
+def _check_methods(C, *methods):
+    mro = C.__mro__
+    for method in methods:
+        for B in mro:
+            if method in B.__dict__:
+                if B.__dict__[method] is None:
+                    return NotImplemented
+                break
+        else:
+            return NotImplemented
+    return True
+
+class AsyncIterable(metaclass=ABCMeta):
+    __slots__ = ()
+
+    @abstractmethod
+    def __aiter__(self):
+        return self
+
+    @classmethod
+    def __subclasshook__(cls, C):
+        if cls is AsyncIterable:
+            return _check_methods(C, "__aiter__")
+        return NotImplemented
+
+    __class_getitem__ = classmethod(GenericAlias)
+
+class AsyncIterator(AsyncIterable):
+    __slots__ = ()
+
+    @abstractmethod
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    def __aiter__(self):
+        return self
+
+    @classmethod
+    def __subclasshook__(cls, C):
+        if cls is AsyncIterator:
+            return _check_methods(C, "__anext__", "__aiter__")
+        return NotImplemented
+
+class AsyncGenerator(AsyncIterator):
+    __slots__ = ()
+
+    @abstractmethod
+    async def athrow(self, typ, val=None, tb=None):
+        raise StopAsyncIteration
+
+    @classmethod
+    def __subclasshook__(cls, C):
+        if cls is AsyncGenerator:
+            return _check_methods(C, "__aiter__", "__anext__", "athrow")
+        return NotImplemented
+
+assert AsyncGenerator.__subclasshook__(AsyncGenerator) is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_collections_abc_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import _collections_abc
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_keyword_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import keyword
+
+assert keyword.iskeyword("while")
+assert not keyword.iskeyword("prism_runtime")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_thread_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import _thread
+
+ident = _thread.get_ident()
+assert isinstance(ident, int)
+assert ident == _thread.get_ident()
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_collections_with_native_weakref_bootstrap() {
+    let result = execute_with_cpython_lib(
+        r#"
+import collections
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_signal_with_cpython_stdlib_roundtrips_sigint_handler() {
+    let result = execute_with_cpython_lib(
+        r#"
+import signal
+
+previous = signal.getsignal(signal.SIGINT)
+assert previous == signal.SIG_DFL
+returned = signal.signal(signal.SIGINT, signal.SIG_IGN)
+assert returned == signal.SIG_DFL
+assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+signal.signal(signal.SIGINT, previous)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_weakref_with_cpython_stdlib_constructs_mapping() {
+    let result = execute_with_cpython_lib(
+        r#"
+import weakref
+
+cache = weakref.WeakKeyDictionary()
+assert isinstance(cache, dict)
+cache["ready"] = 1
+assert cache["ready"] == 1
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_str_join_accepts_generator_expression() {
+    let result = execute(
+        r#"
+joined = ", ".join(str(x) for x in (1, 2, 3))
+assert joined == "1, 2, 3"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_list_extend_accepts_generator_expression() {
+    let result = execute(
+        r#"
+values = []
+values.extend(x * 2 for x in (1, 2, 3))
+assert values == [2, 4, 6]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_generator_expression_captures_enclosing_function_local() {
+    let result = execute(
+        r#"
+def outer(scale, values):
+    return tuple(scale * value for value in values)
+
+assert outer(10, (1, 2, 3)) == (10, 20, 30)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_list_equality_uses_contents() {
+    let result = execute(
+        r#"
+assert ["1", "2", "3"] == ["1", "2", "3"]
+assert ["1", "2", "3"] != ["1", "2"]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_tuple_equality_uses_contents() {
+    let result = execute(
+        r#"
+assert ("1", "2", "3") == ("1", "2", "3")
+assert ("1", "2", "3") != ("1", "2", "4")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_list_accepts_map_iterator() {
+    let result = execute(
+        r#"
+values = list(map(str, (1, 2, 3)))
+assert values == ["1", "2", "3"]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_tuple_accepts_map_iterator() {
+    let result = execute(
+        r#"
+values = tuple(map(str, (1, 2, 3)))
+assert values == ("1", "2", "3")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_list_map_iterator_materializes_string_items() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+values = list(map(str, (1, 2, 3)))
+"#,
+        &[],
+    )
+    .expect("list(map(str, ...)) should execute");
+
+    let values = main
+        .get_attr("values")
+        .expect("values binding should exist");
+    let ptr = values
+        .as_object_ptr()
+        .expect("values should be a heap list object");
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    assert_eq!(header.type_id, TypeId::LIST);
+
+    let list = unsafe { &*(ptr as *const ListObject) };
+    assert_eq!(list.len(), 3);
+    assert!(value_is_python_string(list.get(0).unwrap(), "1"));
+    assert!(value_is_python_string(list.get(1).unwrap(), "2"));
+    assert!(value_is_python_string(list.get(2).unwrap(), "3"));
+}
+
+#[test]
+fn test_tuple_map_iterator_materializes_string_items() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+values = tuple(map(str, (1, 2, 3)))
+"#,
+        &[],
+    )
+    .expect("tuple(map(str, ...)) should execute");
+
+    let values = main
+        .get_attr("values")
+        .expect("values binding should exist");
+    let ptr = values
+        .as_object_ptr()
+        .expect("values should be a heap tuple object");
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    assert_eq!(header.type_id, TypeId::TUPLE);
+
+    let tuple = unsafe { &*(ptr as *const TupleObject) };
+    assert_eq!(tuple.len(), 3);
+    assert!(value_is_python_string(tuple.get(0).unwrap(), "1"));
+    assert!(value_is_python_string(tuple.get(1).unwrap(), "2"));
+    assert!(value_is_python_string(tuple.get(2).unwrap(), "3"));
+}
+
+#[test]
+fn test_namedtuple_creation_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+from collections import namedtuple
+
+Point = namedtuple("Point", ["x", "y"])
+point = Point(1, 2)
+assert point.x == 1
+assert point.y == 2
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_functools_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import functools
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_codecs_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import codecs
+assert codecs.lookup("utf-8")
+assert codecs.lookup_error("strict")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_importlib_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import importlib
+RESULT = importlib.import_module("keyword").iskeyword("for")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+    assert_eq!(
+        result
+            .expect("importlib import should return a value")
+            .as_bool(),
+        Some(true)
+    );
+}
+
+#[test]
+fn test_import_warnings_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import warnings
+RESULT = warnings.defaultaction
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+    assert!(value_is_python_string(
+        result.expect("warnings import should return a value"),
+        "default"
+    ));
+}
+
+#[test]
+fn test_type_constructor_keywords_dispatch_to_heap_metaclass() {
+    let result = execute(
+        r#"
+class Meta(type):
+    def __new__(mcls, name, bases, namespace, token=None, simple=False):
+        cls = super().__new__(mcls, name, bases, namespace)
+        cls.token = token
+        cls.simple = simple
+        return cls
+
+class Base(metaclass=Meta):
+    pass
+
+Created = type("Created", (Base,), {"value": 1}, token=7, simple=True)
+assert Created.token == 7
+assert Created.simple is True
+assert Created.value == 1
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_class_definition_keywords_dispatch_to_metaclass_protocol() {
+    let result = execute(
+        r#"
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases, boundary=None):
+        namespace = {}
+        namespace["prepared_boundary"] = boundary
+        return namespace
+
+    def __new__(mcls, name, bases, namespace, boundary=None):
+        cls = super().__new__(mcls, name, bases, namespace)
+        cls.boundary = boundary
+        cls.prepared_boundary = namespace["prepared_boundary"]
+        return cls
+
+class Base(metaclass=Meta):
+    pass
+
+class Derived(Base, boundary=7):
+    value = 1
+
+assert Derived.boundary == 7
+assert Derived.prepared_boundary == 7
+assert Derived.value == 1
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_enum_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import enum
+RESULT = enum.KEEP.name
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+    assert!(value_is_python_string(
+        result.expect("enum import should return a value"),
+        "KEEP"
+    ));
+}
+
+#[test]
+fn test_import_enum_prefix_through_reprenum() {
+    let temp_dir = unique_temp_dir("enum_prefix_reprenum");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_base.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1296)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let result = execute_with_search_paths(
+        r#"
+import mini_enum_base
+
+class ReprEnum(mini_enum_base.Enum):
+    pass
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_enum_prefix_through_strenum() {
+    let temp_dir = unique_temp_dir("enum_prefix_strenum");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_str.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1341)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let result = execute_with_search_paths(
+        r#"
+import mini_enum_str
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_enum_prefix_strenum_registers_heap_classes_globally() {
+    let temp_dir = unique_temp_dir("enum_prefix_strenum_registry");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_str_registry.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1341)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+import mini_enum_str_registry
+
+StrEnum = mini_enum_str_registry.StrEnum
+ReprEnum = mini_enum_str_registry.ReprEnum
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    )
+    .expect("enum prefix import should execute");
+
+    let str_enum = main.get_attr("StrEnum").expect("StrEnum should be bound");
+    let repr_enum = main.get_attr("ReprEnum").expect("ReprEnum should be bound");
+
+    let str_enum_ptr = str_enum.as_object_ptr().expect("StrEnum should be a class");
+    let repr_enum_ptr = repr_enum
+        .as_object_ptr()
+        .expect("ReprEnum should be a class");
+    let str_enum_class = unsafe { &*(str_enum_ptr as *const PyClassObject) };
+    let repr_enum_class = unsafe { &*(repr_enum_ptr as *const PyClassObject) };
+
+    assert!(
+        global_class(str_enum_class.class_id()).is_some(),
+        "StrEnum should be globally registered"
+    );
+    assert!(
+        global_class(repr_enum_class.class_id()).is_some(),
+        "ReprEnum should be globally registered"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_import_enum_prefix_strenum_exposes_heap_mro() {
+    let temp_dir = unique_temp_dir("enum_prefix_strenum_mro");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_str_mro.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1341)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let result = execute_with_search_paths(
+        r#"
+import mini_enum_str_mro
+
+assert mini_enum_str_mro.StrEnum.__mro__[0] is mini_enum_str_mro.StrEnum
+assert mini_enum_str_mro.StrEnum.__mro__[1] is str
+assert mini_enum_str_mro.StrEnum.__mro__[2] is mini_enum_str_mro.ReprEnum
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_enum_prefix_strenum_generate_next_value_diagnostics() {
+    let temp_dir = unique_temp_dir("enum_prefix_strenum_diag");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_diag.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1308)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+import mini_enum_diag
+
+EVENT_COUNT = 0
+SECOND_IS_SUNDER = None
+SECOND_PRESENT = None
+SECOND_IS_STATICMETHOD = None
+CAUGHT_HAS_GENERATE_NEXT_VALUE_ATTR = None
+RESULT_OK = False
+RESULT_ERROR = None
+
+_original_setitem = mini_enum_diag._EnumDict.__setitem__
+
+def _trace_setitem(self, key, value):
+    global EVENT_COUNT, SECOND_IS_SUNDER, SECOND_PRESENT, SECOND_IS_STATICMETHOD
+    global CAUGHT_HAS_GENERATE_NEXT_VALUE_ATTR
+    if key == "_generate_next_value_":
+        EVENT_COUNT += 1
+        if EVENT_COUNT == 2:
+            SECOND_IS_SUNDER = mini_enum_diag._is_sunder(key)
+            SECOND_PRESENT = key in self
+            SECOND_IS_STATICMETHOD = isinstance(value, staticmethod)
+    try:
+        return _original_setitem(self, key, value)
+    except Exception:
+        if key == "_generate_next_value_":
+            CAUGHT_HAS_GENERATE_NEXT_VALUE_ATTR = hasattr(self, "_generate_next_value")
+        raise
+
+mini_enum_diag._EnumDict.__setitem__ = _trace_setitem
+
+try:
+    class StrEnum(str, mini_enum_diag.ReprEnum):
+        @staticmethod
+        def _generate_next_value_(name, start, count, last_values):
+            return name.lower()
+except Exception as exc:
+    RESULT_ERROR = str(exc)
+else:
+    RESULT_OK = True
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    )
+    .expect("diagnostic enum probe should execute");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert_eq!(
+        main.get_attr("EVENT_COUNT")
+            .and_then(|value| value.as_int()),
+        Some(2)
+    );
+    assert_eq!(
+        main.get_attr("SECOND_IS_SUNDER")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("SECOND_PRESENT")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("SECOND_IS_STATICMETHOD")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("CAUGHT_HAS_GENERATE_NEXT_VALUE_ATTR")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_OK").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn test_import_enum_prefix_through_flag_boundary() {
+    let temp_dir = unique_temp_dir("enum_prefix_flag_boundary");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_flag.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1365)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let result = execute_with_search_paths(
+        r#"
+import mini_enum_flag
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_enum_prefix_strenum_subclass_with_members_initializes_cleanly() {
+    let temp_dir = unique_temp_dir("enum_prefix_strenum_members");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_str_members.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1341)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let result = execute_with_search_paths(
+        r#"
+import mini_enum_str_members
+
+class FlagBoundary(mini_enum_str_members.StrEnum):
+    STRICT = mini_enum_str_members.auto()
+    CONFORM = mini_enum_str_members.auto()
+    EJECT = mini_enum_str_members.auto()
+    KEEP = mini_enum_str_members.auto()
+
+assert FlagBoundary.__mro__[0] is FlagBoundary
+assert FlagBoundary.__mro__[1] is mini_enum_str_members.StrEnum
+assert FlagBoundary.STRICT.value == "strict"
+assert tuple(member.name for member in FlagBoundary) == ("STRICT", "CONFORM", "EJECT", "KEEP")
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_enum_prefix_strenum_subclass_member_construction_reaches_class_completion() {
+    let temp_dir = unique_temp_dir("enum_prefix_strenum_members_stage");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("mini_enum_str_members_stage.py");
+    let enum_source =
+        fs::read_to_string(cpython_lib_dir().join("enum.py")).expect("failed to read enum.py");
+    let prefix = enum_source
+        .lines()
+        .take(1341)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&module_path, prefix).expect("failed to write temp enum prefix");
+
+    let cpython_lib = cpython_lib_dir();
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+import mini_enum_str_members_stage
+
+STAGE = "before_class"
+ERROR = None
+HEAD_OK = None
+STRICT_OK = None
+HOOK_ENTERED = False
+HOOK_MRO_OK = False
+HOOK_STAGE = "not_entered"
+HOOK_LAST_BASE = None
+HOOK_CLASS = None
+TRACE_LINE = None
+TRACE_NAME = None
+TRACE_FILE = None
+HOOK_CALLS = 0
+HOOK_MEMBER = None
+
+_original_set_name = mini_enum_str_members_stage._proto_member.__set_name__
+
+def _traced_set_name(self, enum_class, member_name):
+    global HOOK_ENTERED, HOOK_MRO_OK, HOOK_STAGE, HOOK_LAST_BASE, HOOK_CLASS, HOOK_CALLS, HOOK_MEMBER
+    HOOK_ENTERED = True
+    HOOK_CLASS = enum_class
+    HOOK_CALLS += 1
+    HOOK_MEMBER = member_name
+    HOOK_STAGE = "entered"
+    _ = enum_class.__mro__
+    HOOK_MRO_OK = True
+    HOOK_STAGE = "after_initial_mro"
+    delattr(enum_class, member_name)
+    HOOK_STAGE = "after_delattr"
+
+    value = self.value
+    HOOK_STAGE = "after_value"
+    if not isinstance(value, tuple):
+        args = (value,)
+    else:
+        args = value
+    HOOK_STAGE = "after_args"
+    if enum_class._member_type_ is tuple:
+        args = (args,)
+    HOOK_STAGE = "after_member_type_args"
+
+    if not enum_class._use_args_:
+        enum_member = enum_class._new_member_(enum_class)
+    else:
+        enum_member = enum_class._new_member_(enum_class, *args)
+    HOOK_STAGE = "after_new_member"
+
+    if not hasattr(enum_member, "_value_"):
+        if enum_class._member_type_ is object:
+            enum_member._value_ = value
+        else:
+            enum_member._value_ = enum_class._member_type_(*args)
+    HOOK_STAGE = "after_value_init"
+
+    value = enum_member._value_
+    enum_member._name_ = member_name
+    enum_member.__objclass__ = enum_class
+    HOOK_STAGE = "after_member_identity"
+    enum_member.__init__(*args)
+    enum_member._sort_order_ = len(enum_class._member_names_)
+    HOOK_STAGE = "after_member_init"
+
+    try:
+        try:
+            enum_member = enum_class._value2member_map_[value]
+            HOOK_STAGE = "after_fast_alias_lookup"
+        except TypeError:
+            HOOK_STAGE = "after_alias_lookup_typeerror"
+            for name, canonical_member in enum_class._member_map_.items():
+                if canonical_member._value_ == value:
+                    enum_member = canonical_member
+                    HOOK_STAGE = "after_alias_linear_match"
+                    break
+            else:
+                HOOK_STAGE = "before_alias_keyerror"
+                raise KeyError
+    except KeyError:
+        HOOK_STAGE = "after_alias_keyerror"
+        enum_class._member_names_.append(member_name)
+
+    HOOK_STAGE = "before_descriptor_scan"
+    found_descriptor = None
+    descriptor_type = None
+    class_type = None
+    mro_tail = enum_class.__mro__[1:]
+    HOOK_STAGE = "after_descriptor_mro"
+    for base in mro_tail:
+        HOOK_LAST_BASE = getattr(base, "__name__", None)
+        HOOK_STAGE = "scanning_base"
+        attr = base.__dict__.get(member_name)
+        if attr is not None:
+            if isinstance(attr, (property, mini_enum_str_members_stage.DynamicClassAttribute)):
+                found_descriptor = attr
+                class_type = base
+                descriptor_type = "enum"
+                HOOK_STAGE = "found_enum_descriptor"
+                break
+            elif mini_enum_str_members_stage._is_descriptor(attr):
+                found_descriptor = attr
+                descriptor_type = descriptor_type or "desc"
+                class_type = class_type or base
+                HOOK_STAGE = "found_data_descriptor"
+                continue
+            else:
+                descriptor_type = "attr"
+                class_type = base
+                HOOK_STAGE = "found_plain_attr"
+
+    if found_descriptor:
+        redirect = property()
+        redirect.member = enum_member
+        redirect.__set_name__(enum_class, member_name)
+        if descriptor_type in ("enum", "desc"):
+            redirect.fget = getattr(found_descriptor, "fget", None)
+            redirect._get = getattr(found_descriptor, "__get__", None)
+            redirect.fset = getattr(found_descriptor, "fset", None)
+            redirect._set = getattr(found_descriptor, "__set__", None)
+            redirect.fdel = getattr(found_descriptor, "fdel", None)
+            redirect._del = getattr(found_descriptor, "__delete__", None)
+        redirect._attr_type = descriptor_type
+        redirect._cls_type = class_type
+        setattr(enum_class, member_name, redirect)
+        HOOK_STAGE = "after_redirect_setattr"
+    else:
+        setattr(enum_class, member_name, enum_member)
+        HOOK_STAGE = "after_member_setattr"
+
+    enum_class._member_map_[member_name] = enum_member
+    HOOK_STAGE = "after_member_map"
+    try:
+        enum_class._value2member_map_.setdefault(value, enum_member)
+        HOOK_STAGE = "after_value2member"
+    except TypeError:
+        enum_class._unhashable_values_.append(value)
+        HOOK_STAGE = "after_unhashable_append"
+
+    return None
+
+mini_enum_str_members_stage._proto_member.__set_name__ = _traced_set_name
+
+try:
+    class FlagBoundary(mini_enum_str_members_stage.StrEnum):
+        STRICT = mini_enum_str_members_stage.auto()
+        CONFORM = mini_enum_str_members_stage.auto()
+        EJECT = mini_enum_str_members_stage.auto()
+        KEEP = mini_enum_str_members_stage.auto()
+
+    STAGE = "after_class"
+    HEAD_OK = FlagBoundary.__mro__[0] is FlagBoundary
+    STAGE = "after_mro"
+    STRICT_OK = FlagBoundary.STRICT.value == "strict"
+    STAGE = "after_member"
+except Exception as exc:
+    ERROR = str(exc)
+    tb = exc.__traceback__
+    while tb is not None:
+        TRACE_LINE = tb.tb_lineno
+        TRACE_NAME = tb.tb_frame.f_code.co_name
+        TRACE_FILE = tb.tb_frame.f_code.co_filename
+        tb = tb.tb_next
+"#,
+        &[temp_dir.as_path(), cpython_lib.as_path()],
+    )
+    .expect("diagnostic enum stage probe should execute");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    let stage = python_string_value(main.get_attr("STAGE").expect("STAGE should be bound"))
+        .expect("STAGE should be a python string");
+    let error = main
+        .get_attr("ERROR")
+        .and_then(python_string_value)
+        .unwrap_or_else(|| "<none>".to_string());
+    let hook_entered = main
+        .get_attr("HOOK_ENTERED")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let hook_mro_ok = main
+        .get_attr("HOOK_MRO_OK")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let hook_stage = main
+        .get_attr("HOOK_STAGE")
+        .and_then(python_string_value)
+        .unwrap_or_else(|| "<none>".to_string());
+    let hook_last_base = main
+        .get_attr("HOOK_LAST_BASE")
+        .and_then(python_string_value)
+        .unwrap_or_else(|| "<none>".to_string());
+    let hook_class = main
+        .get_attr("HOOK_CLASS")
+        .expect("HOOK_CLASS should be bound");
+    let hook_class_ptr = hook_class
+        .as_object_ptr()
+        .expect("HOOK_CLASS should reference the active enum class");
+    let hook_class = unsafe { &*(hook_class_ptr as *const PyClassObject) };
+    let hook_class_id = hook_class.class_id().0;
+    let hook_mro_registry = hook_class
+        .mro()
+        .iter()
+        .map(|class_id| {
+            let registered = if class_id.0 < TypeId::FIRST_USER_TYPE {
+                true
+            } else {
+                global_class(*class_id).is_some()
+            };
+            format!("{}={registered}", class_id.0)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let trace_line = main
+        .get_attr("TRACE_LINE")
+        .and_then(|value| value.as_int())
+        .unwrap_or(-1);
+    let trace_name = main
+        .get_attr("TRACE_NAME")
+        .and_then(python_string_value)
+        .unwrap_or_else(|| "<none>".to_string());
+    let trace_file = main
+        .get_attr("TRACE_FILE")
+        .and_then(python_string_value)
+        .unwrap_or_else(|| "<none>".to_string());
+    let hook_calls = main
+        .get_attr("HOOK_CALLS")
+        .and_then(|value| value.as_int())
+        .unwrap_or(-1);
+    let hook_member = main
+        .get_attr("HOOK_MEMBER")
+        .and_then(python_string_value)
+        .unwrap_or_else(|| "<none>".to_string());
+    assert_eq!(
+        stage, "after_member",
+        "ERROR={error}; HOOK_ENTERED={hook_entered}; HOOK_MRO_OK={hook_mro_ok}; HOOK_STAGE={hook_stage}; HOOK_LAST_BASE={hook_last_base}; HOOK_CLASS_ID={hook_class_id}; HOOK_MRO_REGISTRY=[{hook_mro_registry}]; TRACE_LINE={trace_line}; TRACE_NAME={trace_name}; TRACE_FILE={trace_file}; HOOK_CALLS={hook_calls}; HOOK_MEMBER={hook_member}"
+    );
+    assert_eq!(
+        main.get_attr("ERROR").map(|value| value.is_none()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("HEAD_OK").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("STRICT_OK").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("HOOK_ENTERED")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("HOOK_MRO_OK")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("HOOK_STAGE")
+            .and_then(python_string_value)
+            .as_deref(),
+        Some("after_value2member")
+    );
+}
+
+#[test]
+fn test_prepare_mapping_observes_live_class_namespace_mutations() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class TrackingDict(dict):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def __setitem__(self, key, value):
+        self.events.append(("set", key, key in self))
+        return super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.events.append(("del", key, key in self))
+        return super().__delitem__(key)
+
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        namespace = TrackingDict()
+        namespace["seed"] = 41
+        return namespace
+
+    def __new__(mcls, name, bases, namespace):
+        filtered = []
+        for event in namespace.events:
+            key = event[1]
+            if key == "seed" or key == "before" or key == "after":
+                filtered.append(event)
+        cls = super().__new__(mcls, name, bases, namespace)
+        cls.before = namespace["before"]
+        cls.seed = namespace["seed"]
+        cls.filtered_event_count = len(filtered)
+        return cls
+
+class Example(metaclass=Meta):
+    before = seed
+    seed = 42
+    after = seed
+    del after
+
+CHECK_BEFORE = Example.before
+CHECK_SEED = Example.seed
+CHECK_AFTER_PRESENT = hasattr(Example, "after")
+CHECK_FILTERED_EVENT_COUNT = Example.filtered_event_count
+"#,
+        &[],
+    )
+    .expect("prepared namespace mutation program should execute");
+
+    assert_eq!(
+        main.get_attr("CHECK_BEFORE")
+            .and_then(|value| value.as_int()),
+        Some(41)
+    );
+    assert_eq!(
+        main.get_attr("CHECK_SEED").and_then(|value| value.as_int()),
+        Some(42)
+    );
+    assert_eq!(
+        main.get_attr("CHECK_AFTER_PRESENT")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        main.get_attr("CHECK_FILTERED_EVENT_COUNT")
+            .and_then(|value| value.as_int()),
+        Some(4)
+    );
+}
+
+#[test]
+fn test_prepare_mapping_does_not_replay_class_body_writes() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class RecordingDict(dict):
+    def __init__(self):
+        super().__init__()
+        self.counts = {}
+
+    def __setitem__(self, key, value):
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return super().__setitem__(key, value)
+
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        namespace = RecordingDict()
+        namespace["seed"] = 0
+        return namespace
+
+    def __new__(mcls, name, bases, namespace):
+        cls = super().__new__(mcls, name, bases, namespace)
+        cls.seed_writes = namespace.counts["seed"]
+        cls.value_writes = namespace.counts["value"]
+        return cls
+
+class Example(metaclass=Meta):
+    seed = 1
+    value = 2
+
+RESULT_SEED_WRITES = Example.seed_writes
+RESULT_VALUE_WRITES = Example.value_writes
+
+"#,
+        &[],
+    )
+    .expect("prepared namespace replay probe should execute");
+
+    assert_eq!(
+        main.get_attr("RESULT_SEED_WRITES")
+            .and_then(|value| value.as_int()),
+        Some(2)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_VALUE_WRITES")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn test_heap_dict_subscript_overrides_bypass_native_fast_path() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class RecordingDict(dict):
+    def __init__(self):
+        super().__init__()
+        self.set_count = 0
+        self.get_count = 0
+        self.del_count = 0
+
+    def __setitem__(self, key, value):
+        self.set_count += 1
+        return super().__setitem__(key, value + 1)
+
+    def __getitem__(self, key):
+        self.get_count += 1
+        return super().__getitem__(key) + 10
+
+    def __delitem__(self, key):
+        self.del_count += 1
+        return super().__delitem__(key)
+
+mapping = RecordingDict()
+mapping["token"] = 5
+RESULT_READ = mapping["token"]
+del mapping["token"]
+RESULT_AFTER_DELETE = mapping.get("token")
+RESULT_SET_COUNT = mapping.set_count
+RESULT_GET_COUNT = mapping.get_count
+RESULT_DEL_COUNT = mapping.del_count
+"#,
+        &[],
+    )
+    .expect("dict subclass override probe should execute");
+
+    assert_eq!(
+        main.get_attr("RESULT_READ")
+            .and_then(|value| value.as_int()),
+        Some(16)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_SET_COUNT")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_GET_COUNT")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_DEL_COUNT")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert!(
+        main.get_attr("RESULT_AFTER_DELETE")
+            .is_some_and(|value| value.is_none())
+    );
+}
+
+#[test]
+fn test_delete_attribute_executes_runtime_protocol() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Box:
+    pass
+
+box = Box()
+box.value = 41
+del box.value
+
+try:
+    box.value
+except AttributeError:
+    RESULT_MISSING = True
+else:
+    RESULT_MISSING = False
+"#,
+        &[],
+    )
+    .expect("attribute delete probe should execute");
+
+    assert_eq!(
+        main.get_attr("RESULT_MISSING")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn test_prepare_mapping_reads_fall_back_to_globals_before_local_assignment() {
+    let result = execute(
+        r#"
+seed = 7
+
+class TrackingDict(dict):
+    pass
+
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        return TrackingDict()
+
+class Example(metaclass=Meta):
+    before = seed
+    seed = 9
+
+assert Example.before == 7
+assert Example.seed == 9
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_enum_style_sunder_detection_matches_cpython_semantics() {
+    let result = execute(
+        r#"
+def _is_sunder(name):
+    return (
+        len(name) > 2 and
+        name[0] == name[-1] == '_' and
+        name[1:2] != '_' and
+        name[-2:-1] != '_'
+    )
+
+assert _is_sunder("_generate_next_value_")
+assert _is_sunder("_ignore_")
+assert not _is_sunder("__dunder__")
+assert not _is_sunder("plain")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_chained_string_comparison_with_negative_slice_bounds() {
+    let result = execute(
+        r#"
+name = "_generate_next_value_"
+
+assert name[0] == name[-1] == "_"
+assert name[1:2] != "_"
+assert name[-2:-1] != "_"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_prepare_mapping_supports_decorated_sunder_redefinition() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+def _is_sunder(name):
+    return (
+        len(name) > 2 and
+        name[0] == name[-1] == "_" and
+        name[1:2] != "_" and
+        name[-2:-1] != "_"
+    )
+
+class EnumLikeDict(dict):
+    def __init__(self):
+        super().__init__()
+        self._member_names = {}
+
+    def __setitem__(self, key, value):
+        if _is_sunder(key):
+            if key == "_generate_next_value_":
+                pass
+        elif key in self._member_names:
+            raise TypeError("%r already defined as %r" % (key, self[key]))
+        else:
+            if key in self:
+                raise TypeError("%r already defined as %r" % (key, self[key]))
+        return super().__setitem__(key, value)
+
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        namespace = EnumLikeDict()
+        namespace["_generate_next_value_"] = object()
+        return namespace
+
+class Example(metaclass=Meta):
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return count
+
+RESULT = Example._generate_next_value_("x", 1, 2, [])
+"#,
+        &[],
+    )
+    .expect("decorated sunder class body should execute");
+    assert_eq!(
+        main.get_attr("RESULT").and_then(|value| value.as_int()),
+        Some(2)
+    );
+}
+
+#[test]
+fn test_nested_if_inside_elif_does_not_fall_through_outer_chain() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+events = []
+
+def probe(key):
+    if False:
+        events.append("private")
+    elif True:
+        if False:
+            events.append("reserved")
+        if key == "x":
+            events.append("inner")
+        elif key == "y":
+            events.append("ignore")
+    elif key == "x":
+        events.append("duplicate")
+    else:
+        events.append("else")
+
+probe("x")
+EVENT_COUNT = len(events)
+EVENT_0 = events[0] if len(events) > 0 else None
+EVENT_1 = events[1] if len(events) > 1 else None
+HAS_INNER = "inner" in events
+HAS_DUPLICATE = "duplicate" in events
+"#,
+        &[],
+    )
+    .expect("nested elif control-flow probe should execute");
+
+    assert_eq!(
+        main.get_attr("HAS_INNER").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("HAS_DUPLICATE")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        main.get_attr("EVENT_COUNT")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert!(
+        main.get_attr("EVENT_0")
+            .is_some_and(|value| value_is_python_string(value, "inner"))
+    );
+    assert!(
+        main.get_attr("EVENT_1")
+            .is_some_and(|value| value.is_none())
+    );
+}
+
+#[test]
+fn test_prepare_mapping_supports_inherited_generate_next_value_redefinition() {
+    let result = execute(
+        r#"
+def _is_sunder(name):
+    return (
+        len(name) > 2 and
+        name[0] == name[-1] == "_" and
+        name[1:2] != "_" and
+        name[-2:-1] != "_"
+    )
+
+class EnumLikeDict(dict):
+    def __init__(self):
+        super().__init__()
+        self._member_names = {}
+        self._ignore = []
+        self._auto_called = False
+        self._cls_name = ""
+
+    def __setitem__(self, key, value):
+        if _is_sunder(key):
+            if key == "_generate_next_value_":
+                if self._auto_called:
+                    raise TypeError("_generate_next_value_ must be defined before members")
+                _gnv = value.__func__ if isinstance(value, staticmethod) else value
+                self._generate_next_value = _gnv
+        elif key in self._member_names:
+            raise TypeError("%r already defined as %r" % (key, self[key]))
+        else:
+            if key in self:
+                raise TypeError("%r already defined as %r" % (key, self[key]))
+        return super().__setitem__(key, value)
+
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        namespace = EnumLikeDict()
+        namespace._cls_name = name
+        first = bases[0] if bases else None
+        if first is not None:
+            namespace["_generate_next_value_"] = getattr(first, "_generate_next_value_", None)
+        return namespace
+
+class Base(metaclass=Meta):
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return count
+
+class Derived(Base):
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return count + 1
+
+assert Derived._generate_next_value_("x", 1, 2, []) == 3
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_class_function_lookup_on_type_does_not_inject_class_argument() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Example:
+    def combine(a, b):
+        return a + b
+
+RESULT = Example.combine(2, 3)
+"#,
+        &[],
+    )
+    .expect("plain function lookup on class should execute");
+    assert_eq!(
+        main.get_attr("RESULT").and_then(|value| value.as_int()),
+        Some(5)
+    );
+}
+
+#[test]
+fn test_metaclass_method_lookup_still_binds_class_argument() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Meta(type):
+    def describe(cls):
+        return cls.__name__
+
+class Example(metaclass=Meta):
+    pass
+
+RESULT = Example.describe()
+"#,
+        &[],
+    )
+    .expect("metaclass method lookup should execute");
+    assert!(value_is_python_string(
+        main.get_attr("RESULT").expect("RESULT should be bound"),
+        "Example"
+    ));
+}
+
+#[test]
+fn test_import_re_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import re
+RESULT = re.escape("a+b")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+    assert!(value_is_python_string(
+        result.expect("re import should return a value"),
+        "a\\+b"
+    ));
+}
+
+#[test]
+fn test_import_tokenize_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import tokenize
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_unittest_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest
+"#,
+        120_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_unittest_text_runner_executes_basic_testcase_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest
+
+class Smoke(unittest.TestCase):
+    def test_ok(self):
+        self.assertTrue(True)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(Smoke)
+result = unittest.TextTestRunner(verbosity=0).run(suite)
+
+assert result.wasSuccessful()
+assert result.testsRun == 1
+assert len(result.failures) == 0
+assert len(result.errors) == 0
+"#,
+        200_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_unpack_sequence_uses_metaclass_iter_protocol() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Meta(type):
+    def __iter__(cls):
+        return iter((10, 20))
+
+class Values(metaclass=Meta):
+    pass
+
+first, second = Values
+"#,
+        &[],
+    )
+    .expect("metaclass unpack should execute");
+
+    assert_eq!(
+        main.get_attr("first")
+            .and_then(|value| value.as_int())
+            .expect("first should be bound"),
+        10
+    );
+    assert_eq!(
+        main.get_attr("second")
+            .and_then(|value| value.as_int())
+            .expect("second should be bound"),
+        20
+    );
+}
+
+#[test]
+fn test_metaclass_super_new_preserves_namespace_entries() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Meta(type):
+    def __new__(metacls, name, bases, namespace):
+        namespace["_member_names_"] = 7
+        namespace["answer"] = 42
+        return super().__new__(metacls, name, bases, namespace)
+
+class Dynamic(metaclass=Meta):
+    pass
+"#,
+        &[],
+    )
+    .expect("metaclass super().__new__ should execute");
+
+    let dynamic = main.get_attr("Dynamic").expect("Dynamic should exist");
+    let dynamic_ptr = dynamic.as_object_ptr().expect("Dynamic should be a class");
+    let dynamic_class =
+        unsafe { &*(dynamic_ptr as *const prism_runtime::object::class::PyClassObject) };
+    assert_eq!(
+        dynamic_class
+            .get_attr(&prism_core::intern::intern("answer"))
+            .and_then(|value| value.as_int()),
+        Some(42)
+    );
+    assert!(
+        dynamic_class
+            .get_attr(&prism_core::intern::intern("_member_names_"))
+            .is_some(),
+        "metaclass namespace entries should survive type.__new__"
+    );
+}
+
+#[test]
+fn test_metaclass_super_new_invokes_descriptor_set_name_hooks() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        events.append((owner.__name__, name))
+
+class Meta(type):
+    def __new__(metacls, name, bases, namespace):
+        return super().__new__(metacls, name, bases, namespace)
+
+class Example(metaclass=Meta):
+    field = Descriptor()
+
+assert events == [("Example", "field")]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_metaclass_super_new_exposes_fresh_class_mro_during_set_name_hooks() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        assert owner.__mro__[0] is owner
+        assert owner.__mro__[1] is object
+        events.append((owner.__name__, name))
+
+class Meta(type):
+    def __new__(metacls, name, bases, namespace):
+        return super().__new__(metacls, name, bases, namespace)
+
+class Example(metaclass=Meta):
+    field = Descriptor()
+
+assert events == [("Example", "field")]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_metaclass_super_new_preserves_descriptor_set_name_order() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __init__(self, token):
+        self.token = token
+    def __set_name__(self, owner, name):
+        events.append((self.token, owner.__name__, name))
+
+class Meta(type):
+    def __new__(metacls, name, bases, namespace):
+        return super().__new__(metacls, name, bases, namespace)
+
+class Example(metaclass=Meta):
+    first = Descriptor("first")
+    second = Descriptor("second")
+    third = Descriptor("third")
+
+assert events == [
+    ("first", "Example", "first"),
+    ("second", "Example", "second"),
+    ("third", "Example", "third"),
+]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_metaclass_inherited_type_new_invokes_descriptor_set_name_hooks() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        events.append((owner.__name__, name))
+
+class Meta(type):
+    pass
+
+class Example(metaclass=Meta):
+    field = Descriptor()
+
+assert events == [("Example", "field")]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_none_dunder_new_matches_cpython_behavior() {
+    let result = execute(
+        r#"
+sentinel = object()
+value = getattr(None, "__new__", sentinel)
+assert value is not sentinel
+assert value == None.__new__
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_getattr_default_handles_none_in_enum_find_new_pattern() {
+    let result = execute(
+        r#"
+seen = []
+for method in ("__new_member__", "__new__"):
+    for possible in (str, None):
+        target = getattr(possible, method, None)
+        seen.append((possible is None, method, target is None))
+
+assert seen == [
+    (False, "__new_member__", True),
+    (True, "__new_member__", True),
+    (False, "__new__", False),
+    (True, "__new__", False),
+]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_heap_class_dunder_new_repeated_lookup_compares_equal() {
+    let result = execute(
+        r#"
+class Example:
+    def __new__(cls, value=None):
+        return object.__new__(cls)
+
+first = Example.__new__
+second = Example.__new__
+assert first == second
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_heap_class_dunder_new_repeated_lookup_is_hash_stable() {
+    let result = execute(
+        r#"
+class Example:
+    def __new__(cls, value=None):
+        return object.__new__(cls)
+
+first = Example.__new__
+sentinels = {None, None.__new__, object.__new__, Example.__new__}
+assert Example.__new__ in {first}
+assert first in sentinels
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_type_three_arg_form_invokes_descriptor_set_name_hooks() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        events.append((owner.__name__, name))
+
+Example = type("Example", (), {"field": Descriptor()})
+
+assert events == [("Example", "field")]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_set_name_hooks_can_invoke_inherited_init_on_fresh_instances() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        instance = owner()
+        assert callable(instance.__init__)
+        instance.__init__()
+        events.append((owner.__name__, name))
+
+class Example:
+    field = Descriptor()
+
+assert events == [("Example", "field")]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_set_name_hooks_can_delete_class_attr_without_breaking_fresh_mro() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __set_name__(self, owner, name):
+        delattr(owner, name)
+        assert owner.__mro__[0] is owner
+        assert owner.__mro__[1] is object
+        events.append(name)
+
+class Example:
+    field = Descriptor()
+
+assert events == ["field"]
+assert hasattr(Example, "field") is False
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_str_subclass_instances_preserve_native_string_semantics() {
+    let result = execute(
+        r#"
+class StringChild(str):
+    pass
+
+value = str.__new__(StringChild, "Seed")
+value.extra = 7
+
+assert type(value) is StringChild
+assert value == "Seed"
+assert "Seed" == value
+assert hash(value) == hash("Seed")
+assert len(value) == 4
+assert value.lower() == "seed"
+assert callable(value.__init__)
+value.__init__()
+assert value.extra == 7
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_metaclass_new_sees_fresh_str_subclasses_as_native_str_types() {
+    let result = execute(
+        r#"
+SEEN_SUBTYPE = None
+CONSTRUCTED = None
+
+class Meta(type):
+    def __new__(metacls, name, bases, namespace):
+        cls = super().__new__(metacls, name, bases, namespace)
+        global SEEN_SUBTYPE, CONSTRUCTED
+        SEEN_SUBTYPE = issubclass(cls, str)
+        value = str.__new__(cls, "Seed")
+        value.__init__()
+        CONSTRUCTED = (type(value) is cls, value == "Seed", callable(value.__init__))
+        return cls
+
+class StringChild(str, metaclass=Meta):
+    pass
+
+assert SEEN_SUBTYPE is True
+assert CONSTRUCTED == (True, True, True)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_zero_arg_super_calls_parent_method() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Base:
+    def value(self):
+        return "base"
+
+class Child(Base):
+    def value(self):
+        return super().value() + "-child"
+
+RESULT = Child().value()
+"#,
+        &[],
+    )
+    .expect("super() regression program should execute");
+    let result = main.get_attr("RESULT").expect("RESULT should be bound");
+    assert!(value_is_python_string(result, "base-child"));
+}
+
+#[test]
+fn test_explicit_super_calls_parent_method() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Base:
+    def answer(self):
+        return 41
+
+class Child(Base):
+    def answer(self):
+        return super(Child, self).answer() + 1
+
+RESULT = Child().answer()
+"#,
+        &[],
+    )
+    .expect("explicit super regression program should execute");
+    let result = main.get_attr("RESULT").expect("RESULT should be bound");
+    assert_eq!(result.as_int(), Some(42));
+}
+
+#[test]
+fn test_super_exposes_standard_binding_attributes() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Base:
+    pass
+
+class Child(Base):
+    def inspect(self):
+        proxy = super()
+        assert proxy.__self__ is self
+        assert proxy.__self_class__ is Child
+        assert proxy.__thisclass__ is Child
+        return "ok"
+
+RESULT = Child().inspect()
+"#,
+        &[],
+    )
+    .expect("super binding regression program should execute");
+    let result = main.get_attr("RESULT").expect("RESULT should be bound");
+    assert!(value_is_python_string(result, "ok"));
+}
+
+#[test]
+fn test_metaclass_direct_call_uses_custom_new() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Meta(type):
+    def __new__(metacls, name, bases, namespace):
+        namespace["answer"] = 42
+        return type.__new__(metacls, name, bases, namespace)
+
+Dynamic = Meta("Dynamic", (), {})
+"#,
+        &[],
+    )
+    .expect("direct metaclass call should execute");
+
+    let dynamic = main.get_attr("Dynamic").expect("Dynamic should exist");
+    let dynamic_ptr = dynamic.as_object_ptr().expect("Dynamic should be a class");
+    let dynamic_class =
+        unsafe { &*(dynamic_ptr as *const prism_runtime::object::class::PyClassObject) };
+    assert_eq!(
+        dynamic_class
+            .get_attr(&prism_core::intern::intern("answer"))
+            .and_then(|value| value.as_int()),
+        Some(42)
+    );
+}
+
+#[test]
+fn test_user_defined_class_custom_new_executes_before_init() {
+    let result = execute(
+        r#"
+class Token:
+    def __new__(cls, value):
+        instance = object.__new__(cls)
+        instance.created = value
+        return instance
+
+    def __init__(self, value):
+        self.inited = value + 1
+
+token = Token(4)
+assert token.created == 4
+assert token.inited == 5
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_user_defined_class_init_executes_body_before_returning_instance() {
+    let result = execute(
+        r#"
+class Marker:
+    ran = False
+
+    def __init__(self):
+        Marker.ran = True
+
+Marker()
+assert Marker.ran is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_class_body_bindings_preserve_distinct_local_slots() {
+    let result = execute(
+        r#"
+class Probe:
+    x = 1
+    y = 2
+
+assert Probe.x == 1
+assert Probe.y == 2
+assert Probe.__dict__["x"] == 1
+assert Probe.__dict__["y"] == 2
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_class_method_bindings_do_not_alias_init_slot() {
+    let result = execute(
+        r#"
+class Probe:
+    def __init__(self, value):
+        pass
+
+    def f(self, other):
+        return other
+
+assert Probe.__dict__["__init__"](None, 9) is None
+assert Probe.__dict__["f"](None, 7) == 7
+assert isinstance(Probe(1), Probe)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_nested_class_definition_binds_into_outer_class_namespace() {
+    let result = execute(
+        r#"
+class Outer:
+    class Inner:
+        token = 3
+
+assert Outer.Inner.token == 3
+assert Outer.__dict__["Inner"].token == 3
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_keyword_only_function_call_binds_and_executes() {
+    let result = execute(
+        r#"
+def configure(*, maxlevel=6):
+    return maxlevel
+
+assert configure() == 6
+assert configure(maxlevel=4) == 4
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_keyword_only_function_can_mutate_constructed_instance() {
+    let result = execute(
+        r#"
+class Holder:
+    pass
+
+def configure(self, *, maxlevel=6):
+    self.maxlevel = maxlevel
+
+value = Holder()
+configure(value)
+assert value.maxlevel == 6
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_keyword_only_function_mutation_persists_in_main_module_instance() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Holder:
+    pass
+
+def configure(self, *, maxlevel=6):
+    self.maxlevel = maxlevel
+
+value = Holder()
+configure(value)
+"#,
+        &[],
+    )
+    .expect("program should execute");
+
+    let value = main.get_attr("value").expect("value binding should exist");
+    let value_ptr = value
+        .as_object_ptr()
+        .expect("value binding should be an object pointer");
+    let header = unsafe { &*(value_ptr as *const ObjectHeader) };
+    assert!(
+        header.type_id.raw() >= TypeId::FIRST_USER_TYPE,
+        "expected a user-defined instance, got {:?}",
+        header.type_id
+    );
+
+    let shaped =
+        unsafe { &*(value_ptr as *const prism_runtime::object::shaped_object::ShapedObject) };
+    assert_eq!(
+        shaped
+            .get_property("maxlevel")
+            .and_then(|value| value.as_int()),
+        Some(6),
+        "instance mutation should persist on the constructed object"
+    );
+}
+
+#[test]
+fn test_user_defined_class_init_runs_with_keyword_only_defaults() {
+    let result = execute(
+        r#"
+class ReprStyle:
+    def __init__(self, *, maxlevel=6):
+        self.maxlevel = maxlevel
+
+value = ReprStyle()
+assert value.maxlevel == 6
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_user_defined_class_init_binds_positional_and_keyword_args() {
+    let result = execute(
+        r#"
+class Example:
+    def __init__(self, left, *, right=2):
+        self.total = left + right
+
+value = Example(3, right=4)
+assert value.total == 7
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_user_defined_class_init_varkw_preserves_string_keys() {
+    let result = execute(
+        r#"
+class Example:
+    def __init__(self, **kw):
+        assert kw["x"] == 1
+        assert "x" in kw
+        self.kw = kw
+
+value = Example(x=1)
+assert value.kw["x"] == 1
+assert "x" in value.kw
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_functools_partial_keyword_binding_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import functools
+
+p = functools.partial(lambda **kw: kw["x"], x=1)
+assert p() == 1
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_unittest_result_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest.result
+"#,
+        120_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_method_call_uses_positional_default_after_binding_self() {
+    let result = execute(
+        r#"
+class Probe:
+    def value(self, amount=1):
+        return amount
+
+assert Probe().value() == 1
+assert Probe().value(7) == 7
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_method_call_collects_varargs_after_binding_self() {
+    let result = execute(
+        r#"
+class Probe:
+    def collect(self, *args):
+        return args
+
+assert Probe().collect(1, 2, 3) == (1, 2, 3)
+assert Probe().collect() == ()
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_method_call_uses_keyword_only_default_after_binding_self() {
+    let result = execute(
+        r#"
+class Probe:
+    def flag(self, *, enabled=True):
+        return enabled
+
+assert Probe().flag() is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_contextlib_contextmanager_decorator_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import contextlib
+
+@contextlib.contextmanager
+def token():
+    yield 7
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_call_ex_keywords_preserve_locals_across_try_except() {
+    let result = execute(
+        r#"
+def copy_metadata(wrapper, wrapped):
+    for attr in ("__annotations__",):
+        try:
+            value = getattr(wrapped, attr)
+        except AttributeError:
+            pass
+        else:
+            setattr(wrapper, attr, value)
+    assert wrapper is not None
+    return wrapper
+
+def wrapped():
+    yield 1
+
+def wrapper():
+    return 1
+
+args = (wrapper,)
+kwargs = {"wrapped": wrapped}
+assert copy_metadata(*args, **kwargs) is wrapper
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_functools_wraps_decorator_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import functools
+
+def wrapped():
+    yield 1
+
+@functools.wraps(wrapped)
+def wrapper():
+    return 7
+
+assert wrapper.__name__ == "wrapped"
+assert wrapper.__wrapped__ is wrapped
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_reprlib_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import reprlib
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_dict_item_assignment_uses_compiler_set_item_encoding() {
+    let result = execute(
+        r#"
+d = {}
+d["answer"] = 42
+assert d["answer"] == 42
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_sys_modules_mapping_supports_item_assignment() {
+    let result = execute(
+        r#"
+import sys
+sys.modules["prism_alias"] = sys
+assert sys.modules["prism_alias"] is sys
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_frozenset_membership_uses_containment_fast_path() {
+    let result = execute(
+        r#"
+flags = frozenset(["HAVE_LSTAT", "MS_WINDOWS"])
+assert "HAVE_LSTAT" in flags
+assert "chmod" not in flags
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_set_add_method_call_mutates_receiver() {
+    let result = execute(
+        r#"
+seen = set()
+seen.add("nt")
+assert "nt" in seen
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_set_pop_method_call_returns_member_and_updates_membership() {
+    let result = execute(
+        r#"
+seen = {"enum"}
+value = seen.pop()
+assert value == "enum"
+assert "enum" not in seen
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_set_and_frozenset_support_subset_and_superset_comparisons() {
+    let result = execute(
+        r#"
+left = {1, 2}
+right = {1, 2, 3}
+frozen = frozenset([1, 2])
+same = frozenset([1, 2, 3])
+
+assert left <= right
+assert left < right
+assert right >= left
+assert right > frozen
+assert frozen <= right
+assert right >= same
+assert not right < same
+assert not left > right
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_string_upper_method_call_on_return_value() {
+    let result = execute(
+        r#"
+def check_str(value):
+    return value
+
+assert check_str("Path").upper() == "PATH"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_function_call_preserves_returned_string_value() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+def check_str(value):
+    return value
+
+result = check_str("Path")
+"#,
+        &[],
+    )
+    .expect("function call should execute");
+
+    let result = main
+        .get_attr("result")
+        .expect("result binding should exist");
+    assert!(
+        value_is_python_string(result, "Path"),
+        "function should preserve returned string values, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_nested_function_reads_outer_cell_after_alias_assignment() {
+    let result = execute(
+        r#"
+def outer():
+    def check_str(value):
+        return value
+
+    encode = check_str
+
+    def encodekey(key):
+        return encode(key).upper()
+
+    return encodekey("Path")
+
+assert outer() == "PATH"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_os_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import os
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_object_new_attribute_loads_as_builtin_function() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+value = object.__new__
+"#,
+        &[],
+    )
+    .expect("object.__new__ load should execute");
+
+    let value = main.get_attr("value").expect("value binding should exist");
+    let value_ptr = value
+        .as_object_ptr()
+        .expect("object.__new__ should be stored as an object pointer");
+    let header = unsafe { &*(value_ptr as *const ObjectHeader) };
+    assert_eq!(
+        header.type_id,
+        TypeId::BUILTIN_FUNCTION,
+        "object.__new__ should resolve to a builtin function object",
+    );
+}
+
+#[test]
+fn test_object_new_class_decorator_creates_instance_sentinel() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+@object.__new__
+class AllowMissing:
+    pass
+"#,
+        &[],
+    )
+    .expect("object.__new__ class decorator should execute");
+
+    let sentinel = main
+        .get_attr("AllowMissing")
+        .expect("decorated class binding should exist");
+    let sentinel_ptr = sentinel
+        .as_object_ptr()
+        .expect("decorated class binding should be an object pointer");
+    let header = unsafe { &*(sentinel_ptr as *const ObjectHeader) };
+    assert!(
+        header.type_id.raw() >= TypeId::FIRST_USER_TYPE,
+        "decorated class binding should be an instance of the defined class",
+    );
+}
+
+#[test]
+fn test_loaded_object_new_callable_creates_object_instance() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+decorator = object.__new__
+value = decorator(object)
+"#,
+        &[],
+    )
+    .expect("loaded object.__new__ call should execute");
+
+    let value = main.get_attr("value").expect("value binding should exist");
+    let value_ptr = value
+        .as_object_ptr()
+        .expect("object.__new__(object) should return an object instance");
+    let header = unsafe { &*(value_ptr as *const ObjectHeader) };
+    assert_eq!(header.type_id, TypeId::OBJECT);
+}
+
+#[test]
+fn test_plain_python_class_decorator_executes() {
+    let result = execute(
+        r#"
+def identity(value):
+    return value
+
+@identity
+class Example:
+    pass
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_keyword_binds_registered_module_object() {
+    let lib_dir = cpython_lib_dir();
+    let (vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+import keyword
+"#,
+        &[lib_dir.as_path()],
+    )
+    .expect("keyword import should execute");
+
+    let keyword_value = main
+        .get_attr("keyword")
+        .expect("keyword binding should exist");
+    let keyword_ptr = keyword_value
+        .as_object_ptr()
+        .expect("keyword binding should be an object pointer");
+    let keyword_module = vm
+        .import_resolver
+        .module_from_ptr(keyword_ptr)
+        .expect("keyword binding should point at a registered module");
+    assert_eq!(keyword_module.name(), "keyword");
+}
+
+#[test]
+fn test_import_keyword_exposes_bound_builtin_iskeyword() {
+    let lib_dir = cpython_lib_dir();
+    let (vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+import keyword
+"#,
+        &[lib_dir.as_path()],
+    )
+    .expect("keyword import should execute");
+
+    let keyword_value = main
+        .get_attr("keyword")
+        .expect("keyword binding should exist");
+    let keyword_ptr = keyword_value
+        .as_object_ptr()
+        .expect("keyword binding should be an object pointer");
+    let keyword_module = vm
+        .import_resolver
+        .module_from_ptr(keyword_ptr)
+        .expect("keyword binding should point at a registered module");
+
+    let iskeyword = keyword_module
+        .get_attr("iskeyword")
+        .expect("keyword.iskeyword should exist");
+    let iskeyword_ptr = iskeyword
+        .as_object_ptr()
+        .expect("keyword.iskeyword should be callable");
+    let type_id = unsafe { (*(iskeyword_ptr as *const ObjectHeader)).type_id };
+    assert_eq!(
+        type_id,
+        TypeId::BUILTIN_FUNCTION,
+        "keyword.iskeyword should be a bound builtin method, got {}",
+        type_id.name()
+    );
+}
+
+#[test]
+fn test_import_keyword_can_call_iskeyword_without_assert() {
+    let result = execute_with_cpython_lib(
+        r#"
+import keyword
+
+result = keyword.iskeyword("while")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_keyword_asserts_positive_iskeyword() {
+    let result = execute_with_cpython_lib(
+        r#"
+import keyword
+
+assert keyword.iskeyword("while")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_keyword_asserts_negative_iskeyword() {
+    let result = execute_with_cpython_lib(
+        r#"
+import keyword
+
+assert not keyword.iskeyword("prism_runtime")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_class_body_delete_removes_class_binding() {
+    let result = execute(
+        r#"
+class Namespace:
+    token = 1
+    del token
+
+assert not hasattr(Namespace, "token")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_keyword_positive_call_stores_true_bool() {
+    let lib_dir = cpython_lib_dir();
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+import keyword
+
+result = keyword.iskeyword("while")
+"#,
+        &[lib_dir.as_path()],
+    )
+    .expect("keyword positive call should execute");
+
+    let result = main
+        .get_attr("result")
+        .expect("result binding should exist");
+    assert_eq!(
+        result.as_bool(),
+        Some(true),
+        "expected bool True, got {result:?}"
+    );
+}
+
+#[test]
+fn test_import_textwrap_with_cpython_lib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import textwrap
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_collections_namedtuple_accepts_keyword_module_and_defaults() {
+    let result = execute(
+        r#"
+from collections import namedtuple
+
+Point = namedtuple("Point", "x y", module="demo.point", defaults=[7])
+assert Point.__module__ == "demo.point"
+assert Point._field_defaults["y"] == 7
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_unittest_with_cpython_lib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest
+"#,
+        120_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_dir_lists_unittest_module_and_heap_testcase_attrs() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest
+
+class Smoke(unittest.TestCase):
+    marker = 1
+
+    def test_ok(self):
+        pass
+
+module_names = dir(unittest)
+class_names = dir(Smoke)
+
+assert "TestCase" in module_names
+assert "TextTestRunner" in module_names
+assert "marker" in class_names
+assert "test_ok" in class_names
+assert "assertTrue" in class_names
+"#,
+        120_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_unittest_loader_finds_testcase_methods_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest
+
+class Smoke(unittest.TestCase):
+    def test_ok(self):
+        self.assertTrue(True)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(Smoke)
+assert suite.countTestCases() == 1
+"#,
+        160_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_imported_class_method_call_preserves_defining_module_globals() {
+    let temp_dir = unique_temp_dir("imported_class_method_globals");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("modprobe.py");
+    fs::write(
+        &module_path,
+        r#"
+from _abc import _abc_register
+
+class Meta(type):
+    def register(cls, subclass):
+        return _abc_register
+
+class Example(metaclass=Meta):
+    pass
+"#,
+    )
+    .expect("failed to write temp module");
+
+    let result = execute_with_search_paths(
+        r#"
+import modprobe
+Example = modprobe.Example
+Example.register(None)
+"#,
+        &[temp_dir.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_source_defined_metaclass_isinstance_tracks_heap_metaclass_relationship() {
+    let temp_dir = unique_temp_dir("source_defined_metaclass_isinstance");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("metaprobe.py");
+    fs::write(
+        &module_path,
+        r#"
+class Meta(type):
+    pass
+
+class Example(metaclass=Meta):
+    pass
+"#,
+    )
+    .expect("failed to write temp module");
+
+    let result = execute_with_search_paths(
+        r#"
+import metaprobe
+
+assert type(metaprobe.Example) is metaprobe.Meta
+assert isinstance(metaprobe.Example, metaprobe.Meta)
+assert isinstance(metaprobe.Meta, type)
+"#,
+        &[temp_dir.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_imported_class_direct_attribute_call_constructs_instance() {
+    let temp_dir = unique_temp_dir("imported_class_direct_attribute_call");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp module dir");
+    let module_path = temp_dir.join("callprobe.py");
+    fs::write(
+        &module_path,
+        r#"
+class C(dict):
+    pass
+"#,
+    )
+    .expect("failed to write temp module");
+
+    let result = execute_with_search_paths(
+        r#"
+import callprobe
+
+instance = callprobe.C()
+assert type(instance) is callprobe.C
+assert isinstance(instance, callprobe.C)
+assert isinstance(instance, dict)
+"#,
+        &[temp_dir.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_unary_operators() {
     let sources = ["-5", "+5", "not True", "~15"];
 
@@ -328,6 +3684,32 @@ fn test_builtin_len_call() {
 fn test_builtin_abs_call() {
     // Test calling abs() builtin
     let result = execute("x = abs(-5)");
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_builtin_any_all_accept_generator_expressions() {
+    let result = execute(
+        r#"
+assert any(x for x in [0, 0, 1])
+assert not any(x for x in [0, 0, 0])
+assert all(x for x in [1, 2, 3])
+assert not all(x for x in [1, 0, 3])
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_builtin_sorted_and_sum_accept_generator_expressions() {
+    let result = execute(
+        r#"
+assert sorted((x for x in [3, 1, 2])) == [1, 2, 3]
+assert sorted((x for x in [3, 1, 2]), None, True) == [3, 2, 1]
+assert sum(x for x in [1, 2, 3]) == 6
+assert sum((x for x in [1, 2, 3]), 10) == 16
+"#,
+    );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
 

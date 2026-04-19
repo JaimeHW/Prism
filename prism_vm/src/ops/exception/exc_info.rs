@@ -39,6 +39,7 @@
 //! | get_exc_traceback | O(1) | Clone if present |
 
 use crate::VirtualMachine;
+use crate::builtins::ExceptionValue;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 
@@ -222,10 +223,10 @@ fn build_type_value(type_id: u16) -> Value {
 ///
 /// Extracts the traceback from the exception object if present.
 #[inline]
-fn build_traceback_value(_exc_value: &Value) -> Value {
-    // TODO: Extract traceback from exception object
-    // For now, return None
-    Value::none()
+fn build_traceback_value(exc_value: &Value) -> Value {
+    unsafe { ExceptionValue::from_value(*exc_value) }
+        .and_then(|exc| exc.traceback())
+        .unwrap_or_else(Value::none)
 }
 
 // =============================================================================

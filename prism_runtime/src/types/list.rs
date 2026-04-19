@@ -4,7 +4,29 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::slice::SliceObject;
 use prism_core::Value;
+
+/// Errors raised by slice assignment when the replacement sequence does not
+/// satisfy Python's extended-slice invariants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListSliceAssignError {
+    ExtendedSliceSizeMismatch { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for ListSliceAssignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExtendedSliceSizeMismatch { expected, actual } => write!(
+                f,
+                "attempt to assign sequence of size {} to extended slice of size {}",
+                actual, expected
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ListSliceAssignError {}
 
 /// Python list object.
 ///
@@ -129,6 +151,62 @@ impl ListObject {
     #[inline]
     pub fn extend<I: IntoIterator<Item = Value>>(&mut self, iter: I) {
         self.items.extend(iter);
+    }
+
+    /// Replace the elements selected by `slice` with the provided replacement
+    /// sequence, matching Python list slice-assignment semantics.
+    pub fn assign_slice<I>(
+        &mut self,
+        slice: &SliceObject,
+        replacement: I,
+    ) -> Result<(), ListSliceAssignError>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let replacement: Vec<Value> = replacement.into_iter().collect();
+        let indices = slice.indices(self.len());
+
+        if indices.step == 1 {
+            let end = indices.stop.max(indices.start);
+            self.items.splice(indices.start..end, replacement);
+            return Ok(());
+        }
+
+        if replacement.len() != indices.length {
+            return Err(ListSliceAssignError::ExtendedSliceSizeMismatch {
+                expected: indices.length,
+                actual: replacement.len(),
+            });
+        }
+
+        for (index, value) in indices.iter().zip(replacement.into_iter()) {
+            self.items[index] = value;
+        }
+
+        Ok(())
+    }
+
+    /// Delete the elements selected by `slice`, matching Python's list slice
+    /// deletion semantics for both contiguous and extended slices.
+    pub fn delete_slice(&mut self, slice: &SliceObject) {
+        let indices = slice.indices(self.len());
+
+        if indices.length == 0 {
+            return;
+        }
+
+        if indices.step == 1 {
+            let end = indices.stop.max(indices.start);
+            self.items.drain(indices.start..end);
+            return;
+        }
+
+        let mut removal_indices: Vec<usize> = indices.iter().collect();
+        removal_indices.sort_unstable_by(|left, right| right.cmp(left));
+
+        for index in removal_indices {
+            self.items.remove(index);
+        }
     }
 
     /// Reverse the list in place.
@@ -317,5 +395,179 @@ mod tests {
         assert_eq!(list.get(0).unwrap().as_int(), Some(1));
         assert_eq!(list.get(1).unwrap().as_int(), Some(2));
         assert_eq!(list.get(2).unwrap().as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_assign_slice_replaces_contiguous_region() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+
+        list.assign_slice(
+            &SliceObject::start_stop(1, 3),
+            [Value::int(10).unwrap(), Value::int(11).unwrap()],
+        )
+        .expect("contiguous slice assignment should succeed");
+
+        assert_eq!(
+            list.as_slice(),
+            &[
+                Value::int_unchecked(0),
+                Value::int_unchecked(10),
+                Value::int_unchecked(11),
+                Value::int_unchecked(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assign_slice_can_grow_list() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]);
+
+        list.assign_slice(
+            &SliceObject::start_stop(1, 2),
+            [
+                Value::int(10).unwrap(),
+                Value::int(11).unwrap(),
+                Value::int(12).unwrap(),
+            ],
+        )
+        .expect("slice assignment should allow growth");
+
+        assert_eq!(
+            list.as_slice(),
+            &[
+                Value::int_unchecked(0),
+                Value::int_unchecked(10),
+                Value::int_unchecked(11),
+                Value::int_unchecked(12),
+                Value::int_unchecked(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assign_slice_can_insert_into_empty_region() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]);
+
+        list.assign_slice(&SliceObject::start_stop(2, 1), [Value::int(99).unwrap()])
+            .expect("empty-slice assignment should behave as insertion");
+
+        assert_eq!(
+            list.as_slice(),
+            &[
+                Value::int_unchecked(0),
+                Value::int_unchecked(1),
+                Value::int_unchecked(99),
+                Value::int_unchecked(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assign_slice_replaces_extended_slice_in_place() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(4).unwrap(),
+            Value::int(5).unwrap(),
+        ]);
+
+        list.assign_slice(
+            &SliceObject::full(0, 6, 2),
+            [
+                Value::int(10).unwrap(),
+                Value::int(11).unwrap(),
+                Value::int(12).unwrap(),
+            ],
+        )
+        .expect("extended slice assignment should succeed when lengths match");
+
+        assert_eq!(
+            list.as_slice(),
+            &[
+                Value::int_unchecked(10),
+                Value::int_unchecked(1),
+                Value::int_unchecked(11),
+                Value::int_unchecked(3),
+                Value::int_unchecked(12),
+                Value::int_unchecked(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assign_slice_rejects_mismatched_extended_slice_lengths() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+
+        let error = list
+            .assign_slice(&SliceObject::full(0, 4, 2), [Value::int(10).unwrap()])
+            .expect_err("extended slice assignment should validate replacement length");
+
+        assert_eq!(
+            error,
+            ListSliceAssignError::ExtendedSliceSizeMismatch {
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_delete_slice_removes_contiguous_region() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+
+        list.delete_slice(&SliceObject::start_stop(1, 3));
+
+        assert_eq!(
+            list.as_slice(),
+            &[Value::int_unchecked(0), Value::int_unchecked(3)]
+        );
+    }
+
+    #[test]
+    fn test_delete_slice_removes_extended_indices() {
+        let mut list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(4).unwrap(),
+            Value::int(5).unwrap(),
+        ]);
+
+        list.delete_slice(&SliceObject::full(0, 6, 2));
+
+        assert_eq!(
+            list.as_slice(),
+            &[
+                Value::int_unchecked(1),
+                Value::int_unchecked(3),
+                Value::int_unchecked(5),
+            ]
+        );
     }
 }

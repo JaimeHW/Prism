@@ -648,69 +648,21 @@ pub fn spec_ne_float(a: Value, b: Value) -> (SpecResult, Value) {
 
 use prism_runtime::TypeId;
 use prism_runtime::types::StringObject;
-
-/// Check if a Value is a StringObject (heap object with STR type).
-///
-/// This performs a two-step check:
-/// 1. Check if Value is an object pointer (TAG_OBJECT)
-/// 2. Read the object header to verify TypeId::STR
-///
-/// Returns the pointer to the StringObject if valid, None otherwise.
-#[inline(always)]
-fn extract_string_object(v: Value) -> Option<*const StringObject> {
-    if !v.is_object() {
-        return None;
-    }
-
-    if let Some(ptr) = v.as_object_ptr() {
-        // Read the object header to check the type
-        let header_ptr = ptr as *const prism_runtime::ObjectHeader;
-        // SAFETY: We've verified this is an object pointer. The first field
-        // of any Python object is the ObjectHeader.
-        let type_id = unsafe { (*header_ptr).type_id };
-
-        if type_id == TypeId::STR {
-            return Some(ptr as *const StringObject);
-        }
-    }
-
-    None
-}
+use prism_runtime::types::string::{
+    concat_string_values, repeat_string_value, value_as_string_ref,
+};
 
 /// Speculative string concatenation (str + str).
 ///
 /// # Performance
 ///
-/// Uses type header inspection for StringObject detection:
-/// 1. Check both values are object pointers with STR type
-/// 2. Direct pointer extraction
-/// 3. Delegates to optimized `StringObject::concat` with identity fast-paths
-///
-/// # Note
-///
-/// This handles StringObject heap objects. For InternedString (TAG_STRING),
-/// a different path should be used that works with the interned string data.
+/// Supports both tagged interned strings and heap `StringObject` values.
 #[inline(always)]
 pub fn spec_str_concat(a: Value, b: Value) -> (SpecResult, Value) {
-    // Extract StringObject pointers with type verification
-    let a_ptr = match extract_string_object(a) {
-        Some(p) => p,
-        None => return (SpecResult::Deopt, Value::none()),
-    };
-    let b_ptr = match extract_string_object(b) {
-        Some(p) => p,
-        None => return (SpecResult::Deopt, Value::none()),
-    };
-
-    // SAFETY: Type checks above ensure these are valid StringObject pointers.
-    // StringObjects are immutable so no data races are possible.
-    let result = unsafe { (*a_ptr).concat(&*b_ptr) };
-
-    // Box the result and create a Value::object for it
-    // Note: In production, this would integrate with the GC allocator
-    let boxed = Box::new(result);
-    let ptr = Box::into_raw(boxed) as *const ();
-    (SpecResult::Success, Value::object_ptr(ptr))
+    match concat_string_values(a, b) {
+        Some(value) => (SpecResult::Success, value),
+        None => (SpecResult::Deopt, Value::none()),
+    }
 }
 
 /// Speculative string repetition (str * int).
@@ -719,40 +671,18 @@ pub fn spec_str_concat(a: Value, b: Value) -> (SpecResult, Value) {
 ///
 /// # Performance
 ///
-/// 1. Type header check for StringObject detection
-/// 2. Early return for common edge cases (n=0, n=1)
-/// 3. Delegates to optimized `StringObject::repeat` with SSO/ASCII fast-paths
+/// Supports both tagged interned strings and heap `StringObject` values.
 #[inline(always)]
 pub fn spec_str_repeat(a: Value, b: Value) -> (SpecResult, Value) {
-    // Check for str * int pattern
-    if let Some(str_ptr) = extract_string_object(a) {
-        if let Some(n) = b.as_int() {
-            // Negative repetition count: Python returns empty string, but we signal overflow
-            // to let the slow path handle it consistently
-            if n < 0 {
-                return (SpecResult::Overflow, Value::none());
-            }
-
-            // SAFETY: Type check ensures valid StringObject pointer
-            let result = unsafe { (*str_ptr).repeat(n as usize) };
-            let boxed = Box::new(result);
-            let ptr = Box::into_raw(boxed) as *const ();
-            return (SpecResult::Success, Value::object_ptr(ptr));
+    if let Some(n) = b.as_int() {
+        if let Some(value) = repeat_string_value(a, n) {
+            return (SpecResult::Success, value);
         }
     }
 
-    // Check for int * str pattern (Python supports both orderings)
     if let Some(n) = a.as_int() {
-        if let Some(str_ptr) = extract_string_object(b) {
-            if n < 0 {
-                return (SpecResult::Overflow, Value::none());
-            }
-
-            // SAFETY: Type check ensures valid StringObject pointer
-            let result = unsafe { (*str_ptr).repeat(n as usize) };
-            let boxed = Box::new(result);
-            let ptr = Box::into_raw(boxed) as *const ();
-            return (SpecResult::Success, Value::object_ptr(ptr));
+        if let Some(value) = repeat_string_value(b, n) {
+            return (SpecResult::Success, value);
         }
     }
 
@@ -765,17 +695,14 @@ pub fn spec_str_repeat(a: Value, b: Value) -> (SpecResult, Value) {
 ///
 /// # Performance
 ///
-/// Direct pointer access to StringObject for length retrieval.
+/// Supports both tagged interned strings and heap `StringObject` values.
 #[inline(always)]
 pub fn spec_str_len(a: Value) -> (SpecResult, Value) {
-    if let Some(str_ptr) = extract_string_object(a) {
-        // SAFETY: Type check ensures valid StringObject pointer
-        let len = unsafe { (*str_ptr).len() };
-
+    if let Some(string) = value_as_string_ref(a) {
+        let len = string.len();
         if let Some(v) = Value::int(len as i64) {
             return (SpecResult::Success, v);
         }
-        // String too long to fit in integer (very unlikely but handle it)
         return (SpecResult::Overflow, Value::none());
     }
 
@@ -854,6 +781,26 @@ pub fn spec_list_concat(a: Value, b: Value) -> (SpecResult, Value) {
 mod tests {
     use super::*;
     use crate::profiler::CodeId;
+    use prism_core::intern::{intern, interned_by_ptr};
+
+    fn value_to_rust_string(value: Value) -> String {
+        if value.is_string() {
+            let ptr = value
+                .as_string_object_ptr()
+                .expect("tagged string should expose a string payload")
+                as *const u8;
+            return interned_by_ptr(ptr)
+                .expect("tagged string should resolve through the interner")
+                .as_str()
+                .to_string();
+        }
+
+        let ptr = value
+            .as_object_ptr()
+            .expect("string result should be object-backed");
+        let string = unsafe { &*(ptr as *const StringObject) };
+        string.as_str().to_string()
+    }
 
     #[test]
     fn test_speculation_from_operand_pair() {
@@ -1016,6 +963,16 @@ mod tests {
     }
 
     #[test]
+    fn test_spec_str_concat_accepts_tagged_strings() {
+        let (result, value) = spec_str_concat(
+            Value::string(intern("hello")),
+            Value::string(intern(" world")),
+        );
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value_to_rust_string(value), "hello world");
+    }
+
+    #[test]
     fn test_spec_str_repeat_deopt_on_non_string_int() {
         // float * int should deopt
         let a = Value::float(3.14);
@@ -1027,20 +984,10 @@ mod tests {
 
     #[test]
     fn test_spec_str_repeat_negative_count() {
-        // Negative repetition should return Overflow
-        let str_obj = StringObject::new("hello");
-        let boxed = Box::new(str_obj);
-        let ptr = Box::into_raw(boxed) as *const ();
-        let a = Value::object_ptr(ptr);
-        let b = Value::int(-1).unwrap();
-
-        let (result, _) = spec_str_repeat(a, b);
-        assert_eq!(result, SpecResult::Overflow);
-
-        // Cleanup
-        unsafe {
-            drop(Box::from_raw(ptr as *mut StringObject));
-        }
+        let (result, value) =
+            spec_str_repeat(Value::string(intern("hello")), Value::int(-1).unwrap());
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value_to_rust_string(value), "");
     }
 
     #[test]
@@ -1066,6 +1013,13 @@ mod tests {
             drop(Box::from_raw(result_ptr));
             drop(Box::from_raw(ptr as *mut StringObject));
         }
+    }
+
+    #[test]
+    fn test_spec_str_repeat_accepts_tagged_strings() {
+        let (result, value) = spec_str_repeat(Value::string(intern("ab")), Value::int(3).unwrap());
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value_to_rust_string(value), "ababab");
     }
 
     #[test]
@@ -1108,5 +1062,12 @@ mod tests {
         unsafe {
             drop(Box::from_raw(ptr as *mut StringObject));
         }
+    }
+
+    #[test]
+    fn test_spec_str_len_accepts_tagged_strings() {
+        let (result, value) = spec_str_len(Value::string(intern("hello")));
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value.as_int(), Some(5));
     }
 }

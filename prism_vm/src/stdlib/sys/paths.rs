@@ -6,7 +6,7 @@
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::types::list::ListObject;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Module search paths container.
@@ -17,6 +17,83 @@ use std::sync::Arc;
 pub struct SysPaths {
     /// The path list.
     paths: Vec<Arc<str>>,
+}
+
+/// Installation prefix configuration surfaced through `sys.prefix` and
+/// related attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SysPrefixes {
+    prefix: Arc<str>,
+    exec_prefix: Arc<str>,
+    base_prefix: Arc<str>,
+    base_exec_prefix: Arc<str>,
+}
+
+impl SysPrefixes {
+    /// Detect prefix values using `PYTHONHOME` when available, otherwise fall
+    /// back to the executable directory.
+    pub fn from_env(executable: Option<&Path>) -> Self {
+        if let Some((prefix, exec_prefix)) = python_home_prefixes() {
+            return Self {
+                prefix: Arc::from(prefix.as_str()),
+                exec_prefix: Arc::from(exec_prefix.as_str()),
+                base_prefix: Arc::from(prefix.as_str()),
+                base_exec_prefix: Arc::from(exec_prefix.as_str()),
+            };
+        }
+
+        let install_root = executable
+            .and_then(Path::parent)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        Self {
+            prefix: Arc::from(install_root.as_str()),
+            exec_prefix: Arc::from(install_root.as_str()),
+            base_prefix: Arc::from(install_root.as_str()),
+            base_exec_prefix: Arc::from(install_root.as_str()),
+        }
+    }
+
+    #[inline]
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_ref()
+    }
+
+    #[inline]
+    pub fn exec_prefix(&self) -> &str {
+        self.exec_prefix.as_ref()
+    }
+
+    #[inline]
+    pub fn base_prefix(&self) -> &str {
+        self.base_prefix.as_ref()
+    }
+
+    #[inline]
+    pub fn base_exec_prefix(&self) -> &str {
+        self.base_exec_prefix.as_ref()
+    }
+}
+
+fn python_home_prefixes() -> Option<(String, String)> {
+    let home = std::env::var("PYTHONHOME").ok()?;
+    if home.is_empty() {
+        return None;
+    }
+
+    let mut parts = home.split(path_separator());
+    let prefix = parts.next()?.trim();
+    if prefix.is_empty() {
+        return None;
+    }
+    let exec_prefix = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(prefix);
+
+    Some((prefix.to_string(), exec_prefix.to_string()))
 }
 
 impl SysPaths {
@@ -202,6 +279,10 @@ const fn path_separator() -> char {
 mod tests {
     use super::*;
     use prism_core::intern::interned_by_ptr;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // =========================================================================
     // Construction Tests
@@ -227,6 +308,63 @@ mod tests {
     fn test_default() {
         let paths = SysPaths::default();
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_sys_prefixes_default_to_executable_directory() {
+        let executable = Path::new(r"C:\Prism\bin\prism.exe");
+        let prefixes = SysPrefixes::from_env(Some(executable));
+
+        assert_eq!(prefixes.prefix(), r"C:\Prism\bin");
+        assert_eq!(prefixes.exec_prefix(), r"C:\Prism\bin");
+        assert_eq!(prefixes.base_prefix(), r"C:\Prism\bin");
+        assert_eq!(prefixes.base_exec_prefix(), r"C:\Prism\bin");
+    }
+
+    #[test]
+    fn test_sys_prefixes_honor_pythonhome_single_root() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let executable = Path::new(r"C:\Prism\bin\prism.exe");
+        unsafe {
+            std::env::set_var("PYTHONHOME", r"C:\Python312");
+        }
+        let prefixes = SysPrefixes::from_env(Some(executable));
+        unsafe {
+            std::env::remove_var("PYTHONHOME");
+        }
+
+        assert_eq!(prefixes.prefix(), r"C:\Python312");
+        assert_eq!(prefixes.exec_prefix(), r"C:\Python312");
+        assert_eq!(prefixes.base_prefix(), r"C:\Python312");
+        assert_eq!(prefixes.base_exec_prefix(), r"C:\Python312");
+    }
+
+    #[test]
+    fn test_sys_prefixes_honor_pythonhome_prefix_pair() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let executable = Path::new(r"C:\Prism\bin\prism.exe");
+        let pair = if cfg!(windows) {
+            r"C:\Python312;C:\Python312\plat"
+        } else {
+            "/opt/python:/opt/python/plat"
+        };
+        unsafe {
+            std::env::set_var("PYTHONHOME", pair);
+        }
+        let prefixes = SysPrefixes::from_env(Some(executable));
+        unsafe {
+            std::env::remove_var("PYTHONHOME");
+        }
+
+        if cfg!(windows) {
+            assert_eq!(prefixes.prefix(), r"C:\Python312");
+            assert_eq!(prefixes.exec_prefix(), r"C:\Python312\plat");
+        } else {
+            assert_eq!(prefixes.prefix(), "/opt/python");
+            assert_eq!(prefixes.exec_prefix(), "/opt/python/plat");
+        }
+        assert_eq!(prefixes.base_prefix(), prefixes.prefix());
+        assert_eq!(prefixes.base_exec_prefix(), prefixes.exec_prefix());
     }
 
     // =========================================================================

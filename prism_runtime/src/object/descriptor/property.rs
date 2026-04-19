@@ -32,6 +32,8 @@
 //! - Inline caching can specialize property access
 
 use super::{Descriptor, DescriptorFlags, DescriptorKind};
+use crate::object::type_obj::TypeId;
+use crate::object::{ObjectHeader, PyObject};
 use prism_core::{PrismError, PrismResult, Value};
 
 // =============================================================================
@@ -77,7 +79,10 @@ impl Default for PropertyFlags {
 /// functions may internally have mutable state, but that's managed by the
 /// function objects themselves.
 #[derive(Debug)]
+#[repr(C)]
 pub struct PropertyDescriptor {
+    /// Object header for heap storage and fast type dispatch.
+    pub header: ObjectHeader,
     /// Property flags for fast checking.
     flags: PropertyFlags,
     /// The getter function (fget).
@@ -94,6 +99,7 @@ impl PropertyDescriptor {
     /// Create a new property with only a getter (read-only).
     pub fn new_getter(getter: Value) -> Self {
         Self {
+            header: ObjectHeader::new(TypeId::PROPERTY),
             flags: PropertyFlags::HAS_GETTER,
             getter: Some(getter),
             setter: None,
@@ -105,6 +111,7 @@ impl PropertyDescriptor {
     /// Create a new property with getter and setter.
     pub fn new_getter_setter(getter: Value, setter: Value) -> Self {
         Self {
+            header: ObjectHeader::new(TypeId::PROPERTY),
             flags: PropertyFlags::HAS_GETTER | PropertyFlags::HAS_SETTER,
             getter: Some(getter),
             setter: Some(setter),
@@ -135,6 +142,7 @@ impl PropertyDescriptor {
         }
 
         Self {
+            header: ObjectHeader::new(TypeId::PROPERTY),
             flags,
             getter,
             setter,
@@ -190,6 +198,7 @@ impl PropertyDescriptor {
     /// Create a new property with a different getter.
     pub fn with_getter(&self, getter: Value) -> Self {
         Self {
+            header: ObjectHeader::new(TypeId::PROPERTY),
             flags: self.flags | PropertyFlags::HAS_GETTER,
             getter: Some(getter),
             setter: self.setter,
@@ -201,6 +210,7 @@ impl PropertyDescriptor {
     /// Create a new property with a different setter.
     pub fn with_setter(&self, setter: Value) -> Self {
         Self {
+            header: ObjectHeader::new(TypeId::PROPERTY),
             flags: self.flags | PropertyFlags::HAS_SETTER,
             getter: self.getter,
             setter: Some(setter),
@@ -212,6 +222,7 @@ impl PropertyDescriptor {
     /// Create a new property with a different deleter.
     pub fn with_deleter(&self, deleter: Value) -> Self {
         Self {
+            header: ObjectHeader::new(TypeId::PROPERTY),
             flags: self.flags | PropertyFlags::HAS_DELETER,
             getter: self.getter,
             setter: self.setter,
@@ -239,10 +250,10 @@ impl Descriptor for PropertyDescriptor {
             flags |= DescriptorFlags::HAS_DELETE;
         }
 
-        // A property is a data descriptor only if it has __set__ or __delete__
-        if self.has_setter() || self.has_deleter() {
-            flags |= DescriptorFlags::DATA_DESCRIPTOR;
-        }
+        // Python properties are always data descriptors because assignment and
+        // deletion route through the property object even when the underlying
+        // accessor is absent and would raise at runtime.
+        flags |= DescriptorFlags::DATA_DESCRIPTOR;
 
         flags
     }
@@ -250,9 +261,8 @@ impl Descriptor for PropertyDescriptor {
     fn get(&self, obj: Option<Value>, objtype: Value) -> PrismResult<Value> {
         // If accessed through class (obj is None), return the property itself
         if obj.is_none() {
-            // In a full implementation, we'd return self as a Value
-            // For now, return None to indicate class access
-            return Ok(Value::none());
+            let _ = objtype;
+            return Ok(Value::object_ptr(self as *const Self as *const ()));
         }
 
         let obj = obj.unwrap();
@@ -293,6 +303,16 @@ impl Descriptor for PropertyDescriptor {
     }
 }
 
+impl PyObject for PropertyDescriptor {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -310,8 +330,8 @@ mod tests {
         assert!(!prop.has_setter());
         assert!(!prop.has_deleter());
         assert_eq!(prop.kind(), DescriptorKind::Property);
-        // A getter-only property is a NON-data descriptor per Python semantics
-        assert!(!prop.is_data_descriptor());
+        assert_eq!(prop.header.type_id, TypeId::PROPERTY);
+        assert!(prop.is_data_descriptor());
     }
 
     #[test]
@@ -347,8 +367,7 @@ mod tests {
         let flags = prop.flags();
 
         assert!(flags.contains(DescriptorFlags::HAS_GET));
-        // Getter-only property is NOT a data descriptor
-        assert!(!flags.contains(DescriptorFlags::DATA_DESCRIPTOR));
+        assert!(flags.contains(DescriptorFlags::DATA_DESCRIPTOR));
         assert!(!flags.contains(DescriptorFlags::HAS_SET));
     }
 
@@ -378,6 +397,7 @@ mod tests {
         // When accessed through class (obj=None), should return the property itself
         let result = prop.get(None, Value::none());
         assert!(result.is_ok());
+        assert!(result.unwrap().as_object_ptr().is_some());
     }
 
     #[test]

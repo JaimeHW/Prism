@@ -1,0 +1,577 @@
+//! Python-visible view objects over internal runtime metadata.
+
+use crate::object::class::PyClassObject;
+use crate::object::type_obj::TypeId;
+use crate::object::{ObjectHeader, PyObject};
+use crate::types::Cell;
+use prism_compiler::bytecode::CodeObject;
+use prism_core::Value;
+use prism_core::intern::InternedString;
+use std::sync::Arc;
+
+#[repr(C)]
+pub struct CodeObjectView {
+    header: ObjectHeader,
+    code: Arc<CodeObject>,
+}
+
+impl CodeObjectView {
+    #[inline]
+    pub fn new(code: Arc<CodeObject>) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::CODE),
+            code,
+        }
+    }
+
+    #[inline]
+    pub fn code(&self) -> &Arc<CodeObject> {
+        &self.code
+    }
+}
+
+impl PyObject for CodeObjectView {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct CellViewObject {
+    header: ObjectHeader,
+    cell: Arc<Cell>,
+}
+
+impl CellViewObject {
+    #[inline]
+    pub fn new(cell: Arc<Cell>) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::CELL_VIEW),
+            cell,
+        }
+    }
+
+    #[inline]
+    pub fn cell(&self) -> &Arc<Cell> {
+        &self.cell
+    }
+}
+
+impl PyObject for CellViewObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct GenericAliasObject {
+    header: ObjectHeader,
+    origin: Value,
+    args: Box<[Value]>,
+}
+
+impl GenericAliasObject {
+    #[inline]
+    pub fn new(origin: Value, args: Vec<Value>) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::GENERIC_ALIAS),
+            origin,
+            args: args.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn origin(&self) -> Value {
+        self.origin
+    }
+
+    #[inline]
+    pub fn args(&self) -> &[Value] {
+        &self.args
+    }
+}
+
+impl PyObject for GenericAliasObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct UnionTypeObject {
+    header: ObjectHeader,
+    members: Box<[TypeId]>,
+}
+
+impl UnionTypeObject {
+    #[inline]
+    pub fn new(members: Vec<TypeId>) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::UNION),
+            members: members.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn members(&self) -> &[TypeId] {
+        &self.members
+    }
+}
+
+impl PyObject for UnionTypeObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct SingletonObject {
+    header: ObjectHeader,
+}
+
+impl SingletonObject {
+    #[inline]
+    pub fn new(type_id: TypeId) -> Self {
+        debug_assert!(matches!(
+            type_id,
+            TypeId::ELLIPSIS | TypeId::NOT_IMPLEMENTED
+        ));
+        Self {
+            header: ObjectHeader::new(type_id),
+        }
+    }
+}
+
+impl PyObject for SingletonObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingProxySource {
+    BuiltinType(TypeId),
+    UserClass(usize),
+}
+
+#[repr(C)]
+pub struct MappingProxyObject {
+    header: ObjectHeader,
+    source: MappingProxySource,
+}
+
+impl MappingProxyObject {
+    #[inline]
+    pub fn for_builtin_type(type_id: TypeId) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::MAPPING_PROXY),
+            source: MappingProxySource::BuiltinType(type_id),
+        }
+    }
+
+    #[inline]
+    pub fn for_user_class(class: *const PyClassObject) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::MAPPING_PROXY),
+            source: MappingProxySource::UserClass(class as usize),
+        }
+    }
+
+    #[inline]
+    pub fn source(&self) -> MappingProxySource {
+        self.source
+    }
+}
+
+impl PyObject for MappingProxyObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
+impl DictViewKind {
+    #[inline]
+    pub const fn type_id(self) -> TypeId {
+        match self {
+            Self::Keys => TypeId::DICT_KEYS,
+            Self::Values => TypeId::DICT_VALUES,
+            Self::Items => TypeId::DICT_ITEMS,
+        }
+    }
+}
+
+#[repr(C)]
+pub struct DictViewObject {
+    header: ObjectHeader,
+    dict: Value,
+    kind: DictViewKind,
+}
+
+impl DictViewObject {
+    #[inline]
+    pub fn new(kind: DictViewKind, dict: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(kind.type_id()),
+            dict,
+            kind,
+        }
+    }
+
+    #[inline]
+    pub fn dict(&self) -> Value {
+        self.dict
+    }
+
+    #[inline]
+    pub fn kind(&self) -> DictViewKind {
+        self.kind
+    }
+}
+
+impl PyObject for DictViewObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct DescriptorViewObject {
+    header: ObjectHeader,
+    owner: TypeId,
+    name: InternedString,
+}
+
+impl DescriptorViewObject {
+    #[inline]
+    pub fn new(type_id: TypeId, owner: TypeId, name: InternedString) -> Self {
+        debug_assert!(matches!(
+            type_id,
+            TypeId::WRAPPER_DESCRIPTOR
+                | TypeId::METHOD_DESCRIPTOR
+                | TypeId::CLASSMETHOD_DESCRIPTOR
+                | TypeId::GETSET_DESCRIPTOR
+                | TypeId::MEMBER_DESCRIPTOR
+        ));
+        Self {
+            header: ObjectHeader::new(type_id),
+            owner,
+            name,
+        }
+    }
+
+    #[inline]
+    pub fn owner(&self) -> TypeId {
+        self.owner
+    }
+
+    #[inline]
+    pub fn name(&self) -> &InternedString {
+        &self.name
+    }
+}
+
+impl PyObject for DescriptorViewObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct MethodWrapperObject {
+    header: ObjectHeader,
+    owner: TypeId,
+    name: InternedString,
+    receiver: Value,
+}
+
+impl MethodWrapperObject {
+    #[inline]
+    pub fn new(owner: TypeId, name: InternedString, receiver: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::METHOD_WRAPPER),
+            owner,
+            name,
+            receiver,
+        }
+    }
+
+    #[inline]
+    pub fn owner(&self) -> TypeId {
+        self.owner
+    }
+
+    #[inline]
+    pub fn name(&self) -> &InternedString {
+        &self.name
+    }
+
+    #[inline]
+    pub fn receiver(&self) -> Value {
+        self.receiver
+    }
+}
+
+impl PyObject for MethodWrapperObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct FrameViewObject {
+    header: ObjectHeader,
+    code: Option<Arc<CodeObject>>,
+    line_number: u32,
+    lasti: u32,
+}
+
+impl FrameViewObject {
+    #[inline]
+    pub fn new(code: Option<Arc<CodeObject>>, line_number: u32, lasti: u32) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::FRAME),
+            code,
+            line_number,
+            lasti,
+        }
+    }
+
+    #[inline]
+    pub fn code(&self) -> Option<&Arc<CodeObject>> {
+        self.code.as_ref()
+    }
+
+    #[inline]
+    pub fn line_number(&self) -> u32 {
+        self.line_number
+    }
+
+    #[inline]
+    pub fn lasti(&self) -> u32 {
+        self.lasti
+    }
+}
+
+impl PyObject for FrameViewObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+pub struct TracebackViewObject {
+    header: ObjectHeader,
+    frame: Value,
+    next: Option<Value>,
+    line_number: u32,
+    lasti: u32,
+}
+
+impl TracebackViewObject {
+    #[inline]
+    pub fn new(frame: Value, next: Option<Value>, line_number: u32, lasti: u32) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::TRACEBACK),
+            frame,
+            next,
+            line_number,
+            lasti,
+        }
+    }
+
+    #[inline]
+    pub fn frame(&self) -> Value {
+        self.frame
+    }
+
+    #[inline]
+    pub fn next(&self) -> Option<Value> {
+        self.next
+    }
+
+    #[inline]
+    pub fn line_number(&self) -> u32 {
+        self.line_number
+    }
+
+    #[inline]
+    pub fn lasti(&self) -> u32 {
+        self.lasti
+    }
+}
+
+impl PyObject for TracebackViewObject {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_code_object_view_uses_code_type_id() {
+        let code = Arc::new(CodeObject::new("demo", "<test>"));
+        let view = CodeObjectView::new(Arc::clone(&code));
+        assert_eq!(view.header().type_id, TypeId::CODE);
+        assert!(Arc::ptr_eq(view.code(), &code));
+    }
+
+    #[test]
+    fn test_frame_view_uses_frame_type_id() {
+        let code = Arc::new(CodeObject::new("demo", "<test>"));
+        let view = FrameViewObject::new(Some(Arc::clone(&code)), 12, 7);
+        assert_eq!(view.header().type_id, TypeId::FRAME);
+        assert!(Arc::ptr_eq(
+            view.code().expect("code should be present"),
+            &code
+        ));
+        assert_eq!(view.line_number(), 12);
+        assert_eq!(view.lasti(), 7);
+    }
+
+    #[test]
+    fn test_traceback_view_uses_traceback_type_id() {
+        let frame = Value::int(7).unwrap();
+        let view = TracebackViewObject::new(frame, Some(Value::none()), 12, 3);
+        assert_eq!(view.header().type_id, TypeId::TRACEBACK);
+        assert_eq!(view.frame(), frame);
+        assert_eq!(view.next(), Some(Value::none()));
+        assert_eq!(view.line_number(), 12);
+        assert_eq!(view.lasti(), 3);
+    }
+
+    #[test]
+    fn test_cell_view_uses_internal_cell_view_type_id() {
+        let cell = Arc::new(Cell::new(Value::int_unchecked(42)));
+        let view = CellViewObject::new(Arc::clone(&cell));
+        assert_eq!(view.header().type_id, TypeId::CELL_VIEW);
+        assert_eq!(view.cell().get_or_none().as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_generic_alias_preserves_origin_and_args() {
+        let alias = GenericAliasObject::new(
+            Value::int_unchecked(7),
+            vec![Value::int_unchecked(1), Value::int_unchecked(2)],
+        );
+        assert_eq!(alias.header().type_id, TypeId::GENERIC_ALIAS);
+        assert_eq!(alias.origin().as_int(), Some(7));
+        assert_eq!(alias.args().len(), 2);
+    }
+
+    #[test]
+    fn test_union_type_preserves_member_order() {
+        let union = UnionTypeObject::new(vec![TypeId::INT, TypeId::STR]);
+        assert_eq!(union.header().type_id, TypeId::UNION);
+        assert_eq!(union.members(), &[TypeId::INT, TypeId::STR]);
+    }
+
+    #[test]
+    fn test_singleton_object_supports_ellipsis_type_id() {
+        let singleton = SingletonObject::new(TypeId::ELLIPSIS);
+        assert_eq!(singleton.header().type_id, TypeId::ELLIPSIS);
+    }
+
+    #[test]
+    fn test_singleton_object_supports_not_implemented_type_id() {
+        let singleton = SingletonObject::new(TypeId::NOT_IMPLEMENTED);
+        assert_eq!(singleton.header().type_id, TypeId::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn test_mapping_proxy_records_source() {
+        let proxy = MappingProxyObject::for_builtin_type(TypeId::TYPE);
+        assert_eq!(proxy.header().type_id, TypeId::MAPPING_PROXY);
+        assert_eq!(
+            proxy.source(),
+            MappingProxySource::BuiltinType(TypeId::TYPE)
+        );
+    }
+
+    #[test]
+    fn test_dict_view_preserves_kind_and_backing_dict_value() {
+        let dict = Value::int_unchecked(7);
+        let view = DictViewObject::new(DictViewKind::Keys, dict);
+        assert_eq!(view.header().type_id, TypeId::DICT_KEYS);
+        assert_eq!(view.dict(), dict);
+        assert_eq!(view.kind(), DictViewKind::Keys);
+    }
+
+    #[test]
+    fn test_descriptor_view_preserves_owner_and_name() {
+        let view = DescriptorViewObject::new(
+            TypeId::METHOD_DESCRIPTOR,
+            TypeId::STR,
+            prism_core::intern::intern("join"),
+        );
+        assert_eq!(view.header().type_id, TypeId::METHOD_DESCRIPTOR);
+        assert_eq!(view.owner(), TypeId::STR);
+        assert_eq!(view.name().as_str(), "join");
+    }
+
+    #[test]
+    fn test_method_wrapper_preserves_receiver() {
+        let view = MethodWrapperObject::new(
+            TypeId::OBJECT,
+            prism_core::intern::intern("__str__"),
+            Value::int_unchecked(7),
+        );
+        assert_eq!(view.header().type_id, TypeId::METHOD_WRAPPER);
+        assert_eq!(view.owner(), TypeId::OBJECT);
+        assert_eq!(view.name().as_str(), "__str__");
+        assert_eq!(view.receiver().as_int(), Some(7));
+    }
+}

@@ -1037,6 +1037,12 @@ mod io_module_tests {
     }
 
     #[test]
+    fn test_private_module_alias_name() {
+        let module = IoModule::with_name("_io");
+        assert_eq!(module.name(), "_io");
+    }
+
+    #[test]
     fn test_default_buffer_size() {
         let module = IoModule::new();
         let result = module.get_attr("DEFAULT_BUFFER_SIZE");

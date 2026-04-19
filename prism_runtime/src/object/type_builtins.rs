@@ -360,9 +360,12 @@ pub fn type_of_value(value: Value) -> TypeId {
     } else if value.is_none() {
         TypeId::NONE
     } else if value.is_object() {
-        // Heap object - read type from header
-        // For now, return OBJECT as placeholder until header reading is implemented
-        TypeId::OBJECT
+        let ptr = value
+            .as_object_ptr()
+            .expect("Value::is_object() must imply an object pointer");
+        let header = ptr as *const crate::object::ObjectHeader;
+        // SAFETY: every heap object starts with ObjectHeader at offset 0.
+        unsafe { (*header).type_id }
     } else if value.is_string() {
         TypeId::STR
     } else {
@@ -397,7 +400,7 @@ where
     // Get the bitmap for the value's type
     if let Some(bitmap) = get_bitmap(value_class) {
         // O(1) subclass check
-        bitmap.is_subclass_of(TypeId::from_raw(class_id.0))
+        bitmap.is_subclass_of(class_id_to_type_id(class_id))
     } else {
         // Fallback: direct type comparison
         value_class == class_id
@@ -417,7 +420,7 @@ where
 
     if let Some(bitmap) = get_bitmap(value_class) {
         for &class_id in class_ids {
-            if bitmap.is_subclass_of(TypeId::from_raw(class_id.0)) {
+            if bitmap.is_subclass_of(class_id_to_type_id(class_id)) {
                 return true;
             }
         }
@@ -441,7 +444,7 @@ where
     }
 
     if let Some(bitmap) = get_bitmap(sub_class) {
-        bitmap.is_subclass_of(TypeId::from_raw(parent_class.0))
+        bitmap.is_subclass_of(class_id_to_type_id(parent_class))
     } else {
         false
     }
@@ -461,7 +464,7 @@ where
 
     if let Some(bitmap) = get_bitmap(sub_class) {
         for &parent_class in parent_classes {
-            if bitmap.is_subclass_of(TypeId::from_raw(parent_class.0)) {
+            if bitmap.is_subclass_of(class_id_to_type_id(parent_class)) {
                 return true;
             }
         }
@@ -488,7 +491,38 @@ pub fn builtin_type_bitmap(type_id: TypeId) -> SubclassBitmap {
     let mut bitmap = SubclassBitmap::new();
     bitmap.set_bit(type_id);
     bitmap.set_bit(TypeId::OBJECT); // All types inherit from object
+    if type_id == TypeId::BOOL {
+        bitmap.set_bit(TypeId::INT);
+    }
     bitmap
+}
+
+/// Convert a class identifier into the corresponding runtime type id.
+///
+/// Heap classes reuse their allocated type id directly. Builtin base classes
+/// do the same, except for `object`, which is represented in MROs via the
+/// sentinel [`ClassId::OBJECT`].
+#[inline]
+pub fn class_id_to_type_id(class_id: ClassId) -> TypeId {
+    if class_id == ClassId::OBJECT {
+        TypeId::OBJECT
+    } else {
+        TypeId::from_raw(class_id.0)
+    }
+}
+
+/// Get the canonical MRO for a built-in type when used as a base class.
+#[inline]
+pub fn builtin_class_mro(type_id: TypeId) -> Vec<ClassId> {
+    match type_id {
+        TypeId::OBJECT => vec![ClassId::OBJECT],
+        TypeId::BOOL => vec![
+            ClassId(TypeId::BOOL.raw()),
+            ClassId(TypeId::INT.raw()),
+            ClassId::OBJECT,
+        ],
+        _ => vec![ClassId(type_id.raw()), ClassId::OBJECT],
+    }
 }
 
 // =============================================================================
@@ -496,9 +530,10 @@ pub fn builtin_type_bitmap(type_id: TypeId) -> SubclassBitmap {
 // =============================================================================
 
 use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
+use crate::object::descriptor::StaticMethodDescriptor;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Error during dynamic class creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,6 +644,20 @@ pub fn type_new<R>(
 where
     R: ClassRegistry,
 {
+    type_new_with_metaclass(name, bases, namespace, Value::none(), registry)
+}
+
+/// Create a new class with an explicit metaclass selection.
+pub fn type_new_with_metaclass<R>(
+    name: InternedString,
+    bases: &[ClassId],
+    namespace: &ClassDict,
+    metaclass: Value,
+    registry: &R,
+) -> Result<TypeNewResult, TypeCreationError>
+where
+    R: ClassRegistry,
+{
     // 1. Validate class name
     let name_str = name.as_str();
     if name_str.is_empty() {
@@ -618,8 +667,11 @@ where
     }
 
     // 2. Validate base classes
-    let mut parent_bitmaps: Vec<&SubclassBitmap> = Vec::with_capacity(bases.len());
     for &base_id in bases {
+        if base_id.0 < TypeId::FIRST_USER_TYPE {
+            continue;
+        }
+
         let base = registry
             .get_class(base_id)
             .ok_or_else(|| TypeCreationError::BaseNotFound { class_id: base_id })?;
@@ -639,9 +691,13 @@ where
     } else {
         // Has bases - compute MRO
         PyClassObject::new(name.clone(), bases, |id| {
-            registry
-                .get_class(id)
-                .map(|c| c.mro().iter().copied().collect())
+            if id.0 < TypeId::FIRST_USER_TYPE {
+                Some(builtin_class_mro(class_id_to_type_id(id)).into())
+            } else {
+                registry
+                    .get_class(id)
+                    .map(|c| c.mro().iter().copied().collect())
+            }
         })
         .map_err(|e| TypeCreationError::MroError {
             message: e.to_string(),
@@ -656,13 +712,30 @@ where
 
     // Merge parent bitmaps
     for &base_id in bases {
-        if let Some(parent_bitmap) = registry.get_bitmap(base_id) {
+        if base_id.0 < TypeId::FIRST_USER_TYPE {
+            bitmap.merge(&builtin_type_bitmap(class_id_to_type_id(base_id)));
+        } else if let Some(parent_bitmap) = registry.get_bitmap(base_id) {
             bitmap.merge(&parent_bitmap);
         }
     }
 
     // 5. Detect special methods in namespace
     let mut flags = ClassFlags::INITIALIZED;
+
+    if bases.iter().any(|&base_id| {
+        if base_id.0 == TypeId::TYPE.raw() {
+            return true;
+        }
+        if base_id.0 < TypeId::FIRST_USER_TYPE {
+            return false;
+        }
+        registry
+            .get_class(base_id)
+            .map(|base| base.flags().contains(ClassFlags::METACLASS))
+            .unwrap_or(false)
+    }) {
+        flags |= ClassFlags::METACLASS;
+    }
 
     // Check for __new__
     let new_name = prism_core::intern::intern("__new__");
@@ -700,9 +773,10 @@ where
         flags |= ClassFlags::HAS_FINALIZER;
     }
 
-    // 6. Copy namespace to class dict
+    // 6. Copy namespace to class dict and record the resolved metaclass
+    class.set_metaclass(metaclass);
     namespace.for_each(|name, value| {
-        class.set_attr(name.clone(), value);
+        class.set_attr(name.clone(), normalize_class_namespace_value(name, value));
     });
 
     // Set detected flags
@@ -715,6 +789,27 @@ where
         bitmap,
         flags,
     })
+}
+
+#[inline]
+fn normalize_class_namespace_value(name: &InternedString, value: Value) -> Value {
+    if name.as_str() != "__new__" {
+        return value;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return value;
+    };
+
+    let header = ptr as *const crate::object::ObjectHeader;
+    let type_id = unsafe { (*header).type_id };
+    match type_id {
+        TypeId::FUNCTION | TypeId::CLOSURE | TypeId::BUILTIN_FUNCTION => {
+            let descriptor = StaticMethodDescriptor::new(value);
+            Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ())
+        }
+        _ => value,
+    }
 }
 
 /// Simple in-memory class registry for testing.
@@ -736,6 +831,12 @@ impl SimpleClassRegistry {
         self.classes.write().unwrap().insert(id, class);
         self.bitmaps.write().unwrap().insert(id, bitmap);
     }
+
+    /// Remove a registered class and its bitmap.
+    pub fn unregister(&self, id: ClassId) {
+        self.classes.write().unwrap().remove(&id);
+        self.bitmaps.write().unwrap().remove(&id);
+    }
 }
 
 impl ClassRegistry for SimpleClassRegistry {
@@ -751,6 +852,46 @@ impl ClassRegistry for SimpleClassRegistry {
         let id = class.class_id();
         self.classes.write().unwrap().insert(id, class);
     }
+}
+
+static GLOBAL_CLASS_REGISTRY: OnceLock<SimpleClassRegistry> = OnceLock::new();
+
+/// Get the global registry for heap-defined Python classes.
+#[inline]
+pub fn global_class_registry() -> &'static SimpleClassRegistry {
+    GLOBAL_CLASS_REGISTRY.get_or_init(SimpleClassRegistry::new)
+}
+
+/// Look up a user-defined class object by class id.
+#[inline]
+pub fn global_class(id: ClassId) -> Option<Arc<PyClassObject>> {
+    if id.0 < TypeId::FIRST_USER_TYPE {
+        None
+    } else {
+        global_class_registry().get_class(id)
+    }
+}
+
+/// Look up subclass metadata for a class id, including built-in classes.
+#[inline]
+pub fn global_class_bitmap(id: ClassId) -> Option<SubclassBitmap> {
+    if id.0 < TypeId::FIRST_USER_TYPE {
+        Some(builtin_type_bitmap(class_id_to_type_id(id)))
+    } else {
+        global_class_registry().get_bitmap(id)
+    }
+}
+
+/// Register a newly created heap class and its subclass bitmap globally.
+#[inline]
+pub fn register_global_class(class: Arc<PyClassObject>, bitmap: SubclassBitmap) {
+    global_class_registry().register(class, bitmap);
+}
+
+/// Remove a previously registered heap class from the global registry.
+#[inline]
+pub fn unregister_global_class(id: ClassId) {
+    global_class_registry().unregister(id);
 }
 
 // =============================================================================
@@ -1029,6 +1170,16 @@ mod tests {
     }
 
     #[test]
+    fn test_class_id_to_type_id_maps_object_sentinel() {
+        assert_eq!(class_id_to_type_id(ClassId::OBJECT), TypeId::OBJECT);
+        assert_eq!(class_id_to_type_id(ClassId(TypeId::INT.raw())), TypeId::INT);
+        assert_eq!(
+            class_id_to_type_id(ClassId(TypeId::FIRST_USER_TYPE)),
+            TypeId::from_raw(TypeId::FIRST_USER_TYPE)
+        );
+    }
+
+    #[test]
     fn test_isinstance_same_type() {
         let value = Value::int_unchecked(42);
         let int_class = ClassId(TypeId::INT.raw());
@@ -1051,6 +1202,22 @@ mod tests {
         let object_class = ClassId(TypeId::OBJECT.raw());
 
         let result = isinstance(value, object_class, |id| {
+            if id == int_class {
+                Some(builtin_type_bitmap(TypeId::INT))
+            } else {
+                None
+            }
+        });
+
+        assert!(result);
+    }
+
+    #[test]
+    fn test_isinstance_parent_type_accepts_object_sentinel() {
+        let value = Value::int_unchecked(42);
+        let int_class = ClassId(TypeId::INT.raw());
+
+        let result = isinstance(value, ClassId::OBJECT, |id| {
             if id == int_class {
                 Some(builtin_type_bitmap(TypeId::INT))
             } else {
@@ -1114,6 +1281,21 @@ mod tests {
         let object_class = ClassId(TypeId::OBJECT.raw());
 
         let result = issubclass(int_class, object_class, |id| {
+            if id == int_class {
+                Some(builtin_type_bitmap(TypeId::INT))
+            } else {
+                None
+            }
+        });
+
+        assert!(result);
+    }
+
+    #[test]
+    fn test_issubclass_parent_accepts_object_sentinel() {
+        let int_class = ClassId(TypeId::INT.raw());
+
+        let result = issubclass(int_class, ClassId::OBJECT, |id| {
             if id == int_class {
                 Some(builtin_type_bitmap(TypeId::INT))
             } else {
@@ -1245,12 +1427,24 @@ mod tests {
     // type_new Tests
     // =========================================================================
 
-    use super::{ClassRegistry, SimpleClassRegistry, TypeCreationError, type_new};
-    use crate::object::class::{ClassDict, PyClassObject};
+    use super::{
+        ClassRegistry, SimpleClassRegistry, TypeCreationError, type_new, type_new_with_metaclass,
+    };
+    use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
+    use crate::object::descriptor::StaticMethodDescriptor;
+    use crate::types::function::FunctionObject;
+    use prism_compiler::bytecode::CodeObject;
     use prism_core::intern::intern;
+    use std::sync::Arc;
 
     fn create_test_registry() -> SimpleClassRegistry {
         SimpleClassRegistry::new()
+    }
+
+    fn test_function_value(name: &str) -> Value {
+        let code = Arc::new(CodeObject::new(name, "<test>"));
+        let function = FunctionObject::new(code, Arc::from(name), None, None);
+        Value::object_ptr(Box::into_raw(Box::new(function)) as *const ())
     }
 
     #[test]
@@ -1270,6 +1464,30 @@ mod tests {
                 .flags
                 .contains(crate::object::class::ClassFlags::INITIALIZED)
         );
+    }
+
+    #[test]
+    fn test_type_new_records_explicit_metaclass() {
+        let registry = create_test_registry();
+        let name = intern("MetaBoundClass");
+        let namespace = ClassDict::new();
+        let explicit_metaclass = Value::int_unchecked(123);
+
+        let result =
+            type_new_with_metaclass(name, &[], &namespace, explicit_metaclass, &registry).unwrap();
+
+        assert_eq!(result.class.metaclass(), explicit_metaclass);
+    }
+
+    #[test]
+    fn test_type_new_marks_classes_derived_from_type_as_metaclasses() {
+        let registry = create_test_registry();
+        let name = intern("MetaClass");
+        let namespace = ClassDict::new();
+
+        let result = type_new(name, &[ClassId(TypeId::TYPE.raw())], &namespace, &registry).unwrap();
+
+        assert!(result.class.flags().contains(ClassFlags::METACLASS));
     }
 
     #[test]
@@ -1306,6 +1524,50 @@ mod tests {
                 .flags
                 .contains(crate::object::class::ClassFlags::HAS_NEW)
         );
+    }
+
+    #[test]
+    fn test_type_new_wraps_function_dunder_new_as_staticmethod() {
+        let registry = create_test_registry();
+        let name = intern("WrappedNewClass");
+        let namespace = ClassDict::new();
+        let function_value = test_function_value("__new__");
+        namespace.set(intern("__new__"), function_value);
+
+        let result = type_new(name, &[], &namespace, &registry).unwrap();
+        let stored = result
+            .class
+            .get_attr(&intern("__new__"))
+            .expect("__new__ should be present on the class");
+        let ptr = stored
+            .as_object_ptr()
+            .expect("normalized __new__ should be a descriptor object");
+        let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+
+        assert_eq!(
+            unsafe { (*(ptr as *const crate::object::ObjectHeader)).type_id },
+            TypeId::STATICMETHOD
+        );
+        assert_eq!(descriptor.function(), function_value);
+    }
+
+    #[test]
+    fn test_type_new_preserves_explicit_staticmethod_dunder_new() {
+        let registry = create_test_registry();
+        let name = intern("ExplicitStaticNewClass");
+        let namespace = ClassDict::new();
+        let function_value = test_function_value("__new__");
+        let descriptor = StaticMethodDescriptor::new(function_value);
+        let descriptor_value = Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ());
+        namespace.set(intern("__new__"), descriptor_value);
+
+        let result = type_new(name, &[], &namespace, &registry).unwrap();
+        let stored = result
+            .class
+            .get_attr(&intern("__new__"))
+            .expect("__new__ should be present on the class");
+
+        assert_eq!(stored, descriptor_value);
     }
 
     #[test]

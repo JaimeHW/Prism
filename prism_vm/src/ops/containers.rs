@@ -5,6 +5,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::iteration::collect_iterable_values;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 use prism_runtime::types::dict::DictObject;
@@ -249,7 +250,7 @@ pub fn dict_set(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// UnpackSequence: r(dst)..r(dst+src2) = unpack(src1)
 ///
 /// Unpacks a sequence into consecutive registers starting at dst.
-/// Supports lists, tuples, strings (char iteration), and ranges.
+/// Follows Python's iterator protocol, including metaclass-defined `__iter__`.
 ///
 /// # Performance
 ///
@@ -267,61 +268,25 @@ pub fn unpack_sequence(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
 
     // Get the sequence value
     let sequence = vm.current_frame().get_reg(inst.src1().0);
+    let values = match collect_iterable_values(vm, sequence) {
+        Ok(values) => values,
+        Err(err) => return ControlFlow::Error(err),
+    };
 
-    // Dispatch based on type
-    if let Some(ptr) = sequence.as_object_ptr() {
-        // Try as ListObject
-        let list_ptr = ptr as *const ListObject;
-        let list = unsafe { &*list_ptr };
-
-        // Heuristic: check if it looks like a list by length method
-        // In a fully typed system, we'd use type tags
-        let len = list.len();
-
-        if len == count {
-            // Fast path: direct register writes
-            let frame = vm.current_frame_mut();
-            for i in 0..count {
-                if let Some(val) = list.get(i as i64) {
-                    frame.set_reg(dst_start + i as u8, val);
-                } else {
-                    return ControlFlow::Error(RuntimeError::internal(
-                        "list index out of bounds during unpack",
-                    ));
-                }
-            }
-            return ControlFlow::Continue;
-        }
-
-        // Try as TupleObject
-        let tuple_ptr = ptr as *const TupleObject;
-        let tuple = unsafe { &*tuple_ptr };
-        let tuple_len = tuple.len();
-
-        if tuple_len == count {
-            let frame = vm.current_frame_mut();
-            for i in 0..count {
-                if let Some(val) = tuple.get(i as i64) {
-                    frame.set_reg(dst_start + i as u8, val);
-                } else {
-                    return ControlFlow::Error(RuntimeError::internal(
-                        "tuple index out of bounds during unpack",
-                    ));
-                }
-            }
-            return ControlFlow::Continue;
-        }
-
-        // Length mismatch
+    if values.len() != count {
         return ControlFlow::Error(RuntimeError::value_error(format!(
             "not enough values to unpack (expected {}, got {})",
             count,
-            len.max(tuple_len)
+            values.len()
         )));
     }
 
-    // Handle inline types (strings, ranges via iteration)
-    ControlFlow::Error(RuntimeError::type_error("cannot unpack non-sequence type"))
+    let frame = vm.current_frame_mut();
+    for (index, value) in values.into_iter().enumerate() {
+        frame.set_reg(dst_start + index as u8, value);
+    }
+
+    ControlFlow::Continue
 }
 
 /// UnpackEx: unpack with *rest
@@ -349,13 +314,9 @@ pub fn unpack_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let after_count = (packed & 0x0F) as usize;
     let min_required = before_count + after_count;
 
-    // Collect all values from sequence
-    let values: Vec<Value> = if let Some(ptr) = sequence.as_object_ptr() {
-        // Try as ListObject
-        let list = unsafe { &*(ptr as *const ListObject) };
-        list.iter().copied().collect()
-    } else {
-        return ControlFlow::Error(RuntimeError::type_error("cannot unpack non-sequence type"));
+    let values = match collect_iterable_values(vm, sequence) {
+        Ok(values) => values,
+        Err(err) => return ControlFlow::Error(err),
     };
 
     let total = values.len();
@@ -528,12 +489,7 @@ pub fn import_name(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 .set_reg(dst.0, Value::object_ptr(module_ptr));
             ControlFlow::Continue
         }
-        Err(err) => ControlFlow::Error(RuntimeError::new(
-            crate::error::RuntimeErrorKind::ImportError {
-                module: module_name,
-                message: err.to_string().into(),
-            },
-        )),
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -552,20 +508,16 @@ pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let module_value = frame.get_reg(module_reg_idx);
 
     let Some(module_ptr) = module_value.as_object_ptr() else {
-        return ControlFlow::Error(RuntimeError::new(
-            crate::error::RuntimeErrorKind::ImportError {
-                module: "<unknown>".into(),
-                message: "Cannot import from None".into(),
-            },
+        return ControlFlow::Error(RuntimeError::import_error(
+            "<unknown>",
+            "Cannot import from None",
         ));
     };
 
     let Some(module) = vm.import_resolver.module_from_ptr(module_ptr) else {
-        return ControlFlow::Error(RuntimeError::new(
-            crate::error::RuntimeErrorKind::ImportError {
-                module: "<unknown>".into(),
-                message: "cannot import from non-module object".into(),
-            },
+        return ControlFlow::Error(RuntimeError::import_error(
+            "<unknown>",
+            "cannot import from non-module object",
         ));
     };
 
@@ -583,16 +535,13 @@ pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     vm.current_frame_mut().set_reg(dst.0, value);
                     ControlFlow::Continue
                 }
-                Err(_) => ControlFlow::Error(RuntimeError::new(
-                    crate::error::RuntimeErrorKind::ImportError {
-                        module: module.name().into(),
-                        message: format!(
-                            "cannot import name '{}' from '{}'",
-                            attr_name,
-                            module.name()
-                        )
-                        .into(),
-                    },
+                Err(_) => ControlFlow::Error(RuntimeError::import_error(
+                    module.name(),
+                    format!(
+                        "cannot import name '{}' from '{}'",
+                        attr_name,
+                        module.name()
+                    ),
                 )),
             }
         }
@@ -611,20 +560,16 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let module_value = frame.get_reg(module_reg_idx);
 
     let Some(module_ptr) = module_value.as_object_ptr() else {
-        return ControlFlow::Error(RuntimeError::new(
-            crate::error::RuntimeErrorKind::ImportError {
-                module: "<unknown>".into(),
-                message: "Cannot import * from None".into(),
-            },
+        return ControlFlow::Error(RuntimeError::import_error(
+            "<unknown>",
+            "Cannot import * from None",
         ));
     };
 
     let Some(module) = vm.import_resolver.module_from_ptr(module_ptr) else {
-        return ControlFlow::Error(RuntimeError::new(
-            crate::error::RuntimeErrorKind::ImportError {
-                module: "<unknown>".into(),
-                message: "cannot import * from non-module object".into(),
-            },
+        return ControlFlow::Error(RuntimeError::import_error(
+            "<unknown>",
+            "cannot import * from non-module object",
         ));
     };
 

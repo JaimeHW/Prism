@@ -4,8 +4,16 @@
 
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::objects::{extract_type_id, get_attribute_value};
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_core::intern::intern;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::dict::DictObject;
+use std::sync::Arc;
 
 // =============================================================================
 // Constants
@@ -52,21 +60,48 @@ pub fn load_false(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// may be used for explicit local variable access semantics.
 #[inline(always)]
 pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
     let slot = inst.imm16() as u8;
+    let dst = inst.dst().0;
+
+    if let Some(mapping) = vm.current_frame().locals_mapping() {
+        let name = mapped_local_name(vm.current_frame(), slot);
+        return match load_mapped_local(vm, mapping, &name) {
+            Ok(value) => {
+                vm.current_frame_mut().set_reg(dst, value);
+                ControlFlow::Continue
+            }
+            Err(err) => ControlFlow::Error(err),
+        };
+    }
+
+    let frame = vm.current_frame_mut();
     let value = frame.get_reg(slot);
-    frame.set_reg(inst.dst().0, value);
+    frame.set_reg(dst, value);
     ControlFlow::Continue
 }
 
 /// StoreLocal: frame.registers[imm16] = dst-register
 #[inline(always)]
 pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    let slot = inst.imm16() as u8;
+    if let Some(mapping) = vm.current_frame().locals_mapping() {
+        let (value, name) = {
+            let frame = vm.current_frame();
+            (frame.get_reg(inst.dst().0), mapped_local_name(frame, slot))
+        };
+        return match store_mapped_local(vm, mapping, &name, value) {
+            Ok(()) => {
+                vm.current_frame_mut().set_reg(slot, value);
+                ControlFlow::Continue
+            }
+            Err(err) => ControlFlow::Error(err),
+        };
+    }
+
     let frame = vm.current_frame_mut();
     // Store opcodes use DstImm16 encoding where the source register is carried
     // in the dst field and imm16 is the destination slot index.
     let value = frame.get_reg(inst.dst().0);
-    let slot = inst.imm16() as u8;
     frame.set_reg(slot, value);
     ControlFlow::Continue
 }
@@ -74,10 +109,154 @@ pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// DeleteLocal: frame.registers[imm16] = undefined
 #[inline(always)]
 pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
     let slot = inst.imm16() as u8;
-    frame.set_reg(slot, Value::none()); // Mark as unbound
+    if let Some(mapping) = vm.current_frame().locals_mapping() {
+        let name = mapped_local_name(vm.current_frame(), slot);
+        return match delete_mapped_local(vm, mapping, &name) {
+            Ok(true) => {
+                vm.current_frame_mut().clear_reg(slot);
+                ControlFlow::Continue
+            }
+            Ok(false) => ControlFlow::Error(RuntimeError::name_error(name)),
+            Err(err) => ControlFlow::Error(err),
+        };
+    }
+
+    let frame = vm.current_frame_mut();
+    frame.clear_reg(slot);
     ControlFlow::Continue
+}
+
+#[inline]
+fn mapped_local_name(frame: &crate::frame::Frame, slot: u8) -> Arc<str> {
+    Arc::clone(frame.get_local_name(slot as u16))
+}
+
+#[inline]
+fn mapped_local_key(name: &Arc<str>) -> Value {
+    Value::string(intern(name.as_ref()))
+}
+
+fn load_mapped_local(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    name: &Arc<str>,
+) -> Result<Value, RuntimeError> {
+    if let Some(value) = lookup_mapped_local(vm, mapping, name)? {
+        return Ok(value);
+    }
+
+    if let Some(value) = vm.module_scope_value(name) {
+        return Ok(value);
+    }
+
+    if let Some(value) = vm.builtins.get(name) {
+        return Ok(value);
+    }
+
+    Err(RuntimeError::name_error(Arc::clone(name)))
+}
+
+fn lookup_mapped_local(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    name: &Arc<str>,
+) -> Result<Option<Value>, RuntimeError> {
+    let key = mapped_local_key(name);
+
+    if let Some(ptr) = mapping.as_object_ptr()
+        && extract_type_id(ptr) == TypeId::DICT
+    {
+        let dict = unsafe { &*(ptr as *const DictObject) };
+        return Ok(dict.get(key));
+    }
+
+    let getitem_name = intern("__getitem__");
+    let getitem = get_attribute_value(vm, mapping, &getitem_name).map_err(|err| {
+        if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) {
+            RuntimeError::type_error("class namespace mapping must define __getitem__")
+        } else {
+            err
+        }
+    })?;
+
+    match invoke_callable_value(vm, getitem, &[key]) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_missing_mapping_key_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn store_mapped_local(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    name: &Arc<str>,
+    value: Value,
+) -> Result<(), RuntimeError> {
+    let key = mapped_local_key(name);
+
+    if let Some(ptr) = mapping.as_object_ptr()
+        && extract_type_id(ptr) == TypeId::DICT
+    {
+        let dict = unsafe { &mut *(ptr as *mut DictObject) };
+        dict.set(key, value);
+        return Ok(());
+    }
+
+    let setitem_name = intern("__setitem__");
+    let setitem = get_attribute_value(vm, mapping, &setitem_name).map_err(|err| {
+        if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) {
+            RuntimeError::type_error("class namespace mapping must define __setitem__")
+        } else {
+            err
+        }
+    })?;
+    invoke_callable_value(vm, setitem, &[key, value])?;
+    Ok(())
+}
+
+fn delete_mapped_local(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    name: &Arc<str>,
+) -> Result<bool, RuntimeError> {
+    let key = mapped_local_key(name);
+
+    if let Some(ptr) = mapping.as_object_ptr()
+        && extract_type_id(ptr) == TypeId::DICT
+    {
+        let dict = unsafe { &mut *(ptr as *mut DictObject) };
+        return Ok(dict.remove(key).is_some());
+    }
+
+    let delitem_name = intern("__delitem__");
+    let delitem = get_attribute_value(vm, mapping, &delitem_name).map_err(|err| {
+        if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) {
+            RuntimeError::type_error("class namespace mapping must define __delitem__")
+        } else {
+            err
+        }
+    })?;
+
+    match invoke_callable_value(vm, delitem, &[key]) {
+        Ok(_) => Ok(true),
+        Err(err) if is_missing_mapping_key_error(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+#[inline]
+fn is_missing_mapping_key_error(err: &RuntimeError) -> bool {
+    matches!(err.kind, RuntimeErrorKind::KeyError { .. })
+        || matches!(
+            err.kind,
+            RuntimeErrorKind::Exception { type_id, .. }
+                if type_id == ExceptionTypeId::KeyError.as_u8() as u16
+        )
+        || matches!(
+            &err.kind,
+            RuntimeErrorKind::InternalError { message } if message.as_ref() == "key not found"
+        )
 }
 
 // =============================================================================
@@ -160,9 +339,16 @@ pub fn load_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
             }
         }
-        None => ControlFlow::Error(crate::error::RuntimeError::internal(
-            "LoadClosure without closure environment",
-        )),
+        None => {
+            let code = &frame.code;
+            ControlFlow::Error(crate::error::RuntimeError::internal(format!(
+                "LoadClosure without closure environment in {} (qualname={}, cellvars={}, freevars={})",
+                code.name,
+                code.qualname,
+                code.cellvars.len(),
+                code.freevars.len()
+            )))
+        }
     }
 }
 

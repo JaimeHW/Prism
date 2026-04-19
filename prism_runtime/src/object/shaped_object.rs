@@ -22,6 +22,8 @@
 use super::shape::{MAX_INLINE_SLOTS, PropertyFlags, Shape, ShapeId};
 use super::{ObjectHeader, PyObject};
 use crate::object::type_obj::TypeId;
+use crate::types::dict::DictObject;
+use crate::types::string::StringObject;
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
@@ -213,6 +215,20 @@ pub struct ShapedObject {
     /// Overflow storage for properties beyond inline capacity.
     /// Lazily allocated only when needed.
     overflow: Option<Box<OverflowStorage>>,
+
+    /// Optional native dict storage for heap subclasses of `dict`.
+    ///
+    /// This keeps Python-visible mapping state separate from instance
+    /// attributes while allowing builtin `dict` methods and opcodes to
+    /// operate on user-defined subclasses with the same semantics as the
+    /// built-in type.
+    dict_backing: Option<Box<DictObject>>,
+
+    /// Optional native string storage for heap subclasses of `str`.
+    ///
+    /// This preserves native string semantics while keeping heap instance
+    /// attributes in the shaped-object storage.
+    string_backing: Option<Box<StringObject>>,
 }
 
 impl ShapedObject {
@@ -224,13 +240,71 @@ impl ShapedObject {
             shape: empty_shape,
             inline_slots: InlineSlots::new(),
             overflow: None,
+            dict_backing: None,
+            string_backing: None,
         }
+    }
+
+    /// Create a new ShapedObject with native dict storage.
+    #[inline]
+    pub fn new_dict_backed(type_id: TypeId, empty_shape: Arc<Shape>) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.dict_backing = Some(Box::new(DictObject::new()));
+        object
+    }
+
+    /// Create a new ShapedObject with native string storage.
+    #[inline]
+    pub fn new_string_backed(
+        type_id: TypeId,
+        empty_shape: Arc<Shape>,
+        string: StringObject,
+    ) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.string_backing = Some(Box::new(string));
+        object
     }
 
     /// Create a new ShapedObject with default OBJECT type.
     #[inline]
     pub fn with_empty_shape(empty_shape: Arc<Shape>) -> Self {
         Self::new(TypeId::OBJECT, empty_shape)
+    }
+
+    /// Check whether this heap instance carries native dict storage.
+    #[inline]
+    pub fn has_dict_backing(&self) -> bool {
+        self.dict_backing.is_some()
+    }
+
+    /// Borrow the native dict storage for heap subclasses of `dict`.
+    #[inline]
+    pub fn dict_backing(&self) -> Option<&DictObject> {
+        self.dict_backing.as_deref()
+    }
+
+    /// Mutably borrow the native dict storage for heap subclasses of `dict`.
+    #[inline]
+    pub fn dict_backing_mut(&mut self) -> Option<&mut DictObject> {
+        self.dict_backing.as_deref_mut()
+    }
+
+    /// Check whether this heap instance carries native string storage.
+    #[inline]
+    pub fn has_string_backing(&self) -> bool {
+        self.string_backing.is_some()
+    }
+
+    /// Borrow the native string storage for heap subclasses of `str`.
+    #[inline]
+    pub fn string_backing(&self) -> Option<&StringObject> {
+        self.string_backing.as_deref()
+    }
+
+    /// Mutably borrow the native string storage for heap subclasses of `str`.
+    #[inline]
+    pub fn string_backing_mut(&mut self) -> Option<&mut StringObject> {
+        self.string_backing.as_deref_mut()
     }
 
     /// Get the current shape.
@@ -589,6 +663,44 @@ mod tests {
         slots.set(0, val(1));
         slots.set(0, val(2));
         assert_eq!(slots.get(0), val(2));
+    }
+
+    #[test]
+    fn test_new_dict_backed_allocates_native_mapping_storage() {
+        let mut object = ShapedObject::new_dict_backed(TypeId::from_raw(512), Shape::empty());
+        assert!(object.has_dict_backing());
+
+        let key = Value::string(intern("member"));
+        let value = val(7);
+        object
+            .dict_backing_mut()
+            .expect("dict backing should exist")
+            .set(key, value);
+
+        assert_eq!(
+            object
+                .dict_backing()
+                .expect("dict backing should exist")
+                .get(key),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn test_new_string_backed_preserves_native_string_storage() {
+        let object = ShapedObject::new_string_backed(
+            TypeId::from_raw(513),
+            Shape::empty(),
+            StringObject::new("value"),
+        );
+        assert!(object.has_string_backing());
+        assert_eq!(
+            object
+                .string_backing()
+                .expect("string backing should exist")
+                .as_str(),
+            "value"
+        );
     }
 
     #[test]

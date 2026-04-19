@@ -21,6 +21,7 @@
 //! - Pre-allocates containers with exact capacity when sizes are known
 
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -421,10 +422,7 @@ impl ArgumentBinder {
     /// consider string interning.
     #[inline]
     fn create_string_key(name: &str) -> Value {
-        // For now, store string pointer - proper string interning TBD
-        // TODO: Use interned string Value when string object system is complete
-        let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-        Value::from_bits(leaked.as_ptr() as u64 | 0x0006_0000_0000_0000)
+        Value::string(intern(name))
     }
 }
 
@@ -676,6 +674,18 @@ mod tests {
 
         let varkw = bound.varkw.as_ref().unwrap();
         assert_eq!(varkw.len(), 2);
+        assert_eq!(
+            varkw
+                .get(Value::string(intern("extra1")))
+                .and_then(|value| value.as_int()),
+            Some(100)
+        );
+        assert_eq!(
+            varkw
+                .get(Value::string(intern("extra2")))
+                .and_then(|value| value.as_int()),
+            Some(200)
+        );
     }
 
     // =========================================================================

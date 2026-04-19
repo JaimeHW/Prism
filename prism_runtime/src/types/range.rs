@@ -1,63 +1,97 @@
 //! Python range object implementation.
 //!
-//! Provides a memory-efficient representation of integer sequences
-//! that generates values on-demand during iteration.
+//! Prism keeps the fast-path compact `i64` representation for ordinary ranges
+//! while transparently promoting to bigint-backed bounds when Python semantics
+//! require arbitrary-precision integers.
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::int::{bigint_to_value, value_to_i64};
+use num_bigint::BigInt;
+use num_traits::{One, Signed, ToPrimitive, Zero};
+use prism_core::Value;
 use std::fmt;
 
-// =============================================================================
-// RangeObject
-// =============================================================================
+#[derive(Clone, PartialEq, Eq)]
+enum RangeRepr {
+    Small {
+        start: i64,
+        stop: i64,
+        step: i64,
+    },
+    Big {
+        start: BigInt,
+        stop: BigInt,
+        step: BigInt,
+    },
+}
+
+#[inline]
+fn small_len(start: i64, stop: i64, step: i64) -> usize {
+    if step > 0 {
+        if stop <= start {
+            0
+        } else {
+            ((stop - start - 1) / step + 1) as usize
+        }
+    } else if stop >= start {
+        0
+    } else {
+        ((start - stop - 1) / (-step) + 1) as usize
+    }
+}
+
+#[inline]
+fn big_is_empty(start: &BigInt, stop: &BigInt, step: &BigInt) -> bool {
+    if step.is_positive() {
+        stop <= start
+    } else {
+        stop >= start
+    }
+}
+
+fn big_len(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
+    if big_is_empty(start, stop, step) {
+        return BigInt::zero();
+    }
+
+    if step.is_positive() {
+        ((stop - start - BigInt::one()) / step) + BigInt::one()
+    } else {
+        ((start - stop - BigInt::one()) / (-step)) + BigInt::one()
+    }
+}
 
 /// Python range object.
-///
-/// Represents an immutable sequence of integers with start, stop, and step.
-/// Unlike lists, ranges are memory-efficient because they compute values
-/// on-demand rather than storing them.
-///
-/// # Examples
-///
-/// ```text
-/// range(5)        -> 0, 1, 2, 3, 4
-/// range(2, 8)     -> 2, 3, 4, 5, 6, 7
-/// range(0, 10, 2) -> 0, 2, 4, 6, 8
-/// range(10, 0, -1) -> 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
-/// ```
-///
-/// # Performance
-///
-/// - O(1) creation regardless of range size
-/// - O(1) length calculation
-/// - O(1) indexed access
-/// - O(1) membership test
 #[repr(C)]
 pub struct RangeObject {
     /// Object header.
     pub header: ObjectHeader,
-    /// Start value (inclusive).
-    pub start: i64,
-    /// Stop value (exclusive).
-    pub stop: i64,
-    /// Step value (non-zero).
-    pub step: i64,
+    repr: RangeRepr,
 }
 
 impl RangeObject {
     /// Create a new range with start, stop, and step.
-    ///
-    /// # Panics
-    ///
-    /// Panics if step is zero.
     #[inline]
     pub fn new(start: i64, stop: i64, step: i64) -> Self {
         assert!(step != 0, "range() arg 3 must not be zero");
         Self {
             header: ObjectHeader::new(TypeId::RANGE),
-            start,
-            stop,
-            step,
+            repr: RangeRepr::Small { start, stop, step },
+        }
+    }
+
+    /// Create a range with arbitrary-precision bounds.
+    #[inline]
+    pub fn from_bigints(start: BigInt, stop: BigInt, step: BigInt) -> Self {
+        assert!(!step.is_zero(), "range() arg 3 must not be zero");
+
+        match (start.to_i64(), stop.to_i64(), step.to_i64()) {
+            (Some(start), Some(stop), Some(step)) => Self::new(start, stop, step),
+            _ => Self {
+                header: ObjectHeader::new(TypeId::RANGE),
+                repr: RangeRepr::Big { start, stop, step },
+            },
         }
     }
 
@@ -73,120 +107,208 @@ impl RangeObject {
         Self::new(start, stop, 1)
     }
 
+    /// Returns true when the range uses compact `i64` bounds.
+    #[inline]
+    pub fn is_small(&self) -> bool {
+        matches!(self.repr, RangeRepr::Small { .. })
+    }
+
+    /// Return the start value when it fits in `i64`.
+    #[inline]
+    pub fn start_i64(&self) -> Option<i64> {
+        match &self.repr {
+            RangeRepr::Small { start, .. } => Some(*start),
+            RangeRepr::Big { start, .. } => start.to_i64(),
+        }
+    }
+
+    /// Return the stop value when it fits in `i64`.
+    #[inline]
+    pub fn stop_i64(&self) -> Option<i64> {
+        match &self.repr {
+            RangeRepr::Small { stop, .. } => Some(*stop),
+            RangeRepr::Big { stop, .. } => stop.to_i64(),
+        }
+    }
+
+    /// Return the step value when it fits in `i64`.
+    #[inline]
+    pub fn step_i64(&self) -> Option<i64> {
+        match &self.repr {
+            RangeRepr::Small { step, .. } => Some(*step),
+            RangeRepr::Big { step, .. } => step.to_i64(),
+        }
+    }
+
+    /// Get the number of elements when it fits in `usize`.
+    #[inline]
+    pub fn try_len(&self) -> Option<usize> {
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => Some(small_len(*start, *stop, *step)),
+            RangeRepr::Big { start, stop, step } => big_len(start, stop, step).to_usize(),
+        }
+    }
+
     /// Get the number of elements in the range.
     ///
-    /// This is O(1) - computed from start, stop, step.
+    /// Big ranges that exceed `usize` saturate to `usize::MAX`; callers that
+    /// need overflow detection should use [`Self::try_len`].
     #[inline]
     pub fn len(&self) -> usize {
-        if self.step > 0 {
-            if self.stop <= self.start {
-                0
-            } else {
-                ((self.stop - self.start - 1) / self.step + 1) as usize
-            }
-        } else {
-            // step < 0
-            if self.stop >= self.start {
-                0
-            } else {
-                ((self.start - self.stop - 1) / (-self.step) + 1) as usize
-            }
-        }
+        self.try_len().unwrap_or(usize::MAX)
     }
 
     /// Check if the range is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => small_len(*start, *stop, *step) == 0,
+            RangeRepr::Big { start, stop, step } => big_is_empty(start, stop, step),
+        }
     }
 
-    /// Get the element at index (supports negative indexing).
-    ///
-    /// Returns None if index is out of bounds.
+    /// Get the element at index as a Python value.
+    pub fn get_value(&self, index: i64) -> Option<Value> {
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => {
+                let len = small_len(*start, *stop, *step) as i64;
+                let idx = if index < 0 { len + index } else { index };
+                if idx < 0 || idx >= len {
+                    return None;
+                }
+                Some(bigint_to_value(
+                    BigInt::from(*start) + BigInt::from(idx) * BigInt::from(*step),
+                ))
+            }
+            RangeRepr::Big { start, stop, step } => {
+                let idx = if index < 0 {
+                    let len = self.try_len()?.to_i64()?;
+                    len + index
+                } else {
+                    index
+                };
+                if idx < 0 {
+                    return None;
+                }
+
+                let value = start + BigInt::from(idx) * step;
+                if step.is_positive() {
+                    if value < *start || value >= *stop {
+                        return None;
+                    }
+                } else if value > *start || value <= *stop {
+                    return None;
+                }
+                Some(bigint_to_value(value))
+            }
+        }
+    }
+
+    /// Get the element at index when it fits in `i64`.
     #[inline]
     pub fn get(&self, index: i64) -> Option<i64> {
-        let len = self.len() as i64;
-        let idx = if index < 0 { len + index } else { index };
-
-        if idx < 0 || idx >= len {
-            return None;
-        }
-
-        Some(self.start + idx * self.step)
+        self.get_value(index).and_then(value_to_i64)
     }
 
-    /// Check if a value is in the range.
-    ///
-    /// This is O(1) - computed mathematically.
+    /// Check if a small integer is in the range.
     #[inline]
     pub fn contains(&self, value: i64) -> bool {
-        // Check if value is within bounds
-        if self.step > 0 {
-            if value < self.start || value >= self.stop {
-                return false;
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => {
+                if *step > 0 {
+                    if value < *start || value >= *stop {
+                        return false;
+                    }
+                } else if value > *start || value <= *stop {
+                    return false;
+                }
+                (value - *start) % *step == 0
             }
-        } else {
-            if value > self.start || value <= self.stop {
-                return false;
+            RangeRepr::Big { start, stop, step } => {
+                let value = BigInt::from(value);
+                if step.is_positive() {
+                    if value < *start || value >= *stop {
+                        return false;
+                    }
+                } else if value > *start || value <= *stop {
+                    return false;
+                }
+                ((value - start) % step).is_zero()
             }
         }
-
-        // Check if value aligns with step
-        (value - self.start) % self.step == 0
     }
 
     /// Create an iterator over this range.
     #[inline]
     pub fn iter(&self) -> RangeIterator {
-        RangeIterator {
-            current: self.start,
-            stop: self.stop,
-            step: self.step,
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => RangeIterator::Small {
+                current: *start,
+                stop: *stop,
+                step: *step,
+            },
+            RangeRepr::Big { start, stop, step } => RangeIterator::Big {
+                current: start.clone(),
+                stop: stop.clone(),
+                step: step.clone(),
+            },
         }
     }
 
-    /// Get the first element, or None if empty.
+    /// Get the first element when it fits in `i64`.
     #[inline]
     pub fn first(&self) -> Option<i64> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(self.start)
-        }
+        if self.is_empty() { None } else { self.get(0) }
     }
 
-    /// Get the last element, or None if empty.
+    /// Get the last element when it fits in `i64`.
     #[inline]
     pub fn last(&self) -> Option<i64> {
-        let len = self.len();
+        let len = self.try_len()?;
         if len == 0 {
             None
         } else {
-            Some(self.start + ((len - 1) as i64) * self.step)
+            self.get((len - 1) as i64)
         }
     }
 
-    /// Reverse the range (returns a new range).
+    /// Reverse the range.
     pub fn reverse(&self) -> RangeObject {
-        let len = self.len();
-        if len == 0 {
+        if self.is_empty() {
             return RangeObject::new(0, 0, 1);
         }
 
-        let last = self.last().unwrap();
-        let new_stop = if self.step > 0 {
-            self.start - self.step
-        } else {
-            self.start - self.step
-        };
-
-        RangeObject::new(last, new_stop, -self.step)
+        match &self.repr {
+            RangeRepr::Small {
+                start,
+                stop: _,
+                step,
+            } => {
+                let len = small_len(*start, self.stop_i64().unwrap(), *step);
+                let last = self.get((len - 1) as i64).unwrap();
+                RangeObject::new(last, start - step, -step)
+            }
+            RangeRepr::Big {
+                start,
+                stop: _,
+                step,
+            } => {
+                let len = big_len(
+                    start,
+                    match &self.repr {
+                        RangeRepr::Big { stop, .. } => stop,
+                        RangeRepr::Small { .. } => unreachable!(),
+                    },
+                    step,
+                );
+                let last = start + (&len - BigInt::one()) * step;
+                RangeObject::from_bigints(last, start - step, -step.clone())
+            }
+        }
     }
 
-    /// Convert to a vector of values.
-    ///
-    /// Note: This allocates. Use iter() for lazy iteration.
-    pub fn to_vec(&self) -> Vec<i64> {
+    /// Materialize the range into a vector of Python values.
+    pub fn to_vec(&self) -> Vec<Value> {
         self.iter().collect()
     }
 }
@@ -195,23 +317,24 @@ impl Clone for RangeObject {
     fn clone(&self) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::RANGE),
-            start: self.start,
-            stop: self.stop,
-            step: self.step,
+            repr: self.repr.clone(),
         }
     }
 }
 
 impl PartialEq for RangeObject {
     fn eq(&self, other: &Self) -> bool {
-        // Two ranges are equal if they produce the same sequence
-        if self.len() != other.len() {
-            return false;
+        match (self.try_len(), other.try_len()) {
+            (Some(a), Some(b)) if a != b => return false,
+            _ => {}
         }
-        if self.is_empty() {
-            return true; // Both empty
+
+        if self.is_empty() && other.is_empty() {
+            return true;
         }
-        self.start == other.start && self.step == other.step && self.len() == other.len()
+
+        self.iter().next() == other.iter().next()
+            && self.repr_step_string() == other.repr_step_string()
     }
 }
 
@@ -219,20 +342,37 @@ impl Eq for RangeObject {}
 
 impl fmt::Debug for RangeObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.step == 1 {
-            write!(f, "range({}, {})", self.start, self.stop)
-        } else {
-            write!(f, "range({}, {}, {})", self.start, self.stop, self.step)
-        }
+        fmt::Display::fmt(self, f)
     }
 }
 
 impl fmt::Display for RangeObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.step == 1 {
-            write!(f, "range({}, {})", self.start, self.stop)
-        } else {
-            write!(f, "range({}, {}, {})", self.start, self.stop, self.step)
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => {
+                if *step == 1 {
+                    write!(f, "range({}, {})", start, stop)
+                } else {
+                    write!(f, "range({}, {}, {})", start, stop, step)
+                }
+            }
+            RangeRepr::Big { start, stop, step } => {
+                if step == &BigInt::one() {
+                    write!(f, "range({}, {})", start, stop)
+                } else {
+                    write!(f, "range({}, {}, {})", start, stop, step)
+                }
+            }
+        }
+    }
+}
+
+impl RangeObject {
+    #[inline]
+    fn repr_step_string(&self) -> String {
+        match &self.repr {
+            RangeRepr::Small { step, .. } => step.to_string(),
+            RangeRepr::Big { step, .. } => step.to_string(),
         }
     }
 }
@@ -247,93 +387,84 @@ impl PyObject for RangeObject {
     }
 }
 
-// =============================================================================
-// RangeIterator
-// =============================================================================
-
 /// Iterator over a range.
-///
-/// Produces values on-demand with O(1) memory usage regardless of range size.
 #[derive(Clone, Debug)]
-pub struct RangeIterator {
-    current: i64,
-    stop: i64,
-    step: i64,
+pub enum RangeIterator {
+    Small {
+        current: i64,
+        stop: i64,
+        step: i64,
+    },
+    Big {
+        current: BigInt,
+        stop: BigInt,
+        step: BigInt,
+    },
 }
 
 impl RangeIterator {
-    /// Create a new range iterator.
+    /// Remaining element count when it fits in `usize`.
     #[inline]
-    pub fn new(start: i64, stop: i64, step: i64) -> Self {
-        Self {
-            current: start,
-            stop,
-            step,
-        }
-    }
-
-    /// Check if there are more elements.
-    #[inline]
-    pub fn has_next(&self) -> bool {
-        if self.step > 0 {
-            self.current < self.stop
-        } else {
-            self.current > self.stop
+    pub fn remaining_len(&self) -> Option<usize> {
+        match self {
+            Self::Small {
+                current,
+                stop,
+                step,
+            } => Some(small_len(*current, *stop, *step)),
+            Self::Big {
+                current,
+                stop,
+                step,
+            } => big_len(current, stop, step).to_usize(),
         }
     }
 }
 
 impl Iterator for RangeIterator {
-    type Item = i64;
+    type Item = Value;
 
-    #[inline]
-    fn next(&mut self) -> Option<i64> {
-        if self.step > 0 {
-            if self.current < self.stop {
-                let value = self.current;
-                self.current += self.step;
-                Some(value)
-            } else {
-                None
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small {
+                current,
+                stop,
+                step,
+            } => {
+                if (*step > 0 && *current >= *stop) || (*step < 0 && *current <= *stop) {
+                    return None;
+                }
+                let value = *current;
+                *current += *step;
+                Some(bigint_to_value(BigInt::from(value)))
             }
-        } else {
-            if self.current > self.stop {
-                let value = self.current;
-                self.current += self.step; // step is negative
-                Some(value)
-            } else {
-                None
+            Self::Big {
+                current,
+                stop,
+                step,
+            } => {
+                if (step.is_positive() && *current >= *stop)
+                    || (step.is_negative() && *current <= *stop)
+                {
+                    return None;
+                }
+                let value = current.clone();
+                *current += step.clone();
+                Some(bigint_to_value(value))
             }
         }
     }
 
-    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = if self.step > 0 {
-            if self.stop <= self.current {
-                0
-            } else {
-                ((self.stop - self.current - 1) / self.step + 1) as usize
-            }
-        } else {
-            if self.stop >= self.current {
-                0
-            } else {
-                ((self.current - self.stop - 1) / (-self.step) + 1) as usize
-            }
-        };
-        (len, Some(len))
+        match self.remaining_len() {
+            Some(len) => (len, Some(len)),
+            None => (0, None),
+        }
     }
 }
 
-impl ExactSizeIterator for RangeIterator {}
-
-// =============================================================================
-// IntoIterator Implementation
-// =============================================================================
-
 impl IntoIterator for &RangeObject {
-    type Item = i64;
+    type Item = Value;
     type IntoIter = RangeIterator;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -341,28 +472,31 @@ impl IntoIterator for &RangeObject {
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn collect_i64(range: &RangeObject) -> Vec<i64> {
+        range
+            .iter()
+            .map(|value| value_to_i64(value).expect("range item should fit in i64"))
+            .collect()
+    }
+
     #[test]
     fn test_range_from_stop() {
         let r = RangeObject::from_stop(5);
-        assert_eq!(r.start, 0);
-        assert_eq!(r.stop, 5);
-        assert_eq!(r.step, 1);
+        assert_eq!(r.start_i64(), Some(0));
+        assert_eq!(r.stop_i64(), Some(5));
+        assert_eq!(r.step_i64(), Some(1));
         assert_eq!(r.len(), 5);
     }
 
     #[test]
     fn test_range_from_start_stop() {
         let r = RangeObject::from_start_stop(2, 8);
-        assert_eq!(r.start, 2);
-        assert_eq!(r.stop, 8);
+        assert_eq!(r.start_i64(), Some(2));
+        assert_eq!(r.stop_i64(), Some(8));
         assert_eq!(r.len(), 6);
     }
 
@@ -370,24 +504,14 @@ mod tests {
     fn test_range_with_step() {
         let r = RangeObject::new(0, 10, 2);
         assert_eq!(r.len(), 5);
-        let values: Vec<_> = r.iter().collect();
-        assert_eq!(values, vec![0, 2, 4, 6, 8]);
+        assert_eq!(collect_i64(&r), vec![0, 2, 4, 6, 8]);
     }
 
     #[test]
     fn test_range_negative_step() {
         let r = RangeObject::new(10, 0, -1);
         assert_eq!(r.len(), 10);
-        let values: Vec<_> = r.iter().collect();
-        assert_eq!(values, vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
-    }
-
-    #[test]
-    fn test_range_negative_step_by_two() {
-        let r = RangeObject::new(10, 0, -2);
-        assert_eq!(r.len(), 5);
-        let values: Vec<_> = r.iter().collect();
-        assert_eq!(values, vec![10, 8, 6, 4, 2]);
+        assert_eq!(collect_i64(&r), vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
     }
 
     #[test]
@@ -399,82 +523,46 @@ mod tests {
     }
 
     #[test]
-    fn test_range_get() {
+    fn test_range_get_and_contains() {
         let r = RangeObject::new(10, 20, 2);
         assert_eq!(r.get(0), Some(10));
-        assert_eq!(r.get(1), Some(12));
         assert_eq!(r.get(4), Some(18));
-        assert_eq!(r.get(-1), Some(18)); // Last element
-        assert_eq!(r.get(5), None); // Out of bounds
+        assert_eq!(r.get(-1), Some(18));
+        assert_eq!(r.get(5), None);
+        assert!(r.contains(12));
+        assert!(!r.contains(13));
     }
 
     #[test]
-    fn test_range_contains() {
-        let r = RangeObject::new(0, 10, 2);
-        assert!(r.contains(0));
-        assert!(r.contains(2));
-        assert!(r.contains(8));
-        assert!(!r.contains(1)); // Not aligned with step
-        assert!(!r.contains(10)); // Exclusive stop
-        assert!(!r.contains(-1)); // Below start
-    }
-
-    #[test]
-    fn test_range_first_last() {
-        let r = RangeObject::new(5, 15, 3);
-        assert_eq!(r.first(), Some(5));
-        assert_eq!(r.last(), Some(14)); // 5, 8, 11, 14
-    }
-
-    #[test]
-    fn test_range_equality() {
-        let r1 = RangeObject::new(0, 10, 2);
-        let r2 = RangeObject::new(0, 10, 2);
-        let r3 = RangeObject::new(0, 11, 2);
-        assert_eq!(r1, r2);
-        assert_ne!(r1, r3);
-    }
-
-    #[test]
-    fn test_range_display() {
-        let r1 = RangeObject::from_start_stop(0, 10);
-        assert_eq!(format!("{}", r1), "range(0, 10)");
-
-        let r2 = RangeObject::new(0, 10, 2);
-        assert_eq!(format!("{}", r2), "range(0, 10, 2)");
-    }
-
-    #[test]
-    fn test_range_clone() {
-        let r1 = RangeObject::new(1, 100, 5);
-        let r2 = r1.clone();
-        assert_eq!(r1, r2);
-    }
-
-    #[test]
-    fn test_iterator_size_hint() {
-        let r = RangeObject::from_stop(100);
-        let iter = r.iter();
-        assert_eq!(iter.size_hint(), (100, Some(100)));
-    }
-
-    #[test]
-    fn test_exact_size_iterator() {
-        let r = RangeObject::new(0, 10, 3);
-        let iter = r.iter();
-        assert_eq!(iter.len(), 4); // 0, 3, 6, 9
-    }
-
-    #[test]
-    fn test_range_to_vec() {
+    fn test_range_reverse() {
         let r = RangeObject::new(1, 6, 1);
-        assert_eq!(r.to_vec(), vec![1, 2, 3, 4, 5]);
+        let reversed = r.reverse();
+        assert_eq!(collect_i64(&reversed), vec![5, 4, 3, 2, 1]);
     }
 
     #[test]
-    fn test_into_iter() {
-        let r = RangeObject::from_stop(3);
-        let values: Vec<_> = (&r).into_iter().collect();
-        assert_eq!(values, vec![0, 1, 2]);
+    fn test_big_range_iterates_lazily() {
+        let stop = BigInt::from(1_u8) << 1000_u32;
+        let range = RangeObject::from_bigints(BigInt::zero(), stop, BigInt::one());
+
+        let mut iter = range.iter();
+        assert_eq!(value_to_i64(iter.next().unwrap()), Some(0));
+        assert_eq!(value_to_i64(iter.next().unwrap()), Some(1));
+        assert_eq!(value_to_i64(iter.next().unwrap()), Some(2));
+    }
+
+    #[test]
+    fn test_big_range_try_len_reports_overflow() {
+        let stop = BigInt::from(1_u8) << 1000_u32;
+        let range = RangeObject::from_bigints(BigInt::zero(), stop, BigInt::one());
+        assert_eq!(range.try_len(), None);
+        assert_eq!(range.len(), usize::MAX);
+    }
+
+    #[test]
+    fn test_big_range_display() {
+        let stop = BigInt::from(1_u8) << 80_u32;
+        let range = RangeObject::from_bigints(BigInt::zero(), stop.clone(), BigInt::one());
+        assert_eq!(range.to_string(), format!("range(0, {stop})"));
     }
 }

@@ -8,9 +8,11 @@
 //! - **UTF-8 Native**: All strings are valid UTF-8
 //! - **Static Empty String**: Zero-allocation access via `empty_string()`
 
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{HASH_NOT_COMPUTED, ObjectHeader, PyObject};
-use prism_core::intern::InternedString;
+use prism_core::Value;
+use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
@@ -52,6 +54,12 @@ static STATIC_EMPTY_STRING: LazyLock<StringObject> = LazyLock::new(StringObject:
 #[inline(always)]
 pub fn empty_string() -> &'static StringObject {
     &STATIC_EMPTY_STRING
+}
+
+#[inline(always)]
+fn boxed_string_value(string: StringObject) -> Value {
+    let boxed = Box::new(string);
+    Value::object_ptr(Box::into_raw(boxed) as *const ())
 }
 
 // =============================================================================
@@ -117,6 +125,102 @@ enum StringRepr {
     Heap(Arc<str>),
     /// Interned string (shared globally, O(1) equality).
     Interned(InternedString),
+}
+
+#[derive(Clone)]
+pub enum StringValueRef<'a> {
+    Heap(&'a StringObject),
+    Interned(InternedString),
+}
+
+impl StringValueRef<'_> {
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Heap(string) => string.as_str(),
+            Self::Interned(interned) => interned.as_str(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.as_str().is_empty()
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.as_str().len()
+    }
+}
+
+#[inline(always)]
+pub fn value_as_string_ref(value: Value) -> Option<StringValueRef<'static>> {
+    if value.is_string() {
+        let ptr = value.as_string_object_ptr()? as *const u8;
+        return interned_by_ptr(ptr).map(StringValueRef::Interned);
+    }
+
+    let ptr = value.as_object_ptr()?;
+    object_ptr_as_string_ref(ptr)
+}
+
+#[inline(always)]
+pub fn object_ptr_as_string_ref(ptr: *const ()) -> Option<StringValueRef<'static>> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::STR => Some(StringValueRef::Heap(unsafe {
+            &*(ptr as *const StringObject)
+        })),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&*(ptr as *const ShapedObject))
+                .string_backing()
+                .map(StringValueRef::Heap)
+        },
+        _ => None,
+    }
+}
+
+#[inline(always)]
+pub fn clone_string_value(value: Value) -> Option<StringObject> {
+    match value_as_string_ref(value)? {
+        StringValueRef::Heap(string) => Some(string.clone()),
+        StringValueRef::Interned(interned) => Some(StringObject::from_interned(interned)),
+    }
+}
+
+#[inline(always)]
+pub fn concat_string_values(left: Value, right: Value) -> Option<Value> {
+    let left_ref = value_as_string_ref(left)?;
+    let right_ref = value_as_string_ref(right)?;
+
+    if left_ref.is_empty() {
+        return Some(right);
+    }
+    if right_ref.is_empty() {
+        return Some(left);
+    }
+
+    Some(boxed_string_value(StringObject::concat_slices(
+        left_ref.as_str(),
+        right_ref.as_str(),
+    )))
+}
+
+#[inline(always)]
+pub fn repeat_string_value(string: Value, count: i64) -> Option<Value> {
+    let string_ref = value_as_string_ref(string)?;
+
+    if count <= 0 || string_ref.is_empty() {
+        return Some(Value::string(intern("")));
+    }
+    if count == 1 {
+        return Some(string);
+    }
+
+    Some(boxed_string_value(StringObject::repeat_slice(
+        string_ref.as_str(),
+        count as usize,
+    )))
 }
 
 impl StringRepr {
@@ -339,18 +443,19 @@ impl StringObject {
             return self.clone();
         }
 
-        let self_str = self.as_str();
-        let other_str = other.as_str();
-        let self_len = self_str.len();
-        let other_len = other_str.len();
-        let total_len = self_len + other_len;
+        Self::concat_slices(self.as_str(), other.as_str())
+    }
+
+    #[inline(always)]
+    fn concat_slices(a: &str, b: &str) -> StringObject {
+        let a_len = a.len();
+        let b_len = b.len();
+        let total_len = a_len + b_len;
 
         if total_len <= SSO_MAX_LEN {
-            // SSO path: Direct copy into inline storage, no intermediate allocation
-            Self::concat_sso_direct(self_str, other_str, self_len, other_len, total_len)
+            Self::concat_sso_direct(a, b, a_len, b_len, total_len)
         } else {
-            // Heap path: Pre-sized allocation
-            Self::concat_heap(self_str, other_str, total_len)
+            Self::concat_heap(a, b, total_len)
         }
     }
 
@@ -420,26 +525,25 @@ impl StringObject {
             return self.clone();
         }
 
-        let s = self.as_str();
+        Self::repeat_slice(self.as_str(), n)
+    }
+
+    #[inline(always)]
+    fn repeat_slice(s: &str, n: usize) -> StringObject {
         let s_len = s.len();
 
-        // Check for overflow using checked multiplication
         let Some(total_len) = s_len.checked_mul(n) else {
             panic!("string repeat overflow: {} * {} overflows", s_len, n);
         };
 
-        // FAST PATH 3: Single ASCII byte → use optimized fill
         if s_len == 1 {
             let byte = s.as_bytes()[0];
-            // For single-byte strings, use memset-style optimization
             return Self::repeat_single_byte(byte, n, total_len);
         }
 
         if total_len <= SSO_MAX_LEN {
-            // SSO path with unrolled copy
             Self::repeat_sso(s, s_len, n, total_len)
         } else {
-            // Heap path
             Self::repeat_heap(s, n)
         }
     }

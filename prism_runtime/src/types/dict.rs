@@ -4,33 +4,9 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::hashable::HashableValue;
 use prism_core::Value;
 use rustc_hash::FxHashMap;
-use std::hash::{Hash, Hasher};
-
-// =============================================================================
-// Value Wrapper for Hashing
-// =============================================================================
-
-/// Wrapper to make Value hashable for dict keys.
-///
-/// Uses the NaN-boxed representation for fast hashing of primitives.
-#[derive(Clone, Copy)]
-struct HashableValue(Value);
-
-impl Hash for HashableValue {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl PartialEq for HashableValue {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for HashableValue {}
 
 // =============================================================================
 // Dictionary Object
@@ -39,13 +15,19 @@ impl Eq for HashableValue {}
 /// Python dict object.
 ///
 /// Uses FxHashMap for fast insertion and lookup.
-/// Order is not preserved (unlike Python 3.7+, but we can change this).
+/// Insertion order is preserved to match Python 3.7+ semantics.
 #[repr(C)]
+#[derive(Debug)]
 pub struct DictObject {
     /// Object header.
     pub header: ObjectHeader,
-    /// Key-value pairs.
+    entries: DictEntries,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DictEntries {
     items: FxHashMap<HashableValue, Value>,
+    order: Vec<HashableValue>,
 }
 
 impl DictObject {
@@ -54,7 +36,7 @@ impl DictObject {
     pub fn new() -> Self {
         Self {
             header: ObjectHeader::new(TypeId::DICT),
-            items: FxHashMap::default(),
+            entries: DictEntries::default(),
         }
     }
 
@@ -63,84 +45,112 @@ impl DictObject {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::DICT),
-            items: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            entries: DictEntries {
+                items: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+                order: Vec::with_capacity(capacity),
+            },
         }
     }
 
     /// Get the number of items.
     #[inline]
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.entries.items.len()
     }
 
     /// Check if the dict is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.entries.items.is_empty()
     }
 
     /// Get a value by key.
     #[inline]
     pub fn get(&self, key: Value) -> Option<Value> {
-        self.items.get(&HashableValue(key)).copied()
+        self.entries.items.get(&HashableValue(key)).copied()
     }
 
     /// Set a key-value pair.
     #[inline]
     pub fn set(&mut self, key: Value, value: Value) {
-        self.items.insert(HashableValue(key), value);
+        let key = HashableValue(key);
+        if self.entries.items.insert(key, value).is_none() {
+            self.entries.order.push(key);
+        }
     }
 
     /// Remove a key and return its value.
     #[inline]
     pub fn remove(&mut self, key: Value) -> Option<Value> {
-        self.items.remove(&HashableValue(key))
+        let key = HashableValue(key);
+        let removed = self.entries.items.remove(&key);
+        if removed.is_some() {
+            self.entries.order.retain(|existing| existing != &key);
+        }
+        removed
     }
 
     /// Check if the dict contains a key.
     #[inline]
     pub fn contains_key(&self, key: Value) -> bool {
-        self.items.contains_key(&HashableValue(key))
+        self.entries.items.contains_key(&HashableValue(key))
     }
 
     /// Clear all items.
     #[inline]
     pub fn clear(&mut self) {
-        self.items.clear();
+        self.entries.items.clear();
+        self.entries.order.clear();
     }
 
     /// Get an iterator over keys.
     pub fn keys(&self) -> impl Iterator<Item = Value> + '_ {
-        self.items.keys().map(|k| k.0)
+        self.entries.order.iter().map(|key| key.0)
     }
 
     /// Get an iterator over values.
     pub fn values(&self) -> impl Iterator<Item = Value> + '_ {
-        self.items.values().copied()
+        self.entries
+            .order
+            .iter()
+            .filter_map(move |key| self.entries.items.get(key).copied())
     }
 
     /// Get an iterator over key-value pairs.
     pub fn iter(&self) -> impl Iterator<Item = (Value, Value)> + '_ {
-        self.items.iter().map(|(k, v)| (k.0, *v))
+        self.entries
+            .order
+            .iter()
+            .filter_map(move |key| self.entries.items.get(key).map(|value| (key.0, *value)))
     }
 
     /// Update this dict with items from another.
     pub fn update(&mut self, other: &DictObject) {
-        for (k, v) in other.items.iter() {
-            self.items.insert(*k, *v);
+        for (key, value) in other.iter() {
+            self.set(key, value);
         }
     }
 
     /// Get value or insert default.
     pub fn get_or_insert(&mut self, key: Value, default: Value) -> Value {
-        *self.items.entry(HashableValue(key)).or_insert(default)
+        if let Some(existing) = self.get(key) {
+            return existing;
+        }
+
+        self.set(key, default);
+        default
+    }
+
+    /// Return the current value for a key, inserting a default when absent.
+    #[inline]
+    pub fn setdefault(&mut self, key: Value, default: Value) -> Value {
+        self.get_or_insert(key, default)
     }
 
     /// Pop a key and return (key, value) or None.
     pub fn popitem(&mut self) -> Option<(Value, Value)> {
-        // FxHashMap doesn't have pop, so we iterate
-        let key = self.items.keys().next().copied()?;
-        let value = self.items.remove(&key)?;
+        let key = self.entries.order.pop()?;
+        let value = self.entries.items.remove(&key)?;
         Some((key.0, value))
     }
 }
@@ -164,6 +174,8 @@ impl PyObject for DictObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::string::StringObject;
+    use crate::types::tuple::TupleObject;
     use prism_core::intern::intern;
 
     #[test]
@@ -194,6 +206,54 @@ mod tests {
 
         assert_eq!(dict.len(), 1);
         assert_eq!(dict.get(key).unwrap().as_int(), Some(200));
+    }
+
+    #[test]
+    fn test_dict_iter_preserves_insertion_order() {
+        let mut dict = DictObject::new();
+        let alpha = Value::string(intern("alpha"));
+        let beta = Value::string(intern("beta"));
+        let gamma = Value::string(intern("gamma"));
+        dict.set(alpha, Value::int(1).unwrap());
+        dict.set(beta, Value::int(2).unwrap());
+        dict.set(gamma, Value::int(3).unwrap());
+
+        let items = dict
+            .iter()
+            .map(|(key, value)| (key, value.as_int()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items,
+            vec![(alpha, Some(1)), (beta, Some(2)), (gamma, Some(3)),]
+        );
+    }
+
+    #[test]
+    fn test_dict_delete_and_reinsert_moves_key_to_end() {
+        let mut dict = DictObject::new();
+        let alpha = Value::string(intern("alpha"));
+        let beta = Value::string(intern("beta"));
+        let gamma = Value::string(intern("gamma"));
+
+        dict.set(alpha, Value::int(1).unwrap());
+        dict.set(beta, Value::int(2).unwrap());
+        dict.set(gamma, Value::int(3).unwrap());
+        assert_eq!(dict.remove(beta).and_then(|value| value.as_int()), Some(2));
+        dict.set(beta, Value::int(4).unwrap());
+
+        let keys = dict.keys().collect::<Vec<_>>();
+        assert_eq!(keys, vec![alpha, gamma, beta]);
+    }
+
+    #[test]
+    fn test_dict_popitem_uses_lifo_order() {
+        let mut dict = DictObject::new();
+        dict.set(Value::string(intern("alpha")), Value::int(1).unwrap());
+        dict.set(Value::string(intern("beta")), Value::int(2).unwrap());
+
+        let (key, value) = dict.popitem().expect("popitem should return newest item");
+        assert_eq!(key, Value::string(intern("beta")));
+        assert_eq!(value.as_int(), Some(2));
     }
 
     #[test]
@@ -236,5 +296,57 @@ mod tests {
         dict.set(Value::int_unchecked(1), Value::int_unchecked(99));
 
         assert_eq!(dict.get(Value::float(1.0)).unwrap().as_int(), Some(99));
+    }
+
+    #[test]
+    fn test_dict_matches_heap_and_interned_string_keys_by_content() {
+        let mut dict = DictObject::new();
+        let heap_ptr = Box::into_raw(Box::new(StringObject::new("while")));
+        let heap_key = Value::object_ptr(heap_ptr as *const ());
+
+        dict.set(heap_key, Value::int_unchecked(7));
+        assert_eq!(
+            dict.get(Value::string(intern("while"))).unwrap().as_int(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn test_dict_matches_tuple_keys_structurally() {
+        let mut dict = DictObject::new();
+        let left_ptr = Box::into_raw(Box::new(StringObject::new("while")));
+        let right_ptr = Box::into_raw(Box::new(StringObject::new("while")));
+        let tuple_a = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::object_ptr(left_ptr as *const ()),
+            Value::int_unchecked(1),
+        ])));
+        let tuple_b = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::object_ptr(right_ptr as *const ()),
+            Value::int_unchecked(1),
+        ])));
+
+        dict.set(
+            Value::object_ptr(tuple_a as *const ()),
+            Value::int_unchecked(9),
+        );
+        assert_eq!(
+            dict.get(Value::object_ptr(tuple_b as *const ()))
+                .unwrap()
+                .as_int(),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn test_dict_setdefault_inserts_default_once() {
+        let mut dict = DictObject::new();
+        let key = Value::string(intern("token"));
+
+        let inserted = dict.setdefault(key, Value::int_unchecked(7));
+        let existing = dict.setdefault(key, Value::int_unchecked(99));
+
+        assert_eq!(inserted.as_int(), Some(7));
+        assert_eq!(existing.as_int(), Some(7));
+        assert_eq!(dict.get(key).unwrap().as_int(), Some(7));
     }
 }

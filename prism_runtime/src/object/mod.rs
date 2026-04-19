@@ -16,6 +16,7 @@ pub mod shaped_object;
 pub mod super_obj;
 pub mod type_builtins;
 pub mod type_obj;
+pub mod views;
 
 use crate::object::type_obj::TypeId;
 use std::sync::atomic::{AtomicU32, Ordering};

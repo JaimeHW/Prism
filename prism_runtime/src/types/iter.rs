@@ -11,6 +11,7 @@ use crate::types::range::RangeIterator;
 use crate::types::string::StringObject;
 use crate::types::tuple::TupleObject;
 use prism_core::Value;
+use prism_core::intern::{InternedString, interned_by_ptr};
 use std::fmt;
 
 // =============================================================================
@@ -166,6 +167,31 @@ enum IterKind {
     SetIter { values: Vec<Value>, index: usize },
 }
 
+enum StringValueRef<'a> {
+    Heap(&'a StringObject),
+    Interned(InternedString),
+}
+
+impl StringValueRef<'_> {
+    #[inline(always)]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Heap(string) => string.as_str(),
+            Self::Interned(interned) => interned.as_str(),
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.as_str().is_empty()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.as_str().len()
+    }
+}
+
 #[inline(always)]
 fn object_ref<T>(value: Value, expected: TypeId) -> &'static T {
     let ptr = value
@@ -187,8 +213,18 @@ fn tuple_from_value(value: Value) -> &'static TupleObject {
 }
 
 #[inline(always)]
-fn string_from_value(value: Value) -> &'static StringObject {
-    object_ref(value, TypeId::STR)
+fn string_from_value(value: Value) -> StringValueRef<'static> {
+    if value.is_string() {
+        let ptr = value
+            .as_string_object_ptr()
+            .expect("string iterator backing value must provide a string payload")
+            as *const u8;
+        let interned = interned_by_ptr(ptr)
+            .expect("string iterator backing value must resolve through the interner");
+        return StringValueRef::Interned(interned);
+    }
+
+    StringValueRef::Heap(object_ref(value, TypeId::STR))
 }
 
 #[inline(always)]
@@ -443,7 +479,7 @@ impl IteratorObject {
 
         match &mut self.kind {
             IterKind::Range(iter) => match iter.next() {
-                Some(v) => Value::int(v), // Value::int returns Option<Value>
+                Some(v) => Some(v),
                 None => {
                     self.exhausted = true;
                     None
@@ -671,7 +707,7 @@ impl IteratorObject {
         }
 
         match &self.kind {
-            IterKind::Range(iter) => Some(iter.len()),
+            IterKind::Range(iter) => iter.remaining_len(),
             IterKind::List { list, index } => {
                 Some(list_from_value(*list).len().saturating_sub(*index))
             }
@@ -726,6 +762,59 @@ impl IteratorObject {
         }
         result
     }
+
+    /// Advance the iterator using VM-provided callable and truthiness hooks.
+    ///
+    /// This is required for iterators such as `map` and `filter` whose
+    /// semantics depend on evaluating Python callables while iterating.
+    pub fn next_with<E, F, T>(
+        &mut self,
+        invoke: &mut F,
+        is_truthy: &mut T,
+    ) -> Result<Option<Value>, E>
+    where
+        F: FnMut(Value, &[Value]) -> Result<Value, E>,
+        T: FnMut(Value) -> Result<bool, E>,
+    {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        match &mut self.kind {
+            IterKind::Map { func, inner } => {
+                return match inner.next_with(invoke, is_truthy)? {
+                    Some(value) => invoke(*func, &[value]).map(Some),
+                    None => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                };
+            }
+            IterKind::Filter { func, inner } => loop {
+                match inner.next_with(invoke, is_truthy)? {
+                    Some(value) => {
+                        let keep = if let Some(predicate) = *func {
+                            let predicate_result = invoke(predicate, &[value])?;
+                            is_truthy(predicate_result)?
+                        } else {
+                            is_truthy(value)?
+                        };
+
+                        if keep {
+                            return Ok(Some(value));
+                        }
+                    }
+                    None => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
+                }
+            },
+            _ => {}
+        }
+
+        Ok(self.next())
+    }
 }
 
 impl fmt::Debug for IteratorObject {
@@ -775,6 +864,15 @@ mod tests {
     fn leak_value<T>(obj: T) -> Value {
         let ptr = Box::into_raw(Box::new(obj)) as *const ();
         Value::object_ptr(ptr)
+    }
+
+    fn expect_interned_string(value: Value, expected: &str) {
+        let ptr = value
+            .as_string_object_ptr()
+            .expect("iterator should yield an interned string") as *const u8;
+        let actual = prism_core::intern::interned_by_ptr(ptr)
+            .expect("iterator string should resolve through interner");
+        assert_eq!(actual.as_str(), expected);
     }
 
     #[test]
@@ -846,6 +944,17 @@ mod tests {
             values.push(v.as_int().unwrap());
         }
         assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_tagged_string_iterator_yields_unicode_characters() {
+        let mut iter =
+            IteratorObject::from_string_chars(Value::string(prism_core::intern::intern("aé🙂")));
+
+        expect_interned_string(iter.next().unwrap(), "a");
+        expect_interned_string(iter.next().unwrap(), "é");
+        expect_interned_string(iter.next().unwrap(), "🙂");
+        assert!(iter.next().is_none());
     }
 
     #[test]

@@ -628,6 +628,8 @@ dependencies = [
  "bitflags",
  "criterion",
  "memchr",
+ "num-bigint",
+ "num-traits",
  "parking_lot",
  "prism_compiler",
  "prism_core",
@@ -645,6 +647,8 @@ dependencies = [
  "fancy-regex",
  "libc",
  "libm",
+ "num-bigint",
+ "num-traits",
  "prism_compiler",
  "prism_core",
  "prism_gc",
@@ -654,6 +658,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "smallvec",
+ "unicode-xid",
  "windows-sys",
 ]
 

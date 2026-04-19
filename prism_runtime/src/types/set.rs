@@ -4,65 +4,9 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::hashable::HashableValue;
 use prism_core::Value;
 use rustc_hash::FxHashSet;
-use std::hash::{Hash, Hasher};
-
-// =============================================================================
-// HashableValue (Same as DictObject)
-// =============================================================================
-
-/// Wrapper for Value that implements Hash + Eq for use in HashSet.
-///
-/// Only hashable types (int, float, str, bool, None, tuple of hashables)
-/// can be used as set elements.
-#[derive(Clone, Copy)]
-struct HashableValue(Value);
-
-impl Hash for HashableValue {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // For integers and simple values, hash the payload directly
-        if let Some(i) = self.0.as_int() {
-            i.hash(state);
-        } else if let Some(f) = self.0.as_float() {
-            // Hash float bits (handles NaN etc)
-            f.to_bits().hash(state);
-        } else if self.0.is_none() {
-            0u64.hash(state);
-        } else if let Some(b) = self.0.as_bool() {
-            b.hash(state);
-        } else {
-            // For objects, use pointer as hash
-            if let Some(ptr) = self.0.as_object_ptr() {
-                (ptr as usize).hash(state);
-            }
-        }
-    }
-}
-
-impl PartialEq for HashableValue {
-    fn eq(&self, other: &Self) -> bool {
-        // Fast path: same bits
-        if let (Some(a), Some(b)) = (self.0.as_int(), other.0.as_int()) {
-            return a == b;
-        }
-        if let (Some(a), Some(b)) = (self.0.as_float(), other.0.as_float()) {
-            return a == b;
-        }
-        if self.0.is_none() && other.0.is_none() {
-            return true;
-        }
-        if let (Some(a), Some(b)) = (self.0.as_bool(), other.0.as_bool()) {
-            return a == b;
-        }
-        if let (Some(a), Some(b)) = (self.0.as_object_ptr(), other.0.as_object_ptr()) {
-            return a == b;
-        }
-        false
-    }
-}
-
-impl Eq for HashableValue {}
 
 // =============================================================================
 // SetObject
@@ -330,6 +274,9 @@ impl PyObject for SetObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::string::StringObject;
+    use crate::types::tuple::TupleObject;
+    use prism_core::intern::intern;
 
     #[test]
     fn test_set_basic() {
@@ -506,6 +453,33 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.contains(Value::float(1.5)));
         assert!(set.contains(Value::float(2.5)));
+    }
+
+    #[test]
+    fn test_set_matches_heap_and_interned_strings_by_content() {
+        let mut set = SetObject::new();
+        let heap_ptr = Box::into_raw(Box::new(StringObject::new("while")));
+        set.add(Value::object_ptr(heap_ptr as *const ()));
+
+        assert!(set.contains(Value::string(intern("while"))));
+    }
+
+    #[test]
+    fn test_set_matches_tuple_members_structurally() {
+        let mut set = SetObject::new();
+        let left_ptr = Box::into_raw(Box::new(StringObject::new("while")));
+        let right_ptr = Box::into_raw(Box::new(StringObject::new("while")));
+        let tuple_a = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::object_ptr(left_ptr as *const ()),
+            Value::int_unchecked(1),
+        ])));
+        let tuple_b = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::object_ptr(right_ptr as *const ()),
+            Value::int_unchecked(1),
+        ])));
+
+        set.add(Value::object_ptr(tuple_a as *const ()));
+        assert!(set.contains(Value::object_ptr(tuple_b as *const ())));
     }
 
     #[test]

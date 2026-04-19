@@ -5,6 +5,8 @@
 
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 
@@ -23,8 +25,12 @@ use std::sync::{Arc, RwLock};
 /// - Attribute lookup is O(1) via `FxHashMap` with interned string keys
 /// - Thread-safe via `RwLock` for concurrent read access
 /// - Attributes stored as `Value` for zero-copy access
+#[repr(C)]
 #[derive(Debug)]
 pub struct ModuleObject {
+    /// Object header so modules participate correctly in generic object protocol paths.
+    pub header: ObjectHeader,
+
     /// Module name (e.g., "math", "os.path")
     name: Arc<str>,
 
@@ -54,6 +60,7 @@ impl ModuleObject {
         attrs.insert(name_key, Value::string(intern(&name)));
 
         Self {
+            header: ObjectHeader::new(TypeId::MODULE),
             name,
             attrs: RwLock::new(attrs),
             doc: None,
@@ -91,6 +98,7 @@ impl ModuleObject {
         }
 
         Self {
+            header: ObjectHeader::new(TypeId::MODULE),
             name,
             attrs: RwLock::new(attrs),
             doc,
@@ -235,6 +243,7 @@ mod tests {
     fn test_module_new() {
         let module = ModuleObject::new("test_module");
         assert_eq!(module.name(), "test_module");
+        assert_eq!(module.header.type_id, TypeId::MODULE);
         assert!(module.has_attr("__name__"));
     }
 

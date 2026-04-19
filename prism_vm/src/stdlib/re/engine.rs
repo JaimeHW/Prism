@@ -385,6 +385,8 @@ impl Engine for FancyEngine {
 
 /// Apply flags to pattern using inline modifiers.
 fn apply_flags_to_pattern(pattern: &str, flags: RegexFlags) -> String {
+    let normalized = normalize_python_pattern(pattern);
+
     // Check if we need to add any inline modifiers
     let mut modifiers = String::new();
 
@@ -402,10 +404,47 @@ fn apply_flags_to_pattern(pattern: &str, flags: RegexFlags) -> String {
     }
 
     if modifiers.is_empty() {
-        pattern.to_string()
+        normalized
     } else {
-        format!("(?{}){}", modifiers, pattern)
+        format!("(?{}){}", modifiers, normalized)
     }
+}
+
+/// Normalize Python-specific syntax to the equivalent backend syntax.
+///
+/// Rust's `regex` ecosystem uses `\z` for the strict end-of-string anchor while
+/// CPython exposes `\Z`. Translating it here keeps the Python-visible surface
+/// compatible without forcing callers to know about backend-specific syntax.
+fn normalize_python_pattern(pattern: &str) -> String {
+    let mut normalized = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                normalized.push('\\');
+                if let Some(next) = chars.next() {
+                    if !in_class && next == 'Z' {
+                        normalized.push('z');
+                    } else {
+                        normalized.push(next);
+                    }
+                }
+            }
+            '[' if !in_class => {
+                in_class = true;
+                normalized.push(ch);
+            }
+            ']' if in_class => {
+                in_class = false;
+                normalized.push(ch);
+            }
+            _ => normalized.push(ch),
+        }
+    }
+
+    normalized
 }
 
 /// Check if pattern requires fancy-regex features.
@@ -618,5 +657,23 @@ mod tests {
 
         let fancy = compile_pattern(r"(.)\1", RegexFlags::default()).unwrap();
         assert_eq!(fancy.kind(), EngineKind::Fancy);
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_converts_end_of_string_anchor() {
+        assert_eq!(normalize_python_pattern(r"foo\Z"), r"foo\z");
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_preserves_escaped_anchor_literal() {
+        assert_eq!(normalize_python_pattern(r"foo\\Z"), r"foo\\Z");
+    }
+
+    #[test]
+    fn test_standard_engine_accepts_python_end_of_string_anchor() {
+        let engine =
+            StandardEngine::compile(r"foo\Z", RegexFlags::default()).expect(r"\Z should compile");
+        assert!(engine.is_match("foo"));
+        assert!(!engine.is_match("foo\n"));
     }
 }

@@ -194,11 +194,10 @@ pub trait Descriptor: Debug + Send + Sync {
         ))
     }
 
-    /// Check if this is a data descriptor (has __set__ or __delete__).
+    /// Check if this is a data descriptor.
     #[inline]
     fn is_data_descriptor(&self) -> bool {
-        self.flags()
-            .intersects(DescriptorFlags::HAS_SET | DescriptorFlags::HAS_DELETE)
+        self.flags().contains(DescriptorFlags::DATA_DESCRIPTOR)
     }
 }
 

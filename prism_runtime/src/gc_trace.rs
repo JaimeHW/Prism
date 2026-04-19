@@ -9,7 +9,7 @@
 //! The `Trace` trait requires implementing `trace(&self, tracer: &mut dyn Tracer)`
 //! which must visit all GC-managed references held by the object:
 //!
-//! - **Leaf types** (no references): `StringObject`, `RangeObject` - empty trace impls
+//! - **Leaf types** (no references): `StringObject`, `IntObject`, `RangeObject` - empty trace impls
 //! - **Container types**: `ListObject`, `TupleObject`, `DictObject`, `SetObject` - trace all elements
 //! - **Composite types**: `FunctionObject`, `ClosureEnv`, `IteratorObject` - trace contained references
 //!
@@ -25,9 +25,15 @@
 use prism_gc::trace::{Trace, Tracer};
 
 use crate::object::ObjectHeader;
+use crate::object::shaped_object::ShapedObject;
+use crate::object::views::{
+    CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, GenericAliasObject,
+    MappingProxyObject, MethodWrapperObject, UnionTypeObject,
+};
 use crate::types::bytes::BytesObject;
 use crate::types::dict::DictObject;
 use crate::types::function::{ClosureEnv, FunctionObject};
+use crate::types::int::IntObject;
 use crate::types::iter::IteratorObject;
 use crate::types::list::ListObject;
 use crate::types::range::RangeObject;
@@ -85,14 +91,25 @@ unsafe impl Trace for BytesObject {
     }
 }
 
+/// Safety: IntObject contains no GC-managed references.
+/// BigInt digits are Rust-managed allocations, not Prism GC objects.
+unsafe impl Trace for IntObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // IntObject is a leaf type:
+        // - ObjectHeader (traced but empty)
+        // - BigInt digits are not Prism GC-managed references
+    }
+}
+
 /// Safety: RangeObject contains no GC-managed references.
-/// Only holds primitive i64 values (start, stop, step).
+/// Range bounds are stored in Rust-managed integers, not Prism GC objects.
 unsafe impl Trace for RangeObject {
     #[inline]
     fn trace(&self, _tracer: &mut dyn Tracer) {
         // RangeObject is a leaf type:
         // - ObjectHeader (traced but empty)
-        // - start, stop, step: i64 - primitives
+        // - range bounds live outside the Prism GC graph
     }
 }
 
@@ -212,6 +229,14 @@ unsafe impl Trace for FunctionObject {
             closure.trace(tracer);
         }
 
+        // Trace dynamically attached function attributes. Once __dict__ is
+        // materialized, the dict object becomes the single source of truth.
+        if let Some(dict_ptr) = self.attr_dict_ptr() {
+            tracer.trace_ptr(dict_ptr as *const ());
+        } else {
+            self.for_each_attr_value(|value| tracer.trace_value(value));
+        }
+
         // Note: globals_ptr is a raw pointer to the global scope,
         // which is not GC-managed (it's part of the VM)
         // Note: code and name are Arc, not GC-managed
@@ -227,7 +252,27 @@ unsafe impl Trace for FunctionObject {
                 * (std::mem::size_of::<std::sync::Arc<str>>()
                     + std::mem::size_of::<prism_core::Value>());
         }
+        size += self.attr_len()
+            * (std::mem::size_of::<prism_core::intern::InternedString>()
+                + std::mem::size_of::<prism_core::Value>());
         size
+    }
+}
+
+/// Safety: Traces every live property value stored on the shaped instance.
+/// Property names and shapes are Rust-managed metadata, but attribute Values may
+/// reference GC-managed objects.
+unsafe impl Trace for ShapedObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        for (_name, value) in self.iter_properties() {
+            tracer.trace_value(value);
+        }
+    }
+
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.dict_backing().map_or(0, Trace::size_of)
+            + self.string_backing().map_or(0, Trace::size_of)
     }
 }
 
@@ -250,6 +295,62 @@ unsafe impl Trace for IteratorObject {
         // This is a conservative implementation - the actual values
         // are kept alive by the Arc references to the source collections.
         _ = tracer;
+    }
+}
+
+unsafe impl Trace for CodeObjectView {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {}
+}
+
+unsafe impl Trace for CellViewObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.cell().get_or_none());
+    }
+}
+
+unsafe impl Trace for GenericAliasObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.origin());
+        for arg in self.args() {
+            tracer.trace_value(*arg);
+        }
+    }
+
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>() + self.args().len() * std::mem::size_of::<prism_core::Value>()
+    }
+}
+
+unsafe impl Trace for UnionTypeObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {}
+
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.members().len() * std::mem::size_of::<crate::object::type_obj::TypeId>()
+    }
+}
+
+unsafe impl Trace for MappingProxyObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {}
+}
+
+unsafe impl Trace for DictViewObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.dict());
+    }
+}
+
+unsafe impl Trace for DescriptorViewObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {}
+}
+
+unsafe impl Trace for MethodWrapperObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.receiver());
     }
 }
 

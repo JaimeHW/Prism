@@ -92,10 +92,8 @@ impl AttrLookupResult {
 /// Currently we have no built-in data descriptor types registered.
 /// This will be extended when property descriptors are added.
 #[inline]
-pub fn is_data_descriptor_type(_type_id: TypeId) -> bool {
-    // No built-in data descriptor types yet
-    // Future: TypeId::PROPERTY when added
-    false
+pub fn is_data_descriptor_type(type_id: TypeId) -> bool {
+    matches!(type_id, TypeId::PROPERTY)
 }
 
 /// Check if a type ID is a known non-data descriptor type.
@@ -104,7 +102,10 @@ pub fn is_data_descriptor_type(_type_id: TypeId) -> bool {
 /// Functions and methods are non-data descriptors.
 #[inline]
 pub fn is_non_data_descriptor_type(type_id: TypeId) -> bool {
-    matches!(type_id, TypeId::FUNCTION | TypeId::METHOD)
+    matches!(
+        type_id,
+        TypeId::FUNCTION | TypeId::METHOD | TypeId::CLASSMETHOD | TypeId::STATICMETHOD
+    )
 }
 
 /// Check if a value is a data descriptor.

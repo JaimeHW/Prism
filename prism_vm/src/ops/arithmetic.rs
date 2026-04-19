@@ -15,6 +15,12 @@ use crate::error::RuntimeError;
 use crate::type_feedback::BinaryOpFeedback;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::string::{
+    concat_string_values, repeat_string_value, value_as_string_ref,
+};
+use prism_runtime::types::tuple::TupleObject;
 
 // =============================================================================
 // Integer Arithmetic (Fast Path)
@@ -423,6 +429,12 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
     }
 
+    // Try str + str (supports both tagged interned strings and heap strings)
+    if let Some(value) = concat_string_values(a, b) {
+        frame.set_reg(inst.dst().0, value);
+        return ControlFlow::Continue;
+    }
+
     // Try list + list (slow path for list concatenation)
     if a.is_object() && b.is_object() {
         // Use spec_list_concat which handles type checking internally
@@ -432,6 +444,21 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             return ControlFlow::Continue;
         }
         // If deopt, fall through to other type checks
+    }
+
+    // Try tuple + tuple
+    if let (Some(a_ptr), Some(b_ptr)) = (a.as_object_ptr(), b.as_object_ptr()) {
+        let a_header = unsafe { &*(a_ptr as *const ObjectHeader) };
+        let b_header = unsafe { &*(b_ptr as *const ObjectHeader) };
+        if a_header.type_id == TypeId::TUPLE && b_header.type_id == TypeId::TUPLE {
+            let tuple = unsafe {
+                (&*(a_ptr as *const TupleObject)).concat(&*(b_ptr as *const TupleObject))
+            };
+            let boxed = Box::new(tuple);
+            let ptr = Box::into_raw(boxed) as *const ();
+            frame.set_reg(inst.dst().0, Value::object_ptr(ptr));
+            return ControlFlow::Continue;
+        }
     }
 
     // Try float + float or mixed int/float
@@ -587,11 +614,7 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         frame.set_reg(inst.dst().0, value);
                         return ControlFlow::Continue;
                     }
-                    SpecResult::Overflow => {
-                        // Negative repetition count: Python returns empty string
-                        // This is handled in spec_str_repeat, so we shouldn't reach here
-                        // But for safety, fall through to slow path
-                    }
+                    SpecResult::Overflow => {}
                     SpecResult::Deopt => {
                         vm.speculation_cache.invalidate(site);
                     }
@@ -623,6 +646,19 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
         }
         return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+    }
+
+    if let Some(n) = b.as_int() {
+        if let Some(value) = repeat_string_value(a, n) {
+            frame.set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
+        }
+    }
+    if let Some(n) = a.as_int() {
+        if let Some(value) = repeat_string_value(b, n) {
+            frame.set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
+        }
     }
 
     let x = if let Some(f) = a.as_float() {
@@ -902,6 +938,16 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     let frame = vm.current_frame_mut();
 
+    if let Some(template) = value_as_string_ref(a) {
+        match crate::builtins::percent_format_string(template.as_str(), b) {
+            Ok(value) => {
+                frame.set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            Err(err) => return ControlFlow::Error(err.into()),
+        }
+    }
+
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         if y == 0 {
             return ControlFlow::Error(RuntimeError::zero_division());
@@ -1070,5 +1116,193 @@ pub fn neg(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
 #[cfg(test)]
 mod tests {
-    // Arithmetic tests require full VM setup
+    use super::{add, modulo, mul};
+    use crate::ControlFlow;
+    use crate::VirtualMachine;
+    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_core::Value;
+    use prism_core::intern::{intern, interned_by_ptr};
+    use prism_runtime::types::string::value_as_string_ref;
+    use prism_runtime::types::tuple::TupleObject;
+    use std::sync::Arc;
+
+    fn vm_with_frame() -> VirtualMachine {
+        let mut code = CodeObject::new("test_add", "<test>");
+        code.register_count = 16;
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(code), 0).expect("frame push failed");
+        vm
+    }
+
+    fn value_to_rust_string(value: Value) -> String {
+        let string = value_as_string_ref(value).expect("value should be a Python string");
+        string.as_str().to_string()
+    }
+
+    #[test]
+    fn test_add_concatenates_tuples() {
+        let mut vm = vm_with_frame();
+        let left_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ])));
+        let right_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::int(3).unwrap(),
+            Value::int(4).unwrap(),
+        ])));
+
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(left_ptr as *const ()));
+        vm.current_frame_mut()
+            .set_reg(2, Value::object_ptr(right_ptr as *const ()));
+
+        let inst = Instruction::op_dss(
+            Opcode::Add,
+            Register::new(0),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(add(&mut vm, inst), ControlFlow::Continue));
+
+        let result_ptr = vm
+            .current_frame()
+            .get_reg(0)
+            .as_object_ptr()
+            .expect("tuple concat should return tuple object");
+        let result = unsafe { &*(result_ptr as *const TupleObject) };
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.get(0).unwrap().as_int(), Some(1));
+        assert_eq!(result.get(3).unwrap().as_int(), Some(4));
+
+        unsafe {
+            drop(Box::from_raw(left_ptr));
+            drop(Box::from_raw(right_ptr));
+            drop(Box::from_raw(result_ptr as *mut TupleObject));
+        }
+    }
+
+    #[test]
+    fn test_add_concatenates_tagged_strings() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut()
+            .set_reg(1, Value::string(intern("hello")));
+        vm.current_frame_mut()
+            .set_reg(2, Value::string(intern(" world")));
+
+        let inst = Instruction::op_dss(
+            Opcode::Add,
+            Register::new(0),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(add(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(
+            value_to_rust_string(vm.current_frame().get_reg(0)),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_mul_repeats_tagged_strings() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut()
+            .set_reg(1, Value::string(intern("ab")));
+        vm.current_frame_mut().set_reg(2, Value::int(3).unwrap());
+
+        let inst = Instruction::op_dss(
+            Opcode::Mul,
+            Register::new(0),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(mul(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(
+            value_to_rust_string(vm.current_frame().get_reg(0)),
+            "ababab"
+        );
+    }
+
+    #[test]
+    fn test_mul_negative_string_repeat_returns_empty() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut()
+            .set_reg(1, Value::string(intern("ab")));
+        vm.current_frame_mut().set_reg(2, Value::int(-1).unwrap());
+
+        let inst = Instruction::op_dss(
+            Opcode::Mul,
+            Register::new(0),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(mul(&mut vm, inst), ControlFlow::Continue));
+
+        let result = vm.current_frame().get_reg(0);
+        assert!(result.is_string());
+        let ptr = result
+            .as_string_object_ptr()
+            .expect("empty repeat should return tagged empty string")
+            as *const u8;
+        assert_eq!(
+            interned_by_ptr(ptr)
+                .expect("empty repeat result should resolve through the interner")
+                .as_str(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_modulo_formats_tagged_string_with_single_argument() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut()
+            .set_reg(1, Value::string(intern("hello %s")));
+        vm.current_frame_mut()
+            .set_reg(2, Value::string(intern("world")));
+
+        let inst = Instruction::op_dss(
+            Opcode::Mod,
+            Register::new(0),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(modulo(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(
+            value_to_rust_string(vm.current_frame().get_reg(0)),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_modulo_formats_tagged_string_with_tuple_arguments() {
+        let mut vm = vm_with_frame();
+        let tuple_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::string(intern("value")),
+            Value::int(7).unwrap(),
+        ])));
+        vm.current_frame_mut()
+            .set_reg(1, Value::string(intern("%s = %d")));
+        vm.current_frame_mut()
+            .set_reg(2, Value::object_ptr(tuple_ptr as *const ()));
+
+        let inst = Instruction::op_dss(
+            Opcode::Mod,
+            Register::new(0),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(modulo(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(
+            value_to_rust_string(vm.current_frame().get_reg(0)),
+            "value = 7"
+        );
+
+        unsafe {
+            drop(Box::from_raw(tuple_ptr));
+            if let Some(result_ptr) = vm.current_frame().get_reg(0).as_object_ptr() {
+                drop(Box::from_raw(
+                    result_ptr as *mut prism_runtime::types::string::StringObject,
+                ));
+            }
+        }
+    }
 }
