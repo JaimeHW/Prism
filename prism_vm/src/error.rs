@@ -83,12 +83,20 @@ pub enum RuntimeErrorKind {
     // =========================================================================
     /// Recursion limit exceeded
     RecursionError { depth: usize },
+    /// Instruction execution budget exceeded
+    ExecutionLimitExceeded { limit: u64 },
     /// Invalid opcode
     InvalidOpcode { opcode: u8 },
     /// Internal VM error (should not happen)
     InternalError { message: Arc<str> },
     /// Import error
-    ImportError { module: Arc<str>, message: Arc<str> },
+    ImportError {
+        module: Arc<str>,
+        message: Arc<str>,
+        name: Option<Arc<str>>,
+        path: Option<Arc<str>>,
+        missing: bool,
+    },
     /// Python exception raised
     Exception { type_id: u16, message: Arc<str> },
 }
@@ -215,6 +223,11 @@ impl RuntimeError {
     }
 
     #[inline]
+    pub fn execution_limit_exceeded(limit: u64) -> Self {
+        Self::new(RuntimeErrorKind::ExecutionLimitExceeded { limit })
+    }
+
+    #[inline]
     pub fn stop_iteration() -> Self {
         Self::new(RuntimeErrorKind::StopIteration)
     }
@@ -228,6 +241,29 @@ impl RuntimeError {
     pub fn internal(message: impl Into<Arc<str>>) -> Self {
         Self::new(RuntimeErrorKind::InternalError {
             message: message.into(),
+        })
+    }
+
+    #[inline]
+    pub fn import_error(module: impl Into<Arc<str>>, message: impl Into<Arc<str>>) -> Self {
+        Self::new(RuntimeErrorKind::ImportError {
+            module: module.into(),
+            message: message.into(),
+            name: None,
+            path: None,
+            missing: false,
+        })
+    }
+
+    #[inline]
+    pub fn module_not_found(name: impl Into<Arc<str>>) -> Self {
+        let name = name.into();
+        Self::new(RuntimeErrorKind::ImportError {
+            module: Arc::clone(&name),
+            message: Arc::<str>::from(format!("No module named '{}'", name)),
+            name: Some(name),
+            path: None,
+            missing: true,
         })
     }
 
@@ -309,14 +345,28 @@ impl fmt::Display for RuntimeError {
                     depth
                 )
             }
+            RuntimeErrorKind::ExecutionLimitExceeded { limit } => {
+                write!(f, "RuntimeError: execution step limit exceeded ({})", limit)
+            }
             RuntimeErrorKind::InvalidOpcode { opcode } => {
                 write!(f, "InternalError: invalid opcode 0x{:02x}", opcode)
             }
             RuntimeErrorKind::InternalError { message } => {
                 write!(f, "InternalError: {}", message)
             }
-            RuntimeErrorKind::ImportError { module, message } => {
-                write!(f, "ImportError: cannot import '{}': {}", module, message)
+            RuntimeErrorKind::ImportError {
+                module,
+                message,
+                name,
+                missing,
+                ..
+            } => {
+                if *missing {
+                    let missing_name = name.as_deref().unwrap_or(module);
+                    write!(f, "ModuleNotFoundError: No module named '{}'", missing_name)
+                } else {
+                    write!(f, "ImportError: cannot import '{}': {}", module, message)
+                }
             }
             RuntimeErrorKind::Exception { type_id, message } => {
                 write!(f, "Exception(type_id={}): {}", type_id, message)
@@ -334,6 +384,15 @@ impl From<BuiltinError> for RuntimeError {
         match err {
             BuiltinError::TypeError(message) => Self::type_error(message),
             BuiltinError::ValueError(message) => Self::value_error(message),
+            BuiltinError::OSError(message) => {
+                Self::exception(ExceptionTypeId::OSError.as_u8() as u16, message)
+            }
+            BuiltinError::ImportError(message) => {
+                Self::exception(ExceptionTypeId::ImportError.as_u8() as u16, message)
+            }
+            BuiltinError::ModuleNotFoundError(message) => {
+                Self::exception(ExceptionTypeId::ModuleNotFoundError.as_u8() as u16, message)
+            }
             BuiltinError::StopIteration => Self::stop_iteration(),
             BuiltinError::AttributeError(message) => {
                 Self::exception(ExceptionTypeId::AttributeError.as_u8() as u16, message)
@@ -380,13 +439,16 @@ impl From<RuntimeError> for PrismError {
             RuntimeErrorKind::RecursionError { depth } => {
                 PrismError::internal(format!("maximum recursion depth exceeded ({})", depth))
             }
+            RuntimeErrorKind::ExecutionLimitExceeded { limit } => {
+                PrismError::internal(format!("execution step limit exceeded ({})", limit))
+            }
             RuntimeErrorKind::InvalidOpcode { opcode } => {
                 PrismError::internal(format!("invalid opcode 0x{:02x}", opcode))
             }
             RuntimeErrorKind::InternalError { message } => PrismError::internal(&**message),
-            RuntimeErrorKind::ImportError { module, message } => {
-                PrismError::import(format!("cannot import '{}': {}", module, message))
-            }
+            RuntimeErrorKind::ImportError {
+                module, message, ..
+            } => PrismError::import(format!("cannot import '{}': {}", module, message)),
             RuntimeErrorKind::Exception { message, .. } => PrismError::internal(&**message),
         }
     }
@@ -436,5 +498,14 @@ mod tests {
         let err = RuntimeError::from(crate::builtins::BuiltinError::StopIteration);
         assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
         assert_eq!(err.to_string(), "StopIteration");
+    }
+
+    #[test]
+    fn test_execution_limit_error_display() {
+        let err = RuntimeError::execution_limit_exceeded(128);
+        assert_eq!(
+            err.to_string(),
+            "RuntimeError: execution step limit exceeded (128)"
+        );
     }
 }

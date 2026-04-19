@@ -19,6 +19,9 @@ pub const VERSION_SERIAL: u8 = 0;
 /// Version string matching Python's sys.version format.
 pub const VERSION_STRING: &str = concat!("3.12.0 (Prism ", env!("CARGO_PKG_VERSION"), ")");
 
+/// Windows version string exposed as `sys.winver` on CPython-compatible builds.
+pub const WINVER: &str = "3.12";
+
 /// Hexadecimal version for easy comparison.
 /// Format: 0xAABBCCDD where AA=major, BB=minor, CC=micro, DD=release
 /// Release: 0xA0=alpha, 0xB0=beta, 0xC0=candidate, 0xF0=final
@@ -201,6 +204,11 @@ mod tests {
     fn test_version_string_format() {
         assert!(VERSION_STRING.starts_with("3.12.0"));
         assert!(VERSION_STRING.contains("Prism"));
+    }
+
+    #[test]
+    fn test_winver_format() {
+        assert_eq!(WINVER, "3.12");
     }
 
     #[test]

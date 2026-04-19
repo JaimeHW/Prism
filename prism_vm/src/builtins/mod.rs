@@ -14,11 +14,16 @@ mod io;
 mod iter_dispatch;
 mod itertools;
 mod numeric;
+mod percent_format;
 mod string;
+mod type_reflection;
 mod types;
 
 pub use builtin_function::*;
 pub use exception_type::*;
+pub(crate) use exception_type::{
+    exception_proxy_class_id_from_ptr, exception_type_attribute_value,
+};
 pub use exception_value::*;
 pub use exceptions::*;
 pub use execution::*;
@@ -28,12 +33,18 @@ pub use io::*;
 pub use iter_dispatch::*;
 pub use itertools::*;
 pub use numeric::*;
+pub(crate) use percent_format::percent_format_string;
 pub use string::*;
+pub(crate) use type_reflection::*;
+pub(crate) use types::builtin_type_object_type_id;
 pub use types::*;
 
+use crate::error::{RuntimeError, RuntimeErrorKind};
 use prism_core::Value;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::SingletonObject;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // =============================================================================
 // BuiltinFn Type
@@ -44,6 +55,7 @@ use std::sync::Arc;
 /// Takes a slice of arguments and returns a Result.
 /// Using Result allows proper error propagation.
 pub type BuiltinFn = fn(&[Value]) -> Result<Value, BuiltinError>;
+pub type VmBuiltinFn = fn(&mut crate::VirtualMachine, &[Value]) -> Result<Value, BuiltinError>;
 
 /// Error type for builtin functions.
 #[derive(Debug, Clone)]
@@ -52,6 +64,12 @@ pub enum BuiltinError {
     TypeError(String),
     /// Value error (e.g., negative index).
     ValueError(String),
+    /// Operating-system level failure.
+    OSError(String),
+    /// Import failure while loading a module or attribute.
+    ImportError(String),
+    /// Requested module does not exist.
+    ModuleNotFoundError(String),
     /// Iterator exhaustion.
     StopIteration,
     /// Attribute error.
@@ -71,6 +89,11 @@ impl std::fmt::Display for BuiltinError {
         match self {
             BuiltinError::TypeError(msg) => write!(f, "TypeError: {}", msg),
             BuiltinError::ValueError(msg) => write!(f, "ValueError: {}", msg),
+            BuiltinError::OSError(msg) => write!(f, "OSError: {}", msg),
+            BuiltinError::ImportError(msg) => write!(f, "ImportError: {}", msg),
+            BuiltinError::ModuleNotFoundError(msg) => {
+                write!(f, "ModuleNotFoundError: {}", msg)
+            }
             BuiltinError::StopIteration => write!(f, "StopIteration"),
             BuiltinError::AttributeError(msg) => write!(f, "AttributeError: {}", msg),
             BuiltinError::KeyError(msg) => write!(f, "KeyError: {}", msg),
@@ -83,6 +106,39 @@ impl std::fmt::Display for BuiltinError {
 
 impl std::error::Error for BuiltinError {}
 
+#[inline]
+fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
+    let display = err.to_string();
+    match err.kind {
+        RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
+        RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
+            format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
+        ),
+        RuntimeErrorKind::NotCallable { type_name } => {
+            BuiltinError::TypeError(format!("'{}' object is not callable", type_name))
+        }
+        RuntimeErrorKind::NotIterable { type_name } => {
+            BuiltinError::TypeError(format!("'{}' object is not iterable", type_name))
+        }
+        RuntimeErrorKind::NotSubscriptable { type_name } => {
+            BuiltinError::TypeError(format!("'{}' object is not subscriptable", type_name))
+        }
+        RuntimeErrorKind::AttributeError { type_name, attr } => BuiltinError::AttributeError(
+            format!("'{}' object has no attribute '{}'", type_name, attr),
+        ),
+        RuntimeErrorKind::KeyError { key } => BuiltinError::KeyError(key.to_string()),
+        RuntimeErrorKind::IndexError { index, length } => {
+            BuiltinError::IndexError(format!("index {index} out of range for length {length}"))
+        }
+        RuntimeErrorKind::ValueError { message } => BuiltinError::ValueError(message.to_string()),
+        RuntimeErrorKind::OverflowError { message } => {
+            BuiltinError::OverflowError(message.to_string())
+        }
+        RuntimeErrorKind::StopIteration => BuiltinError::StopIteration,
+        _ => BuiltinError::TypeError(display),
+    }
+}
+
 // =============================================================================
 // BuiltinRegistry
 // =============================================================================
@@ -91,12 +147,35 @@ impl std::error::Error for BuiltinError {}
 ///
 /// Uses FxHashMap for O(1) lookup by name.
 /// Static function pointers ensure zero-cost dispatch.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BuiltinRegistry {
     /// Name to value mappings.
     entries: FxHashMap<Arc<str>, Value>,
     /// Function table for direct dispatch.
     functions: FxHashMap<Arc<str>, BuiltinFn>,
+    /// VM-aware function table for builtins that need runtime execution context.
+    vm_functions: FxHashMap<Arc<str>, VmBuiltinFn>,
+}
+
+static ELLIPSIS_SINGLETON: LazyLock<Value> =
+    LazyLock::new(|| singleton_builtin_value(TypeId::ELLIPSIS));
+static NOT_IMPLEMENTED_SINGLETON: LazyLock<Value> =
+    LazyLock::new(|| singleton_builtin_value(TypeId::NOT_IMPLEMENTED));
+
+#[inline]
+fn singleton_builtin_value(type_id: TypeId) -> Value {
+    let ptr = Box::leak(Box::new(SingletonObject::new(type_id))) as *mut SingletonObject;
+    Value::object_ptr(ptr.cast_const().cast())
+}
+
+#[inline]
+pub fn builtin_ellipsis_value() -> Value {
+    *ELLIPSIS_SINGLETON
+}
+
+#[inline]
+pub fn builtin_not_implemented_value() -> Value {
+    *NOT_IMPLEMENTED_SINGLETON
 }
 
 impl BuiltinRegistry {
@@ -106,6 +185,7 @@ impl BuiltinRegistry {
         Self {
             entries: FxHashMap::default(),
             functions: FxHashMap::default(),
+            vm_functions: FxHashMap::default(),
         }
     }
 
@@ -117,13 +197,15 @@ impl BuiltinRegistry {
         registry.register_value("None", Value::none());
         registry.register_value("True", Value::bool(true));
         registry.register_value("False", Value::bool(false));
+        registry.register_value("Ellipsis", builtin_ellipsis_value());
+        registry.register_value("NotImplemented", builtin_not_implemented_value());
 
         // Register core functions
         registry.register_function("len", functions::builtin_len);
         registry.register_function("abs", functions::builtin_abs);
         registry.register_function("min", functions::builtin_min);
         registry.register_function("max", functions::builtin_max);
-        registry.register_function("sum", functions::builtin_sum);
+        registry.register_function_vm("sum", functions::builtin_sum_vm);
         registry.register_function("pow", functions::builtin_pow);
         registry.register_function("round", functions::builtin_round);
         registry.register_function("divmod", functions::builtin_divmod);
@@ -139,20 +221,18 @@ impl BuiltinRegistry {
         registry.register_function("oct", numeric::builtin_oct);
         registry.register_function("complex", numeric::builtin_complex);
 
-        // Register string/bytes functions
+        // Register string utilities
         registry.register_function("ord", string::builtin_ord);
         registry.register_function("chr", string::builtin_chr);
-        registry.register_function("bytes", string::builtin_bytes);
-        registry.register_function("bytearray", string::builtin_bytearray);
         registry.register_function("format", string::builtin_format);
 
         // Register introspection functions
-        registry.register_function("dir", introspect::builtin_dir);
+        registry.register_function_vm("dir", introspect::builtin_dir_vm);
         registry.register_function("vars", introspect::builtin_vars);
         registry.register_function("globals", introspect::builtin_globals);
         registry.register_function("locals", introspect::builtin_locals);
         registry.register_function("help", introspect::builtin_help);
-        registry.register_function("__import__", introspect::builtin_import);
+        registry.register_function_vm("__import__", introspect::builtin_import_vm);
 
         // Register execution functions
         registry.register_function("exec", execution::builtin_exec);
@@ -161,51 +241,141 @@ impl BuiltinRegistry {
         registry.register_function("breakpoint", execution::builtin_breakpoint);
 
         // Register iteration functions
-        registry.register_function("range", itertools::builtin_range);
-        registry.register_function("iter", itertools::builtin_iter);
-        registry.register_function("next", itertools::builtin_next);
+        registry.register_function_vm("iter", itertools::builtin_iter_vm);
+        registry.register_function_vm("next", itertools::builtin_next_vm);
         registry.register_function("enumerate", itertools::builtin_enumerate);
         registry.register_function("zip", itertools::builtin_zip);
         registry.register_function("map", itertools::builtin_map);
         registry.register_function("filter", itertools::builtin_filter);
         registry.register_function("reversed", itertools::builtin_reversed);
-        registry.register_function("sorted", itertools::builtin_sorted);
-        registry.register_function("all", itertools::builtin_all);
-        registry.register_function("any", itertools::builtin_any);
+        registry.register_function_vm("sorted", itertools::builtin_sorted_vm);
+        registry.register_function_vm("all", itertools::builtin_all_vm);
+        registry.register_function_vm("any", itertools::builtin_any_vm);
 
         // Register I/O functions
         registry.register_function("print", io::builtin_print);
         registry.register_function("input", io::builtin_input);
         registry.register_function("open", io::builtin_open);
 
-        // Register type constructors/converters
-        registry.register_function("int", types::builtin_int);
-        registry.register_function("float", types::builtin_float);
-        registry.register_function("str", types::builtin_str);
-        registry.register_function("bool", types::builtin_bool);
-        registry.register_function("list", types::builtin_list);
-        registry.register_function("tuple", types::builtin_tuple);
-        registry.register_function("dict", types::builtin_dict);
-        registry.register_function("set", types::builtin_set);
-        registry.register_function("frozenset", types::builtin_frozenset);
-        registry.register_function("type", types::builtin_type);
+        // Register type constructors/converters as callable type objects.
+        registry.register_callable_type(
+            "int",
+            prism_runtime::object::type_obj::TypeId::INT,
+            types::builtin_int,
+        );
+        registry.register_callable_type(
+            "float",
+            prism_runtime::object::type_obj::TypeId::FLOAT,
+            types::builtin_float,
+        );
+        registry.register_callable_type(
+            "str",
+            prism_runtime::object::type_obj::TypeId::STR,
+            types::builtin_str,
+        );
+        registry.register_callable_type(
+            "bool",
+            prism_runtime::object::type_obj::TypeId::BOOL,
+            types::builtin_bool,
+        );
+        registry.register_callable_type(
+            "bytes",
+            prism_runtime::object::type_obj::TypeId::BYTES,
+            string::builtin_bytes,
+        );
+        registry.register_callable_type(
+            "bytearray",
+            prism_runtime::object::type_obj::TypeId::BYTEARRAY,
+            string::builtin_bytearray,
+        );
+        registry.register_callable_type(
+            "memoryview",
+            prism_runtime::object::type_obj::TypeId::MEMORYVIEW,
+            types::builtin_memoryview,
+        );
+        registry.register_callable_type(
+            "list",
+            prism_runtime::object::type_obj::TypeId::LIST,
+            types::builtin_list,
+        );
+        registry.register_callable_type(
+            "tuple",
+            prism_runtime::object::type_obj::TypeId::TUPLE,
+            types::builtin_tuple,
+        );
+        registry.register_callable_type(
+            "dict",
+            prism_runtime::object::type_obj::TypeId::DICT,
+            types::builtin_dict,
+        );
+        registry.register_callable_type(
+            "set",
+            prism_runtime::object::type_obj::TypeId::SET,
+            types::builtin_set,
+        );
+        registry.register_callable_type(
+            "frozenset",
+            prism_runtime::object::type_obj::TypeId::FROZENSET,
+            types::builtin_frozenset,
+        );
+        registry.register_callable_type(
+            "range",
+            prism_runtime::object::type_obj::TypeId::RANGE,
+            itertools::builtin_range,
+        );
+        registry.register_callable_type(
+            "slice",
+            prism_runtime::object::type_obj::TypeId::SLICE,
+            types::builtin_slice,
+        );
+        registry.register_callable_type(
+            "type",
+            prism_runtime::object::type_obj::TypeId::TYPE,
+            types::builtin_type,
+        );
         registry.register_function("isinstance", types::builtin_isinstance);
         registry.register_function("issubclass", types::builtin_issubclass);
-        registry.register_function("object", types::builtin_object);
-        registry.register_function("getattr", types::builtin_getattr);
-        registry.register_function("setattr", types::builtin_setattr);
-        registry.register_function("hasattr", types::builtin_hasattr);
-        registry.register_function("delattr", types::builtin_delattr);
+        registry.register_callable_type(
+            "object",
+            prism_runtime::object::type_obj::TypeId::OBJECT,
+            types::builtin_object,
+        );
+        registry.register_value(
+            "super",
+            types::builtin_type_object_for_type_id(prism_runtime::object::type_obj::TypeId::SUPER),
+        );
+        registry.register_callable_type(
+            "classmethod",
+            prism_runtime::object::type_obj::TypeId::CLASSMETHOD,
+            types::builtin_classmethod,
+        );
+        registry.register_callable_type(
+            "staticmethod",
+            prism_runtime::object::type_obj::TypeId::STATICMETHOD,
+            types::builtin_staticmethod,
+        );
+        registry.register_callable_type(
+            "property",
+            prism_runtime::object::type_obj::TypeId::PROPERTY,
+            types::builtin_property,
+        );
+        registry.register_function_vm("getattr", types::builtin_getattr_vm);
+        registry.register_function_vm("setattr", types::builtin_setattr_vm);
+        registry.register_function_vm("hasattr", types::builtin_hasattr_vm);
+        registry.register_function_vm("delattr", types::builtin_delattr_vm);
 
         // Register exception type objects (as callable types, not functions)
         // This allows except ValueError: to match correctly via type_id extraction
         for (name, exc_type) in exception_type::EXCEPTION_TYPE_TABLE {
-            // Get a pointer to the static ExceptionTypeObject
-            // exc_type is &LazyLock<ExceptionTypeObject>
-            // We need to borrow the inner ExceptionTypeObject via Deref
-            use std::ops::Deref;
-            let exc_type_obj: &exception_type::ExceptionTypeObject = exc_type.deref();
+            let exc_type_obj: &exception_type::ExceptionTypeObject = exc_type;
             let ptr = exc_type_obj as *const exception_type::ExceptionTypeObject as *const ();
+            registry
+                .entries
+                .insert(Arc::from(*name), Value::object_ptr(ptr));
+        }
+
+        for (name, class) in exception_type::SUPPLEMENTAL_EXCEPTION_CLASS_TABLE {
+            let ptr = std::sync::Arc::as_ptr(&***class) as *const ();
             registry
                 .entries
                 .insert(Arc::from(*name), Value::object_ptr(ptr));
@@ -236,6 +406,32 @@ impl BuiltinRegistry {
         self.entries.insert(name, Value::object_ptr(ptr));
     }
 
+    /// Register a builtin function that needs VM context at call time.
+    #[inline]
+    pub fn register_function_vm(&mut self, name: impl Into<Arc<str>>, func: VmBuiltinFn) {
+        let name = name.into();
+        self.vm_functions.insert(name.clone(), func);
+
+        let builtin_obj = Box::new(BuiltinFunctionObject::new_vm(name.clone(), func));
+        let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
+        self.entries.insert(name, Value::object_ptr(ptr));
+    }
+
+    /// Register a builtin type object while preserving the direct-call
+    /// constructor in the function table.
+    #[inline]
+    pub fn register_callable_type(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        type_id: prism_runtime::object::type_obj::TypeId,
+        constructor: BuiltinFn,
+    ) {
+        let name = name.into();
+        self.functions.insert(name.clone(), constructor);
+        self.entries
+            .insert(name, types::builtin_type_object_for_type_id(type_id));
+    }
+
     /// Get a builtin value by name.
     #[inline]
     pub fn get(&self, name: &str) -> Option<Value> {
@@ -246,6 +442,12 @@ impl BuiltinRegistry {
     #[inline]
     pub fn get_function(&self, name: &str) -> Option<BuiltinFn> {
         self.functions.get(name).copied()
+    }
+
+    /// Get a VM-aware builtin function by name.
+    #[inline]
+    pub fn get_vm_function(&self, name: &str) -> Option<VmBuiltinFn> {
+        self.vm_functions.get(name).copied()
     }
 
     /// Call a builtin function by name.
@@ -261,6 +463,27 @@ impl BuiltinRegistry {
         }
     }
 
+    /// Call a builtin function by name, supplying VM context when required.
+    #[inline]
+    pub fn call_with_vm(
+        &self,
+        vm: &mut crate::VirtualMachine,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, BuiltinError> {
+        if let Some(func) = self.functions.get(name) {
+            return func(args);
+        }
+        if let Some(func) = self.vm_functions.get(name) {
+            return func(vm, args);
+        }
+
+        Err(BuiltinError::AttributeError(format!(
+            "builtin function '{}' not found",
+            name
+        )))
+    }
+
     /// Check if a name is a builtin.
     #[inline]
     pub fn contains(&self, name: &str) -> bool {
@@ -270,7 +493,7 @@ impl BuiltinRegistry {
     /// Check if a name is a builtin function.
     #[inline]
     pub fn is_function(&self, name: &str) -> bool {
-        self.functions.contains_key(name)
+        self.functions.contains_key(name) || self.vm_functions.contains_key(name)
     }
 
     /// Iterate over all builtins.
@@ -296,6 +519,7 @@ impl std::fmt::Debug for BuiltinRegistry {
         f.debug_struct("BuiltinRegistry")
             .field("entries", &self.entries.len())
             .field("functions", &self.functions.len())
+            .field("vm_functions", &self.vm_functions.len())
             .finish()
     }
 }
@@ -315,6 +539,42 @@ mod tests {
         assert!(registry.get("None").unwrap().is_none());
         assert!(registry.get("True").unwrap().is_truthy());
         assert!(!registry.get("False").unwrap().is_truthy());
+        assert!(registry.get("Ellipsis").unwrap().as_object_ptr().is_some());
+        assert!(
+            registry
+                .get("NotImplemented")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_builtin_registry_singletons_have_runtime_type_ids() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+
+        let ellipsis = registry
+            .get("Ellipsis")
+            .expect("Ellipsis should be registered");
+        let not_implemented = registry
+            .get("NotImplemented")
+            .expect("NotImplemented should be registered");
+
+        let ellipsis_ptr = ellipsis
+            .as_object_ptr()
+            .expect("Ellipsis should be a heap singleton");
+        let not_implemented_ptr = not_implemented
+            .as_object_ptr()
+            .expect("NotImplemented should be a heap singleton");
+
+        let ellipsis_type =
+            unsafe { (*(ellipsis_ptr as *const prism_runtime::object::ObjectHeader)).type_id };
+        let not_implemented_type = unsafe {
+            (*(not_implemented_ptr as *const prism_runtime::object::ObjectHeader)).type_id
+        };
+
+        assert_eq!(ellipsis_type, TypeId::ELLIPSIS);
+        assert_eq!(not_implemented_type, TypeId::NOT_IMPLEMENTED);
     }
 
     #[test]
@@ -325,7 +585,127 @@ mod tests {
         assert!(registry.is_function("print"));
         assert!(registry.is_function("range"));
         assert!(registry.is_function("type"));
+        assert!(registry.is_function("getattr"));
         assert!(!registry.is_function("None")); // Not a function
+    }
+
+    #[test]
+    fn test_registry_exposes_vm_aware_builtin_function_entries() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+
+        assert!(registry.get_vm_function("getattr").is_some());
+        assert!(
+            registry
+                .get("getattr")
+                .and_then(|value| value.as_object_ptr())
+                .is_some()
+        );
+        assert!(registry.get_vm_function("__import__").is_some());
+        assert!(
+            registry
+                .get("__import__")
+                .and_then(|value| value.as_object_ptr())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_registry_contains_memoryview_type_object() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+        let memoryview = registry
+            .get("memoryview")
+            .expect("memoryview should be registered");
+        let ptr = memoryview
+            .as_object_ptr()
+            .expect("memoryview should be exposed as a type object");
+
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::TYPE);
+        assert_eq!(
+            crate::builtins::builtin_type_object_type_id(ptr),
+            Some(TypeId::MEMORYVIEW)
+        );
+    }
+
+    #[test]
+    fn test_registry_contains_slice_type_object() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+        let slice_type = registry.get("slice").expect("slice should be registered");
+        let ptr = slice_type
+            .as_object_ptr()
+            .expect("slice should be exposed as a type object");
+
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::TYPE);
+        assert_eq!(
+            crate::builtins::builtin_type_object_type_id(ptr),
+            Some(TypeId::SLICE)
+        );
+    }
+
+    #[test]
+    fn test_registry_contains_super_type_object() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+        let super_type = registry.get("super").expect("super should be registered");
+        let ptr = super_type
+            .as_object_ptr()
+            .expect("super should be exposed as a type object");
+
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::TYPE);
+        assert_eq!(
+            crate::builtins::builtin_type_object_type_id(ptr),
+            Some(TypeId::SUPER)
+        );
+    }
+
+    #[test]
+    fn test_registry_contains_supplemental_warning_category_types() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+
+        for name in [
+            "BytesWarning",
+            "FutureWarning",
+            "ImportWarning",
+            "ResourceWarning",
+            "UnicodeWarning",
+            "EncodingWarning",
+        ] {
+            let value = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("builtin {name} should be registered"));
+            let ptr = value
+                .as_object_ptr()
+                .unwrap_or_else(|| panic!("builtin {name} should be a type object"));
+            let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+            assert_eq!(header.type_id, TypeId::TYPE, "{name} should be a heap type");
+        }
+    }
+
+    #[test]
+    fn test_registry_warning_categories_are_warning_subclasses() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+        let warning = registry.get("Warning").expect("Warning should exist");
+
+        for name in [
+            "BytesWarning",
+            "FutureWarning",
+            "ImportWarning",
+            "ResourceWarning",
+            "UnicodeWarning",
+            "EncodingWarning",
+        ] {
+            let category = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("builtin {name} should be registered"));
+            let result = builtin_issubclass(&[category, warning])
+                .unwrap_or_else(|_| panic!("{name} should be comparable with Warning"));
+            assert_eq!(
+                result.as_bool(),
+                Some(true),
+                "{name} should subclass Warning",
+            );
+        }
     }
 
     #[test]
