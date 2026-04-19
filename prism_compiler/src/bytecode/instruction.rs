@@ -432,6 +432,10 @@ pub enum Opcode {
     BuildClass = 0x6A,
     /// Load method for super(): dst = super().method lookup.
     LoadMethod = 0x6B,
+    /// Build class with an explicit metaclass value.
+    /// Bases are in registers starting at dst+1 and the metaclass value is
+    /// stored immediately after the final base register.
+    BuildClassWithMeta = 0x6C,
 
     // =========================================================================
     // Function Calls (0x70-0x7F)
@@ -699,6 +703,7 @@ impl Opcode {
             0x69 => Some(Opcode::IsCallable),
             0x6A => Some(Opcode::BuildClass),
             0x6B => Some(Opcode::LoadMethod),
+            0x6C => Some(Opcode::BuildClassWithMeta),
 
             0x70 => Some(Opcode::Call),
             0x71 => Some(Opcode::CallKw),
@@ -813,6 +818,7 @@ impl Opcode {
             // Class operations
             BuildClass => DstSrcSrc, // dst = class, src1 = class-body code const index (u8), src2 = base count
             LoadMethod => DstSrcSrc, // dst = method, src1 = object, src2 = name_idx
+            BuildClassWithMeta => DstSrcSrc, // dst = class, src1 = class-body code const index, src2 = base count
 
             // Container ops
             BuildList | BuildTuple | BuildSet | BuildDict | BuildString | UnpackSequence

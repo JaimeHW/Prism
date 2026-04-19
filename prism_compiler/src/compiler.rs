@@ -251,6 +251,22 @@ impl Compiler {
         scope
     }
 
+    fn ordered_cellvar_names(scope: &crate::scope::Scope) -> Vec<Arc<str>> {
+        scope
+            .ordered_cellvars()
+            .into_iter()
+            .map(|symbol| Arc::clone(&symbol.name))
+            .collect()
+    }
+
+    fn ordered_freevar_names(scope: &crate::scope::Scope) -> Vec<Arc<str>> {
+        scope
+            .ordered_freevars()
+            .into_iter()
+            .map(|symbol| Arc::clone(&symbol.name))
+            .collect()
+    }
+
     /// Enter a child scope by index.
     fn enter_child_scope(&mut self, child_idx: usize) {
         self.scope_path.push(child_idx);
@@ -563,7 +579,7 @@ impl Compiler {
             StmtKind::ClassDef {
                 name,
                 bases,
-                keywords: _keywords,
+                keywords,
                 body,
                 decorator_list,
                 type_params: _type_params,
@@ -584,29 +600,70 @@ impl Compiler {
 
                 // Step 2: Evaluate base classes into registers
                 let base_count = bases.len();
-                let base_regs: Vec<Register> = bases
+                let explicit_metaclass = keywords
                     .iter()
-                    .map(|b| self.compile_expr(b))
-                    .collect::<Result<_, _>>()?;
+                    .find(|keyword| keyword.arg.as_deref() == Some("metaclass"))
+                    .map(|keyword| &keyword.value);
+                let class_keywords: Vec<_> = keywords
+                    .iter()
+                    .filter(|keyword| keyword.arg.as_deref() != Some("metaclass"))
+                    .collect();
+                let base_count_u8 = u8::try_from(base_count).map_err(|_| CompileError {
+                    message: "class definition supports at most 255 base classes".to_string(),
+                    line: stmt.span.start,
+                    column: 0,
+                })?;
+                let class_block_size = u8::try_from(
+                    base_count
+                        + 1
+                        + usize::from(explicit_metaclass.is_some())
+                        + class_keywords.len(),
+                )
+                .map_err(|_| CompileError {
+                    message: "class definition requires more registers than the VM can encode"
+                        .to_string(),
+                    line: stmt.span.start,
+                    column: 0,
+                })?;
+                // Reserve the BUILD_CLASS register block up front and compile bases
+                // directly into their final positions. This avoids keeping a second
+                // layer of temporary base registers live under high register pressure.
+                let result_reg = self.builder.alloc_register_block(class_block_size);
+                for (index, base) in bases.iter().enumerate() {
+                    let base_dst = Register::new(result_reg.0 + 1 + index as u8);
+                    self.compile_expr_into(base, base_dst)?;
+                }
+                if let Some(metaclass_expr) = explicit_metaclass {
+                    let meta_dst = Register::new(result_reg.0 + 1 + base_count as u8);
+                    self.compile_expr_into(metaclass_expr, meta_dst)?;
+                }
+                let keyword_base =
+                    result_reg.0 + 1 + base_count as u8 + u8::from(explicit_metaclass.is_some());
+                for (index, keyword) in class_keywords.iter().enumerate() {
+                    let kw_dst = Register::new(keyword_base + index as u8);
+                    self.compile_expr_into(&keyword.value, kw_dst)?;
+                }
 
                 // Step 3: Create the class body code object using builder-swap pattern
                 // Find the scope for this class from the symbol table
                 let class_scope_idx = self.find_child_scope(ScopeKind::Class, name.as_ref());
-                let (class_cellvars, class_freevars) = if let Some(scope_idx) = class_scope_idx {
-                    let scope = &self.current_scope().children[scope_idx];
-                    let cellvars = scope
-                        .cellvars()
-                        .filter(|sym| sym.name.as_ref() != "__class__")
-                        .map(|sym| Arc::from(sym.name.as_ref()))
-                        .collect::<Vec<_>>();
-                    let freevars = scope
-                        .freevars()
-                        .map(|sym| Arc::from(sym.name.as_ref()))
-                        .collect::<Vec<_>>();
-                    (cellvars, freevars)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
+                let (class_cellvars, class_freevars, class_locals) =
+                    if let Some(scope_idx) = class_scope_idx {
+                        let scope = &self.current_scope().children[scope_idx];
+                        let cellvars = Self::ordered_cellvar_names(scope)
+                            .into_iter()
+                            .filter(|name| name.as_ref() != "__class__")
+                            .collect::<Vec<_>>();
+                        let freevars = Self::ordered_freevar_names(scope);
+                        let mut locals = scope
+                            .locals()
+                            .map(|sym| Arc::from(sym.name.as_ref()))
+                            .collect::<Vec<Arc<str>>>();
+                        locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+                        (cellvars, freevars, locals)
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
+                    };
 
                 // Create a new FunctionBuilder for the class body
                 let mut class_builder = FunctionBuilder::new(name.clone());
@@ -623,6 +680,9 @@ impl Compiler {
                 }
 
                 // Register cell and free variables from scope analysis
+                for name in class_locals {
+                    class_builder.define_local(name);
+                }
                 for name in class_cellvars {
                     class_builder.add_cellvar(name);
                 }
@@ -660,10 +720,40 @@ impl Compiler {
                 let code_idx = self.builder.add_code_object(Arc::new(class_code));
 
                 // Step 4: Emit BUILD_CLASS instruction
-                // Allocate result register for the class object
-                let result_reg = self.builder.alloc_register();
-                self.builder
-                    .emit_build_class(result_reg, code_idx, base_count as u8);
+                // BUILD_CLASS consumes bases from the contiguous block
+                // [result, base0, base1, ...].
+                if explicit_metaclass.is_some() {
+                    self.builder
+                        .emit_build_class_with_meta(result_reg, code_idx, base_count_u8);
+                } else {
+                    self.builder
+                        .emit_build_class(result_reg, code_idx, base_count_u8);
+                }
+                if !class_keywords.is_empty() {
+                    let names = class_keywords
+                        .iter()
+                        .map(|keyword| {
+                            keyword
+                                .arg
+                                .as_deref()
+                                .ok_or_else(|| CompileError {
+                                    message:
+                                        "class definition does not support unpacked keyword arguments"
+                                            .to_string(),
+                                    line: stmt.span.start,
+                                    column: 0,
+                                })
+                                .map(Arc::from)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let kwnames_idx = self.builder.add_kwnames_tuple(names);
+                    self.builder.emit(Instruction::new(
+                        Opcode::CallKwEx,
+                        class_keywords.len() as u8,
+                        (kwnames_idx & 0xFF) as u8,
+                        (kwnames_idx >> 8) as u8,
+                    ));
+                }
 
                 // Step 5: Apply decorators in reverse order
                 // @decorator1
@@ -671,31 +761,28 @@ impl Compiler {
                 // class Foo: ...
                 // is equivalent to: Foo = decorator1(decorator2(Foo))
                 for decorator_reg in decorator_regs.into_iter().rev() {
-                    // Call decorator with class as argument
-                    let call_result = self.builder.alloc_register();
+                    // Decorator calls use [result, arg0] in a dedicated block to
+                    // avoid aliasing the live class register or base block.
+                    let call_block = self.builder.alloc_register_block(2);
                     self.builder
-                        .emit_move(Register::new(call_result.0 + 1), result_reg);
+                        .emit_move(Register::new(call_block.0 + 1), result_reg);
                     self.builder.emit(Instruction::op_dss(
                         Opcode::Call,
-                        call_result,
+                        call_block,
                         decorator_reg,
                         Register::new(1), // 1 argument
                     ));
+                    self.builder.emit_move(result_reg, call_block);
+                    self.builder.free_register_block(call_block, 2);
                     self.builder.free_register(decorator_reg);
-                    self.builder.free_register(result_reg);
-                    // Move result to result_reg position (we'll reuse call_result as func_reg)
-                }
-
-                // Free base class registers
-                for base_reg in base_regs {
-                    self.builder.free_register(base_reg);
                 }
 
                 // Step 6: Store the class in the enclosing scope
-                // Use scope-aware storage (global for module-level, local for nested)
-                let name_idx = self.builder.add_name(name.clone());
-                self.builder.emit_store_global(name_idx, result_reg);
-                self.builder.free_register(result_reg);
+                let location = self.resolve_variable(name);
+                self.builder
+                    .emit_store_var(location, result_reg, Some(name));
+                self.builder
+                    .free_register_block(result_reg, class_block_size);
             }
 
             StmtKind::Import(aliases) => {
@@ -828,19 +915,7 @@ impl Compiler {
 
             StmtKind::Delete(targets) => {
                 for target in targets {
-                    match &target.kind {
-                        ExprKind::Name(name) => {
-                            let name_idx = self.builder.add_name(name.clone());
-                            self.builder.emit(Instruction::op_di(
-                                Opcode::DeleteGlobal,
-                                Register::new(0),
-                                name_idx,
-                            ));
-                        }
-                        _ => {
-                            // TODO: Handle delete subscript/attribute
-                        }
-                    }
+                    self.compile_delete_target(target)?;
                 }
             }
 
@@ -1013,7 +1088,12 @@ impl Compiler {
     /// Compile an expression and return the register containing the result.
     fn compile_expr(&mut self, expr: &Expr) -> CompileResult<Register> {
         let reg = self.builder.alloc_register();
+        self.compile_expr_into(expr, reg)?;
+        Ok(reg)
+    }
 
+    /// Compile an expression into a specific destination register.
+    fn compile_expr_into(&mut self, expr: &Expr, reg: Register) -> CompileResult<()> {
         match &expr.kind {
             ExprKind::Int(n) => {
                 let idx = self.builder.add_int(*n);
@@ -1041,6 +1121,10 @@ impl Compiler {
                 // Add string to constant pool with automatic interning and deduplication
                 let str_idx = self.builder.add_string(s.value.as_str());
                 self.builder.emit_load_const(reg, str_idx);
+            }
+
+            ExprKind::Bytes(bytes) => {
+                self.compile_bytes_literal(bytes, reg)?;
             }
 
             ExprKind::Name(name) => {
@@ -1156,13 +1240,8 @@ impl Compiler {
 
                 if has_star_unpack || has_dstar_unpack {
                     // Dynamic call path: build tuple/dict and call with unpacking
-                    return self.compile_dynamic_call(
-                        func,
-                        args,
-                        keywords,
-                        reg,
-                        expr.span.start as u32,
-                    );
+                    self.compile_dynamic_call(func, args, keywords, reg, expr.span.start as u32)?;
+                    return Ok(());
                 }
 
                 // =====================================================================
@@ -1176,7 +1255,8 @@ impl Compiler {
                     // - No keyword arguments (CallMethodKw not yet implemented)
                     // - No *args/**kwargs unpacking (already handled above)
                     if keywords.is_empty() {
-                        return self.compile_method_call(value, attr, args, reg);
+                        self.compile_method_call(value, attr, args, reg)?;
+                        return Ok(());
                     }
                     // TODO: Implement compile_method_call_kw for keyword arguments
                 }
@@ -1225,11 +1305,7 @@ impl Compiler {
                 // Compile positional arguments to call_dst+1..call_dst+posargc
                 for (i, arg) in args.iter().enumerate() {
                     let arg_dst = Register::new(call_dst.0 + 1 + i as u8);
-                    let temp = self.compile_expr(arg)?;
-                    if temp != arg_dst {
-                        self.builder.emit_move(arg_dst, temp);
-                    }
-                    self.builder.free_register(temp);
+                    self.compile_expr_into(arg, arg_dst)?;
                 }
 
                 // Handle keyword arguments
@@ -1241,11 +1317,7 @@ impl Compiler {
                     // after positional arguments
                     for (i, kw) in keywords.iter().enumerate() {
                         let kw_dst = Register::new(call_dst.0 + 1 + posargc as u8 + i as u8);
-                        let temp = self.compile_expr(&kw.value)?;
-                        if temp != kw_dst {
-                            self.builder.emit_move(kw_dst, temp);
-                        }
-                        self.builder.free_register(temp);
+                        self.compile_expr_into(&kw.value, kw_dst)?;
                     }
 
                     // Build keyword names tuple for the constant pool
@@ -1655,18 +1727,21 @@ impl Compiler {
                 // 1. Body is a single expression (not statements)
                 // 2. Result is implicitly returned
                 // 3. Lambda inherits async context from enclosing scope
-                return self.compile_lambda(args, body, reg);
+                self.compile_lambda(args, body, reg)?;
+                return Ok(());
             }
 
             ExprKind::ListComp { elt, generators } => {
                 // List comprehensions create nested code objects for proper scoping.
                 // This prevents loop variables from leaking into enclosing scope.
-                return self.compile_listcomp(elt, generators, reg);
+                self.compile_listcomp(elt, generators, reg)?;
+                return Ok(());
             }
 
             ExprKind::SetComp { elt, generators } => {
                 // Set comprehensions follow same pattern as list comprehensions
-                return self.compile_setcomp(elt, generators, reg);
+                self.compile_setcomp(elt, generators, reg)?;
+                return Ok(());
             }
 
             ExprKind::DictComp {
@@ -1675,12 +1750,14 @@ impl Compiler {
                 generators,
             } => {
                 // Dict comprehensions create nested code for proper scoping
-                return self.compile_dictcomp(key, value, generators, reg);
+                self.compile_dictcomp(key, value, generators, reg)?;
+                return Ok(());
             }
 
             ExprKind::GeneratorExp { elt, generators } => {
                 // Generator expressions are lazy - create generator function
-                return self.compile_genexp(elt, generators, reg);
+                self.compile_genexp(elt, generators, reg)?;
+                return Ok(());
             }
 
             // TODO: Implement remaining expressions
@@ -1690,7 +1767,51 @@ impl Compiler {
             }
         }
 
-        Ok(reg)
+        Ok(())
+    }
+
+    fn compile_bytes_literal(&mut self, bytes: &[u8], dst: Register) -> CompileResult<()> {
+        let mut ctor_reg = self.builder.alloc_register();
+        let location = self.resolve_variable("bytes");
+        self.builder
+            .emit_load_var(ctor_reg, location, Some("bytes"));
+
+        if bytes.is_empty() {
+            self.builder.emit_call(dst, ctor_reg, 0);
+            self.builder.free_register(ctor_reg);
+            return Ok(());
+        }
+
+        let call_block = self.builder.alloc_register_block(3);
+        let call_block_end = call_block.0 + 3;
+        if ctor_reg.0 >= call_block.0 && ctor_reg.0 < call_block_end {
+            let safe_reg = self.builder.alloc_register();
+            self.builder.emit_move(safe_reg, ctor_reg);
+            self.builder.free_register(ctor_reg);
+            ctor_reg = safe_reg;
+        }
+
+        let literal_reg = Register::new(call_block.0 + 1);
+        let encoding_reg = Register::new(call_block.0 + 2);
+
+        let mut latin1_text = String::with_capacity(bytes.len());
+        for byte in bytes {
+            latin1_text.push(char::from(*byte));
+        }
+
+        let literal_idx = self.builder.add_string(&latin1_text);
+        self.builder.emit_load_const(literal_reg, literal_idx);
+
+        let encoding_idx = self.builder.add_string("latin-1");
+        self.builder.emit_load_const(encoding_reg, encoding_idx);
+
+        self.builder.emit_call(call_block, ctor_reg, 2);
+        self.builder.emit_move(dst, call_block);
+
+        self.builder.free_register(ctor_reg);
+        self.builder.free_register_block(call_block, 3);
+
+        Ok(())
     }
 
     /// Compile an optimized method call using LoadMethod/CallMethod.
@@ -1723,12 +1844,12 @@ impl Compiler {
         // Step 1: Compile the object expression
         let obj_reg = self.compile_expr(obj_expr)?;
 
-        // Step 2: Allocate registers for method call
-        // LoadMethod needs dst (for method) and dst+1 (for self)
-        // Arguments go to dst+2, dst+3, etc.
-        let method_reg = self.builder.alloc_register();
-        // Reserve the next register for self (LoadMethod writes to both)
-        let self_reg = self.builder.alloc_register();
+        // Step 2: Reserve a contiguous block for [method, self, arg0, arg1, ...]
+        let block_size = 2u8
+            .checked_add(args.len() as u8)
+            .expect("method call register block overflow");
+        let method_reg = self.builder.alloc_register_block(block_size);
+        let self_reg = Register::new(method_reg.0 + 1);
 
         // Step 3: Emit LoadMethod - this populates method_reg and self_reg
         let name_idx = self.builder.add_name(method_name);
@@ -1756,12 +1877,9 @@ impl Compiler {
         self.builder
             .emit_call_method(dst, method_reg, args.len() as u8);
 
-        // Step 6: Cleanup - free method and self registers
-        self.builder.free_register(method_reg);
-        self.builder.free_register(self_reg);
-        for arg_reg in arg_regs {
-            self.builder.free_register(arg_reg);
-        }
+        // Step 6: Cleanup - free the reserved method-call block
+        let _ = arg_regs;
+        self.builder.free_register_block(method_reg, block_size);
 
         Ok(dst)
     }
@@ -1781,8 +1899,8 @@ impl Compiler {
                 value: obj, attr, ..
             } => {
                 let obj_reg = self.compile_expr(obj)?;
-                let _name_idx = self.builder.add_name(attr.clone());
-                // TODO: Emit SetAttr
+                let name_idx = self.builder.add_name(attr.clone());
+                self.builder.emit_set_attr(obj_reg, name_idx, value);
                 self.builder.free_register(obj_reg);
             }
 
@@ -1882,6 +2000,46 @@ impl Compiler {
             _ => {
                 return Err(CompileError {
                     message: format!("cannot assign to {:?}", target.kind),
+                    line: target.span.start,
+                    column: 0,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compile_delete_target(&mut self, target: &Expr) -> CompileResult<()> {
+        match &target.kind {
+            ExprKind::Name(name) => {
+                let location = self.resolve_variable(name);
+                self.builder.emit_delete_var(location, Some(name));
+            }
+            ExprKind::Attribute {
+                value: obj, attr, ..
+            } => {
+                let obj_reg = self.compile_expr(obj)?;
+                let name_idx = self.builder.add_name(attr.clone());
+                self.builder.emit_del_attr(obj_reg, name_idx);
+                self.builder.free_register(obj_reg);
+            }
+            ExprKind::Subscript {
+                value: obj, slice, ..
+            } => {
+                let obj_reg = self.compile_expr(obj)?;
+                let key_reg = self.compile_expr(slice)?;
+                self.builder.emit_del_item(obj_reg, key_reg);
+                self.builder.free_register(obj_reg);
+                self.builder.free_register(key_reg);
+            }
+            ExprKind::Tuple(elts) | ExprKind::List(elts) => {
+                for elt in elts {
+                    self.compile_delete_target(elt)?;
+                }
+            }
+            _ => {
+                return Err(CompileError {
+                    message: format!("cannot delete {:?}", target.kind),
                     line: target.span.start,
                     column: 0,
                 });
@@ -2503,32 +2661,20 @@ impl Compiler {
 
         // Step 3: Load __exit__ method (need to store for cleanup)
         // We store both the manager and __exit__ bound method for cleanup
-        let exit_method_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::new(
-            Opcode::LoadMethod,
-            exit_method_reg.0,
-            mgr_reg.0,
-            (exit_name_idx & 0xFF) as u8,
-        ));
+        let exit_method_reg = self.builder.alloc_register_block(5);
+        self.builder
+            .emit_load_method(exit_method_reg, mgr_reg, exit_name_idx);
 
         // Step 4: Load __enter__ method
-        let enter_method_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::new(
-            Opcode::LoadMethod,
-            enter_method_reg.0,
-            mgr_reg.0,
-            (enter_name_idx & 0xFF) as u8,
-        ));
+        let enter_method_reg = self.builder.alloc_register_block(2);
+        self.builder
+            .emit_load_method(enter_method_reg, mgr_reg, enter_name_idx);
 
         // Step 5: Call __enter__() -> value
         let value_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::op_dss(
-            Opcode::Call,
-            value_reg,
-            enter_method_reg,
-            Register::new(0), // 0 arguments
-        ));
-        self.builder.free_register(enter_method_reg);
+        self.builder
+            .emit_call_method(value_reg, enter_method_reg, 0);
+        self.builder.free_register_block(enter_method_reg, 2);
 
         // Step 6: If there's an as-clause, bind the value
         if let Some(optional_vars) = &item.optional_vars {
@@ -2549,45 +2695,23 @@ impl Compiler {
         let try_end_pc = self.builder.current_pc();
 
         // Step 10: Normal exit - call __exit__(None, None, None)
-        // Load three None values
-        let none1_reg = self.builder.alloc_register();
-        let none2_reg = self.builder.alloc_register();
-        let none3_reg = self.builder.alloc_register();
-        self.builder
-            .emit(Instruction::op_d(Opcode::LoadNone, none1_reg));
-        self.builder
-            .emit(Instruction::op_d(Opcode::LoadNone, none2_reg));
-        self.builder
-            .emit(Instruction::op_d(Opcode::LoadNone, none3_reg));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(exit_method_reg.0 + 2),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(exit_method_reg.0 + 3),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(exit_method_reg.0 + 4),
+        ));
 
         // Call exit_method(None, None, None)
         let exit_result_reg = self.builder.alloc_register();
-        // We need to set up call with 3 arguments
-        // Args go in registers following the result register
-        self.builder.emit(Instruction::op_ds(
-            Opcode::Move,
-            Register::new(exit_result_reg.0 + 1),
-            none1_reg,
-        ));
-        self.builder.emit(Instruction::op_ds(
-            Opcode::Move,
-            Register::new(exit_result_reg.0 + 2),
-            none2_reg,
-        ));
-        self.builder.emit(Instruction::op_ds(
-            Opcode::Move,
-            Register::new(exit_result_reg.0 + 3),
-            none3_reg,
-        ));
-        self.builder.emit(Instruction::op_dss(
-            Opcode::Call,
-            exit_result_reg,
-            exit_method_reg,
-            Register::new(3), // 3 arguments
-        ));
-        self.builder.free_register(none1_reg);
-        self.builder.free_register(none2_reg);
-        self.builder.free_register(none3_reg);
+        self.builder
+            .emit_call_method(exit_result_reg, exit_method_reg, 3);
         self.builder.free_register(exit_result_reg);
 
         // Jump to end (skip exception path)
@@ -2620,25 +2744,21 @@ impl Compiler {
         let suppress_reg = self.builder.alloc_register();
         self.builder.emit(Instruction::op_ds(
             Opcode::Move,
-            Register::new(suppress_reg.0 + 1),
+            Register::new(exit_method_reg.0 + 2),
             exc_type_reg,
         ));
         self.builder.emit(Instruction::op_ds(
             Opcode::Move,
-            Register::new(suppress_reg.0 + 2),
+            Register::new(exit_method_reg.0 + 3),
             exc_val_reg,
         ));
         self.builder.emit(Instruction::op_ds(
             Opcode::Move,
-            Register::new(suppress_reg.0 + 3),
+            Register::new(exit_method_reg.0 + 4),
             exc_tb_reg,
         ));
-        self.builder.emit(Instruction::op_dss(
-            Opcode::Call,
-            suppress_reg,
-            exit_method_reg,
-            Register::new(3), // 3 arguments
-        ));
+        self.builder
+            .emit_call_method(suppress_reg, exit_method_reg, 3);
 
         // Pop exception info
         self.builder.emit(Instruction::op(Opcode::PopExcInfo));
@@ -2658,7 +2778,7 @@ impl Compiler {
         self.builder.bind_label(end_label);
 
         // Free the stored method and manager registers
-        self.builder.free_register(exit_method_reg);
+        self.builder.free_register_block(exit_method_reg, 5);
         self.builder.free_register(mgr_reg);
 
         // Step 13: Add exception table entry for cleanup
@@ -2727,32 +2847,20 @@ impl Compiler {
         let aexit_name_idx = self.builder.add_name("__aexit__");
 
         // Step 3: Load __aexit__ method (need to store for cleanup)
-        let aexit_method_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::new(
-            Opcode::LoadMethod,
-            aexit_method_reg.0,
-            mgr_reg.0,
-            (aexit_name_idx & 0xFF) as u8,
-        ));
+        let aexit_method_reg = self.builder.alloc_register_block(5);
+        self.builder
+            .emit_load_method(aexit_method_reg, mgr_reg, aexit_name_idx);
 
         // Step 4: Load __aenter__ method
-        let aenter_method_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::new(
-            Opcode::LoadMethod,
-            aenter_method_reg.0,
-            mgr_reg.0,
-            (aenter_name_idx & 0xFF) as u8,
-        ));
+        let aenter_method_reg = self.builder.alloc_register_block(2);
+        self.builder
+            .emit_load_method(aenter_method_reg, mgr_reg, aenter_name_idx);
 
         // Step 5: Call __aenter__() and AWAIT the result
         let aenter_awaitable_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::op_dss(
-            Opcode::Call,
-            aenter_awaitable_reg,
-            aenter_method_reg,
-            Register::new(0), // 0 arguments
-        ));
-        self.builder.free_register(aenter_method_reg);
+        self.builder
+            .emit_call_method(aenter_awaitable_reg, aenter_method_reg, 0);
+        self.builder.free_register_block(aenter_method_reg, 2);
 
         // Await the __aenter__ result: GetAwaitable + YieldFrom
         let value_reg = self.builder.alloc_register();
@@ -2783,42 +2891,23 @@ impl Compiler {
         let try_end_pc = self.builder.current_pc();
 
         // Load three None values for __aexit__(None, None, None)
-        let none1_reg = self.builder.alloc_register();
-        let none2_reg = self.builder.alloc_register();
-        let none3_reg = self.builder.alloc_register();
-        self.builder
-            .emit(Instruction::op_d(Opcode::LoadNone, none1_reg));
-        self.builder
-            .emit(Instruction::op_d(Opcode::LoadNone, none2_reg));
-        self.builder
-            .emit(Instruction::op_d(Opcode::LoadNone, none3_reg));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(aexit_method_reg.0 + 2),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(aexit_method_reg.0 + 3),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(aexit_method_reg.0 + 4),
+        ));
 
         // Call __aexit__(None, None, None)
         let aexit_awaitable_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::op_ds(
-            Opcode::Move,
-            Register::new(aexit_awaitable_reg.0 + 1),
-            none1_reg,
-        ));
-        self.builder.emit(Instruction::op_ds(
-            Opcode::Move,
-            Register::new(aexit_awaitable_reg.0 + 2),
-            none2_reg,
-        ));
-        self.builder.emit(Instruction::op_ds(
-            Opcode::Move,
-            Register::new(aexit_awaitable_reg.0 + 3),
-            none3_reg,
-        ));
-        self.builder.emit(Instruction::op_dss(
-            Opcode::Call,
-            aexit_awaitable_reg,
-            aexit_method_reg,
-            Register::new(3),
-        ));
-        self.builder.free_register(none1_reg);
-        self.builder.free_register(none2_reg);
-        self.builder.free_register(none3_reg);
+        self.builder
+            .emit_call_method(aexit_awaitable_reg, aexit_method_reg, 3);
 
         // Await the __aexit__ result
         let aexit_result_reg = self.builder.alloc_register();
@@ -2861,25 +2950,21 @@ impl Compiler {
         let suppress_awaitable_reg = self.builder.alloc_register();
         self.builder.emit(Instruction::op_ds(
             Opcode::Move,
-            Register::new(suppress_awaitable_reg.0 + 1),
+            Register::new(aexit_method_reg.0 + 2),
             exc_type_reg,
         ));
         self.builder.emit(Instruction::op_ds(
             Opcode::Move,
-            Register::new(suppress_awaitable_reg.0 + 2),
+            Register::new(aexit_method_reg.0 + 3),
             exc_val_reg,
         ));
         self.builder.emit(Instruction::op_ds(
             Opcode::Move,
-            Register::new(suppress_awaitable_reg.0 + 3),
+            Register::new(aexit_method_reg.0 + 4),
             exc_tb_reg,
         ));
-        self.builder.emit(Instruction::op_dss(
-            Opcode::Call,
-            suppress_awaitable_reg,
-            aexit_method_reg,
-            Register::new(3),
-        ));
+        self.builder
+            .emit_call_method(suppress_awaitable_reg, aexit_method_reg, 3);
 
         // Await the __aexit__ result for exception case
         let suppress_reg = self.builder.alloc_register();
@@ -2913,7 +2998,7 @@ impl Compiler {
         self.builder.bind_label(end_label);
 
         // Free the stored method and manager registers
-        self.builder.free_register(aexit_method_reg);
+        self.builder.free_register_block(aexit_method_reg, 5);
         self.builder.free_register(mgr_reg);
 
         // Step 12: Add exception table entry for cleanup
@@ -3349,14 +3434,8 @@ impl Compiler {
         let (func_cellvars, func_freevars, func_locals, scope_has_yield) =
             if let Some(scope_idx) = func_scope_idx {
                 let scope = &self.current_scope().children[scope_idx];
-                let cellvars = scope
-                    .cellvars()
-                    .map(|sym| Arc::from(sym.name.as_ref()))
-                    .collect::<Vec<_>>();
-                let freevars = scope
-                    .freevars()
-                    .map(|sym| Arc::from(sym.name.as_ref()))
-                    .collect::<Vec<_>>();
+                let cellvars = Self::ordered_cellvar_names(scope);
+                let freevars = Self::ordered_freevar_names(scope);
                 let mut locals = scope
                     .locals()
                     .map(|sym| Arc::from(sym.name.as_ref()))
@@ -3506,7 +3585,7 @@ impl Compiler {
         let kw_defaults_reg = self.compile_kw_defaults_dict(&args.kwonlyargs, &args.kw_defaults)?;
 
         // Emit function/closure creation
-        let mut func_reg = self.builder.alloc_register();
+        let func_reg = self.builder.alloc_register();
 
         if has_closure {
             // MakeClosure: needs to capture variables from current scope
@@ -3560,21 +3639,21 @@ impl Compiler {
         // def func(): ...
         // is equivalent to: func = decorator1(decorator2(func))
         for decorator_reg in decorator_regs.into_iter().rev() {
-            // Call decorator with function as argument
-            let call_result = self.builder.alloc_register();
-            // Place function as arg in next register after call_result
+            // Decorator calls need a dedicated contiguous block [result, arg0]
+            // so the argument register cannot alias any live temporary reused
+            // by the allocator between decorated definitions.
+            let call_block = self.builder.alloc_register_block(2);
             self.builder
-                .emit_move(Register::new(call_result.0 + 1), func_reg);
+                .emit_move(Register::new(call_block.0 + 1), func_reg);
             self.builder.emit(Instruction::op_dss(
                 Opcode::Call,
-                call_result,
+                call_block,
                 decorator_reg,
                 Register::new(1), // 1 argument
             ));
+            self.builder.emit_move(func_reg, call_block);
+            self.builder.free_register_block(call_block, 2);
             self.builder.free_register(decorator_reg);
-            self.builder.free_register(func_reg);
-            // Result becomes the function value for the next decorator (or final store).
-            func_reg = call_result;
         }
 
         // Store function using lexical scope resolution.
@@ -3623,6 +3702,16 @@ impl Compiler {
         }
     }
 
+    /// Advance to the next comprehension child scope in source order.
+    ///
+    /// Comprehensions participate in the same child-scope cursor as functions,
+    /// lambdas, and classes. Even comprehensions that are currently compiled
+    /// inline must still consume their analyzed scope entry so later sibling
+    /// scopes remain aligned with the AST traversal order.
+    fn next_comprehension_scope(&mut self, name: &str) -> Option<usize> {
+        self.find_child_scope(ScopeKind::Comprehension, name)
+    }
+
     // =========================================================================
     // Lambda Expression Compilation
     // =========================================================================
@@ -3647,25 +3736,19 @@ impl Compiler {
     ) -> CompileResult<Register> {
         // Find lambda scope from symbol table (lambdas are named "<lambda>" in scope analysis)
         let lambda_scope_idx = self.find_child_scope(ScopeKind::Lambda, "<lambda>");
-        let (lambda_cellvars, lambda_freevars, lambda_locals) =
+        let (lambda_cellvars, lambda_freevars, lambda_locals, lambda_has_yield) =
             if let Some(scope_idx) = lambda_scope_idx {
                 let scope = &self.current_scope().children[scope_idx];
-                let cellvars = scope
-                    .cellvars()
-                    .map(|sym| Arc::from(sym.name.as_ref()))
-                    .collect::<Vec<_>>();
-                let freevars = scope
-                    .freevars()
-                    .map(|sym| Arc::from(sym.name.as_ref()))
-                    .collect::<Vec<_>>();
+                let cellvars = Self::ordered_cellvar_names(scope);
+                let freevars = Self::ordered_freevar_names(scope);
                 let mut locals = scope
                     .locals()
                     .map(|sym| Arc::from(sym.name.as_ref()))
                     .collect::<Vec<Arc<str>>>();
                 locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-                (cellvars, freevars, locals)
+                (cellvars, freevars, locals, scope.has_yield)
             } else {
-                (Vec::new(), Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new(), false)
             };
 
         // Create a new FunctionBuilder for the lambda body
@@ -3689,6 +3772,9 @@ impl Compiler {
         }
         if args.kwarg.is_some() {
             lambda_builder.add_flags(CodeFlags::VARKEYWORDS);
+        }
+        if lambda_has_yield {
+            lambda_builder.add_flags(CodeFlags::GENERATOR);
         }
 
         // Register parameters as locals
@@ -3826,23 +3912,20 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
+        let _ = self.next_comprehension_scope("<comprehension>");
+
         // For now, compile comprehension inline for simplicity
         // Full implementation would create a nested scope
 
-        // Create the result list
-        // CRITICAL: Use alloc_register_block(1) instead of alloc_register() to prevent
-        // the list register from being at a position that could be clobbered by
-        // Call instruction's consecutive argument writes ([dst, dst+1, dst+2, ...]).
-        // alloc_register_block allocates from next_register (guaranteed contiguous),
-        // not from the free list which could give us a register adjacent to Call's dst.
+        // Create the result list in a fresh register so nested call blocks can
+        // reserve their own contiguous layouts without aliasing the live list.
+        //
+        // We intentionally preserve the existing free-register pool here. Call
+        // lowering already allocates fresh contiguous blocks when needed, so
+        // discarding reusable registers only increases pressure and can exhaust
+        // the 8-bit virtual register space on large stdlib functions such as
+        // CPython's `functools._c3_mro`.
         let list_reg = self.builder.alloc_register_block(1);
-        // CRITICAL: Clear the free register list to prevent register reuse.
-        // Call instructions use consecutive registers [dst, dst+1, ...], and if dst
-        // is reused from the free list at a position before list_reg, then dst+1
-        // could clobber list_reg. By clearing the free list, all subsequent allocations
-        // (including Call's dst) will use fresh registers from next_register (which is
-        // after list_reg), preventing any clobbering.
-        self.builder.clear_free_registers();
 
         self.builder.emit_build_list(list_reg, list_reg, 0);
 
@@ -3863,6 +3946,8 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
+        let _ = self.next_comprehension_scope("<comprehension>");
+
         // Create empty set
         let set_reg = self.builder.alloc_register();
         self.builder
@@ -3886,6 +3971,8 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
+        let _ = self.next_comprehension_scope("<dictcomp>");
+
         // Create empty dict
         let dict_reg = self.builder.alloc_register();
         self.builder
@@ -3911,6 +3998,21 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
+        let gen_scope_idx = self.next_comprehension_scope("<comprehension>");
+        let (gen_cellvars, gen_freevars, gen_locals) = if let Some(scope_idx) = gen_scope_idx {
+            let scope = &self.current_scope().children[scope_idx];
+            let cellvars = Self::ordered_cellvar_names(scope);
+            let freevars = Self::ordered_freevar_names(scope);
+            let mut locals = scope
+                .locals()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<Arc<str>>>();
+            locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            (cellvars, freevars, locals)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+
         // Create a generator function that yields each element
         let mut gen_builder = FunctionBuilder::new("<genexpr>");
         gen_builder.set_filename(&*self.filename);
@@ -3919,9 +4021,25 @@ impl Compiler {
         // First iterator is passed as argument
         gen_builder.set_arg_count(1);
         gen_builder.define_local(".0"); // Hidden argument for first iterator
+        for name in gen_locals {
+            gen_builder.define_local(name);
+        }
+
+        let mut has_closure = false;
+        for name in gen_cellvars {
+            gen_builder.add_cellvar(name);
+            has_closure = true;
+        }
+        for name in gen_freevars {
+            gen_builder.add_freevar(name);
+            has_closure = true;
+        }
 
         // Swap builders
         let parent_builder = std::mem::replace(&mut self.builder, gen_builder);
+        if let Some(scope_idx) = gen_scope_idx {
+            self.enter_child_scope(scope_idx);
+        }
 
         // Get the first iterator from argument
         let iter_reg = self.builder.alloc_register();
@@ -3934,28 +4052,49 @@ impl Compiler {
         // Return None at end
         self.builder.emit_return_none();
 
+        if gen_scope_idx.is_some() {
+            self.exit_child_scope();
+        }
+
         // Swap back
         let gen_builder = std::mem::replace(&mut self.builder, parent_builder);
         let gen_code = gen_builder.finish();
 
         // Store code object and create function
         let code_idx = self.builder.add_code_object(Arc::new(gen_code));
-        let func_reg = self.builder.alloc_register();
-        self.builder
-            .emit(Instruction::op_di(Opcode::MakeFunction, func_reg, code_idx));
+        let mut func_reg = self.builder.alloc_register();
+        self.builder.emit(Instruction::op_di(
+            if has_closure {
+                Opcode::MakeClosure
+            } else {
+                Opcode::MakeFunction
+            },
+            func_reg,
+            code_idx,
+        ));
 
-        // Compile first iterator and call generator function
+        // Reserve a fresh contiguous block [result, arg0] so the iterator
+        // argument cannot overwrite the callable register before the call.
+        let call_block = self.builder.alloc_register_block(2);
+        if func_reg.0 >= call_block.0 && func_reg.0 < call_block.0 + 2 {
+            let safe_reg = self.builder.alloc_register();
+            self.builder.emit_move(safe_reg, func_reg);
+            self.builder.free_register(func_reg);
+            func_reg = safe_reg;
+        }
+
+        // Compile first iterator and pass it in the dedicated arg slot.
         let first_iter = self.compile_expr(&generators[0].iter)?;
-        let iter_result = self.builder.alloc_register();
-        self.builder.emit_get_iter(iter_result, first_iter);
+        let arg_reg = Register::new(call_block.0 + 1);
+        self.builder.emit_get_iter(arg_reg, first_iter);
         self.builder.free_register(first_iter);
 
-        // Call generator function with first iterator
-        self.builder
-            .emit_move(Register::new(dst.0 + 1), iter_result);
-        self.builder.emit_call(dst, func_reg, 1);
+        self.builder.emit_call(call_block, func_reg, 1);
+        if call_block != dst {
+            self.builder.emit_move(dst, call_block);
+        }
         self.builder.free_register(func_reg);
-        self.builder.free_register(iter_result);
+        self.builder.free_register_block(call_block, 2);
 
         Ok(dst)
     }
@@ -4243,6 +4382,30 @@ mod tests {
         Compiler::compile_module(&module, "<test>").expect("compile error")
     }
 
+    fn large_call_then_functools_style_listcomp_source() -> String {
+        let large_arg_list = (0..250)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            "def helper(*args, **kwargs):\n    return args\n\n\
+             def stressed(seq, abcs):\n    helper({large_arg_list})\n    return [helper(base, abcs=abcs) for base in seq]\n"
+        )
+    }
+
+    fn large_call_then_class_definition_source() -> String {
+        let large_arg_list = (0..250)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            "def helper(*args, **kwargs):\n    return object\n\n\
+             def stressed():\n    helper({large_arg_list})\n    class Derived(helper()):\n        pass\n    return Derived\n"
+        )
+    }
+
     fn compile_with_optimization(source: &str, optimize: OptimizationLevel) -> CodeObject {
         let module = prism_parser::parse(source).expect("parse error");
         Compiler::compile_module_with_optimization(&module, "<test>", optimize)
@@ -4255,6 +4418,85 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_with_uses_call_method_for_context_manager_protocol() {
+        let code = compile(
+            r#"
+with manager:
+    pass
+"#,
+        );
+
+        let load_method_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadMethod as u8)
+            .count();
+        let call_method_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::CallMethod as u8)
+            .count();
+
+        assert_eq!(
+            load_method_count, 2,
+            "with should load __enter__ and __exit__"
+        );
+        assert_eq!(
+            call_method_count, 3,
+            "with should call __enter__ plus both normal/exception __exit__ paths via CallMethod"
+        );
+        assert!(
+            !code
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::Call as u8),
+            "with should not use generic Call for context-manager methods"
+        );
+    }
+
+    #[test]
+    fn test_compile_async_with_uses_call_method_for_context_manager_protocol() {
+        let code = compile(
+            r#"
+async def run():
+    async with manager:
+        pass
+"#,
+        );
+
+        let async_fn = code
+            .nested_code_objects
+            .first()
+            .expect("expected nested async function");
+        let load_method_count = async_fn
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadMethod as u8)
+            .count();
+        let call_method_count = async_fn
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::CallMethod as u8)
+            .count();
+
+        assert_eq!(
+            load_method_count, 2,
+            "async with should load __aenter__ and __aexit__"
+        );
+        assert_eq!(
+            call_method_count, 3,
+            "async with should call __aenter__ plus both normal/exception __aexit__ paths via CallMethod"
+        );
+        assert!(
+            !async_fn
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::Call as u8),
+            "async with should not use generic Call for context-manager methods"
+        );
+    }
+
+    #[test]
     fn test_compile_simple_expr() {
         let code = compile("1 + 2");
         assert!(!code.instructions.is_empty());
@@ -4264,6 +4506,32 @@ mod tests {
     fn test_compile_assignment() {
         let code = compile("x = 42");
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_attribute_assignment_emits_set_attr() {
+        let code = compile(
+            r#"
+class Holder:
+    pass
+
+def configure(obj, value):
+    obj.answer = value
+"#,
+        );
+        let configure = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "configure")
+            .expect("expected nested configure function");
+
+        assert!(
+            configure
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::SetAttr as u8),
+            "attribute assignment should lower to SetAttr"
+        );
     }
 
     #[test]
@@ -4282,6 +4550,102 @@ mod tests {
     fn test_compile_function_call() {
         let code = compile("print(42)");
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_redefined_functions_preserve_distinct_nested_code_objects() {
+        let code = compile(
+            r#"
+def value(self):
+    return self
+
+def value(self, new_value):
+    return new_value
+"#,
+        );
+
+        let value_defs = code
+            .nested_code_objects
+            .iter()
+            .filter(|nested| nested.name.as_ref() == "value")
+            .collect::<Vec<_>>();
+
+        assert_eq!(value_defs.len(), 2);
+        assert_eq!(value_defs[0].arg_count, 1);
+        assert_eq!(value_defs[1].arg_count, 2);
+    }
+
+    #[test]
+    fn test_compile_bytes_literal_uses_builtin_constructor_lowering() {
+        let code = compile("value = b'AB'");
+        let call = code
+            .instructions
+            .iter()
+            .find(|inst| inst.opcode() == Opcode::Call as u8)
+            .expect("expected bytes literal lowering to emit a call");
+
+        assert_eq!(
+            call.src2().0,
+            2,
+            "bytes literal should call bytes(..., encoding)"
+        );
+        assert!(
+            code.names.iter().any(|name| &**name == "bytes"),
+            "bytes constructor should be resolved by name"
+        );
+    }
+
+    #[test]
+    fn test_compile_empty_bytes_literal_avoids_placeholder_none_lowering() {
+        let bytes_code = compile("value = b''");
+        let string_code = compile("value = ''");
+        let bytes_load_none_count = bytes_code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadNone as u8)
+            .count();
+        let string_load_none_count = string_code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadNone as u8)
+            .count();
+
+        assert_eq!(
+            bytes_load_none_count, string_load_none_count,
+            "empty bytes literals should compile like ordinary literals instead of the unimplemented-expression fallback"
+        );
+    }
+
+    #[test]
+    fn test_compile_listcomp_reuses_register_pool_after_large_call_blocks() {
+        let source = large_call_then_functools_style_listcomp_source();
+        let code = compile(&source);
+        let stressed = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "stressed")
+            .expect("expected nested stressed function");
+
+        assert!(
+            !stressed.instructions.is_empty(),
+            "list comprehension should compile into a real function body"
+        );
+    }
+
+    #[test]
+    fn test_compile_class_definition_reuses_register_pool_after_large_call_blocks() {
+        let source = large_call_then_class_definition_source();
+        let code = compile(&source);
+        let stressed = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "stressed")
+            .expect("expected nested stressed function");
+
+        assert!(
+            !stressed.instructions.is_empty(),
+            "class definition should compile into a real function body"
+        );
     }
 
     #[test]
@@ -4453,6 +4817,52 @@ def f():
         assert!(
             optimized_load_consts < unoptimized_load_consts,
             "function docstring should be removed under -OO"
+        );
+    }
+
+    #[test]
+    fn test_compile_closure_metadata_follows_closure_slot_order() {
+        let code = compile(
+            r#"
+def outer():
+    b = 1
+    a = 2
+
+    def inner():
+        return a, b
+
+    return inner
+"#,
+        );
+
+        let outer = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "outer")
+            .map(Arc::as_ref)
+            .expect("expected outer function code object");
+        let inner = outer
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "inner")
+            .map(Arc::as_ref)
+            .expect("expected inner function code object");
+
+        assert_eq!(
+            outer
+                .cellvars
+                .iter()
+                .map(|name| name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            inner
+                .freevars
+                .iter()
+                .map(|name| name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
         );
     }
 
@@ -4750,6 +5160,74 @@ class Child(Base1, Base2):
     }
 
     #[test]
+    fn test_compile_build_class_moves_bases_into_contiguous_result_block() {
+        let code = compile(
+            r#"
+class Child(Base1, Base2):
+    pass
+"#,
+        );
+
+        let (build_index, build_class) = code
+            .instructions
+            .iter()
+            .enumerate()
+            .find(|(_, inst)| inst.opcode() == Opcode::BuildClass as u8)
+            .expect("expected BUILD_CLASS instruction");
+        let result_reg = build_class.dst().0;
+
+        let moved_base_regs: Vec<u8> = code.instructions[..build_index]
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::Move as u8)
+            .map(|inst| inst.dst().0)
+            .filter(|dst| *dst == result_reg + 1 || *dst == result_reg + 2)
+            .collect();
+
+        assert!(
+            moved_base_regs.contains(&(result_reg + 1)),
+            "expected first base to be moved into BUILD_CLASS base slot"
+        );
+        assert!(
+            moved_base_regs.contains(&(result_reg + 2)),
+            "expected second base to be moved into BUILD_CLASS base slot"
+        );
+    }
+
+    #[test]
+    fn test_compile_build_class_emits_keyword_metadata_for_class_keywords() {
+        let code = compile(
+            r#"
+class Child(Base, answer=42):
+    pass
+"#,
+        );
+
+        let (build_index, _) = code
+            .instructions
+            .iter()
+            .enumerate()
+            .find(|(_, inst)| inst.opcode() == Opcode::BuildClass as u8)
+            .expect("expected BUILD_CLASS instruction");
+        let ext = code
+            .instructions
+            .get(build_index + 1)
+            .copied()
+            .expect("BUILD_CLASS with keywords must be followed by metadata");
+
+        assert_eq!(ext.opcode(), Opcode::CallKwEx as u8);
+        assert_eq!(ext.dst().0, 1, "expected one class keyword");
+
+        let kwnames_idx = (ext.src1().0 as u16) | ((ext.src2().0 as u16) << 8);
+        let names_ptr = code
+            .constants
+            .get(kwnames_idx as usize)
+            .and_then(|value| value.as_object_ptr())
+            .expect("class keyword metadata should point at keyword names");
+        let names = unsafe { &*(names_ptr as *const crate::bytecode::KwNamesTuple) };
+        assert_eq!(names.get(0).map(|name| name.as_ref()), Some("answer"));
+    }
+
+    #[test]
     fn test_compile_class_with_method() {
         // Class with a simple method
         let code = compile(
@@ -4791,6 +5269,161 @@ class Config:
 "#,
         );
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_body_predefines_scope_locals() {
+        let code = compile(
+            r#"
+class Config:
+    DEBUG = True
+
+    def build(self):
+        return DEBUG
+"#,
+        );
+
+        let class_body = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "Config")
+            .map(Arc::as_ref)
+            .expect("expected class body code object");
+
+        let locals = class_body
+            .locals
+            .iter()
+            .map(|name| name.as_ref())
+            .collect::<Vec<_>>();
+        assert!(locals.contains(&"DEBUG"));
+        assert!(locals.contains(&"build"));
+    }
+
+    #[test]
+    fn test_compile_nested_class_binds_into_class_namespace() {
+        let code = compile(
+            r#"
+class Outer:
+    class Inner:
+        pass
+"#,
+        );
+
+        let outer = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "Outer")
+            .map(Arc::as_ref)
+            .expect("expected outer class body");
+
+        assert!(
+            outer
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::StoreLocal as u8),
+            "nested class bindings inside a class body should target class locals"
+        );
+    }
+
+    #[test]
+    fn test_compile_class_delete_name_targets_class_locals() {
+        let code = compile(
+            r#"
+class Example:
+    value = 1
+    del value
+"#,
+        );
+
+        let class_body = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "Example")
+            .map(Arc::as_ref)
+            .expect("expected class body code object");
+
+        assert!(
+            class_body
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::DeleteLocal as u8),
+            "class body deletes should target class locals"
+        );
+        assert!(
+            !class_body
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::DeleteGlobal as u8),
+            "class body deletes should not be lowered as global deletes"
+        );
+    }
+
+    #[test]
+    fn test_compile_delete_subscript_lowers_to_del_item() {
+        let code = compile(
+            r#"
+mapping = {"token": 1}
+del mapping["token"]
+"#,
+        );
+
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::DelItem as u8),
+            "subscript deletes should lower to DelItem"
+        );
+    }
+
+    #[test]
+    fn test_compile_delete_attribute_lowers_to_del_attr() {
+        let code = compile(
+            r#"
+class Box:
+    pass
+
+box = Box()
+del box.value
+"#,
+        );
+
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::DelAttr as u8),
+            "attribute deletes should lower to DelAttr"
+        );
+    }
+
+    #[test]
+    fn debug_nested_if_elif_probe_disassembly() {
+        let code = compile(
+            r#"
+events = []
+
+def probe(key):
+    if False:
+        events.append("private")
+    elif True:
+        if False:
+            events.append("reserved")
+        if key == "x":
+            events.append("inner")
+        elif key == "y":
+            events.append("ignore")
+    elif key == "x":
+        events.append("duplicate")
+    else:
+        events.append("else")
+"#,
+        );
+
+        let nested = code
+            .nested_code_objects
+            .iter()
+            .find(|nested| nested.name.as_ref() == "probe")
+            .expect("expected nested probe code object");
+        println!("{}", crate::bytecode::disassemble(nested));
     }
 
     #[test]
@@ -4998,6 +5631,41 @@ class Child(Parent):
 "#,
         );
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_zero_arg_super_captures_class_cell() {
+        let code = compile(
+            r#"
+class Child(Parent):
+    def method(self):
+        return super().process()
+"#,
+        );
+
+        let class_body = code
+            .nested_code_objects
+            .first()
+            .expect("class body code should be nested in module");
+        assert!(
+            class_body
+                .cellvars
+                .iter()
+                .any(|name| name.as_ref() == "__class__"),
+            "class body should expose __class__ as a cellvar"
+        );
+
+        let method_code = class_body
+            .nested_code_objects
+            .first()
+            .expect("method code should be nested in class body");
+        assert!(
+            method_code
+                .freevars
+                .iter()
+                .any(|name| name.as_ref() == "__class__"),
+            "method using zero-arg super should capture __class__ as a freevar"
+        );
     }
 
     #[test]

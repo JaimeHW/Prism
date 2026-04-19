@@ -1,6 +1,7 @@
 //! AST visitor for scope analysis.
 
 use super::symbol::{Scope, ScopeKind, SymbolFlags, SymbolTable};
+use crate::class_compiler::ClassCompiler;
 use prism_parser::ast::{Expr, ExprKind, Module, Pattern, PatternKind, Stmt, StmtKind};
 use std::sync::Arc;
 
@@ -118,6 +119,10 @@ impl ScopeAnalyzer {
                     }
                 }
 
+                if ClassCompiler::uses_zero_arg_super(body) {
+                    func_scope.use_symbol("__class__");
+                }
+
                 // Analyze function body
                 self.push_scope(func_scope);
                 for s in body {
@@ -166,6 +171,10 @@ impl ScopeAnalyzer {
                     self.visit_stmt_in_current(s);
                 }
                 let mut class_scope = self.pop_scope();
+
+                if ClassCompiler::uses_zero_arg_super(body) {
+                    class_scope.define("__class__", SymbolFlags::DEF);
+                }
 
                 self.classify_unbound(&mut class_scope);
                 scope.children.push(class_scope);

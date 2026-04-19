@@ -183,7 +183,10 @@ impl ClosureAnalyzer {
             // Class and module scopes don't provide closure capture:
             // - Class vars are accessed via attributes, not lexical cells.
             // - Module vars are globals, not closure cells.
-            if enc_info.kind == ScopeKind::Class || enc_info.kind == ScopeKind::Module {
+            if enc_info.kind == ScopeKind::Module {
+                continue;
+            }
+            if enc_info.kind == ScopeKind::Class && var_name.as_ref() != "__class__" {
                 continue;
             }
 

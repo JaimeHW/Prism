@@ -242,6 +242,21 @@ mod lambda_tests {
     }
 
     #[test]
+    fn test_lambda_with_yield_sets_generator_flag() {
+        let code = compile_source("f = lambda: (yield)");
+        assert!(!code.nested_code_objects.is_empty());
+        let lambda_code = &code.nested_code_objects[0];
+        assert!(
+            lambda_code.flags.contains(CodeFlags::GENERATOR),
+            "Lambda containing yield must be compiled as a generator"
+        );
+        assert!(
+            has_opcode(lambda_code, Opcode::Yield),
+            "Generator lambda should retain its Yield opcode in the nested code object"
+        );
+    }
+
+    #[test]
     fn test_lambda_with_attribute_access() {
         let code = compile_source("f = lambda obj: obj.value");
         assert!(!code.nested_code_objects.is_empty());
@@ -627,6 +642,38 @@ mod genexp_tests {
         assert!(!code.nested_code_objects.is_empty());
         let gen_code = &code.nested_code_objects[0];
         assert!(count_opcode(gen_code, Opcode::ForIter) >= 2);
+    }
+
+    #[test]
+    fn test_genexp_captures_outer_local_via_closure() {
+        let code =
+            compile_source("def outer(scale, items):\n    return (scale * x for x in items)");
+        assert!(!code.nested_code_objects.is_empty());
+
+        let outer_code = &code.nested_code_objects[0];
+        assert!(
+            has_opcode(outer_code, Opcode::MakeClosure),
+            "genexp that captures an enclosing local must be created with MakeClosure"
+        );
+
+        let outer_cellvars = outer_code
+            .cellvars
+            .iter()
+            .map(|name| name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(outer_cellvars, vec!["scale"]);
+
+        assert!(
+            !outer_code.nested_code_objects.is_empty(),
+            "outer function should contain the genexp code object"
+        );
+        let gen_code = &outer_code.nested_code_objects[0];
+        let gen_freevars = gen_code
+            .freevars
+            .iter()
+            .map(|name| name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(gen_freevars, vec!["scale"]);
     }
 }
 

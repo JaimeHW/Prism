@@ -357,12 +357,6 @@ pub enum Keyword {
     With,
     /// `yield`
     Yield,
-    /// `match` (Python 3.10+)
-    Match,
-    /// `case` (Python 3.10+)
-    Case,
-    /// `type` (Python 3.12+)
-    Type,
 }
 
 impl Keyword {
@@ -405,9 +399,6 @@ impl Keyword {
             "while" => Some(Self::While),
             "with" => Some(Self::With),
             "yield" => Some(Self::Yield),
-            "match" => Some(Self::Match),
-            "case" => Some(Self::Case),
-            "type" => Some(Self::Type),
             _ => None,
         }
     }
@@ -451,9 +442,6 @@ impl Keyword {
             Self::While => "while",
             Self::With => "with",
             Self::Yield => "yield",
-            Self::Match => "match",
-            Self::Case => "case",
-            Self::Type => "type",
         }
     }
 }
@@ -501,8 +489,9 @@ mod tests {
         assert_eq!(Keyword::from_str("True"), Some(Keyword::True));
         assert_eq!(Keyword::from_str("False"), Some(Keyword::False));
         assert_eq!(Keyword::from_str("None"), Some(Keyword::None));
-        assert_eq!(Keyword::from_str("match"), Some(Keyword::Match));
-        assert_eq!(Keyword::from_str("type"), Some(Keyword::Type));
+        assert_eq!(Keyword::from_str("match"), None);
+        assert_eq!(Keyword::from_str("case"), None);
+        assert_eq!(Keyword::from_str("type"), None);
         assert_eq!(Keyword::from_str("not_a_keyword"), None);
     }
 
@@ -557,9 +546,6 @@ mod tests {
             Keyword::While,
             Keyword::With,
             Keyword::Yield,
-            Keyword::Match,
-            Keyword::Case,
-            Keyword::Type,
         ];
 
         for kw in keywords {

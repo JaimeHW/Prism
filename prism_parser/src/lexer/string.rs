@@ -80,20 +80,142 @@ pub fn parse_string(cursor: &mut Cursor<'_>, prefix: StringPrefix) -> TokenKind 
         return parse_fstring_content(cursor, quote_char, is_triple, prefix.raw);
     }
 
-    // Parse regular string content
-    let content = parse_string_content(cursor, quote_char, is_triple, prefix.raw);
+    if prefix.bytes {
+        match parse_bytes_content(cursor, quote_char, is_triple, prefix.raw) {
+            Ok(bytes) => TokenKind::Bytes(bytes),
+            Err(msg) => TokenKind::Error(msg),
+        }
+    } else {
+        match parse_string_content(cursor, quote_char, is_triple, prefix.raw) {
+            Ok(s) => TokenKind::String(s),
+            Err(msg) => TokenKind::Error(msg),
+        }
+    }
+}
 
-    match content {
-        Ok(s) => {
-            if prefix.bytes {
-                // Convert to bytes
-                TokenKind::Bytes(s.into_bytes())
+fn parse_bytes_content(
+    cursor: &mut Cursor<'_>,
+    quote_char: char,
+    is_triple: bool,
+    is_raw: bool,
+) -> Result<Vec<u8>, String> {
+    let mut content = Vec::new();
+
+    loop {
+        let c = cursor.first();
+
+        if c == EOF_CHAR {
+            return Err("unterminated string".to_string());
+        }
+
+        if c == quote_char {
+            if is_triple {
+                if cursor.second() == quote_char && cursor.third() == quote_char {
+                    cursor.bump();
+                    cursor.bump();
+                    cursor.bump();
+                    break;
+                }
             } else {
-                TokenKind::String(s)
+                cursor.bump();
+                break;
             }
         }
-        Err(msg) => TokenKind::Error(msg),
+
+        if !is_triple && (c == '\n' || c == '\r') {
+            return Err("unterminated string (newline in single-quoted string)".to_string());
+        }
+
+        cursor.bump();
+
+        if c == '\\' && !is_raw {
+            parse_byte_escape(cursor, &mut content)?;
+        } else if c == '\\' && is_raw {
+            content.push(b'\\');
+            if cursor.first() == quote_char {
+                push_ascii_byte(&mut content, cursor.bump_or_eof())?;
+            }
+        } else {
+            push_ascii_byte(&mut content, c)?;
+        }
     }
+
+    Ok(content)
+}
+
+#[inline]
+fn push_ascii_byte(content: &mut Vec<u8>, c: char) -> Result<(), String> {
+    if c.is_ascii() {
+        content.push(c as u8);
+        Ok(())
+    } else {
+        Err("bytes can only contain ASCII literal characters".to_string())
+    }
+}
+
+fn parse_byte_escape(cursor: &mut Cursor<'_>, content: &mut Vec<u8>) -> Result<(), String> {
+    let c = cursor.bump_or_eof();
+    match c {
+        '\\' => content.push(b'\\'),
+        '\'' => content.push(b'\''),
+        '"' => content.push(b'"'),
+        'n' => content.push(b'\n'),
+        'r' => content.push(b'\r'),
+        't' => content.push(b'\t'),
+        'b' => content.push(b'\x08'),
+        'f' => content.push(b'\x0c'),
+        'v' => content.push(b'\x0b'),
+        'a' => content.push(b'\x07'),
+        '\n' => {}
+        '\r' => {
+            if cursor.first() == '\n' {
+                cursor.bump();
+            }
+        }
+        'x' => content.push(parse_byte_hex_escape(cursor, 2)?),
+        'u' | 'U' | 'N' => {
+            content.push(b'\\');
+            content.push(c as u8);
+        }
+        _ if c.is_ascii_digit() => content.push(parse_byte_octal_escape(cursor, c)?),
+        EOF_CHAR => return Err("unterminated escape sequence".to_string()),
+        _ => {
+            content.push(b'\\');
+            push_ascii_byte(content, c)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_byte_hex_escape(cursor: &mut Cursor<'_>, count: usize) -> Result<u8, String> {
+    let mut value: u32 = 0;
+    for _ in 0..count {
+        let c = cursor.bump_or_eof();
+        let digit = c
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex escape: {}", c))?;
+        value = value * 16 + digit;
+    }
+    u8::try_from(value).map_err(|_| format!("invalid byte value: {}", value))
+}
+
+fn parse_byte_octal_escape(cursor: &mut Cursor<'_>, first: char) -> Result<u8, String> {
+    let mut value = first.to_digit(8).unwrap();
+
+    for _ in 0..2 {
+        if let Some(digit) = cursor.first().to_digit(8) {
+            value = value * 8 + digit;
+            cursor.bump();
+        } else {
+            break;
+        }
+    }
+
+    if value > 0o377 {
+        return Err("octal escape too large".to_string());
+    }
+
+    Ok(value as u8)
 }
 
 /// Parse string content until the closing quote(s).
@@ -253,19 +375,179 @@ fn parse_fstring_content(
     is_triple: bool,
     is_raw: bool,
 ) -> TokenKind {
-    // F-strings are complex - for now return a placeholder
-    // A full implementation would need to:
-    // 1. Parse literal parts
-    // 2. Identify expression parts (in braces)
-    // 3. Handle nested braces, strings, and format specs
-    // 4. Return a structured representation
-
-    // Skip to end of string for now
-    let result = parse_string_content(cursor, quote_char, is_triple, is_raw);
+    // Prism does not fully lower f-strings yet, but the lexer must still scan
+    // them correctly so CPython source modules can be parsed and compiled.
+    // This scanner tracks expression braces and nested Python string literals
+    // inside replacement fields so inner quotes do not terminate the outer
+    // f-string prematurely.
+    let result = scan_fstring_content(cursor, quote_char, is_triple, is_raw);
     match result {
         Ok(s) => TokenKind::String(format!("f-string: {}", s)),
         Err(e) => TokenKind::Error(e),
     }
+}
+
+fn scan_fstring_content(
+    cursor: &mut Cursor<'_>,
+    quote_char: char,
+    is_triple: bool,
+    is_raw: bool,
+) -> Result<String, String> {
+    let mut content = String::new();
+
+    loop {
+        let c = cursor.first();
+
+        if c == EOF_CHAR {
+            return Err("unterminated string".to_string());
+        }
+
+        if c == quote_char {
+            if is_triple {
+                if cursor.second() == quote_char && cursor.third() == quote_char {
+                    cursor.bump();
+                    cursor.bump();
+                    cursor.bump();
+                    break;
+                }
+            } else {
+                cursor.bump();
+                break;
+            }
+        }
+
+        if !is_triple && (c == '\n' || c == '\r') {
+            return Err("unterminated string (newline in single-quoted string)".to_string());
+        }
+
+        if c == '{' {
+            cursor.bump();
+            if cursor.first() == '{' {
+                cursor.bump();
+                content.push('{');
+                continue;
+            }
+
+            content.push('{');
+            scan_fstring_expression(cursor, &mut content)?;
+            continue;
+        }
+
+        if c == '}' {
+            cursor.bump();
+            if cursor.first() == '}' {
+                cursor.bump();
+                content.push('}');
+                continue;
+            }
+            return Err("single '}' is not allowed in f-string".to_string());
+        }
+
+        cursor.bump();
+
+        if c == '\\' && !is_raw {
+            let escaped = parse_escape(cursor)?;
+            content.push(escaped);
+        } else if c == '\\' && is_raw {
+            content.push('\\');
+            if cursor.first() == quote_char {
+                content.push(cursor.bump_or_eof());
+            }
+        } else {
+            content.push(c);
+        }
+    }
+
+    Ok(content)
+}
+
+fn scan_fstring_expression(cursor: &mut Cursor<'_>, content: &mut String) -> Result<(), String> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    loop {
+        let c = cursor.first();
+
+        if c == EOF_CHAR {
+            return Err("unterminated f-string expression".to_string());
+        }
+
+        if c == '\'' || c == '"' {
+            scan_nested_python_string_literal(cursor, content)?;
+            continue;
+        }
+
+        cursor.bump();
+        content.push(c);
+
+        match c {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => {
+                if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                    break;
+                }
+                brace_depth = brace_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn scan_nested_python_string_literal(
+    cursor: &mut Cursor<'_>,
+    content: &mut String,
+) -> Result<(), String> {
+    let quote_char = cursor.bump_or_eof();
+    if quote_char != '\'' && quote_char != '"' {
+        return Err("expected quote".to_string());
+    }
+    content.push(quote_char);
+
+    let is_triple = cursor.first() == quote_char && cursor.second() == quote_char;
+    if is_triple {
+        content.push(cursor.bump_or_eof());
+        content.push(cursor.bump_or_eof());
+    }
+
+    loop {
+        let c = cursor.first();
+        if c == EOF_CHAR {
+            return Err("unterminated string in f-string expression".to_string());
+        }
+
+        cursor.bump();
+        content.push(c);
+
+        if c == '\\' {
+            let next = cursor.bump_or_eof();
+            if next == EOF_CHAR {
+                return Err("unterminated escape sequence in f-string expression".to_string());
+            }
+            content.push(next);
+            continue;
+        }
+
+        if c == quote_char {
+            if is_triple {
+                if cursor.first() == quote_char && cursor.second() == quote_char {
+                    content.push(cursor.bump_or_eof());
+                    content.push(cursor.bump_or_eof());
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if a character can start a string prefix.
@@ -357,9 +639,56 @@ mod tests {
     }
 
     #[test]
+    fn test_fstring_expression_can_contain_matching_inner_string_quotes() {
+        let result = lex_string_with_prefix(
+            "'Ignored error getting __notes__: {_safe_string(e, '__notes__', repr)}'",
+            "f",
+        );
+        assert_eq!(
+            result,
+            TokenKind::String(
+                "f-string: Ignored error getting __notes__: {_safe_string(e, '__notes__', repr)}"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_fstring_expression_can_contain_nested_braces() {
+        let result = lex_string_with_prefix("\"{ {'key': value} }\"", "f");
+        assert_eq!(
+            result,
+            TokenKind::String("f-string: { {'key': value} }".to_string())
+        );
+    }
+
+    #[test]
     fn test_byte_string() {
         let result = lex_string_with_prefix("\"hello\"", "b");
         assert_eq!(result, TokenKind::Bytes(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_byte_string_hex_escape_preserves_single_byte_values() {
+        let result = lex_string_with_prefix("\"\\x00A\\xff\"", "b");
+        assert_eq!(result, TokenKind::Bytes(vec![0x00, b'A', 0xff]));
+    }
+
+    #[test]
+    fn test_byte_string_unicode_escape_is_kept_literal() {
+        let result = lex_string_with_prefix("\"\\u0041\"", "b");
+        assert_eq!(result, TokenKind::Bytes(br"\u0041".to_vec()));
+    }
+
+    #[test]
+    fn test_byte_string_rejects_non_ascii_literal_characters() {
+        let result = lex_string_with_prefix("\"é\"", "b");
+        match result {
+            TokenKind::Error(message) => {
+                assert!(message.contains("ASCII literal characters"));
+            }
+            other => panic!("expected bytes literal error, got {:?}", other),
+        }
     }
 
     #[test]

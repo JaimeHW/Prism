@@ -105,6 +105,8 @@ impl std::ops::BitOrAssign for SymbolFlags {
     }
 }
 
+use std::cmp::Ordering;
+
 /// Information about a symbol in a scope.
 #[derive(Debug, Clone)]
 pub struct Symbol {
@@ -238,6 +240,38 @@ impl Scope {
     pub fn cellvars(&self) -> impl Iterator<Item = &Symbol> {
         self.symbols.values().filter(|s| s.is_cell())
     }
+
+    fn ordered_closure_symbols<F>(&self, include: F) -> Vec<&Symbol>
+    where
+        F: Fn(&Symbol) -> bool,
+    {
+        let mut symbols: Vec<_> = self
+            .symbols
+            .values()
+            .filter(|symbol| include(symbol))
+            .collect();
+        symbols.sort_unstable_by(
+            |left, right| match (left.closure_slot, right.closure_slot) {
+                (Some(left_slot), Some(right_slot)) => left_slot
+                    .cmp(&right_slot)
+                    .then_with(|| left.name.as_ref().cmp(right.name.as_ref())),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => left.name.as_ref().cmp(right.name.as_ref()),
+            },
+        );
+        symbols
+    }
+
+    /// Get cell variables ordered by closure slot.
+    pub fn ordered_cellvars(&self) -> Vec<&Symbol> {
+        self.ordered_closure_symbols(Symbol::is_cell)
+    }
+
+    /// Get free variables ordered by closure slot.
+    pub fn ordered_freevars(&self) -> Vec<&Symbol> {
+        self.ordered_closure_symbols(Symbol::is_free)
+    }
 }
 
 /// Complete symbol table for a module.
@@ -293,5 +327,56 @@ mod tests {
         sym.flags |= SymbolFlags::GLOBAL_EXPLICIT;
         assert!(!sym.is_local());
         assert!(sym.is_global());
+    }
+
+    #[test]
+    fn test_ordered_cellvars_follow_closure_slots() {
+        let mut scope = Scope::new(ScopeKind::Function, "test");
+
+        let mut z = Symbol::new("z");
+        z.flags |= SymbolFlags::DEF | SymbolFlags::CELL;
+        z.closure_slot = Some(2);
+        scope.symbols.insert(Arc::from("z"), z);
+
+        let mut a = Symbol::new("a");
+        a.flags |= SymbolFlags::DEF | SymbolFlags::CELL;
+        a.closure_slot = Some(0);
+        scope.symbols.insert(Arc::from("a"), a);
+
+        let mut m = Symbol::new("m");
+        m.flags |= SymbolFlags::DEF | SymbolFlags::CELL;
+        m.closure_slot = Some(1);
+        scope.symbols.insert(Arc::from("m"), m);
+
+        let ordered = scope
+            .ordered_cellvars()
+            .into_iter()
+            .map(|symbol| symbol.name.as_ref().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn test_ordered_freevars_follow_closure_slots() {
+        let mut scope = Scope::new(ScopeKind::Function, "test");
+
+        let mut second = Symbol::new("second");
+        second.flags |= SymbolFlags::FREE | SymbolFlags::USE;
+        second.closure_slot = Some(3);
+        scope.symbols.insert(Arc::from("second"), second);
+
+        let mut first = Symbol::new("first");
+        first.flags |= SymbolFlags::FREE | SymbolFlags::USE;
+        first.closure_slot = Some(2);
+        scope.symbols.insert(Arc::from("first"), first);
+
+        let ordered = scope
+            .ordered_freevars()
+            .into_iter()
+            .map(|symbol| symbol.name.as_ref().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec!["first", "second"]);
     }
 }

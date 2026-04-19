@@ -163,8 +163,6 @@ enum ConstantKey {
     /// Float bits for exact comparison.
     Float(u64),
     String(Arc<str>),
-    /// Code object by name (simplified).
-    Code(Arc<str>),
     /// Tuple of strings (for keyword argument names).
     KwNamesTuple(Box<[Arc<str>]>),
 }
@@ -327,8 +325,9 @@ impl FunctionBuilder {
 
     /// Allocate a contiguous block of registers for function calls.
     ///
-    /// This reserves `count` consecutive registers starting from a fresh base register
-    /// (never from the free list) to avoid clobbering live registers.
+    /// This reserves `count` consecutive registers. The allocator first tries to
+    /// reclaim a fully free contiguous span from the free list; if none exists,
+    /// it extends the high-water mark.
     ///
     /// Call instructions use consecutive registers: [result, arg0, arg1, ...]
     /// This method ensures all those registers are properly reserved.
@@ -337,8 +336,10 @@ impl FunctionBuilder {
     /// The base register of the block. Registers [base..base+count) are reserved.
     #[inline]
     pub fn alloc_register_block(&mut self, count: u8) -> Register {
-        // Allocate from `next_register` to guarantee contiguity
-        // Do NOT reuse freed registers, as they may be scattered
+        if let Some(base) = self.take_contiguous_free_block(count) {
+            return base;
+        }
+
         let base = Register(self.next_register);
         self.next_register = self
             .next_register
@@ -348,6 +349,47 @@ impl FunctionBuilder {
         base
     }
 
+    fn take_contiguous_free_block(&mut self, count: u8) -> Option<Register> {
+        if count == 0 || self.free_registers.len() < count as usize {
+            return None;
+        }
+
+        let mut entries: Vec<(usize, u8)> = self
+            .free_registers
+            .iter()
+            .enumerate()
+            .map(|(index, register)| (index, register.0))
+            .collect();
+        entries.sort_unstable_by_key(|&(_, register)| register);
+
+        let span_len = count as usize;
+        for start in 0..=entries.len() - span_len {
+            let base = entries[start].1;
+            let is_contiguous = entries[start..start + span_len].iter().enumerate().all(
+                |(offset, &(_, register))| {
+                    base.checked_add(offset as u8)
+                        .map(|expected| register == expected)
+                        .unwrap_or(false)
+                },
+            );
+            if !is_contiguous {
+                continue;
+            }
+
+            let mut removal_indices: Vec<usize> = entries[start..start + span_len]
+                .iter()
+                .map(|&(index, _)| index)
+                .collect();
+            removal_indices.sort_unstable_by(|left, right| right.cmp(left));
+            for index in removal_indices {
+                self.free_registers.swap_remove(index);
+            }
+            return Some(Register(base));
+        }
+
+        None
+    }
+
     /// Free a contiguous block of registers (for cleanup after call).
     #[inline]
     pub fn free_register_block(&mut self, base: Register, count: u8) {
@@ -355,20 +397,6 @@ impl FunctionBuilder {
         for i in 0..count {
             self.free_registers.push(Register(base.0 + i));
         }
-    }
-
-    /// Clear the free register list to prevent register reuse.
-    ///
-    /// This is used before compiling code that allocates a live register (like list_reg in comprehensions)
-    /// followed by inner code that uses Call instructions. Call uses consecutive registers
-    /// [dst, dst+1, ...], and if dst is reused from the free list at a low position,
-    /// dst+1 could clobber the live register.
-    ///
-    /// By clearing the free list, we force all subsequent allocations to use fresh registers
-    /// from `next_register`, which are guaranteed to be after any previously allocated live registers.
-    #[inline]
-    pub fn clear_free_registers(&mut self) {
-        self.free_registers.clear();
     }
 
     // =========================================================================
@@ -449,21 +477,11 @@ impl FunctionBuilder {
     ///
     /// Returns the constant index that can be used with MakeFunction/MakeClosure opcodes.
     pub fn add_code_object(&mut self, code: Arc<CodeObject>) -> u16 {
-        // Store code object reference as a constant
-        // We use the name for deduplication key
-        let name = code.name.clone();
-        let key = ConstantKey::Code(name);
-
-        if let Some(&idx) = self.constant_map.get(&key) {
-            return idx.0;
-        }
-
         // Store the Arc<CodeObject> as an object pointer constant
         // At runtime, the VM will interpret this as a code object reference
         let code_ptr = Arc::into_raw(Arc::clone(&code)) as *const ();
         let idx = ConstIndex::new(self.constants.len() as u16);
         self.constants.push(Value::object_ptr(code_ptr));
-        self.constant_map.insert(key, idx);
 
         // Store Arc in nested_code_objects for test accessibility
         self.nested_code_objects.push(code);
@@ -700,6 +718,26 @@ impl FunctionBuilder {
         ));
     }
 
+    /// Emit BUILD_CLASS_WITH_META for class definitions with an explicit metaclass.
+    ///
+    /// Register layout:
+    /// - `dst` = result class object
+    /// - `dst+1..dst+base_count` = base classes
+    /// - `dst+1+base_count` = explicit metaclass value
+    pub fn emit_build_class_with_meta(&mut self, dst: Register, code_idx: u16, base_count: u8) {
+        assert!(
+            code_idx <= u8::MAX as u16,
+            "BUILD_CLASS_WITH_META code index {} exceeds 8-bit encoding",
+            code_idx
+        );
+        self.emit(Instruction::op_dss(
+            Opcode::BuildClassWithMeta,
+            dst,
+            Register::new(code_idx as u8),
+            Register::new(base_count),
+        ));
+    }
+
     /// Move value between registers.
     pub fn emit_move(&mut self, dst: Register, src: Register) {
         if dst != src {
@@ -875,6 +913,30 @@ impl FunctionBuilder {
         // Full 16-bit name indices require an extended instruction format.
     }
 
+    /// Set attribute: obj.attr = value.
+    pub fn emit_set_attr(&mut self, obj: Register, name_idx: u16, value: Register) {
+        self.emit(Instruction::new(
+            Opcode::SetAttr,
+            obj.0,
+            (name_idx & 0xFF) as u8,
+            value.0,
+        ));
+        // Note: SetAttr currently uses compact 8-bit name encoding.
+        // Full 16-bit name indices require an extended instruction format.
+    }
+
+    /// Delete attribute: del obj.attr.
+    pub fn emit_del_attr(&mut self, obj: Register, name_idx: u16) {
+        self.emit(Instruction::new(
+            Opcode::DelAttr,
+            0,
+            obj.0,
+            (name_idx & 0xFF) as u8,
+        ));
+        // Note: DelAttr currently uses compact 8-bit name encoding.
+        // Full 16-bit name indices require an extended instruction format.
+    }
+
     /// Get item: dst = obj[key].
     pub fn emit_get_item(&mut self, dst: Register, obj: Register, key: Register) {
         self.emit(Instruction::op_dss(Opcode::GetItem, dst, obj, key));
@@ -882,7 +944,17 @@ impl FunctionBuilder {
 
     /// Set item: obj[key] = value.
     pub fn emit_set_item(&mut self, obj: Register, key: Register, value: Register) {
-        self.emit(Instruction::op_dss(Opcode::SetItem, obj, key, value));
+        self.emit(Instruction::op_dss(Opcode::SetItem, key, obj, value));
+    }
+
+    /// Delete item: del obj[key].
+    pub fn emit_del_item(&mut self, obj: Register, key: Register) {
+        self.emit(Instruction::op_dss(
+            Opcode::DelItem,
+            Register::new(0),
+            obj,
+            key,
+        ));
     }
 
     // --- Function Calls ---
@@ -1346,6 +1418,28 @@ mod tests {
     }
 
     #[test]
+    fn test_code_object_constants_are_not_deduplicated_by_name() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let mut first = CodeObject::new("same_name", "test.py");
+        first.arg_count = 1;
+        let mut second = CodeObject::new("same_name", "test.py");
+        second.arg_count = 2;
+
+        let first_idx = builder.add_code_object(Arc::new(first));
+        let second_idx = builder.add_code_object(Arc::new(second));
+        let code = builder.finish();
+
+        assert_ne!(
+            first_idx, second_idx,
+            "distinct nested functions must keep distinct code constants even when names match"
+        );
+        assert_eq!(code.nested_code_objects.len(), 2);
+        assert_eq!(code.nested_code_objects[0].arg_count, 1);
+        assert_eq!(code.nested_code_objects[1].arg_count, 2);
+    }
+
+    #[test]
     fn test_labels() {
         let mut builder = FunctionBuilder::new("loop");
 
@@ -1380,6 +1474,19 @@ mod tests {
     }
 
     #[test]
+    fn test_register_block_allocation_reuses_contiguous_free_span() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let block = builder.alloc_register_block(4);
+        builder.free_register_block(block, 4);
+
+        let reused = builder.alloc_register_block(3);
+
+        assert_eq!(reused, Register(0));
+        assert_eq!(builder.next_register, 4);
+    }
+
+    #[test]
     fn test_emit_get_attr_uses_low_byte_of_name_index() {
         let mut builder = FunctionBuilder::new("attr");
         let dst = builder.alloc_register();
@@ -1391,6 +1498,70 @@ mod tests {
 
         assert_eq!(inst.opcode(), Opcode::GetAttr as u8);
         assert_eq!(inst.src2().0, 0x23);
+    }
+
+    #[test]
+    fn test_emit_set_attr_uses_low_byte_of_name_index() {
+        let mut builder = FunctionBuilder::new("set_attr");
+        let obj = builder.alloc_register();
+        let value = builder.alloc_register();
+
+        builder.emit_set_attr(obj, 0x0123, value);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::SetAttr as u8);
+        assert_eq!(inst.dst().0, obj.0);
+        assert_eq!(inst.src1().0, 0x23);
+        assert_eq!(inst.src2().0, value.0);
+    }
+
+    #[test]
+    fn test_emit_set_item_encodes_key_container_and_value_registers() {
+        let mut builder = FunctionBuilder::new("set_item");
+        let obj = builder.alloc_register();
+        let key = builder.alloc_register();
+        let value = builder.alloc_register();
+
+        builder.emit_set_item(obj, key, value);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::SetItem as u8);
+        assert_eq!(inst.dst().0, key.0);
+        assert_eq!(inst.src1().0, obj.0);
+        assert_eq!(inst.src2().0, value.0);
+    }
+
+    #[test]
+    fn test_emit_del_attr_uses_object_register_and_low_byte_of_name_index() {
+        let mut builder = FunctionBuilder::new("del_attr");
+        let obj = builder.alloc_register();
+
+        builder.emit_del_attr(obj, 0x0123);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::DelAttr as u8);
+        assert_eq!(inst.dst().0, 0);
+        assert_eq!(inst.src1().0, obj.0);
+        assert_eq!(inst.src2().0, 0x23);
+    }
+
+    #[test]
+    fn test_emit_del_item_encodes_container_and_key_registers() {
+        let mut builder = FunctionBuilder::new("del_item");
+        let obj = builder.alloc_register();
+        let key = builder.alloc_register();
+
+        builder.emit_del_item(obj, key);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::DelItem as u8);
+        assert_eq!(inst.dst().0, 0);
+        assert_eq!(inst.src1().0, obj.0);
+        assert_eq!(inst.src2().0, key.0);
     }
 
     #[test]
@@ -1406,6 +1577,21 @@ mod tests {
         assert_eq!(inst.dst().0, dst.0);
         assert_eq!(inst.src1().0, 0x2A);
         assert_eq!(inst.src2().0, 3);
+    }
+
+    #[test]
+    fn test_emit_build_class_with_meta_encodes_code_index_and_base_count() {
+        let mut builder = FunctionBuilder::new("class_builder_meta");
+        let dst = builder.alloc_register();
+
+        builder.emit_build_class_with_meta(dst, 0x19, 2);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::BuildClassWithMeta as u8);
+        assert_eq!(inst.dst().0, dst.0);
+        assert_eq!(inst.src1().0, 0x19);
+        assert_eq!(inst.src2().0, 2);
     }
 
     #[test]

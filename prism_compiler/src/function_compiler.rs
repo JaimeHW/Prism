@@ -188,6 +188,16 @@ impl<'a> FunctionContext<'a> {
     pub fn freevars(&self) -> impl Iterator<Item = &'a Symbol> {
         self.scope_ref.scope.freevars()
     }
+
+    /// Get cell variables ordered by closure slot.
+    pub fn ordered_cellvars(&self) -> Vec<&'a Symbol> {
+        self.scope_ref.scope.ordered_cellvars()
+    }
+
+    /// Get free variables ordered by closure slot.
+    pub fn ordered_freevars(&self) -> Vec<&'a Symbol> {
+        self.scope_ref.scope.ordered_freevars()
+    }
 }
 
 // =============================================================================
@@ -286,9 +296,17 @@ pub struct ClosureInfo {
 impl ClosureInfo {
     /// Create closure info from a function context.
     pub fn from_context(ctx: &FunctionContext<'_>) -> Self {
-        let cellvar_names: Vec<Arc<str>> = ctx.cellvars().map(|s| s.name.clone()).collect();
+        let cellvar_names: Vec<Arc<str>> = ctx
+            .ordered_cellvars()
+            .into_iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
 
-        let freevar_names: Vec<Arc<str>> = ctx.freevars().map(|s| s.name.clone()).collect();
+        let freevar_names: Vec<Arc<str>> = ctx
+            .ordered_freevars()
+            .into_iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
 
         Self {
             cellvar_names,
@@ -589,6 +607,41 @@ mod tests {
         assert_eq!(info.cellvar_names.len(), 1);
         assert_eq!(info.freevar_names.len(), 1);
         assert_eq!(info.slot_count(), 2);
+    }
+
+    #[test]
+    fn test_closure_info_orders_names_by_closure_slot() {
+        let mut scope = Scope::new(ScopeKind::Function, "ordered");
+
+        let late = scope
+            .symbols
+            .entry(Arc::from("late"))
+            .or_insert_with(|| Symbol::new("late"));
+        late.flags |= SymbolFlags::DEF | SymbolFlags::CELL;
+        late.closure_slot = Some(1);
+
+        let early = scope
+            .symbols
+            .entry(Arc::from("early"))
+            .or_insert_with(|| Symbol::new("early"));
+        early.flags |= SymbolFlags::DEF | SymbolFlags::CELL;
+        early.closure_slot = Some(0);
+
+        let captured = scope
+            .symbols
+            .entry(Arc::from("captured"))
+            .or_insert_with(|| Symbol::new("captured"));
+        captured.flags |= SymbolFlags::USE | SymbolFlags::FREE;
+        captured.closure_slot = Some(2);
+
+        let ctx = FunctionContext::new(&scope);
+        let info = ClosureInfo::from_context(&ctx);
+
+        assert_eq!(
+            info.cellvar_names,
+            vec![Arc::<str>::from("early"), Arc::<str>::from("late")]
+        );
+        assert_eq!(info.freevar_names, vec![Arc::<str>::from("captured")]);
     }
 
     // =========================================================================

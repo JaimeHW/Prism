@@ -3,7 +3,7 @@
 //! Implements operator precedence parsing for all Python 3.12 expressions.
 
 use crate::ast::{
-    Arguments, BinOp, BoolOp, CmpOp, Comprehension, Expr, ExprKind, Keyword, StringLiteral, UnaryOp,
+    Arguments, BinOp, BoolOp, CmpOp, Comprehension, Expr, ExprKind, Keyword, UnaryOp,
 };
 use crate::parser::{Parser, Precedence};
 use crate::token::{Keyword as KW, TokenKind};
@@ -54,16 +54,16 @@ impl ExprParser {
                     parser.span_from(start),
                 ))
             }
-            TokenKind::String(s) => {
-                parser.advance();
+            TokenKind::String(_) => {
+                let literal = parser.parse_concatenated_string_literal()?;
                 Ok(Expr::new(
-                    ExprKind::String(StringLiteral::new(s)),
+                    ExprKind::String(literal),
                     parser.span_from(start),
                 ))
             }
-            TokenKind::Bytes(b) => {
-                parser.advance();
-                Ok(Expr::new(ExprKind::Bytes(b), parser.span_from(start)))
+            TokenKind::Bytes(_) => {
+                let literal = parser.parse_concatenated_bytes_literal()?;
+                Ok(Expr::new(ExprKind::Bytes(literal), parser.span_from(start)))
             }
             TokenKind::Keyword(KW::True) => {
                 parser.advance();
@@ -1136,6 +1136,51 @@ mod tests {
     fn test_identifier() {
         let expr = parse("foo");
         assert!(matches!(expr.kind, ExprKind::Name(ref n) if n == "foo"));
+    }
+
+    #[test]
+    fn test_adjacent_string_literals_are_concatenated() {
+        let expr = parse("\"meta\" \"class\"");
+        match expr.kind {
+            ExprKind::String(literal) => assert_eq!(literal.value, "metaclass"),
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_multiline_string_literals_are_concatenated() {
+        let expr = parse("(\"meta\" \n \"class\")");
+        match expr.kind {
+            ExprKind::String(literal) => assert_eq!(literal.value, "metaclass"),
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_adjacent_bytes_literals_are_concatenated() {
+        let expr = parse("b\"meta\" b\"class\"");
+        match expr.kind {
+            ExprKind::Bytes(literal) => assert_eq!(literal, b"metaclass"),
+            other => panic!("expected Bytes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bytes_literal_hex_escapes_preserve_raw_byte_values() {
+        let expr = parse("b\"\\x00A\\xff\"");
+        match expr.kind {
+            ExprKind::Bytes(literal) => assert_eq!(literal, vec![0x00, b'A', 0xff]),
+            other => panic!("expected Bytes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mixed_string_and_bytes_literals_are_rejected() {
+        let err = parse_expression("(\"meta\" b\"class\")").expect_err("expected syntax error");
+        assert!(
+            format!("{err}").contains("cannot mix bytes and nonbytes literals"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

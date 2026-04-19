@@ -8,7 +8,7 @@ use crate::ast::{
 };
 use crate::parser::{ExprParser, Parser, Precedence};
 use crate::token::{Keyword as KW, TokenKind};
-use prism_core::PrismResult;
+use prism_core::{PrismResult, Span};
 
 /// Statement parser.
 pub struct StmtParser;
@@ -17,6 +17,10 @@ impl StmtParser {
     /// Parse a statement.
     pub fn parse(parser: &mut Parser<'_>) -> PrismResult<Stmt> {
         let start = parser.start_span();
+
+        if Self::looks_like_match_statement(parser) {
+            return Self::parse_match(parser, start);
+        }
 
         // Check for compound statements
         if let TokenKind::Keyword(kw) = &parser.current().kind {
@@ -29,7 +33,6 @@ impl StmtParser {
                 KW::Def => return Self::parse_function_def(parser, start, false),
                 KW::Class => return Self::parse_class_def(parser, start),
                 KW::Async => return Self::parse_async(parser, start),
-                KW::Match => return Self::parse_match(parser, start),
                 _ => {}
             }
         }
@@ -45,6 +48,12 @@ impl StmtParser {
 
     /// Parse a simple statement.
     fn parse_simple_statement(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
+        if Self::looks_like_type_alias(parser) {
+            let stmt = Self::parse_type_alias(parser, start)?;
+            parser.match_token(TokenKind::Newline);
+            return Ok(stmt);
+        }
+
         let stmt = match &parser.current().kind.clone() {
             TokenKind::Keyword(KW::Pass) => {
                 parser.advance();
@@ -66,7 +75,6 @@ impl StmtParser {
             TokenKind::Keyword(KW::Nonlocal) => Self::parse_nonlocal(parser, start)?,
             TokenKind::Keyword(KW::Import) => Self::parse_import(parser, start)?,
             TokenKind::Keyword(KW::From) => Self::parse_from_import(parser, start)?,
-            TokenKind::Keyword(KW::Type) => Self::parse_type_alias(parser, start)?,
             _ => Self::parse_expression_statement(parser, start)?,
         };
 
@@ -78,6 +86,26 @@ impl StmtParser {
     // =========================================================================
     // Simple Statements
     // =========================================================================
+
+    fn looks_like_match_statement(parser: &Parser<'_>) -> bool {
+        if !parser.check_identifier_value("match") {
+            return false;
+        }
+
+        let mut probe = parser.clone();
+        let start = probe.start_span();
+        Self::parse_match(&mut probe, start).is_ok()
+    }
+
+    fn looks_like_type_alias(parser: &Parser<'_>) -> bool {
+        if !parser.check_identifier_value("type") {
+            return false;
+        }
+
+        let mut probe = parser.clone();
+        let start = probe.start_span();
+        Self::parse_type_alias(&mut probe, start).is_ok()
+    }
 
     /// Parse an expression statement (possibly assignment).
     fn parse_expression_statement(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
@@ -154,19 +182,23 @@ impl StmtParser {
     /// - Targets: `a, b = ...`
     /// - Values: `a = 1, 2`
     /// - Chained assignments: `a = b = 1, 2`
-    fn parse_comma_tuple_expr(
+    /// - For iterables: `for x in a, b: ...`
+    fn parse_comma_tuple_expr_until<F>(
         parser: &mut Parser<'_>,
         start: u32,
         first: Expr,
-        stop_at_equal: bool,
-    ) -> PrismResult<Expr> {
+        mut should_stop: F,
+    ) -> PrismResult<Expr>
+    where
+        F: FnMut(&Parser<'_>) -> bool,
+    {
         if !parser.match_token(TokenKind::Comma) {
             return Ok(first);
         }
 
         let mut elements = vec![first];
         while !parser.check(TokenKind::Newline) && !parser.check(TokenKind::Eof) {
-            if stop_at_equal && parser.check(TokenKind::Equal) {
+            if should_stop(parser) {
                 break;
             }
 
@@ -180,6 +212,17 @@ impl StmtParser {
             ExprKind::Tuple(elements),
             parser.span_from(start),
         ))
+    }
+
+    fn parse_comma_tuple_expr(
+        parser: &mut Parser<'_>,
+        start: u32,
+        first: Expr,
+        stop_at_equal: bool,
+    ) -> PrismResult<Expr> {
+        Self::parse_comma_tuple_expr_until(parser, start, first, |parser| {
+            stop_at_equal && parser.check(TokenKind::Equal)
+        })
     }
 
     /// Match an augmented assignment operator.
@@ -447,7 +490,9 @@ impl StmtParser {
 
     /// Parse a type alias statement (Python 3.12+).
     fn parse_type_alias(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
-        parser.advance(); // consume 'type'
+        if !parser.match_identifier_value("type") {
+            return Err(parser.error_at_current("expected 'type'"));
+        }
 
         let name = parser.expect_identifier("expected type name")?;
         let name_span = parser.span_from(start);
@@ -483,35 +528,34 @@ impl StmtParser {
 
         let test = ExprParser::parse(parser, Precedence::Lowest)?;
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
-        let mut orelse = Vec::new();
+        let mut elif_clauses = Vec::new();
         while parser.match_keyword(KW::Elif) {
             let elif_start = parser.previous().span.start;
             let elif_test = ExprParser::parse(parser, Precedence::Lowest)?;
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            let elif_body = Self::parse_block(parser)?;
-            orelse.push(Stmt::new(
+            let elif_body = Self::parse_suite(parser)?;
+            elif_clauses.push((elif_start, elif_test, elif_body));
+        }
+
+        let mut orelse = if parser.match_keyword(KW::Else) {
+            parser.expect(TokenKind::Colon, "expected ':'")?;
+            Self::parse_suite(parser)?
+        } else {
+            Vec::new()
+        };
+
+        let tail_end = parser.previous().span.end;
+        for (elif_start, elif_test, elif_body) in elif_clauses.into_iter().rev() {
+            orelse = vec![Stmt::new(
                 StmtKind::If {
                     test: Box::new(elif_test),
                     body: elif_body,
-                    orelse: Vec::new(),
+                    orelse,
                 },
-                parser.span_from(elif_start),
-            ));
-        }
-
-        if parser.match_keyword(KW::Else) {
-            parser.expect(TokenKind::Colon, "expected ':'")?;
-            let else_body = Self::parse_block(parser)?;
-            // Attach else to the innermost if
-            if let Some(last) = orelse.last_mut() {
-                if let StmtKind::If { orelse: inner, .. } = &mut last.kind {
-                    *inner = else_body;
-                }
-            } else {
-                orelse = else_body;
-            }
+                Span::new(elif_start, tail_end),
+            )];
         }
 
         Ok(Stmt::new(
@@ -530,11 +574,11 @@ impl StmtParser {
 
         let test = ExprParser::parse(parser, Precedence::Lowest)?;
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
         let orelse = if parser.match_keyword(KW::Else) {
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            Self::parse_block(parser)?
+            Self::parse_suite(parser)?
         } else {
             Vec::new()
         };
@@ -575,13 +619,17 @@ impl StmtParser {
         };
 
         parser.expect_keyword(KW::In, "expected 'in'")?;
-        let iter = ExprParser::parse(parser, Precedence::Lowest)?;
+        let iter_start = parser.start_span();
+        let iter_first = ExprParser::parse(parser, Precedence::Lowest)?;
+        let iter = Self::parse_comma_tuple_expr_until(parser, iter_start, iter_first, |parser| {
+            parser.check(TokenKind::Colon)
+        })?;
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
         let orelse = if parser.match_keyword(KW::Else) {
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            Self::parse_block(parser)?
+            Self::parse_suite(parser)?
         } else {
             Vec::new()
         };
@@ -609,7 +657,7 @@ impl StmtParser {
     fn parse_try(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
         parser.advance(); // consume 'try'
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
         let is_star = parser.check_keyword(KW::Except) && {
             // Peek to see if it's 'except*'
@@ -633,7 +681,7 @@ impl StmtParser {
             };
 
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            let handler_body = Self::parse_block(parser)?;
+            let handler_body = Self::parse_suite(parser)?;
 
             handlers.push(ExceptHandler {
                 typ,
@@ -645,14 +693,14 @@ impl StmtParser {
 
         let orelse = if parser.match_keyword(KW::Else) {
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            Self::parse_block(parser)?
+            Self::parse_suite(parser)?
         } else {
             Vec::new()
         };
 
         let finalbody = if parser.match_keyword(KW::Finally) {
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            Self::parse_block(parser)?
+            Self::parse_suite(parser)?
         } else {
             Vec::new()
         };
@@ -699,7 +747,7 @@ impl StmtParser {
         }
 
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
         let kind = if is_async {
             StmtKind::AsyncWith { items, body }
@@ -740,7 +788,7 @@ impl StmtParser {
         };
 
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
         let kind = if is_async {
             StmtKind::AsyncFunctionDef {
@@ -898,7 +946,7 @@ impl StmtParser {
         };
 
         parser.expect(TokenKind::Colon, "expected ':'")?;
-        let body = Self::parse_block(parser)?;
+        let body = Self::parse_suite(parser)?;
 
         Ok(Stmt::new(
             StmtKind::ClassDef {
@@ -973,7 +1021,9 @@ impl StmtParser {
 
     /// Parse a match statement.
     fn parse_match(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
-        parser.advance(); // consume 'match'
+        if !parser.match_identifier_value("match") {
+            return Err(parser.error_at_current("expected 'match'"));
+        }
 
         let subject = ExprParser::parse(parser, Precedence::Lowest)?;
         parser.expect(TokenKind::Colon, "expected ':'")?;
@@ -981,7 +1031,7 @@ impl StmtParser {
         parser.expect(TokenKind::Indent, "expected indent")?;
 
         let mut cases = Vec::new();
-        while parser.match_keyword(KW::Case) {
+        while parser.match_identifier_value("case") {
             let pattern = Self::parse_pattern(parser)?;
             let guard = if parser.match_keyword(KW::If) {
                 Some(ExprParser::parse(parser, Precedence::Lowest)?)
@@ -992,7 +1042,7 @@ impl StmtParser {
 
             // Support both single-line (case 1: x = 1) and block bodies
             let body = if parser.check(TokenKind::Newline) {
-                Self::parse_block(parser)?
+                Self::parse_suite(parser)?
             } else {
                 // Single-line body: parse a simple statement
                 let start = parser.start_span();
@@ -1188,11 +1238,21 @@ impl StmtParser {
                     span: parser.span_from(start),
                 })
             }
-            TokenKind::String(s) => {
-                parser.advance();
+            TokenKind::String(_) => {
+                let literal = parser.parse_concatenated_string_literal()?;
                 Ok(Pattern {
                     kind: PatternKind::MatchValue(Box::new(Expr::new(
-                        ExprKind::String(crate::ast::StringLiteral::new(s)),
+                        ExprKind::String(literal),
+                        parser.span_from(start),
+                    ))),
+                    span: parser.span_from(start),
+                })
+            }
+            TokenKind::Bytes(_) => {
+                let literal = parser.parse_concatenated_bytes_literal()?;
+                Ok(Pattern {
+                    kind: PatternKind::MatchValue(Box::new(Expr::new(
+                        ExprKind::Bytes(literal),
                         parser.span_from(start),
                     ))),
                     span: parser.span_from(start),
@@ -1484,8 +1544,20 @@ impl StmtParser {
         Ok(params)
     }
 
-    /// Parse a block of statements.
-    fn parse_block(parser: &mut Parser<'_>) -> PrismResult<Vec<Stmt>> {
+    /// Parse a suite following a compound statement colon.
+    ///
+    /// Python allows either an indented block or an inline suite of simple
+    /// statements separated by semicolons.
+    fn parse_suite(parser: &mut Parser<'_>) -> PrismResult<Vec<Stmt>> {
+        if parser.check(TokenKind::Newline) {
+            return Self::parse_indented_block(parser);
+        }
+
+        Self::parse_inline_suite(parser)
+    }
+
+    /// Parse an indented block of statements.
+    fn parse_indented_block(parser: &mut Parser<'_>) -> PrismResult<Vec<Stmt>> {
         parser.expect(TokenKind::Newline, "expected newline")?;
         parser.expect(TokenKind::Indent, "expected indent")?;
 
@@ -1499,6 +1571,27 @@ impl StmtParser {
         }
 
         parser.expect(TokenKind::Dedent, "expected dedent")?;
+        Ok(stmts)
+    }
+
+    /// Parse an inline suite of semicolon-separated simple statements.
+    fn parse_inline_suite(parser: &mut Parser<'_>) -> PrismResult<Vec<Stmt>> {
+        let mut stmts = Vec::new();
+
+        loop {
+            let stmt_start = parser.start_span();
+            stmts.push(Self::parse_simple_statement(parser, stmt_start)?);
+
+            if !parser.match_token(TokenKind::Semicolon) {
+                break;
+            }
+
+            if parser.check(TokenKind::Newline) || parser.check(TokenKind::Eof) {
+                break;
+            }
+        }
+
+        parser.match_token(TokenKind::Newline);
         Ok(stmts)
     }
 }
@@ -1611,9 +1704,61 @@ mod tests {
     }
 
     #[test]
+    fn test_match_pattern_supports_adjacent_string_literals() {
+        let stmt = parse_stmt("match x:\n    case \"meta\" \"class\":\n        pass\n");
+        match stmt.kind {
+            StmtKind::Match { cases, .. } => match &cases[0].pattern.kind {
+                PatternKind::MatchValue(expr) => match &expr.kind {
+                    ExprKind::String(literal) => assert_eq!(literal.value, "metaclass"),
+                    other => panic!("expected string literal pattern, got {:?}", other),
+                },
+                other => panic!("expected literal pattern, got {:?}", other),
+            },
+            other => panic!("expected match statement, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_from_import() {
         let stmt = parse_stmt("from os import path");
         assert!(matches!(stmt.kind, StmtKind::ImportFrom { .. }));
+    }
+
+    #[test]
+    fn test_from_import_allows_soft_keyword_module_segment() {
+        let stmt = parse_stmt("from unittest.case import TestCase");
+        match stmt.kind {
+            StmtKind::ImportFrom { module, names, .. } => {
+                assert_eq!(module.as_deref(), Some("unittest.case"));
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].name, "TestCase");
+            }
+            other => panic!("expected import-from, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_assignment_allows_type_identifier() {
+        let stmt = parse_stmt("value = type");
+        match stmt.kind {
+            StmtKind::Assign { value, .. } => match value.kind {
+                ExprKind::Name(name) => assert_eq!(name, "type"),
+                other => panic!("expected name expression, got {:?}", other),
+            },
+            other => panic!("expected assignment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_parses_with_soft_keyword_tokenization() {
+        let stmt = parse_stmt("type Point = int");
+        assert!(matches!(stmt.kind, StmtKind::TypeAlias { .. }));
+    }
+
+    #[test]
+    fn test_match_statement_parses_with_soft_keyword_tokenization() {
+        let module = parse("match x:\n    case 1:\n        pass").expect("parse failed");
+        assert!(matches!(module.body[0].kind, StmtKind::Match { .. }));
     }
 
     #[test]
@@ -1634,6 +1779,68 @@ mod tests {
     }
 
     #[test]
+    fn test_if_elif_nests_orelse_chain() {
+        let module =
+            parse("if x:\n    pass\nelif y:\n    pass\nelif z:\n    pass").expect("parse failed");
+
+        let StmtKind::If { orelse, .. } = &module.body[0].kind else {
+            panic!("expected top-level If");
+        };
+        assert_eq!(
+            orelse.len(),
+            1,
+            "elif chain should be represented as one nested If"
+        );
+
+        let StmtKind::If {
+            body: first_elif_body,
+            orelse: nested_orelse,
+            ..
+        } = &orelse[0].kind
+        else {
+            panic!("expected first elif to lower into nested If");
+        };
+        assert_eq!(first_elif_body.len(), 1);
+        assert_eq!(
+            nested_orelse.len(),
+            1,
+            "second elif should appear in the first elif's orelse"
+        );
+        assert!(
+            matches!(nested_orelse[0].kind, StmtKind::If { .. }),
+            "second elif should remain a nested If node"
+        );
+    }
+
+    #[test]
+    fn test_if_elif_else_attaches_to_innermost_nested_if() {
+        let module =
+            parse("if x:\n    pass\nelif y:\n    pass\nelse:\n    z = 1").expect("parse failed");
+
+        let StmtKind::If { orelse, .. } = &module.body[0].kind else {
+            panic!("expected top-level If");
+        };
+        assert_eq!(orelse.len(), 1, "single elif should still nest in orelse");
+
+        let StmtKind::If {
+            orelse: nested_orelse,
+            ..
+        } = &orelse[0].kind
+        else {
+            panic!("expected elif to lower into nested If");
+        };
+        assert_eq!(
+            nested_orelse.len(),
+            1,
+            "else body should attach to the innermost nested If"
+        );
+        assert!(
+            matches!(nested_orelse[0].kind, StmtKind::Assign { .. }),
+            "else body should remain ordinary statements, not sibling If nodes"
+        );
+    }
+
+    #[test]
     fn test_while() {
         let module = parse("while x:\n    pass").expect("parse failed");
         assert!(matches!(module.body[0].kind, StmtKind::While { .. }));
@@ -1646,15 +1853,53 @@ mod tests {
     }
 
     #[test]
+    fn test_for_accepts_implicit_tuple_iterable() {
+        let module = parse("for x in False, True:\n    pass").expect("parse failed");
+        let StmtKind::For { iter, .. } = &module.body[0].kind else {
+            panic!("expected For");
+        };
+
+        match &iter.kind {
+            ExprKind::Tuple(elements) => assert_eq!(elements.len(), 2),
+            other => panic!("expected tuple iterable, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_function_def() {
         let module = parse("def foo():\n    pass").expect("parse failed");
         assert!(matches!(module.body[0].kind, StmtKind::FunctionDef { .. }));
     }
 
     #[test]
+    fn test_inline_function_def() {
+        let module = parse("def foo(): pass").expect("parse failed");
+        let StmtKind::FunctionDef { body, .. } = &module.body[0].kind else {
+            panic!("expected FunctionDef");
+        };
+        assert_eq!(body.len(), 1);
+        assert!(matches!(body[0].kind, StmtKind::Pass));
+    }
+
+    #[test]
     fn test_class_def() {
         let module = parse("class Foo:\n    pass").expect("parse failed");
         assert!(matches!(module.body[0].kind, StmtKind::ClassDef { .. }));
+    }
+
+    #[test]
+    fn test_inline_class_method_def() {
+        let module = parse("class Foo:\n    def bar(self): pass").expect("parse failed");
+        let StmtKind::ClassDef { body, .. } = &module.body[0].kind else {
+            panic!("expected ClassDef");
+        };
+        assert_eq!(body.len(), 1);
+
+        let StmtKind::FunctionDef { body, .. } = &body[0].kind else {
+            panic!("expected FunctionDef in class body");
+        };
+        assert_eq!(body.len(), 1);
+        assert!(matches!(body[0].kind, StmtKind::Pass));
     }
 
     #[test]
@@ -1667,5 +1912,16 @@ mod tests {
     fn test_with() {
         let module = parse("with x:\n    pass").expect("parse failed");
         assert!(matches!(module.body[0].kind, StmtKind::With { .. }));
+    }
+
+    #[test]
+    fn test_inline_if_suite_with_semicolons() {
+        let module = parse("if x: pass; y = 1").expect("parse failed");
+        let StmtKind::If { body, .. } = &module.body[0].kind else {
+            panic!("expected If");
+        };
+        assert_eq!(body.len(), 2);
+        assert!(matches!(body[0].kind, StmtKind::Pass));
+        assert!(matches!(body[1].kind, StmtKind::Assign { .. }));
     }
 }

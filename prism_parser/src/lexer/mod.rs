@@ -25,7 +25,7 @@ use string::{StringPrefix, is_string_prefix, parse_string};
 use crate::token::{Token, TokenKind};
 
 /// The Python 3.12 lexer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Lexer<'src> {
     /// Character cursor.
     cursor: Cursor<'src>,

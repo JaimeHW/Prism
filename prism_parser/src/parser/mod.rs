@@ -6,7 +6,7 @@
 mod expr;
 mod stmt;
 
-use crate::ast::{Expr, Module, Stmt};
+use crate::ast::{Expr, Module, Stmt, StringLiteral};
 use crate::lexer::Lexer;
 use crate::token::{Keyword, Token, TokenKind};
 use prism_core::{PrismError, PrismResult, Span};
@@ -19,6 +19,7 @@ pub use stmt::StmtParser;
 // =============================================================================
 
 /// Python 3.12 parser.
+#[derive(Clone)]
 pub struct Parser<'src> {
     /// Lexer for tokenization.
     lexer: Lexer<'src>,
@@ -122,6 +123,12 @@ impl<'src> Parser<'src> {
         matches!(&self.current.kind, TokenKind::Keyword(k) if *k == kw)
     }
 
+    /// Check if the current token is the given identifier text.
+    #[inline]
+    pub fn check_identifier_value(&self, value: &str) -> bool {
+        matches!(&self.current.kind, TokenKind::Ident(name) if name == value)
+    }
+
     /// Consume the current token if it matches, otherwise return false.
     pub fn match_token(&mut self, kind: TokenKind) -> bool {
         if self.check(kind) {
@@ -135,6 +142,16 @@ impl<'src> Parser<'src> {
     /// Consume the current token if it's the given keyword.
     pub fn match_keyword(&mut self, kw: Keyword) -> bool {
         if self.check_keyword(kw) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume the current token if it is the given identifier text.
+    pub fn match_identifier_value(&mut self, value: &str) -> bool {
+        if self.check_identifier_value(value) {
             self.advance();
             true
         } else {
@@ -178,6 +195,61 @@ impl<'src> Parser<'src> {
         while self.check(TokenKind::Newline) {
             self.advance();
         }
+    }
+
+    /// Parse one or more adjacent string literal tokens into a single literal.
+    ///
+    /// Python performs compile-time concatenation for adjacent string literals.
+    /// This helper also rejects mixed string/bytes literal groups with the same
+    /// syntax error CPython reports for that construct.
+    pub(crate) fn parse_concatenated_string_literal(&mut self) -> PrismResult<StringLiteral> {
+        let mut value = match self.current.kind.clone() {
+            TokenKind::String(value) => value,
+            _ => unreachable!("parse_concatenated_string_literal requires a string token"),
+        };
+        self.advance();
+
+        loop {
+            match self.current.kind.clone() {
+                TokenKind::String(segment) => {
+                    value.push_str(&segment);
+                    self.advance();
+                }
+                TokenKind::Bytes(_) => {
+                    return Err(self.error_at_current("cannot mix bytes and nonbytes literals"));
+                }
+                _ => break,
+            }
+        }
+
+        Ok(StringLiteral::new(value))
+    }
+
+    /// Parse one or more adjacent bytes literal tokens into a single literal.
+    ///
+    /// Python performs compile-time concatenation for adjacent bytes literals.
+    /// Mixed string/bytes groups are rejected as syntax errors.
+    pub(crate) fn parse_concatenated_bytes_literal(&mut self) -> PrismResult<Vec<u8>> {
+        let mut value = match self.current.kind.clone() {
+            TokenKind::Bytes(value) => value,
+            _ => unreachable!("parse_concatenated_bytes_literal requires a bytes token"),
+        };
+        self.advance();
+
+        loop {
+            match self.current.kind.clone() {
+                TokenKind::Bytes(segment) => {
+                    value.extend(segment);
+                    self.advance();
+                }
+                TokenKind::String(_) => {
+                    return Err(self.error_at_current("cannot mix bytes and nonbytes literals"));
+                }
+                _ => break,
+            }
+        }
+
+        Ok(value)
     }
 
     /// Check if at end of file.
@@ -246,10 +318,13 @@ impl<'src> Parser<'src> {
                     | Keyword::Import
                     | Keyword::From
                     | Keyword::Try
-                    | Keyword::With
-                    | Keyword::Match => return,
+                    | Keyword::With => return,
                     _ => {}
                 }
+            }
+
+            if self.check_identifier_value("match") || self.check_identifier_value("type") {
+                return;
             }
 
             self.advance();
