@@ -4,8 +4,8 @@ use std::path::Path;
 
 use object::write::{Object, Relocation, SectionId, Symbol, SymbolId, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, RelocationEncoding, RelocationFlags,
-    RelocationKind, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+    Architecture, BinaryFormat, Endianness, RelocationEncoding, RelocationFlags, RelocationKind,
+    SectionKind, SymbolFlags, SymbolKind, SymbolScope,
 };
 use prism_core::aot::{
     AOT_IMPORT_FROM_SYMBOL, AOT_IMPORT_MODULE_SYMBOL, AOT_NATIVE_INIT_TABLE_END_SYMBOL,
@@ -173,7 +173,11 @@ fn emit_windows_coff_build_plan(
     let mut object = Object::new(BinaryFormat::Coff, architecture, Endianness::Little);
     emit_bundle_section(&mut object, bundle)?;
 
-    if plan.modules.iter().any(|module| module.native_init.is_some()) {
+    if plan
+        .modules
+        .iter()
+        .any(|module| module.native_init.is_some())
+    {
         match architecture {
             Architecture::X86_64 => emit_x86_64_native_init_stubs(&mut object, plan)?,
             _ => {
@@ -273,13 +277,8 @@ fn emit_native_init_stub(
 ) -> Result<SymbolId, AotError> {
     let mut operations = Vec::with_capacity(native_init.operations.len());
     for (index, operation) in native_init.operations.iter().enumerate() {
-        let descriptor_symbol = emit_operation_descriptor(
-            object,
-            state,
-            native_init,
-            operation,
-            index,
-        )?;
+        let descriptor_symbol =
+            emit_operation_descriptor(object, state, native_init, operation, index)?;
         let helper_symbol = helper_symbol_id(object, state, operation_helper_symbol(operation));
         operations.push((descriptor_symbol, helper_symbol));
     }
@@ -299,14 +298,13 @@ fn emit_native_init_stub(
             code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x20]);
             code.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x28]);
 
-            let lea_disp_offset = u64::try_from(code.len() + 3).map_err(|_| {
-                AotError::InvalidArtifact {
+            let lea_disp_offset =
+                u64::try_from(code.len() + 3).map_err(|_| AotError::InvalidArtifact {
                     message: format!(
                         "native init stub '{}' exceeds supported code size",
                         native_init.symbol_name
                     ),
-                }
-            })?;
+                })?;
             code.extend_from_slice(&[0x4C, 0x8D, 0x05, 0, 0, 0, 0]);
             relocations.push(PendingRelocation {
                 offset: lea_disp_offset,
@@ -317,14 +315,13 @@ fn emit_native_init_stub(
                 size: 32,
             });
 
-            let call_disp_offset = u64::try_from(code.len() + 1).map_err(|_| {
-                AotError::InvalidArtifact {
+            let call_disp_offset =
+                u64::try_from(code.len() + 1).map_err(|_| AotError::InvalidArtifact {
                     message: format!(
                         "native init stub '{}' exceeds supported code size",
                         native_init.symbol_name
                     ),
-                }
-            })?;
+                })?;
             code.extend_from_slice(&[0xE8, 0, 0, 0, 0]);
             relocations.push(PendingRelocation {
                 offset: call_disp_offset,
@@ -387,11 +384,12 @@ fn emit_native_init_registry(
     }
 
     let entry_size = size_of::<AotNativeModuleInitEntry>();
-    let total_size = entry_size
-        .checked_mul(entries.len())
-        .ok_or_else(|| AotError::InvalidArtifact {
-            message: "native init registry exceeds supported size".to_string(),
-        })?;
+    let total_size =
+        entry_size
+            .checked_mul(entries.len())
+            .ok_or_else(|| AotError::InvalidArtifact {
+                message: "native init registry exceeds supported size".to_string(),
+            })?;
     let mut bytes = vec![0_u8; total_size];
     let mut relocations = Vec::new();
 
@@ -634,7 +632,11 @@ fn encode_operand(
                 NativeImmediate::ValueBits(bits) => {
                     bytes[immediate_base + offset_of!(AotImmediate, kind)] =
                         AotImmediateKind::ValueBits as u8;
-                    write_u64(bytes, immediate_base + offset_of!(AotImmediate, bits), *bits);
+                    write_u64(
+                        bytes,
+                        immediate_base + offset_of!(AotImmediate, bits),
+                        *bits,
+                    );
                 }
                 NativeImmediate::String(string) => {
                     bytes[immediate_base + offset_of!(AotImmediate, kind)] =
@@ -867,7 +869,12 @@ mod tests {
 
     fn symbol_names(file: &object::File<'_>) -> Vec<(SymbolIndex, String)> {
         file.symbols()
-            .filter_map(|symbol| symbol.name().ok().map(|name| (symbol.index(), name.to_string())))
+            .filter_map(|symbol| {
+                symbol
+                    .name()
+                    .ok()
+                    .map(|name| (symbol.index(), name.to_string()))
+            })
             .collect()
     }
 
@@ -934,19 +941,23 @@ mod tests {
         let file = object::File::parse(artifact.bytes.as_slice()).expect("COFF parse should work");
         let names = symbol_names(&file);
         assert!(
-            names.iter()
+            names
+                .iter()
                 .any(|(_, name)| name == AOT_NATIVE_INIT_TABLE_START_SYMBOL)
         );
         assert!(
-            names.iter()
+            names
+                .iter()
                 .any(|(_, name)| name == AOT_NATIVE_INIT_TABLE_END_SYMBOL)
         );
         assert!(
-            names.iter()
+            names
+                .iter()
                 .any(|(_, name)| name == &native_init_symbol("__main__"))
         );
         assert!(
-            names.iter()
+            names
+                .iter()
                 .any(|(_, name)| name == &native_init_symbol("helper"))
         );
 

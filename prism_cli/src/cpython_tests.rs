@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_WORKDIR_COMPONENT_LEN: usize = 80;
+const BOOTSTRAP_SCRIPT_NAME: &str = "bootstrap.py";
 const SPLIT_TEST_DIRS: &[&str] = &[
     "test_asyncio",
     "test_concurrent_futures",
@@ -315,7 +316,7 @@ impl TestExecutor for SubprocessPrismExecutor {
         let work_dir = config.work_root.join(sanitize_path_component(&test.name));
         recreate_directory(&work_dir)?;
 
-        let bootstrap_path = work_dir.join("bootstrap.py");
+        let bootstrap_path = work_dir.join(BOOTSTRAP_SCRIPT_NAME);
         let stdout_path = work_dir.join("stdout.txt");
         let stderr_path = work_dir.join("stderr.txt");
 
@@ -333,7 +334,7 @@ impl TestExecutor for SubprocessPrismExecutor {
         let mut command = Command::new(&config.prism_command.executable);
         command.args(&config.prism_command.prefix_args);
         command.arg("-B");
-        command.arg(&bootstrap_path);
+        command.arg(BOOTSTRAP_SCRIPT_NAME);
         command.current_dir(&work_dir);
         command.stdin(Stdio::null());
         command.stdout(Stdio::from(stdout_file));
@@ -343,7 +344,7 @@ impl TestExecutor for SubprocessPrismExecutor {
         let command_line = describe_command(
             &config.prism_command.executable,
             &config.prism_command.prefix_args,
-            &["-B".to_string(), bootstrap_path.display().to_string()],
+            &["-B".to_string(), BOOTSTRAP_SCRIPT_NAME.to_string()],
         );
 
         let start = Instant::now();
@@ -788,15 +789,19 @@ fn expand_requested_test(
 
 fn render_bootstrap_script(module_name: &str, runner: RunnerMode, verbose: bool) -> String {
     let verbosity = if verbose { 2 } else { 1 };
-    let import_stmt = format!("import {module_name} as module");
+    let import_stmt = format!(
+        "import unittest\ntry:\n    module = __import__('{module_name}', fromlist=['*'])\nexcept unittest.SkipTest as skip:\n    @unittest.skip(str(skip))\n    class _PrismModuleSkipped(unittest.TestCase):\n        def test_module_skipped(self):\n            pass\n    _prism_module_skipped_suite = unittest.defaultTestLoader.loadTestsFromTestCase(_PrismModuleSkipped)\nelse:\n    _prism_module_skipped_suite = None"
+    );
 
     match runner {
-        RunnerMode::Import => format!("{import_stmt}\n"),
+        RunnerMode::Import => {
+            format!("__import__('{module_name}', fromlist=['*'])\n")
+        }
         RunnerMode::TestMain => format!(
-            "{import_stmt}\nif hasattr(module, 'test_main'):\n    module.test_main()\nelse:\n    raise SystemExit(\"test module does not define test_main\")\n"
+            "{import_stmt}\nif _prism_module_skipped_suite is not None:\n    result = unittest.TextTestRunner(verbosity={verbosity}).run(_prism_module_skipped_suite)\n    if not result.wasSuccessful():\n        raise SystemExit(1)\nelif hasattr(module, 'test_main'):\n    try:\n        module.test_main()\n    except unittest.SkipTest as skip:\n        @unittest.skip(str(skip))\n        class _PrismModuleSkipped(unittest.TestCase):\n            def test_module_skipped(self):\n                pass\n        result = unittest.TextTestRunner(verbosity={verbosity}).run(unittest.defaultTestLoader.loadTestsFromTestCase(_PrismModuleSkipped))\n        if not result.wasSuccessful():\n            raise SystemExit(1)\nelse:\n    raise SystemExit(\"test module does not define test_main\")\n"
         ),
         RunnerMode::Suite => format!(
-            "{import_stmt}\nif hasattr(module, 'test_main'):\n    module.test_main()\nelse:\n    import unittest\n    suite = unittest.defaultTestLoader.loadTestsFromModule(module)\n    result = unittest.TextTestRunner(verbosity={verbosity}).run(suite)\n    if not result.wasSuccessful():\n        raise SystemExit(1)\n"
+            "{import_stmt}\nif _prism_module_skipped_suite is not None:\n    suite = _prism_module_skipped_suite\nelif hasattr(module, 'test_main'):\n    try:\n        module.test_main()\n    except unittest.SkipTest as skip:\n        @unittest.skip(str(skip))\n        class _PrismModuleSkipped(unittest.TestCase):\n            def test_module_skipped(self):\n                pass\n        suite = unittest.defaultTestLoader.loadTestsFromTestCase(_PrismModuleSkipped)\n    else:\n        raise SystemExit(0)\nelse:\n    suite = unittest.defaultTestLoader.loadTestsFromModule(module)\nresult = unittest.TextTestRunner(verbosity={verbosity}).run(suite)\nif not result.wasSuccessful():\n    raise SystemExit(1)\n"
         ),
     }
 }
@@ -831,9 +836,7 @@ fn wait_for_child(
                     return Ok(ChildOutcome::Completed(status));
                 }
                 if start.elapsed() >= timeout {
-                    child.kill().map_err(|source| {
-                        HarnessError::io("failed to terminate timed out test", source)
-                    })?;
+                    terminate_child_process(child)?;
                     let _ = child.wait();
                     return Ok(ChildOutcome::TimedOut);
                 }
@@ -841,6 +844,45 @@ fn wait_for_child(
             }
         }
     }
+}
+
+fn terminate_child_process(child: &mut std::process::Child) -> Result<(), HarnessError> {
+    if child
+        .try_wait()
+        .map_err(|source| HarnessError::io("failed to poll Prism test process", source))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        match Command::new("taskkill")
+            .args(["/T", "/F", "/PID", pid.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) | Err(_) => {
+                if child
+                    .try_wait()
+                    .map_err(|source| {
+                        HarnessError::io("failed to poll Prism test process", source)
+                    })?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    child
+        .kill()
+        .map_err(|source| HarnessError::io("failed to terminate timed out test", source))
 }
 
 fn read_optional_text(path: &Path) -> Result<String, HarnessError> {
@@ -1190,9 +1232,27 @@ mod tests {
                 duration_ms: 10,
                 stdout: stdout.to_string(),
                 stderr: stderr.to_string(),
-                command: vec!["prism".to_string(), "bootstrap.py".to_string()],
+                command: vec!["prism".to_string(), BOOTSTRAP_SCRIPT_NAME.to_string()],
                 failure_summary: summarize_failure(status, stdout, stderr),
             })
+        }
+    }
+
+    struct CurrentDirGuard {
+        previous: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn set_to(path: &Path) -> Self {
+            let previous = std::env::current_dir().expect("cwd should resolve");
+            std::env::set_current_dir(path).expect("cwd should update");
+            Self { previous }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
         }
     }
 
@@ -1241,16 +1301,20 @@ mod tests {
     #[test]
     fn test_render_bootstrap_import_mode_is_minimal() {
         let script = render_bootstrap_script("test.test_math", RunnerMode::Import, false);
-        assert!(script.contains("import test.test_math as module"));
-        assert!(!script.contains("unittest"));
+        assert!(script.contains("__import__('test.test_math', fromlist=['*'])"));
+        assert!(!script.contains("import unittest"));
+        assert!(!script.contains("SkipTest"));
     }
 
     #[test]
     fn test_render_bootstrap_suite_mode_uses_unittest() {
         let script = render_bootstrap_script("test.test_math", RunnerMode::Suite, true);
         assert!(script.contains("import unittest"));
+        assert!(!script.contains("import importlib"));
         assert!(script.contains("verbosity=2"));
         assert!(script.contains("test_main"));
+        assert!(script.contains("except unittest.SkipTest as skip"));
+        assert!(script.contains("_PrismModuleSkipped"));
     }
 
     #[test]
@@ -1456,6 +1520,82 @@ mod tests {
             serde_json::from_str(&json).expect("report should be valid JSON");
         assert_eq!(parsed["selected"], 1);
         assert_eq!(parsed["passed"], 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_terminate_child_process_accepts_completed_child() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .expect("child process should spawn");
+        let _ = child.wait().expect("child should exit");
+
+        terminate_child_process(&mut child).expect("completed child should be accepted");
+    }
+
+    #[test]
+    fn test_subprocess_executor_uses_workdir_relative_bootstrap_argument() {
+        static CURRENT_DIR_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        let _lock = CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("cwd lock should succeed");
+
+        let temp = TestTempDir::new();
+        let _cwd_guard = CurrentDirGuard::set_to(&temp.path);
+
+        let lib_dir = temp.path.join("Lib");
+        let test_dir = lib_dir.join("test");
+        fs::create_dir_all(&test_dir).expect("test dir should be created");
+
+        let prism_script = temp.path.join("fake_prism.cmd");
+        write_file(
+            &prism_script,
+            "@echo off\r\nif /I not \"%~1\"==\"-B\" exit /b 11\r\nif /I not \"%~2\"==\"bootstrap.py\" exit /b 12\r\nif not exist \"%~2\" exit /b 13\r\nexit /b 0\r\n",
+        );
+
+        let command_shell = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+
+        let config = HarnessConfig {
+            prism_command: PrismCommand {
+                executable: command_shell,
+                prefix_args: vec!["/c".to_string(), prism_script.display().to_string()],
+            },
+            lib_dir: lib_dir.clone(),
+            test_dir: test_dir.clone(),
+            search_root: lib_dir,
+            work_root: PathBuf::from("relative-work"),
+            prefix_test_package: true,
+            runner: RunnerMode::Suite,
+            timeout: Some(Duration::from_secs(5)),
+            fail_fast: false,
+            verbose: false,
+            quiet: true,
+            json_report: None,
+        };
+
+        let test = DiscoveredTest {
+            name: "test_keyword".to_string(),
+            module: "test.test_keyword".to_string(),
+            path: test_dir.join("test_keyword.py"),
+        };
+
+        let result = SubprocessPrismExecutor
+            .run(&test, &config)
+            .expect("subprocess executor should complete");
+
+        assert_eq!(result.status, TestStatus::Passed);
+        assert_eq!(
+            result.command.last().map(String::as_str),
+            Some(BOOTSTRAP_SCRIPT_NAME)
+        );
+        assert!(
+            result.work_dir.join(BOOTSTRAP_SCRIPT_NAME).is_file(),
+            "bootstrap script should be created inside the per-test work dir"
+        );
     }
 
     #[test]

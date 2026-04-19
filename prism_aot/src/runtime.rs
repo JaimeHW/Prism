@@ -47,7 +47,9 @@ pub struct RuntimeFrozenBundle {
 impl RuntimeFrozenBundle {
     /// Look up a decoded module by canonical name.
     pub fn module(&self, name: &str) -> Option<&RuntimeFrozenModule> {
-        self.modules.iter().find(|module| module.name.as_ref() == name)
+        self.modules
+            .iter()
+            .find(|module| module.name.as_ref() == name)
     }
 
     /// Resolve the decoded entry module.
@@ -111,18 +113,23 @@ impl CodeImage {
             .constants
             .iter()
             .enumerate()
-            .map(|(index, constant)| constant.to_value(&nested_code_objects).map_err(|err| {
-                AotError::InvalidArtifact {
-                    message: format!(
-                        "failed to decode constant {} for '{}': {}",
-                        index, self.qualname, err
-                    ),
-                }
-            }))
+            .map(|(index, constant)| {
+                constant
+                    .to_value(&nested_code_objects)
+                    .map_err(|err| AotError::InvalidArtifact {
+                        message: format!(
+                            "failed to decode constant {} for '{}': {}",
+                            index, self.qualname, err
+                        ),
+                    })
+            })
             .collect::<Result<Vec<_>, AotError>>()?;
 
         let flags = CodeFlags::from_bits(self.flags).ok_or_else(|| AotError::InvalidArtifact {
-            message: format!("invalid code flags {:#010x} in '{}'", self.flags, self.qualname),
+            message: format!(
+                "invalid code flags {:#010x} in '{}'",
+                self.flags, self.qualname
+            ),
         })?;
 
         Ok(CodeObject {
@@ -180,9 +187,14 @@ impl ConstantImage {
         match self {
             ConstantImage::None => Ok(Value::none()),
             ConstantImage::Bool(value) => Ok(Value::bool(*value)),
-            ConstantImage::Int(value) => Value::int(*value).ok_or_else(|| AotError::InvalidArtifact {
-                message: format!("integer constant {} does not fit Prism immediate format", value),
-            }),
+            ConstantImage::Int(value) => {
+                Value::int(*value).ok_or_else(|| AotError::InvalidArtifact {
+                    message: format!(
+                        "integer constant {} does not fit Prism immediate format",
+                        value
+                    ),
+                })
+            }
             ConstantImage::FloatBits(bits) => Ok(Value::float(f64::from_bits(*bits))),
             ConstantImage::String(value) => Ok(Value::string(intern(value))),
             ConstantImage::NestedCode(index) => {
@@ -295,7 +307,10 @@ mod tests {
 
         assert_eq!(code.qualname.as_ref(), "<module>");
         assert_eq!(code.filename.as_ref(), image.filename.as_str());
-        assert_eq!(code.nested_code_objects.len(), image.nested_code_objects.len());
+        assert_eq!(
+            code.nested_code_objects.len(),
+            image.nested_code_objects.len()
+        );
         assert!(code.constants.iter().any(|value| value.is_string()));
         assert!(code.constants.iter().any(|value| value.is_object()));
     }

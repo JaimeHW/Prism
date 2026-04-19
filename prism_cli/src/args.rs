@@ -416,6 +416,7 @@ Options (and corresponding environment variables):
 -V     : print the Prism version number and exit (also --version)
 -W arg : warning control; arg is action:message:category:module:lineno
 -X opt : set implementation-specific option
+         supported: jit=on|off, nojit, max-steps=N
 file   : program read from script file
 -      : program read from stdin (default; interactive mode if a tty)
 arg ...: arguments passed to program in sys.argv[1:]

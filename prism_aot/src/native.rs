@@ -143,10 +143,14 @@ fn lower_stmt(
         StmtKind::Pass | StmtKind::Global(_) => Ok(()),
         StmtKind::Import(aliases) => {
             for alias in aliases {
-                let target = alias
-                    .asname
-                    .clone()
-                    .unwrap_or_else(|| alias.name.split('.').next().unwrap_or(&alias.name).to_string());
+                let target = alias.asname.clone().unwrap_or_else(|| {
+                    alias
+                        .name
+                        .split('.')
+                        .next()
+                        .unwrap_or(&alias.name)
+                        .to_string()
+                });
                 let binding = if alias.asname.is_none() && alias.name.contains('.') {
                     AotImportBinding::TopLevel
                 } else {

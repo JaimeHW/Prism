@@ -49,6 +49,9 @@ pub struct RuntimeConfig {
     /// Implementation-specific `-X` options.
     pub x_options: Vec<String>,
 
+    /// Deterministic interpreter step budget (`-X max-steps=N`).
+    pub execution_step_limit: Option<u64>,
+
     /// Parser debugging mode (`-d`).
     pub debug: bool,
 
@@ -113,6 +116,7 @@ impl RuntimeConfig {
             no_site: args.no_site,
             warnings: args.warnings.clone(),
             x_options: args.x_options.clone(),
+            execution_step_limit: Self::parse_execution_step_limit(&args.x_options),
             debug: args.debug,
             hash_seed,
         }
@@ -135,6 +139,22 @@ impl RuntimeConfig {
         }
 
         enabled
+    }
+
+    fn parse_execution_step_limit(x_options: &[String]) -> Option<u64> {
+        let mut limit = None;
+
+        for opt in x_options {
+            let value = opt
+                .strip_prefix("max-steps=")
+                .or_else(|| opt.strip_prefix("max_steps="));
+
+            if let Some(raw) = value {
+                limit = raw.parse::<u64>().ok().filter(|parsed| *parsed > 0);
+            }
+        }
+
+        limit
     }
 
     /// Check if an environment variable is set to a non-empty, truthy value.
@@ -199,6 +219,7 @@ mod tests {
         assert!(!config.no_site);
         assert!(config.warnings.is_empty());
         assert!(config.x_options.is_empty());
+        assert_eq!(config.execution_step_limit, None);
     }
 
     #[test]
@@ -284,6 +305,37 @@ mod tests {
         };
         let config = RuntimeConfig::from_args(&args);
         assert_eq!(config.x_options, vec!["utf8", "dev"]);
+    }
+
+    #[test]
+    fn test_config_parses_execution_step_limit_from_x_options() {
+        let args = PrismArgs {
+            x_options: vec!["max-steps=4096".to_string(), "dev".to_string()],
+            ..Default::default()
+        };
+        let config = RuntimeConfig::from_args(&args);
+        assert_eq!(config.execution_step_limit, Some(4096));
+    }
+
+    #[test]
+    fn test_config_ignores_invalid_execution_step_limit_values() {
+        let zero_args = PrismArgs {
+            x_options: vec!["max-steps=0".to_string()],
+            ..Default::default()
+        };
+        let invalid_args = PrismArgs {
+            x_options: vec!["max_steps=abc".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RuntimeConfig::from_args(&zero_args).execution_step_limit,
+            None
+        );
+        assert_eq!(
+            RuntimeConfig::from_args(&invalid_args).execution_step_limit,
+            None
+        );
     }
 
     #[test]
