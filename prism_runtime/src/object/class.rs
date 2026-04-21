@@ -33,11 +33,14 @@ use crate::object::registry::global_registry;
 use crate::object::shape::Shape;
 use crate::object::type_obj::{TypeId, TypeSlots};
 use crate::object::{ObjectHeader, PyObject};
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // =============================================================================
 // Global Type ID Counter
@@ -117,11 +120,13 @@ pub enum InstantiationHint {
 
 /// Class attribute dictionary (methods, class variables).
 ///
-/// Uses FxHashMap for fast lookup with string keys.
-/// Values are boxed Python objects (methods, descriptors, etc.).
-#[derive(Debug, Default)]
+/// Reads use an immutable published snapshot so steady-state lookup stays
+/// lock-free. Writers serialize through a small mutex and publish a new
+/// snapshot after each mutation.
+#[derive(Debug)]
 pub struct ClassDict {
-    entries: RwLock<ClassDictEntries>,
+    entries: ArcSwap<ClassDictEntries>,
+    write_lock: Mutex<()>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -134,55 +139,60 @@ impl ClassDict {
     /// Create a new empty class dict.
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(ClassDictEntries::default()),
+            entries: ArcSwap::from(Arc::new(ClassDictEntries::default())),
+            write_lock: Mutex::new(()),
         }
     }
 
     /// Get an attribute.
     #[inline]
     pub fn get(&self, name: &InternedString) -> Option<Value> {
-        self.entries.read().unwrap().attrs.get(name).copied()
+        self.entries.load().attrs.get(name).copied()
     }
 
     /// Set an attribute.
     #[inline]
     pub fn set(&self, name: InternedString, value: Value) {
-        let mut entries = self.entries.write().unwrap();
+        let _guard = self.write_lock.lock();
+        let mut entries = (*self.entries.load_full()).clone();
         if entries.attrs.insert(name.clone(), value).is_none() {
             entries.order.push(name);
         }
+        self.entries.store(Arc::new(entries));
     }
 
     /// Delete an attribute.
     #[inline]
     pub fn delete(&self, name: &InternedString) -> Option<Value> {
-        let mut entries = self.entries.write().unwrap();
+        let _guard = self.write_lock.lock();
+        let mut entries = (*self.entries.load_full()).clone();
         let removed = entries.attrs.remove(name);
         if removed.is_some() {
             entries.order.retain(|existing| existing != name);
         }
+        self.entries.store(Arc::new(entries));
         removed
     }
 
     /// Check if attribute exists.
     #[inline]
     pub fn contains(&self, name: &InternedString) -> bool {
-        self.entries.read().unwrap().attrs.contains_key(name)
+        self.entries.load().attrs.contains_key(name)
     }
 
     /// Get all attribute names.
     pub fn keys(&self) -> Vec<InternedString> {
-        self.entries.read().unwrap().order.clone()
+        self.entries.load().order.clone()
     }
 
     /// Number of attributes.
     pub fn len(&self) -> usize {
-        self.entries.read().unwrap().attrs.len()
+        self.entries.load().attrs.len()
     }
 
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.read().unwrap().attrs.is_empty()
+        self.entries.load().attrs.is_empty()
     }
 
     /// Iterate over all attributes.
@@ -190,7 +200,7 @@ impl ClassDict {
     where
         F: FnMut(&InternedString, Value),
     {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.load_full();
         for name in &entries.order {
             let value = entries
                 .attrs
@@ -200,12 +210,18 @@ impl ClassDict {
             f(name, value);
         }
     }
+
+    #[inline]
+    fn snapshot(&self) -> Arc<ClassDictEntries> {
+        self.entries.load_full()
+    }
 }
 
 impl Clone for ClassDict {
     fn clone(&self) -> Self {
         Self {
-            entries: RwLock::new(self.entries.read().unwrap().clone()),
+            entries: ArcSwap::from(Arc::new((*self.entries.load_full()).clone())),
+            write_lock: Mutex::new(()),
         }
     }
 }
@@ -231,6 +247,11 @@ pub struct MethodSlot {
     pub defining_class: ClassId,
     /// Index in MRO where method was found.
     pub mro_index: u16,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ClassMethodLayout {
+    methods: FxHashMap<InternedString, MethodSlot>,
 }
 
 // =============================================================================
@@ -277,6 +298,12 @@ pub struct PyClassObject {
     /// Class attributes (methods, class variables).
     dict: ClassDict,
 
+    /// Published user-defined method layout for O(1) steady-state lookup.
+    method_layout: ArcSwap<ClassMethodLayout>,
+
+    /// Monotonic version tag for method/layout-dependent caches.
+    method_layout_version: AtomicU64,
+
     /// Type slots for special method dispatch.
     slots: TypeSlots,
 
@@ -321,6 +348,8 @@ impl PyClassObject {
             flags: ClassFlags::empty(),
             metaclass: Value::none(),
             dict: ClassDict::new(),
+            method_layout: ArcSwap::from(Arc::new(ClassMethodLayout::default())),
+            method_layout_version: AtomicU64::new(1),
             slots: TypeSlots::default(),
             instance_shape: Shape::empty(),
             slot_names: None,
@@ -346,6 +375,8 @@ impl PyClassObject {
             flags: ClassFlags::empty(),
             metaclass: Value::none(),
             dict: ClassDict::new(),
+            method_layout: ArcSwap::from(Arc::new(ClassMethodLayout::default())),
+            method_layout_version: AtomicU64::new(1),
             slots: TypeSlots::default(),
             instance_shape: Shape::empty(),
             slot_names: None,
@@ -418,6 +449,12 @@ impl PyClassObject {
         &self.instance_shape
     }
 
+    /// Get the published method-layout version for cache validation.
+    #[inline]
+    pub fn method_layout_version(&self) -> u64 {
+        self.method_layout_version.load(Ordering::Acquire)
+    }
+
     // =========================================================================
     // Attribute Access
     // =========================================================================
@@ -432,6 +469,7 @@ impl PyClassObject {
     #[inline]
     pub fn set_attr(&self, name: InternedString, value: Value) {
         self.dict.set(name, value);
+        self.refresh_registered_method_layouts();
     }
 
     /// Set the metaclass value for this class.
@@ -443,7 +481,11 @@ impl PyClassObject {
     /// Delete a class attribute.
     #[inline]
     pub fn del_attr(&self, name: &InternedString) -> Option<Value> {
-        self.dict.delete(name)
+        let removed = self.dict.delete(name);
+        if removed.is_some() {
+            self.refresh_registered_method_layouts();
+        }
+        removed
     }
 
     /// Check if class has an attribute.
@@ -460,9 +502,26 @@ impl PyClassObject {
         self.dict.for_each(f);
     }
 
+    fn refresh_registered_method_layouts(&self) {
+        if self.type_id.raw() < TypeId::FIRST_USER_TYPE {
+            return;
+        }
+
+        crate::object::type_builtins::refresh_global_class_layouts(self.type_id);
+    }
+
     // =========================================================================
     // Method Lookup (MRO walk)
     // =========================================================================
+
+    /// Look up a user-defined method through the published class layout.
+    ///
+    /// This is the hot path used by the VM once classes are registered in the
+    /// global heap-type registry.
+    #[inline]
+    pub fn lookup_method_published(&self, name: &InternedString) -> Option<MethodSlot> {
+        self.method_layout.load().methods.get(name).cloned()
+    }
 
     /// Look up a method by walking the MRO.
     ///
@@ -506,6 +565,70 @@ impl PyClassObject {
         }
 
         None
+    }
+
+    /// Rebuild the published user-defined method layout for this class.
+    pub(crate) fn rebuild_method_layout<F>(&self, class_registry: F)
+    where
+        F: Fn(ClassId) -> Option<Arc<PyClassObject>>,
+    {
+        let direct = self.dict.snapshot();
+        let mut methods = FxHashMap::default();
+        methods.reserve(direct.attrs.len());
+
+        for name in &direct.order {
+            let value = direct
+                .attrs
+                .get(name)
+                .copied()
+                .expect("class dict order must stay in sync with attributes");
+            methods.insert(
+                name.clone(),
+                MethodSlot {
+                    value,
+                    defining_class: self.class_id(),
+                    mro_index: 0,
+                },
+            );
+        }
+
+        for (mro_index, &class_id) in self.mro.iter().enumerate().skip(1) {
+            if class_id.0 < TypeId::FIRST_USER_TYPE {
+                continue;
+            }
+
+            let Some(parent) = class_registry(class_id) else {
+                continue;
+            };
+            let parent_entries = parent.dict.snapshot();
+            for name in &parent_entries.order {
+                if methods.contains_key(name) {
+                    continue;
+                }
+
+                let value = parent_entries
+                    .attrs
+                    .get(name)
+                    .copied()
+                    .expect("class dict order must stay in sync with attributes");
+                methods.insert(
+                    name.clone(),
+                    MethodSlot {
+                        value,
+                        defining_class: class_id,
+                        mro_index: mro_index as u16,
+                    },
+                );
+            }
+        }
+
+        self.method_layout
+            .store(Arc::new(ClassMethodLayout { methods }));
+    }
+
+    #[inline]
+    pub(crate) fn bump_method_layout_version(&self) {
+        self.method_layout_version.fetch_add(1, Ordering::AcqRel);
     }
 
     // =========================================================================
@@ -796,7 +919,7 @@ mod tests {
         use std::sync::Arc;
 
         // Create parent class with a method
-        let mut parent = PyClassObject::new_simple(intern("Parent"));
+        let parent = PyClassObject::new_simple(intern("Parent"));
         let method_name = intern("greet");
         parent.set_attr(method_name.clone(), Value::int_unchecked(100));
         let parent_id = parent.class_id();
@@ -831,7 +954,7 @@ mod tests {
         use std::sync::Arc;
 
         // Create parent class with a method
-        let mut parent = PyClassObject::new_simple(intern("Parent"));
+        let parent = PyClassObject::new_simple(intern("Parent"));
         let method_name = intern("greet");
         parent.set_attr(method_name.clone(), Value::int_unchecked(100));
         let parent_id = parent.class_id();
@@ -861,6 +984,46 @@ mod tests {
         assert_eq!(slot.defining_class, child_id);
         assert_eq!(slot.mro_index, 0); // First in MRO (Child itself)
         assert_eq!(slot.value, Value::int_unchecked(200));
+    }
+
+    #[test]
+    fn test_published_method_layout_rebuilds_inherited_and_overridden_entries() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let parent = PyClassObject::new_simple(intern("ParentPublished"));
+        let method_name = intern("greet");
+        parent.set_attr(method_name.clone(), Value::int_unchecked(100));
+        let parent_id = parent.class_id();
+        let parent = Arc::new(parent);
+
+        let mut registry: HashMap<ClassId, Arc<PyClassObject>> = HashMap::new();
+        registry.insert(parent_id, Arc::clone(&parent));
+
+        let child = PyClassObject::new(intern("ChildPublished"), &[parent_id], |id| {
+            registry.get(&id).map(|class| class.mro.clone())
+        })
+        .unwrap();
+        let child_id = child.class_id();
+        let child = Arc::new(child);
+        registry.insert(child_id, Arc::clone(&child));
+
+        child.rebuild_method_layout(|id| registry.get(&id).cloned());
+        let inherited = child
+            .lookup_method_published(&method_name)
+            .expect("published layout should expose inherited methods");
+        assert_eq!(inherited.value, Value::int_unchecked(100));
+        assert_eq!(inherited.defining_class, parent_id);
+        assert_eq!(inherited.mro_index, 1);
+
+        child.set_attr(method_name.clone(), Value::int_unchecked(200));
+        child.rebuild_method_layout(|id| registry.get(&id).cloned());
+        let overridden = child
+            .lookup_method_published(&method_name)
+            .expect("published layout should prefer direct overrides");
+        assert_eq!(overridden.value, Value::int_unchecked(200));
+        assert_eq!(overridden.defining_class, child_id);
+        assert_eq!(overridden.mro_index, 0);
     }
 
     #[test]

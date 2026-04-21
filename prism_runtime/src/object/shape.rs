@@ -40,11 +40,11 @@
 //! avoiding dictionary overhead for common cases. When inline storage is exhausted,
 //! properties spill to a backing dictionary.
 
-use prism_core::intern::InternedString;
 use parking_lot::RwLock;
+use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // =============================================================================
 // Property Attributes
@@ -414,10 +414,7 @@ impl Shape {
 
     /// Check if a transition exists for the given property.
     pub fn has_transition(&self, name: &InternedString) -> bool {
-        self.transitions
-            .read()
-            .keys()
-            .any(|key| &key.name == name)
+        self.transitions.read().keys().any(|key| &key.name == name)
     }
 
     /// Check if a transition exists for the exact property descriptor key.

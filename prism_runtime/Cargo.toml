@@ -9,6 +9,7 @@ prism_core.workspace = true
 prism_code.workspace = true
 prism_gc.workspace = true
 parking_lot.workspace = true
+arc-swap.workspace = true
 smallvec.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true

@@ -69,12 +69,10 @@ impl TypeRegistry {
                 }
                 Err(existing) if existing == new_ptr => {}
                 Err(existing) => {
-                let existing = unsafe { &*existing };
-                panic!(
-                    "TypeId {:?} already registered to a different type object ({:?} vs {:?})",
-                    type_id,
-                    existing.name,
-                    type_obj.name
+                    let existing = unsafe { &*existing };
+                    panic!(
+                        "TypeId {:?} already registered to a different type object ({:?} vs {:?})",
+                        type_id, existing.name, type_obj.name
                     );
                 }
             }
@@ -97,9 +95,7 @@ impl TypeRegistry {
                 let existing = unsafe { &*(ptr as *const TypeObject) };
                 panic!(
                     "TypeId {:?} already registered to a different type object ({:?} vs {:?})",
-                    type_id,
-                    existing.name,
-                    type_obj.name
+                    type_id, existing.name, type_obj.name
                 );
             }
         }
@@ -211,7 +207,9 @@ mod tests {
 
         registry.register(type_id, type_obj);
 
-        let loaded = registry.get(type_id).expect("registered type should be returned");
+        let loaded = registry
+            .get(type_id)
+            .expect("registered type should be returned");
         assert!(std::ptr::eq(loaded, type_obj));
         assert!(registry.contains(type_id));
         assert_eq!(registry.len(), 1);

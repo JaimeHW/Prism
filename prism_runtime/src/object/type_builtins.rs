@@ -541,8 +541,13 @@ fn builtin_base_type_error(type_id: TypeId) -> Option<TypeCreationError> {
 
 use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
 use crate::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
+use crate::object::registry::global_registry;
+use crate::object::type_obj::{TypeFlags, TypeObject};
+use arc_swap::ArcSwapOption;
+use parking_lot::Mutex;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Error during dynamic class creation.
@@ -800,6 +805,7 @@ where
 
     // Set detected flags
     class.set_flags(flags);
+    class.rebuild_method_layout(|id| registry.get_class(id));
 
     let class = Arc::new(class);
 
@@ -859,7 +865,198 @@ fn wrap_implicit_descriptor(value: Value, kind: ImplicitDescriptorKind) -> Value
     }
 }
 
-/// Simple in-memory class registry for testing.
+const HEAP_TYPE_FAST_TABLE_CAPACITY: usize = 1 << 16;
+
+#[derive(Debug)]
+struct PublishedClassEntry {
+    class: Arc<PyClassObject>,
+    bitmap: SubclassBitmap,
+}
+
+#[derive(Debug)]
+struct OverflowClassSlot {
+    entry: ArcSwapOption<PublishedClassEntry>,
+}
+
+impl OverflowClassSlot {
+    fn empty() -> Self {
+        Self {
+            entry: ArcSwapOption::from(None::<Arc<PublishedClassEntry>>),
+        }
+    }
+}
+
+/// Dense published heap-type registry for user-defined classes.
+///
+/// The common path is a direct indexed load by `TypeId`, avoiding the global
+/// hash table and lock traffic that previously sat on every heap-type lookup.
+pub struct PublishedClassRegistry {
+    entries: Box<[ArcSwapOption<PublishedClassEntry>]>,
+    overflow: Mutex<Vec<OverflowClassSlot>>,
+    registered: AtomicU32,
+}
+
+impl PublishedClassRegistry {
+    pub fn new() -> Self {
+        let mut entries = Vec::with_capacity(HEAP_TYPE_FAST_TABLE_CAPACITY);
+        entries.resize_with(HEAP_TYPE_FAST_TABLE_CAPACITY, || {
+            ArcSwapOption::from(None::<Arc<PublishedClassEntry>>)
+        });
+        Self {
+            entries: entries.into_boxed_slice(),
+            overflow: Mutex::new(Vec::new()),
+            registered: AtomicU32::new(0),
+        }
+    }
+
+    fn load_entry(&self, id: ClassId) -> Option<Arc<PublishedClassEntry>> {
+        let index = id.0 as usize;
+        if let Some(slot) = self.entries.get(index) {
+            return slot.load_full();
+        }
+
+        let overflow_index = index - self.entries.len();
+        let overflow = self.overflow.lock();
+        overflow.get(overflow_index)?.entry.load_full()
+    }
+
+    fn store_entry(&self, id: ClassId, entry: Arc<PublishedClassEntry>) {
+        let index = id.0 as usize;
+        if let Some(slot) = self.entries.get(index) {
+            if slot.swap(Some(Arc::clone(&entry))).is_none() {
+                self.registered.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        let overflow_index = index - self.entries.len();
+        let mut overflow = self.overflow.lock();
+        if overflow.len() <= overflow_index {
+            overflow.resize_with(overflow_index + 1, OverflowClassSlot::empty);
+        }
+        if overflow[overflow_index].entry.swap(Some(entry)).is_none() {
+            self.registered.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Register or refresh a heap class publication.
+    pub fn register(&self, class: Arc<PyClassObject>, bitmap: SubclassBitmap) {
+        publish_heap_type_object(class.as_ref());
+        class.rebuild_method_layout(global_class);
+        let id = class.class_id();
+        let entry = Arc::new(PublishedClassEntry { class, bitmap });
+        self.store_entry(id, entry);
+    }
+
+    /// Remove a registered class publication.
+    pub fn unregister(&self, id: ClassId) {
+        let index = id.0 as usize;
+        let removed = if let Some(slot) = self.entries.get(index) {
+            slot.swap(None).is_some()
+        } else {
+            let overflow_index = index - self.entries.len();
+            let overflow = self.overflow.lock();
+            overflow
+                .get(overflow_index)
+                .and_then(|slot| slot.entry.swap(None))
+                .is_some()
+        };
+        if removed {
+            self.registered.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get_class(&self, id: ClassId) -> Option<Arc<PyClassObject>> {
+        self.load_entry(id).map(|entry| Arc::clone(&entry.class))
+    }
+
+    pub fn get_bitmap(&self, id: ClassId) -> Option<SubclassBitmap> {
+        self.load_entry(id).map(|entry| entry.bitmap.clone())
+    }
+
+    pub fn class_version(&self, id: ClassId) -> Option<u64> {
+        self.load_entry(id)
+            .map(|entry| entry.class.method_layout_version())
+    }
+
+    pub fn refresh_layouts_for_hierarchy(&self, root_type_id: TypeId) {
+        let mut affected = Vec::new();
+
+        for slot in self.entries.iter() {
+            if let Some(entry) = slot.load_full()
+                && entry.bitmap.is_subclass_of(root_type_id)
+            {
+                affected.push(entry.class.clone());
+            }
+        }
+
+        let overflow = self.overflow.lock();
+        for slot in overflow.iter() {
+            if let Some(entry) = slot.entry.load_full()
+                && entry.bitmap.is_subclass_of(root_type_id)
+            {
+                affected.push(entry.class.clone());
+            }
+        }
+        drop(overflow);
+
+        for class in affected {
+            class.rebuild_method_layout(global_class);
+            class.bump_method_layout_version();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.registered.load(Ordering::Relaxed) as usize
+    }
+}
+
+fn publish_heap_type_object(class: &PyClassObject) {
+    let registry = global_registry();
+    let type_id = class.class_type_id();
+    if registry.contains(type_id) {
+        return;
+    }
+
+    let base = class
+        .bases()
+        .iter()
+        .copied()
+        .find_map(|base_id| registry.get(class_id_to_type_id(base_id)));
+    let type_object = Box::leak(Box::new(TypeObject::new(
+        type_id,
+        class.name().clone(),
+        base,
+        0,
+        TypeFlags::HEAPTYPE,
+    )));
+    registry.register(type_id, type_object);
+}
+
+impl Default for PublishedClassRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClassRegistry for PublishedClassRegistry {
+    fn get_class(&self, id: ClassId) -> Option<Arc<PyClassObject>> {
+        self.get_class(id)
+    }
+
+    fn get_bitmap(&self, id: ClassId) -> Option<SubclassBitmap> {
+        self.get_bitmap(id)
+    }
+
+    fn register_class(&self, class: Arc<PyClassObject>) {
+        let bitmap = self
+            .get_bitmap(class.class_id())
+            .unwrap_or_else(|| SubclassBitmap::for_type(class.class_type_id()));
+        self.register(class, bitmap);
+    }
+}
+
+/// Simple in-memory class registry for tests and isolated construction flows.
 #[derive(Default)]
 pub struct SimpleClassRegistry {
     classes: std::sync::RwLock<FxHashMap<ClassId, Arc<PyClassObject>>>,
@@ -901,12 +1098,12 @@ impl ClassRegistry for SimpleClassRegistry {
     }
 }
 
-static GLOBAL_CLASS_REGISTRY: OnceLock<SimpleClassRegistry> = OnceLock::new();
+static GLOBAL_CLASS_REGISTRY: OnceLock<PublishedClassRegistry> = OnceLock::new();
 
 /// Get the global registry for heap-defined Python classes.
 #[inline]
-pub fn global_class_registry() -> &'static SimpleClassRegistry {
-    GLOBAL_CLASS_REGISTRY.get_or_init(SimpleClassRegistry::new)
+pub fn global_class_registry() -> &'static PublishedClassRegistry {
+    GLOBAL_CLASS_REGISTRY.get_or_init(PublishedClassRegistry::new)
 }
 
 /// Look up a user-defined class object by class id.
@@ -939,6 +1136,22 @@ pub fn register_global_class(class: Arc<PyClassObject>, bitmap: SubclassBitmap) 
 #[inline]
 pub fn unregister_global_class(id: ClassId) {
     global_class_registry().unregister(id);
+}
+
+/// Get the published method-layout version for a heap class.
+#[inline]
+pub fn global_class_version(id: ClassId) -> Option<u64> {
+    (id.0 >= TypeId::FIRST_USER_TYPE)
+        .then(|| global_class_registry().class_version(id))
+        .flatten()
+}
+
+/// Refresh published method layouts for a class and its registered subclasses.
+#[inline]
+pub fn refresh_global_class_layouts(type_id: TypeId) {
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE {
+        global_class_registry().refresh_layouts_for_hierarchy(type_id);
+    }
 }
 
 // =============================================================================
@@ -1479,6 +1692,8 @@ mod tests {
     };
     use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
     use crate::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
+    use crate::object::registry::global_registry;
+    use crate::object::type_obj::TypeFlags;
     use crate::types::function::FunctionObject;
     use prism_code::CodeObject;
     use prism_core::intern::intern;
@@ -1486,6 +1701,14 @@ mod tests {
 
     fn create_test_registry() -> SimpleClassRegistry {
         SimpleClassRegistry::new()
+    }
+
+    fn bitmap_for_class(class: &PyClassObject) -> SubclassBitmap {
+        let mut bitmap = SubclassBitmap::new();
+        for &class_id in class.mro() {
+            bitmap.set_bit(class_id_to_type_id(class_id));
+        }
+        bitmap
     }
 
     fn test_function_value(name: &str) -> Value {
@@ -1986,5 +2209,98 @@ mod tests {
         // Test not found
         assert!(registry.get_class(ClassId(99999)).is_none());
         assert!(registry.get_bitmap(ClassId(99999)).is_none());
+    }
+
+    #[test]
+    fn test_register_global_class_publishes_heap_type_metadata() {
+        let class = Arc::new(PyClassObject::new_simple(intern("PublishedHeapType")));
+        let class_id = class.class_id();
+        let type_id = class.class_type_id();
+
+        register_global_class(Arc::clone(&class), bitmap_for_class(class.as_ref()));
+
+        let published = global_registry()
+            .get(type_id)
+            .expect("heap type should be published into the dense type registry");
+        assert_eq!(published.type_id(), type_id);
+        assert_eq!(published.name.as_str(), "PublishedHeapType");
+        assert!(published.flags.contains(TypeFlags::HEAPTYPE));
+        assert_eq!(
+            global_class(class_id)
+                .as_ref()
+                .map(|published_class| published_class.class_type_id()),
+            Some(type_id)
+        );
+        assert!(
+            global_class_bitmap(class_id)
+                .expect("heap class bitmap should be published")
+                .is_subclass_of(type_id)
+        );
+
+        unregister_global_class(class_id);
+    }
+
+    #[test]
+    fn test_registered_hierarchy_refreshes_published_layouts_and_versions() {
+        let shared = intern("shared");
+
+        let parent = Arc::new(PyClassObject::new_simple(intern("PublishedParent")));
+        let parent_id = parent.class_id();
+        register_global_class(Arc::clone(&parent), bitmap_for_class(parent.as_ref()));
+
+        let child = Arc::new(
+            PyClassObject::new(intern("PublishedChild"), &[parent_id], |id| {
+                (id == parent_id).then(|| parent.mro().iter().copied().collect())
+            })
+            .expect("child class should build"),
+        );
+        let child_id = child.class_id();
+        register_global_class(Arc::clone(&child), bitmap_for_class(child.as_ref()));
+
+        let parent_version = global_class_version(parent_id).expect("parent version should exist");
+        let child_version = global_class_version(child_id).expect("child version should exist");
+        assert!(child.lookup_method_published(&shared).is_none());
+
+        parent.set_attr(shared.clone(), Value::int_unchecked(10));
+
+        let inherited = child
+            .lookup_method_published(&shared)
+            .expect("child layout should refresh inherited members after parent mutation");
+        assert_eq!(inherited.value, Value::int_unchecked(10));
+        assert_eq!(inherited.defining_class, parent_id);
+        assert_eq!(inherited.mro_index, 1);
+        assert!(
+            global_class_version(parent_id).expect("parent version should update") > parent_version
+        );
+        let child_version_after_parent =
+            global_class_version(child_id).expect("child version should update");
+        assert!(child_version_after_parent > child_version);
+
+        child.set_attr(shared.clone(), Value::int_unchecked(20));
+
+        let overridden = child
+            .lookup_method_published(&shared)
+            .expect("child layout should prefer direct override");
+        assert_eq!(overridden.value, Value::int_unchecked(20));
+        assert_eq!(overridden.defining_class, child_id);
+        assert_eq!(overridden.mro_index, 0);
+        assert!(
+            global_class_version(child_id).expect("child version should advance again")
+                > child_version_after_parent
+        );
+
+        assert_eq!(
+            child.del_attr(&shared),
+            Some(Value::int_unchecked(20)),
+            "deleting the override should fall back to the parent publication"
+        );
+        let fallback = child
+            .lookup_method_published(&shared)
+            .expect("published layout should fall back to the parent after delete");
+        assert_eq!(fallback.value, Value::int_unchecked(10));
+        assert_eq!(fallback.defining_class, parent_id);
+
+        unregister_global_class(child_id);
+        unregister_global_class(parent_id);
     }
 }

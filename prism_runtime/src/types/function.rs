@@ -272,17 +272,13 @@ impl FunctionObject {
     /// Check if function takes *args.
     #[inline]
     pub fn has_varargs(&self) -> bool {
-        self.code
-            .flags
-            .contains(prism_code::CodeFlags::VARARGS)
+        self.code.flags.contains(prism_code::CodeFlags::VARARGS)
     }
 
     /// Check if function takes **kwargs.
     #[inline]
     pub fn has_varkw(&self) -> bool {
-        self.code
-            .flags
-            .contains(prism_code::CodeFlags::VARKEYWORDS)
+        self.code.flags.contains(prism_code::CodeFlags::VARKEYWORDS)
     }
 
     /// Get default value for parameter at index.

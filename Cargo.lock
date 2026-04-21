@@ -30,6 +30,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,6 +643,7 @@ dependencies = [
 name = "prism_runtime"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bitflags",
  "criterion",
  "memchr",
@@ -658,6 +668,7 @@ dependencies = [
  "libm",
  "num-bigint",
  "num-traits",
+ "parking_lot",
  "prism_code",
  "prism_compiler",
  "prism_core",

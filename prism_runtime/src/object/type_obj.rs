@@ -336,6 +336,8 @@ impl std::fmt::Debug for TypeSlots {
 pub struct TypeObject {
     /// Object header (type of type is TYPE).
     pub header: ObjectHeader,
+    /// Runtime type identifier represented by this type object.
+    type_id: TypeId,
     /// Type name.
     pub name: InternedString,
     /// Base type (None for object).
@@ -359,6 +361,7 @@ impl TypeObject {
     ) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::TYPE),
+            type_id,
             name,
             base,
             slots: TypeSlots::default(),
@@ -369,7 +372,7 @@ impl TypeObject {
 
     /// Get the type ID.
     pub fn type_id(&self) -> TypeId {
-        self.header.type_id
+        self.type_id
     }
 
     /// Check if type is callable.
@@ -416,12 +419,27 @@ impl PyObject for TypeObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::intern;
 
     #[test]
     fn test_type_id_builtin() {
         assert!(TypeId::INT.is_builtin());
         assert!(TypeId::LIST.is_builtin());
         assert!(!TypeId(256).is_builtin());
+    }
+
+    #[test]
+    fn test_type_object_retains_runtime_type_id() {
+        let ty = TypeObject::new(
+            TypeId::from_raw(TypeId::FIRST_USER_TYPE + 7),
+            intern("HeapCarrier"),
+            None,
+            0,
+            TypeFlags::HEAPTYPE,
+        );
+
+        assert_eq!(ty.header.type_id, TypeId::TYPE);
+        assert_eq!(ty.type_id(), TypeId::from_raw(TypeId::FIRST_USER_TYPE + 7));
     }
 
     #[test]
