@@ -701,7 +701,10 @@ mod tests {
         frame.set_reg(2, Value::int(3).unwrap());
         pool.release(frame);
 
-        let pooled = pool.free_frames.last().expect("frame should be stored in pool");
+        let pooled = pool
+            .free_frames
+            .last()
+            .expect("frame should be stored in pool");
         assert!(pooled.get_reg(0).is_none());
         assert!(pooled.get_reg(2).is_none());
         assert!(!pooled.reg_is_written(0));

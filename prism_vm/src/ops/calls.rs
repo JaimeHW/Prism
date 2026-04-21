@@ -142,7 +142,7 @@ fn resolve_dunder_call_target(value: Value) -> Option<ResolvedCallableTarget> {
     if type_id.raw() >= TypeId::FIRST_USER_TYPE {
         let class = global_class(ClassId(type_id.raw()))?;
         let name = intern("__call__");
-        if let Some(slot) = class.lookup_method(&name, global_class) {
+        if let Some(slot) = class.lookup_method_published(&name) {
             return Some(ResolvedCallableTarget {
                 callable: slot.value,
                 implicit_self: value,
@@ -1147,8 +1147,7 @@ fn invoke_user_function_with_implicit_self(
                     "Invalid keyword names in constant pool",
                 ));
             };
-            let kwnames =
-                unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
+            let kwnames = unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
             let mut keyword_args: SmallVec<[(&str, Value); 4]> = SmallVec::with_capacity(kwargc);
             for i in 0..kwargc {
                 let kw_name = kwnames
@@ -2362,9 +2361,7 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                                 "Invalid keyword names in constant pool",
                             ));
                         };
-                        let kwnames = unsafe {
-                            &*(kwnames_ptr as *const prism_code::KwNamesTuple)
-                        };
+                        let kwnames = unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
                         let mut keyword_args: SmallVec<[(&str, Value); 4]> =
                             SmallVec::with_capacity(kwargc);
                         for i in 0..kwargc {
@@ -2608,8 +2605,7 @@ fn call_kw_user_function(
         let kwnames_val = vm.frames[caller_frame_idx].get_const(kwnames_idx);
 
         if let Some(kwnames_ptr) = kwnames_val.as_object_ptr() {
-            let kwnames =
-                unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
+            let kwnames = unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
 
             for i in 0..kwargc {
                 let kw_name = match kwnames.get(i) {

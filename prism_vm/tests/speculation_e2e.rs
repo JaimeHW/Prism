@@ -3,9 +3,7 @@
 //! Tests the complete speculation pipeline from bytecode through interpreter
 //! to speculative execution. Focuses on correctness of operations.
 
-use prism_code::{
-    CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
-};
+use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;

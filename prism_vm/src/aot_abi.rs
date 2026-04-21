@@ -218,7 +218,7 @@ mod tests {
     use prism_compiler::{Compiler, OptimizationLevel};
     use prism_parser::parse;
 
-fn compile_module(source: &str, filename: &str) -> Arc<prism_code::CodeObject> {
+    fn compile_module(source: &str, filename: &str) -> Arc<prism_code::CodeObject> {
         let parsed = parse(source).expect("source should parse");
         Arc::new(
             Compiler::compile_module_with_optimization(&parsed, filename, OptimizationLevel::Basic)

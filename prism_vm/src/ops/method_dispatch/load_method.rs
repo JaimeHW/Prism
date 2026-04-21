@@ -36,7 +36,9 @@ use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shaped_object::ShapedObject;
-use prism_runtime::object::type_builtins::{builtin_class_mro, class_id_to_type_id, global_class};
+use prism_runtime::object::type_builtins::{
+    builtin_class_mro, class_id_to_type_id, global_class, global_class_version,
+};
 use prism_runtime::object::type_obj::TypeId;
 use std::sync::Arc;
 
@@ -119,14 +121,15 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
         // Check method cache first (shared across call sites)
         let name_ptr = name.as_ptr() as u64;
-        if let Some(cached) = method_cache().get(type_id, name_ptr) {
+        let cache_version = method_cache_version(type_id);
+        if let Some(cached) = method_cache().get(type_id, name_ptr, cache_version) {
             return apply_cached_method(vm, dst, obj, cached);
         }
 
         if type_id.raw() >= TypeId::FIRST_USER_TYPE {
             return match resolve_user_defined_method(obj, type_id, &name) {
                 Ok(cached) => {
-                    method_cache().insert(type_id, name_ptr, cached);
+                    method_cache().insert(type_id, name_ptr, cache_version, cached);
                     apply_cached_method(vm, dst, obj, cached)
                 }
                 Err(err)
@@ -155,7 +158,7 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         match resolve_method(vm, obj, type_id, &name) {
             Ok(cached) => {
                 // Populate cache for future calls
-                method_cache().insert(type_id, name_ptr, cached);
+                method_cache().insert(type_id, name_ptr, cache_version, cached);
                 apply_cached_method(vm, dst, obj, cached)
             }
             Err(err)
@@ -179,15 +182,16 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         // Primitive type - get type from value and look up method
         let prim_type_id = get_primitive_type_id(obj);
         let name_ptr = name.as_ptr() as u64;
+        let cache_version = method_cache_version(prim_type_id);
 
-        if let Some(cached) = method_cache().get(prim_type_id, name_ptr) {
+        if let Some(cached) = method_cache().get(prim_type_id, name_ptr, cache_version) {
             return apply_cached_method(vm, dst, obj, cached);
         }
 
         // Resolve method on primitive type
         match resolve_primitive_method(vm, obj, prim_type_id, &name) {
             Ok(cached) => {
-                method_cache().insert(prim_type_id, name_ptr, cached);
+                method_cache().insert(prim_type_id, name_ptr, cache_version, cached);
                 apply_cached_method(vm, dst, obj, cached)
             }
             Err(e) => ControlFlow::Error(e),
@@ -221,6 +225,15 @@ fn get_primitive_type_id(val: Value) -> TypeId {
         TypeId::STR
     } else {
         TypeId::OBJECT // Fallback
+    }
+}
+
+#[inline]
+fn method_cache_version(type_id: TypeId) -> u64 {
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE {
+        global_class_version(ClassId(type_id.raw())).unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -764,7 +777,7 @@ fn resolve_user_defined_method(
         .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name))?;
     let interned_name = prism_core::intern::intern(name);
 
-    if let Some(slot) = class.lookup_method(&interned_name, global_class) {
+    if let Some(slot) = class.lookup_method_published(&interned_name) {
         return Ok(cached_method_from_value(slot.value));
     }
 
@@ -1262,6 +1275,53 @@ mod tests {
         let header = unsafe { &*(method_ptr as *const ObjectHeader) };
         assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
         assert!(!cached.is_descriptor);
+    }
+
+    #[test]
+    fn test_load_method_refreshes_cached_heap_method_after_class_version_change() {
+        method_cache().clear();
+
+        let method_name = intern("method");
+        let (first_ptr, first_value) = make_test_function_value("method_v1");
+        let class = PyClassObject::new_simple(intern("VersionedCarrier"));
+        class.set_attr(method_name.clone(), first_value);
+        let class = register_test_class(class);
+
+        let instance = ShapedObject::new(class.class_type_id(), class.instance_shape().clone());
+        let instance_ptr = Box::into_raw(Box::new(instance));
+        let instance_value = Value::object_ptr(instance_ptr as *const ());
+
+        let mut vm = vm_with_names(&["method"]);
+        vm.current_frame_mut().set_reg(1, instance_value);
+        let inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+
+        assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2), first_value);
+        assert_eq!(vm.current_frame().get_reg(3), instance_value);
+        assert_eq!(method_cache().len(), 1);
+
+        let (second_ptr, second_value) = make_test_function_value("method_v2");
+        class.set_attr(method_name, second_value);
+
+        vm.current_frame_mut().set_reg(2, Value::none());
+        vm.current_frame_mut().set_reg(3, Value::none());
+        assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2), second_value);
+        assert_eq!(vm.current_frame().get_reg(3), instance_value);
+        assert_eq!(method_cache().len(), 1);
+
+        unsafe {
+            drop(Box::from_raw(instance_ptr));
+            drop(Box::from_raw(first_ptr));
+            drop(Box::from_raw(second_ptr));
+        }
+
+        method_cache().clear();
     }
 
     #[test]

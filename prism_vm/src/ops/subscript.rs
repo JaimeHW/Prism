@@ -77,7 +77,7 @@ fn can_use_dict_storage_fast_path(ptr: *const (), special_method: &str) -> bool 
     // Python dispatch so __prepare__ mappings and other dict subclasses observe
     // user-defined overrides correctly.
     class
-        .lookup_method(&intern(special_method), global_class)
+        .lookup_method_published(&intern(special_method))
         .is_none()
 }
 
@@ -1131,8 +1131,7 @@ mod tests {
     #[test]
     fn test_store_subscr_assigns_list_slice_from_iterable() {
         let mut vm = VirtualMachine::new();
-        let code =
-            std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let list = ListObject::from_iter(vec![
@@ -1178,8 +1177,7 @@ mod tests {
     #[test]
     fn test_store_subscr_updates_heap_dict_subclass_native_storage() {
         let mut vm = VirtualMachine::new();
-        let code =
-            std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let class = register_dict_subclass("StoreDictSubclass");
@@ -1210,8 +1208,7 @@ mod tests {
     #[test]
     fn test_store_subscr_rejects_mismatched_extended_slice_assignment() {
         let mut vm = VirtualMachine::new();
-        let code =
-            std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let list = ListObject::from_iter(vec![
@@ -1253,9 +1250,7 @@ mod tests {
     #[test]
     fn test_delete_subscr_removes_list_slice() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_code::CodeObject::new(
-            "delete", "<test>",
-        ));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("delete", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let list = ListObject::from_iter(vec![
@@ -1295,9 +1290,7 @@ mod tests {
     #[test]
     fn test_delete_subscr_removes_heap_dict_subclass_native_storage_entry() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_code::CodeObject::new(
-            "delete", "<test>",
-        ));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("delete", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let class = register_dict_subclass("DeleteDictSubclass");

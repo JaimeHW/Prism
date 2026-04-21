@@ -1424,8 +1424,8 @@ mod tests {
     use super::*;
     use crate::VirtualMachine;
     use crate::builtins::builtin_type_object_for_type_id;
-    use prism_compiler::Compiler;
     use prism_code::{CodeObject, Instruction, Opcode, Register};
+    use prism_compiler::Compiler;
     use prism_core::intern::intern;
     use prism_parser::parse;
     use prism_runtime::object::shape::Shape;

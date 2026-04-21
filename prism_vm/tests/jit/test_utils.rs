@@ -1,8 +1,6 @@
 //! Shared test utilities for JIT integration tests.
 
-use prism_code::{
-    CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
-};
+use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;

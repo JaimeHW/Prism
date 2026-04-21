@@ -187,9 +187,7 @@ mod tests {
     use crate::error::RuntimeErrorKind;
     use crate::stdlib::exceptions::ExceptionTypeId;
     use crate::stdlib::generators::LivenessMap;
-    use prism_code::{
-        CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
-    };
+    use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register};
     use std::sync::Arc;
 
     fn generator_value_for_state(state: GeneratorState) -> Value {

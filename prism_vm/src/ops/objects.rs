@@ -120,9 +120,7 @@ fn class_object_from_type_ptr(ptr: *const ()) -> Option<&'static PyClassObject> 
 
 #[inline]
 fn lookup_user_class_attr(class: &PyClassObject, name: &InternedString) -> Option<Value> {
-    class
-        .lookup_method(name, global_class)
-        .map(|slot| slot.value)
+    class.lookup_method_published(name).map(|slot| slot.value)
 }
 
 #[inline]
@@ -134,7 +132,7 @@ pub(crate) fn lookup_class_metaclass_attr(
     let ptr = metaclass.as_object_ptr()?;
     let metaclass_class = class_object_from_type_ptr(ptr)?;
     metaclass_class
-        .lookup_method(name, global_class)
+        .lookup_method_published(name)
         .map(|slot| slot.value)
 }
 
@@ -1911,9 +1909,7 @@ mod tests {
     use crate::builtins::BuiltinFunctionObject;
     use crate::frame::ClosureEnv;
     use crate::import::ModuleObject;
-    use prism_code::{
-        CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode, Register,
-    };
+    use prism_code::{CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode, Register};
     use prism_core::Value;
     use prism_core::intern::intern;
     use prism_runtime::object::ObjectHeader;
@@ -3050,6 +3046,38 @@ mod tests {
         unsafe {
             drop_boxed(instance_ptr);
         }
+    }
+
+    #[test]
+    fn test_lookup_user_class_attr_tracks_registered_parent_mutations() {
+        let shared = intern("shared");
+
+        let parent = register_test_class(PyClassObject::new_simple(intern("LookupParent")));
+        let child = PyClassObject::new(intern("LookupChild"), &[parent.class_id()], |id| {
+            (id == parent.class_id()).then(|| parent.mro().iter().copied().collect())
+        })
+        .expect("child class should build");
+        let child = register_test_class(child);
+
+        assert!(lookup_user_class_attr(child.as_ref(), &shared).is_none());
+
+        parent.set_attr(shared.clone(), Value::int_unchecked(10));
+        assert_eq!(
+            lookup_user_class_attr(child.as_ref(), &shared),
+            Some(Value::int_unchecked(10))
+        );
+
+        child.set_attr(shared.clone(), Value::int_unchecked(20));
+        assert_eq!(
+            lookup_user_class_attr(child.as_ref(), &shared),
+            Some(Value::int_unchecked(20))
+        );
+
+        assert_eq!(child.del_attr(&shared), Some(Value::int_unchecked(20)));
+        assert_eq!(
+            lookup_user_class_attr(child.as_ref(), &shared),
+            Some(Value::int_unchecked(10))
+        );
     }
 
     #[test]

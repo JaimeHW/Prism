@@ -497,10 +497,7 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let mut executor = JitExecutor::new(cache);
 
-        let code = Arc::new(prism_code::CodeObject::new(
-            "jit_raw_abi_test",
-            "<test>",
-        ));
+        let code = Arc::new(prism_code::CodeObject::new("jit_raw_abi_test", "<test>"));
         let mut frame = Frame::new(code, None, 0);
 
         let entry = CompiledEntry::new(1, jit_stub_return_int30_bits as *const u8, 1)

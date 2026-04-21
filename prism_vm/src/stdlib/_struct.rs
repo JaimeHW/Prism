@@ -37,8 +37,9 @@ static UNPACK_FROM_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| 
 static ITER_UNPACK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_struct.iter_unpack"), iter_unpack_builtin)
 });
-static CLEARCACHE_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_struct._clearcache"), clearcache_builtin));
+static CLEARCACHE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_struct._clearcache"), clearcache_builtin)
+});
 static STRUCT_CONSTRUCTOR_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_struct.Struct"), struct_constructor));
 
@@ -242,7 +243,12 @@ impl FormatCode {
         }
     }
 
-    fn pack_into_slice(self, value: Value, layout: Layout, out: &mut [u8]) -> Result<(), BuiltinError> {
+    fn pack_into_slice(
+        self,
+        value: Value,
+        layout: Layout,
+        out: &mut [u8],
+    ) -> Result<(), BuiltinError> {
         match self {
             Self::Pad => {
                 out.fill(0);
@@ -265,24 +271,48 @@ impl FormatCode {
                     .ok_or_else(out_of_range_error)?;
                 Ok(())
             }
-            Self::Int16 => write_i16(out, layout.endianness(), integer_argument(value, "pack expected integer")?
-                .to_i16()
-                .ok_or_else(out_of_range_error)?),
-            Self::UInt16 => write_u16(out, layout.endianness(), integer_argument(value, "pack expected integer")?
-                .to_u16()
-                .ok_or_else(out_of_range_error)?),
-            Self::Int32 => write_i32(out, layout.endianness(), integer_argument(value, "pack expected integer")?
-                .to_i32()
-                .ok_or_else(out_of_range_error)?),
-            Self::UInt32 => write_u32(out, layout.endianness(), integer_argument(value, "pack expected integer")?
-                .to_u32()
-                .ok_or_else(out_of_range_error)?),
-            Self::Int64 => write_i64(out, layout.endianness(), integer_argument(value, "pack expected integer")?
-                .to_i64()
-                .ok_or_else(out_of_range_error)?),
-            Self::UInt64 => write_u64(out, layout.endianness(), integer_argument(value, "pack expected integer")?
-                .to_u64()
-                .ok_or_else(out_of_range_error)?),
+            Self::Int16 => write_i16(
+                out,
+                layout.endianness(),
+                integer_argument(value, "pack expected integer")?
+                    .to_i16()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::UInt16 => write_u16(
+                out,
+                layout.endianness(),
+                integer_argument(value, "pack expected integer")?
+                    .to_u16()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::Int32 => write_i32(
+                out,
+                layout.endianness(),
+                integer_argument(value, "pack expected integer")?
+                    .to_i32()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::UInt32 => write_u32(
+                out,
+                layout.endianness(),
+                integer_argument(value, "pack expected integer")?
+                    .to_u32()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::Int64 => write_i64(
+                out,
+                layout.endianness(),
+                integer_argument(value, "pack expected integer")?
+                    .to_i64()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::UInt64 => write_u64(
+                out,
+                layout.endianness(),
+                integer_argument(value, "pack expected integer")?
+                    .to_u64()
+                    .ok_or_else(out_of_range_error)?,
+            ),
             Self::Float32 => write_f32(out, layout.endianness(), float_argument(value)? as f32),
             Self::Float64 => write_f64(out, layout.endianness(), float_argument(value)?),
         }
@@ -298,8 +328,12 @@ impl FormatCode {
             Self::UInt16 => Value::int(i64::from(read_u16(data, layout.endianness()))).unwrap(),
             Self::Int32 => Value::int(i64::from(read_i32(data, layout.endianness()))).unwrap(),
             Self::UInt32 => Value::int(i64::from(read_u32(data, layout.endianness()))).unwrap(),
-            Self::Int64 => Value::int(read_i64(data, layout.endianness()))
-                .unwrap_or_else(|| prism_runtime::types::int::bigint_to_value(BigInt::from(read_i64(data, layout.endianness())))),
+            Self::Int64 => Value::int(read_i64(data, layout.endianness())).unwrap_or_else(|| {
+                prism_runtime::types::int::bigint_to_value(BigInt::from(read_i64(
+                    data,
+                    layout.endianness(),
+                )))
+            }),
             Self::UInt64 => {
                 let value = read_u64(data, layout.endianness());
                 if value <= i64::MAX as u64 {
@@ -379,7 +413,10 @@ fn calcsize_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let spec = parse_format_spec(value_to_rust_string(args[0], "calcsize() format must be a str")?)?;
+    let spec = parse_format_spec(value_to_rust_string(
+        args[0],
+        "calcsize() format must be a str",
+    )?)?;
     Ok(Value::int(spec.size as i64).expect("struct size should fit in i64"))
 }
 
@@ -404,7 +441,11 @@ fn unpack_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let format = value_to_rust_string(args[0], "unpack() format must be a str")?;
-    unpack_tuple_value(&format, &value_to_bytes_like(args[1], "unpack() buffer must be bytes-like")?, 0)
+    unpack_tuple_value(
+        &format,
+        &value_to_bytes_like(args[1], "unpack() buffer must be bytes-like")?,
+        0,
+    )
 }
 
 fn pack_into_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -415,8 +456,13 @@ fn pack_into_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let format = value_to_rust_string(args[0], "pack_into() format must be a str")?;
-    let buffer_ptr = writable_bytearray_ptr(args[1], "pack_into() requires a writable bytearray buffer")?;
-    let offset = offset_argument(args[2], buffer_len(buffer_ptr), "pack_into() offset out of range")?;
+    let buffer_ptr =
+        writable_bytearray_ptr(args[1], "pack_into() requires a writable bytearray buffer")?;
+    let offset = offset_argument(
+        args[2],
+        buffer_len(buffer_ptr),
+        "pack_into() offset out of range",
+    )?;
     let encoded = pack_with_format(&format, &args[3..])?;
     if offset + encoded.len() > buffer_len(buffer_ptr) {
         return Err(BuiltinError::ValueError(
@@ -443,7 +489,11 @@ fn unpack_from_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     let format = value_to_rust_string(args[0], "unpack_from() format must be a str")?;
     let buffer = value_to_bytes_like(args[1], "unpack_from() buffer must be bytes-like")?;
     let offset = if let Some(offset_value) = args.get(2) {
-        offset_argument(*offset_value, buffer.len(), "unpack_from() offset out of range")?
+        offset_argument(
+            *offset_value,
+            buffer.len(),
+            "unpack_from() offset out of range",
+        )?
     } else {
         0
     };
@@ -503,11 +553,17 @@ fn struct_constructor(args: &[Value]) -> Result<Value, BuiltinError> {
     let format = value_to_rust_string(args[0], "Struct() format must be a str")?;
     let spec = parse_format_spec(format.clone())?;
 
-    let object = Box::new(ShapedObject::with_empty_shape(shape_registry().empty_shape()));
+    let object = Box::new(ShapedObject::with_empty_shape(
+        shape_registry().empty_shape(),
+    ));
     let ptr = Box::into_raw(object);
     let receiver = Value::object_ptr(ptr as *const ());
     let shaped = unsafe { &mut *ptr };
-    shaped.set_property(intern("format"), Value::string(intern(&format)), shape_registry());
+    shaped.set_property(
+        intern("format"),
+        Value::string(intern(&format)),
+        shape_registry(),
+    );
     shaped.set_property(
         intern("size"),
         Value::int(spec.size as i64).expect("struct size should fit in i64"),
@@ -619,7 +675,8 @@ fn pack_with_format(format: &str, values: &[Value]) -> Result<Vec<u8>, BuiltinEr
             continue;
         }
         let slice = &mut buffer[field.offset..field.offset + field.size];
-        field.code
+        field
+            .code
             .pack_into_slice(values[value_index], spec.layout, slice)?;
         value_index += 1;
     }
@@ -631,7 +688,11 @@ fn unpack_tuple_value(format: &str, buffer: &[u8], offset: usize) -> Result<Valu
     Ok(unpack_from_bytes(&spec, buffer, offset)?)
 }
 
-fn unpack_from_bytes(spec: &FormatSpec, buffer: &[u8], offset: usize) -> Result<Value, BuiltinError> {
+fn unpack_from_bytes(
+    spec: &FormatSpec,
+    buffer: &[u8],
+    offset: usize,
+) -> Result<Value, BuiltinError> {
     let end = offset.checked_add(spec.size).ok_or_else(|| {
         BuiltinError::ValueError("unpack requires a buffer of the requested size".to_string())
     })?;
@@ -648,7 +709,11 @@ fn unpack_from_bytes(spec: &FormatSpec, buffer: &[u8], offset: usize) -> Result<
         }
         let start = offset + field.offset;
         let end = start + field.size;
-        items.push(field.code.unpack_from_slice(spec.layout, &buffer[start..end])?);
+        items.push(
+            field
+                .code
+                .unpack_from_slice(spec.layout, &buffer[start..end])?,
+        );
     }
     Ok(tuple_value(items))
 }
@@ -710,7 +775,14 @@ fn parse_format_spec(format: String) -> Result<FormatSpec, BuiltinError> {
                 BuiltinError::ValueError("struct repeat count is too large".to_string())
             })?;
             count_text.clear();
-            push_fields(&mut fields, &mut offset, &mut value_count, layout, code_char, count)?;
+            push_fields(
+                &mut fields,
+                &mut offset,
+                &mut value_count,
+                layout,
+                code_char,
+                count,
+            )?;
             continue;
         }
 
@@ -837,9 +909,8 @@ fn offset_argument(value: Value, buffer_len: usize, context: &str) -> Result<usi
     };
 
     let adjusted = if raw < 0 {
-        raw.checked_add(buffer_len as i64).ok_or_else(|| {
-            BuiltinError::ValueError(context.to_string())
-        })?
+        raw.checked_add(buffer_len as i64)
+            .ok_or_else(|| BuiltinError::ValueError(context.to_string()))?
     } else {
         raw
     };
@@ -1031,7 +1102,11 @@ mod tests {
         let cases = [
             ("<B", Value::int(0x7f).unwrap(), vec![0x7f]),
             ("<H", Value::int(0x1234).unwrap(), vec![0x34, 0x12]),
-            ("<I", Value::int(0x1234_5678).unwrap(), vec![0x78, 0x56, 0x34, 0x12]),
+            (
+                "<I",
+                Value::int(0x1234_5678).unwrap(),
+                vec![0x78, 0x56, 0x34, 0x12],
+            ),
             (
                 "<Q",
                 prism_runtime::types::int::bigint_to_value(BigInt::from(0x0102_0304_0506_0708_u64)),
@@ -1077,13 +1152,13 @@ mod tests {
             vec![0, 0, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0]
         );
 
-        let unpacked = unpack_from_builtin(&[
-            Value::string(intern("<I")),
-            target,
-            Value::int(2).unwrap(),
-        ])
-        .expect("unpack_from");
-        assert_eq!(tuple_items(unpacked), vec![Value::int(0x1122_3344).unwrap()]);
+        let unpacked =
+            unpack_from_builtin(&[Value::string(intern("<I")), target, Value::int(2).unwrap()])
+                .expect("unpack_from");
+        assert_eq!(
+            tuple_items(unpacked),
+            vec![Value::int(0x1122_3344).unwrap()]
+        );
 
         let iter = iter_unpack_builtin(&[
             Value::string(intern("<H")),
