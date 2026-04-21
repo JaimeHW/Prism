@@ -56,6 +56,18 @@ pub struct SysModule {
     path_importer_cache_value: Value,
     /// Fallback dict backing `sys.modules` before import resolver injection.
     modules_value: Value,
+    /// Python-visible standard input stream.
+    stdin_value: Value,
+    /// Python-visible standard output stream.
+    stdout_value: Value,
+    /// Python-visible standard error stream.
+    stderr_value: Value,
+    /// Original standard input stream exposed via `__stdin__`.
+    original_stdin_value: Value,
+    /// Original standard output stream exposed via `__stdout__`.
+    original_stdout_value: Value,
+    /// Original standard error stream exposed via `__stderr__`.
+    original_stderr_value: Value,
     /// Process flags exposed via `sys.flags`.
     flags_value: Value,
     /// Module search paths
@@ -83,6 +95,15 @@ static INTERN_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.intern"), sys_intern));
 static AUDIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.audit"), sys_audit));
+static DISPLAYHOOK_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.displayhook"), sys_displayhook));
+static EXCEPTHOOK_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.excepthook"), sys_excepthook));
+static EXC_INFO_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("sys.exc_info"), sys_exc_info));
+static GETWINDOWSVERSION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("sys.getwindowsversion"), sys_getwindowsversion)
+});
 
 impl SysModule {
     /// Create a new sys module with default configuration.
@@ -91,6 +112,9 @@ impl SysModule {
         let argv = SysArgv::from_env();
         let path = SysPaths::from_env();
         let platform = Platform::detect();
+        let stdin_value = super::io::new_stdin_stream_object();
+        let stdout_value = super::io::new_stdout_stream_object();
+        let stderr_value = super::io::new_stderr_stream_object();
         let executable_path = std::env::current_exe().ok();
         let executable = executable_path
             .as_ref()
@@ -107,6 +131,12 @@ impl SysModule {
             path_hooks_value: empty_list_value(),
             path_importer_cache_value: empty_dict_value(),
             modules_value: empty_dict_value(),
+            stdin_value,
+            stdout_value,
+            stderr_value,
+            original_stdin_value: stdin_value,
+            original_stdout_value: stdout_value,
+            original_stderr_value: stderr_value,
             flags_value: sys_flags_value(),
             argv,
             path,
@@ -120,6 +150,9 @@ impl SysModule {
         let argv = SysArgv::new(args);
         let path = SysPaths::from_env();
         let platform = Platform::detect();
+        let stdin_value = super::io::new_stdin_stream_object();
+        let stdout_value = super::io::new_stdout_stream_object();
+        let stderr_value = super::io::new_stderr_stream_object();
         let executable_path = std::env::current_exe().ok();
         let executable = executable_path
             .as_ref()
@@ -136,6 +169,12 @@ impl SysModule {
             path_hooks_value: empty_list_value(),
             path_importer_cache_value: empty_dict_value(),
             modules_value: empty_dict_value(),
+            stdin_value,
+            stdout_value,
+            stderr_value,
+            original_stdin_value: stdin_value,
+            original_stdout_value: stdout_value,
+            original_stderr_value: stderr_value,
             flags_value: sys_flags_value(),
             argv,
             path,
@@ -216,6 +255,7 @@ impl Module for SysModule {
                 Ok(Value::none()) // Placeholder for callable
             }
 
+            "exc_info" => Ok(builtin_value(&EXC_INFO_FUNCTION)),
             "intern" => Ok(builtin_value(&INTERN_FUNCTION)),
             "getfilesystemencoding" => Ok(builtin_value(&GET_FILESYSTEM_ENCODING_FUNCTION)),
             "getfilesystemencodeerrors" => Ok(builtin_value(&GET_FILESYSTEM_ENCODEERRORS_FUNCTION)),
@@ -232,11 +272,14 @@ impl Module for SysModule {
             "winver" if self.platform.is_windows() => Ok(Value::string(intern(WINVER))),
             "byteorder" => Ok(Value::string(intern(byte_order()))),
             "copyright" => Ok(Value::string(intern(COPYRIGHT))),
+            "platlibdir" => Ok(Value::string(intern(PLATLIBDIR))),
+            "_vpath" if self.platform.is_windows() => Ok(Value::string(intern(VPATH))),
 
-            // Tuples/objects - return None placeholder
-            "version_info" | "implementation" | "float_info" | "int_info" | "hash_info" => {
-                Ok(Value::none()) // TODO: Return tuple/namespace objects
-            }
+            "version_info" => Ok(version_info_tuple()),
+            "implementation" => Ok(implementation_info()),
+            "float_info" => Ok(float_info_tuple()),
+            "int_info" => Ok(int_info_tuple()),
+            "hash_info" => Ok(hash_info_tuple()),
 
             "builtin_module_names" => Ok(self.builtin_module_names_value),
             "warnoptions" => Ok(self.warnoptions_value),
@@ -246,18 +289,23 @@ impl Module for SysModule {
             "modules" => Ok(self.modules_value),
             "flags" => Ok(self.flags_value),
 
-            // Streams - return None placeholder (would be file objects)
-            "stdin" | "stdout" | "stderr" | "__stdin__" | "__stdout__" | "__stderr__" => {
-                Ok(Value::none())
-            }
+            "stdin" => Ok(self.stdin_value),
+            "stdout" => Ok(self.stdout_value),
+            "stderr" => Ok(self.stderr_value),
+            "__stdin__" => Ok(self.original_stdin_value),
+            "__stdout__" => Ok(self.original_stdout_value),
+            "__stderr__" => Ok(self.original_stderr_value),
 
-            // Hooks - return None placeholder
-            "displayhook" | "excepthook" => Ok(Value::none()),
+            "displayhook" | "__displayhook__" => Ok(builtin_value(&DISPLAYHOOK_FUNCTION)),
+            "excepthook" | "__excepthook__" => Ok(builtin_value(&EXCEPTHOOK_FUNCTION)),
 
             // Path list
             "path" => Ok(self.path.to_value()),
             // Command-line arguments
             "argv" => Ok(self.argv_value),
+            "getwindowsversion" if self.platform.is_windows() => {
+                Ok(builtin_value(&GETWINDOWSVERSION_FUNCTION))
+            }
 
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'sys' has no attribute '{}'",
@@ -282,6 +330,7 @@ impl Module for SysModule {
             Arc::from("base_exec_prefix"),
             Arc::from("byteorder"),
             Arc::from("copyright"),
+            Arc::from("platlibdir"),
             Arc::from("builtin_module_names"),
             Arc::from("warnoptions"),
             Arc::from("meta_path"),
@@ -302,9 +351,12 @@ impl Module for SysModule {
             Arc::from("__stderr__"),
             Arc::from("displayhook"),
             Arc::from("excepthook"),
+            Arc::from("__displayhook__"),
+            Arc::from("__excepthook__"),
             Arc::from("audit"),
             Arc::from("path"),
             Arc::from("argv"),
+            Arc::from("exc_info"),
             Arc::from("exit"),
             Arc::from("getfilesystemencoding"),
             Arc::from("getfilesystemencodeerrors"),
@@ -316,6 +368,8 @@ impl Module for SysModule {
         ];
         if self.platform.is_windows() {
             entries.push(Arc::from("winver"));
+            entries.push(Arc::from("_vpath"));
+            entries.push(Arc::from("getwindowsversion"));
         }
         entries
     }
@@ -324,6 +378,45 @@ impl Module for SysModule {
 #[inline]
 fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+fn sys_displayhook(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "displayhook() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::none())
+}
+
+fn sys_excepthook(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "excepthook() takes exactly 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::none())
+}
+
+fn sys_exc_info(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "exc_info() takes exactly 0 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let exc_info = crate::ops::exception::build_exc_info(vm);
+    let (exc_type, exc_value, exc_traceback) = exc_info.to_tuple();
+    Ok(leak_object_value(TupleObject::from_slice(&[
+        exc_type,
+        exc_value,
+        exc_traceback,
+    ])))
 }
 
 fn sys_intern(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -471,6 +564,17 @@ fn sys_audit(_args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::none())
 }
 
+fn sys_getwindowsversion(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getwindowsversion() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    Ok(windows_version_info())
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -586,21 +690,53 @@ mod tests {
     fn test_stdin_attribute() {
         let sys = SysModule::new();
         let stdin = sys.get_attr("stdin").unwrap();
-        assert!(stdin.is_none());
+        let ptr = stdin
+            .as_object_ptr()
+            .expect("sys.stdin should be a stream object");
+        let stream = unsafe { &*(ptr as *const ShapedObject) };
+        assert_eq!(
+            stream
+                .get_property("closed")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(stream.get_property("readline").is_some());
     }
 
     #[test]
     fn test_stdout_attribute() {
         let sys = SysModule::new();
         let stdout = sys.get_attr("stdout").unwrap();
-        assert!(stdout.is_none());
+        let ptr = stdout
+            .as_object_ptr()
+            .expect("sys.stdout should be a stream object");
+        let stream = unsafe { &*(ptr as *const ShapedObject) };
+        assert_eq!(
+            stream
+                .get_property("closed")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(stream.get_property("write").is_some());
+        assert!(stream.get_property("flush").is_some());
     }
 
     #[test]
     fn test_stderr_attribute() {
         let sys = SysModule::new();
         let stderr = sys.get_attr("stderr").unwrap();
-        assert!(stderr.is_none());
+        let ptr = stderr
+            .as_object_ptr()
+            .expect("sys.stderr should be a stream object");
+        let stream = unsafe { &*(ptr as *const ShapedObject) };
+        assert_eq!(
+            stream
+                .get_property("closed")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(stream.get_property("write").is_some());
+        assert!(stream.get_property("flush").is_some());
     }
 
     #[test]
@@ -880,6 +1016,109 @@ mod tests {
     }
 
     #[test]
+    fn test_version_info_attribute_is_real_tuple() {
+        let sys = SysModule::new();
+        let value = sys
+            .get_attr("version_info")
+            .expect("version_info should exist");
+        let ptr = value
+            .as_object_ptr()
+            .expect("version_info should be a tuple object");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        assert_eq!(tuple.len(), 5);
+        assert_eq!(tuple.get(0).and_then(|value| value.as_int()), Some(3));
+    }
+
+    #[test]
+    fn test_implementation_attribute_exposes_namespace_fields() {
+        let sys = SysModule::new();
+        let value = sys
+            .get_attr("implementation")
+            .expect("implementation should exist");
+        let ptr = value
+            .as_object_ptr()
+            .expect("implementation should be heap allocated");
+        let object = unsafe { &*(ptr as *const ShapedObject) };
+        assert_eq!(
+            object.get_property("name"),
+            Some(Value::string(intern("prism")))
+        );
+        assert!(object.get_property("version").is_some());
+    }
+
+    #[test]
+    fn test_hash_info_attribute_exposes_runtime_metadata() {
+        let sys = SysModule::new();
+        let value = sys.get_attr("hash_info").expect("hash_info should exist");
+        let ptr = value
+            .as_object_ptr()
+            .expect("hash_info should be heap allocated");
+        let object = unsafe { &*(ptr as *const ShapedObject) };
+
+        assert_eq!(
+            object
+                .get_property("width")
+                .and_then(|value| value.as_int()),
+            Some(i64::from(usize::BITS))
+        );
+        assert!(object.get_property("algorithm").is_some());
+    }
+
+    #[test]
+    fn test_platlibdir_attribute_matches_runtime_constant() {
+        let sys = SysModule::new();
+        let value = sys.get_attr("platlibdir").expect("platlibdir should exist");
+        let ptr = value
+            .as_string_object_ptr()
+            .expect("platlibdir should be an interned string") as *const u8;
+        assert_eq!(
+            interned_by_ptr(ptr)
+                .expect("platlibdir should resolve")
+                .as_ref(),
+            PLATLIBDIR
+        );
+    }
+
+    #[test]
+    fn test_windows_only_vpath_and_getwindowsversion_surface() {
+        let sys = SysModule::new();
+        let vpath = sys.get_attr("_vpath");
+        let getter = sys.get_attr("getwindowsversion");
+
+        if cfg!(windows) {
+            let vpath = vpath.expect("_vpath should exist on Windows");
+            let ptr = vpath
+                .as_string_object_ptr()
+                .expect("_vpath should be an interned string") as *const u8;
+            assert_eq!(
+                interned_by_ptr(ptr)
+                    .expect("_vpath should resolve")
+                    .as_ref(),
+                VPATH
+            );
+
+            let getter = getter.expect("getwindowsversion should exist on Windows");
+            let ptr = getter
+                .as_object_ptr()
+                .expect("getwindowsversion should be callable");
+            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            let result = builtin.call(&[]).expect("getwindowsversion should succeed");
+            let result_ptr = result
+                .as_object_ptr()
+                .expect("getwindowsversion should return a heap object");
+            let info = unsafe { &*(result_ptr as *const ShapedObject) };
+            assert_eq!(
+                info.get_property("platform")
+                    .and_then(|value| value.as_int()),
+                Some(2)
+            );
+        } else {
+            assert!(matches!(vpath, Err(ModuleError::AttributeError(_))));
+            assert!(matches!(getter, Err(ModuleError::AttributeError(_))));
+        }
+    }
+
+    #[test]
     fn test_argv_attribute_is_list() {
         let sys = SysModule::new();
         let argv = sys.get_attr("argv").unwrap();
@@ -956,6 +1195,86 @@ mod tests {
                 .iter()
                 .any(|name| name.as_ref() == "getfilesystemencoding")
         );
+        assert!(names.iter().any(|name| name.as_ref() == "__displayhook__"));
+        assert!(names.iter().any(|name| name.as_ref() == "__excepthook__"));
+    }
+
+    #[test]
+    fn test_sys_hooks_expose_default_callable_objects() {
+        let sys = SysModule::new();
+        let displayhook = sys
+            .get_attr("displayhook")
+            .expect("sys.displayhook should exist");
+        let default_displayhook = sys
+            .get_attr("__displayhook__")
+            .expect("sys.__displayhook__ should exist");
+        let excepthook = sys
+            .get_attr("excepthook")
+            .expect("sys.excepthook should exist");
+        let default_excepthook = sys
+            .get_attr("__excepthook__")
+            .expect("sys.__excepthook__ should exist");
+
+        for hook in [
+            displayhook,
+            default_displayhook,
+            excepthook,
+            default_excepthook,
+        ] {
+            let ptr = hook
+                .as_object_ptr()
+                .expect("sys hook should be a builtin function");
+            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            assert!(
+                builtin.name().starts_with("sys."),
+                "hook should be backed by a sys builtin"
+            );
+        }
+
+        assert_eq!(displayhook, default_displayhook);
+        assert_eq!(excepthook, default_excepthook);
+    }
+
+    #[test]
+    fn test_sys_excepthook_accepts_standard_signature() {
+        let sys = SysModule::new();
+        let hook = sys
+            .get_attr("excepthook")
+            .expect("sys.excepthook should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys.excepthook should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+
+        assert!(
+            builtin
+                .call(&[Value::none(), Value::none(), Value::none()])
+                .expect("sys.excepthook should accept exc triplets")
+                .is_none()
+        );
+        assert!(matches!(builtin.call(&[]), Err(BuiltinError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_sys_exc_info_returns_empty_triple_without_active_exception() {
+        let sys = SysModule::new();
+        let hook = sys.get_attr("exc_info").expect("sys.exc_info should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys.exc_info should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let mut vm = crate::VirtualMachine::new();
+
+        let value = builtin
+            .call_with_vm(&mut vm, &[])
+            .expect("sys.exc_info should accept zero arguments");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("sys.exc_info should return a tuple");
+        let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+
+        assert_eq!(tuple.len(), 3);
+        assert!(tuple.iter().all(Value::is_none));
     }
 
     #[test]

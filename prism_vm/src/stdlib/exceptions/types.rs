@@ -179,9 +179,13 @@ pub enum ExceptionTypeId {
     /// Method not implemented.
     NotImplementedError = 43,
 
+    /// Base class for grouped exceptions.
+    BaseExceptionGroup = 44,
+
+    /// Grouped exceptions that are also regular exceptions.
+    ExceptionGroup = 45,
+
     /// Reserved for future use.
-    _Reserved44 = 44,
-    _Reserved45 = 45,
     _Reserved46 = 46,
     _Reserved47 = 47,
 
@@ -305,6 +309,8 @@ impl ExceptionTypeId {
             41 => Some(Self::RuntimeError),
             42 => Some(Self::RecursionError),
             43 => Some(Self::NotImplementedError),
+            44 => Some(Self::BaseExceptionGroup),
+            45 => Some(Self::ExceptionGroup),
             48 => Some(Self::SyntaxError),
             49 => Some(Self::IndentationError),
             50 => Some(Self::TabError),
@@ -373,8 +379,8 @@ impl ExceptionTypeId {
             Self::RuntimeError => "RuntimeError",
             Self::RecursionError => "RecursionError",
             Self::NotImplementedError => "NotImplementedError",
-            Self::_Reserved44 => "_Reserved44",
-            Self::_Reserved45 => "_Reserved45",
+            Self::BaseExceptionGroup => "BaseExceptionGroup",
+            Self::ExceptionGroup => "ExceptionGroup",
             Self::_Reserved46 => "_Reserved46",
             Self::_Reserved47 => "_Reserved47",
             Self::SyntaxError => "SyntaxError",
@@ -463,8 +469,8 @@ impl ExceptionTypeId {
             Self::RuntimeError => Some(Self::Exception),
             Self::RecursionError => Some(Self::RuntimeError),
             Self::NotImplementedError => Some(Self::RuntimeError),
-            Self::_Reserved44 => Some(Self::Exception),
-            Self::_Reserved45 => Some(Self::Exception),
+            Self::BaseExceptionGroup => Some(Self::BaseException),
+            Self::ExceptionGroup => Some(Self::BaseExceptionGroup),
             Self::_Reserved46 => Some(Self::Exception),
             Self::_Reserved47 => Some(Self::Exception),
 
@@ -492,6 +498,16 @@ impl ExceptionTypeId {
         }
     }
 
+    /// Returns an additional direct parent for built-in types that model a
+    /// small amount of multiple inheritance in CPython's exception hierarchy.
+    #[inline]
+    pub const fn secondary_parent(self) -> Option<Self> {
+        match self {
+            Self::ExceptionGroup => Some(Self::Exception),
+            _ => None,
+        }
+    }
+
     /// Checks if this exception type is a subclass of another.
     ///
     /// This walks up the hierarchy, so worst case is O(depth).
@@ -499,6 +515,12 @@ impl ExceptionTypeId {
     #[inline]
     pub fn is_subclass_of(self, base: Self) -> bool {
         if self == base {
+            return true;
+        }
+
+        if let Some(secondary_parent) = self.secondary_parent()
+            && secondary_parent.is_subclass_of(base)
+        {
             return true;
         }
 
@@ -523,6 +545,11 @@ impl ExceptionTypeId {
             depth += 1;
             current = parent;
         }
+
+        if let Some(secondary_parent) = self.secondary_parent() {
+            depth = depth.min(secondary_parent.depth().saturating_add(1));
+        }
+
         depth
     }
 
@@ -625,8 +652,6 @@ mod tests {
     fn test_type_id_from_u8_reserved() {
         // Reserved IDs should return None
         assert_eq!(ExceptionTypeId::from_u8(23), None);
-        assert_eq!(ExceptionTypeId::from_u8(44), None);
-        assert_eq!(ExceptionTypeId::from_u8(45), None);
         assert_eq!(ExceptionTypeId::from_u8(46), None);
         assert_eq!(ExceptionTypeId::from_u8(47), None);
     }
@@ -663,6 +688,11 @@ mod tests {
         assert_eq!(ExceptionTypeId::StopIteration.name(), "StopIteration");
         assert_eq!(ExceptionTypeId::KeyError.name(), "KeyError");
         assert_eq!(ExceptionTypeId::IndexError.name(), "IndexError");
+        assert_eq!(
+            ExceptionTypeId::BaseExceptionGroup.name(),
+            "BaseExceptionGroup"
+        );
+        assert_eq!(ExceptionTypeId::ExceptionGroup.name(), "ExceptionGroup");
         assert_eq!(
             ExceptionTypeId::ZeroDivisionError.name(),
             "ZeroDivisionError"
@@ -728,6 +758,22 @@ mod tests {
         );
         assert_eq!(
             tab_error.parent().unwrap().parent().unwrap().parent(),
+            Some(ExceptionTypeId::Exception)
+        );
+    }
+
+    #[test]
+    fn test_exception_group_parent_chain() {
+        assert_eq!(
+            ExceptionTypeId::BaseExceptionGroup.parent(),
+            Some(ExceptionTypeId::BaseException)
+        );
+        assert_eq!(
+            ExceptionTypeId::ExceptionGroup.parent(),
+            Some(ExceptionTypeId::BaseExceptionGroup)
+        );
+        assert_eq!(
+            ExceptionTypeId::ExceptionGroup.secondary_parent(),
             Some(ExceptionTypeId::Exception)
         );
     }
@@ -846,6 +892,17 @@ mod tests {
     }
 
     #[test]
+    fn test_exception_group_multiple_inheritance_relationships() {
+        assert!(ExceptionTypeId::ExceptionGroup.is_subclass_of(ExceptionTypeId::ExceptionGroup));
+        assert!(ExceptionTypeId::ExceptionGroup.is_subclass_of(ExceptionTypeId::Exception));
+        assert!(
+            ExceptionTypeId::ExceptionGroup.is_subclass_of(ExceptionTypeId::BaseExceptionGroup)
+        );
+        assert!(ExceptionTypeId::ExceptionGroup.is_subclass_of(ExceptionTypeId::BaseException));
+        assert!(!ExceptionTypeId::BaseExceptionGroup.is_subclass_of(ExceptionTypeId::Exception));
+    }
+
+    #[test]
     fn test_is_not_subclass() {
         // TypeError is not a subclass of ValueError
         assert!(!ExceptionTypeId::TypeError.is_subclass_of(ExceptionTypeId::ValueError));
@@ -900,6 +957,12 @@ mod tests {
     fn test_depth_connection_refused() {
         // ConnectionRefusedError → ConnectionError → OSError → Exception → BaseException = depth 4
         assert_eq!(ExceptionTypeId::ConnectionRefusedError.depth(), 4);
+    }
+
+    #[test]
+    fn test_depth_exception_group_uses_shortest_builtin_chain() {
+        assert_eq!(ExceptionTypeId::BaseExceptionGroup.depth(), 1);
+        assert_eq!(ExceptionTypeId::ExceptionGroup.depth(), 2);
     }
 
     #[test]

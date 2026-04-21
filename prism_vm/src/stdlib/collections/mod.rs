@@ -48,9 +48,11 @@ use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_parser::lexer::identifier::{is_id_continue, is_id_start};
 use prism_parser::token::Keyword;
-use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::class::{ClassFlags, PyClassObject};
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
-    SubclassBitmap, class_id_to_type_id, register_global_class,
+    SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
@@ -69,10 +71,74 @@ static COUNTER_CONSTRUCTOR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static NAMEDTUPLE_FACTORY: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("collections.namedtuple"), builtin_namedtuple)
 });
+static ORDEREDDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("collections.OrderedDict.__repr__"),
+        ordered_dict_repr,
+    )
+});
+static DEFAULTDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("collections.defaultdict.__repr__"),
+        defaultdict_repr,
+    )
+});
+static CHAINMAP_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("collections.ChainMap.__repr__"), chainmap_repr)
+});
+static USERDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("collections.UserDict.__repr__"), userdict_repr)
+});
+static USERLIST_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("collections.UserList.__repr__"), userlist_repr)
+});
+static USERSTRING_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("collections.UserString.__repr__"),
+        userstring_repr,
+    )
+});
+static ORDEREDDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_native_collection_class(
+        "OrderedDict",
+        &[ClassId(TypeId::DICT.raw())],
+        &[("__repr__", builtin_value(&ORDEREDDICT_REPR))],
+    )
+});
+static DEFAULTDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_native_collection_class(
+        "defaultdict",
+        &[ClassId(TypeId::DICT.raw())],
+        &[("__repr__", builtin_value(&DEFAULTDICT_REPR))],
+    )
+});
 static CHAINMAP_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
-    let class = PyClassObject::new_simple(intern("ChainMap"));
-    class.set_attr(intern("__module__"), Value::string(intern("collections")));
-    Arc::new(class)
+    build_native_collection_class(
+        "ChainMap",
+        &[],
+        &[("__repr__", builtin_value(&CHAINMAP_REPR))],
+    )
+});
+static USERDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_native_collection_class(
+        "UserDict",
+        &[],
+        &[("__repr__", builtin_value(&USERDICT_REPR))],
+    )
+});
+static USERLIST_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_native_collection_class(
+        "UserList",
+        &[],
+        &[("__repr__", builtin_value(&USERLIST_REPR))],
+    )
+});
+static USERSTRING_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_native_collection_class(
+        "UserString",
+        &[],
+        &[("__repr__", builtin_value(&USERSTRING_REPR))],
+    )
 });
 
 // =============================================================================
@@ -121,12 +187,11 @@ impl Module for CollectionsModule {
             "Counter" => Ok(builtin_value(&COUNTER_CONSTRUCTOR)),
             "namedtuple" => Ok(builtin_value(&NAMEDTUPLE_FACTORY)),
             "ChainMap" => Ok(class_value(&CHAINMAP_CLASS)),
-            "defaultdict" | "OrderedDict" | "UserDict" | "UserList" | "UserString" => {
-                Err(ModuleError::AttributeError(format!(
-                    "collections.{} is not yet available as a type object",
-                    name
-                )))
-            }
+            "defaultdict" => Ok(class_value(&DEFAULTDICT_CLASS)),
+            "OrderedDict" => Ok(class_value(&ORDEREDDICT_CLASS)),
+            "UserDict" => Ok(class_value(&USERDICT_CLASS)),
+            "UserList" => Ok(class_value(&USERLIST_CLASS)),
+            "UserString" => Ok(class_value(&USERSTRING_CLASS)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'collections' has no attribute '{}'",
                 name
@@ -156,6 +221,41 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 #[inline]
 fn class_value(class: &Arc<PyClassObject>) -> Value {
     Value::object_ptr(Arc::into_raw(Arc::clone(class)) as *const ())
+}
+
+fn build_native_collection_class(
+    name: &str,
+    bases: &[ClassId],
+    attrs: &[(&str, Value)],
+) -> Arc<PyClassObject> {
+    let mut class = if bases.is_empty() {
+        PyClassObject::new_simple(intern(name))
+    } else {
+        PyClassObject::new(intern(name), bases, |class_id| {
+            (class_id == ClassId::OBJECT || class_id.0 < TypeId::FIRST_USER_TYPE).then(|| {
+                builtin_class_mro(class_id_to_type_id(class_id))
+                    .into_iter()
+                    .collect()
+            })
+        })
+        .unwrap_or_else(|err| panic!("failed to create collections.{name}: {err}"))
+    };
+
+    class.set_attr(intern("__module__"), Value::string(intern("collections")));
+    class.set_attr(intern("__qualname__"), Value::string(intern(name)));
+    for &(attr_name, attr_value) in attrs {
+        class.set_attr(intern(attr_name), attr_value);
+    }
+    class.add_flags(ClassFlags::INITIALIZED);
+
+    let mut bitmap = SubclassBitmap::new();
+    for &class_id in class.mro() {
+        bitmap.set_bit(class_id_to_type_id(class_id));
+    }
+
+    let class = Arc::new(class);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
 }
 
 #[inline]
@@ -422,9 +522,130 @@ fn extract_string_value(value: Value) -> Result<String, BuiltinError> {
     Ok(string.as_str().to_string())
 }
 
+fn collection_repr_text(value: Value) -> Result<String, BuiltinError> {
+    extract_string_value(crate::builtins::builtin_repr(&[value])?)
+}
+
+fn expect_collection_instance(
+    args: &[Value],
+    descriptor_name: &str,
+) -> Result<*const (), BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{descriptor_name}() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '{descriptor_name}' requires an instance"
+        ))
+    })
+}
+
+fn expect_collection_dict(
+    args: &[Value],
+    descriptor_name: &str,
+) -> Result<&'static DictObject, BuiltinError> {
+    let ptr = expect_collection_instance(args, descriptor_name)?;
+    crate::ops::objects::dict_storage_ref_from_ptr(ptr).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '{descriptor_name}' requires a dict-backed collections object"
+        ))
+    })
+}
+
+fn dict_repr_body(dict: &DictObject) -> Result<String, BuiltinError> {
+    let mut out = String::from("{");
+    for (index, (key, value)) in dict.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&collection_repr_text(key)?);
+        out.push_str(": ");
+        out.push_str(&collection_repr_text(value)?);
+    }
+    out.push('}');
+    Ok(out)
+}
+
+fn shaped_property_repr(ptr: *const (), name: &str) -> Result<Option<String>, BuiltinError> {
+    if crate::ops::objects::extract_type_id(ptr).raw() < TypeId::FIRST_USER_TYPE {
+        return Ok(None);
+    }
+
+    let object = unsafe { &*(ptr as *const ShapedObject) };
+    object
+        .get_property(name)
+        .map(collection_repr_text)
+        .transpose()
+}
+
+fn ordered_dict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    let dict = expect_collection_dict(args, "__repr__")?;
+    let mut out = String::from("OrderedDict(");
+    if dict.is_empty() {
+        out.push(')');
+        return Ok(Value::string(intern(&out)));
+    }
+
+    out.push('[');
+    for (index, (key, value)) in dict.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push('(');
+        out.push_str(&collection_repr_text(key)?);
+        out.push_str(", ");
+        out.push_str(&collection_repr_text(value)?);
+        out.push(')');
+    }
+    out.push_str("])");
+    Ok(Value::string(intern(&out)))
+}
+
+fn defaultdict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    let ptr = expect_collection_instance(args, "__repr__")?;
+    let dict = crate::ops::objects::dict_storage_ref_from_ptr(ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "descriptor '__repr__' requires a dict-backed collections object".to_string(),
+        )
+    })?;
+    let default_factory =
+        shaped_property_repr(ptr, "default_factory")?.unwrap_or_else(|| "None".to_string());
+    let result = format!("defaultdict({default_factory}, {})", dict_repr_body(dict)?);
+    Ok(Value::string(intern(&result)))
+}
+
+fn chainmap_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    let ptr = expect_collection_instance(args, "__repr__")?;
+    let maps_repr = shaped_property_repr(ptr, "maps")?.unwrap_or_else(|| "()".to_string());
+    Ok(Value::string(intern(&format!("ChainMap({maps_repr})"))))
+}
+
+fn userdict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    let ptr = expect_collection_instance(args, "__repr__")?;
+    let data_repr = shaped_property_repr(ptr, "data")?.unwrap_or_else(|| "{}".to_string());
+    Ok(Value::string(intern(&format!("UserDict({data_repr})"))))
+}
+
+fn userlist_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    let ptr = expect_collection_instance(args, "__repr__")?;
+    let data_repr = shaped_property_repr(ptr, "data")?.unwrap_or_else(|| "[]".to_string());
+    Ok(Value::string(intern(&format!("UserList({data_repr})"))))
+}
+
+fn userstring_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    let ptr = expect_collection_instance(args, "__repr__")?;
+    let data_repr = shaped_property_repr(ptr, "data")?.unwrap_or_else(|| "''".to_string());
+    Ok(Value::string(intern(&format!("UserString({data_repr})"))))
+}
+
 #[cfg(test)]
 mod module_tests {
     use super::*;
+    use crate::ops::objects::extract_type_id;
 
     fn dict_from_value(value: Value) -> *mut DictObject {
         value
@@ -433,7 +654,7 @@ mod module_tests {
     }
 
     #[test]
-    fn test_get_attr_exposes_counter_namedtuple_and_chainmap() {
+    fn test_get_attr_exposes_counter_namedtuple_and_collection_type_objects() {
         let module = CollectionsModule::new();
 
         assert!(
@@ -451,16 +672,47 @@ mod module_tests {
                 .is_some()
         );
 
-        let chainmap = module.get_attr("ChainMap").unwrap();
-        let chainmap_ptr = chainmap.as_object_ptr().expect("ChainMap should be class");
-        assert_eq!(
-            crate::ops::objects::extract_type_id(chainmap_ptr),
-            TypeId::TYPE
-        );
+        for name in [
+            "ChainMap",
+            "defaultdict",
+            "OrderedDict",
+            "UserDict",
+            "UserList",
+            "UserString",
+        ] {
+            let class_value = module
+                .get_attr(name)
+                .unwrap_or_else(|_| panic!("collections.{name} should resolve"));
+            let class_ptr = class_value
+                .as_object_ptr()
+                .unwrap_or_else(|| panic!("collections.{name} should be a class"));
+            assert_eq!(extract_type_id(class_ptr), TypeId::TYPE);
 
-        unsafe {
-            drop(Arc::from_raw(chainmap_ptr as *const PyClassObject));
+            unsafe {
+                drop(Arc::from_raw(class_ptr as *const PyClassObject));
+            }
         }
+    }
+
+    #[test]
+    fn test_pprint_sensitive_collection_reprs_are_distinct_from_builtin_dispatch_keys() {
+        let ordered = ORDEREDDICT_CLASS
+            .get_attr(&intern("__repr__"))
+            .expect("OrderedDict should define __repr__");
+        let default_dict = DEFAULTDICT_CLASS
+            .get_attr(&intern("__repr__"))
+            .expect("defaultdict should define __repr__");
+        let chainmap = CHAINMAP_CLASS
+            .get_attr(&intern("__repr__"))
+            .expect("ChainMap should define __repr__");
+        let user_dict = USERDICT_CLASS
+            .get_attr(&intern("__repr__"))
+            .expect("UserDict should define __repr__");
+
+        assert_ne!(ordered, default_dict);
+        assert_ne!(ordered, chainmap);
+        assert_ne!(default_dict, chainmap);
+        assert_ne!(user_dict, chainmap);
     }
 
     #[test]

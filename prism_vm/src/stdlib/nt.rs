@@ -38,14 +38,35 @@ static NT_LSTAT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.lstat"), nt_lstat));
 static NT_LISTDIR_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.listdir"), nt_listdir));
+static NT_GETPID_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.getpid"), nt_getpid));
 static NT_SCANDIR_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.scandir"), nt_scandir));
 static NT_GETCWD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.getcwd"), nt_getcwd));
 static NT_GETCWDB_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.getcwdb"), nt_getcwdb));
+static NT_GET_TERMINAL_SIZE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("nt.get_terminal_size"), nt_get_terminal_size)
+});
+static NT_MKDIR_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.mkdir"), nt_mkdir));
+static NT_REMOVE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.remove"), nt_remove));
+static NT_RENAME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.rename"), nt_rename));
+static NT_REPLACE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.replace"), nt_replace));
+static NT_RMDIR_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.rmdir"), nt_rmdir));
+static NT_TERMINAL_SIZE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.terminal_size"), nt_terminal_size));
+static NT_UNLINK_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.unlink"), nt_unlink));
 static NT_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt._exit"), nt_exit));
+static NT_ACCESS_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.access"), nt_access));
 static NT_STAT_RESULT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_stat_result_class);
 
 const STAT_RESULT_MATCH_ARGS: [&str; 7] = [
@@ -86,20 +107,34 @@ impl NtModule {
         Self {
             attrs: vec![
                 Arc::from("__all__"),
+                Arc::from("access"),
                 Arc::from("open"),
                 Arc::from("stat"),
                 Arc::from("lstat"),
                 Arc::from("listdir"),
+                Arc::from("getpid"),
                 Arc::from("scandir"),
                 Arc::from("getcwd"),
                 Arc::from("getcwdb"),
+                Arc::from("get_terminal_size"),
+                Arc::from("mkdir"),
+                Arc::from("remove"),
+                Arc::from("rename"),
+                Arc::from("replace"),
+                Arc::from("rmdir"),
+                Arc::from("unlink"),
                 Arc::from("stat_result"),
+                Arc::from("terminal_size"),
                 Arc::from("environ"),
                 Arc::from("_have_functions"),
                 Arc::from("_exit"),
                 Arc::from("SEEK_SET"),
                 Arc::from("SEEK_CUR"),
                 Arc::from("SEEK_END"),
+                Arc::from("F_OK"),
+                Arc::from("R_OK"),
+                Arc::from("W_OK"),
+                Arc::from("X_OK"),
             ],
             all_value: export_names_value(),
             environ_value: environ_value(),
@@ -122,20 +157,34 @@ impl Module for NtModule {
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
             "__all__" => Ok(self.all_value),
+            "access" => Ok(builtin_value(&NT_ACCESS_FUNCTION)),
             "open" => Ok(builtin_value(&NT_OPEN_FUNCTION)),
             "stat" => Ok(builtin_value(&NT_STAT_FUNCTION)),
             "lstat" => Ok(builtin_value(&NT_LSTAT_FUNCTION)),
             "listdir" => Ok(builtin_value(&NT_LISTDIR_FUNCTION)),
+            "getpid" => Ok(builtin_value(&NT_GETPID_FUNCTION)),
             "scandir" => Ok(builtin_value(&NT_SCANDIR_FUNCTION)),
             "getcwd" => Ok(builtin_value(&NT_GETCWD_FUNCTION)),
             "getcwdb" => Ok(builtin_value(&NT_GETCWDB_FUNCTION)),
+            "get_terminal_size" => Ok(builtin_value(&NT_GET_TERMINAL_SIZE_FUNCTION)),
+            "mkdir" => Ok(builtin_value(&NT_MKDIR_FUNCTION)),
+            "remove" => Ok(builtin_value(&NT_REMOVE_FUNCTION)),
+            "rename" => Ok(builtin_value(&NT_RENAME_FUNCTION)),
+            "replace" => Ok(builtin_value(&NT_REPLACE_FUNCTION)),
+            "rmdir" => Ok(builtin_value(&NT_RMDIR_FUNCTION)),
+            "unlink" => Ok(builtin_value(&NT_UNLINK_FUNCTION)),
             "stat_result" => Ok(stat_result_class_value()),
+            "terminal_size" => Ok(builtin_value(&NT_TERMINAL_SIZE_FUNCTION)),
             "environ" => Ok(self.environ_value),
             "_have_functions" => Ok(self.have_functions_value),
             "_exit" => Ok(builtin_value(&NT_EXIT_FUNCTION)),
             "SEEK_SET" => Ok(Value::int(0).expect("SEEK_SET fits in i64")),
             "SEEK_CUR" => Ok(Value::int(1).expect("SEEK_CUR fits in i64")),
             "SEEK_END" => Ok(Value::int(2).expect("SEEK_END fits in i64")),
+            "F_OK" => Ok(Value::int(0).expect("F_OK fits in i64")),
+            "R_OK" => Ok(Value::int(4).expect("R_OK fits in i64")),
+            "W_OK" => Ok(Value::int(2).expect("W_OK fits in i64")),
+            "X_OK" => Ok(Value::int(1).expect("X_OK fits in i64")),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'nt' has no attribute '{}'",
                 name
@@ -161,18 +210,32 @@ fn leak_object_value<T>(object: T) -> Value {
 
 fn export_names_value() -> Value {
     let names = [
+        "access",
         "open",
         "stat",
         "lstat",
         "listdir",
+        "getpid",
         "scandir",
         "getcwd",
         "getcwdb",
+        "get_terminal_size",
+        "mkdir",
+        "remove",
+        "rename",
+        "replace",
+        "rmdir",
+        "unlink",
         "stat_result",
+        "terminal_size",
         "environ",
         "SEEK_SET",
         "SEEK_CUR",
         "SEEK_END",
+        "F_OK",
+        "R_OK",
+        "W_OK",
+        "X_OK",
     ]
     .into_iter()
     .map(|name| Value::string(intern(name)))
@@ -280,6 +343,35 @@ fn parse_single_path_arg(args: &[Value], fn_name: &str) -> Result<PathBuf, Built
             args[0].type_name()
         ))
     })
+}
+
+fn path_from_value(value: Value, fn_name: &str, parameter: &str) -> Result<PathBuf, BuiltinError> {
+    if let Some(path) = value_to_string(value) {
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Some(bytes) = value_to_bytes(value) {
+        return Ok(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()));
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "{fn_name}() {parameter} must be str, bytes, or bytearray, not {}",
+        value.type_name()
+    )))
+}
+
+fn parse_two_path_args(args: &[Value], fn_name: &str) -> Result<(PathBuf, PathBuf), BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "{fn_name}() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok((
+        path_from_value(args[0], fn_name, "source path")?,
+        path_from_value(args[1], fn_name, "destination path")?,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,13 +545,88 @@ fn build_stat_result_value(path: &Path, metadata: &Metadata) -> Value {
     leak_object_value(instance)
 }
 
+fn build_terminal_size_value(columns: i64, lines: i64) -> Value {
+    let registry = shape_registry();
+    let mut terminal_size = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
+    terminal_size.set_property(
+        intern("columns"),
+        Value::int(columns).expect("terminal_size.columns should fit"),
+        registry,
+    );
+    terminal_size.set_property(
+        intern("lines"),
+        Value::int(lines).expect("terminal_size.lines should fit"),
+        registry,
+    );
+    Value::object_ptr(Box::into_raw(terminal_size) as *const ())
+}
+
+fn terminal_size_components_from_value(
+    value: Value,
+    fn_name: &str,
+) -> Result<(i64, i64), BuiltinError> {
+    let ptr = value.as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "{fn_name}() argument must be a sequence of length 2, not {}",
+            value.type_name()
+        ))
+    })?;
+
+    if crate::ops::objects::extract_type_id(ptr) == TypeId::TUPLE {
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        if tuple.len() != 2 {
+            return Err(BuiltinError::TypeError(format!(
+                "{fn_name}() takes a 2-sequence ({}-sequence given)",
+                tuple.len()
+            )));
+        }
+        return Ok((
+            terminal_size_component(tuple.get(0).expect("tuple should contain first item"))?,
+            terminal_size_component(tuple.get(1).expect("tuple should contain second item"))?,
+        ));
+    }
+
+    if crate::ops::objects::extract_type_id(ptr) == TypeId::LIST {
+        let list = unsafe { &*(ptr as *const ListObject) };
+        if list.len() != 2 {
+            return Err(BuiltinError::TypeError(format!(
+                "{fn_name}() takes a 2-sequence ({}-sequence given)",
+                list.len()
+            )));
+        }
+        return Ok((
+            terminal_size_component(list.get(0).expect("list should contain first item"))?,
+            terminal_size_component(list.get(1).expect("list should contain second item"))?,
+        ));
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "{fn_name}() argument must be a tuple or list, not {}",
+        value.type_name()
+    )))
+}
+
+fn terminal_size_component(value: Value) -> Result<i64, BuiltinError> {
+    if let Some(integer) = value.as_int() {
+        return Ok(integer);
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "terminal_size() elements must be integers, not {}",
+        value.type_name()
+    )))
+}
+
 fn stat_impl<F>(args: &[Value], fn_name: &str, stat_fn: F) -> Result<Value, BuiltinError>
 where
     F: Fn(&Path) -> std::io::Result<Metadata>,
 {
     let path = parse_single_path_arg(args, fn_name)?;
     let metadata = stat_fn(&path).map_err(|err| {
-        BuiltinError::ValueError(format!(
+        BuiltinError::OSError(format!(
             "{}() failed for '{}': {}",
             fn_name,
             path.display(),
@@ -478,6 +645,50 @@ fn not_implemented(function_name: &str, _args: &[Value]) -> Result<Value, Builti
 
 fn nt_open(args: &[Value]) -> Result<Value, BuiltinError> {
     not_implemented("nt.open()", args)
+}
+
+fn nt_access(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "access() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let path = path_from_value(args[0], "access", "path")?;
+    let mode = args[1]
+        .as_int()
+        .or_else(|| args[1].as_bool().map(i64::from))
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "access() mode must be an integer, not {}",
+                args[1].type_name()
+            ))
+        })?;
+
+    let exists = path.exists();
+    let writable = std::fs::metadata(&path)
+        .map(|metadata| !metadata.permissions().readonly())
+        .unwrap_or(false);
+    let executable = exists;
+
+    let allowed = if mode == 0 {
+        exists
+    } else {
+        let mut result = true;
+        if mode & 4 != 0 {
+            result &= exists;
+        }
+        if mode & 2 != 0 {
+            result &= writable;
+        }
+        if mode & 1 != 0 {
+            result &= executable;
+        }
+        result
+    };
+
+    Ok(Value::bool(allowed))
 }
 
 fn nt_stat(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -519,6 +730,92 @@ fn nt_scandir(args: &[Value]) -> Result<Value, BuiltinError> {
     not_implemented("nt.scandir()", args)
 }
 
+fn nt_getpid(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getpid() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    Ok(Value::int(std::process::id() as i64).expect("process id fits in i64"))
+}
+
+fn remove_impl(args: &[Value], fn_name: &str) -> Result<Value, BuiltinError> {
+    let path = parse_single_path_arg(args, fn_name)?;
+    std::fs::remove_file(&path).map_err(|err| {
+        BuiltinError::OSError(format!(
+            "{}() failed for '{}': {}",
+            fn_name,
+            path.display(),
+            err
+        ))
+    })?;
+    Ok(Value::none())
+}
+
+fn nt_mkdir(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "mkdir() takes 1 or 2 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let path = path_from_value(args[0], "mkdir", "path")?;
+    if let Some(mode) = args.get(1)
+        && mode.as_int().is_none()
+        && mode.as_bool().is_none()
+    {
+        return Err(BuiltinError::TypeError(format!(
+            "mkdir() integer mode expected, not {}",
+            mode.type_name()
+        )));
+    }
+
+    std::fs::create_dir(&path).map_err(|err| {
+        BuiltinError::OSError(format!("mkdir() failed for '{}': {}", path.display(), err))
+    })?;
+    Ok(Value::none())
+}
+
+fn nt_remove(args: &[Value]) -> Result<Value, BuiltinError> {
+    remove_impl(args, "remove")
+}
+
+fn rename_impl(args: &[Value], fn_name: &str) -> Result<Value, BuiltinError> {
+    let (src, dst) = parse_two_path_args(args, fn_name)?;
+    std::fs::rename(&src, &dst).map_err(|err| {
+        BuiltinError::OSError(format!(
+            "{fn_name}() failed from '{}' to '{}': {}",
+            src.display(),
+            dst.display(),
+            err
+        ))
+    })?;
+    Ok(Value::none())
+}
+
+fn nt_rename(args: &[Value]) -> Result<Value, BuiltinError> {
+    rename_impl(args, "rename")
+}
+
+fn nt_replace(args: &[Value]) -> Result<Value, BuiltinError> {
+    rename_impl(args, "replace")
+}
+
+fn nt_rmdir(args: &[Value]) -> Result<Value, BuiltinError> {
+    let path = parse_single_path_arg(args, "rmdir")?;
+    std::fs::remove_dir(&path).map_err(|err| {
+        BuiltinError::OSError(format!("rmdir() failed for '{}': {}", path.display(), err))
+    })?;
+    Ok(Value::none())
+}
+
+fn nt_unlink(args: &[Value]) -> Result<Value, BuiltinError> {
+    remove_impl(args, "unlink")
+}
+
 fn cwd_string() -> Result<String, BuiltinError> {
     super::os::getcwd()
         .map(|cwd| cwd.as_ref().to_owned())
@@ -546,6 +843,79 @@ fn nt_getcwdb(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let cwd = cwd_string()?;
     Ok(leak_object_value(BytesObject::from_slice(cwd.as_bytes())))
+}
+
+fn nt_terminal_size(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "terminal_size() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let (columns, lines) = terminal_size_components_from_value(args[0], "terminal_size")?;
+    Ok(build_terminal_size_value(columns, lines))
+}
+
+fn nt_get_terminal_size(args: &[Value]) -> Result<Value, BuiltinError> {
+    let fd = match args {
+        [] => 1,
+        [value] => value.as_int().ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "get_terminal_size() argument must be an integer, not {}",
+                value.type_name()
+            ))
+        })?,
+        _ => {
+            return Err(BuiltinError::TypeError(format!(
+                "get_terminal_size() takes at most 1 argument ({} given)",
+                args.len()
+            )));
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        let std_handle = match fd {
+            0 => STD_INPUT_HANDLE,
+            1 => STD_OUTPUT_HANDLE,
+            2 => STD_ERROR_HANDLE,
+            _ => return Err(BuiltinError::OSError(format!("bad file descriptor: {fd}"))),
+        };
+
+        let handle = unsafe { GetStdHandle(std_handle) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE as *mut core::ffi::c_void {
+            return Err(BuiltinError::OSError(format!(
+                "failed to access console handle for file descriptor {fd}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let mut info = MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::zeroed();
+        if unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) } == 0 {
+            return Err(BuiltinError::OSError(format!(
+                "failed to query console size for file descriptor {fd}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let info = unsafe { info.assume_init() };
+        let columns = i64::from(info.srWindow.Right - info.srWindow.Left + 1);
+        let lines = i64::from(info.srWindow.Bottom - info.srWindow.Top + 1);
+        return Ok(build_terminal_size_value(columns, lines));
+    }
+
+    #[allow(unreachable_code)]
+    Err(BuiltinError::OSError(
+        "get_terminal_size() is only available on Windows builds".to_string(),
+    ))
 }
 
 fn nt_exit(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -576,17 +946,31 @@ mod tests {
         let module = NtModule::new();
 
         assert!(module.get_attr("__all__").is_ok());
+        assert!(module.get_attr("access").is_ok());
         assert!(module.get_attr("open").is_ok());
         assert!(module.get_attr("stat").is_ok());
         assert!(module.get_attr("lstat").is_ok());
         assert!(module.get_attr("listdir").is_ok());
+        assert!(module.get_attr("getpid").is_ok());
         assert!(module.get_attr("scandir").is_ok());
         assert!(module.get_attr("getcwd").is_ok());
         assert!(module.get_attr("getcwdb").is_ok());
+        assert!(module.get_attr("get_terminal_size").is_ok());
+        assert!(module.get_attr("mkdir").is_ok());
+        assert!(module.get_attr("remove").is_ok());
+        assert!(module.get_attr("rename").is_ok());
+        assert!(module.get_attr("replace").is_ok());
+        assert!(module.get_attr("rmdir").is_ok());
+        assert!(module.get_attr("unlink").is_ok());
         assert!(module.get_attr("stat_result").is_ok());
+        assert!(module.get_attr("terminal_size").is_ok());
         assert!(module.get_attr("environ").is_ok());
         assert!(module.get_attr("_have_functions").is_ok());
         assert!(module.get_attr("_exit").is_ok());
+        assert!(module.get_attr("F_OK").is_ok());
+        assert!(module.get_attr("R_OK").is_ok());
+        assert!(module.get_attr("W_OK").is_ok());
+        assert!(module.get_attr("X_OK").is_ok());
     }
 
     #[test]
@@ -606,6 +990,11 @@ mod tests {
         assert!(
             tuple
                 .iter()
+                .any(|value| value == &Value::string(intern("F_OK")))
+        );
+        assert!(
+            tuple
+                .iter()
                 .any(|value| value == &Value::string(intern("stat")))
         );
         assert!(
@@ -621,7 +1010,22 @@ mod tests {
         assert!(
             tuple
                 .iter()
+                .any(|value| value == &Value::string(intern("getpid")))
+        );
+        assert!(
+            tuple
+                .iter()
                 .any(|value| value == &Value::string(intern("getcwd")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("terminal_size")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("rmdir")))
         );
         assert!(
             tuple
@@ -755,6 +1159,143 @@ mod tests {
         let cwd = std::env::current_dir().expect("current_dir should succeed");
         assert_eq!(bytes.as_bytes(), cwd.to_string_lossy().as_bytes());
         assert_eq!(bytes.header.type_id, TypeId::BYTES);
+    }
+
+    #[test]
+    fn test_nt_terminal_size_constructor_builds_named_record() {
+        let value = nt_terminal_size(&[leak_object_value(TupleObject::from_vec(vec![
+            Value::int(120).expect("columns should fit"),
+            Value::int(40).expect("lines should fit"),
+        ]))])
+        .expect("terminal_size constructor should accept a 2-tuple");
+        let ptr = value
+            .as_object_ptr()
+            .expect("terminal_size should return a heap object");
+        let shaped = unsafe { &*(ptr as *const ShapedObject) };
+
+        assert_eq!(
+            shaped
+                .get_property("columns")
+                .and_then(|value| value.as_int()),
+            Some(120)
+        );
+        assert_eq!(
+            shaped
+                .get_property("lines")
+                .and_then(|value| value.as_int()),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn test_nt_terminal_size_rejects_non_sequences() {
+        let err = nt_terminal_size(&[Value::int(80).expect("integer should fit")])
+            .expect_err("terminal_size should validate constructor input");
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_nt_get_terminal_size_rejects_bad_file_descriptors() {
+        let err = nt_get_terminal_size(&[Value::int(99).expect("descriptor should fit")])
+            .expect_err("unsupported file descriptors should fail");
+        assert!(matches!(err, BuiltinError::OSError(_)));
+        assert!(err.to_string().contains("bad file descriptor"));
+    }
+
+    #[test]
+    fn test_nt_getpid_returns_process_identifier() {
+        let result = nt_getpid(&[]).expect("nt.getpid should succeed");
+        assert_eq!(result.as_int(), Some(std::process::id() as i64));
+    }
+
+    #[test]
+    fn test_nt_remove_and_unlink_delete_files() {
+        let remove_path = unique_temp_path("remove");
+        fs::write(&remove_path, b"remove").expect("temp file should be written");
+        nt_remove(&[Value::string(intern(&remove_path.to_string_lossy()))])
+            .expect("nt.remove should delete files");
+        assert!(!remove_path.exists());
+
+        let unlink_path = unique_temp_path("unlink");
+        fs::write(&unlink_path, b"unlink").expect("temp file should be written");
+        nt_unlink(&[Value::string(intern(&unlink_path.to_string_lossy()))])
+            .expect("nt.unlink should delete files");
+        assert!(!unlink_path.exists());
+    }
+
+    #[test]
+    fn test_nt_access_tracks_existence_and_writability() {
+        let file = unique_temp_path("access");
+        fs::write(&file, b"probe").expect("probe file should be written");
+
+        let exists = nt_access(&[
+            Value::string(intern(&file.to_string_lossy())),
+            Value::int(0).expect("F_OK should fit"),
+        ])
+        .expect("access should succeed");
+        assert_eq!(exists.as_bool(), Some(true));
+
+        let writable = nt_access(&[
+            Value::string(intern(&file.to_string_lossy())),
+            Value::int(2).expect("W_OK should fit"),
+        ])
+        .expect("access should accept W_OK");
+        assert_eq!(writable.as_bool(), Some(true));
+
+        let missing = nt_access(&[
+            Value::string(intern(
+                &unique_temp_path("missing_access").to_string_lossy(),
+            )),
+            Value::int(0).expect("F_OK should fit"),
+        ])
+        .expect("access should handle missing paths");
+        assert_eq!(missing.as_bool(), Some(false));
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_nt_mkdir_and_rmdir_manage_directories() {
+        let dir = unique_temp_path("mkdir");
+        nt_mkdir(&[Value::string(intern(&dir.to_string_lossy()))])
+            .expect("nt.mkdir should create directories");
+        assert!(dir.is_dir());
+
+        nt_rmdir(&[Value::string(intern(&dir.to_string_lossy()))])
+            .expect("nt.rmdir should remove empty directories");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_nt_rename_and_replace_move_files() {
+        let src = unique_temp_path("rename_src");
+        let dst = unique_temp_path("rename_dst");
+        fs::write(&src, b"payload").expect("source file should be created");
+        nt_rename(&[
+            Value::string(intern(&src.to_string_lossy())),
+            Value::string(intern(&dst.to_string_lossy())),
+        ])
+        .expect("nt.rename should move files");
+        assert!(!src.exists());
+        assert_eq!(
+            fs::read(&dst).expect("destination should exist"),
+            b"payload"
+        );
+
+        let replacement = unique_temp_path("replace_src");
+        fs::write(&replacement, b"replacement").expect("replacement file should be created");
+        nt_replace(&[
+            Value::string(intern(&replacement.to_string_lossy())),
+            Value::string(intern(&dst.to_string_lossy())),
+        ])
+        .expect("nt.replace should atomically replace files");
+        assert!(!replacement.exists());
+        assert_eq!(
+            fs::read(&dst).expect("destination should remain after replace"),
+            b"replacement"
+        );
+
+        let _ = fs::remove_file(dst);
     }
 
     #[test]

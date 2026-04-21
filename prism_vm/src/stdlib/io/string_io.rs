@@ -60,6 +60,22 @@ impl StringIO {
         }
     }
 
+    /// Rebuild a `StringIO` from persisted interpreter-visible state.
+    #[inline]
+    pub(crate) fn from_parts(buffer: String, position: usize, closed: bool) -> Self {
+        Self {
+            buffer,
+            position,
+            closed,
+        }
+    }
+
+    /// Split a `StringIO` into persisted interpreter-visible state.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (String, usize, bool) {
+        (self.buffer, self.position, self.closed)
+    }
+
     /// Get the entire contents of the stream.
     ///
     /// This returns the full buffer regardless of position.

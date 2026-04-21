@@ -3,6 +3,7 @@
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::builtins::{decode_bytes_to_text, encode_text_to_data};
 use crate::ops::calls::invoke_callable_value;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
@@ -55,6 +56,18 @@ static IGNORE_ERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
 });
 static REPLACE_ERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_codecs.replace_errors"), builtin_replace_errors)
+});
+static SURROGATEESCAPE_ERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_codecs.surrogateescape_errors"),
+        builtin_surrogateescape_errors,
+    )
+});
+static SURROGATEPASS_ERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_codecs.surrogatepass_errors"),
+        builtin_surrogatepass_errors,
+    )
 });
 static XMLCHARREFREPLACE_ERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -171,6 +184,14 @@ impl CodecRegistry {
         error_handlers.insert(intern("strict"), builtin_value(&STRICT_ERRORS_FUNCTION));
         error_handlers.insert(intern("ignore"), builtin_value(&IGNORE_ERRORS_FUNCTION));
         error_handlers.insert(intern("replace"), builtin_value(&REPLACE_ERRORS_FUNCTION));
+        error_handlers.insert(
+            intern("surrogateescape"),
+            builtin_value(&SURROGATEESCAPE_ERRORS_FUNCTION),
+        );
+        error_handlers.insert(
+            intern("surrogatepass"),
+            builtin_value(&SURROGATEPASS_ERRORS_FUNCTION),
+        );
         error_handlers.insert(
             intern("xmlcharrefreplace"),
             builtin_value(&XMLCHARREFREPLACE_ERRORS_FUNCTION),
@@ -508,6 +529,14 @@ fn builtin_replace_errors(args: &[Value]) -> Result<Value, BuiltinError> {
     builtin_passthrough_error_handler(args)
 }
 
+fn builtin_surrogateescape_errors(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_passthrough_error_handler(args)
+}
+
+fn builtin_surrogatepass_errors(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_passthrough_error_handler(args)
+}
+
 fn builtin_passthrough_error_handler(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -620,7 +649,7 @@ fn encode_value(value: Value, kind: CodecKind, errors: &str) -> Result<Value, Bu
         value,
         &format!("{} encoder expects str input", kind.canonical_name()),
     )?;
-    let bytes = encode_string(&input, kind, parse_error_policy(errors)?)?;
+    let bytes = encode_with_kind(&input, kind, errors)?;
     Ok(leak_object_value(BytesObject::from_vec_with_type(
         bytes,
         TypeId::BYTES,
@@ -632,11 +661,7 @@ fn decode_value(value: Value, kind: CodecKind, errors: &str) -> Result<Value, Bu
         value,
         &format!("{} decoder expects bytes input", kind.canonical_name()),
     )?;
-    Ok(string_value(decode_bytes(
-        &input,
-        kind,
-        parse_error_policy(errors)?,
-    )?))
+    Ok(string_value(decode_with_kind(&input, kind, errors)?))
 }
 
 fn string_value(text: String) -> Value {
@@ -691,18 +716,64 @@ fn consumed_length_for_decode(value: Value, _kind: CodecKind) -> Result<Value, B
     Ok(Value::int(count).expect("consumed length fits"))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ErrorPolicy {
-    Strict,
-    Ignore,
-    Replace,
+fn encode_with_kind(input: &str, kind: CodecKind, errors: &str) -> Result<Vec<u8>, BuiltinError> {
+    let normalized_errors = validate_error_policy(errors)?;
+    match kind {
+        CodecKind::Ascii => {
+            encode_text_to_data(input, Some("ascii"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+        CodecKind::Latin1 => {
+            encode_text_to_data(input, Some("latin-1"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+        CodecKind::Utf8 => {
+            encode_text_to_data(input, Some("utf-8"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+        CodecKind::Utf8Sig => {
+            let payload =
+                encode_text_to_data(input, Some("utf-8"), Some(normalized_errors.as_str()))
+                    .map_err(remap_unknown_error_handler)?;
+            let mut out = Vec::with_capacity(payload.len() + 3);
+            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            out.extend_from_slice(&payload);
+            Ok(out)
+        }
+    }
 }
 
-fn parse_error_policy(errors: &str) -> Result<ErrorPolicy, BuiltinError> {
-    match errors.to_ascii_lowercase().as_str() {
-        "strict" => Ok(ErrorPolicy::Strict),
-        "ignore" => Ok(ErrorPolicy::Ignore),
-        "replace" => Ok(ErrorPolicy::Replace),
+fn decode_with_kind(input: &[u8], kind: CodecKind, errors: &str) -> Result<String, BuiltinError> {
+    let normalized_errors = validate_error_policy(errors)?;
+    match kind {
+        CodecKind::Ascii => {
+            decode_bytes_to_text(input, Some("ascii"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+        CodecKind::Latin1 => {
+            decode_bytes_to_text(input, Some("latin-1"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+        CodecKind::Utf8 => {
+            decode_bytes_to_text(input, Some("utf-8"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+        CodecKind::Utf8Sig => {
+            let payload = if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                &input[3..]
+            } else {
+                input
+            };
+            decode_bytes_to_text(payload, Some("utf-8"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
+    }
+}
+
+fn validate_error_policy(errors: &str) -> Result<String, BuiltinError> {
+    let normalized = errors.to_ascii_lowercase();
+    match normalized.as_str() {
+        "strict" | "ignore" | "replace" | "surrogateescape" | "surrogatepass" => Ok(normalized),
         _ => Err(BuiltinError::KeyError(format!(
             "unknown error handler name '{}'",
             errors
@@ -710,144 +781,19 @@ fn parse_error_policy(errors: &str) -> Result<ErrorPolicy, BuiltinError> {
     }
 }
 
-fn encode_string(
-    input: &str,
-    kind: CodecKind,
-    policy: ErrorPolicy,
-) -> Result<Vec<u8>, BuiltinError> {
-    match kind {
-        CodecKind::Ascii => encode_ascii(input, policy, "ascii"),
-        CodecKind::Latin1 => encode_latin1(input, policy, "latin-1"),
-        CodecKind::Utf8 => Ok(input.as_bytes().to_vec()),
-        CodecKind::Utf8Sig => {
-            let mut out = Vec::with_capacity(input.len() + 3);
-            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-            out.extend_from_slice(input.as_bytes());
-            Ok(out)
+fn remap_unknown_error_handler(err: BuiltinError) -> BuiltinError {
+    match err {
+        BuiltinError::ValueError(message) if message.starts_with("unknown error handler name ") => {
+            BuiltinError::KeyError(message)
         }
-    }
-}
-
-fn decode_bytes(
-    input: &[u8],
-    kind: CodecKind,
-    policy: ErrorPolicy,
-) -> Result<String, BuiltinError> {
-    match kind {
-        CodecKind::Ascii => decode_ascii(input, policy, "ascii"),
-        CodecKind::Latin1 => Ok(input.iter().map(|&byte| byte as char).collect()),
-        CodecKind::Utf8 => decode_utf8(input, policy, false),
-        CodecKind::Utf8Sig => decode_utf8(input, policy, true),
-    }
-}
-
-fn encode_ascii(input: &str, policy: ErrorPolicy, name: &str) -> Result<Vec<u8>, BuiltinError> {
-    let mut out = Vec::with_capacity(input.len());
-    for ch in input.chars() {
-        let code = ch as u32;
-        if code <= 0x7F {
-            out.push(code as u8);
-            continue;
-        }
-        match policy {
-            ErrorPolicy::Strict => {
-                return Err(BuiltinError::ValueError(format!(
-                    "{name} codec can't encode character U+{code:04X}"
-                )));
-            }
-            ErrorPolicy::Ignore => {}
-            ErrorPolicy::Replace => out.push(b'?'),
-        }
-    }
-    Ok(out)
-}
-
-fn encode_latin1(input: &str, policy: ErrorPolicy, name: &str) -> Result<Vec<u8>, BuiltinError> {
-    let mut out = Vec::with_capacity(input.len());
-    for ch in input.chars() {
-        let code = ch as u32;
-        if code <= 0xFF {
-            out.push(code as u8);
-            continue;
-        }
-        match policy {
-            ErrorPolicy::Strict => {
-                return Err(BuiltinError::ValueError(format!(
-                    "{name} codec can't encode character U+{code:04X}"
-                )));
-            }
-            ErrorPolicy::Ignore => {}
-            ErrorPolicy::Replace => out.push(b'?'),
-        }
-    }
-    Ok(out)
-}
-
-fn decode_ascii(input: &[u8], policy: ErrorPolicy, name: &str) -> Result<String, BuiltinError> {
-    let mut out = String::with_capacity(input.len());
-    for &byte in input {
-        if byte <= 0x7F {
-            out.push(byte as char);
-            continue;
-        }
-        match policy {
-            ErrorPolicy::Strict => {
-                return Err(BuiltinError::ValueError(format!(
-                    "{name} codec can't decode byte 0x{byte:02X}"
-                )));
-            }
-            ErrorPolicy::Ignore => {}
-            ErrorPolicy::Replace => out.push('\u{FFFD}'),
-        }
-    }
-    Ok(out)
-}
-
-fn decode_utf8(input: &[u8], policy: ErrorPolicy, strip_bom: bool) -> Result<String, BuiltinError> {
-    let bytes = if strip_bom && input.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &input[3..]
-    } else {
-        input
-    };
-    match policy {
-        ErrorPolicy::Strict => std::str::from_utf8(bytes)
-            .map(|text| text.to_string())
-            .map_err(|err| {
-                BuiltinError::ValueError(format!("utf-8 codec can't decode data: {}", err))
-            }),
-        ErrorPolicy::Replace => Ok(String::from_utf8_lossy(bytes).into_owned()),
-        ErrorPolicy::Ignore => {
-            let mut out = String::new();
-            let mut remaining = bytes;
-            while !remaining.is_empty() {
-                match std::str::from_utf8(remaining) {
-                    Ok(valid) => {
-                        out.push_str(valid);
-                        break;
-                    }
-                    Err(err) => {
-                        let valid_up_to = err.valid_up_to();
-                        if valid_up_to > 0 {
-                            let (valid, rest) = remaining.split_at(valid_up_to);
-                            out.push_str(
-                                std::str::from_utf8(valid)
-                                    .expect("prefix validated by Utf8Error::valid_up_to"),
-                            );
-                            remaining = rest;
-                        } else {
-                            remaining = &remaining[1..];
-                        }
-                    }
-                }
-            }
-            Ok(out)
-        }
+        other => other,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::python_unicode::encode_python_code_point;
 
     fn builtin_from_value(value: Value) -> &'static BuiltinFunctionObject {
         let ptr = value.as_object_ptr().expect("expected builtin");
@@ -906,6 +852,22 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_error_exposes_surrogate_handlers() {
+        let lookup_error =
+            builtin_from_value(CodecsModule::new().get_attr("lookup_error").unwrap());
+
+        for handler_name in ["surrogateescape", "surrogatepass"] {
+            let value = lookup_error
+                .call(&[Value::string(intern(handler_name))])
+                .expect("built-in surrogate handler should resolve");
+            assert!(
+                value.as_object_ptr().is_some(),
+                "lookup_error should return callable object for {handler_name}"
+            );
+        }
+    }
+
+    #[test]
     fn test_utf8_encode_returns_tuple() {
         let value = builtin_from_value(CodecsModule::new().get_attr("utf_8_encode").unwrap())
             .call(&[Value::string(intern("hello"))])
@@ -920,5 +882,54 @@ mod tests {
         let bytes = unsafe { &*(bytes_ptr as *const BytesObject) };
         assert_eq!(bytes.as_bytes(), b"hello");
         assert_eq!(tuple.get(1).unwrap().as_int(), Some(5));
+    }
+
+    #[test]
+    fn test_utf8_encode_supports_surrogatepass() {
+        let surrogate = encode_python_code_point(0xDC80).expect("surrogate carrier should encode");
+        let text = format!("A{surrogate}");
+
+        let value = builtin_from_value(CodecsModule::new().get_attr("utf_8_encode").unwrap())
+            .call(&[
+                leak_object_value(StringObject::from_string(text)),
+                Value::string(intern("surrogatepass")),
+            ])
+            .expect("utf_8_encode should accept surrogatepass");
+
+        let ptr = value.as_object_ptr().expect("tuple should be object");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        let bytes_ptr = tuple
+            .get(0)
+            .unwrap()
+            .as_object_ptr()
+            .expect("bytes should be object");
+        let bytes = unsafe { &*(bytes_ptr as *const BytesObject) };
+        assert_eq!(bytes.as_bytes(), &[0x41, 0xED, 0xB2, 0x80]);
+        assert_eq!(tuple.get(1).unwrap().as_int(), Some(2));
+    }
+
+    #[test]
+    fn test_utf8_decode_supports_surrogateescape() {
+        let value = builtin_from_value(CodecsModule::new().get_attr("utf_8_decode").unwrap())
+            .call(&[
+                leak_object_value(BytesObject::from_vec_with_type(
+                    vec![0x41, 0xFF, 0x42],
+                    TypeId::BYTES,
+                )),
+                Value::string(intern("surrogateescape")),
+            ])
+            .expect("utf_8_decode should accept surrogateescape");
+
+        let ptr = value.as_object_ptr().expect("tuple should be object");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        let string_ptr = tuple
+            .get(0)
+            .unwrap()
+            .as_object_ptr()
+            .expect("decoded text should be object");
+        let decoded = unsafe { &*(string_ptr as *const StringObject) };
+        let escaped = encode_python_code_point(0xDCFF).expect("surrogate carrier should encode");
+        assert_eq!(decoded.as_str(), format!("A{escaped}B"));
+        assert_eq!(tuple.get(1).unwrap().as_int(), Some(3));
     }
 }

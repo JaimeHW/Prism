@@ -53,6 +53,7 @@ mod tests {
         assert!(module.get_attr("open").is_ok());
         assert!(module.get_attr("len").is_ok());
         assert!(module.get_attr("type").is_ok());
+        assert!(module.get_attr("SystemError").is_ok());
     }
 
     #[test]
@@ -80,6 +81,7 @@ mod tests {
         assert_eq!(dir.len(), builtins.len());
         assert!(dir.iter().any(|name| name.as_ref() == "open"));
         assert!(dir.iter().any(|name| name.as_ref() == "__import__"));
+        assert!(dir.iter().any(|name| name.as_ref() == "SystemError"));
     }
 
     #[test]

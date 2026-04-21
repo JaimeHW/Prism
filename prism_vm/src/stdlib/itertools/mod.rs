@@ -64,7 +64,8 @@ macro_rules! itertools_stub {
     };
 }
 
-itertools_stub!(COUNT_FUNCTION, builtin_count, "itertools.count", "count");
+static COUNT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("itertools.count"), builtin_count));
 itertools_stub!(CYCLE_FUNCTION, builtin_cycle, "itertools.cycle", "cycle");
 itertools_stub!(
     REPEAT_FUNCTION,
@@ -103,12 +104,8 @@ itertools_stub!(
     "itertools.filterfalse",
     "filterfalse"
 );
-itertools_stub!(
-    ISLICE_FUNCTION,
-    builtin_islice,
-    "itertools.islice",
-    "islice"
-);
+static ISLICE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("itertools.islice"), builtin_islice));
 itertools_stub!(
     STARMAP_FUNCTION,
     builtin_starmap,
@@ -261,6 +258,76 @@ fn parse_non_negative_usize(value: Value, name: &str) -> Result<usize, BuiltinEr
     Ok(raw as usize)
 }
 
+fn parse_optional_non_negative_usize(
+    value: Value,
+    name: &str,
+) -> Result<Option<usize>, BuiltinError> {
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    parse_non_negative_usize(value, name).map(Some)
+}
+
+fn builtin_count(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "count expected at most 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let start = args
+        .first()
+        .copied()
+        .unwrap_or_else(|| Value::int(0).unwrap());
+    let step = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| Value::int(1).unwrap());
+    let iter = IteratorObject::count(start, step).ok_or_else(|| {
+        BuiltinError::TypeError("count() requires integer or float arguments".to_string())
+    })?;
+    Ok(iterator_value(iter))
+}
+
+fn builtin_islice(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "islice expected 2 to 4 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let iterator = crate::builtins::value_to_iterator(&args[0]).map_err(BuiltinError::from)?;
+    let (start, stop, step) = match args.len() {
+        2 => (0, parse_optional_non_negative_usize(args[1], "stop")?, 1),
+        3 => (
+            parse_non_negative_usize(args[1], "start")?,
+            parse_optional_non_negative_usize(args[2], "stop")?,
+            1,
+        ),
+        4 => {
+            let step = parse_non_negative_usize(args[3], "step")?;
+            if step == 0 {
+                return Err(BuiltinError::ValueError(
+                    "step must be greater than zero".to_string(),
+                ));
+            }
+            (
+                parse_non_negative_usize(args[1], "start")?,
+                parse_optional_non_negative_usize(args[2], "stop")?,
+                step,
+            )
+        }
+        _ => unreachable!("argument count validated above"),
+    };
+
+    Ok(iterator_value(IteratorObject::islice(
+        iterator, start, stop, step,
+    )))
+}
+
 fn builtin_product(args: &[Value]) -> Result<Value, BuiltinError> {
     let pools: Result<Vec<Vec<Value>>, BuiltinError> =
         args.iter().copied().map(collect_iterable_values).collect();
@@ -372,6 +439,49 @@ mod mod_tests {
             .expect("product entry should be a tuple");
         let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
         assert_eq!(tuple.len(), 0);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_builtin_islice_slices_count_iterators_lazily() {
+        let count = builtin_count(&[]).expect("count() should succeed");
+        let iter_value = builtin_islice(&[
+            count,
+            Value::int_unchecked(3),
+            Value::int_unchecked(8),
+            Value::int_unchecked(2),
+        ])
+        .expect("islice() should succeed");
+        let iter = get_iterator_mut(&iter_value).expect("islice() should return an iterator");
+
+        let mut values = Vec::new();
+        while let Some(value) = iter.next() {
+            values.push(value.as_int().expect("islice(count()) should yield ints"));
+        }
+
+        assert_eq!(values, vec![3, 5, 7]);
+    }
+
+    #[test]
+    fn test_builtin_islice_supports_none_stop() {
+        let tuple = TupleObject::from_slice(&[
+            Value::int_unchecked(10),
+            Value::int_unchecked(11),
+            Value::int_unchecked(12),
+            Value::int_unchecked(13),
+        ]);
+        let tuple_ptr = Box::leak(Box::new(tuple)) as *mut TupleObject as *const ();
+
+        let iter_value = builtin_islice(&[
+            Value::object_ptr(tuple_ptr),
+            Value::int_unchecked(2),
+            Value::none(),
+        ])
+        .expect("islice() should succeed");
+        let iter = get_iterator_mut(&iter_value).expect("islice() should return an iterator");
+
+        assert_eq!(iter.next().unwrap().as_int(), Some(12));
+        assert_eq!(iter.next().unwrap().as_int(), Some(13));
         assert!(iter.next().is_none());
     }
 

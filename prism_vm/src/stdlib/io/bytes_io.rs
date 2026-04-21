@@ -19,7 +19,8 @@ const DEFAULT_CAPACITY: usize = 256;
 /// In-memory binary stream.
 ///
 /// Provides a file-like interface over an in-memory `Vec<u8>` buffer.
-/// Supports read, write, seek, tell, truncate, and getvalue operations.
+/// Supports read, write, seek, tell, truncate, getvalue, and getbuffer
+/// operations.
 #[derive(Clone)]
 pub struct BytesIO {
     /// The underlying byte buffer.
@@ -61,11 +62,35 @@ impl BytesIO {
         }
     }
 
+    /// Rebuild a `BytesIO` from persisted interpreter-visible state.
+    #[inline]
+    pub(crate) fn from_parts(buffer: Vec<u8>, position: usize, closed: bool) -> Self {
+        Self {
+            buffer,
+            position,
+            closed,
+        }
+    }
+
+    /// Split a `BytesIO` into persisted interpreter-visible state.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (Vec<u8>, usize, bool) {
+        (self.buffer, self.position, self.closed)
+    }
+
     /// Get the entire contents of the stream as bytes.
     ///
     /// This returns the full buffer regardless of position.
     #[inline]
     pub fn getvalue(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Borrow the current readable buffer contents.
+    ///
+    /// This mirrors the buffer that backs the stream at the current instant.
+    #[inline]
+    pub fn getbuffer(&self) -> &[u8] {
         &self.buffer
     }
 

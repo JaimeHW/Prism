@@ -642,6 +642,14 @@ mod bytes_io_tests {
         assert!(line.is_empty());
     }
 
+    #[test]
+    fn test_getbuffer_returns_current_contents() {
+        let mut bio = BytesIO::with_initial(b"hello");
+        bio.seek(0, 2).unwrap();
+        bio.write(b" world").unwrap();
+        assert_eq!(bio.getbuffer(), b"hello world");
+    }
+
     // =========================================================================
     // Seek and Tell
     // =========================================================================
@@ -1029,6 +1037,7 @@ mod file_mode_tests {
 
 mod io_module_tests {
     use super::*;
+    use crate::builtins::builtin_issubclass;
 
     #[test]
     fn test_module_name() {
@@ -1058,6 +1067,38 @@ mod io_module_tests {
     }
 
     #[test]
+    fn test_stringio_attribute_is_callable() {
+        let module = IoModule::new();
+        let value = module
+            .get_attr("StringIO")
+            .expect("io.StringIO should be exposed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("io.StringIO should be a builtin function");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(
+            header.type_id,
+            prism_runtime::object::type_obj::TypeId::BUILTIN_FUNCTION
+        );
+    }
+
+    #[test]
+    fn test_bytesio_attribute_is_callable() {
+        let module = IoModule::new();
+        let value = module
+            .get_attr("BytesIO")
+            .expect("io.BytesIO should be exposed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("io.BytesIO should be a builtin function");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(
+            header.type_id,
+            prism_runtime::object::type_obj::TypeId::BUILTIN_FUNCTION
+        );
+    }
+
+    #[test]
     fn test_unknown_attr() {
         let module = IoModule::new();
         assert!(module.get_attr("nonexistent").is_err());
@@ -1076,6 +1117,43 @@ mod io_module_tests {
     fn test_default_impl() {
         let module = IoModule::default();
         assert_eq!(module.name(), "io");
+    }
+
+    #[test]
+    fn test_buffered_io_base_is_exposed_as_a_class() {
+        let module = IoModule::new();
+        let buffered = module
+            .get_attr("BufferedIOBase")
+            .expect("BufferedIOBase should be exposed");
+        assert!(buffered.as_object_ptr().is_some());
+    }
+
+    #[test]
+    fn test_io_base_hierarchy_is_registered_for_issubclass() {
+        let module = IoModule::new();
+        let io_base = module.get_attr("IOBase").expect("IOBase should exist");
+        let buffered = module
+            .get_attr("BufferedIOBase")
+            .expect("BufferedIOBase should exist");
+        let raw = module
+            .get_attr("RawIOBase")
+            .expect("RawIOBase should exist");
+        let text = module
+            .get_attr("TextIOBase")
+            .expect("TextIOBase should exist");
+
+        assert_eq!(
+            builtin_issubclass(&[buffered, io_base]).unwrap().as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            builtin_issubclass(&[raw, io_base]).unwrap().as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            builtin_issubclass(&[text, io_base]).unwrap().as_bool(),
+            Some(true)
+        );
     }
 }
 

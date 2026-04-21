@@ -237,6 +237,12 @@ pub const fn descendants(type_id: ExceptionTypeId) -> ExceptionTypeSet {
                 | (1u64 << ExceptionTypeId::ModuleNotFoundError.as_u8()),
         ),
 
+        // BaseExceptionGroup: ExceptionGroup
+        ExceptionTypeId::BaseExceptionGroup => ExceptionTypeSet::from_raw(
+            (1u64 << ExceptionTypeId::BaseExceptionGroup.as_u8())
+                | (1u64 << ExceptionTypeId::ExceptionGroup.as_u8()),
+        ),
+
         // Warning: All warning subtypes
         ExceptionTypeId::Warning => ExceptionTypeSet::from_raw(
             (1u64 << ExceptionTypeId::Warning.as_u8())
@@ -504,6 +510,15 @@ mod tests {
     }
 
     #[test]
+    fn test_base_exception_group_descendants() {
+        let desc = descendants(ExceptionTypeId::BaseExceptionGroup);
+
+        assert!(desc.contains(ExceptionTypeId::BaseExceptionGroup));
+        assert!(desc.contains(ExceptionTypeId::ExceptionGroup));
+        assert!(!desc.contains(ExceptionTypeId::TypeError));
+    }
+
+    #[test]
     fn test_leaf_type_descendants() {
         // Leaf types should only contain themselves
         let desc = descendants(ExceptionTypeId::TypeError);
@@ -527,6 +542,18 @@ mod tests {
         ));
         assert!(is_subclass(
             ExceptionTypeId::Exception,
+            ExceptionTypeId::Exception
+        ));
+    }
+
+    #[test]
+    fn test_is_subclass_exception_group() {
+        assert!(is_subclass(
+            ExceptionTypeId::ExceptionGroup,
+            ExceptionTypeId::BaseExceptionGroup
+        ));
+        assert!(is_subclass(
+            ExceptionTypeId::ExceptionGroup,
             ExceptionTypeId::Exception
         ));
     }

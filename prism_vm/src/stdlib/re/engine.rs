@@ -149,14 +149,9 @@ pub struct StandardEngine {
 impl StandardEngine {
     /// Compile a pattern with flags.
     pub fn compile(pattern: &str, flags: RegexFlags) -> EngineResult<Self> {
-        // Build regex with flags
-        let regex_pattern = apply_flags_to_pattern(pattern, flags);
+        let regex_pattern = prepare_pattern_for_backend(pattern, flags)?;
 
         let regex = regex::RegexBuilder::new(&regex_pattern)
-            .case_insensitive(flags.is_case_insensitive())
-            .multi_line(flags.is_multiline())
-            .dot_matches_new_line(flags.is_dotall())
-            .ignore_whitespace(flags.is_verbose())
             .build()
             .map_err(|e| RegexError::syntax(e.to_string(), Some(pattern.to_string())))?;
 
@@ -181,13 +176,13 @@ impl Engine for StandardEngine {
     fn find(&self, text: &str) -> Option<Match> {
         self.regex
             .captures(text)
-            .map(|caps| Match::from_captures(&caps, text))
+            .map(|caps| Match::from_captures_with_regex(&caps, text, &self.regex))
     }
 
     fn find_all(&self, text: &str) -> Vec<Match> {
         self.regex
             .captures_iter(text)
-            .map(|caps| Match::from_captures(&caps, text))
+            .map(|caps| Match::from_captures_with_regex(&caps, text, &self.regex))
             .collect()
     }
 
@@ -195,7 +190,7 @@ impl Engine for StandardEngine {
         self.regex.captures(text).and_then(|caps| {
             let m = caps.get(0).unwrap();
             if m.start() == 0 {
-                Some(Match::from_captures(&caps, text))
+                Some(Match::from_captures_with_regex(&caps, text, &self.regex))
             } else {
                 None
             }
@@ -256,7 +251,7 @@ pub struct FancyEngine {
 impl FancyEngine {
     /// Compile a pattern with flags.
     pub fn compile(pattern: &str, flags: RegexFlags) -> EngineResult<Self> {
-        let regex_pattern = apply_flags_to_pattern(pattern, flags);
+        let regex_pattern = prepare_pattern_for_backend(pattern, flags)?;
 
         let regex = fancy_regex::Regex::new(&regex_pattern)
             .map_err(|e| RegexError::syntax(e.to_string(), Some(pattern.to_string())))?;
@@ -383,11 +378,21 @@ impl Engine for FancyEngine {
 // Helper Functions
 // =============================================================================
 
-/// Apply flags to pattern using inline modifiers.
-fn apply_flags_to_pattern(pattern: &str, flags: RegexFlags) -> String {
-    let normalized = normalize_python_pattern(pattern);
+/// Prepare a Python pattern for the backend regex engine.
+pub(crate) fn prepare_pattern_for_backend(
+    pattern: &str,
+    flags: RegexFlags,
+) -> EngineResult<String> {
+    if flags.contains(RegexFlags::LOCALE) {
+        return Err(RegexError {
+            kind: RegexErrorKind::Unsupported,
+            message: "LOCALE flag is not yet supported".to_string(),
+            pattern: Some(pattern.to_string()),
+            position: None,
+        });
+    }
 
-    // Check if we need to add any inline modifiers
+    let normalized = normalize_python_pattern(pattern)?;
     let mut modifiers = String::new();
 
     if flags.is_case_insensitive() {
@@ -404,10 +409,10 @@ fn apply_flags_to_pattern(pattern: &str, flags: RegexFlags) -> String {
     }
 
     if modifiers.is_empty() {
-        normalized
-    } else {
-        format!("(?{}){}", modifiers, normalized)
+        return Ok(normalized);
     }
+
+    Ok(format!("(?{}){}", modifiers, normalized))
 }
 
 /// Normalize Python-specific syntax to the equivalent backend syntax.
@@ -415,36 +420,241 @@ fn apply_flags_to_pattern(pattern: &str, flags: RegexFlags) -> String {
 /// Rust's `regex` ecosystem uses `\z` for the strict end-of-string anchor while
 /// CPython exposes `\Z`. Translating it here keeps the Python-visible surface
 /// compatible without forcing callers to know about backend-specific syntax.
-fn normalize_python_pattern(pattern: &str) -> String {
+pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
     let mut normalized = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
     let mut in_class = false;
+    let mut offset = 0;
 
-    while let Some(ch) = chars.next() {
+    while offset < pattern.len() {
+        let ch = pattern[offset..]
+            .chars()
+            .next()
+            .expect("slice should begin on a character boundary");
         match ch {
             '\\' => {
                 normalized.push('\\');
-                if let Some(next) = chars.next() {
-                    if !in_class && next == 'Z' {
-                        normalized.push('z');
-                    } else {
-                        normalized.push(next);
-                    }
+                offset += ch.len_utf8();
+                if offset >= pattern.len() {
+                    break;
                 }
+
+                let next = pattern[offset..]
+                    .chars()
+                    .next()
+                    .expect("slice should begin on a character boundary");
+                if !in_class && next == 'Z' {
+                    normalized.push('z');
+                } else {
+                    normalized.push(next);
+                }
+                offset += next.len_utf8();
             }
             '[' if !in_class => {
                 in_class = true;
                 normalized.push(ch);
+                offset += ch.len_utf8();
+            }
+            '{' if !in_class => {
+                if let Some((translated, consumed)) = normalize_brace_sequence(&pattern[offset..]) {
+                    normalized.push_str(&translated);
+                    offset += consumed;
+                } else {
+                    normalized.push('\\');
+                    normalized.push('{');
+                    offset += ch.len_utf8();
+                }
             }
             ']' if in_class => {
                 in_class = false;
                 normalized.push(ch);
+                offset += ch.len_utf8();
             }
-            _ => normalized.push(ch),
+            '}' if !in_class => {
+                normalized.push('\\');
+                normalized.push('}');
+                offset += ch.len_utf8();
+            }
+            '(' if !in_class => {
+                if let Some((translated, consumed)) =
+                    translate_inline_flag_group(&pattern[offset..], pattern)?
+                {
+                    normalized.push_str(&translated);
+                    offset += consumed;
+                } else {
+                    normalized.push(ch);
+                    offset += ch.len_utf8();
+                }
+            }
+            _ => {
+                normalized.push(ch);
+                offset += ch.len_utf8();
+            }
         }
     }
 
-    normalized
+    Ok(normalized)
+}
+
+fn normalize_brace_sequence(input: &str) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+
+    let mut index = 1;
+    let first_digits_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+
+    if index < bytes.len() && bytes[index] == b'}' && index > first_digits_start {
+        return Some((input[..=index].to_string(), index + 1));
+    }
+
+    if index >= bytes.len() || bytes[index] != b',' {
+        return None;
+    }
+
+    let has_leading_bound = index > first_digits_start;
+    index += 1;
+    let second_digits_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+
+    if index >= bytes.len() || bytes[index] != b'}' {
+        return None;
+    }
+
+    if !has_leading_bound && second_digits_start == index {
+        return None;
+    }
+
+    if !has_leading_bound {
+        let upper = &input[second_digits_start..index];
+        return Some((format!("{{0,{upper}}}"), index + 1));
+    }
+
+    Some((input[..=index].to_string(), index + 1))
+}
+
+fn translate_inline_flag_group(
+    input: &str,
+    original_pattern: &str,
+) -> EngineResult<Option<(String, usize)>> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'(' || bytes[1] != b'?' {
+        return Ok(None);
+    }
+
+    match bytes[2] {
+        b':' | b'=' | b'!' | b'#' | b'P' | b'<' => return Ok(None),
+        _ => {}
+    }
+
+    let mut index = 2;
+    let mut saw_flag = false;
+    let mut saw_dash = false;
+    let mut enabled = String::new();
+    let mut disabled = String::new();
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'i' | b'm' | b's' | b'x' | b'a' | b'u' | b'L' => {
+                saw_flag = true;
+                if saw_dash {
+                    disabled.push(bytes[index] as char);
+                } else {
+                    enabled.push(bytes[index] as char);
+                }
+                index += 1;
+            }
+            b'-' if saw_flag && !saw_dash => {
+                saw_dash = true;
+                index += 1;
+            }
+            b':' | b')' if saw_flag => {
+                let spec = translate_inline_flag_spec(&enabled, &disabled, original_pattern)?;
+                let delimiter = bytes[index] as char;
+                return Ok(Some((format!("(?{spec}{delimiter}"), index + 1)));
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(None)
+}
+
+fn translate_inline_flag_spec(
+    enabled: &str,
+    disabled: &str,
+    pattern: &str,
+) -> EngineResult<String> {
+    let mut rust_enabled = String::new();
+    let mut rust_disabled = String::new();
+    let mut unicode_mode: Option<bool> = None;
+
+    for flag in enabled.chars() {
+        match flag {
+            'i' | 'm' | 's' | 'x' => rust_enabled.push(flag),
+            'a' => {
+                if unicode_mode == Some(true) {
+                    return Err(RegexError::syntax(
+                        "inline flags 'a' and 'u' are mutually exclusive",
+                        Some(pattern.to_string()),
+                    ));
+                }
+                unicode_mode = Some(false);
+            }
+            'u' => {
+                if unicode_mode == Some(false) {
+                    return Err(RegexError::syntax(
+                        "inline flags 'a' and 'u' are mutually exclusive",
+                        Some(pattern.to_string()),
+                    ));
+                }
+                unicode_mode = Some(true);
+            }
+            'L' => {
+                return Err(RegexError {
+                    kind: RegexErrorKind::Unsupported,
+                    message: "locale-dependent inline regex flags are not yet supported"
+                        .to_string(),
+                    pattern: Some(pattern.to_string()),
+                    position: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    for flag in disabled.chars() {
+        match flag {
+            'i' | 'm' | 's' | 'x' => rust_disabled.push(flag),
+            'u' => unicode_mode = Some(false),
+            'a' | 'L' => {
+                return Err(RegexError::syntax(
+                    format!("inline flag '{flag}' cannot be disabled"),
+                    Some(pattern.to_string()),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    match unicode_mode {
+        Some(true) => rust_enabled.push('u'),
+        Some(false) => rust_disabled.push('u'),
+        None => {}
+    }
+
+    if rust_disabled.is_empty() {
+        Ok(rust_enabled)
+    } else if rust_enabled.is_empty() {
+        Ok(format!("-{rust_disabled}"))
+    } else {
+        Ok(format!("{rust_enabled}-{rust_disabled}"))
+    }
 }
 
 /// Check if pattern requires fancy-regex features.
@@ -661,12 +871,60 @@ mod tests {
 
     #[test]
     fn test_normalize_python_pattern_converts_end_of_string_anchor() {
-        assert_eq!(normalize_python_pattern(r"foo\Z"), r"foo\z");
+        assert_eq!(normalize_python_pattern(r"foo\Z").unwrap(), r"foo\z");
     }
 
     #[test]
     fn test_normalize_python_pattern_preserves_escaped_anchor_literal() {
-        assert_eq!(normalize_python_pattern(r"foo\\Z"), r"foo\\Z");
+        assert_eq!(normalize_python_pattern(r"foo\\Z").unwrap(), r"foo\\Z");
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_translates_ascii_scoped_flag_group() {
+        assert_eq!(
+            normalize_python_pattern(r"(?a:[_a-z][_a-z0-9]*)").unwrap(),
+            r"(?-u:[_a-z][_a-z0-9]*)"
+        );
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_escapes_literal_braces() {
+        assert_eq!(
+            normalize_python_pattern(r"{(?P<braced>\w+)}").unwrap(),
+            r"\{(?P<braced>\w+)\}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_translates_open_lower_quantifier_bound() {
+        assert_eq!(normalize_python_pattern(r"a{,2}").unwrap(), r"a{0,2}");
+    }
+
+    #[test]
+    fn test_prepare_pattern_for_backend_applies_ascii_and_verbose_flags() {
+        let prepared = prepare_pattern_for_backend(
+            r"\$(?:(?P<named>(?a:[_a-z][_a-z0-9]*)))",
+            RegexFlags::new(RegexFlags::IGNORECASE | RegexFlags::VERBOSE),
+        )
+        .unwrap();
+        assert!(prepared.starts_with("(?ix)"));
+        assert!(prepared.contains(r"(?-u:[_a-z][_a-z0-9]*)"));
+    }
+
+    #[test]
+    fn test_standard_engine_compiles_string_template_identifier_pattern() {
+        let pattern = r"
+            \$(?:
+              (?P<escaped>\$)  |
+              (?P<named>(?a:[_a-z][_a-z0-9]*)) |
+              {(?P<braced>(?a:[_a-z][_a-z0-9]*))} |
+              (?P<invalid>)
+            )
+        ";
+        let flags = RegexFlags::new(RegexFlags::IGNORECASE | RegexFlags::VERBOSE);
+        let engine =
+            StandardEngine::compile(pattern, flags).expect("template pattern should compile");
+        assert!(engine.is_match("$name"));
     }
 
     #[test]

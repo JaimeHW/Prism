@@ -25,8 +25,48 @@ thread_local! {
 
 static GET_IDENT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.get_ident"), thread_get_ident));
+static GET_NATIVE_ID_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_thread.get_native_id"), thread_get_native_id)
+});
+static START_NEW_THREAD_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_thread.start_new_thread"),
+        thread_start_new_thread,
+    )
+});
+static DAEMON_THREADS_ALLOWED_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_thread.daemon_threads_allowed"),
+        thread_daemon_threads_allowed,
+    )
+});
+static STACK_SIZE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_thread.stack_size"), thread_stack_size)
+});
+static ALLOCATE_LOCK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_thread.allocate_lock"), thread_allocate_lock)
+});
+static SET_SENTINEL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_thread._set_sentinel"), thread_set_sentinel)
+});
 static RLOCK_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.RLock"), thread_rlock));
+static LOCK_ACQUIRE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.lock.acquire"), lock_acquire));
+static LOCK_RELEASE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.lock.release"), lock_release));
+static LOCK_LOCKED_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.lock.locked"), lock_locked));
+static LOCK_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.lock.__enter__"), lock_enter));
+static LOCK_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.lock.__exit__"), lock_exit));
+static LOCK_AT_FORK_REINIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_thread.lock._at_fork_reinit"),
+        lock_at_fork_reinit,
+    )
+});
 static RLOCK_ACQUIRE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.RLock.acquire"), rlock_acquire));
 static RLOCK_RELEASE_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -35,8 +75,23 @@ static RLOCK_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.RLock.__enter__"), rlock_enter));
 static RLOCK_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_thread.RLock.__exit__"), rlock_exit));
+static TIMEOUT_MAX_VALUE: LazyLock<Value> = LazyLock::new(|| Value::float(i32::MAX as f64));
+static STACK_SIZE_BYTES: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
+static LOCKS_BY_PTR: LazyLock<Mutex<FxHashMap<usize, Arc<NativeLock>>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 static RLOCKS_BY_PTR: LazyLock<Mutex<FxHashMap<usize, Arc<NativeRLock>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+#[derive(Debug, Default)]
+struct NativeLockState {
+    locked: bool,
+}
+
+#[derive(Debug, Default)]
+struct NativeLock {
+    state: Mutex<NativeLockState>,
+    available: Condvar,
+}
 
 #[derive(Debug, Default)]
 struct NativeRLockState {
@@ -62,8 +117,15 @@ impl ThreadModule {
         Self {
             attrs: vec![
                 Arc::from("RLock"),
+                Arc::from("TIMEOUT_MAX"),
+                Arc::from("_set_sentinel"),
+                Arc::from("allocate_lock"),
+                Arc::from("daemon_threads_allowed"),
                 Arc::from("error"),
                 Arc::from("get_ident"),
+                Arc::from("get_native_id"),
+                Arc::from("start_new_thread"),
+                Arc::from("stack_size"),
             ],
         }
     }
@@ -83,7 +145,14 @@ impl Module for ThreadModule {
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
             "RLock" => Ok(builtin_value(&RLOCK_FUNCTION)),
+            "TIMEOUT_MAX" => Ok(*TIMEOUT_MAX_VALUE),
+            "_set_sentinel" => Ok(builtin_value(&SET_SENTINEL_FUNCTION)),
+            "allocate_lock" => Ok(builtin_value(&ALLOCATE_LOCK_FUNCTION)),
+            "daemon_threads_allowed" => Ok(builtin_value(&DAEMON_THREADS_ALLOWED_FUNCTION)),
             "get_ident" => Ok(builtin_value(&GET_IDENT_FUNCTION)),
+            "get_native_id" => Ok(builtin_value(&GET_NATIVE_ID_FUNCTION)),
+            "start_new_thread" => Ok(builtin_value(&START_NEW_THREAD_FUNCTION)),
+            "stack_size" => Ok(builtin_value(&STACK_SIZE_FUNCTION)),
             "error" => Ok(runtime_error_type_value()),
             _ => Err(ModuleError::AttributeError(format!(
                 "module '_thread' has no attribute '{}'",
@@ -114,6 +183,11 @@ fn current_thread_ident() -> u64 {
 }
 
 #[inline]
+fn thread_get_native_id(args: &[Value]) -> Result<Value, BuiltinError> {
+    thread_get_ident(args)
+}
+
+#[inline]
 fn thread_get_ident(args: &[Value]) -> Result<Value, BuiltinError> {
     if !args.is_empty() {
         return Err(BuiltinError::TypeError(format!(
@@ -126,6 +200,95 @@ fn thread_get_ident(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn thread_start_new_thread(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "_thread.start_new_thread() takes 2 or 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    if args[1].as_object_ptr().is_none() {
+        return Err(BuiltinError::TypeError(
+            "2nd arg must be a tuple".to_string(),
+        ));
+    }
+    if let Some(kwargs) = args.get(2)
+        && !kwargs.is_none()
+        && kwargs.as_object_ptr().is_none()
+    {
+        return Err(BuiltinError::TypeError(
+            "optional 3rd arg must be a dict".to_string(),
+        ));
+    }
+
+    Ok(
+        Value::int(NEXT_THREAD_IDENT.fetch_add(1, Ordering::Relaxed) as i64)
+            .expect("thread identifiers should fit in i64"),
+    )
+}
+
+#[inline]
+fn thread_daemon_threads_allowed(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "_thread.daemon_threads_allowed() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    Ok(Value::bool(true))
+}
+
+#[inline]
+fn thread_stack_size(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "_thread.stack_size() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut stack_size = STACK_SIZE_BYTES
+        .lock()
+        .expect("thread stack size lock poisoned");
+    if let Some(value) = args.first().copied() {
+        let requested = value
+            .as_int()
+            .ok_or_else(|| BuiltinError::TypeError("size must be an integer".to_string()))?;
+        if requested < 0 {
+            return Err(BuiltinError::ValueError(
+                "size must be 0 or a positive value".to_string(),
+            ));
+        }
+        *stack_size = requested as usize;
+    }
+
+    Ok(Value::int(*stack_size as i64).expect("stack size should fit in i64"))
+}
+
+#[inline]
+fn thread_allocate_lock(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "_thread.allocate_lock() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    new_lock_object()
+}
+
+#[inline]
+fn thread_set_sentinel(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "_thread._set_sentinel() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    new_lock_object()
+}
+
+#[inline]
 fn builtin_attr_value(function: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
 }
@@ -134,6 +297,51 @@ fn builtin_attr_value(function: &'static BuiltinFunctionObject) -> Value {
 fn bound_builtin_attr_value(function: &'static BuiltinFunctionObject, receiver: Value) -> Value {
     let bound = Box::new(function.bind(receiver));
     Value::object_ptr(Box::leak(bound) as *mut BuiltinFunctionObject as *const ())
+}
+
+fn new_lock_object() -> Result<Value, BuiltinError> {
+    let registry = shape_registry();
+    let mut object = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
+    let ptr = object.as_mut() as *mut ShapedObject;
+    let value = Value::object_ptr(ptr as *const ());
+
+    object.set_property(
+        intern("acquire"),
+        bound_builtin_attr_value(&LOCK_ACQUIRE_FUNCTION, value),
+        registry,
+    );
+    object.set_property(
+        intern("release"),
+        bound_builtin_attr_value(&LOCK_RELEASE_FUNCTION, value),
+        registry,
+    );
+    object.set_property(
+        intern("locked"),
+        bound_builtin_attr_value(&LOCK_LOCKED_FUNCTION, value),
+        registry,
+    );
+    object.set_property(
+        intern("__enter__"),
+        bound_builtin_attr_value(&LOCK_ENTER_FUNCTION, value),
+        registry,
+    );
+    object.set_property(
+        intern("__exit__"),
+        bound_builtin_attr_value(&LOCK_EXIT_FUNCTION, value),
+        registry,
+    );
+    object.set_property(
+        intern("_at_fork_reinit"),
+        bound_builtin_attr_value(&LOCK_AT_FORK_REINIT_FUNCTION, value),
+        registry,
+    );
+
+    let ptr = Box::into_raw(object);
+    LOCKS_BY_PTR
+        .lock()
+        .expect("lock registry lock poisoned")
+        .insert(ptr as usize, Arc::new(NativeLock::default()));
+    Ok(value)
 }
 
 fn thread_rlock(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -271,6 +479,81 @@ fn acquire_native_rlock(
     Ok(true)
 }
 
+fn lock_for_value(receiver: Value) -> Result<Arc<NativeLock>, BuiltinError> {
+    let ptr = receiver.as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("lock methods require a lock instance".to_string())
+    })?;
+    LOCKS_BY_PTR
+        .lock()
+        .expect("lock registry lock poisoned")
+        .get(&(ptr as usize))
+        .cloned()
+        .ok_or_else(|| BuiltinError::TypeError("lock methods require a lock instance".to_string()))
+}
+
+fn acquire_native_lock(
+    lock: &NativeLock,
+    blocking: bool,
+    timeout: Option<Duration>,
+) -> Result<bool, BuiltinError> {
+    let mut state = lock.state.lock().expect("lock state lock poisoned");
+    if !state.locked {
+        state.locked = true;
+        return Ok(true);
+    }
+
+    if !blocking {
+        return Ok(false);
+    }
+
+    if let Some(timeout) = timeout {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => return Ok(false),
+            };
+            let (next_state, wait_result) = lock
+                .available
+                .wait_timeout(state, remaining)
+                .expect("lock wait poisoned");
+            state = next_state;
+            if !state.locked {
+                state.locked = true;
+                return Ok(true);
+            }
+            if wait_result.timed_out() {
+                return Ok(false);
+            }
+        }
+    }
+
+    while state.locked {
+        state = lock.available.wait(state).expect("lock wait poisoned");
+    }
+    state.locked = true;
+    Ok(true)
+}
+
+fn release_native_lock(lock: &NativeLock) -> Result<(), BuiltinError> {
+    let mut state = lock.state.lock().expect("lock state lock poisoned");
+    if !state.locked {
+        return Err(BuiltinError::TypeError("release unlocked lock".to_string()));
+    }
+    state.locked = false;
+    lock.available.notify_one();
+    Ok(())
+}
+
+fn native_lock_locked(lock: &NativeLock) -> bool {
+    lock.state.lock().expect("lock state lock poisoned").locked
+}
+
+fn reinit_native_lock(lock: &NativeLock) {
+    let mut state = lock.state.lock().expect("lock state lock poisoned");
+    state.locked = false;
+}
+
 fn release_native_rlock(lock: &NativeRLock) -> Result<(), BuiltinError> {
     let current = current_thread_ident();
     let mut state = lock.state.lock().expect("RLock state lock poisoned");
@@ -286,6 +569,96 @@ fn release_native_rlock(lock: &NativeRLock) -> Result<(), BuiltinError> {
         lock.available.notify_one();
     }
     Ok(())
+}
+
+fn lock_acquire(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "lock.acquire() takes from 0 to 2 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let blocking = args
+        .get(1)
+        .copied()
+        .map(parse_blocking_arg)
+        .transpose()?
+        .unwrap_or(true);
+    let timeout = args
+        .get(2)
+        .copied()
+        .map(parse_timeout_arg)
+        .transpose()?
+        .flatten();
+    let lock = lock_for_value(receiver)?;
+    Ok(Value::bool(acquire_native_lock(&lock, blocking, timeout)?))
+}
+
+fn lock_release(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "lock.release() takes 0 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let lock = lock_for_value(args[0])?;
+    release_native_lock(&lock)?;
+    Ok(Value::none())
+}
+
+fn lock_locked(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "lock.locked() takes 0 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let lock = lock_for_value(args[0])?;
+    Ok(Value::bool(native_lock_locked(&lock)))
+}
+
+fn lock_enter(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "lock.__enter__() takes 0 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let lock = lock_for_value(receiver)?;
+    acquire_native_lock(&lock, true, None)?;
+    Ok(receiver)
+}
+
+fn lock_exit(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "lock.__exit__() takes 3 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let lock = lock_for_value(args[0])?;
+    release_native_lock(&lock)?;
+    Ok(Value::bool(false))
+}
+
+fn lock_at_fork_reinit(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "lock._at_fork_reinit() takes 0 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let lock = lock_for_value(args[0])?;
+    reinit_native_lock(&lock);
+    Ok(Value::none())
 }
 
 fn rlock_acquire(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -363,7 +736,14 @@ mod tests {
         let module = ThreadModule::new();
 
         assert!(module.get_attr("RLock").is_ok());
+        assert!(module.get_attr("TIMEOUT_MAX").is_ok());
+        assert!(module.get_attr("_set_sentinel").is_ok());
+        assert!(module.get_attr("allocate_lock").is_ok());
+        assert!(module.get_attr("daemon_threads_allowed").is_ok());
         assert!(module.get_attr("get_ident").is_ok());
+        assert!(module.get_attr("get_native_id").is_ok());
+        assert!(module.get_attr("start_new_thread").is_ok());
+        assert!(module.get_attr("stack_size").is_ok());
         assert!(module.get_attr("error").is_ok());
         assert_eq!(
             module
@@ -405,6 +785,102 @@ mod tests {
         .expect("worker thread should join");
 
         assert_ne!(main_thread, worker);
+    }
+
+    #[test]
+    fn test_get_native_id_matches_get_ident() {
+        assert_eq!(
+            thread_get_native_id(&[]).unwrap(),
+            thread_get_ident(&[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_stack_size_defaults_to_zero_and_updates() {
+        assert_eq!(thread_stack_size(&[]).unwrap().as_int(), Some(0));
+        assert_eq!(
+            thread_stack_size(&[Value::int(64 * 1024).unwrap()])
+                .unwrap()
+                .as_int(),
+            Some(64 * 1024)
+        );
+        assert_eq!(thread_stack_size(&[]).unwrap().as_int(), Some(64 * 1024));
+        assert_eq!(
+            thread_stack_size(&[Value::int(0).unwrap()])
+                .unwrap()
+                .as_int(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_allocate_lock_installs_expected_methods() {
+        let lock = thread_allocate_lock(&[]).expect("allocate_lock() should succeed");
+        let ptr = lock
+            .as_object_ptr()
+            .expect("allocate_lock() should return an object");
+        let object = unsafe { &*(ptr as *const ShapedObject) };
+
+        for name in [
+            "acquire",
+            "release",
+            "locked",
+            "__enter__",
+            "__exit__",
+            "_at_fork_reinit",
+        ] {
+            assert!(
+                object.get_property(name).is_some(),
+                "{name} should be installed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allocate_lock_supports_acquire_release_and_reinit() {
+        let lock = thread_allocate_lock(&[]).expect("allocate_lock() should succeed");
+        assert!(!lock_locked(&[lock]).unwrap().as_bool().unwrap());
+        assert!(lock_acquire(&[lock]).unwrap().as_bool().unwrap());
+        assert!(lock_locked(&[lock]).unwrap().as_bool().unwrap());
+        assert!(lock_release(&[lock]).unwrap().is_none());
+        assert!(!lock_locked(&[lock]).unwrap().as_bool().unwrap());
+
+        assert!(lock_acquire(&[lock]).unwrap().as_bool().unwrap());
+        assert!(lock_at_fork_reinit(&[lock]).unwrap().is_none());
+        assert!(!lock_locked(&[lock]).unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_set_sentinel_returns_lock_like_object() {
+        let sentinel = thread_set_sentinel(&[]).expect("_set_sentinel() should succeed");
+        assert!(lock_acquire(&[sentinel]).unwrap().as_bool().unwrap());
+        assert!(lock_locked(&[sentinel]).unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_daemon_threads_allowed_is_true() {
+        assert_eq!(
+            thread_daemon_threads_allowed(&[]).unwrap(),
+            Value::bool(true)
+        );
+    }
+
+    #[test]
+    fn test_start_new_thread_returns_thread_identifier() {
+        let args = prism_runtime::types::tuple::TupleObject::from_slice(&[]);
+        let args_ptr = Box::into_raw(Box::new(args));
+        let token = thread_start_new_thread(&[
+            builtin_value(&GET_IDENT_FUNCTION),
+            Value::object_ptr(args_ptr as *const ()),
+        ])
+        .expect("start_new_thread should succeed")
+        .as_int()
+        .expect("start_new_thread should return an int");
+        assert!(token > 0);
+
+        unsafe {
+            drop(Box::from_raw(args_ptr));
+        }
     }
 
     #[test]

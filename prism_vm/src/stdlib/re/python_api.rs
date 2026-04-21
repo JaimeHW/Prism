@@ -1,4 +1,4 @@
-use super::engine::{RegexError, RegexErrorKind};
+use super::engine::{RegexError, RegexErrorKind, prepare_pattern_for_backend};
 use super::flags::RegexFlags;
 use super::functions;
 use super::match_obj::Match;
@@ -12,6 +12,7 @@ use prism_gc::trace::{Trace, Tracer};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::{ObjectHeader, PyObject};
 use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use regex::bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
@@ -170,13 +171,9 @@ impl CompiledBytesPattern {
             pattern: Some(String::from_utf8_lossy(pattern).into_owned()),
             position: None,
         })?;
-        let pattern_text = apply_flags_to_pattern(pattern_text, flags);
+        let pattern_text = prepare_pattern_for_backend(pattern_text, flags)?;
 
         let mut builder = BytesRegexBuilder::new(&pattern_text);
-        builder.case_insensitive(flags.is_case_insensitive());
-        builder.multi_line(flags.is_multiline());
-        builder.dot_matches_new_line(flags.is_dotall());
-        builder.ignore_whitespace(flags.is_verbose());
         builder.unicode(false);
 
         let regex = builder.build().map_err(|err| RegexError {
@@ -285,29 +282,6 @@ impl BytesMatch {
     }
 }
 
-fn apply_flags_to_pattern(pattern: &str, flags: RegexFlags) -> String {
-    let mut modifiers = String::new();
-
-    if flags.is_case_insensitive() {
-        modifiers.push('i');
-    }
-    if flags.is_multiline() {
-        modifiers.push('m');
-    }
-    if flags.is_dotall() {
-        modifiers.push('s');
-    }
-    if flags.is_verbose() {
-        modifiers.push('x');
-    }
-
-    if modifiers.is_empty() {
-        pattern.to_string()
-    } else {
-        format!("(?{}){}", modifiers, pattern)
-    }
-}
-
 pub fn builtin_compile(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.is_empty() || args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
@@ -406,6 +380,70 @@ pub fn builtin_match_group(vm: &mut VirtualMachine, args: &[Value]) -> Result<Va
             value_from_optional_bytes(vm, match_value.group(group_index)?)
         }
     }
+}
+
+pub fn builtin_match_groups(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "Match.groups() takes from 1 to 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let match_value = expect_match_ref(args[0], "groups")?;
+    let default = args.get(1).copied().unwrap_or_else(Value::none);
+    let elements = match &match_value.match_value {
+        RegexMatchKind::Text(match_value) => {
+            let groups = match_value.groups();
+            let mut values = Vec::with_capacity(groups.len());
+            for group in groups {
+                values.push(value_from_optional_str_or_default(vm, group, default)?);
+            }
+            values
+        }
+        RegexMatchKind::Bytes(match_value) => {
+            let mut values = Vec::with_capacity(match_value.len().saturating_sub(1));
+            for group_index in 1..match_value.len() {
+                values.push(value_from_optional_bytes_or_default(
+                    vm,
+                    match_value.group(group_index)?,
+                    default,
+                )?);
+            }
+            values
+        }
+    };
+
+    alloc_value(vm, TupleObject::from_vec(elements), "regex groups tuple")
+}
+
+pub fn builtin_match_groupdict(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "Match.groupdict() takes from 1 to 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let match_value = expect_match_ref(args[0], "groupdict")?;
+    let default = args.get(1).copied().unwrap_or_else(Value::none);
+    let mut dict = DictObject::new();
+
+    if let RegexMatchKind::Text(match_value) = &match_value.match_value {
+        for (name, value) in match_value.groupdict() {
+            let key = Value::string(prism_core::intern::intern(name.as_ref()));
+            let value = value_from_optional_str_or_default(vm, value, default)?;
+            dict.set(key, value);
+        }
+    }
+
+    alloc_value(vm, dict, "regex groupdict")
 }
 
 pub fn builtin_match_start(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -771,6 +809,28 @@ fn value_from_optional_bytes(
     }
 }
 
+fn value_from_optional_str_or_default(
+    vm: &mut VirtualMachine,
+    value: Option<&str>,
+    default: Value,
+) -> Result<Value, BuiltinError> {
+    match value {
+        Some(value) => value_from_optional_str(vm, Some(value)),
+        None => Ok(default),
+    }
+}
+
+fn value_from_optional_bytes_or_default(
+    vm: &mut VirtualMachine,
+    value: Option<&[u8]>,
+    default: Value,
+) -> Result<Value, BuiltinError> {
+    match value {
+        Some(value) => value_from_optional_bytes(vm, Some(value)),
+        None => Ok(default),
+    }
+}
+
 fn match_result_to_value(
     vm: &mut VirtualMachine,
     match_value: Option<RegexMatchKind>,
@@ -912,6 +972,16 @@ mod tests {
         unsafe { &*(ptr as *const BytesObject) }.as_bytes().to_vec()
     }
 
+    fn tuple_values(value: Value) -> Vec<Value> {
+        let ptr = value.as_object_ptr().expect("expected tuple object");
+        unsafe { &*(ptr as *const TupleObject) }.as_slice().to_vec()
+    }
+
+    fn dict_entries(value: Value) -> Vec<(Value, Value)> {
+        let ptr = value.as_object_ptr().expect("expected dict object");
+        unsafe { &*(ptr as *const DictObject) }.iter().collect()
+    }
+
     #[test]
     fn test_compile_string_pattern_and_match_group() {
         let mut vm = VirtualMachine::new();
@@ -964,5 +1034,77 @@ mod tests {
         )
         .expect("escape should succeed");
         assert_eq!(bytes_value(escaped), br"a\+b");
+    }
+
+    #[test]
+    fn test_match_groups_returns_capture_tuple() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(&mut vm, &[Value::string(intern(r"(\d+)-(\w+)"))])
+            .expect("compile should succeed");
+        let matched = builtin_pattern_search(
+            &mut vm,
+            &[pattern, Value::string(intern("prefix 123-word suffix"))],
+        )
+        .expect("search should succeed");
+
+        let groups = builtin_match_groups(&mut vm, &[matched]).expect("groups() should succeed");
+        let values = tuple_values(groups);
+        assert_eq!(values.len(), 2);
+        assert_eq!(string_value(values[0]), "123");
+        assert_eq!(string_value(values[1]), "word");
+    }
+
+    #[test]
+    fn test_match_groups_uses_default_for_unmatched_captures() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(&mut vm, &[Value::string(intern(r"(a)?(b)"))])
+            .expect("compile should succeed");
+        let matched = builtin_pattern_search(&mut vm, &[pattern, Value::string(intern("b"))])
+            .expect("search should succeed");
+
+        let groups = builtin_match_groups(&mut vm, &[matched, Value::string(intern("<missing>"))])
+            .expect("groups() should succeed");
+        let values = tuple_values(groups);
+        assert_eq!(values.len(), 2);
+        assert_eq!(string_value(values[0]), "<missing>");
+        assert_eq!(string_value(values[1]), "b");
+    }
+
+    #[test]
+    fn test_match_groupdict_returns_named_groups() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(
+            &mut vm,
+            &[Value::string(intern(r"(?P<lhs>\w+)=(?P<rhs>\w+)"))],
+        )
+        .expect("compile should succeed");
+        let matched =
+            builtin_pattern_search(&mut vm, &[pattern, Value::string(intern("alpha=beta"))])
+                .expect("search should succeed");
+
+        let groupdict =
+            builtin_match_groupdict(&mut vm, &[matched]).expect("groupdict() should succeed");
+        let entries = dict_entries(groupdict);
+        assert_eq!(entries.len(), 2);
+
+        let lhs = entries
+            .iter()
+            .find(|(key, _)| {
+                prism_runtime::types::string::value_as_string_ref(*key)
+                    .is_some_and(|key| key.as_str() == "lhs")
+            })
+            .map(|(_, value)| *value)
+            .expect("lhs entry should exist");
+        let rhs = entries
+            .iter()
+            .find(|(key, _)| {
+                prism_runtime::types::string::value_as_string_ref(*key)
+                    .is_some_and(|key| key.as_str() == "rhs")
+            })
+            .map(|(_, value)| *value)
+            .expect("rhs entry should exist");
+
+        assert_eq!(string_value(lhs), "alpha");
+        assert_eq!(string_value(rhs), "beta");
     }
 }

@@ -34,8 +34,48 @@ pub use functions::*;
 pub use struct_time::StructTime;
 
 use super::{Module, ModuleError, ModuleResult};
+use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use prism_core::Value;
+use prism_core::intern::{intern, interned_by_ptr};
+use prism_runtime::object::shape::shape_registry;
+use prism_runtime::object::shaped_object::ShapedObject;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::string::StringObject;
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+static TIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.time"), time_builtin));
+static TIME_NS_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.time_ns"), time_ns_builtin));
+static MONOTONIC_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.monotonic"), monotonic_builtin));
+static MONOTONIC_NS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.monotonic_ns"), monotonic_ns_builtin)
+});
+static PERF_COUNTER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.perf_counter"), perf_counter_builtin)
+});
+static PERF_COUNTER_NS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.perf_counter_ns"), perf_counter_ns_builtin)
+});
+static PROCESS_TIME_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.process_time"), process_time_builtin)
+});
+static PROCESS_TIME_NS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.process_time_ns"), process_time_ns_builtin)
+});
+static THREAD_TIME_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.thread_time"), thread_time_builtin)
+});
+static THREAD_TIME_NS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.thread_time_ns"), thread_time_ns_builtin)
+});
+static SLEEP_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.sleep"), sleep_builtin));
+static GET_CLOCK_INFO_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.get_clock_info"), get_clock_info_builtin)
+});
 
 // =============================================================================
 // Time Module Constants
@@ -107,6 +147,7 @@ impl TimeModule {
             Arc::from("strptime"),
             Arc::from("asctime"),
             Arc::from("ctime"),
+            Arc::from("get_clock_info"),
             Arc::from("timezone"),
             Arc::from("altzone"),
             Arc::from("daylight"),
@@ -136,17 +177,23 @@ impl Module for TimeModule {
 
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
-            // Time retrieval functions - return error until callable system is ready
-            "time" | "time_ns" | "monotonic" | "monotonic_ns" | "perf_counter"
-            | "perf_counter_ns" | "process_time" | "process_time_ns" | "thread_time"
-            | "thread_time_ns" | "sleep" | "gmtime" | "localtime" | "mktime" | "strftime"
-            | "strptime" | "asctime" | "ctime" | "get_clock_info" | "struct_time" => {
-                // TODO: Return actual function objects when callable system is ready
-                Err(ModuleError::AttributeError(format!(
-                    "time.{} is not yet callable as an object",
-                    name
-                )))
-            }
+            "time" => Ok(builtin_value(&TIME_FUNCTION)),
+            "time_ns" => Ok(builtin_value(&TIME_NS_FUNCTION)),
+            "monotonic" => Ok(builtin_value(&MONOTONIC_FUNCTION)),
+            "monotonic_ns" => Ok(builtin_value(&MONOTONIC_NS_FUNCTION)),
+            "perf_counter" => Ok(builtin_value(&PERF_COUNTER_FUNCTION)),
+            "perf_counter_ns" => Ok(builtin_value(&PERF_COUNTER_NS_FUNCTION)),
+            "process_time" => Ok(builtin_value(&PROCESS_TIME_FUNCTION)),
+            "process_time_ns" => Ok(builtin_value(&PROCESS_TIME_NS_FUNCTION)),
+            "thread_time" => Ok(builtin_value(&THREAD_TIME_FUNCTION)),
+            "thread_time_ns" => Ok(builtin_value(&THREAD_TIME_NS_FUNCTION)),
+            "sleep" => Ok(builtin_value(&SLEEP_FUNCTION)),
+            "get_clock_info" => Ok(builtin_value(&GET_CLOCK_INFO_FUNCTION)),
+            "gmtime" | "localtime" | "mktime" | "strftime" | "strptime" | "asctime" | "ctime"
+            | "struct_time" => Err(ModuleError::AttributeError(format!(
+                "time.{} is not yet callable as an object",
+                name
+            ))),
 
             // Timezone info - integer constants
             "timezone" => Ok(Value::int_unchecked(get_timezone_offset())),
@@ -292,4 +339,156 @@ fn get_tzname() -> (String, String) {
             (std_name, dst_name)
         }
     }
+}
+
+#[inline]
+fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
+    Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+#[inline]
+fn expect_no_args(args: &[Value], fn_name: &str) -> Result<(), BuiltinError> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "{fn_name}() takes 0 positional arguments but {} were given",
+            args.len()
+        )))
+    }
+}
+
+fn int_value(value: i128, context: &str) -> Result<Value, BuiltinError> {
+    let value = i64::try_from(value).map_err(|_| {
+        BuiltinError::OverflowError(format!("{context} result exceeds supported range"))
+    })?;
+    Value::int(value).ok_or_else(|| {
+        BuiltinError::OverflowError(format!("{context} result exceeds supported range"))
+    })
+}
+
+fn value_to_string(value: Value, context: &str) -> Result<String, BuiltinError> {
+    if value.is_string() {
+        let ptr = value
+            .as_string_object_ptr()
+            .ok_or_else(|| BuiltinError::TypeError(format!("{context} must be str")))?;
+        let interned = interned_by_ptr(ptr as *const u8)
+            .ok_or_else(|| BuiltinError::TypeError(format!("{context} must be str")))?;
+        return Ok(interned.as_str().to_string());
+    }
+
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError(format!("{context} must be str")))?;
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::STR {
+        return Err(BuiltinError::TypeError(format!("{context} must be str")));
+    }
+
+    let string = unsafe { &*(ptr as *const StringObject) };
+    Ok(string.as_str().to_string())
+}
+
+fn time_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "time")?;
+    Ok(Value::float(time()))
+}
+
+fn time_ns_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "time_ns")?;
+    int_value(time_ns(), "time_ns")
+}
+
+fn monotonic_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "monotonic")?;
+    Ok(Value::float(monotonic()))
+}
+
+fn monotonic_ns_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "monotonic_ns")?;
+    int_value(monotonic_ns(), "monotonic_ns")
+}
+
+fn perf_counter_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "perf_counter")?;
+    Ok(Value::float(perf_counter()))
+}
+
+fn perf_counter_ns_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "perf_counter_ns")?;
+    int_value(perf_counter_ns(), "perf_counter_ns")
+}
+
+fn process_time_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "process_time")?;
+    Ok(Value::float(process_time()))
+}
+
+fn process_time_ns_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "process_time_ns")?;
+    int_value(process_time_ns(), "process_time_ns")
+}
+
+fn thread_time_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "thread_time")?;
+    Ok(Value::float(thread_time()))
+}
+
+fn thread_time_ns_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args(args, "thread_time_ns")?;
+    int_value(thread_time_ns(), "thread_time_ns")
+}
+
+fn sleep_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "sleep() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let seconds = if let Some(value) = args[0].as_float() {
+        value
+    } else if let Some(value) = args[0].as_int() {
+        value as f64
+    } else {
+        return Err(BuiltinError::TypeError(
+            "sleep() argument must be int or float".to_string(),
+        ));
+    };
+
+    if seconds.is_sign_negative() {
+        return Err(BuiltinError::ValueError(
+            "sleep length must be non-negative".to_string(),
+        ));
+    }
+
+    sleep(seconds);
+    Ok(Value::none())
+}
+
+fn get_clock_info_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "get_clock_info() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let name = value_to_string(args[0], "clock name")?;
+    let info = get_clock_info(&name).map_err(|err| BuiltinError::ValueError(err.to_string()))?;
+    let registry = shape_registry();
+    let mut object = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
+    object.set_property(
+        intern("implementation"),
+        Value::string(intern(info.implementation)),
+        registry,
+    );
+    object.set_property(intern("monotonic"), Value::bool(info.monotonic), registry);
+    object.set_property(intern("adjustable"), Value::bool(info.adjustable), registry);
+    object.set_property(
+        intern("resolution"),
+        Value::float(info.resolution),
+        registry,
+    );
+    Ok(Value::object_ptr(Box::into_raw(object) as *const ()))
 }

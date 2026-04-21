@@ -4,7 +4,7 @@
 //! and encoding support.
 
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 // =============================================================================
 // Stream Types
@@ -159,6 +159,15 @@ impl Default for StandardStreams {
     fn default() -> Self {
         Self::new()
     }
+}
+
+static STANDARD_STREAMS: LazyLock<StandardStreams> = LazyLock::new(StandardStreams::new);
+
+/// Return the process-global standard stream adapters used by Python-visible
+/// `sys.std*` objects.
+#[inline]
+pub fn standard_streams() -> &'static StandardStreams {
+    &STANDARD_STREAMS
 }
 
 // =============================================================================

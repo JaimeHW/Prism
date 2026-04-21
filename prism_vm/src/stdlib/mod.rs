@@ -17,17 +17,24 @@ pub mod _abc;
 pub mod _ast;
 pub mod _codecs;
 pub mod _imp;
+pub mod _string;
+pub mod _struct;
 pub mod _thread;
 pub mod _tokenize;
 pub mod _warnings;
 pub mod _weakref;
+pub mod _winapi;
 pub mod collections;
+pub mod errno;
 pub mod exceptions;
+pub mod fnmatch;
 pub mod functools;
 pub mod generators;
+pub mod inspect;
 pub mod io;
 pub mod itertools;
 pub mod json;
+pub mod marshal;
 pub mod math;
 pub mod nt;
 pub mod os;
@@ -48,13 +55,17 @@ const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_codecs",
     "_imp",
     "_io",
+    "_string",
+    "_struct",
     "_thread",
     "_tokenize",
+    "_winapi",
     "_warnings",
     "_weakref",
     "builtins",
     "io",
     "itertools",
+    "marshal",
     "math",
     "signal",
     "sys",
@@ -68,13 +79,17 @@ const WINDOWS_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_codecs",
     "_imp",
     "_io",
+    "_string",
+    "_struct",
     "_thread",
     "_tokenize",
+    "_winapi",
     "_warnings",
     "_weakref",
     "builtins",
     "io",
     "itertools",
+    "marshal",
     "math",
     "nt",
     "signal",
@@ -89,6 +104,8 @@ const POSIX_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_codecs",
     "_imp",
     "_io",
+    "_string",
+    "_struct",
     "_thread",
     "_tokenize",
     "_warnings",
@@ -96,6 +113,7 @@ const POSIX_BUILTIN_MODULE_NAMES: &[&str] = &[
     "builtins",
     "io",
     "itertools",
+    "marshal",
     "math",
     "posix",
     "signal",
@@ -275,10 +293,33 @@ impl StdlibRegistry {
 
         Self::insert_module(
             &mut modules,
+            "_string",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_string::StringModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_struct",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_struct::StructModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "_thread",
             StdlibResolutionPolicy::PreferNative,
             Box::new(_thread::ThreadModule::new()),
         );
+
+        if cfg!(windows) {
+            Self::insert_module(
+                &mut modules,
+                "_winapi",
+                StdlibResolutionPolicy::PreferNative,
+                Box::new(_winapi::WinApiModule::new()),
+            );
+        }
 
         Self::insert_module(
             &mut modules,
@@ -304,9 +345,23 @@ impl StdlibRegistry {
         // Register math module
         Self::insert_module(
             &mut modules,
+            "marshal",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(marshal::MarshalModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "math",
             StdlibResolutionPolicy::PreferNative,
             Box::new(math::MathModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "errno",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(errno::ErrnoModule::new()),
         );
 
         if cfg!(windows) {
@@ -403,6 +458,20 @@ impl StdlibRegistry {
 
         Self::insert_module(
             &mut modules,
+            "fnmatch",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(fnmatch::FnmatchModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "inspect",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(inspect::InspectModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "itertools",
             StdlibResolutionPolicy::PreferNative,
             Box::new(itertools::ItertoolsModule::new()),
@@ -465,6 +534,7 @@ mod tests {
     fn test_registry_creation() {
         let registry = StdlibRegistry::new();
         assert!(registry.contains("math"));
+        assert!(registry.contains("errno"));
         assert!(registry.contains("builtins"));
         assert!(registry.contains("signal"));
         assert!(registry.contains("_codecs"));
@@ -535,6 +605,7 @@ mod tests {
         assert!(is_builtin_module_name("_imp"));
         assert!(is_builtin_module_name("_io"));
         assert!(is_builtin_module_name("_thread"));
+        assert!(is_builtin_module_name("_winapi"));
         assert!(is_builtin_module_name("_weakref"));
         assert!(is_builtin_module_name("_warnings"));
         assert!(!is_builtin_module_name("re"));
