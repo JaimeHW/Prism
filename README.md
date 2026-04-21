@@ -269,17 +269,6 @@ Prism is under active development. Current status:
 
 **Total test coverage: 8,800+ tests**
 
-### Roadmap
-
-- [ ] Async/await coroutines
-- [ ] ARM64 backend (infrastructure complete, codegen in progress)
-- [ ] Extended standard library coverage
-- [ ] Package import system
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
 ## License
 
 Licensed under either of:
