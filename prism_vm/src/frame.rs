@@ -16,13 +16,10 @@ pub const MAX_RECURSION_DEPTH: usize = 1000;
 pub const REGISTER_COUNT: usize = 256;
 
 #[derive(Clone, Copy)]
-pub struct FrameStateSnapshot {
-    ip: u32,
-    registers: [Value; REGISTER_COUNT],
-    written_registers: [u64; REGISTER_COUNT / 64],
-    locals_mapping: Option<Value>,
-    yield_point: u32,
-    handler_cache: InlineHandlerCache,
+pub struct RegisterSnapshot {
+    reg: u8,
+    value: Value,
+    written: bool,
 }
 
 /// A call frame representing a function invocation.
@@ -353,25 +350,26 @@ impl Frame {
     }
 
     #[inline(always)]
-    pub fn snapshot_state(&self) -> FrameStateSnapshot {
-        FrameStateSnapshot {
-            ip: self.ip,
-            registers: self.registers,
-            written_registers: self.written_registers,
-            locals_mapping: self.locals_mapping,
-            yield_point: self.yield_point,
-            handler_cache: self.handler_cache,
+    pub fn snapshot_register(&self, reg: u8) -> RegisterSnapshot {
+        RegisterSnapshot {
+            reg,
+            value: self.get_reg(reg),
+            written: self.reg_is_written(reg),
         }
     }
 
     #[inline(always)]
-    pub fn restore_state(&mut self, snapshot: FrameStateSnapshot) {
-        self.ip = snapshot.ip;
-        self.registers = snapshot.registers;
-        self.written_registers = snapshot.written_registers;
-        self.locals_mapping = snapshot.locals_mapping;
-        self.yield_point = snapshot.yield_point;
-        self.handler_cache = snapshot.handler_cache;
+    pub fn restore_register(&mut self, snapshot: RegisterSnapshot) {
+        let reg_idx = snapshot.reg as usize;
+        unsafe { *self.registers.get_unchecked_mut(reg_idx) = snapshot.value };
+
+        let word = reg_idx / 64;
+        let bit = reg_idx % 64;
+        if snapshot.written {
+            self.written_registers[word] |= 1u64 << bit;
+        } else {
+            self.written_registers[word] &= !(1u64 << bit);
+        }
     }
 
     /// Check whether a register has been explicitly written.

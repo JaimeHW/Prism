@@ -16,7 +16,7 @@ use crate::builtins::{
 };
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::frame::{ClosureEnv, FrameStateSnapshot};
+use crate::frame::{ClosureEnv, RegisterSnapshot};
 use crate::ops::kw_binding::{ArgumentBinder, BoundArguments};
 use crate::stdlib::generators::{GeneratorObject, LivenessMap};
 use crate::vm::NestedTargetFrameOutcome;
@@ -84,11 +84,11 @@ pub(crate) enum InvokeCallableOutcome {
 fn restore_direct_call_caller_state(
     vm: &mut VirtualMachine,
     stop_depth: usize,
-    saved_frame: FrameStateSnapshot,
+    saved_register: RegisterSnapshot,
     saved_exception_context: crate::vm::ExceptionContextSnapshot,
 ) {
     if vm.call_depth() == stop_depth {
-        vm.current_frame_mut().restore_state(saved_frame);
+        vm.current_frame_mut().restore_register(saved_register);
         vm.restore_exception_context(saved_exception_context);
     }
 }
@@ -1455,7 +1455,7 @@ fn invoke_user_function_direct_impl(
         ));
     }
 
-    let saved_caller_frame = vm.current_frame().snapshot_state();
+    let saved_caller_register = vm.current_frame().snapshot_register(DIRECT_CALL_RETURN_REG);
     let saved_exception_context = vm.capture_exception_context();
 
     let stop_depth = vm.call_depth();
@@ -1494,7 +1494,7 @@ fn invoke_user_function_direct_impl(
         restore_direct_call_caller_state(
             vm,
             stop_depth,
-            saved_caller_frame,
+            saved_caller_register,
             saved_exception_context,
         );
     }
@@ -1522,7 +1522,7 @@ fn invoke_user_function_direct_with_keywords(
         ));
     }
 
-    let saved_caller_frame = vm.current_frame().snapshot_state();
+    let saved_caller_register = vm.current_frame().snapshot_register(DIRECT_CALL_RETURN_REG);
     let saved_exception_context = vm.capture_exception_context();
 
     let stop_depth = vm.call_depth();
@@ -1547,7 +1547,12 @@ fn invoke_user_function_direct_with_keywords(
         let target_frame_id = vm.current_frame_id();
         vm.execute_until_target_frame_returns(stop_depth, target_frame_id)
     };
-    restore_direct_call_caller_state(vm, stop_depth, saved_caller_frame, saved_exception_context);
+    restore_direct_call_caller_state(
+        vm,
+        stop_depth,
+        saved_caller_register,
+        saved_exception_context,
+    );
 
     result
 }
@@ -1573,9 +1578,8 @@ fn invoke_callable_value_impl(
         _ if extract_type_id(ptr) == EXCEPTION_TYPE_ID => {
             let exc_type = unsafe { &*(ptr as *const ExceptionTypeObject) };
             exc_type
-                .call(args)
+                .call_in_vm(vm, args)
                 .map(InvokeCallableOutcome::Returned)
-                .map_err(|err| RuntimeError::type_error(err.to_string()))
         }
         TypeId::TYPE => {
             if let Some(represented_type) = builtin_type_object_type_id(ptr) {
@@ -3380,10 +3384,12 @@ pub(crate) fn initialize_closure_cellvars_from_locals(
 #[cfg(test)]
 mod tests {
     use super::BoundArgs;
+    use super::DIRECT_CALL_RETURN_REG;
     use super::call;
     use super::invoke_callable_value;
     use super::invoke_callable_value_with_keywords;
     use super::resolve_instantiation_slot;
+    use super::restore_direct_call_caller_state;
     use super::value_supports_call_protocol;
     use crate::VirtualMachine;
     use crate::builtins::{BuiltinError, BuiltinFunctionObject};
@@ -3504,6 +3510,76 @@ mod tests {
         let mut bound = BoundArgs::new(65);
         bound.set_bound(70);
         assert!(!bound.is_bound(70));
+    }
+
+    #[test]
+    fn test_restore_direct_call_caller_state_only_restores_scratch_register() {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(
+            Arc::new(CodeObject::new("direct_call_restore", "<test>")),
+            0,
+        )
+        .expect("frame push should succeed");
+        vm.current_frame_mut().set_reg(7, Value::int(1).unwrap());
+
+        let saved_register = vm.current_frame().snapshot_register(DIRECT_CALL_RETURN_REG);
+        let saved_exception_context = vm.capture_exception_context();
+
+        vm.current_frame_mut()
+            .set_reg(DIRECT_CALL_RETURN_REG, Value::int(99).unwrap());
+        vm.current_frame_mut().set_reg(7, Value::int(42).unwrap());
+
+        let stop_depth = vm.call_depth();
+        restore_direct_call_caller_state(
+            &mut vm,
+            stop_depth,
+            saved_register,
+            saved_exception_context,
+        );
+
+        assert_eq!(vm.current_frame().get_reg(7).as_int(), Some(42));
+        assert_eq!(
+            vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG),
+            Value::none()
+        );
+        assert!(vm.current_frame().reg_is_written(7));
+        assert!(!vm.current_frame().reg_is_written(DIRECT_CALL_RETURN_REG));
+    }
+
+    #[test]
+    fn test_restore_direct_call_caller_state_preserves_written_scratch_register_state() {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(
+            Arc::new(CodeObject::new("direct_call_written", "<test>")),
+            0,
+        )
+        .expect("frame push should succeed");
+        vm.current_frame_mut()
+            .set_reg(DIRECT_CALL_RETURN_REG, Value::int(5).unwrap());
+        vm.current_frame_mut().set_reg(8, Value::int(11).unwrap());
+
+        let saved_register = vm.current_frame().snapshot_register(DIRECT_CALL_RETURN_REG);
+        let saved_exception_context = vm.capture_exception_context();
+
+        vm.current_frame_mut()
+            .set_reg(DIRECT_CALL_RETURN_REG, Value::int(77).unwrap());
+        vm.current_frame_mut().set_reg(8, Value::int(22).unwrap());
+
+        let stop_depth = vm.call_depth();
+        restore_direct_call_caller_state(
+            &mut vm,
+            stop_depth,
+            saved_register,
+            saved_exception_context,
+        );
+
+        assert_eq!(
+            vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG).as_int(),
+            Some(5)
+        );
+        assert_eq!(vm.current_frame().get_reg(8).as_int(), Some(22));
+        assert!(vm.current_frame().reg_is_written(DIRECT_CALL_RETURN_REG));
+        assert!(vm.current_frame().reg_is_written(8));
     }
 
     #[test]

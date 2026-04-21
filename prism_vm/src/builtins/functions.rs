@@ -8,8 +8,8 @@ use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::python_numeric::int_like_value;
 use crate::stdlib::collections::deque::DequeObject;
-use num_bigint::Sign;
-use num_traits::ToPrimitive;
+use num_bigint::{BigInt, Sign};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
@@ -18,7 +18,7 @@ use prism_runtime::object::views::MappingProxyObject;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::{int_value_to_string, value_to_bigint};
+use prism_runtime::types::int::{IntObject, bigint_to_value, int_value_to_string, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
@@ -543,10 +543,8 @@ fn primitive_extreme_ordering(left: Value, right: Value) -> Option<Ordering> {
         return Some(Ordering::Equal);
     }
 
-    let left_numeric = numeric_extreme_key(left);
-    let right_numeric = numeric_extreme_key(right);
-    if let (Some(left), Some(right)) = (left_numeric, right_numeric) {
-        return left.partial_cmp(&right);
+    if let Some(ordering) = compare_numeric_extreme_values(left, right) {
+        return Some(ordering);
     }
 
     match (value_as_string_ref(left), value_as_string_ref(right)) {
@@ -556,14 +554,85 @@ fn primitive_extreme_ordering(left: Value, right: Value) -> Option<Ordering> {
 }
 
 #[inline]
-fn numeric_extreme_key(value: Value) -> Option<f64> {
+fn compare_numeric_extreme_values(left: Value, right: Value) -> Option<Ordering> {
+    if let (Some(left_int), Some(right_int)) = (
+        numeric_value_to_bigint(left),
+        numeric_value_to_bigint(right),
+    ) {
+        return Some(left_int.cmp(&right_int));
+    }
+
+    match (numeric_value_to_f64(left), numeric_value_to_f64(right)) {
+        (Some(left_float), Some(right_float)) => left_float.partial_cmp(&right_float),
+        (Some(left_float), None) => {
+            compare_f64_to_bigint(left_float, &numeric_value_to_bigint(right)?)
+        }
+        (None, Some(right_float)) => {
+            compare_bigint_to_f64(&numeric_value_to_bigint(left)?, right_float)
+        }
+        (None, None) => None,
+    }
+}
+
+#[inline]
+fn numeric_value_to_bigint(value: Value) -> Option<BigInt> {
     if let Some(boolean) = value.as_bool() {
-        return Some(if boolean { 1.0 } else { 0.0 });
+        return Some(BigInt::from(u8::from(boolean)));
     }
-    if let Some(integer) = value.as_int() {
-        return Some(integer as f64);
-    }
+
+    value_to_bigint(value)
+}
+
+#[inline]
+fn numeric_value_to_f64(value: Value) -> Option<f64> {
     value.as_float()
+}
+
+#[inline]
+fn compare_f64_to_bigint(left: f64, right: &BigInt) -> Option<Ordering> {
+    compare_bigint_to_f64(right, left).map(Ordering::reverse)
+}
+
+fn compare_bigint_to_f64(left: &BigInt, right: f64) -> Option<Ordering> {
+    if right.is_nan() {
+        return None;
+    }
+    if right.is_infinite() {
+        return Some(if right.is_sign_positive() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+
+    let bits = right.to_bits();
+    let sign_negative = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let mantissa_bits = bits & ((1u64 << 52) - 1);
+
+    if exponent_bits == 0 && mantissa_bits == 0 {
+        return Some(left.cmp(&BigInt::zero()));
+    }
+
+    let exponent = if exponent_bits == 0 {
+        -1022
+    } else {
+        exponent_bits - 1023
+    };
+    let mantissa = if exponent_bits == 0 {
+        BigInt::from(mantissa_bits)
+    } else {
+        BigInt::from((1u64 << 52) | mantissa_bits)
+    };
+    let signed_mantissa = if sign_negative { -mantissa } else { mantissa };
+
+    if exponent >= 52 {
+        let shifted = signed_mantissa << ((exponent - 52) as usize);
+        return Some(left.cmp(&shifted));
+    }
+
+    let shift = (52 - exponent) as usize;
+    Some((left << shift).cmp(&signed_mantissa))
 }
 
 #[inline]
@@ -621,7 +690,7 @@ pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
     let mut acc = if args.len() == 2 {
         NumericAccumulator::from_start(args[1])?
     } else {
-        NumericAccumulator::Int(0)
+        NumericAccumulator::SmallInt(0)
     };
 
     if let Some(iter) = super::iter_dispatch::get_iterator_mut(&args[0]) {
@@ -636,7 +705,7 @@ pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
         }
     }
 
-    acc.into_value()
+    Ok(acc.into_value())
 }
 
 /// VM-aware sum builtin.
@@ -651,7 +720,7 @@ pub fn builtin_sum_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     let mut acc = if args.len() == 2 {
         NumericAccumulator::from_start(args[1])?
     } else {
-        NumericAccumulator::Int(0)
+        NumericAccumulator::SmallInt(0)
     };
 
     let iterator =
@@ -659,14 +728,15 @@ pub fn builtin_sum_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     loop {
         match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
             IterStep::Yielded(item) => acc.add(item)?,
-            IterStep::Exhausted => return acc.into_value(),
+            IterStep::Exhausted => return acc.into_value_in_vm(vm),
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum NumericAccumulator {
-    Int(i64),
+    SmallInt(i64),
+    BigInt(BigInt),
     Float(f64),
 }
 
@@ -679,14 +749,16 @@ impl NumericAccumulator {
             ));
         }
 
-        if let Some(i) = value.as_int() {
-            return Ok(Self::Int(i));
-        }
         if let Some(f) = value.as_float() {
             return Ok(Self::Float(f));
         }
-        if let Some(b) = value.as_bool() {
-            return Ok(Self::Int(if b { 1 } else { 0 }));
+        if let Some(bigint) = numeric_value_to_bigint(value) {
+            if let Some(i) = bigint.to_i64()
+                && Value::int(i).is_some()
+            {
+                return Ok(Self::SmallInt(i));
+            }
+            return Ok(Self::BigInt(bigint));
         }
 
         Err(BuiltinError::TypeError(format!(
@@ -697,16 +769,20 @@ impl NumericAccumulator {
 
     #[inline]
     fn add(&mut self, value: Value) -> Result<(), BuiltinError> {
-        let rhs = if let Some(i) = value.as_int() {
-            NumericAccumulator::Int(i)
-        } else if let Some(f) = value.as_float() {
+        let rhs = if let Some(f) = value.as_float() {
             NumericAccumulator::Float(f)
-        } else if let Some(b) = value.as_bool() {
-            NumericAccumulator::Int(if b { 1 } else { 0 })
         } else if value.is_string() || is_str_object(value) {
             return Err(BuiltinError::TypeError(
                 "sum() can't sum strings [use ''.join(seq) instead]".to_string(),
             ));
+        } else if let Some(bigint) = numeric_value_to_bigint(value) {
+            if let Some(i) = bigint.to_i64()
+                && Value::int(i).is_some()
+            {
+                NumericAccumulator::SmallInt(i)
+            } else {
+                NumericAccumulator::BigInt(bigint)
+            }
         } else {
             return Err(BuiltinError::TypeError(format!(
                 "unsupported operand type(s) for +: '{}' and '{}'",
@@ -715,44 +791,74 @@ impl NumericAccumulator {
             )));
         };
 
-        match (*self, rhs) {
-            (NumericAccumulator::Int(lhs), NumericAccumulator::Int(rhs_i)) => {
-                let sum = lhs.checked_add(rhs_i).ok_or_else(|| {
-                    BuiltinError::OverflowError("integer overflow in sum".to_string())
-                })?;
-                if Value::int(sum).is_none() {
-                    return Err(BuiltinError::OverflowError(
-                        "integer overflow in sum".to_string(),
-                    ));
+        match (&*self, rhs) {
+            (NumericAccumulator::SmallInt(lhs), NumericAccumulator::SmallInt(rhs_i)) => {
+                if let Some(sum) = lhs.checked_add(rhs_i) {
+                    *self = if Value::int(sum).is_some() {
+                        NumericAccumulator::SmallInt(sum)
+                    } else {
+                        NumericAccumulator::BigInt(BigInt::from(sum))
+                    };
+                } else {
+                    *self = NumericAccumulator::BigInt(BigInt::from(*lhs) + BigInt::from(rhs_i));
                 }
-                *self = NumericAccumulator::Int(sum);
             }
-            (NumericAccumulator::Int(lhs), NumericAccumulator::Float(rhs_f)) => {
-                *self = NumericAccumulator::Float(lhs as f64 + rhs_f);
+            (NumericAccumulator::SmallInt(lhs), NumericAccumulator::BigInt(rhs_big)) => {
+                *self = NumericAccumulator::BigInt(BigInt::from(*lhs) + rhs_big);
             }
-            (NumericAccumulator::Float(lhs), NumericAccumulator::Int(rhs_i)) => {
-                *self = NumericAccumulator::Float(lhs + rhs_i as f64);
+            (NumericAccumulator::BigInt(lhs_big), NumericAccumulator::SmallInt(rhs_i)) => {
+                *self = NumericAccumulator::BigInt(lhs_big + BigInt::from(rhs_i));
+            }
+            (NumericAccumulator::BigInt(lhs_big), NumericAccumulator::BigInt(rhs_big)) => {
+                *self = NumericAccumulator::BigInt(lhs_big + rhs_big);
+            }
+            (NumericAccumulator::SmallInt(lhs), NumericAccumulator::Float(rhs_f)) => {
+                *self = NumericAccumulator::Float(*lhs as f64 + rhs_f);
+            }
+            (NumericAccumulator::Float(lhs), NumericAccumulator::SmallInt(rhs_i)) => {
+                *self = NumericAccumulator::Float(*lhs + rhs_i as f64);
+            }
+            (NumericAccumulator::BigInt(lhs_big), NumericAccumulator::Float(rhs_f)) => {
+                let lhs = bigint_to_finite_f64(lhs_big)?;
+                *self = NumericAccumulator::Float(lhs + rhs_f);
+            }
+            (NumericAccumulator::Float(lhs), NumericAccumulator::BigInt(rhs_big)) => {
+                let rhs = bigint_to_finite_f64(&rhs_big)?;
+                *self = NumericAccumulator::Float(*lhs + rhs);
             }
             (NumericAccumulator::Float(lhs), NumericAccumulator::Float(rhs_f)) => {
-                *self = NumericAccumulator::Float(lhs + rhs_f);
+                *self = NumericAccumulator::Float(*lhs + rhs_f);
             }
         }
         Ok(())
     }
 
     #[inline]
-    fn type_name(self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         match self {
-            NumericAccumulator::Int(_) => "int",
+            NumericAccumulator::SmallInt(_) | NumericAccumulator::BigInt(_) => "int",
             NumericAccumulator::Float(_) => "float",
         }
     }
 
     #[inline]
-    fn into_value(self) -> Result<Value, BuiltinError> {
+    fn into_value(self) -> Value {
         match self {
-            NumericAccumulator::Int(i) => Value::int(i)
-                .ok_or_else(|| BuiltinError::OverflowError("integer overflow in sum".to_string())),
+            NumericAccumulator::SmallInt(i) => Value::int(i).expect("small accumulator must fit"),
+            NumericAccumulator::BigInt(value) => bigint_to_value(value),
+            NumericAccumulator::Float(f) => Value::float(f),
+        }
+    }
+
+    #[inline]
+    fn into_value_in_vm(self, vm: &VirtualMachine) -> Result<Value, BuiltinError> {
+        match self {
+            NumericAccumulator::SmallInt(i) => {
+                Ok(Value::int(i).expect("small accumulator must fit"))
+            }
+            NumericAccumulator::BigInt(value) => {
+                bigint_to_value_in_vm(vm, value).map_err(super::runtime_error_to_builtin_error)
+            }
             NumericAccumulator::Float(f) => Ok(Value::float(f)),
         }
     }
@@ -764,6 +870,33 @@ fn is_str_object(value: Value) -> bool {
         .as_object_ptr()
         .and_then(object_ptr_as_string_ref)
         .is_some()
+}
+
+#[inline]
+fn bigint_to_finite_f64(value: &BigInt) -> Result<f64, BuiltinError> {
+    let converted = value.to_f64().ok_or_else(|| {
+        BuiltinError::OverflowError("int too large to convert to float".to_string())
+    })?;
+    if converted.is_finite() {
+        Ok(converted)
+    } else {
+        Err(BuiltinError::OverflowError(
+            "int too large to convert to float".to_string(),
+        ))
+    }
+}
+
+#[inline]
+fn bigint_to_value_in_vm(vm: &VirtualMachine, value: BigInt) -> Result<Value, RuntimeError> {
+    if let Some(i) = value.to_i64()
+        && let Some(inline) = Value::int(i)
+    {
+        return Ok(inline);
+    }
+
+    vm.allocator()
+        .alloc_value(IntObject::new(value))
+        .ok_or_else(|| RuntimeError::internal("out of memory: failed to allocate int"))
 }
 
 #[inline]
@@ -793,6 +926,15 @@ fn value_type_name(value: Value) -> &'static str {
 ///
 /// pow(base, exp[, mod]) - Compute base**exp, optionally modulo mod.
 pub fn builtin_pow(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_pow_impl(None, args)
+}
+
+/// VM-aware pow builtin that allocates promoted integer results in the managed heap.
+pub fn builtin_pow_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_pow_impl(Some(vm), args)
+}
+
+fn builtin_pow_impl(vm: Option<&VirtualMachine>, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
             "pow expected 2 or 3 arguments, got {}",
@@ -803,39 +945,44 @@ pub fn builtin_pow(args: &[Value]) -> Result<Value, BuiltinError> {
     let base = args[0];
     let exp = args[1];
 
-    // Integer power
-    if let (Some(b), Some(e)) = (base.as_int(), exp.as_int()) {
+    if let (Some(base_int), Some(exp_int)) =
+        (numeric_value_to_bigint(base), numeric_value_to_bigint(exp))
+    {
         if args.len() == 3 {
-            // Modular exponentiation
-            if let Some(m) = args[2].as_int() {
-                if m == 0 {
-                    return Err(BuiltinError::ValueError(
-                        "pow() 3rd argument cannot be 0".to_string(),
-                    ));
-                }
-                // Use modular exponentiation
-                let result = mod_pow(b, e, m);
-                return Value::int(result).ok_or_else(|| {
-                    BuiltinError::OverflowError("integer overflow in pow".to_string())
-                });
-            }
+            let modulus = numeric_value_to_bigint(args[2]).ok_or_else(|| {
+                BuiltinError::TypeError(
+                    "pow() 3rd argument not allowed unless all arguments are integers".to_string(),
+                )
+            })?;
+
+            let result = pow_bigint_with_modulus(base_int, exp_int, modulus)?;
+            return bigint_result_to_value(vm, result);
         }
 
-        // Simple integer power
-        if e >= 0 && e <= 63 {
-            if let Some(result) = b.checked_pow(e as u32) {
-                return Value::int(result).ok_or_else(|| {
-                    BuiltinError::OverflowError("integer overflow in pow".to_string())
-                });
+        if exp_int.is_negative() {
+            if base_int.is_zero() {
+                return Err(BuiltinError::Raised(
+                    RuntimeError::zero_division_with_message(
+                        "0.0 cannot be raised to a negative power",
+                    ),
+                ));
             }
+
+            let base_float = bigint_to_finite_f64(&base_int)?;
+            let exp_float = bigint_to_finite_f64(&exp_int)?;
+            return Ok(Value::float(base_float.powf(exp_float)));
         }
 
-        // Fall back to float for large exponents
-        let result = (b as f64).powf(e as f64);
-        return Ok(Value::float(result));
+        let result = pow_bigint_non_negative(&base_int, &exp_int);
+        return bigint_result_to_value(vm, result);
     }
 
-    // Float power
+    if args.len() == 3 {
+        return Err(BuiltinError::TypeError(
+            "pow() 3rd argument not allowed unless all arguments are integers".to_string(),
+        ));
+    }
+
     if let (Some(b), Some(e)) = (base.as_float_coerce(), exp.as_float_coerce()) {
         let result = b.powf(e);
         return Ok(Value::float(result));
@@ -846,26 +993,77 @@ pub fn builtin_pow(args: &[Value]) -> Result<Value, BuiltinError> {
     ))
 }
 
-/// Modular exponentiation: (base^exp) mod modulus
 #[inline]
-fn mod_pow(mut base: i64, mut exp: i64, modulus: i64) -> i64 {
-    if exp < 0 {
-        // Negative exponent with modulus is not supported for integers
-        return 0;
+fn bigint_result_to_value(
+    vm: Option<&VirtualMachine>,
+    value: BigInt,
+) -> Result<Value, BuiltinError> {
+    match vm {
+        Some(vm) => bigint_to_value_in_vm(vm, value).map_err(super::runtime_error_to_builtin_error),
+        None => Ok(bigint_to_value(value)),
+    }
+}
+
+fn pow_bigint_non_negative(base: &BigInt, exponent: &BigInt) -> BigInt {
+    if let Some(exp_u32) = exponent.to_u32() {
+        return base.pow(exp_u32);
     }
 
-    let mut result: i64 = 1;
-    base = base.rem_euclid(modulus);
+    let mut exponent = exponent.clone();
+    let mut factor = base.clone();
+    let mut result = BigInt::one();
 
-    while exp > 0 {
-        if exp % 2 == 1 {
-            result = (result * base).rem_euclid(modulus);
+    while !exponent.is_zero() {
+        if (&exponent & BigInt::one()) == BigInt::one() {
+            result *= &factor;
         }
-        exp /= 2;
-        base = (base * base).rem_euclid(modulus);
+        exponent >>= 1usize;
+        if !exponent.is_zero() {
+            factor = &factor * &factor;
+        }
     }
 
     result
+}
+
+fn pow_bigint_with_modulus(
+    base: BigInt,
+    exponent: BigInt,
+    modulus: BigInt,
+) -> Result<BigInt, BuiltinError> {
+    if modulus.is_zero() {
+        return Err(BuiltinError::ValueError(
+            "pow() 3rd argument cannot be 0".to_string(),
+        ));
+    }
+
+    let modulus_negative = modulus.sign() == Sign::Minus;
+    let modulus_abs = modulus.abs();
+    let base = mod_floor_bigint(&base, &modulus_abs);
+
+    let result = if exponent.is_negative() {
+        let inverse = base.modinv(&modulus_abs).ok_or_else(|| {
+            BuiltinError::ValueError("base is not invertible for the given modulus".to_string())
+        })?;
+        inverse.modpow(&(-exponent), &modulus_abs)
+    } else {
+        base.modpow(&exponent, &modulus_abs)
+    };
+
+    if modulus_negative && !result.is_zero() {
+        Ok(result - modulus_abs)
+    } else {
+        Ok(result)
+    }
+}
+
+fn mod_floor_bigint(value: &BigInt, modulus: &BigInt) -> BigInt {
+    let remainder = value % modulus;
+    if remainder.is_zero() || remainder.sign() == modulus.sign() {
+        remainder
+    } else {
+        remainder + modulus
+    }
 }
 
 // =============================================================================
@@ -1839,8 +2037,26 @@ mod tests {
         let list =
             ListObject::from_slice(&[Value::int(SMALL_INT_MAX).unwrap(), Value::int(1).unwrap()]);
         let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value]).unwrap();
+        assert_eq!(
+            value_to_bigint(result),
+            Some(BigInt::from(SMALL_INT_MAX) + BigInt::from(1_i64))
+        );
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_bigint_and_float_reports_exact_overflow_boundary() {
+        let huge = bigint_to_value(BigInt::from(1_u8) << 10000_u32);
+        let list = ListObject::from_slice(&[huge, Value::float(1.0)]);
+        let (value, ptr) = boxed_value(list);
         let err = builtin_sum(&[value]).unwrap_err();
         assert!(matches!(err, BuiltinError::OverflowError(_)));
+        assert!(
+            err.to_string()
+                .contains("int too large to convert to float"),
+            "unexpected error: {err}"
+        );
         unsafe { drop_boxed(ptr) };
     }
 
@@ -1859,6 +2075,96 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(result.as_int(), Some(24)); // 1024 % 100 = 24
+    }
+
+    #[test]
+    fn test_min_prefers_exact_bigint_ordering_over_float_rounding() {
+        let huge = bigint_to_value(BigInt::from(1_u8) << 80_u32);
+        let result = builtin_min(&[huge, Value::float(2f64.powi(80))]).unwrap();
+        assert_eq!(value_to_bigint(result), Some(BigInt::from(1_u8) << 80_u32));
+    }
+
+    #[test]
+    fn test_max_prefers_exact_bigint_ordering_over_float_rounding() {
+        let huge_plus_one = bigint_to_value((BigInt::from(1_u8) << 80_u32) + BigInt::from(1_u8));
+        let result = builtin_max(&[huge_plus_one, Value::float(2f64.powi(80))]).unwrap();
+        assert_eq!(
+            value_to_bigint(result),
+            Some((BigInt::from(1_u8) << 80_u32) + BigInt::from(1_u8))
+        );
+    }
+
+    #[test]
+    fn test_min_handles_negative_bigint_float_boundary_exactly() {
+        let huge_negative = bigint_to_value(-((BigInt::from(1_u8) << 80_u32) + BigInt::from(1_u8)));
+        let result = builtin_min(&[huge_negative, Value::float(-2f64.powi(80))]).unwrap();
+        assert_eq!(
+            value_to_bigint(result),
+            Some(-((BigInt::from(1_u8) << 80_u32) + BigInt::from(1_u8)))
+        );
+    }
+
+    #[test]
+    fn test_pow_promotes_large_integer_results_to_bigint() {
+        let result = builtin_pow(&[Value::int(2).unwrap(), Value::int(100).unwrap()]).unwrap();
+        assert_eq!(value_to_bigint(result), Some(BigInt::from(1_u8) << 100_u32));
+    }
+
+    #[test]
+    fn test_pow_negative_modular_exponent_uses_inverse() {
+        let result = builtin_pow(&[
+            Value::int(2).unwrap(),
+            Value::int(-1).unwrap(),
+            Value::int(5).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(result.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_pow_negative_modulus_matches_python_sign_rules() {
+        let result = builtin_pow(&[
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(-5).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(result.as_int(), Some(-2));
+
+        let inverse = builtin_pow(&[
+            Value::int(2).unwrap(),
+            Value::int(-1).unwrap(),
+            Value::int(-5).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(inverse.as_int(), Some(-2));
+    }
+
+    #[test]
+    fn test_pow_non_invertible_negative_modular_exponent_errors() {
+        let err = builtin_pow(&[
+            Value::int(2).unwrap(),
+            Value::int(-1).unwrap(),
+            Value::int(4).unwrap(),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, BuiltinError::ValueError(_)));
+        assert!(
+            err.to_string()
+                .contains("base is not invertible for the given modulus"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pow_zero_to_negative_power_raises_zero_division() {
+        let err = builtin_pow(&[Value::int(0).unwrap(), Value::int(-1).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::Raised(_)));
+        assert!(
+            err.to_string()
+                .contains("0.0 cannot be raised to a negative power"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
