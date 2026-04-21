@@ -1157,6 +1157,37 @@ mod tests {
         assert!(desc.is_writable());
     }
 
+    #[test]
+    fn test_shaped_object_same_property_name_different_flags_gets_distinct_shapes() {
+        let registry = ShapeRegistry::new();
+        let mut writable = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
+        let mut read_only = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
+
+        writable.set_property(intern("shared"), val(1), &registry);
+        read_only.set_property_with_flags(
+            intern("shared"),
+            val(2),
+            PropertyFlags::read_only(),
+            &registry,
+        );
+
+        assert_ne!(writable.shape_id(), read_only.shape_id());
+        assert!(
+            writable
+                .shape()
+                .get_descriptor("shared")
+                .expect("writable descriptor missing")
+                .is_writable()
+        );
+        assert!(
+            !read_only
+                .shape()
+                .get_descriptor("shared")
+                .expect("read-only descriptor missing")
+                .is_writable()
+        );
+    }
+
     // -------------------------------------------------------------------------
     // ShapedObject Tests - Iterator
     // -------------------------------------------------------------------------

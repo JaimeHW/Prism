@@ -41,9 +41,10 @@
 //! properties spill to a backing dictionary.
 
 use prism_core::intern::InternedString;
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // =============================================================================
 // Property Attributes
@@ -189,6 +190,63 @@ impl ShapeId {
 /// 8 slots = 64 bytes of inline storage (8 * 8-byte Values).
 pub const MAX_INLINE_SLOTS: usize = 8;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TransitionKey {
+    name: InternedString,
+    flags: PropertyFlags,
+}
+
+impl TransitionKey {
+    #[inline]
+    fn new(name: InternedString, flags: PropertyFlags) -> Self {
+        Self { name, flags }
+    }
+}
+
+#[derive(Debug)]
+struct ShapeLayout {
+    descriptors: Box<[PropertyDescriptor]>,
+    descriptor_indices: FxHashMap<InternedString, u16>,
+}
+
+impl ShapeLayout {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            descriptors: Box::new([]),
+            descriptor_indices: FxHashMap::default(),
+        })
+    }
+
+    fn extend(parent: &Arc<Self>, descriptor: PropertyDescriptor) -> Arc<Self> {
+        let mut descriptors = Vec::with_capacity(parent.descriptors.len() + 1);
+        descriptors.extend_from_slice(parent.descriptors.as_ref());
+        let descriptor_index = descriptors.len() as u16;
+        descriptors.push(descriptor.clone());
+
+        let mut descriptor_indices = parent.descriptor_indices.clone();
+        descriptor_indices.insert(descriptor.name.clone(), descriptor_index);
+
+        Arc::new(Self {
+            descriptors: descriptors.into_boxed_slice(),
+            descriptor_indices,
+        })
+    }
+
+    #[inline]
+    fn lookup_interned(&self, name: &InternedString) -> Option<u16> {
+        self.descriptor_indices
+            .get(name)
+            .map(|&index| self.descriptors[index as usize].slot_index)
+    }
+
+    #[inline]
+    fn get_descriptor_interned(&self, name: &InternedString) -> Option<&PropertyDescriptor> {
+        self.descriptor_indices
+            .get(name)
+            .map(|&index| &self.descriptors[index as usize])
+    }
+}
+
 /// A Shape describes the property layout of objects.
 ///
 /// Objects with the same property sequence share a Shape, enabling:
@@ -208,6 +266,9 @@ pub struct Shape {
     /// None for the empty shape.
     property: Option<PropertyDescriptor>,
 
+    /// Immutable descriptor table for O(1) baseline property lookup.
+    layout: Arc<ShapeLayout>,
+
     /// Total number of properties in this shape chain.
     property_count: u16,
 
@@ -215,9 +276,8 @@ pub struct Shape {
     inline_count: u16,
 
     /// Transitions to child shapes (lazily populated).
-    /// Key: property name, Value: child shape.
-    /// Uses RwLock for thread-safe lazy initialization.
-    transitions: RwLock<FxHashMap<InternedString, Arc<Shape>>>,
+    /// Key: property name + flags, Value: child shape.
+    transitions: RwLock<FxHashMap<TransitionKey, Arc<Shape>>>,
 }
 
 impl Shape {
@@ -227,6 +287,7 @@ impl Shape {
             id: ShapeId::EMPTY,
             parent: None,
             property: None,
+            layout: ShapeLayout::empty(),
             property_count: 0,
             inline_count: 0,
             transitions: RwLock::new(FxHashMap::default()),
@@ -248,11 +309,14 @@ impl Shape {
             // Beyond inline storage - would spill to dictionary
             parent.inline_count
         };
+        let descriptor = PropertyDescriptor::new(name, slot_index, flags);
+        let layout = ShapeLayout::extend(&parent.layout, descriptor.clone());
 
         Arc::new(Self {
             id,
             parent: Some(parent),
-            property: Some(PropertyDescriptor::new(name, slot_index, flags)),
+            property: Some(descriptor),
+            layout,
             property_count: parent_property_count + 1,
             inline_count,
             transitions: RwLock::new(FxHashMap::default()),
@@ -304,112 +368,80 @@ impl Shape {
     /// Lookup a property by name, traversing the shape chain.
     ///
     /// Returns the slot index if found.
-    /// O(n) where n is property count, but short chains are fast.
+    /// String-based lookups are kept off the hot path; interned lookups use the
+    /// prebuilt descriptor index.
     pub fn lookup(&self, name: &str) -> Option<u16> {
-        let mut current = self;
-        loop {
-            if let Some(prop) = &current.property {
-                if prop.name.as_str() == name {
-                    return Some(prop.slot_index);
-                }
-            }
-            match &current.parent {
-                Some(parent) => current = parent.as_ref(),
-                None => return None,
-            }
-        }
+        self.layout
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.name.as_str() == name)
+            .map(|descriptor| descriptor.slot_index)
     }
 
     /// Lookup a property by interned name (faster comparison).
     #[inline]
     pub fn lookup_interned(&self, name: &InternedString) -> Option<u16> {
-        let mut current = self;
-        loop {
-            if let Some(prop) = &current.property {
-                // Interned string comparison is pointer equality
-                if &prop.name == name {
-                    return Some(prop.slot_index);
-                }
-            }
-            match &current.parent {
-                Some(parent) => current = parent.as_ref(),
-                None => return None,
-            }
-        }
+        self.layout.lookup_interned(name)
     }
 
     /// Get full property descriptor by name.
     pub fn get_descriptor(&self, name: &str) -> Option<&PropertyDescriptor> {
-        let mut current = self;
-        loop {
-            if let Some(prop) = &current.property {
-                if prop.name.as_str() == name {
-                    return Some(prop);
-                }
-            }
-            match &current.parent {
-                Some(parent) => current = parent.as_ref(),
-                None => return None,
-            }
-        }
+        self.layout
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.name.as_str() == name)
+    }
+
+    /// Get a full property descriptor by interned name.
+    #[inline]
+    pub fn get_descriptor_interned(&self, name: &InternedString) -> Option<&PropertyDescriptor> {
+        self.layout.get_descriptor_interned(name)
     }
 
     /// Collect all property names in definition order.
     pub fn property_names(&self) -> Vec<InternedString> {
-        let mut names = Vec::with_capacity(self.property_count as usize);
-        self.collect_names(&mut names);
-        names
-    }
-
-    /// Collect names by walking parent chain (reverses order).
-    fn collect_names(&self, names: &mut Vec<InternedString>) {
-        if let Some(parent) = &self.parent {
-            parent.collect_names(names);
-        }
-        if let Some(prop) = &self.property {
-            names.push(prop.name.clone());
-        }
+        self.layout
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.name.clone())
+            .collect()
     }
 
     /// Collect all property descriptors in definition order.
     pub fn all_descriptors(&self) -> Vec<PropertyDescriptor> {
-        let mut descriptors = Vec::with_capacity(self.property_count as usize);
-        self.collect_descriptors(&mut descriptors);
-        descriptors
-    }
-
-    fn collect_descriptors(&self, descriptors: &mut Vec<PropertyDescriptor>) {
-        if let Some(parent) = &self.parent {
-            parent.collect_descriptors(descriptors);
-        }
-        if let Some(prop) = &self.property {
-            descriptors.push(prop.clone());
-        }
+        self.layout.descriptors.to_vec()
     }
 
     /// Check if a transition exists for the given property.
     pub fn has_transition(&self, name: &InternedString) -> bool {
         self.transitions
             .read()
-            .expect("Shape transitions lock poisoned")
-            .contains_key(name)
+            .keys()
+            .any(|key| &key.name == name)
     }
 
-    /// Get an existing transition (if any).
-    pub fn get_transition(&self, name: &InternedString) -> Option<Arc<Shape>> {
+    /// Check if a transition exists for the exact property descriptor key.
+    pub fn has_transition_with_flags(&self, name: &InternedString, flags: PropertyFlags) -> bool {
         self.transitions
             .read()
-            .expect("Shape transitions lock poisoned")
-            .get(name)
-            .cloned()
+            .contains_key(&TransitionKey::new(name.clone(), flags))
     }
 
-    /// Add a transition (internal use by ShapeRegistry).
-    fn add_transition(&self, name: InternedString, shape: Arc<Shape>) {
+    /// Get the default-attribute transition for a property name (if any).
+    pub fn get_transition(&self, name: &InternedString) -> Option<Arc<Shape>> {
+        self.get_transition_with_flags(name, PropertyFlags::default())
+    }
+
+    /// Get an existing transition for the exact property descriptor key.
+    pub fn get_transition_with_flags(
+        &self,
+        name: &InternedString,
+        flags: PropertyFlags,
+    ) -> Option<Arc<Shape>> {
         self.transitions
-            .write()
-            .expect("Shape transitions lock poisoned")
-            .insert(name, shape);
+            .read()
+            .get(&TransitionKey::new(name.clone(), flags))
+            .cloned()
     }
 }
 
@@ -455,18 +487,23 @@ impl ShapeRegistry {
         name: InternedString,
         flags: PropertyFlags,
     ) -> Arc<Shape> {
+        let key = TransitionKey::new(name.clone(), flags);
+
         // Fast path: check if transition already exists
-        if let Some(existing) = from.get_transition(&name) {
+        if let Some(existing) = from.get_transition_with_flags(&name, flags) {
             return existing;
         }
 
-        // Slow path: create new shape
+        // Slow path: canonicalize under the transition-table write lock so
+        // concurrent creators cannot materialize duplicate child shapes.
+        let mut transitions = from.transitions.write();
+        if let Some(existing) = transitions.get(&key) {
+            return Arc::clone(existing);
+        }
+
         let id = ShapeId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let new_shape = Shape::with_property(Arc::clone(from), name.clone(), flags, id);
-
-        // Cache the transition
-        from.add_transition(name, Arc::clone(&new_shape));
-
+        let new_shape = Shape::with_property(Arc::clone(from), name, flags, id);
+        transitions.insert(key, Arc::clone(&new_shape));
         new_shape
     }
 
@@ -938,7 +975,7 @@ mod tests {
         let handles: Vec<_> = (0..10)
             .map(|i| {
                 let empty_clone = Arc::clone(&empty);
-                let name = intern(&format!("thread_prop_{}", i));
+                let _name = intern(&format!("thread_prop_{}", i));
                 thread::spawn(move || {
                     // Can't use registry across threads, but shapes should be thread-safe
                     empty_clone.lookup(&format!("prop{}", i))
@@ -1008,5 +1045,60 @@ mod tests {
 
         let hidden_desc = hidden.get_descriptor("hidden").unwrap();
         assert!(!hidden_desc.is_enumerable());
+    }
+
+    #[test]
+    fn test_transition_distinguishes_same_name_with_different_flags() {
+        let registry = ShapeRegistry::new();
+        let empty = registry.empty_shape();
+        let name = intern("shared");
+
+        let writable = registry.transition(&empty, name.clone(), PropertyFlags::default());
+        let read_only = registry.transition(&empty, name.clone(), PropertyFlags::read_only());
+
+        assert_ne!(writable.id(), read_only.id());
+        assert!(empty.has_transition_with_flags(&name, PropertyFlags::default()));
+        assert!(empty.has_transition_with_flags(&name, PropertyFlags::read_only()));
+        assert_eq!(
+            writable.get_descriptor("shared").unwrap().flags,
+            PropertyFlags::default()
+        );
+        assert_eq!(
+            read_only.get_descriptor("shared").unwrap().flags,
+            PropertyFlags::read_only()
+        );
+    }
+
+    #[test]
+    fn test_transition_is_canonical_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let registry = Arc::new(ShapeRegistry::new());
+        let empty = registry.empty_shape();
+        let barrier = Arc::new(Barrier::new(16));
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let empty = Arc::clone(&empty);
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    barrier.wait();
+                    registry
+                        .transition(&empty, intern("shared"), PropertyFlags::hidden())
+                        .id()
+                })
+            })
+            .collect();
+
+        let ids: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("shape transition thread panicked"))
+            .collect();
+
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(registry.shape_count(), 2);
     }
 }
