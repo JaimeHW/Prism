@@ -26,7 +26,7 @@ use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::{
-    concat_string_values, repeat_string_value, value_as_string_ref,
+    StringObject, concat_string_objects, repeat_string_object, value_as_string_ref,
 };
 use prism_runtime::types::tuple::TupleObject;
 
@@ -390,7 +390,10 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
             Speculation::StrStr => {
                 // String concatenation fast path
-                let (result, value) = spec_str_concat(a, b);
+                let (result, value) = match spec_str_concat(vm, a, b) {
+                    Ok(result) => result,
+                    Err(err) => return ControlFlow::Error(err),
+                };
                 if result == SpecResult::Success {
                     let frame = vm.current_frame_mut();
                     frame.set_reg(inst.dst().0, value);
@@ -429,13 +432,11 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    let frame = vm.current_frame_mut();
-
     // Try int + int
     if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         if let Some(result) = x.checked_add(y) {
             if let Some(v) = Value::int(result) {
-                frame.set_reg(inst.dst().0, v);
+                vm.current_frame_mut().set_reg(inst.dst().0, v);
                 return ControlFlow::Continue;
             }
         }
@@ -443,20 +444,24 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     if let Some(value) = try_add_complex_values(a, b) {
-        frame.set_reg(inst.dst().0, value);
+        vm.current_frame_mut().set_reg(inst.dst().0, value);
         return ControlFlow::Continue;
     }
 
     // Try str + str (supports both tagged interned strings and heap strings)
-    if let Some(value) = concat_string_values(a, b) {
-        frame.set_reg(inst.dst().0, value);
-        return ControlFlow::Continue;
+    match concat_string_value_in_vm(vm, a, b) {
+        Ok(Some(value)) => {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
+        }
+        Ok(None) => {}
+        Err(err) => return ControlFlow::Error(err),
     }
 
     // Try bytes/bytearray concatenation. Match CPython's sequence semantics:
     // accept byte sequences on both sides and preserve the left operand type.
     if let Some(value) = concat_byte_sequence_values(a, b) {
-        frame.set_reg(inst.dst().0, value);
+        vm.current_frame_mut().set_reg(inst.dst().0, value);
         return ControlFlow::Continue;
     }
 
@@ -465,7 +470,7 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         // Use spec_list_concat which handles type checking internally
         let (result, value) = spec_list_concat(a, b);
         if result == SpecResult::Success {
-            frame.set_reg(inst.dst().0, value);
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
             return ControlFlow::Continue;
         }
         // If deopt, fall through to other type checks
@@ -481,7 +486,8 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             };
             let boxed = Box::new(tuple);
             let ptr = Box::into_raw(boxed) as *const ();
-            frame.set_reg(inst.dst().0, Value::object_ptr(ptr));
+            vm.current_frame_mut()
+                .set_reg(inst.dst().0, Value::object_ptr(ptr));
             return ControlFlow::Continue;
         }
     }
@@ -502,7 +508,8 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    frame.set_reg(inst.dst().0, Value::float(x + y));
+    vm.current_frame_mut()
+        .set_reg(inst.dst().0, Value::float(x + y));
     ControlFlow::Continue
 }
 
@@ -512,6 +519,61 @@ fn concat_byte_sequence_values(left: Value, right: Value) -> Option<Value> {
     let right_bytes = value_as_byte_sequence_ref(right)?;
     let result = left_bytes.concat(right_bytes.as_bytes());
     Some(boxed_bytes_value(result))
+}
+
+#[inline]
+pub(crate) fn alloc_string_value(
+    vm: &VirtualMachine,
+    string: StringObject,
+) -> Result<Value, RuntimeError> {
+    vm.allocator()
+        .alloc_value(string)
+        .ok_or_else(|| RuntimeError::internal("out of memory: failed to allocate string"))
+}
+
+#[inline]
+pub(crate) fn concat_string_value_in_vm(
+    vm: &VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(left_ref) = value_as_string_ref(left) else {
+        return Ok(None);
+    };
+    let Some(right_ref) = value_as_string_ref(right) else {
+        return Ok(None);
+    };
+
+    if left_ref.is_empty() {
+        return Ok(Some(right));
+    }
+    if right_ref.is_empty() {
+        return Ok(Some(left));
+    }
+
+    let result = concat_string_objects(left, right).expect("validated string operands");
+    alloc_string_value(vm, result).map(Some)
+}
+
+#[inline]
+pub(crate) fn repeat_string_value_in_vm(
+    vm: &VirtualMachine,
+    string: Value,
+    count: i64,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(string_ref) = value_as_string_ref(string) else {
+        return Ok(None);
+    };
+
+    if count <= 0 || string_ref.is_empty() {
+        return Ok(Some(Value::string(prism_core::intern::intern(""))));
+    }
+    if count == 1 {
+        return Ok(Some(string));
+    }
+
+    let result = repeat_string_object(string, count).expect("validated string operand");
+    alloc_string_value(vm, result).map(Some)
 }
 
 #[inline]
@@ -689,7 +751,10 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
             Speculation::StrInt | Speculation::IntStr => {
                 // String repetition fast path (str * int or int * str)
-                let (result, value) = spec_str_repeat(a, b);
+                let (result, value) = match spec_str_repeat(vm, a, b) {
+                    Ok(result) => result,
+                    Err(err) => return ControlFlow::Error(err),
+                };
                 match result {
                     SpecResult::Success => {
                         let frame = vm.current_frame_mut();
@@ -718,12 +783,10 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    let frame = vm.current_frame_mut();
-
     if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         if let Some(result) = x.checked_mul(y) {
             if let Some(v) = Value::int(result) {
-                frame.set_reg(inst.dst().0, v);
+                vm.current_frame_mut().set_reg(inst.dst().0, v);
                 return ControlFlow::Continue;
             }
         }
@@ -731,13 +794,17 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     if let Some(n) = int_like_value(b) {
-        if let Some(value) = repeat_string_value(a, n) {
-            frame.set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
+        match repeat_string_value_in_vm(vm, a, n) {
+            Ok(Some(value)) => {
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            Ok(None) => {}
+            Err(err) => return ControlFlow::Error(err),
         }
         match repeat_sequence_value(a, n) {
             Ok(Some(value)) => {
-                frame.set_reg(inst.dst().0, value);
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
                 return ControlFlow::Continue;
             }
             Ok(None) => {}
@@ -745,13 +812,17 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     }
     if let Some(n) = int_like_value(a) {
-        if let Some(value) = repeat_string_value(b, n) {
-            frame.set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
+        match repeat_string_value_in_vm(vm, b, n) {
+            Ok(Some(value)) => {
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            Ok(None) => {}
+            Err(err) => return ControlFlow::Error(err),
         }
         match repeat_sequence_value(b, n) {
             Ok(Some(value)) => {
-                frame.set_reg(inst.dst().0, value);
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
                 return ControlFlow::Continue;
             }
             Ok(None) => {}
@@ -774,7 +845,8 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    frame.set_reg(inst.dst().0, Value::float(x * y));
+    vm.current_frame_mut()
+        .set_reg(inst.dst().0, Value::float(x * y));
     ControlFlow::Continue
 }
 

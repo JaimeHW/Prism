@@ -8,9 +8,11 @@
 //! - **UTF-8 Native**: All strings are valid UTF-8
 //! - **Static Empty String**: Zero-allocation access via `empty_string()`
 
+use crate::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
 use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{HASH_NOT_COMPUTED, ObjectHeader, PyObject};
+use crate::pinned_store::PinnedObjectStore;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use std::borrow::Cow;
@@ -41,6 +43,8 @@ const EMPTY_INLINE: InlineString = InlineString {
 /// Returns a reference to a pre-allocated empty StringObject.
 /// Used for zero-allocation empty string operations like `str * 0`.
 static STATIC_EMPTY_STRING: LazyLock<StringObject> = LazyLock::new(StringObject::empty);
+static PINNED_STRING_OBJECTS: LazyLock<PinnedObjectStore<StringObject>> =
+    LazyLock::new(PinnedObjectStore::default);
 
 /// Get a reference to the static empty string (zero allocation).
 ///
@@ -58,8 +62,11 @@ pub fn empty_string() -> &'static StringObject {
 
 #[inline(always)]
 fn boxed_string_value(string: StringObject) -> Value {
-    let boxed = Box::new(string);
-    Value::object_ptr(Box::into_raw(boxed) as *const ())
+    if has_current_heap_binding() {
+        alloc_value_in_current_heap(string).expect("bound heap should satisfy string allocation")
+    } else {
+        Value::object_ptr(PINNED_STRING_OBJECTS.alloc(string) as *const ())
+    }
 }
 
 // =============================================================================
@@ -190,37 +197,47 @@ pub fn clone_string_value(value: Value) -> Option<StringObject> {
 
 #[inline(always)]
 pub fn concat_string_values(left: Value, right: Value) -> Option<Value> {
+    Some(boxed_string_value(concat_string_objects(left, right)?))
+}
+
+#[inline(always)]
+pub fn concat_string_objects(left: Value, right: Value) -> Option<StringObject> {
     let left_ref = value_as_string_ref(left)?;
     let right_ref = value_as_string_ref(right)?;
 
     if left_ref.is_empty() {
-        return Some(right);
+        return Some(clone_string_value(right)?);
     }
     if right_ref.is_empty() {
-        return Some(left);
+        return Some(clone_string_value(left)?);
     }
 
-    Some(boxed_string_value(StringObject::concat_slices(
+    Some(StringObject::concat_slices(
         left_ref.as_str(),
         right_ref.as_str(),
-    )))
+    ))
 }
 
 #[inline(always)]
 pub fn repeat_string_value(string: Value, count: i64) -> Option<Value> {
+    Some(boxed_string_value(repeat_string_object(string, count)?))
+}
+
+#[inline(always)]
+pub fn repeat_string_object(string: Value, count: i64) -> Option<StringObject> {
     let string_ref = value_as_string_ref(string)?;
 
     if count <= 0 || string_ref.is_empty() {
-        return Some(Value::string(intern("")));
+        return Some(StringObject::from_interned(intern("")));
     }
     if count == 1 {
-        return Some(string);
+        return Some(clone_string_value(string)?);
     }
 
-    Some(boxed_string_value(StringObject::repeat_slice(
+    Some(StringObject::repeat_slice(
         string_ref.as_str(),
         count as usize,
-    )))
+    ))
 }
 
 impl StringRepr {
@@ -912,6 +929,9 @@ impl<'a> From<Cow<'a, str>> for StringObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocation_context::{RuntimeHeapBinding, current_heap_binding_depth};
+    use prism_gc::config::GcConfig;
+    use prism_gc::heap::GcHeap;
 
     #[test]
     fn test_empty_string() {
@@ -997,6 +1017,44 @@ mod tests {
         let s = StringObject::new("hello");
         let r = s.repeat(0);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_concat_string_objects_preserves_heap_result_shape() {
+        let left = Value::string(intern("alpha"));
+        let right = Value::string(intern("beta"));
+        let result = concat_string_objects(left, right).expect("concat should succeed");
+        assert_eq!(result.as_str(), "alphabeta");
+        assert!(result.is_inline());
+    }
+
+    #[test]
+    fn test_repeat_string_object_clones_existing_value_for_identity_repeat() {
+        let original = StringObject::new("repeat me");
+        let value = boxed_string_value(original.clone());
+        let repeated = repeat_string_object(value, 1).expect("repeat should succeed");
+        assert_eq!(repeated.as_str(), original.as_str());
+    }
+
+    #[test]
+    fn test_concat_string_values_uses_bound_vm_heap_when_available() {
+        assert_eq!(current_heap_binding_depth(), 0);
+        let heap = GcHeap::new(GcConfig::default());
+        let _binding = RuntimeHeapBinding::register(&heap);
+
+        let baseline = PINNED_STRING_OBJECTS.len();
+        let result = concat_string_values(
+            Value::string(intern("managed")),
+            Value::string(intern(" heap")),
+        )
+        .expect("concat should allocate");
+
+        assert_eq!(PINNED_STRING_OBJECTS.len(), baseline);
+        let ptr = result
+            .as_object_ptr()
+            .expect("managed concat should produce heap-backed string");
+        let string = unsafe { &*(ptr as *const StringObject) };
+        assert_eq!(string.as_str(), "managed heap");
     }
 
     #[test]

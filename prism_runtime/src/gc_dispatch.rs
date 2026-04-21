@@ -46,8 +46,9 @@ use crate::types::string::StringObject;
 use crate::types::tuple::TupleObject;
 use prism_gc::Trace;
 use prism_gc::trace::Tracer;
+use rustc_hash::FxHashMap;
 use std::mem;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 // =============================================================================
 // Type Dispatch Entry
@@ -141,11 +142,17 @@ impl DispatchTable {
 
 /// Global dispatch table singleton.
 static DISPATCH_TABLE: OnceLock<DispatchTable> = OnceLock::new();
+static EXTERNAL_DISPATCH: OnceLock<RwLock<FxHashMap<u32, DispatchEntry>>> = OnceLock::new();
 
 /// Get the global dispatch table.
 #[inline(always)]
 fn dispatch_table() -> &'static DispatchTable {
     DISPATCH_TABLE.get_or_init(init_dispatch_table)
+}
+
+#[inline(always)]
+fn external_dispatch() -> &'static RwLock<FxHashMap<u32, DispatchEntry>> {
+    EXTERNAL_DISPATCH.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
 /// Initialize the dispatch table with all built-in types.
@@ -395,6 +402,30 @@ fn init_dispatch_table() -> DispatchTable {
 /// Call this once at runtime startup to ensure the dispatch table is ready.
 pub fn init_gc_dispatch() {
     let _ = dispatch_table();
+    let _ = external_dispatch();
+}
+
+/// Register GC dispatch callbacks for a runtime type defined outside
+/// `prism_runtime`.
+pub fn register_external_dispatch(type_id: TypeId, entry: DispatchEntry) {
+    external_dispatch()
+        .write()
+        .expect("external GC dispatch registry poisoned")
+        .insert(type_id.raw(), entry);
+}
+
+#[inline(always)]
+fn lookup_dispatch_entry(type_id: TypeId) -> DispatchEntry {
+    if let Some(entry) = external_dispatch()
+        .read()
+        .expect("external GC dispatch registry poisoned")
+        .get(&type_id.raw())
+        .copied()
+    {
+        return entry;
+    }
+
+    *dispatch_table().get(type_id)
 }
 
 // =============================================================================
@@ -408,7 +439,7 @@ pub fn init_gc_dispatch() {
 /// - The `type_id` must match the actual type of the object
 #[inline]
 pub unsafe fn trace_object(ptr: *const (), type_id: TypeId, tracer: &mut dyn Tracer) {
-    let entry = dispatch_table().get(type_id);
+    let entry = lookup_dispatch_entry(type_id);
     // SAFETY: Caller guarantees ptr points to valid object of correct type
     unsafe { (entry.trace)(ptr, tracer) };
 }
@@ -420,7 +451,7 @@ pub unsafe fn trace_object(ptr: *const (), type_id: TypeId, tracer: &mut dyn Tra
 /// - The `type_id` must match the actual type of the object
 #[inline]
 pub unsafe fn size_of_object(ptr: *const (), type_id: TypeId) -> usize {
-    let entry = dispatch_table().get(type_id);
+    let entry = lookup_dispatch_entry(type_id);
     // SAFETY: Caller guarantees ptr points to valid object of correct type
     unsafe { (entry.size)(ptr) }
 }
@@ -433,7 +464,7 @@ pub unsafe fn size_of_object(ptr: *const (), type_id: TypeId) -> usize {
 /// - Must be called exactly once before memory is reclaimed
 #[inline]
 pub unsafe fn finalize_object(ptr: *mut (), type_id: TypeId) {
-    let entry = dispatch_table().get(type_id);
+    let entry = lookup_dispatch_entry(type_id);
     // SAFETY: Caller guarantees ptr points to valid object of correct type
     unsafe { (entry.finalize)(ptr) };
 }

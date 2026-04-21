@@ -5,11 +5,14 @@
 //! [`num_bigint::BigInt`]. This mirrors CPython's single visible `int` type
 //! while preserving the fast small-int representation.
 
+use crate::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::pinned_store::PinnedObjectStore;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
+use std::sync::LazyLock;
 
 /// Heap-backed arbitrary-precision Python integer.
 #[repr(C)]
@@ -45,6 +48,9 @@ impl PyObject for IntObject {
         &mut self.header
     }
 }
+
+static PINNED_INT_OBJECTS: LazyLock<PinnedObjectStore<IntObject>> =
+    LazyLock::new(PinnedObjectStore::default);
 
 /// Return the heap-backed integer object if `value` is a promoted `int`.
 #[inline]
@@ -102,13 +108,20 @@ pub fn bigint_to_value(value: BigInt) -> Value {
         }
     }
 
-    let ptr = Box::leak(Box::new(IntObject::new(value))) as *mut IntObject as *const ();
-    Value::object_ptr(ptr)
+    if has_current_heap_binding() {
+        alloc_value_in_current_heap(IntObject::new(value))
+            .expect("bound heap should satisfy int allocation")
+    } else {
+        Value::object_ptr(PINNED_INT_OBJECTS.alloc(IntObject::new(value)) as *const ())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocation_context::{RuntimeHeapBinding, current_heap_binding_depth};
+    use prism_gc::config::GcConfig;
+    use prism_gc::heap::GcHeap;
 
     #[test]
     fn test_bigint_to_value_keeps_small_ints_inline() {
@@ -132,5 +145,20 @@ mod tests {
         let big = BigInt::from(1_u8) << 90_u32;
         let value = bigint_to_value(big.clone());
         assert_eq!(int_value_to_string(value), Some(big.to_string()));
+    }
+
+    #[test]
+    fn test_bigint_to_value_uses_bound_vm_heap_when_available() {
+        assert_eq!(current_heap_binding_depth(), 0);
+        let heap = GcHeap::new(GcConfig::default());
+        let _binding = RuntimeHeapBinding::register(&heap);
+
+        let baseline = PINNED_INT_OBJECTS.len();
+        let big = BigInt::from(1_u8) << 100_u32;
+        let value = bigint_to_value(big.clone());
+
+        assert_eq!(PINNED_INT_OBJECTS.len(), baseline);
+        let obj = value_as_heap_int(value).expect("bound heap should allocate managed int");
+        assert_eq!(obj.value(), &big);
     }
 }

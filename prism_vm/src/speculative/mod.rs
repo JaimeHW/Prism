@@ -648,9 +648,10 @@ pub fn spec_ne_float(a: Value, b: Value) -> (SpecResult, Value) {
 
 use prism_runtime::TypeId;
 use prism_runtime::types::StringObject;
-use prism_runtime::types::string::{
-    concat_string_values, repeat_string_value, value_as_string_ref,
-};
+use prism_runtime::types::string::value_as_string_ref;
+
+use crate::VirtualMachine;
+use crate::error::RuntimeError;
 
 /// Speculative string concatenation (str + str).
 ///
@@ -658,10 +659,14 @@ use prism_runtime::types::string::{
 ///
 /// Supports both tagged interned strings and heap `StringObject` values.
 #[inline(always)]
-pub fn spec_str_concat(a: Value, b: Value) -> (SpecResult, Value) {
-    match concat_string_values(a, b) {
-        Some(value) => (SpecResult::Success, value),
-        None => (SpecResult::Deopt, Value::none()),
+pub fn spec_str_concat(
+    vm: &VirtualMachine,
+    a: Value,
+    b: Value,
+) -> Result<(SpecResult, Value), RuntimeError> {
+    match crate::ops::arithmetic::concat_string_value_in_vm(vm, a, b)? {
+        Some(value) => Ok((SpecResult::Success, value)),
+        None => Ok((SpecResult::Deopt, Value::none())),
     }
 }
 
@@ -673,20 +678,24 @@ pub fn spec_str_concat(a: Value, b: Value) -> (SpecResult, Value) {
 ///
 /// Supports both tagged interned strings and heap `StringObject` values.
 #[inline(always)]
-pub fn spec_str_repeat(a: Value, b: Value) -> (SpecResult, Value) {
+pub fn spec_str_repeat(
+    vm: &VirtualMachine,
+    a: Value,
+    b: Value,
+) -> Result<(SpecResult, Value), RuntimeError> {
     if let Some(n) = b.as_int() {
-        if let Some(value) = repeat_string_value(a, n) {
-            return (SpecResult::Success, value);
+        if let Some(value) = crate::ops::arithmetic::repeat_string_value_in_vm(vm, a, n)? {
+            return Ok((SpecResult::Success, value));
         }
     }
 
     if let Some(n) = a.as_int() {
-        if let Some(value) = repeat_string_value(b, n) {
-            return (SpecResult::Success, value);
+        if let Some(value) = crate::ops::arithmetic::repeat_string_value_in_vm(vm, b, n)? {
+            return Ok((SpecResult::Success, value));
         }
     }
 
-    (SpecResult::Deopt, Value::none())
+    Ok((SpecResult::Deopt, Value::none()))
 }
 
 /// Speculative string length.
@@ -937,23 +946,25 @@ mod tests {
     #[test]
     fn test_spec_str_concat_deopt_on_non_strings() {
         // Test that non-string operands cause deopt
+        let vm = VirtualMachine::new();
         let a = Value::int(10).unwrap();
         let b = Value::int(20).unwrap();
 
-        let (result, _) = spec_str_concat(a, b);
+        let (result, _) = spec_str_concat(&vm, a, b).unwrap();
         assert_eq!(result, SpecResult::Deopt);
     }
 
     #[test]
     fn test_spec_str_concat_deopt_on_mixed_types() {
         // String + int should deopt (not supported for concat)
+        let vm = VirtualMachine::new();
         let str_obj = StringObject::new("hello");
         let boxed = Box::new(str_obj);
         let ptr = Box::into_raw(boxed) as *const ();
         let a = Value::object_ptr(ptr);
         let b = Value::int(5).unwrap();
 
-        let (result, _) = spec_str_concat(a, b);
+        let (result, _) = spec_str_concat(&vm, a, b).unwrap();
         assert_eq!(result, SpecResult::Deopt);
 
         // Cleanup
@@ -964,10 +975,13 @@ mod tests {
 
     #[test]
     fn test_spec_str_concat_accepts_tagged_strings() {
+        let vm = VirtualMachine::new();
         let (result, value) = spec_str_concat(
+            &vm,
             Value::string(intern("hello")),
             Value::string(intern(" world")),
-        );
+        )
+        .unwrap();
         assert_eq!(result, SpecResult::Success);
         assert_eq!(value_to_rust_string(value), "hello world");
     }
@@ -975,17 +989,19 @@ mod tests {
     #[test]
     fn test_spec_str_repeat_deopt_on_non_string_int() {
         // float * int should deopt
+        let vm = VirtualMachine::new();
         let a = Value::float(3.14);
         let b = Value::int(5).unwrap();
 
-        let (result, _) = spec_str_repeat(a, b);
+        let (result, _) = spec_str_repeat(&vm, a, b).unwrap();
         assert_eq!(result, SpecResult::Deopt);
     }
 
     #[test]
     fn test_spec_str_repeat_negative_count() {
+        let vm = VirtualMachine::new();
         let (result, value) =
-            spec_str_repeat(Value::string(intern("hello")), Value::int(-1).unwrap());
+            spec_str_repeat(&vm, Value::string(intern("hello")), Value::int(-1).unwrap()).unwrap();
         assert_eq!(result, SpecResult::Success);
         assert_eq!(value_to_rust_string(value), "");
     }
@@ -993,31 +1009,31 @@ mod tests {
     #[test]
     fn test_spec_str_repeat_int_str_order() {
         // int * str should also work (Python supports both orderings)
+        let vm = VirtualMachine::new();
         let str_obj = StringObject::new("ab");
         let boxed = Box::new(str_obj);
         let ptr = Box::into_raw(boxed) as *const ();
         let a = Value::int(3).unwrap();
         let b = Value::object_ptr(ptr);
 
-        let (result, value) = spec_str_repeat(a, b);
+        let (result, value) = spec_str_repeat(&vm, a, b).unwrap();
         assert_eq!(result, SpecResult::Success);
 
         // Verify the result is a valid object pointer
         assert!(value.is_object());
 
-        // Cleanup both string objects
+        // Cleanup the original test string object.
         unsafe {
-            let result_ptr = value.as_object_ptr().unwrap() as *mut StringObject;
-            let result_str = &*result_ptr;
-            assert_eq!(result_str.as_str(), "ababab");
-            drop(Box::from_raw(result_ptr));
             drop(Box::from_raw(ptr as *mut StringObject));
         }
+        assert_eq!(value_to_rust_string(value), "ababab");
     }
 
     #[test]
     fn test_spec_str_repeat_accepts_tagged_strings() {
-        let (result, value) = spec_str_repeat(Value::string(intern("ab")), Value::int(3).unwrap());
+        let vm = VirtualMachine::new();
+        let (result, value) =
+            spec_str_repeat(&vm, Value::string(intern("ab")), Value::int(3).unwrap()).unwrap();
         assert_eq!(result, SpecResult::Success);
         assert_eq!(value_to_rust_string(value), "ababab");
     }

@@ -11,12 +11,14 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod allocation_context;
 pub mod gc;
 pub mod gc_barrier;
 pub mod gc_dispatch;
 pub mod gc_trace;
 pub mod object;
 pub mod object_tracer;
+pub mod pinned_store;
 pub mod types;
 
 // Re-export commonly used items
