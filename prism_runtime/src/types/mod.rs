@@ -4,6 +4,7 @@
 
 pub mod bytes;
 pub mod cell;
+pub mod complex;
 pub mod dict;
 pub mod function;
 pub(crate) mod hashable;
@@ -21,6 +22,7 @@ pub mod tuple;
 // Re-export commonly used types
 pub use bytes::BytesObject;
 pub use cell::Cell;
+pub use complex::ComplexObject;
 pub use dict::DictObject;
 pub use function::FunctionObject;
 pub use int::IntObject;

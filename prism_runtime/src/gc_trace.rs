@@ -28,9 +28,10 @@ use crate::object::ObjectHeader;
 use crate::object::shaped_object::ShapedObject;
 use crate::object::views::{
     CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, GenericAliasObject,
-    MappingProxyObject, MethodWrapperObject, UnionTypeObject,
+    MappingProxyObject, MappingProxySource, MethodWrapperObject, UnionTypeObject,
 };
 use crate::types::bytes::BytesObject;
+use crate::types::complex::ComplexObject;
 use crate::types::dict::DictObject;
 use crate::types::function::{ClosureEnv, FunctionObject};
 use crate::types::int::IntObject;
@@ -110,6 +111,16 @@ unsafe impl Trace for RangeObject {
         // RangeObject is a leaf type:
         // - ObjectHeader (traced but empty)
         // - range bounds live outside the Prism GC graph
+    }
+}
+
+/// Safety: ComplexObject contains no GC-managed references.
+unsafe impl Trace for ComplexObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // ComplexObject is a leaf type:
+        // - ObjectHeader (traced but empty)
+        // - two f64 components
     }
 }
 
@@ -267,11 +278,19 @@ unsafe impl Trace for ShapedObject {
         for (_name, value) in self.iter_properties() {
             tracer.trace_value(value);
         }
+
+        if let Some(dict) = self.dict_backing() {
+            dict.trace(tracer);
+        }
+        if let Some(list) = self.list_backing() {
+            list.trace(tracer);
+        }
     }
 
     fn size_of(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.dict_backing().map_or(0, Trace::size_of)
+            + self.list_backing().map_or(0, Trace::size_of)
             + self.string_backing().map_or(0, Trace::size_of)
     }
 }
@@ -334,7 +353,11 @@ unsafe impl Trace for UnionTypeObject {
 
 unsafe impl Trace for MappingProxyObject {
     #[inline]
-    fn trace(&self, _tracer: &mut dyn Tracer) {}
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        if let MappingProxySource::Dict(mapping) = self.source() {
+            tracer.trace_value(mapping);
+        }
+    }
 }
 
 unsafe impl Trace for DictViewObject {

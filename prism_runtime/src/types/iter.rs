@@ -6,7 +6,7 @@
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::bytes::BytesObject;
-use crate::types::list::ListObject;
+use crate::types::list::{ListObject, value_as_list_ref};
 use crate::types::range::RangeIterator;
 use crate::types::string::StringObject;
 use crate::types::tuple::TupleObject;
@@ -74,6 +74,12 @@ enum IterKind {
     /// Iterator over a range (most efficient).
     Range(RangeIterator),
 
+    /// Infinite arithmetic progression, used by `itertools.count()`.
+    Count {
+        current: CountState,
+        step: CountStep,
+    },
+
     /// Iterator over a list.
     List { list: Value, index: usize },
 
@@ -93,6 +99,15 @@ enum IterKind {
     /// Iterator over a generic sequence of values.
     /// Used as fallback for custom iterables.
     Values { values: Vec<Value>, index: usize },
+
+    /// Proxy over an existing iterator value.
+    ///
+    /// This preserves Python's iterator identity semantics for composite
+    /// iterator constructors such as `enumerate(iterable)` when the iterable is
+    /// already an iterator value. Native Prism iterator objects can be driven
+    /// directly; generators and protocol-based iterators are advanced through
+    /// the VM-aware `next_with` path.
+    SharedIterator { iterator: Value },
 
     /// Empty iterator.
     Empty,
@@ -137,6 +152,19 @@ enum IterKind {
         inner: Box<IteratorObject>,
     },
 
+    /// Islice iterator - yields a stepped slice of another iterator.
+    ///
+    /// # Performance
+    /// - O(start) initial skip by consumption
+    /// - O(step) amortized per yielded element
+    ISlice {
+        inner: Box<IteratorObject>,
+        next_yield: usize,
+        stop: Option<usize>,
+        step: usize,
+        pos: usize,
+    },
+
     /// Reversed iterator - iterates in reverse order.
     ///
     /// # Performance
@@ -172,6 +200,18 @@ enum StringValueRef<'a> {
     Interned(InternedString),
 }
 
+#[derive(Clone, Copy)]
+enum CountState {
+    Int(i64),
+    Float(f64),
+}
+
+#[derive(Clone, Copy)]
+enum CountStep {
+    Int(i64),
+    Float(f64),
+}
+
 impl StringValueRef<'_> {
     #[inline(always)]
     fn as_str(&self) -> &str {
@@ -204,7 +244,7 @@ fn object_ref<T>(value: Value, expected: TypeId) -> &'static T {
 
 #[inline(always)]
 fn list_from_value(value: Value) -> &'static ListObject {
-    object_ref(value, TypeId::LIST)
+    value_as_list_ref(value).expect("iterator backing value must provide list storage")
 }
 
 #[inline(always)]
@@ -237,6 +277,43 @@ fn bytes_from_value(value: Value) -> &'static BytesObject {
     unsafe { &*(ptr as *const BytesObject) }
 }
 
+#[inline(always)]
+fn iterator_from_value(value: Value) -> &'static IteratorObject {
+    object_ref(value, TypeId::ITERATOR)
+}
+
+#[inline(always)]
+fn native_iterator_from_value(value: Value) -> Option<&'static IteratorObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::ITERATOR {
+        return None;
+    }
+
+    Some(unsafe { &*(ptr as *const IteratorObject) })
+}
+
+#[inline(always)]
+fn iterator_from_value_mut(value: Value) -> &'static mut IteratorObject {
+    let ptr = value
+        .as_object_ptr()
+        .expect("iterator proxy backing value must be an object");
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    debug_assert_eq!(header.type_id, TypeId::ITERATOR);
+    unsafe { &mut *(ptr as *mut IteratorObject) }
+}
+
+#[inline(always)]
+fn native_iterator_from_value_mut(value: Value) -> Option<&'static mut IteratorObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::ITERATOR {
+        return None;
+    }
+
+    Some(unsafe { &mut *(ptr as *mut IteratorObject) })
+}
+
 impl IteratorObject {
     /// Create an empty iterator.
     #[inline]
@@ -256,6 +333,29 @@ impl IteratorObject {
             kind: IterKind::Range(iter),
             exhausted: false,
         }
+    }
+
+    /// Create an infinite count iterator.
+    #[inline]
+    pub fn count(start: Value, step: Value) -> Option<Self> {
+        let (current, step) = match (start.as_int(), step.as_int()) {
+            (Some(start), Some(step)) => (CountState::Int(start), CountStep::Int(step)),
+            _ => {
+                let start = start
+                    .as_float()
+                    .or_else(|| start.as_int().map(|v| v as f64))?;
+                let step = step
+                    .as_float()
+                    .or_else(|| step.as_int().map(|v| v as f64))?;
+                (CountState::Float(start), CountStep::Float(step))
+            }
+        };
+
+        Some(Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::Count { current, step },
+            exhausted: false,
+        })
     }
 
     /// Create an iterator over a list.
@@ -316,6 +416,19 @@ impl IteratorObject {
         Self {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::Values { values, index: 0 },
+            exhausted,
+        }
+    }
+
+    /// Create a proxy iterator that forwards to an existing iterator object.
+    #[inline]
+    pub fn from_existing_iterator(iterator: Value) -> Self {
+        let exhausted = native_iterator_from_value(iterator)
+            .map(IteratorObject::is_exhausted)
+            .unwrap_or(false);
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::SharedIterator { iterator },
             exhausted,
         }
     }
@@ -397,6 +510,24 @@ impl IteratorObject {
                 inner: Box::new(inner),
             },
             exhausted: false,
+        }
+    }
+
+    /// Create an islice iterator over another iterator.
+    #[inline]
+    pub fn islice(inner: IteratorObject, start: usize, stop: Option<usize>, step: usize) -> Self {
+        let exhausted =
+            inner.is_exhausted() || matches!(stop, Some(stop_index) if start >= stop_index);
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::ISlice {
+                inner: Box::new(inner),
+                next_yield: start,
+                stop,
+                step: step.max(1),
+                pos: 0,
+            },
+            exhausted,
         }
     }
 
@@ -486,6 +617,26 @@ impl IteratorObject {
                 }
             },
 
+            IterKind::Count { current, step } => match (*current, *step) {
+                (CountState::Int(value), CountStep::Int(delta)) => {
+                    *current = CountState::Int(value.wrapping_add(delta));
+                    Some(Value::int_unchecked(value))
+                }
+                (CountState::Int(value), CountStep::Float(delta)) => {
+                    let value = value as f64;
+                    *current = CountState::Float(value + delta);
+                    Some(Value::float(value))
+                }
+                (CountState::Float(value), CountStep::Int(delta)) => {
+                    *current = CountState::Float(value + delta as f64);
+                    Some(Value::float(value))
+                }
+                (CountState::Float(value), CountStep::Float(delta)) => {
+                    *current = CountState::Float(value + delta);
+                    Some(Value::float(value))
+                }
+            },
+
             IterKind::List { list, index } => {
                 let list = list_from_value(*list);
                 if *index < list.len() {
@@ -555,6 +706,20 @@ impl IteratorObject {
                 } else {
                     self.exhausted = true;
                     None
+                }
+            }
+
+            IterKind::SharedIterator { iterator } => {
+                match native_iterator_from_value_mut(*iterator) {
+                    Some(iter) => {
+                        let value = iter.next();
+                        self.exhausted = iter.is_exhausted();
+                        value
+                    }
+                    None => {
+                        self.exhausted = true;
+                        None
+                    }
                 }
             }
 
@@ -642,6 +807,39 @@ impl IteratorObject {
                 }
             }
 
+            IterKind::ISlice {
+                inner,
+                next_yield,
+                stop,
+                step,
+                pos,
+            } => {
+                if stop.is_some_and(|stop_index| *next_yield >= stop_index) {
+                    self.exhausted = true;
+                    return None;
+                }
+
+                while *pos < *next_yield {
+                    if inner.next().is_none() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                    *pos += 1;
+                }
+
+                match inner.next() {
+                    Some(value) => {
+                        *pos += 1;
+                        *next_yield = next_yield.saturating_add(*step);
+                        Some(value)
+                    }
+                    None => {
+                        self.exhausted = true;
+                        None
+                    }
+                }
+            }
+
             IterKind::Reversed {
                 values,
                 reverse_index,
@@ -708,6 +906,7 @@ impl IteratorObject {
 
         match &self.kind {
             IterKind::Range(iter) => iter.remaining_len(),
+            IterKind::Count { .. } => None,
             IterKind::List { list, index } => {
                 Some(list_from_value(*list).len().saturating_sub(*index))
             }
@@ -733,6 +932,9 @@ impl IteratorObject {
                 Some(bytes_from_value(*bytes).len().saturating_sub(*index))
             }
             IterKind::Values { values, index } => Some(values.len().saturating_sub(*index)),
+            IterKind::SharedIterator { iterator } => {
+                native_iterator_from_value(*iterator).and_then(IteratorObject::size_hint)
+            }
             IterKind::Empty => Some(0),
 
             // Composite iterators
@@ -743,6 +945,16 @@ impl IteratorObject {
             }
             IterKind::Map { inner, .. } => inner.size_hint(),
             IterKind::Filter { .. } => None, // Cannot know without evaluating predicate
+            IterKind::ISlice {
+                next_yield,
+                stop,
+                step,
+                ..
+            } => match stop {
+                Some(stop_index) if *next_yield >= *stop_index => Some(0),
+                Some(stop_index) => Some((stop_index - next_yield + step - 1) / step),
+                None => None,
+            },
             IterKind::Reversed {
                 values,
                 reverse_index,
@@ -767,22 +979,36 @@ impl IteratorObject {
     ///
     /// This is required for iterators such as `map` and `filter` whose
     /// semantics depend on evaluating Python callables while iterating.
-    pub fn next_with<E, F, T>(
+    pub fn next_with<E, F, T, N>(
         &mut self,
         invoke: &mut F,
         is_truthy: &mut T,
+        advance_iterator: &mut N,
     ) -> Result<Option<Value>, E>
     where
         F: FnMut(Value, &[Value]) -> Result<Value, E>,
         T: FnMut(Value) -> Result<bool, E>,
+        N: FnMut(Value) -> Result<Option<Value>, E>,
     {
         if self.exhausted {
             return Ok(None);
         }
 
         match &mut self.kind {
+            IterKind::SharedIterator { iterator } => {
+                let next = if let Some(iter) = native_iterator_from_value_mut(*iterator) {
+                    let next = iter.next_with(invoke, is_truthy, advance_iterator)?;
+                    self.exhausted = iter.is_exhausted();
+                    next
+                } else {
+                    let next = advance_iterator(*iterator)?;
+                    self.exhausted = next.is_none();
+                    next
+                };
+                return Ok(next);
+            }
             IterKind::Map { func, inner } => {
-                return match inner.next_with(invoke, is_truthy)? {
+                return match inner.next_with(invoke, is_truthy, advance_iterator)? {
                     Some(value) => invoke(*func, &[value]).map(Some),
                     None => {
                         self.exhausted = true;
@@ -790,8 +1016,21 @@ impl IteratorObject {
                     }
                 };
             }
+            IterKind::Enumerate { inner, index } => {
+                return match inner.next_with(invoke, is_truthy, advance_iterator)? {
+                    Some(value) => {
+                        let current_index = *index;
+                        *index += 1;
+                        Ok(Some(create_tuple_pair(current_index, value)))
+                    }
+                    None => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                };
+            }
             IterKind::Filter { func, inner } => loop {
-                match inner.next_with(invoke, is_truthy)? {
+                match inner.next_with(invoke, is_truthy, advance_iterator)? {
                     Some(value) => {
                         let keep = if let Some(predicate) = *func {
                             let predicate_result = invoke(predicate, &[value])?;
@@ -810,6 +1049,41 @@ impl IteratorObject {
                     }
                 }
             },
+            IterKind::ISlice {
+                inner,
+                next_yield,
+                stop,
+                step,
+                pos,
+            } => {
+                if stop.is_some_and(|stop_index| *next_yield >= stop_index) {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                while *pos < *next_yield {
+                    if inner
+                        .next_with(invoke, is_truthy, advance_iterator)?
+                        .is_none()
+                    {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
+                    *pos += 1;
+                }
+
+                return match inner.next_with(invoke, is_truthy, advance_iterator)? {
+                    Some(value) => {
+                        *pos += 1;
+                        *next_yield = next_yield.saturating_add(*step);
+                        Ok(Some(value))
+                    }
+                    None => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                };
+            }
             _ => {}
         }
 
@@ -821,17 +1095,20 @@ impl fmt::Debug for IteratorObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind_name = match &self.kind {
             IterKind::Range(_) => "range_iterator",
+            IterKind::Count { .. } => "count",
             IterKind::List { .. } => "list_iterator",
             IterKind::Tuple { .. } => "tuple_iterator",
             IterKind::StringChars { .. } => "str_iterator",
             IterKind::Bytes { .. } => "bytes_iterator",
             IterKind::Values { .. } => "iterator",
+            IterKind::SharedIterator { .. } => "iterator",
             IterKind::Empty => "empty_iterator",
             // Composite iterators
             IterKind::Enumerate { .. } => "enumerate",
             IterKind::Zip { .. } => "zip",
             IterKind::Map { .. } => "map",
             IterKind::Filter { .. } => "filter",
+            IterKind::ISlice { .. } => "islice",
             IterKind::Reversed { .. } => "reversed",
             IterKind::DictKeys { .. } => "dict_keys",
             IterKind::DictValues { .. } => "dict_values",
@@ -968,6 +1245,55 @@ mod tests {
         assert_eq!(iter.next().unwrap().as_int().unwrap(), 200);
         assert_eq!(iter.size_hint(), Some(0));
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_shared_iterator_proxies_remaining_items() {
+        let source = leak_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+        let iterator_value = leak_value(IteratorObject::from_list(source));
+        let mut proxy = IteratorObject::from_existing_iterator(iterator_value);
+
+        assert_eq!(proxy.size_hint(), Some(3));
+        assert_eq!(proxy.next().unwrap().as_int(), Some(1));
+        assert_eq!(proxy.size_hint(), Some(2));
+        assert_eq!(proxy.next().unwrap().as_int(), Some(2));
+        assert_eq!(proxy.next().unwrap().as_int(), Some(3));
+        assert!(proxy.next().is_none());
+        assert!(proxy.is_exhausted());
+    }
+
+    #[test]
+    fn test_shared_iterator_observes_underlying_progress() {
+        let source = leak_value(ListObject::from_slice(&[
+            Value::int(10).unwrap(),
+            Value::int(20).unwrap(),
+            Value::int(30).unwrap(),
+        ]));
+        let iterator_value = leak_value(IteratorObject::from_list(source));
+        let underlying = iterator_from_value_mut(iterator_value);
+        assert_eq!(underlying.next().unwrap().as_int(), Some(10));
+        let mut proxy = IteratorObject::from_existing_iterator(iterator_value);
+
+        assert_eq!(proxy.next().unwrap().as_int(), Some(20));
+        assert_eq!(proxy.next().unwrap().as_int(), Some(30));
+        assert!(proxy.next().is_none());
+    }
+
+    #[test]
+    fn test_count_iterator_yields_unbounded_progression() {
+        let mut iter = IteratorObject::count(Value::int(3).unwrap(), Value::int(2).unwrap())
+            .expect("count iterator should construct");
+
+        assert_eq!(format!("{:?}", iter), "<count>");
+        assert_eq!(iter.size_hint(), None);
+        assert_eq!(iter.next().unwrap().as_int(), Some(3));
+        assert_eq!(iter.next().unwrap().as_int(), Some(5));
+        assert_eq!(iter.next().unwrap().as_int(), Some(7));
+        assert!(!iter.is_exhausted());
     }
 
     #[test]
@@ -1294,6 +1620,44 @@ mod tests {
         assert_eq!(filter.next().unwrap().as_int().unwrap(), 2);
         assert_eq!(filter.next().unwrap().as_int().unwrap(), 3);
         assert!(filter.next().is_none());
+    }
+
+    #[test]
+    fn test_islice_with_finite_stop_skips_and_steps() {
+        let values = vec![
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(4).unwrap(),
+            Value::int(5).unwrap(),
+        ];
+        let inner = IteratorObject::from_values(values);
+        let mut islice = IteratorObject::islice(inner, 1, Some(6), 2);
+
+        assert_eq!(format!("{:?}", islice), "<islice>");
+        assert_eq!(islice.size_hint(), Some(3));
+        assert_eq!(islice.next().unwrap().as_int(), Some(1));
+        assert_eq!(islice.next().unwrap().as_int(), Some(3));
+        assert_eq!(islice.next().unwrap().as_int(), Some(5));
+        assert_eq!(islice.size_hint(), Some(0));
+        assert!(islice.next().is_none());
+    }
+
+    #[test]
+    fn test_islice_without_stop_consumes_remaining_source() {
+        let values = vec![
+            Value::int(10).unwrap(),
+            Value::int(11).unwrap(),
+            Value::int(12).unwrap(),
+            Value::int(13).unwrap(),
+        ];
+        let inner = IteratorObject::from_values(values);
+        let mut islice = IteratorObject::islice(inner, 2, None, 1);
+
+        assert_eq!(islice.next().unwrap().as_int(), Some(12));
+        assert_eq!(islice.next().unwrap().as_int(), Some(13));
+        assert!(islice.next().is_none());
     }
 
     #[test]

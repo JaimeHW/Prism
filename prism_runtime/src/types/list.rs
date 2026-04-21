@@ -2,6 +2,7 @@
 //!
 //! High-performance mutable sequence type.
 
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::slice::SliceObject;
@@ -33,6 +34,7 @@ impl std::error::Error for ListSliceAssignError {}
 /// Uses a Vec for dynamic growth. The capacity is managed internally
 /// for amortized O(1) appends.
 #[repr(C)]
+#[derive(Debug)]
 pub struct ListObject {
     /// Object header.
     pub header: ObjectHeader,
@@ -236,6 +238,28 @@ impl ListObject {
         }
     }
 
+    /// Repeat this list `n` times into a freshly allocated list.
+    ///
+    /// Mirrors Python's `list * int` semantics by returning a new list and
+    /// preserving element order for each repetition.
+    #[inline]
+    pub fn repeat(&self, n: usize) -> Self {
+        if n == 0 || self.items.is_empty() {
+            return Self::new();
+        }
+
+        let total_len = self.items.len() * n;
+        let mut result = Vec::with_capacity(total_len);
+        for _ in 0..n {
+            result.extend(self.items.iter().copied());
+        }
+
+        Self {
+            header: ObjectHeader::new(TypeId::LIST),
+            items: result,
+        }
+    }
+
     /// Get a slice of the list.
     pub fn slice(&self, start: Option<i64>, end: Option<i64>, step: Option<i64>) -> Self {
         let len = self.len() as i64;
@@ -335,6 +359,36 @@ impl Default for ListObject {
     }
 }
 
+#[inline(always)]
+pub fn value_as_list_ref(value: Value) -> Option<&'static ListObject> {
+    let ptr = value.as_object_ptr()?;
+    object_ptr_as_list_ref(ptr)
+}
+
+#[inline(always)]
+pub fn object_ptr_as_list_ref(ptr: *const ()) -> Option<&'static ListObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::LIST => Some(unsafe { &*(ptr as *const ListObject) }),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&*(ptr as *const ShapedObject)).list_backing()
+        },
+        _ => None,
+    }
+}
+
+#[inline(always)]
+pub fn object_ptr_as_list_mut(ptr: *mut ()) -> Option<&'static mut ListObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::LIST => Some(unsafe { &mut *(ptr as *mut ListObject) }),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&mut *(ptr as *mut ShapedObject)).list_backing_mut()
+        },
+        _ => None,
+    }
+}
+
 impl PyObject for ListObject {
     fn header(&self) -> &ObjectHeader {
         &self.header
@@ -348,6 +402,7 @@ impl PyObject for ListObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::shape::Shape;
 
     #[test]
     fn test_list_basic() {
@@ -395,6 +450,33 @@ mod tests {
         assert_eq!(list.get(0).unwrap().as_int(), Some(1));
         assert_eq!(list.get(1).unwrap().as_int(), Some(2));
         assert_eq!(list.get(2).unwrap().as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_list_repeat() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let repeated = list.repeat(3);
+
+        assert_eq!(repeated.len(), 6);
+        assert_eq!(
+            repeated.as_slice(),
+            &[
+                Value::int_unchecked(1),
+                Value::int_unchecked(2),
+                Value::int_unchecked(1),
+                Value::int_unchecked(2),
+                Value::int_unchecked(1),
+                Value::int_unchecked(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_repeat_zero_returns_empty() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap()]);
+        let repeated = list.repeat(0);
+
+        assert!(repeated.is_empty());
     }
 
     #[test]
@@ -569,5 +651,25 @@ mod tests {
                 Value::int_unchecked(5),
             ]
         );
+    }
+
+    #[test]
+    fn test_object_ptr_as_list_ref_supports_heap_list_subclasses() {
+        let object = Box::into_raw(Box::new(ShapedObject::new_list_backed(
+            TypeId::from_raw(512),
+            Shape::empty(),
+        )));
+        unsafe { &mut *object }
+            .list_backing_mut()
+            .expect("list backing should exist")
+            .push(Value::int(5).unwrap());
+
+        let list = object_ptr_as_list_ref(object as *const ())
+            .expect("heap list subclass should expose native list storage");
+        assert_eq!(list.as_slice(), &[Value::int(5).unwrap()]);
+
+        unsafe {
+            drop(Box::from_raw(object));
+        }
     }
 }

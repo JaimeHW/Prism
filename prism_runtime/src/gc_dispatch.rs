@@ -34,6 +34,7 @@ use crate::object::views::{
     MappingProxyObject, MethodWrapperObject, UnionTypeObject,
 };
 use crate::types::bytes::BytesObject;
+use crate::types::complex::ComplexObject;
 use crate::types::dict::DictObject;
 use crate::types::function::FunctionObject;
 use crate::types::int::IntObject;
@@ -185,6 +186,15 @@ fn init_dispatch_table() -> DispatchTable {
             trace: trace_bytes,
             size: size_bytes,
             finalize: finalize_bytes,
+        },
+    );
+
+    table.register(
+        TypeId::COMPLEX,
+        DispatchEntry {
+            trace: trace_complex,
+            size: size_complex,
+            finalize: finalize_complex,
         },
     );
 
@@ -705,6 +715,23 @@ unsafe fn size_range(_ptr: *const ()) -> usize {
 unsafe fn finalize_range(ptr: *mut ()) {
     // SAFETY: Caller guarantees ptr points to valid RangeObject
     unsafe { std::ptr::drop_in_place(ptr as *mut RangeObject) };
+}
+
+// =============================================================================
+// ComplexObject Dispatch
+// =============================================================================
+
+unsafe fn trace_complex(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const ComplexObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_complex(_ptr: *const ()) -> usize {
+    mem::size_of::<ComplexObject>()
+}
+
+unsafe fn finalize_complex(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut ComplexObject) };
 }
 
 // =============================================================================

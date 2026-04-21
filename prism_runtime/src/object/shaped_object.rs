@@ -23,6 +23,7 @@ use super::shape::{MAX_INLINE_SLOTS, PropertyFlags, Shape, ShapeId};
 use super::{ObjectHeader, PyObject};
 use crate::object::type_obj::TypeId;
 use crate::types::dict::DictObject;
+use crate::types::list::ListObject;
 use crate::types::string::StringObject;
 use prism_core::Value;
 use prism_core::intern::InternedString;
@@ -224,6 +225,12 @@ pub struct ShapedObject {
     /// built-in type.
     dict_backing: Option<Box<DictObject>>,
 
+    /// Optional native list storage for heap subclasses of `list`.
+    ///
+    /// This preserves list protocol semantics for heap subclasses while
+    /// keeping user-defined instance attributes in the shaped-object storage.
+    list_backing: Option<Box<ListObject>>,
+
     /// Optional native string storage for heap subclasses of `str`.
     ///
     /// This preserves native string semantics while keeping heap instance
@@ -241,6 +248,7 @@ impl ShapedObject {
             inline_slots: InlineSlots::new(),
             overflow: None,
             dict_backing: None,
+            list_backing: None,
             string_backing: None,
         }
     }
@@ -250,6 +258,14 @@ impl ShapedObject {
     pub fn new_dict_backed(type_id: TypeId, empty_shape: Arc<Shape>) -> Self {
         let mut object = Self::new(type_id, empty_shape);
         object.dict_backing = Some(Box::new(DictObject::new()));
+        object
+    }
+
+    /// Create a new ShapedObject with native list storage.
+    #[inline]
+    pub fn new_list_backed(type_id: TypeId, empty_shape: Arc<Shape>) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.list_backing = Some(Box::new(ListObject::new()));
         object
     }
 
@@ -287,6 +303,24 @@ impl ShapedObject {
     #[inline]
     pub fn dict_backing_mut(&mut self) -> Option<&mut DictObject> {
         self.dict_backing.as_deref_mut()
+    }
+
+    /// Check whether this heap instance carries native list storage.
+    #[inline]
+    pub fn has_list_backing(&self) -> bool {
+        self.list_backing.is_some()
+    }
+
+    /// Borrow the native list storage for heap subclasses of `list`.
+    #[inline]
+    pub fn list_backing(&self) -> Option<&ListObject> {
+        self.list_backing.as_deref()
+    }
+
+    /// Mutably borrow the native list storage for heap subclasses of `list`.
+    #[inline]
+    pub fn list_backing_mut(&mut self) -> Option<&mut ListObject> {
+        self.list_backing.as_deref_mut()
     }
 
     /// Check whether this heap instance carries native string storage.
@@ -687,9 +721,29 @@ mod tests {
     }
 
     #[test]
+    fn test_new_list_backed_allocates_native_sequence_storage() {
+        let mut object = ShapedObject::new_list_backed(TypeId::from_raw(513), Shape::empty());
+        assert!(object.has_list_backing());
+
+        let value = val(11);
+        object
+            .list_backing_mut()
+            .expect("list backing should exist")
+            .push(value);
+
+        assert_eq!(
+            object
+                .list_backing()
+                .expect("list backing should exist")
+                .get(0),
+            Some(value)
+        );
+    }
+
+    #[test]
     fn test_new_string_backed_preserves_native_string_storage() {
         let object = ShapedObject::new_string_backed(
-            TypeId::from_raw(513),
+            TypeId::from_raw(514),
             Shape::empty(),
             StringObject::new("value"),
         );

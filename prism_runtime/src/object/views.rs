@@ -172,6 +172,7 @@ impl PyObject for SingletonObject {
 pub enum MappingProxySource {
     BuiltinType(TypeId),
     UserClass(usize),
+    Dict(Value),
 }
 
 #[repr(C)]
@@ -194,6 +195,14 @@ impl MappingProxyObject {
         Self {
             header: ObjectHeader::new(TypeId::MAPPING_PROXY),
             source: MappingProxySource::UserClass(class as usize),
+        }
+    }
+
+    #[inline]
+    pub fn for_mapping(mapping: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::MAPPING_PROXY),
+            source: MappingProxySource::Dict(mapping),
         }
     }
 
@@ -364,16 +373,26 @@ impl PyObject for MethodWrapperObject {
 pub struct FrameViewObject {
     header: ObjectHeader,
     code: Option<Arc<CodeObject>>,
+    globals: Value,
+    locals: Value,
     line_number: u32,
     lasti: u32,
 }
 
 impl FrameViewObject {
     #[inline]
-    pub fn new(code: Option<Arc<CodeObject>>, line_number: u32, lasti: u32) -> Self {
+    pub fn new(
+        code: Option<Arc<CodeObject>>,
+        globals: Value,
+        locals: Value,
+        line_number: u32,
+        lasti: u32,
+    ) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::FRAME),
             code,
+            globals,
+            locals,
             line_number,
             lasti,
         }
@@ -382,6 +401,16 @@ impl FrameViewObject {
     #[inline]
     pub fn code(&self) -> Option<&Arc<CodeObject>> {
         self.code.as_ref()
+    }
+
+    #[inline]
+    pub fn globals(&self) -> Value {
+        self.globals
+    }
+
+    #[inline]
+    pub fn locals(&self) -> Value {
+        self.locals
     }
 
     #[inline]
@@ -472,12 +501,16 @@ mod tests {
     #[test]
     fn test_frame_view_uses_frame_type_id() {
         let code = Arc::new(CodeObject::new("demo", "<test>"));
-        let view = FrameViewObject::new(Some(Arc::clone(&code)), 12, 7);
+        let globals = Value::int(11).unwrap();
+        let locals = Value::int(13).unwrap();
+        let view = FrameViewObject::new(Some(Arc::clone(&code)), globals, locals, 12, 7);
         assert_eq!(view.header().type_id, TypeId::FRAME);
         assert!(Arc::ptr_eq(
             view.code().expect("code should be present"),
             &code
         ));
+        assert_eq!(view.globals(), globals);
+        assert_eq!(view.locals(), locals);
         assert_eq!(view.line_number(), 12);
         assert_eq!(view.lasti(), 7);
     }

@@ -6,6 +6,7 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::slice::SliceObject;
 use std::fmt;
 
 /// Shared object backing for `bytes` and `bytearray`.
@@ -146,6 +147,46 @@ impl BytesObject {
         self.data.clone()
     }
 
+    /// Materialize a Python slice of the byte sequence, preserving the concrete
+    /// `bytes`/`bytearray` type.
+    #[inline]
+    pub fn slice(&self, slice: &SliceObject) -> Self {
+        let indices = slice.indices(self.data.len());
+        let mut data = Vec::with_capacity(indices.length);
+        for idx in indices.iter() {
+            if idx < self.data.len() {
+                data.push(self.data[idx]);
+            }
+        }
+        Self::from_vec_with_type(data, self.header.type_id)
+    }
+
+    /// Concatenate another byte slice, preserving this object's concrete type.
+    #[inline]
+    pub fn concat(&self, other: &[u8]) -> Self {
+        let mut data = Vec::with_capacity(self.data.len() + other.len());
+        data.extend_from_slice(&self.data);
+        data.extend_from_slice(other);
+        Self::from_vec_with_type(data, self.header.type_id)
+    }
+
+    /// Repeat the byte sequence `n` times, preserving the concrete type.
+    ///
+    /// Returns `None` when the repeated byte length would overflow `usize`.
+    #[inline]
+    pub fn repeat_sequence(&self, n: usize) -> Option<Self> {
+        let total_len = self.data.len().checked_mul(n)?;
+        if total_len == 0 {
+            return Some(Self::from_vec_with_type(Vec::new(), self.header.type_id));
+        }
+
+        let mut data = Vec::with_capacity(total_len);
+        for _ in 0..n {
+            data.extend_from_slice(&self.data);
+        }
+        Some(Self::from_vec_with_type(data, self.header.type_id))
+    }
+
     #[inline]
     fn normalize_index(&self, index: i64) -> Option<usize> {
         let len = self.data.len() as i64;
@@ -236,6 +277,36 @@ mod tests {
     }
 
     #[test]
+    fn test_repeat_sequence_preserves_type_and_contents() {
+        let bytes = BytesObject::from_slice(b"ab")
+            .repeat_sequence(3)
+            .expect("bytes repeat should not overflow");
+        assert_eq!(bytes.header.type_id, TypeId::BYTES);
+        assert_eq!(bytes.as_bytes(), b"ababab");
+
+        let bytearray = BytesObject::bytearray_from_slice(b"xy")
+            .repeat_sequence(2)
+            .expect("bytearray repeat should not overflow");
+        assert_eq!(bytearray.header.type_id, TypeId::BYTEARRAY);
+        assert_eq!(bytearray.as_bytes(), b"xyxy");
+    }
+
+    #[test]
+    fn test_repeat_sequence_zero_count_returns_empty_same_type() {
+        let bytes = BytesObject::from_slice(b"ab")
+            .repeat_sequence(0)
+            .expect("zero repeat should be representable");
+        assert_eq!(bytes.header.type_id, TypeId::BYTES);
+        assert!(bytes.is_empty());
+
+        let bytearray = BytesObject::bytearray_from_slice(b"xy")
+            .repeat_sequence(0)
+            .expect("zero repeat should be representable");
+        assert_eq!(bytearray.header.type_id, TypeId::BYTEARRAY);
+        assert!(bytearray.is_empty());
+    }
+
+    #[test]
     fn test_get_positive_and_negative_index() {
         let bytes = BytesObject::from_slice(&[10, 20, 30]);
         assert_eq!(bytes.get(0), Some(10));
@@ -256,6 +327,42 @@ mod tests {
         let bytes = BytesObject::from_slice(&[1, 2, 3, 4]);
         let collected: Vec<u8> = bytes.iter().collect();
         assert_eq!(collected, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_slice_preserves_bytes_type_and_supports_steps() {
+        let bytes = BytesObject::from_slice(b"abcdef");
+        let slice = SliceObject::full(0, 6, 2);
+        let sliced = bytes.slice(&slice);
+
+        assert_eq!(sliced.header.type_id, TypeId::BYTES);
+        assert_eq!(sliced.as_bytes(), b"ace");
+    }
+
+    #[test]
+    fn test_slice_preserves_bytearray_type_and_supports_reverse() {
+        let bytes = BytesObject::bytearray_from_slice(b"abcd");
+        let slice = SliceObject::new(None, None, Some(-1));
+        let sliced = bytes.slice(&slice);
+
+        assert_eq!(sliced.header.type_id, TypeId::BYTEARRAY);
+        assert_eq!(sliced.as_bytes(), b"dcba");
+    }
+
+    #[test]
+    fn test_concat_preserves_bytes_type() {
+        let bytes = BytesObject::from_slice(b"abc");
+        let result = bytes.concat(b"def");
+        assert_eq!(result.header.type_id, TypeId::BYTES);
+        assert_eq!(result.as_bytes(), b"abcdef");
+    }
+
+    #[test]
+    fn test_concat_preserves_bytearray_type() {
+        let bytearray = BytesObject::bytearray_from_slice(b"abc");
+        let result = bytearray.concat(b"def");
+        assert_eq!(result.header.type_id, TypeId::BYTEARRAY);
+        assert_eq!(result.as_bytes(), b"abcdef");
     }
 
     #[test]

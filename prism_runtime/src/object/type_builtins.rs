@@ -525,12 +525,22 @@ pub fn builtin_class_mro(type_id: TypeId) -> Vec<ClassId> {
     }
 }
 
+#[inline]
+fn builtin_base_type_error(type_id: TypeId) -> Option<TypeCreationError> {
+    match type_id {
+        TypeId::BOOL => Some(TypeCreationError::UnacceptableBaseType {
+            class_name: type_id.name().to_string(),
+        }),
+        _ => None,
+    }
+}
+
 // =============================================================================
 // Type Creation (3-arg form)
 // =============================================================================
 
 use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
-use crate::object::descriptor::StaticMethodDescriptor;
+use crate::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, OnceLock};
@@ -540,6 +550,9 @@ use std::sync::{Arc, OnceLock};
 pub enum TypeCreationError {
     /// Base class is marked final and cannot be subclassed.
     FinalBase { class_name: String },
+
+    /// Built-in type cannot be used as a base class.
+    UnacceptableBaseType { class_name: String },
 
     /// MRO computation failed (C3 linearization conflict).
     MroError { message: String },
@@ -562,6 +575,9 @@ impl std::fmt::Display for TypeCreationError {
         match self {
             TypeCreationError::FinalBase { class_name } => {
                 write!(f, "cannot subclass final class '{}'", class_name)
+            }
+            TypeCreationError::UnacceptableBaseType { class_name } => {
+                write!(f, "type '{}' is not an acceptable base type", class_name)
             }
             TypeCreationError::MroError { message } => {
                 write!(f, "MRO error: {}", message)
@@ -669,6 +685,9 @@ where
     // 2. Validate base classes
     for &base_id in bases {
         if base_id.0 < TypeId::FIRST_USER_TYPE {
+            if let Some(err) = builtin_base_type_error(class_id_to_type_id(base_id)) {
+                return Err(err);
+            }
             continue;
         }
 
@@ -793,9 +812,9 @@ where
 
 #[inline]
 fn normalize_class_namespace_value(name: &InternedString, value: Value) -> Value {
-    if name.as_str() != "__new__" {
+    let Some(kind) = implicit_descriptor_kind(name.as_str()) else {
         return value;
-    }
+    };
 
     let Some(ptr) = value.as_object_ptr() else {
         return value;
@@ -805,10 +824,38 @@ fn normalize_class_namespace_value(name: &InternedString, value: Value) -> Value
     let type_id = unsafe { (*header).type_id };
     match type_id {
         TypeId::FUNCTION | TypeId::CLOSURE | TypeId::BUILTIN_FUNCTION => {
+            wrap_implicit_descriptor(value, kind)
+        }
+        _ => value,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImplicitDescriptorKind {
+    StaticMethod,
+    ClassMethod,
+}
+
+#[inline]
+fn implicit_descriptor_kind(name: &str) -> Option<ImplicitDescriptorKind> {
+    match name {
+        "__new__" => Some(ImplicitDescriptorKind::StaticMethod),
+        "__init_subclass__" | "__class_getitem__" => Some(ImplicitDescriptorKind::ClassMethod),
+        _ => None,
+    }
+}
+
+#[inline]
+fn wrap_implicit_descriptor(value: Value, kind: ImplicitDescriptorKind) -> Value {
+    match kind {
+        ImplicitDescriptorKind::StaticMethod => {
             let descriptor = StaticMethodDescriptor::new(value);
             Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ())
         }
-        _ => value,
+        ImplicitDescriptorKind::ClassMethod => {
+            let descriptor = ClassMethodDescriptor::new(value);
+            Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ())
+        }
     }
 }
 
@@ -1431,7 +1478,7 @@ mod tests {
         ClassRegistry, SimpleClassRegistry, TypeCreationError, type_new, type_new_with_metaclass,
     };
     use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
-    use crate::object::descriptor::StaticMethodDescriptor;
+    use crate::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
     use crate::types::function::FunctionObject;
     use prism_compiler::bytecode::CodeObject;
     use prism_core::intern::intern;
@@ -1552,6 +1599,56 @@ mod tests {
     }
 
     #[test]
+    fn test_type_new_wraps_function_dunder_init_subclass_as_classmethod() {
+        let registry = create_test_registry();
+        let name = intern("WrappedInitSubclassClass");
+        let namespace = ClassDict::new();
+        let function_value = test_function_value("__init_subclass__");
+        namespace.set(intern("__init_subclass__"), function_value);
+
+        let result = type_new(name, &[], &namespace, &registry).unwrap();
+        let stored = result
+            .class
+            .get_attr(&intern("__init_subclass__"))
+            .expect("__init_subclass__ should be present on the class");
+        let ptr = stored
+            .as_object_ptr()
+            .expect("normalized __init_subclass__ should be a descriptor object");
+        let descriptor = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+
+        assert_eq!(
+            unsafe { (*(ptr as *const crate::object::ObjectHeader)).type_id },
+            TypeId::CLASSMETHOD
+        );
+        assert_eq!(descriptor.function(), function_value);
+    }
+
+    #[test]
+    fn test_type_new_wraps_function_dunder_class_getitem_as_classmethod() {
+        let registry = create_test_registry();
+        let name = intern("WrappedClassGetitemClass");
+        let namespace = ClassDict::new();
+        let function_value = test_function_value("__class_getitem__");
+        namespace.set(intern("__class_getitem__"), function_value);
+
+        let result = type_new(name, &[], &namespace, &registry).unwrap();
+        let stored = result
+            .class
+            .get_attr(&intern("__class_getitem__"))
+            .expect("__class_getitem__ should be present on the class");
+        let ptr = stored
+            .as_object_ptr()
+            .expect("normalized __class_getitem__ should be a descriptor object");
+        let descriptor = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+
+        assert_eq!(
+            unsafe { (*(ptr as *const crate::object::ObjectHeader)).type_id },
+            TypeId::CLASSMETHOD
+        );
+        assert_eq!(descriptor.function(), function_value);
+    }
+
+    #[test]
     fn test_type_new_preserves_explicit_staticmethod_dunder_new() {
         let registry = create_test_registry();
         let name = intern("ExplicitStaticNewClass");
@@ -1566,6 +1663,25 @@ mod tests {
             .class
             .get_attr(&intern("__new__"))
             .expect("__new__ should be present on the class");
+
+        assert_eq!(stored, descriptor_value);
+    }
+
+    #[test]
+    fn test_type_new_preserves_explicit_classmethod_dunder_init_subclass() {
+        let registry = create_test_registry();
+        let name = intern("ExplicitClassMethodInitSubclassClass");
+        let namespace = ClassDict::new();
+        let function_value = test_function_value("__init_subclass__");
+        let descriptor = ClassMethodDescriptor::new(function_value);
+        let descriptor_value = Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ());
+        namespace.set(intern("__init_subclass__"), descriptor_value);
+
+        let result = type_new(name, &[], &namespace, &registry).unwrap();
+        let stored = result
+            .class
+            .get_attr(&intern("__init_subclass__"))
+            .expect("__init_subclass__ should be present on the class");
 
         assert_eq!(stored, descriptor_value);
     }
@@ -1732,6 +1848,23 @@ mod tests {
     }
 
     #[test]
+    fn test_type_new_rejects_bool_as_base_type() {
+        let registry = create_test_registry();
+        let name = intern("DerivedFromBool");
+        let namespace = ClassDict::new();
+
+        let result = type_new(name, &[ClassId(TypeId::BOOL.raw())], &namespace, &registry);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            TypeCreationError::UnacceptableBaseType { class_name } => {
+                assert_eq!(class_name, "bool");
+            }
+            _ => panic!("Expected UnacceptableBaseType error"),
+        }
+    }
+
+    #[test]
     fn test_type_new_namespace_copied() {
         let registry = create_test_registry();
         let name = intern("AttrClass");
@@ -1810,6 +1943,14 @@ mod tests {
             class_name: "MyFinal".to_string(),
         };
         assert_eq!(err.to_string(), "cannot subclass final class 'MyFinal'");
+
+        let err = TypeCreationError::UnacceptableBaseType {
+            class_name: "bool".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "type 'bool' is not an acceptable base type"
+        );
 
         let err = TypeCreationError::MroError {
             message: "conflict".to_string(),
