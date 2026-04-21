@@ -529,6 +529,7 @@ name = "prism_aot"
 version = "0.1.0"
 dependencies = [
  "object",
+ "prism_code",
  "prism_compiler",
  "prism_core",
  "prism_parser",
@@ -561,9 +562,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism_code"
+version = "0.1.0"
+dependencies = [
+ "prism_core",
+]
+
+[[package]]
 name = "prism_compiler"
 version = "0.1.0"
 dependencies = [
+ "prism_code",
  "prism_core",
  "prism_parser",
  "smallvec",
@@ -604,7 +613,7 @@ dependencies = [
  "libc",
  "memmap2",
  "parking_lot",
- "prism_compiler",
+ "prism_code",
  "prism_core",
  "prism_runtime",
  "rustc-hash",
@@ -631,7 +640,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "parking_lot",
- "prism_compiler",
+ "prism_code",
  "prism_core",
  "prism_gc",
  "rustc-hash",
@@ -649,6 +658,7 @@ dependencies = [
  "libm",
  "num-bigint",
  "num-traits",
+ "prism_code",
  "prism_compiler",
  "prism_core",
  "prism_gc",
