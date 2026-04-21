@@ -17,7 +17,9 @@ mod builtin_tests {
     use prism_core::intern::intern;
     use prism_runtime::object::shape::shape_registry;
     use prism_runtime::object::shaped_object::ShapedObject;
+    use prism_runtime::types::iter::IteratorObject;
     use prism_runtime::types::string::StringObject;
+    use prism_vm::builtins::BuiltinFunctionObject;
     use prism_vm::builtins::{
         BuiltinError, builtin_delattr, builtin_getattr, builtin_hasattr, builtin_setattr,
     };
@@ -30,6 +32,10 @@ mod builtin_tests {
 
     unsafe fn drop_boxed<T>(ptr: *mut T) {
         drop(unsafe { Box::from_raw(ptr) });
+    }
+
+    fn iterator_value(iterator: IteratorObject) -> Value {
+        Value::object_ptr(Box::into_raw(Box::new(iterator)) as *const ())
     }
 
     // =========================================================================
@@ -252,6 +258,31 @@ mod builtin_tests {
 
         unsafe { drop_boxed(string_ptr) };
         unsafe { drop_boxed(obj_ptr) };
+    }
+
+    #[test]
+    fn test_getattr_exposes_iterator_next_method() {
+        let iterator = iterator_value(IteratorObject::from_values(vec![
+            Value::int(7).unwrap(),
+            Value::int(8).unwrap(),
+        ]));
+
+        let next_method = builtin_getattr(&[iterator, Value::string(intern("__next__"))])
+            .expect("iterator should expose __next__");
+        let next_ptr = next_method
+            .as_object_ptr()
+            .expect("__next__ should be a heap-allocated builtin");
+        let next_builtin = unsafe { &*(next_ptr as *const BuiltinFunctionObject) };
+        let first = next_builtin.call(&[]).expect("first item");
+        let second = next_builtin.call(&[]).expect("second item");
+
+        assert_eq!(first.as_int(), Some(7));
+        assert_eq!(second.as_int(), Some(8));
+
+        match next_builtin.call(&[]) {
+            Err(BuiltinError::StopIteration) => {}
+            other => panic!("expected StopIteration, got {other:?}"),
+        }
     }
 
     #[test]

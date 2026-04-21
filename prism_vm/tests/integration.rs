@@ -196,6 +196,152 @@ fn test_float_division() {
 }
 
 #[test]
+fn test_unary_plus_preserves_python_numeric_semantics() {
+    let result = execute(
+        r#"
+assert +False == 0
+assert (+False) is not False
+assert +True == 1
+assert (+True) is not True
+assert +1.5 == 1.5
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_unary_plus_dispatches_dunder_pos() {
+    let result = execute(
+        r#"
+class Signed:
+    def __pos__(self):
+        return 42
+
+assert +Signed() == 42
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bool_invert_emits_deprecation_warning() {
+    let result = execute_with_cpython_lib(
+        r#"
+import warnings
+
+with warnings.catch_warnings(record=True) as seen:
+    warnings.simplefilter("always", DeprecationWarning)
+    flag = False
+    assert ~flag == -1
+    assert len(seen) == 1
+    assert seen[0].category is DeprecationWarning
+    assert "Bitwise inversion '~' on bool is deprecated" in str(seen[0].message)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_eval_bool_invert_emits_deprecation_warning() {
+    let result = execute_with_cpython_lib(
+        r#"
+import warnings
+
+with warnings.catch_warnings(record=True) as seen:
+    warnings.simplefilter("always", DeprecationWarning)
+    assert eval("~False") == -1
+    assert len(seen) == 1
+    assert seen[0].category is DeprecationWarning
+    assert "Bitwise inversion '~' on bool is deprecated" in str(seen[0].message)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_struct_module_supports_pickle_bootstrap_formats() {
+    let result = execute_with_cpython_lib(
+        r#"
+import struct
+
+assert struct.calcsize("<Q") == 8
+assert struct.pack("<I", 0x12345678) == b"\x78\x56\x34\x12"
+assert struct.unpack("<I", b"\x78\x56\x34\x12") == (0x12345678,)
+assert struct.pack(">d", 1.5) == b"\x3f\xf8\x00\x00\x00\x00\x00\x00"
+assert struct.unpack(">d", b"\x3f\xf8\x00\x00\x00\x00\x00\x00") == (1.5,)
+
+buf = bytearray(b"\x00" * 10)
+struct.pack_into("<H", buf, 4, 0x1234)
+assert bytes(buf) == b"\x00\x00\x00\x00\x34\x12\x00\x00\x00\x00"
+assert struct.unpack_from("<H", buf, 4) == (0x1234,)
+assert list(struct.iter_unpack("<H", b"\x01\x00\x02\x00")) == [(1,), (2,)]
+
+compiled = struct.Struct("<I")
+assert compiled.size == 4
+assert compiled.pack(7) == b"\x07\x00\x00\x00"
+assert compiled.unpack(b"\x07\x00\x00\x00") == (7,)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_pickle_bool_round_trip_uses_native_struct_bootstrap() {
+    let result = execute_with_cpython_lib(
+        r#"
+import pickle
+
+for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+    assert pickle.loads(pickle.dumps(True, proto)) is True
+    assert pickle.loads(pickle.dumps(False, proto)) is False
+
+assert pickle.dumps(True, protocol=0) == b"I01\n."
+assert pickle.dumps(False, protocol=0) == b"I00\n."
+assert pickle.dumps(True, protocol=1) == b"I01\n."
+assert pickle.dumps(False, protocol=1) == b"I00\n."
+assert pickle.dumps(True, protocol=2) == b"\x80\x02\x88."
+assert pickle.dumps(False, protocol=2) == b"\x80\x02\x89."
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bytesio_getbuffer_exposes_readable_buffer_contents() {
+    let result = execute_with_cpython_lib(
+        r#"
+import io
+
+buf = io.BytesIO(b"frame-data")
+view = buf.getbuffer()
+
+assert len(view) == 10
+assert view == b"frame-data"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_for_iter_handles_large_bool_loop_exit_offsets() {
+    let mut body = String::new();
+    for _ in 0..48 {
+        body.push_str("    acc += flag & 1\n");
+        body.push_str("    acc += flag | 0\n");
+        body.push_str("    acc += flag ^ 0\n");
+    }
+    let source = format!("acc = 0\nfor flag in (False, True):\n{body}result = acc\n");
+
+    let (_vm, main) = execute_in_main_module_with_search_paths(&source, &[])
+        .expect("large bool loop should execute");
+
+    let result = main
+        .get_attr("result")
+        .expect("result binding should exist");
+    assert_eq!(result.as_int(), Some(144));
+}
+
+#[test]
 fn test_string_addition() {
     let result = execute(
         r#"
@@ -213,6 +359,215 @@ fn test_string_repetition() {
 value = "ab" * 3
 assert value == "ababab"
 assert "ab" * -1 == ""
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_fstring_values_can_drive_dynamic_exec_source() {
+    let result = execute(
+        r#"
+key = "False"
+source = f"{key} = 42"
+assert source == "False = 42"
+
+try:
+    exec(source)
+except SyntaxError:
+    pass
+else:
+    raise AssertionError("expected SyntaxError from keyword assignment")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_fstring_numeric_format_specs_render_runtime_strings() {
+    let result = execute(
+        r#"
+value = 255
+width = 4
+assert f"{value:{width}}" == " 255"
+assert f"{value:08X}" == "000000FF"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_exec_without_explicit_namespaces_preserves_caller_frame() {
+    let result = execute(
+        r#"
+marker = "alive"
+exec("_ = 42")
+assert marker == "alive"
+assert _ == 42
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_exec_exceptions_can_transfer_control_to_surrounding_handlers() {
+    let result = execute(
+        r#"
+handled = False
+try:
+    exec("raise ValueError('boom')")
+except ValueError:
+    handled = True
+
+assert handled is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_with_cleanup_passes_exception_classes_into_unittest_assert_raises() {
+    let result = execute_with_cpython_lib(
+        r#"
+import sys
+import unittest
+
+case = unittest.TestCase()
+with case.assertRaises(SyntaxError):
+    exec("False = 42")
+
+assert sys.exc_info() == (None, None, None)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_with_cleanup_clears_exc_info_after_truthy_exit() {
+    let result = execute(
+        r#"
+import sys
+
+class SuppressSyntax:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        assert exc_type is SyntaxError
+        assert exc is not None
+        return True
+
+with SuppressSyntax():
+    exec("False = 42")
+
+assert sys.exc_info() == (None, None, None)
+
+with SuppressSyntax():
+    exec("False = 42")
+
+assert sys.exc_info() == (None, None, None)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_exception_with_traceback_round_trips_and_returns_same_instance() {
+    let result = execute(
+        r#"
+try:
+    raise ValueError("boom")
+except ValueError as caught:
+    tb = caught.__traceback__
+
+rebound = BaseException().with_traceback(tb)
+assert rebound.__traceback__ is tb
+assert rebound.with_traceback(None) is rebound
+assert rebound.__traceback__ is None
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_exception_traceback_assignment_validates_input() {
+    let result = execute(
+        r#"
+try:
+    raise ValueError("boom")
+except ValueError as caught:
+    tb = caught.__traceback__
+
+sink = BaseException()
+sink.__traceback__ = tb
+assert sink.__traceback__ is tb
+sink.__traceback__ = None
+assert sink.__traceback__ is None
+
+try:
+    sink.__traceback__ = 1
+except TypeError as exc:
+    assert "__traceback__ must be a traceback" in str(exc)
+else:
+    raise AssertionError("expected traceback assignment to reject non-traceback values")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_traceback_extract_tb_reads_code_positions() {
+    let result = execute_with_cpython_lib(
+        r#"import traceback
+
+def boom():
+    raise ValueError("boom")
+
+try:
+    boom()
+except ValueError as exc:
+    frames = traceback.extract_tb(exc.__traceback__)
+    assert len(frames) == 2
+    outer = frames[0]
+    assert outer.name == "<module>"
+    assert outer.filename == "<test>"
+    assert outer.lineno == 6
+    frame = frames[1]
+    assert frame.name == "boom"
+    assert frame.filename == "<test>"
+    assert frame.lineno == 3
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_exception_group_builtin_hierarchy_matches_cpython_surface() {
+    let result = execute(
+        r#"assert issubclass(BaseExceptionGroup, BaseException)
+assert issubclass(ExceptionGroup, BaseExceptionGroup)
+assert issubclass(ExceptionGroup, Exception)
+assert BaseExceptionGroup.__bases__ == (BaseException,)
+assert ExceptionGroup.__bases__ == (BaseExceptionGroup, Exception)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_generator_yield_comma_tuple_expression() {
+    let result = execute(
+        r#"def probe():
+    yield 1, 2
+
+g = probe()
+assert next(g) == (1, 2)
+try:
+    next(g)
+except StopIteration:
+    pass
+else:
+    raise AssertionError("generator should be exhausted")
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
@@ -380,6 +735,60 @@ fn test_parenthesized_expression() {
 #[test]
 fn test_generator_lambda_creation_does_not_escape_yield_to_module_scope() {
     let result = execute("generator_type = type((lambda: (yield))())");
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_generator_throw_injects_exception_into_suspended_generator() {
+    let result = execute(
+        r#"
+def probe():
+    try:
+        yield 1
+    except ValueError as exc:
+        assert exc is marker
+        observed.append(exc is marker)
+        return
+
+g = probe()
+observed = []
+marker = ValueError("boom")
+assert next(g) == 1
+try:
+    g.throw(marker)
+except StopIteration:
+    assert observed == [True]
+else:
+    raise AssertionError("throw() should exhaust the generator after it is handled")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_generator_throw_on_unstarted_generator_raises_original_exception() {
+    let result = execute(
+        r#"
+def probe():
+    yield 1
+
+g = probe()
+marker = ValueError("boom")
+try:
+    g.throw(marker)
+except ValueError as exc:
+    assert exc is marker
+else:
+    raise AssertionError("throw() should propagate into an unstarted generator")
+
+try:
+    next(g)
+except StopIteration:
+    pass
+else:
+    raise AssertionError("unstarted throw() should exhaust the generator")
+"#,
+    );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
 
@@ -692,6 +1101,24 @@ assert copied["label"] == "ready"
 }
 
 #[test]
+fn test_mappingproxy_type_wraps_plain_dicts() {
+    let result = execute_with_cpython_lib(
+        r#"
+from types import MappingProxyType
+
+source = {"alpha": 1}
+proxy = MappingProxyType(source)
+assert proxy["alpha"] == 1
+
+source["beta"] = 2
+assert proxy["beta"] == 2
+assert list(proxy.keys()) == ["alpha", "beta"]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_abc_abstractmethod_with_defaults_does_not_break_following_classmethod() {
     let result = execute_with_cpython_lib(
         r#"
@@ -799,6 +1226,20 @@ import keyword
 
 assert keyword.iskeyword("while")
 assert not keyword.iskeyword("prism_runtime")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_test_support_os_helper_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+from test.support import os_helper
+
+assert isinstance(os_helper.TESTFN_ASCII, str)
+assert os_helper.TESTFN
+assert os_helper.FS_NONASCII == "" or os_helper.FS_NONASCII in os_helper.TESTFN_NONASCII
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
@@ -1886,6 +2327,60 @@ RESULT_DEL_COUNT = mapping.del_count
 }
 
 #[test]
+fn test_tuple_subscript_keys_round_trip_through_getitem() {
+    let (_, main) = execute_in_main_module_with_search_paths(
+        r#"
+class Matrix:
+    def __getitem__(self, key):
+        return key
+
+plain_key = Matrix()[1, 2]
+slice_key = Matrix()[1:3, 4]
+
+RESULT_PLAIN_LEN = len(plain_key)
+RESULT_PLAIN_FIRST = plain_key[0]
+RESULT_PLAIN_SECOND = plain_key[1]
+RESULT_SLICE_LEN = len(slice_key)
+RESULT_SLICE_IS_SLICE = type(slice_key[0]).__name__ == "slice"
+RESULT_SLICE_SECOND = slice_key[1]
+"#,
+        &[],
+    )
+    .expect("tuple subscript probe should execute");
+
+    assert_eq!(
+        main.get_attr("RESULT_PLAIN_LEN")
+            .and_then(|value| value.as_int()),
+        Some(2)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_PLAIN_FIRST")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_PLAIN_SECOND")
+            .and_then(|value| value.as_int()),
+        Some(2)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_SLICE_IS_SLICE")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_SLICE_LEN")
+            .and_then(|value| value.as_int()),
+        Some(2)
+    );
+    assert_eq!(
+        main.get_attr("RESULT_SLICE_SECOND")
+            .and_then(|value| value.as_int()),
+        Some(4)
+    );
+}
+
+#[test]
 fn test_delete_attribute_executes_runtime_protocol() {
     let (_, main) = execute_in_main_module_with_search_paths(
         r#"
@@ -2208,6 +2703,39 @@ import tokenize
 }
 
 #[test]
+fn test_import_dataclasses_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import dataclasses
+"#,
+        120_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_locale_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import locale
+"#,
+        200_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_argparse_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import argparse
+"#,
+        200_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_import_unittest_with_cpython_stdlib() {
     let result = execute_with_cpython_lib_and_step_limit(
         r#"
@@ -2270,6 +2798,27 @@ first, second = Values
             .expect("second should be bound"),
         20
     );
+}
+
+#[test]
+fn test_class_iteration_prefers_metaclass_special_method_over_base_instance_iter() {
+    let result = execute(
+        r#"
+class Meta(type):
+    def __iter__(cls):
+        return iter((10, 20))
+
+class Base:
+    def __iter__(self):
+        raise AssertionError("instance __iter__ should not be used for class iteration")
+
+class Example(Base, metaclass=Meta):
+    pass
+
+assert list(Example) == [10, 20]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
 }
 
 #[test]
@@ -2973,6 +3522,139 @@ def token():
 }
 
 #[test]
+fn test_contextlib_contextmanager_exit_preserves_thrown_exception_identity() {
+    let lib_dir = cpython_lib_dir();
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+import contextlib
+
+events = []
+INNER_SAME = None
+OUTER_SAME = None
+OUTER_TYPE = None
+EVENTS_MATCH = None
+
+@contextlib.contextmanager
+def manager():
+    global INNER_SAME
+    try:
+        yield
+    except KeyError as exc:
+        INNER_SAME = exc is marker
+        events.append(exc)
+        raise
+
+marker = KeyError("boom")
+try:
+    with manager():
+        raise marker
+except KeyError as exc:
+    OUTER_SAME = exc is marker
+    OUTER_TYPE = type(exc).__name__
+else:
+    OUTER_TYPE = "missing"
+
+EVENTS_MATCH = len(events) == 1 and events[0] is marker
+"#,
+        &[lib_dir.as_path()],
+    )
+    .expect("contextlib throw() probe should execute");
+
+    assert_eq!(
+        main.get_attr("INNER_SAME")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "generator handler should receive the original exception object",
+    );
+    assert_eq!(
+        main.get_attr("OUTER_SAME")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "contextlib should re-raise the original exception object",
+    );
+    assert_eq!(
+        main.get_attr("OUTER_TYPE").and_then(python_string_value),
+        Some("KeyError".to_string()),
+        "contextlib should re-raise KeyError after throw() propagation",
+    );
+    assert_eq!(
+        main.get_attr("EVENTS_MATCH")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "the handler-observed exception should match the original object",
+    );
+}
+
+#[test]
+fn test_complex_constructor_matches_bool_numeric_semantics() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+ZERO_EQ_LITERAL = complex(False) == 0j
+ZERO_EQ_BOOL = complex(False) == False
+ONE_EQ_LITERAL = complex(True) == 1 + 0j
+ONE_EQ_BOOL = complex(True) == True
+ZERO_TEXT = str(0j)
+ONE_TEXT = str(1 + 0j)
+"#,
+        &[],
+    )
+    .expect("complex numeric script should execute");
+
+    assert_eq!(
+        main.get_attr("ZERO_EQ_LITERAL")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("ZERO_EQ_BOOL")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("ONE_EQ_LITERAL")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("ONE_EQ_BOOL")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        main.get_attr("ZERO_TEXT").and_then(python_string_value),
+        Some("0j".to_string())
+    );
+    assert_eq!(
+        main.get_attr("ONE_TEXT").and_then(python_string_value),
+        Some("(1+0j)".to_string())
+    );
+}
+
+#[test]
+fn test_complex_literals_bypass_shadowed_builtin_name() {
+    let (_vm, main) = execute_in_main_module_with_search_paths(
+        r#"
+complex = lambda *args: 99
+VALUE = 1 + 0j
+VALUE_TEXT = str(VALUE)
+VALUE_MATCH = VALUE == 1 + 0j
+"#,
+        &[],
+    )
+    .expect("complex literal script should execute");
+
+    assert_eq!(
+        main.get_attr("VALUE_TEXT").and_then(python_string_value),
+        Some("(1+0j)".to_string())
+    );
+    assert_eq!(
+        main.get_attr("VALUE_MATCH")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
 fn test_call_ex_keywords_preserve_locals_across_try_except() {
     let result = execute(
         r#"
@@ -3172,6 +3854,98 @@ assert outer() == "PATH"
 }
 
 #[test]
+fn test_nested_closure_cells_are_fresh_per_call() {
+    let result = execute(
+        r#"
+def outer(value):
+    def inner():
+        return value
+
+    return inner
+
+first = outer("first")
+second = outer("second")
+
+assert outer.__closure__ is None
+assert len(first.__closure__) == 1
+assert len(second.__closure__) == 1
+assert first.__closure__[0].cell_contents == "first"
+assert second.__closure__[0].cell_contents == "second"
+assert first() == "first"
+assert second() == "second"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_functools_wraps_closures_keep_distinct_wrapped_functions() {
+    let result = execute(
+        r#"
+import functools
+
+def first():
+    return "first"
+
+def second():
+    return "second"
+
+def make_wrapper(fn):
+    @functools.wraps(fn)
+    def inner(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return inner
+
+a = make_wrapper(first)
+b = make_wrapper(second)
+
+assert a() == "first"
+assert b() == "second"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_unittest_smoke_suite_runs_with_cpython_lib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import unittest
+
+class Smoke(unittest.TestCase):
+    def test_truth(self):
+        self.assertTrue(True)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(Smoke)
+result = unittest.TestResult()
+suite.run(result)
+assert result.wasSuccessful()
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_super_init_subclass_resolves_object_hook_for_type_bindings() {
+    let result = execute(
+        r#"
+class Base:
+    seen = None
+
+    def __init_subclass__(cls):
+        cls.seen = cls.__name__
+        super().__init_subclass__()
+
+class Child(Base):
+    pass
+
+assert Child.seen == "Child"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_import_os_with_cpython_stdlib() {
     let result = execute_with_cpython_lib(
         r#"
@@ -3360,6 +4134,21 @@ assert not keyword.iskeyword("prism_runtime")
 }
 
 #[test]
+fn test_import_sysconfig_supports_dict_union_operators() {
+    let result = execute_with_cpython_lib(
+        r#"
+import sysconfig
+
+paths = sysconfig.get_paths()
+assert sysconfig.get_default_scheme() in sysconfig.get_scheme_names()
+assert "stdlib" in paths
+assert "platlib" in paths
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_class_body_delete_removes_class_binding() {
     let result = execute(
         r#"
@@ -3427,6 +4216,100 @@ fn test_import_unittest_with_cpython_lib() {
 import unittest
 "#,
         120_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_io_stringio_supports_core_text_buffer_protocol() {
+    let result = execute(
+        r#"
+from io import StringIO
+
+buffer = StringIO("seed")
+assert buffer.getvalue() == "seed"
+assert buffer.tell() == 0
+
+buffer.seek(4)
+assert buffer.write("!")
+assert buffer.getvalue() == "seed!"
+
+buffer.seek(0)
+assert buffer.read() == "seed!"
+buffer.seek(0)
+assert buffer.readline() == "seed!"
+
+buffer.seek(0)
+buffer.truncate(2)
+assert buffer.getvalue() == "se"
+assert buffer.writable()
+assert buffer.readable()
+assert buffer.seekable()
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_sys_standard_streams_expose_text_runner_methods() {
+    let result = execute(
+        r#"
+import sys
+
+assert sys.stdout is sys.__stdout__
+assert sys.stderr is sys.__stderr__
+assert sys.stdin is sys.__stdin__
+
+assert sys.stdout.write("") == 0
+assert sys.stderr.write("") == 0
+assert sys.stdout.flush() is None
+assert sys.stderr.flush() is None
+assert hasattr(sys.stdin, "readline")
+assert sys.stdout.closed is False
+assert sys.stderr.closed is False
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_open_context_manager_tracks_closed_state_like_cpython_bool_suite() {
+    let result = execute_with_cpython_lib(
+        r#"
+from test.support import os_helper
+import os
+
+try:
+    with open(os_helper.TESTFN, "w", encoding="utf-8") as f:
+        assert f.closed is False
+    assert f.closed is True
+finally:
+    if os.path.exists(os_helper.TESTFN):
+        os.remove(os_helper.TESTFN)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_open_supports_text_round_trip_with_keyword_encoding() {
+    let result = execute_with_cpython_lib(
+        r#"
+from test.support import os_helper
+import os
+
+try:
+    with open(os_helper.TESTFN, "w", encoding="utf-8") as f:
+        assert f.write("hello")
+        assert f.closed is False
+
+    with open(os_helper.TESTFN, "r", encoding="utf-8") as f:
+        assert f.read() == "hello"
+        assert f.readline() == ""
+finally:
+    if os.path.exists(os_helper.TESTFN):
+        os.remove(os_helper.TESTFN)
+"#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
@@ -3615,6 +4498,75 @@ fn test_boolean_literals() {
     assert!(result.is_ok(), "False failed: {:?}", result);
 }
 
+#[test]
+fn test_bool_type_rejects_subclassing_and_int_new_receiver() {
+    let result = execute(
+        r#"
+try:
+    class C(bool):
+        pass
+except TypeError as exc:
+    BASE_ERROR = str(exc)
+else:
+    raise AssertionError("bool should not be subclassable")
+
+try:
+    int.__new__(bool, 0)
+except TypeError as exc:
+    NEW_ERROR = str(exc)
+else:
+    raise AssertionError("int.__new__(bool, 0) should fail")
+
+assert BASE_ERROR.endswith("type 'bool' is not an acceptable base type")
+assert NEW_ERROR.endswith("int.__new__(bool) is not safe, use bool.__new__()")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_marshal_round_trips_bool_like_cpython_bool_suite() {
+    let result = execute(
+        r#"
+import marshal
+
+assert marshal.loads(marshal.dumps(True)) is True
+assert marshal.loads(marshal.dumps(False)) is False
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bool_from_bytes_matches_cpython_semantics() {
+    let result = execute(
+        r#"
+assert bool.from_bytes(b"\x00" * 8, "big") is False
+assert bool.from_bytes(b"abcd", "little") is True
+assert bool.from_bytes([], "big") is False
+assert bool.from_bytes([0, 1], byteorder="big") is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bool_real_and_imag_project_to_int_values() {
+    let result = execute(
+        r#"
+assert True.real == 1
+assert True.imag == 0
+assert type(True.real) is int
+assert type(True.imag) is int
+assert False.real == 0
+assert False.imag == 0
+assert type(False.real) is int
+assert type(False.imag) is int
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
 // =============================================================================
 // Complex Programs
 // =============================================================================
@@ -3708,6 +4660,33 @@ assert sorted((x for x in [3, 1, 2])) == [1, 2, 3]
 assert sorted((x for x in [3, 1, 2]), None, True) == [3, 2, 1]
 assert sum(x for x in [1, 2, 3]) == 6
 assert sum((x for x in [1, 2, 3]), 10) == 16
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_heap_list_subclass_inherits_core_list_protocols() {
+    let result = execute(
+        r#"
+class L(list):
+    pass
+
+items = L()
+assert not items
+assert len(items) == 0
+items.append(1)
+items.append(2)
+assert items
+assert len(items) == 2
+assert items[0] == 1
+assert items[1] == 2
+assert list(items) == [1, 2]
+assert repr(items) == "[1, 2]"
+items[1] = 5
+assert list(items) == [1, 5]
+del items[0]
+assert list(items) == [5]
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
