@@ -45,8 +45,13 @@
 //! let exc = value_error.construct(&[Value::none()]);
 //! ```
 
+use crate::VirtualMachine;
 use crate::builtins::BuiltinError;
-use crate::builtins::exception_value::{create_exception, create_exception_with_args};
+use crate::builtins::exception_value::{
+    create_exception, create_exception_in_vm, create_exception_with_args,
+    create_exception_with_args_in_vm,
+};
+use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
@@ -330,12 +335,35 @@ impl ExceptionTypeObject {
         create_exception_with_args(type_id, None, args.to_vec().into_boxed_slice())
     }
 
+    /// Construct an exception instance using the VM-managed heap.
+    #[inline]
+    pub fn construct_in_vm(
+        &self,
+        vm: &VirtualMachine,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let type_id = ExceptionTypeId::from_u8(self.exception_type_id as u8)
+            .unwrap_or(ExceptionTypeId::Exception);
+
+        if args.is_empty() {
+            return create_exception_in_vm(vm, type_id, None);
+        }
+
+        create_exception_with_args_in_vm(vm, type_id, None, args.to_vec().into_boxed_slice())
+    }
+
     /// Call the exception type as a constructor (for builtins integration).
     ///
     /// This is the entry point for `ValueError("message")` style calls.
     #[inline]
     pub fn call(&self, args: &[Value]) -> Result<Value, BuiltinError> {
         Ok(self.construct(args))
+    }
+
+    /// Call the exception type using the VM-managed heap.
+    #[inline]
+    pub fn call_in_vm(&self, vm: &VirtualMachine, args: &[Value]) -> Result<Value, RuntimeError> {
+        self.construct_in_vm(vm, args)
     }
 
     /// Convert to a Value (object pointer).

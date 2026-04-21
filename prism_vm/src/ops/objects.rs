@@ -1140,13 +1140,11 @@ pub(crate) fn get_attribute_value(
                         .map(|message| Value::string(intern(message)))
                         .unwrap_or_else(Value::none)),
                     "name" => Ok(exc
-                        .import_name
-                        .as_deref()
+                        .import_name()
                         .map(|import_name| Value::string(intern(import_name)))
                         .unwrap_or_else(Value::none)),
                     "path" => Ok(exc
-                        .import_path
-                        .as_deref()
+                        .import_path()
                         .map(|import_path| Value::string(intern(import_path)))
                         .unwrap_or_else(Value::none)),
                     "__traceback__" => Ok(exc.traceback().unwrap_or_else(Value::none)),

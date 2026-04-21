@@ -26,6 +26,7 @@ use prism_compiler::{OptimizationLevel, bytecode::CodeObject};
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
 use prism_parser::parse as parse_module_source;
+use prism_runtime::allocation_context::RuntimeHeapBinding;
 use prism_runtime::object::class::ClassDict;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -176,9 +177,15 @@ pub struct VirtualMachine {
     // =========================================================================
     // GC Integration
     // =========================================================================
+    /// Thread-local binding that exposes this heap to runtime helpers.
+    ///
+    /// This must drop before `heap` so runtime helper teardown cannot observe a
+    /// stale heap binding.
+    _runtime_heap_binding: RuntimeHeapBinding,
     /// GC-managed heap for object allocation.
-    /// All runtime objects (List, Tuple, Dict, etc.) are allocated from here.
-    heap: ManagedHeap,
+    /// Stored behind a box so the underlying `GcHeap` address remains stable even
+    /// if the `VirtualMachine` itself moves.
+    heap: Box<ManagedHeap>,
 
     // =========================================================================
     // Exception Handling State
@@ -1265,6 +1272,8 @@ impl VirtualMachine {
     /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
+        let heap = Box::new(ManagedHeap::with_defaults());
+        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
@@ -1277,7 +1286,8 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
-            heap: ManagedHeap::with_defaults(),
+            heap,
+            _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             active_exception: None,
@@ -1295,6 +1305,8 @@ impl VirtualMachine {
     /// Create a new virtual machine with JIT compilation enabled.
     pub fn with_jit() -> Self {
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
+        let heap = Box::new(ManagedHeap::with_defaults());
+        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
@@ -1307,7 +1319,8 @@ impl VirtualMachine {
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
             function_closures: HashMap::new(),
-            heap: ManagedHeap::with_defaults(),
+            heap,
+            _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             active_exception: None,
@@ -1330,6 +1343,8 @@ impl VirtualMachine {
             None
         };
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
+        let heap = Box::new(ManagedHeap::with_defaults());
+        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
@@ -1342,7 +1357,8 @@ impl VirtualMachine {
             jit,
             jit_return_value: None,
             function_closures: HashMap::new(),
-            heap: ManagedHeap::with_defaults(),
+            heap,
+            _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             active_exception: None,
@@ -1360,6 +1376,8 @@ impl VirtualMachine {
     /// Create with pre-populated globals.
     pub fn with_globals(globals: GlobalScope) -> Self {
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
+        let heap = Box::new(ManagedHeap::with_defaults());
+        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             current_frame_idx: 0,
@@ -1372,7 +1390,8 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
-            heap: ManagedHeap::with_defaults(),
+            heap,
+            _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             active_exception: None,
@@ -1706,7 +1725,7 @@ impl VirtualMachine {
             RuntimeErrorKind::IndexError { .. } => ExceptionTypeId::IndexError.as_u8() as u16,
             RuntimeErrorKind::KeyError { .. } => ExceptionTypeId::KeyError.as_u8() as u16,
             RuntimeErrorKind::ValueError { .. } => ExceptionTypeId::ValueError.as_u8() as u16,
-            RuntimeErrorKind::ZeroDivisionError => {
+            RuntimeErrorKind::ZeroDivisionError { .. } => {
                 ExceptionTypeId::ZeroDivisionError.as_u8() as u16
             }
             RuntimeErrorKind::OverflowError { .. } => ExceptionTypeId::OverflowError.as_u8() as u16,
@@ -2435,7 +2454,7 @@ impl VirtualMachine {
     /// or read heap configuration.
     #[inline]
     pub fn heap(&self) -> &ManagedHeap {
-        &self.heap
+        self.heap.as_ref()
     }
 
     /// Get mutable access to the managed heap.
@@ -2446,7 +2465,7 @@ impl VirtualMachine {
     /// - Modifying heap configuration
     #[inline]
     pub fn heap_mut(&mut self) -> &mut ManagedHeap {
-        &mut self.heap
+        self.heap.as_mut()
     }
 
     /// Get a typed allocator for GC-managed object allocation.
@@ -3526,8 +3545,8 @@ mod tests {
             crate::builtins::ExceptionValue::from_value(active)
                 .expect("active import error should be an ExceptionValue")
         };
-        assert_eq!(exc.import_name.as_deref(), Some("pkg.missing"));
-        assert!(exc.import_path.is_none());
+        assert_eq!(exc.import_name(), Some("pkg.missing"));
+        assert!(exc.import_path().is_none());
     }
 
     #[test]

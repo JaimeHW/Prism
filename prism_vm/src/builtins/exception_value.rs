@@ -11,14 +11,22 @@
 //! - **Zero-alloc type_id**: Uses u16 discriminant from ExceptionTypeId
 
 use super::{BuiltinError, BuiltinFunctionObject};
+use crate::VirtualMachine;
+use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::interned_by_ptr;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
+use prism_gc::trace::{Trace, Tracer};
+use prism_runtime::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
+use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::string::StringObject;
-use std::sync::{Arc, LazyLock};
+use std::cell::RefCell;
+use std::mem;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock, Once};
 
 // =============================================================================
 // ExceptionValue
@@ -61,11 +69,8 @@ pub struct ExceptionValue {
     /// Lazily allocated - most exceptions only use message.
     pub args: Option<Box<[Value]>>,
 
-    /// ImportError / ModuleNotFoundError `.name` payload.
-    pub import_name: Option<Arc<str>>,
-
-    /// ImportError / ModuleNotFoundError `.path` payload.
-    pub import_path: Option<Arc<str>>,
+    /// Lazily allocated ImportError / ModuleNotFoundError metadata.
+    import_details: Option<Box<ImportErrorDetails>>,
 
     /// Explicit cause (from `raise X from Y`).
     /// Uses raw pointer to avoid recursive Box issues.
@@ -84,12 +89,25 @@ pub struct ExceptionValue {
     _reserved: u32,
 }
 
+#[derive(Debug)]
+struct ImportErrorDetails {
+    name: Option<Arc<str>>,
+    path: Option<Arc<str>>,
+}
+
 static EXCEPTION_WITH_TRACEBACK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("BaseException.with_traceback"),
         builtin_exception_with_traceback,
     )
 });
+static EXCEPTION_GC_DISPATCH_ONCE: Once = Once::new();
+
+thread_local! {
+    static PINNED_EXCEPTION_VALUES: RefCell<Vec<Pin<Box<ExceptionValue>>>> = const {
+        RefCell::new(Vec::new())
+    };
+}
 
 const TRACEBACK_TYPE_ERROR_MESSAGE: &str = "__traceback__ must be a traceback or None";
 
@@ -155,8 +173,7 @@ impl ExceptionValue {
             _pad: [0; 4],
             message,
             args: None,
-            import_name: None,
-            import_path: None,
+            import_details: None,
             cause: None,
             context: None,
             traceback: None,
@@ -178,8 +195,7 @@ impl ExceptionValue {
             _pad: [0; 4],
             message,
             args: Some(args),
-            import_name: None,
-            import_path: None,
+            import_details: None,
             cause: None,
             context: None,
             traceback: None,
@@ -204,6 +220,20 @@ impl ExceptionValue {
     #[inline]
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    #[inline]
+    pub fn import_name(&self) -> Option<&str> {
+        self.import_details
+            .as_deref()
+            .and_then(|details| details.name.as_deref())
+    }
+
+    #[inline]
+    pub fn import_path(&self) -> Option<&str> {
+        self.import_details
+            .as_deref()
+            .and_then(|details| details.path.as_deref())
     }
 
     /// Render the exception payload using Python's `str(exception)` semantics.
@@ -305,8 +335,14 @@ impl ExceptionValue {
         import_name: Option<Arc<str>>,
         import_path: Option<Arc<str>>,
     ) -> Self {
-        self.import_name = import_name;
-        self.import_path = import_path;
+        self.import_details = if import_name.is_some() || import_path.is_some() {
+            Some(Box::new(ImportErrorDetails {
+                name: import_name,
+                path: import_path,
+            }))
+        } else {
+            None
+        };
         self
     }
 
@@ -320,12 +356,27 @@ impl ExceptionValue {
     }
 
     /// Create exception on heap and return as Value.
-    ///
-    /// Uses Box::leak for now - should use GC allocator in production.
     pub fn into_value(self) -> Value {
-        let boxed = Box::new(self);
-        let ptr = Box::leak(boxed) as *mut ExceptionValue as *const ();
-        Value::object_ptr(ptr)
+        ensure_exception_gc_dispatch_registered();
+        if has_current_heap_binding() {
+            return alloc_value_in_current_heap(self)
+                .expect("bound heap should satisfy exception allocation");
+        }
+
+        PINNED_EXCEPTION_VALUES.with(|store| {
+            let pinned = Box::into_pin(Box::new(self));
+            let ptr = (&*pinned) as *const ExceptionValue as *const ();
+            store.borrow_mut().push(pinned);
+            Value::object_ptr(ptr)
+        })
+    }
+
+    /// Allocate the exception in the VM-managed heap.
+    pub fn into_gc_value(self, vm: &VirtualMachine) -> Result<Value, RuntimeError> {
+        ensure_exception_gc_dispatch_registered();
+        vm.allocator()
+            .alloc_value(self)
+            .ok_or_else(|| RuntimeError::internal("out of memory: failed to allocate exception"))
     }
 
     /// Try to extract ExceptionValue from a Value.
@@ -362,13 +413,71 @@ impl ExceptionValue {
     }
 }
 
+unsafe impl Trace for ExceptionValue {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        if let Some(args) = self.args.as_deref() {
+            for value in args {
+                tracer.trace_value(*value);
+            }
+        }
+        if let Some(cause) = self.cause {
+            tracer.trace_ptr(cause as *const ());
+        }
+        if let Some(context) = self.context {
+            tracer.trace_ptr(context as *const ());
+        }
+        if let Some(traceback) = self.traceback {
+            tracer.trace_value(traceback);
+        }
+    }
+
+    fn size_of(&self) -> usize {
+        mem::size_of::<Self>()
+            + self
+                .import_details
+                .as_deref()
+                .map_or(0, |_| mem::size_of::<ImportErrorDetails>())
+            + self
+                .args
+                .as_deref()
+                .map_or(0, |args| mem::size_of_val(args))
+    }
+}
+
+unsafe fn trace_exception_value(ptr: *const (), tracer: &mut dyn Tracer) {
+    let value = unsafe { &*(ptr as *const ExceptionValue) };
+    value.trace(tracer);
+}
+
+unsafe fn size_exception_value(ptr: *const ()) -> usize {
+    let value = unsafe { &*(ptr as *const ExceptionValue) };
+    value.size_of()
+}
+
+unsafe fn finalize_exception_value(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut ExceptionValue) };
+}
+
+pub(crate) fn ensure_exception_gc_dispatch_registered() {
+    EXCEPTION_GC_DISPATCH_ONCE.call_once(|| {
+        register_external_dispatch(
+            TypeId::EXCEPTION,
+            DispatchEntry {
+                trace: trace_exception_value,
+                size: size_exception_value,
+                finalize: finalize_exception_value,
+            },
+        );
+    });
+}
+
 impl std::fmt::Debug for ExceptionValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExceptionValue")
             .field("type", &self.type_name())
             .field("message", &self.message)
-            .field("import_name", &self.import_name)
-            .field("import_path", &self.import_path)
+            .field("import_name", &self.import_name())
+            .field("import_path", &self.import_path())
             .field("flags", &self.flags)
             .finish()
     }
@@ -546,6 +655,14 @@ pub fn create_exception(type_id: ExceptionTypeId, message: Option<Arc<str>>) -> 
     ExceptionValue::new(type_id, message).into_value()
 }
 
+pub fn create_exception_in_vm(
+    vm: &VirtualMachine,
+    type_id: ExceptionTypeId,
+    message: Option<Arc<str>>,
+) -> Result<Value, RuntimeError> {
+    ExceptionValue::new(type_id, message).into_gc_value(vm)
+}
+
 /// Create an exception with arguments.
 pub fn create_exception_with_args(
     type_id: ExceptionTypeId,
@@ -553,6 +670,15 @@ pub fn create_exception_with_args(
     args: Box<[Value]>,
 ) -> Value {
     ExceptionValue::with_args(type_id, message, args).into_value()
+}
+
+pub fn create_exception_with_args_in_vm(
+    vm: &VirtualMachine,
+    type_id: ExceptionTypeId,
+    message: Option<Arc<str>>,
+    args: Box<[Value]>,
+) -> Result<Value, RuntimeError> {
+    ExceptionValue::with_args(type_id, message, args).into_gc_value(vm)
 }
 
 /// Create an import-related exception with `.name` / `.path` metadata.
@@ -567,6 +693,18 @@ pub fn create_exception_with_import_details(
         .into_value()
 }
 
+pub fn create_exception_with_import_details_in_vm(
+    vm: &VirtualMachine,
+    type_id: ExceptionTypeId,
+    message: Option<Arc<str>>,
+    import_name: Option<Arc<str>>,
+    import_path: Option<Arc<str>>,
+) -> Result<Value, RuntimeError> {
+    ExceptionValue::new(type_id, message)
+        .with_import_details(import_name, import_path)
+        .into_gc_value(vm)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -574,7 +712,9 @@ pub fn create_exception_with_import_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_gc::trace::tracer::CountingTracer;
     use prism_runtime::object::views::TracebackViewObject;
+    use prism_runtime::{size_of_object, trace_object};
 
     // ════════════════════════════════════════════════════════════════════════
     // Construction Tests
@@ -602,8 +742,8 @@ mod tests {
             Some(Arc::from("No module named 'pkg.missing'")),
         )
         .with_import_details(Some(Arc::from("pkg.missing")), None);
-        assert_eq!(exc.import_name.as_deref(), Some("pkg.missing"));
-        assert!(exc.import_path.is_none());
+        assert_eq!(exc.import_name(), Some("pkg.missing"));
+        assert!(exc.import_path().is_none());
     }
 
     #[test]
@@ -774,6 +914,50 @@ mod tests {
     }
 
     #[test]
+    fn test_exception_into_value_uses_bound_vm_heap_when_available() {
+        let baseline = PINNED_EXCEPTION_VALUES.with(|store| store.borrow().len());
+        let _vm = VirtualMachine::new();
+
+        let value = ExceptionValue::new(
+            ExceptionTypeId::RuntimeError,
+            Some(Arc::from("managed allocation")),
+        )
+        .into_value();
+
+        assert_eq!(
+            PINNED_EXCEPTION_VALUES.with(|store| store.borrow().len()),
+            baseline
+        );
+        let recovered =
+            unsafe { ExceptionValue::from_value(value).expect("exception should downcast") };
+        assert_eq!(recovered.message(), Some("managed allocation"));
+    }
+
+    #[test]
+    fn test_exception_into_value_survives_vm_move_after_binding() {
+        fn relocate_vm(vm: VirtualMachine) -> VirtualMachine {
+            vm
+        }
+
+        let baseline = PINNED_EXCEPTION_VALUES.with(|store| store.borrow().len());
+        let _vm = relocate_vm(VirtualMachine::new());
+
+        let value = ExceptionValue::new(
+            ExceptionTypeId::RuntimeError,
+            Some(Arc::from("moved vm allocation")),
+        )
+        .into_value();
+
+        assert_eq!(
+            PINNED_EXCEPTION_VALUES.with(|store| store.borrow().len()),
+            baseline
+        );
+        let recovered =
+            unsafe { ExceptionValue::from_value(value).expect("exception should downcast") };
+        assert_eq!(recovered.message(), Some("moved vm allocation"));
+    }
+
+    #[test]
     fn test_exception_from_value() {
         let exc = ExceptionValue::new(ExceptionTypeId::IndexError, Some(Arc::from("out of range")));
         let value = exc.into_value();
@@ -826,14 +1010,14 @@ mod tests {
             Some(Arc::from("invalid input")),
         );
         let display = format!("{}", exc);
-        assert_eq!(display, "ValueError: invalid input");
+        assert_eq!(display, "invalid input");
     }
 
     #[test]
     fn test_exception_display_no_message() {
         let exc = ExceptionValue::new(ExceptionTypeId::StopIteration, None);
         let display = format!("{}", exc);
-        assert_eq!(display, "StopIteration");
+        assert_eq!(display, "");
     }
 
     #[test]
@@ -888,8 +1072,8 @@ mod tests {
 
         let exc = unsafe { ExceptionValue::from_value(value).unwrap() };
         assert_eq!(exc.type_id(), ExceptionTypeId::ModuleNotFoundError);
-        assert_eq!(exc.import_name.as_deref(), Some("pkg.missing"));
-        assert!(exc.import_path.is_none());
+        assert_eq!(exc.import_name(), Some("pkg.missing"));
+        assert!(exc.import_path().is_none());
     }
 
     #[test]
@@ -915,6 +1099,52 @@ mod tests {
             .expect("with_traceback should be heap allocated");
         let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
         assert_eq!(builtin.name(), "BaseException.with_traceback");
+    }
+
+    #[test]
+    fn test_exception_gc_dispatch_traces_args_links_and_traceback() {
+        let vm = VirtualMachine::new();
+        let cause =
+            ExceptionValue::new(ExceptionTypeId::ValueError, Some(Arc::from("cause"))).into_value();
+        let context = ExceptionValue::new(ExceptionTypeId::TypeError, Some(Arc::from("context")))
+            .into_value();
+
+        let mut exc = ExceptionValue::with_args(
+            ExceptionTypeId::RuntimeError,
+            Some(Arc::from("boom")),
+            vec![
+                Value::int(1).unwrap(),
+                Value::string(prism_core::intern::intern("arg")),
+            ]
+            .into_boxed_slice(),
+        );
+        let expected_size = std::mem::size_of::<ExceptionValue>()
+            + std::mem::size_of_val(exc.args.as_deref().expect("args should exist"));
+        let cause_ptr = unsafe { ExceptionValue::from_value(cause).expect("cause should downcast") }
+            as *const ExceptionValue;
+        let context_ptr =
+            unsafe { ExceptionValue::from_value(context).expect("context should downcast") }
+                as *const ExceptionValue;
+        exc.set_cause(cause_ptr);
+        exc.set_context(context_ptr);
+        exc.set_traceback(Value::string(prism_core::intern::intern("traceback")));
+
+        let value = exc
+            .into_gc_value(&vm)
+            .expect("managed exception allocation should succeed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("managed exception should be object-backed");
+        let mut tracer = CountingTracer::new();
+
+        unsafe {
+            trace_object(ptr, TypeId::EXCEPTION, &mut tracer);
+        }
+
+        assert_eq!(tracer.value_count, 3);
+        assert_eq!(tracer.ptr_count, 2);
+        let size = unsafe { size_of_object(ptr, TypeId::EXCEPTION) };
+        assert_eq!(size, expected_size);
     }
 
     // ════════════════════════════════════════════════════════════════════════

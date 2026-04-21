@@ -65,8 +65,8 @@ pub enum RuntimeErrorKind {
     // =========================================================================
     /// Invalid value for operation
     ValueError { message: Arc<str> },
-    /// Division by zero
-    ZeroDivisionError,
+    /// Division by zero.
+    ZeroDivisionError { message: Arc<str> },
     /// Overflow in arithmetic
     OverflowError { message: Arc<str> },
 
@@ -218,7 +218,14 @@ impl RuntimeError {
 
     #[inline]
     pub fn zero_division() -> Self {
-        Self::new(RuntimeErrorKind::ZeroDivisionError)
+        Self::zero_division_with_message("division by zero")
+    }
+
+    #[inline]
+    pub fn zero_division_with_message(message: impl Into<Arc<str>>) -> Self {
+        Self::new(RuntimeErrorKind::ZeroDivisionError {
+            message: message.into(),
+        })
     }
 
     #[inline]
@@ -335,8 +342,8 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeErrorKind::KeyError { key } => write!(f, "KeyError: '{}'", key),
             RuntimeErrorKind::ValueError { message } => write!(f, "ValueError: {}", message),
-            RuntimeErrorKind::ZeroDivisionError => {
-                write!(f, "ZeroDivisionError: division by zero")
+            RuntimeErrorKind::ZeroDivisionError { message } => {
+                write!(f, "ZeroDivisionError: {}", message)
             }
             RuntimeErrorKind::OverflowError { message } => {
                 write!(f, "OverflowError: {}", message)
@@ -515,7 +522,9 @@ impl From<RuntimeError> for PrismError {
             RuntimeErrorKind::IndexError { .. } => PrismError::index(err.to_string()),
             RuntimeErrorKind::KeyError { key } => PrismError::key(&**key),
             RuntimeErrorKind::ValueError { message } => PrismError::value_error(&**message),
-            RuntimeErrorKind::ZeroDivisionError => PrismError::zero_division("division by zero"),
+            RuntimeErrorKind::ZeroDivisionError { message } => {
+                PrismError::zero_division(message.as_ref())
+            }
             RuntimeErrorKind::OverflowError { message } => PrismError::value_error(&**message),
             RuntimeErrorKind::StopIteration => PrismError::internal("StopIteration"),
             RuntimeErrorKind::GeneratorExit => PrismError::internal("GeneratorExit"),
