@@ -54,13 +54,7 @@ impl ExprParser {
                     parser.span_from(start),
                 ))
             }
-            TokenKind::String(_) => {
-                let literal = parser.parse_concatenated_string_literal()?;
-                Ok(Expr::new(
-                    ExprKind::String(literal),
-                    parser.span_from(start),
-                ))
-            }
+            TokenKind::String(_) | TokenKind::FString(_) => parser.parse_concatenated_string_expr(),
             TokenKind::Bytes(_) => {
                 let literal = parser.parse_concatenated_bytes_literal()?;
                 Ok(Expr::new(ExprKind::Bytes(literal), parser.span_from(start)))
@@ -811,6 +805,33 @@ impl ExprParser {
 
     /// Parse a slice or index expression.
     fn parse_slice_or_index(parser: &mut Parser<'_>) -> PrismResult<Expr> {
+        let first = Self::parse_subscript_item(parser)?;
+
+        if !parser.match_token(TokenKind::Comma) {
+            return Ok(first);
+        }
+
+        let start = first.span.start;
+        let mut items = vec![first];
+
+        loop {
+            if parser.check(TokenKind::RightBracket) {
+                break;
+            }
+
+            items.push(Self::parse_subscript_item(parser)?);
+
+            if !parser.match_token(TokenKind::Comma) {
+                break;
+            }
+        }
+
+        Ok(Expr::new(ExprKind::Tuple(items), parser.span_from(start)))
+    }
+
+    /// Parse a single subscript item, which can be either an index expression
+    /// or a slice expression.
+    fn parse_subscript_item(parser: &mut Parser<'_>) -> PrismResult<Expr> {
         let start = parser.start_span();
 
         // Check if this looks like a slice
@@ -1094,7 +1115,15 @@ impl ExprParser {
         {
             Ok(Expr::new(ExprKind::Yield(None), parser.span_from(start)))
         } else {
-            let value = Self::parse(parser, Precedence::Lowest)?;
+            let value_start = parser.start_span();
+            let first = Self::parse(parser, Precedence::Lowest)?;
+            let value = parser.parse_comma_tuple_expr_until(value_start, first, |parser| {
+                parser.check(TokenKind::RightParen)
+                    || parser.check(TokenKind::RightBracket)
+                    || parser.check(TokenKind::RightBrace)
+                    || parser.check(TokenKind::Colon)
+                    || parser.check(TokenKind::Semicolon)
+            })?;
             Ok(Expr::new(
                 ExprKind::Yield(Some(Box::new(value))),
                 parser.span_from(start),
@@ -1184,6 +1213,160 @@ mod tests {
     }
 
     #[test]
+    fn test_fstring_lowers_to_joined_str() {
+        let expr = parse("f\"{key} = 42\"");
+        let ExprKind::JoinedStr(parts) = expr.kind else {
+            panic!("expected JoinedStr");
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0].kind,
+            ExprKind::FormattedValue {
+                value,
+                conversion: -1,
+                format_spec: None,
+            } if matches!(value.kind, ExprKind::Name(ref name) if name == "key")
+        ));
+        assert!(matches!(
+            parts[1].kind,
+            ExprKind::String(ref literal) if literal.value == " = 42"
+        ));
+    }
+
+    #[test]
+    fn test_adjacent_plain_and_formatted_strings_join_into_single_joined_str() {
+        let expr = parse("\"prefix\" f\"{value}\" \"suffix\"");
+        let ExprKind::JoinedStr(parts) = expr.kind else {
+            panic!("expected JoinedStr");
+        };
+
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(
+            parts[0].kind,
+            ExprKind::String(ref literal) if literal.value == "prefix"
+        ));
+        assert!(matches!(parts[1].kind, ExprKind::FormattedValue { .. }));
+        assert!(matches!(
+            parts[2].kind,
+            ExprKind::String(ref literal) if literal.value == "suffix"
+        ));
+    }
+
+    #[test]
+    fn test_fstring_conversion_and_nested_format_spec_are_parsed() {
+        let expr = parse("f\"{value!r:{width}}\"");
+        let ExprKind::JoinedStr(parts) = expr.kind else {
+            panic!("expected JoinedStr");
+        };
+
+        let ExprKind::FormattedValue {
+            value,
+            conversion,
+            format_spec,
+        } = &parts[0].kind
+        else {
+            panic!("expected formatted value");
+        };
+
+        assert!(matches!(value.kind, ExprKind::Name(ref name) if name == "value"));
+        assert_eq!(*conversion, 'r' as i8);
+
+        let spec = format_spec.as_ref().expect("expected nested format spec");
+        let ExprKind::JoinedStr(spec_parts) = &spec.kind else {
+            panic!("expected JoinedStr format spec");
+        };
+        assert!(matches!(
+            &spec_parts[0].kind,
+            ExprKind::FormattedValue {
+                value,
+                conversion: -1,
+                format_spec: None,
+            } if matches!(value.kind, ExprKind::Name(ref name) if name == "width")
+        ));
+    }
+
+    #[test]
+    fn test_fstring_debug_syntax_lowers_to_literal_plus_repr_formatted_value() {
+        let expr = parse("f\"{value=}\"");
+        let ExprKind::JoinedStr(parts) = expr.kind else {
+            panic!("expected JoinedStr");
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            parts[0].kind,
+            ExprKind::String(ref literal) if literal.value == "value="
+        ));
+        assert!(matches!(
+            &parts[1].kind,
+            ExprKind::FormattedValue {
+                value,
+                conversion,
+                format_spec: None,
+            } if *conversion == 'r' as i8
+                && matches!(value.kind, ExprKind::Name(ref name) if name == "value")
+        ));
+    }
+
+    #[test]
+    fn test_fstring_debug_syntax_preserves_literal_spacing_and_nested_format_spec() {
+        let expr = parse("f\"{value = :>{width}}\"");
+        let ExprKind::JoinedStr(parts) = expr.kind else {
+            panic!("expected JoinedStr");
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            parts[0].kind,
+            ExprKind::String(ref literal) if literal.value == "value = "
+        ));
+
+        let ExprKind::FormattedValue {
+            value,
+            conversion,
+            format_spec,
+        } = &parts[1].kind
+        else {
+            panic!("expected formatted value");
+        };
+
+        assert!(matches!(value.kind, ExprKind::Name(ref name) if name == "value"));
+        assert_eq!(*conversion, 'r' as i8);
+
+        let spec = format_spec.as_ref().expect("expected nested format spec");
+        let ExprKind::JoinedStr(spec_parts) = &spec.kind else {
+            panic!("expected JoinedStr format spec");
+        };
+        assert!(matches!(
+            &spec_parts[1].kind,
+            ExprKind::FormattedValue {
+                value,
+                conversion: -1,
+                format_spec: None,
+            } if matches!(value.kind, ExprKind::Name(ref name) if name == "width")
+        ));
+    }
+
+    #[test]
+    fn test_fstring_equality_expression_is_not_misparsed_as_debug_syntax() {
+        let expr = parse("f\"{left == right}\"");
+        let ExprKind::JoinedStr(parts) = expr.kind else {
+            panic!("expected JoinedStr");
+        };
+
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0].kind,
+            ExprKind::FormattedValue {
+                value,
+                conversion: -1,
+                format_spec: None,
+            } if matches!(value.kind, ExprKind::Compare { .. })
+        ));
+    }
+
+    #[test]
     fn test_binary_add() {
         let expr = parse("1 + 2");
         assert!(matches!(expr.kind, ExprKind::BinOp { op: BinOp::Add, .. }));
@@ -1270,6 +1453,40 @@ mod tests {
     }
 
     #[test]
+    fn test_subscript_tuple_index() {
+        let expr = parse("matrix[row, col]");
+
+        let ExprKind::Subscript { slice, .. } = expr.kind else {
+            panic!("expected Subscript");
+        };
+
+        let ExprKind::Tuple(items) = slice.kind else {
+            panic!("expected tuple subscript");
+        };
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0].kind, ExprKind::Name(_)));
+        assert!(matches!(items[1].kind, ExprKind::Name(_)));
+    }
+
+    #[test]
+    fn test_subscript_tuple_mixed_slice_and_index() {
+        let expr = parse("matrix[1:3, col]");
+
+        let ExprKind::Subscript { slice, .. } = expr.kind else {
+            panic!("expected Subscript");
+        };
+
+        let ExprKind::Tuple(items) = slice.kind else {
+            panic!("expected tuple subscript");
+        };
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0].kind, ExprKind::Slice { .. }));
+        assert!(matches!(items[1].kind, ExprKind::Name(_)));
+    }
+
+    #[test]
     fn test_list() {
         let expr = parse("[1, 2, 3]");
         if let ExprKind::List(elements) = expr.kind {
@@ -1287,6 +1504,22 @@ mod tests {
         } else {
             panic!("expected Tuple");
         }
+    }
+
+    #[test]
+    fn test_yield_value_absorbs_comma_tuple() {
+        let mut parser = Parser::new("yield 1, 2");
+        let expr = ExprParser::parse(&mut parser, Precedence::Lowest).expect("parse failed");
+
+        match expr.kind {
+            ExprKind::Yield(Some(value)) => match value.kind {
+                ExprKind::Tuple(elements) => assert_eq!(elements.len(), 2),
+                other => panic!("expected yield tuple payload, got {:?}", other),
+            },
+            other => panic!("expected yield expression, got {:?}", other),
+        }
+
+        assert!(parser.check(TokenKind::Eof));
     }
 
     #[test]

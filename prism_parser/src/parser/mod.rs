@@ -6,7 +6,7 @@
 mod expr;
 mod stmt;
 
-use crate::ast::{Expr, Module, Stmt, StringLiteral};
+use crate::ast::{Expr, ExprKind, Module, Stmt, StringLiteral};
 use crate::lexer::Lexer;
 use crate::token::{Keyword, Token, TokenKind};
 use prism_core::{PrismError, PrismResult, Span};
@@ -87,6 +87,48 @@ impl<'src> Parser<'src> {
     /// Parse an expression with minimum precedence.
     pub fn parse_expression_with_precedence(&mut self, min_prec: Precedence) -> PrismResult<Expr> {
         ExprParser::parse(self, min_prec)
+    }
+
+    /// Parse an implicit comma tuple that continues from an already-parsed
+    /// first expression.
+    pub(crate) fn parse_comma_tuple_expr_until<F>(
+        &mut self,
+        start: u32,
+        first: Expr,
+        mut should_stop: F,
+    ) -> PrismResult<Expr>
+    where
+        F: FnMut(&Parser<'src>) -> bool,
+    {
+        if !self.match_token(TokenKind::Comma) {
+            return Ok(first);
+        }
+
+        let mut elements = vec![first];
+        while !self.check(TokenKind::Newline) && !self.check(TokenKind::Eof) {
+            if should_stop(self) {
+                break;
+            }
+
+            elements.push(ExprParser::parse(self, Precedence::Lowest)?);
+            if !self.match_token(TokenKind::Comma) {
+                break;
+            }
+        }
+
+        Ok(Expr::new(ExprKind::Tuple(elements), self.span_from(start)))
+    }
+
+    /// Parse an implicit comma tuple, optionally stopping before `=`.
+    pub(crate) fn parse_comma_tuple_expr(
+        &mut self,
+        start: u32,
+        first: Expr,
+        stop_at_equal: bool,
+    ) -> PrismResult<Expr> {
+        self.parse_comma_tuple_expr_until(start, first, |parser| {
+            stop_at_equal && parser.check(TokenKind::Equal)
+        })
     }
 
     // =========================================================================
@@ -195,6 +237,65 @@ impl<'src> Parser<'src> {
         while self.check(TokenKind::Newline) {
             self.advance();
         }
+    }
+
+    /// Parse one or more adjacent plain/f-string literal tokens into an
+    /// expression node.
+    ///
+    /// Ordinary adjacent strings collapse into a single `ExprKind::String`.
+    /// If any formatted string participates in the group, the result is lowered
+    /// to `ExprKind::JoinedStr` with compile-time concatenation of adjacent
+    /// literal segments.
+    pub(crate) fn parse_concatenated_string_expr(&mut self) -> PrismResult<Expr> {
+        let start = self.start_span();
+        let mut plain_literal = String::new();
+        let mut joined_parts = Vec::new();
+        let mut saw_fstring = false;
+
+        loop {
+            match self.current.kind.clone() {
+                TokenKind::String(segment) => {
+                    self.advance();
+                    if saw_fstring {
+                        append_joined_string_literal(&mut joined_parts, &segment);
+                    } else {
+                        plain_literal.push_str(&segment);
+                    }
+                }
+                TokenKind::FString(content) => {
+                    self.advance();
+                    if !plain_literal.is_empty() {
+                        append_joined_string_literal(&mut joined_parts, &plain_literal);
+                        plain_literal.clear();
+                    }
+                    saw_fstring = true;
+                    joined_parts.extend(parse_fstring_parts(&content)?);
+                }
+                TokenKind::Bytes(_) => {
+                    return Err(self.error_at_current("cannot mix bytes and nonbytes literals"));
+                }
+                _ => break,
+            }
+        }
+
+        if !saw_fstring {
+            return Ok(Expr::new(
+                ExprKind::String(StringLiteral::new(plain_literal)),
+                self.span_from(start),
+            ));
+        }
+
+        if !plain_literal.is_empty() {
+            append_joined_string_literal(&mut joined_parts, &plain_literal);
+        }
+        if joined_parts.is_empty() {
+            append_joined_string_literal(&mut joined_parts, "");
+        }
+
+        Ok(Expr::new(
+            ExprKind::JoinedStr(joined_parts),
+            self.span_from(start),
+        ))
     }
 
     /// Parse one or more adjacent string literal tokens into a single literal.
@@ -330,6 +431,426 @@ impl<'src> Parser<'src> {
             self.advance();
         }
     }
+}
+
+fn append_joined_string_literal(parts: &mut Vec<Expr>, segment: &str) {
+    if let Some(Expr {
+        kind: ExprKind::String(literal),
+        ..
+    }) = parts.last_mut()
+    {
+        literal.value.push_str(segment);
+        return;
+    }
+
+    parts.push(Expr::new(
+        ExprKind::String(StringLiteral::new(segment.to_string())),
+        Span::dummy(),
+    ));
+}
+
+fn parse_fstring_parts(content: &str) -> PrismResult<Vec<Expr>> {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut index = 0usize;
+
+    while index < content.len() {
+        let ch = next_char(content, index)?;
+        match ch {
+            '{' => {
+                if next_char_at(content, index + 1) == Some('{') {
+                    literal.push('{');
+                    index += 2;
+                    continue;
+                }
+
+                if !literal.is_empty() {
+                    append_joined_string_literal(&mut parts, &literal);
+                    literal.clear();
+                }
+
+                let end = find_fstring_expression_end(content, index + 1)?;
+                let field = &content[index + 1..end];
+                parts.extend(parse_fstring_field_parts(field)?);
+                index = end + 1;
+            }
+            '}' => {
+                if next_char_at(content, index + 1) == Some('}') {
+                    literal.push('}');
+                    index += 2;
+                    continue;
+                }
+                return Err(PrismError::syntax(
+                    "single '}' is not allowed in f-string",
+                    Span::dummy(),
+                ));
+            }
+            _ => {
+                literal.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+
+    if !literal.is_empty() {
+        append_joined_string_literal(&mut parts, &literal);
+    }
+
+    Ok(parts)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitFStringField {
+    expr_text: String,
+    conversion: i8,
+    format_spec: Option<String>,
+    debug_literal: Option<String>,
+}
+
+fn parse_fstring_field_parts(field: &str) -> PrismResult<Vec<Expr>> {
+    let SplitFStringField {
+        expr_text,
+        conversion,
+        format_spec,
+        debug_literal,
+    } = split_fstring_field(field)?;
+    let value = parse_embedded_fstring_expr(expr_text.trim())?;
+    let format_spec = format_spec
+        .map(parse_fstring_format_spec)
+        .transpose()?
+        .map(Box::new);
+
+    let formatted = Expr::new(
+        ExprKind::FormattedValue {
+            value: Box::new(value),
+            conversion,
+            format_spec,
+        },
+        Span::dummy(),
+    );
+
+    if let Some(debug_literal) = debug_literal {
+        let mut parts = Vec::with_capacity(2);
+        append_joined_string_literal(&mut parts, &debug_literal);
+        parts.push(formatted);
+        Ok(parts)
+    } else {
+        Ok(vec![formatted])
+    }
+}
+
+fn parse_fstring_format_spec(spec: String) -> PrismResult<Expr> {
+    let mut parts = parse_fstring_parts(&spec)?;
+    if parts.is_empty() {
+        append_joined_string_literal(&mut parts, "");
+    }
+    Ok(Expr::new(ExprKind::JoinedStr(parts), Span::dummy()))
+}
+
+fn parse_embedded_fstring_expr(source: &str) -> PrismResult<Expr> {
+    let mut parser = Parser::new(source);
+    let expr = parser.parse_expression()?;
+    parser.skip_newlines();
+    if !parser.is_at_end() {
+        return Err(parser.error_at_current("unexpected trailing tokens in f-string expression"));
+    }
+    Ok(expr)
+}
+
+fn split_fstring_field(field: &str) -> PrismResult<SplitFStringField> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut conversion_index = None;
+    let mut format_index = None;
+    let mut index = 0usize;
+
+    while index < field.len() {
+        let ch = next_char(field, index)?;
+        if ch == '\'' || ch == '"' {
+            index = skip_python_string_literal(field, index)?;
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '!' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                conversion_index = Some(index);
+                break;
+            }
+            ':' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                format_index = Some(index);
+                break;
+            }
+            _ => {}
+        }
+
+        index += ch.len_utf8();
+    }
+
+    let expr_boundary = conversion_index.or(format_index).unwrap_or(field.len());
+    let debug_equals = find_fstring_debug_equals(field, expr_boundary)?;
+    let expr_text_end = debug_equals.unwrap_or(expr_boundary);
+    let debug_literal = debug_equals.map(|_| field[..expr_boundary].to_string());
+
+    if let Some(conversion_start) = conversion_index {
+        let expr_text = field[..expr_text_end].to_string();
+        let conversion_offset = conversion_start + 1;
+        let conversion = next_char(field, conversion_offset)?;
+        let conversion_value = match conversion {
+            's' | 'r' | 'a' => conversion as i8,
+            _ => {
+                return Err(PrismError::syntax(
+                    format!("invalid conversion character '{conversion}' in f-string"),
+                    Span::dummy(),
+                ));
+            }
+        };
+
+        let after_conversion = conversion_offset + conversion.len_utf8();
+        let (format_spec, remainder_start) = if next_char_at(field, after_conversion) == Some(':') {
+            (
+                Some(field[after_conversion + 1..].to_string()),
+                after_conversion,
+            )
+        } else {
+            (None, after_conversion)
+        };
+
+        if after_conversion < field.len()
+            && !matches!(next_char_at(field, after_conversion), Some(':'))
+        {
+            return Err(PrismError::syntax(
+                "expected ':' after f-string conversion specifier",
+                Span::dummy(),
+            ));
+        }
+        let _ = remainder_start;
+
+        return Ok(SplitFStringField {
+            expr_text,
+            conversion: conversion_value,
+            format_spec,
+            debug_literal,
+        });
+    }
+
+    if format_index.is_none() {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut scan = 0usize;
+
+        while scan < field.len() {
+            let ch = next_char(field, scan)?;
+            if ch == '\'' || ch == '"' {
+                scan = skip_python_string_literal(field, scan)?;
+                continue;
+            }
+
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                '{' => brace_depth += 1,
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                ':' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    format_index = Some(scan);
+                    break;
+                }
+                _ => {}
+            }
+
+            scan += ch.len_utf8();
+        }
+    }
+
+    if let Some(format_start) = format_index {
+        Ok(SplitFStringField {
+            expr_text: field[..expr_text_end].to_string(),
+            conversion: if debug_equals.is_some() {
+                'r' as i8
+            } else {
+                -1
+            },
+            format_spec: Some(field[format_start + 1..].to_string()),
+            debug_literal,
+        })
+    } else {
+        Ok(SplitFStringField {
+            expr_text: field[..expr_text_end].to_string(),
+            conversion: if debug_equals.is_some() {
+                'r' as i8
+            } else {
+                -1
+            },
+            format_spec: None,
+            debug_literal,
+        })
+    }
+}
+
+fn find_fstring_debug_equals(field: &str, boundary: usize) -> PrismResult<Option<usize>> {
+    let trimmed_boundary = field[..boundary]
+        .trim_end_matches(char::is_whitespace)
+        .len();
+    if trimmed_boundary == 0 {
+        return Ok(None);
+    }
+
+    let Some(eq_index) = previous_char_start(field, trimmed_boundary) else {
+        return Ok(None);
+    };
+    if next_char(field, eq_index)? != '=' {
+        return Ok(None);
+    }
+    if !is_standalone_fstring_equals(field, eq_index) {
+        return Ok(None);
+    }
+
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut index = 0usize;
+
+    while index < eq_index {
+        let ch = next_char(field, index)?;
+        if ch == '\'' || ch == '"' {
+            index = skip_python_string_literal(field, index)?;
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+
+        index += ch.len_utf8();
+    }
+
+    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+        Ok(Some(eq_index))
+    } else {
+        Ok(None)
+    }
+}
+
+fn previous_char_start(content: &str, end: usize) -> Option<usize> {
+    content[..end].char_indices().last().map(|(index, _)| index)
+}
+
+fn is_standalone_fstring_equals(field: &str, index: usize) -> bool {
+    let previous = field[..index].chars().next_back();
+    let next = next_char_at(field, index + 1);
+
+    !matches!(previous, Some('=' | '!' | '<' | '>' | ':')) && next != Some('=')
+}
+
+fn find_fstring_expression_end(content: &str, start: usize) -> PrismResult<usize> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut index = start;
+
+    while index < content.len() {
+        let ch = next_char(content, index)?;
+        if ch == '\'' || ch == '"' {
+            index = skip_python_string_literal(content, index)?;
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => {
+                if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                    return Ok(index);
+                }
+                brace_depth = brace_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+
+        index += ch.len_utf8();
+    }
+
+    Err(PrismError::syntax(
+        "unterminated f-string expression",
+        Span::dummy(),
+    ))
+}
+
+fn skip_python_string_literal(content: &str, start: usize) -> PrismResult<usize> {
+    let quote = next_char(content, start)?;
+    let quote_byte = quote as u8;
+    let bytes = content.as_bytes();
+    let mut index = start + 1;
+    let is_triple =
+        bytes.get(index) == Some(&quote_byte) && bytes.get(index + 1) == Some(&quote_byte);
+
+    if is_triple {
+        index += 2;
+    }
+
+    while index < content.len() {
+        let ch = next_char(content, index)?;
+        if ch == '\\' {
+            index += 1;
+            if index >= content.len() {
+                return Err(PrismError::syntax(
+                    "unterminated escape sequence in f-string expression",
+                    Span::dummy(),
+                ));
+            }
+            let escaped = next_char(content, index)?;
+            index += escaped.len_utf8();
+            continue;
+        }
+
+        if ch == quote {
+            if is_triple {
+                if bytes.get(index + 1) == Some(&quote_byte)
+                    && bytes.get(index + 2) == Some(&quote_byte)
+                {
+                    return Ok(index + 3);
+                }
+            } else {
+                return Ok(index + 1);
+            }
+        }
+
+        index += ch.len_utf8();
+    }
+
+    Err(PrismError::syntax(
+        "unterminated string in f-string expression",
+        Span::dummy(),
+    ))
+}
+
+fn next_char(content: &str, index: usize) -> PrismResult<char> {
+    content[index..]
+        .chars()
+        .next()
+        .ok_or_else(|| PrismError::syntax("unexpected end of f-string content", Span::dummy()))
+}
+
+fn next_char_at(content: &str, index: usize) -> Option<char> {
+    content.get(index..)?.chars().next()
 }
 
 // =============================================================================

@@ -49,6 +49,8 @@ pub enum TokenKind {
     Complex(f64),
     /// String literal.
     String(String),
+    /// Formatted string literal content.
+    FString(String),
     /// Bytes literal.
     Bytes(Vec<u8>),
     /// F-string start.
@@ -222,6 +224,7 @@ impl fmt::Display for TokenKind {
             Self::Float(n) => write!(f, "{}", n),
             Self::Complex(n) => write!(f, "{}j", n),
             Self::String(s) => write!(f, "\"{}\"", s),
+            Self::FString(s) => write!(f, "f\"{}\"", s),
             Self::Bytes(b) => write!(f, "b\"{}\"", String::from_utf8_lossy(b)),
             Self::FStringStart => write!(f, "f\""),
             Self::FStringMiddle(s) => write!(f, "{}", s),

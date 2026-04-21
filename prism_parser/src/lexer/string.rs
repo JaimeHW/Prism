@@ -10,6 +10,7 @@
 
 use super::cursor::{Cursor, EOF_CHAR};
 use crate::token::TokenKind;
+use prism_core::python_unicode::encode_python_code_point;
 
 /// String prefix flags.
 #[derive(Debug, Clone, Copy, Default)]
@@ -320,7 +321,7 @@ fn parse_hex_escape(cursor: &mut Cursor<'_>, count: usize) -> Result<char, Strin
             .ok_or_else(|| format!("invalid hex escape: {}", c))?;
         value = value * 16 + digit;
     }
-    char::from_u32(value).ok_or_else(|| format!("invalid unicode codepoint: {}", value))
+    encode_python_code_point(value).ok_or_else(|| format!("invalid unicode codepoint: {}", value))
 }
 
 /// Parse an octal escape sequence (\NNN).
@@ -375,14 +376,9 @@ fn parse_fstring_content(
     is_triple: bool,
     is_raw: bool,
 ) -> TokenKind {
-    // Prism does not fully lower f-strings yet, but the lexer must still scan
-    // them correctly so CPython source modules can be parsed and compiled.
-    // This scanner tracks expression braces and nested Python string literals
-    // inside replacement fields so inner quotes do not terminate the outer
-    // f-string prematurely.
     let result = scan_fstring_content(cursor, quote_char, is_triple, is_raw);
     match result {
-        Ok(s) => TokenKind::String(format!("f-string: {}", s)),
+        Ok(s) => TokenKind::FString(s),
         Err(e) => TokenKind::Error(e),
     }
 }
@@ -425,6 +421,7 @@ fn scan_fstring_content(
             if cursor.first() == '{' {
                 cursor.bump();
                 content.push('{');
+                content.push('{');
                 continue;
             }
 
@@ -437,6 +434,7 @@ fn scan_fstring_content(
             cursor.bump();
             if cursor.first() == '}' {
                 cursor.bump();
+                content.push('}');
                 content.push('}');
                 continue;
             }
@@ -567,6 +565,7 @@ pub fn is_valid_string_prefix(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::python_unicode::encode_python_code_point;
 
     fn lex_string(s: &str) -> TokenKind {
         let mut cursor = Cursor::new(s);
@@ -633,6 +632,14 @@ mod tests {
     }
 
     #[test]
+    fn test_unicode_escape_preserves_python_surrogates_via_internal_carrier() {
+        let result = lex_string("\"\\uDC80\"");
+        let surrogate = encode_python_code_point(0xDC80)
+            .expect("Python surrogate escape should map into carrier range");
+        assert_eq!(result, TokenKind::String(surrogate.to_string()));
+    }
+
+    #[test]
     fn test_raw_string() {
         let result = lex_string_with_prefix("\"hello\\nworld\"", "r");
         assert_eq!(result, TokenKind::String("hello\\nworld".to_string()));
@@ -646,9 +653,8 @@ mod tests {
         );
         assert_eq!(
             result,
-            TokenKind::String(
-                "f-string: Ignored error getting __notes__: {_safe_string(e, '__notes__', repr)}"
-                    .to_string()
+            TokenKind::FString(
+                "Ignored error getting __notes__: {_safe_string(e, '__notes__', repr)}".to_string()
             )
         );
     }
@@ -656,10 +662,13 @@ mod tests {
     #[test]
     fn test_fstring_expression_can_contain_nested_braces() {
         let result = lex_string_with_prefix("\"{ {'key': value} }\"", "f");
-        assert_eq!(
-            result,
-            TokenKind::String("f-string: { {'key': value} }".to_string())
-        );
+        assert_eq!(result, TokenKind::FString("{ {'key': value} }".to_string()));
+    }
+
+    #[test]
+    fn test_fstring_preserves_escaped_braces_for_parser_lowering() {
+        let result = lex_string_with_prefix("\"{{name}} = {value}\"", "f");
+        assert_eq!(result, TokenKind::FString("{{name}} = {value}".to_string()));
     }
 
     #[test]

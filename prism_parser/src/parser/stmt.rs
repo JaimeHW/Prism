@@ -111,7 +111,7 @@ impl StmtParser {
     fn parse_expression_statement(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
         let first_start = parser.start_span();
         let first = ExprParser::parse(parser, Precedence::Lowest)?;
-        let first = Self::parse_comma_tuple_expr(parser, first_start, first, true)?;
+        let first = parser.parse_comma_tuple_expr(first_start, first, true)?;
 
         // Check for assignment
         if parser.match_token(TokenKind::Equal) {
@@ -121,7 +121,7 @@ impl StmtParser {
             loop {
                 let value_start = parser.start_span();
                 let value_first = ExprParser::parse(parser, Precedence::Lowest)?;
-                let value = Self::parse_comma_tuple_expr(parser, value_start, value_first, true)?;
+                let value = parser.parse_comma_tuple_expr(value_start, value_first, true)?;
                 if parser.match_token(TokenKind::Equal) {
                     targets.push(value);
                 } else {
@@ -176,55 +176,6 @@ impl StmtParser {
         ))
     }
 
-    /// Parse trailing comma-separated expressions into a tuple expression.
-    ///
-    /// This supports Python's implicit tuple syntax in statement contexts:
-    /// - Targets: `a, b = ...`
-    /// - Values: `a = 1, 2`
-    /// - Chained assignments: `a = b = 1, 2`
-    /// - For iterables: `for x in a, b: ...`
-    fn parse_comma_tuple_expr_until<F>(
-        parser: &mut Parser<'_>,
-        start: u32,
-        first: Expr,
-        mut should_stop: F,
-    ) -> PrismResult<Expr>
-    where
-        F: FnMut(&Parser<'_>) -> bool,
-    {
-        if !parser.match_token(TokenKind::Comma) {
-            return Ok(first);
-        }
-
-        let mut elements = vec![first];
-        while !parser.check(TokenKind::Newline) && !parser.check(TokenKind::Eof) {
-            if should_stop(parser) {
-                break;
-            }
-
-            elements.push(ExprParser::parse(parser, Precedence::Lowest)?);
-            if !parser.match_token(TokenKind::Comma) {
-                break;
-            }
-        }
-
-        Ok(Expr::new(
-            ExprKind::Tuple(elements),
-            parser.span_from(start),
-        ))
-    }
-
-    fn parse_comma_tuple_expr(
-        parser: &mut Parser<'_>,
-        start: u32,
-        first: Expr,
-        stop_at_equal: bool,
-    ) -> PrismResult<Expr> {
-        Self::parse_comma_tuple_expr_until(parser, start, first, |parser| {
-            stop_at_equal && parser.check(TokenKind::Equal)
-        })
-    }
-
     /// Match an augmented assignment operator.
     fn match_aug_assign(parser: &mut Parser<'_>) -> Option<AugOp> {
         let op = match &parser.current().kind {
@@ -254,30 +205,13 @@ impl StmtParser {
         let value = if parser.check(TokenKind::Newline) || parser.check(TokenKind::Eof) {
             None
         } else {
-            // Parse first expression
+            let first_start = parser.start_span();
             let first = ExprParser::parse(parser, Precedence::Lowest)?;
-
-            // Check for comma (tuple return)
-            if parser.match_token(TokenKind::Comma) {
-                let first_start = first.span.start;
-                let mut elements = vec![first];
-
-                // Parse remaining comma-separated expressions
-                while !parser.check(TokenKind::Newline) && !parser.check(TokenKind::Eof) {
-                    elements.push(ExprParser::parse(parser, Precedence::Lowest)?);
-                    if !parser.match_token(TokenKind::Comma) {
-                        break;
-                    }
-                }
-
-                // Create tuple from elements
-                Some(Box::new(Expr::new(
-                    ExprKind::Tuple(elements),
-                    parser.span_from(first_start),
-                )))
-            } else {
-                Some(Box::new(first))
-            }
+            Some(Box::new(parser.parse_comma_tuple_expr_until(
+                first_start,
+                first,
+                |_| false,
+            )?))
         };
 
         Ok(Stmt::new(StmtKind::Return(value), parser.span_from(start)))
@@ -621,7 +555,7 @@ impl StmtParser {
         parser.expect_keyword(KW::In, "expected 'in'")?;
         let iter_start = parser.start_span();
         let iter_first = ExprParser::parse(parser, Precedence::Lowest)?;
-        let iter = Self::parse_comma_tuple_expr_until(parser, iter_start, iter_first, |parser| {
+        let iter = parser.parse_comma_tuple_expr_until(iter_start, iter_first, |parser| {
             parser.check(TokenKind::Colon)
         })?;
         parser.expect(TokenKind::Colon, "expected ':'")?;
@@ -1634,6 +1568,24 @@ mod tests {
     fn test_return_none() {
         let stmt = parse_stmt("return");
         assert!(matches!(stmt.kind, StmtKind::Return(None)));
+    }
+
+    #[test]
+    fn test_generator_statement_yield_tuple_value() {
+        let stmt = parse_stmt("def probe():\n    yield 1, 2\n");
+        match stmt.kind {
+            StmtKind::FunctionDef { body, .. } => match &body[0].kind {
+                StmtKind::Expr(expr) => match &expr.kind {
+                    ExprKind::Yield(Some(value)) => match &value.kind {
+                        ExprKind::Tuple(elements) => assert_eq!(elements.len(), 2),
+                        other => panic!("expected tuple payload, got {:?}", other),
+                    },
+                    other => panic!("expected yield expression, got {:?}", other),
+                },
+                other => panic!("expected expression statement, got {:?}", other),
+            },
+            other => panic!("expected function definition, got {:?}", other),
+        }
     }
 
     #[test]
