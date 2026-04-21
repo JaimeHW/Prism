@@ -10,6 +10,7 @@ use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::iter::IteratorObject;
+use std::cell::RefCell;
 
 /// Result of advancing an iterator-like object by one step.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,10 +67,21 @@ pub(crate) fn next_step(
     match type_id {
         TypeId::ITERATOR => {
             let iter = unsafe { &mut *(ptr as *mut IteratorObject) };
+            let vm_cell = RefCell::new(vm);
             Ok(
                 match iter.next_with(
-                    &mut |callable, args| invoke_callable_value(vm, callable, args),
+                    &mut |callable, args| {
+                        let vm = &mut *vm_cell.borrow_mut();
+                        invoke_callable_value(vm, callable, args)
+                    },
                     &mut |value| Ok(crate::truthiness::is_truthy(value)),
+                    &mut |iterator| {
+                        let vm = &mut *vm_cell.borrow_mut();
+                        match next_step(vm, iterator)? {
+                            IterStep::Yielded(value) => Ok(Some(value)),
+                            IterStep::Exhausted => Ok(None),
+                        }
+                    },
                 )? {
                     Some(value) => IterStep::Yielded(value),
                     None => IterStep::Exhausted,

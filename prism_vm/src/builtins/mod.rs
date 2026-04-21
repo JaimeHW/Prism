@@ -23,6 +23,7 @@ pub use builtin_function::*;
 pub use exception_type::*;
 pub(crate) use exception_type::{
     exception_proxy_class_id_from_ptr, exception_type_attribute_value,
+    exception_type_id_for_proxy_class_id,
 };
 pub use exception_value::*;
 pub use exceptions::*;
@@ -56,6 +57,8 @@ use std::sync::{Arc, LazyLock};
 /// Using Result allows proper error propagation.
 pub type BuiltinFn = fn(&[Value]) -> Result<Value, BuiltinError>;
 pub type VmBuiltinFn = fn(&mut crate::VirtualMachine, &[Value]) -> Result<Value, BuiltinError>;
+pub type VmBuiltinKwFn =
+    fn(&mut crate::VirtualMachine, &[Value], &[(&str, Value)]) -> Result<Value, BuiltinError>;
 
 /// Error type for builtin functions.
 #[derive(Debug, Clone)]
@@ -64,6 +67,8 @@ pub enum BuiltinError {
     TypeError(String),
     /// Value error (e.g., negative index).
     ValueError(String),
+    /// Syntax error raised while parsing dynamically executed source.
+    SyntaxError(String),
     /// Operating-system level failure.
     OSError(String),
     /// Import failure while loading a module or attribute.
@@ -80,6 +85,8 @@ pub enum BuiltinError {
     IndexError(String),
     /// Overflow error.
     OverflowError(String),
+    /// Preserve a fully classified runtime exception raised from nested execution.
+    Raised(RuntimeError),
     /// Not implemented.
     NotImplemented(String),
 }
@@ -89,6 +96,7 @@ impl std::fmt::Display for BuiltinError {
         match self {
             BuiltinError::TypeError(msg) => write!(f, "TypeError: {}", msg),
             BuiltinError::ValueError(msg) => write!(f, "ValueError: {}", msg),
+            BuiltinError::SyntaxError(msg) => write!(f, "SyntaxError: {}", msg),
             BuiltinError::OSError(msg) => write!(f, "OSError: {}", msg),
             BuiltinError::ImportError(msg) => write!(f, "ImportError: {}", msg),
             BuiltinError::ModuleNotFoundError(msg) => {
@@ -99,6 +107,7 @@ impl std::fmt::Display for BuiltinError {
             BuiltinError::KeyError(msg) => write!(f, "KeyError: {}", msg),
             BuiltinError::IndexError(msg) => write!(f, "IndexError: {}", msg),
             BuiltinError::OverflowError(msg) => write!(f, "OverflowError: {}", msg),
+            BuiltinError::Raised(err) => write!(f, "{err}"),
             BuiltinError::NotImplemented(msg) => write!(f, "NotImplementedError: {}", msg),
         }
     }
@@ -108,7 +117,6 @@ impl std::error::Error for BuiltinError {}
 
 #[inline]
 fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
-    let display = err.to_string();
     match err.kind {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
@@ -135,7 +143,7 @@ fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
             BuiltinError::OverflowError(message.to_string())
         }
         RuntimeErrorKind::StopIteration => BuiltinError::StopIteration,
-        _ => BuiltinError::TypeError(display),
+        _ => BuiltinError::Raised(err),
     }
 }
 
@@ -155,6 +163,8 @@ pub struct BuiltinRegistry {
     functions: FxHashMap<Arc<str>, BuiltinFn>,
     /// VM-aware function table for builtins that need runtime execution context.
     vm_functions: FxHashMap<Arc<str>, VmBuiltinFn>,
+    /// VM-aware function table for builtins that accept keyword arguments.
+    vm_keyword_functions: FxHashMap<Arc<str>, VmBuiltinKwFn>,
 }
 
 static ELLIPSIS_SINGLETON: LazyLock<Value> =
@@ -186,6 +196,7 @@ impl BuiltinRegistry {
             entries: FxHashMap::default(),
             functions: FxHashMap::default(),
             vm_functions: FxHashMap::default(),
+            vm_keyword_functions: FxHashMap::default(),
         }
     }
 
@@ -201,10 +212,10 @@ impl BuiltinRegistry {
         registry.register_value("NotImplemented", builtin_not_implemented_value());
 
         // Register core functions
-        registry.register_function("len", functions::builtin_len);
+        registry.register_function_vm("len", functions::builtin_len_vm);
         registry.register_function("abs", functions::builtin_abs);
-        registry.register_function("min", functions::builtin_min);
-        registry.register_function("max", functions::builtin_max);
+        registry.register_function_vm_kw("min", functions::builtin_min_vm_kw);
+        registry.register_function_vm_kw("max", functions::builtin_max_vm_kw);
         registry.register_function_vm("sum", functions::builtin_sum_vm);
         registry.register_function("pow", functions::builtin_pow);
         registry.register_function("round", functions::builtin_round);
@@ -219,7 +230,11 @@ impl BuiltinRegistry {
         registry.register_function("bin", numeric::builtin_bin);
         registry.register_function("hex", numeric::builtin_hex);
         registry.register_function("oct", numeric::builtin_oct);
-        registry.register_function("complex", numeric::builtin_complex);
+        registry.register_callable_type(
+            "complex",
+            prism_runtime::object::type_obj::TypeId::COMPLEX,
+            numeric::builtin_complex,
+        );
 
         // Register string utilities
         registry.register_function("ord", string::builtin_ord);
@@ -235,15 +250,15 @@ impl BuiltinRegistry {
         registry.register_function_vm("__import__", introspect::builtin_import_vm);
 
         // Register execution functions
-        registry.register_function("exec", execution::builtin_exec);
-        registry.register_function("eval", execution::builtin_eval);
+        registry.register_function_vm("exec", execution::builtin_exec_vm);
+        registry.register_function_vm("eval", execution::builtin_eval_vm);
         registry.register_function("compile", execution::builtin_compile);
         registry.register_function("breakpoint", execution::builtin_breakpoint);
 
         // Register iteration functions
         registry.register_function_vm("iter", itertools::builtin_iter_vm);
         registry.register_function_vm("next", itertools::builtin_next_vm);
-        registry.register_function("enumerate", itertools::builtin_enumerate);
+        registry.register_function_vm("enumerate", itertools::builtin_enumerate_vm);
         registry.register_function("zip", itertools::builtin_zip);
         registry.register_function("map", itertools::builtin_map);
         registry.register_function("filter", itertools::builtin_filter);
@@ -255,7 +270,7 @@ impl BuiltinRegistry {
         // Register I/O functions
         registry.register_function("print", io::builtin_print);
         registry.register_function("input", io::builtin_input);
-        registry.register_function("open", io::builtin_open);
+        registry.register_function_vm_kw("open", io::builtin_open_vm_kw);
 
         // Register type constructors/converters as callable type objects.
         registry.register_callable_type(
@@ -417,6 +432,17 @@ impl BuiltinRegistry {
         self.entries.insert(name, Value::object_ptr(ptr));
     }
 
+    /// Register a builtin function that needs VM context and accepts keyword arguments.
+    #[inline]
+    pub fn register_function_vm_kw(&mut self, name: impl Into<Arc<str>>, func: VmBuiltinKwFn) {
+        let name = name.into();
+        self.vm_keyword_functions.insert(name.clone(), func);
+
+        let builtin_obj = Box::new(BuiltinFunctionObject::new_vm_kw(name.clone(), func));
+        let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
+        self.entries.insert(name, Value::object_ptr(ptr));
+    }
+
     /// Register a builtin type object while preserving the direct-call
     /// constructor in the function table.
     #[inline]
@@ -477,6 +503,9 @@ impl BuiltinRegistry {
         if let Some(func) = self.vm_functions.get(name) {
             return func(vm, args);
         }
+        if let Some(func) = self.vm_keyword_functions.get(name) {
+            return func(vm, args, &[]);
+        }
 
         Err(BuiltinError::AttributeError(format!(
             "builtin function '{}' not found",
@@ -493,7 +522,9 @@ impl BuiltinRegistry {
     /// Check if a name is a builtin function.
     #[inline]
     pub fn is_function(&self, name: &str) -> bool {
-        self.functions.contains_key(name) || self.vm_functions.contains_key(name)
+        self.functions.contains_key(name)
+            || self.vm_functions.contains_key(name)
+            || self.vm_keyword_functions.contains_key(name)
     }
 
     /// Iterate over all builtins.

@@ -9,6 +9,10 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::python_numeric::{
+    complex_like_parts, float_like_value, int_like_value, is_complex_value,
+};
+use crate::stdlib::_warnings::emit_bool_invert_deprecation_warning;
 use num_traits::ToPrimitive;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
@@ -23,6 +27,7 @@ use prism_runtime::types::simd::search::{bytes_contains, str_contains};
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::{DictObject, ListObject, SetObject, TupleObject};
 use rustc_hash::FxHashSet;
+use std::cmp::Ordering;
 
 #[inline]
 fn with_string_value<R>(value: Value, f: impl FnOnce(&str) -> R) -> Option<R> {
@@ -33,6 +38,25 @@ fn with_string_value<R>(value: Value, f: impl FnOnce(&str) -> R) -> Option<R> {
 #[inline]
 fn string_values_equal(a: Value, b: Value) -> Option<bool> {
     with_string_value(a, |left| with_string_value(b, |right| left == right)).flatten()
+}
+
+#[inline]
+fn compare_string_values(a: Value, b: Value) -> Option<Ordering> {
+    with_string_value(a, |left| with_string_value(b, |right| left.cmp(right))).flatten()
+}
+
+#[inline]
+fn bytes_values_equal(a: Value, b: Value) -> Option<bool> {
+    let left = value_as_bytes_ref(a)?;
+    let right = value_as_bytes_ref(b)?;
+    Some(left == right)
+}
+
+#[inline]
+fn compare_bytes_values(a: Value, b: Value) -> Option<Ordering> {
+    let left = value_as_bytes_ref(a)?;
+    let right = value_as_bytes_ref(b)?;
+    Some(left.cmp(right))
 }
 
 #[inline]
@@ -49,7 +73,7 @@ fn value_as_bytes_ref(value: Value) -> Option<&'static [u8]> {
 
 #[inline]
 fn contains_bytes_value(needle: Value, haystack: &[u8]) -> Result<bool, ControlFlow> {
-    if let Some(value) = needle.as_int() {
+    if let Some(value) = int_like_value(needle) {
         let byte = u8::try_from(value).map_err(|_| {
             ControlFlow::Error(RuntimeError::value_error("byte must be in range(0, 256)"))
         })?;
@@ -142,10 +166,70 @@ fn set_binary_operands(
 }
 
 #[inline]
+fn supports_membership_iteration_fallback(type_id: TypeId) -> bool {
+    matches!(
+        type_id,
+        TypeId::OBJECT
+            | TypeId::TYPE
+            | TypeId::ITERATOR
+            | TypeId::GENERATOR
+            | TypeId::DEQUE
+            | TypeId::DICT_KEYS
+            | TypeId::DICT_VALUES
+            | TypeId::DICT_ITEMS
+    ) || crate::ops::attribute::is_user_defined_type(type_id)
+}
+
+#[inline]
+fn dict_binary_operands(
+    left: Value,
+    right: Value,
+) -> Option<(&'static DictObject, &'static DictObject)> {
+    let left_ptr = left.as_object_ptr()?;
+    let right_ptr = right.as_object_ptr()?;
+
+    let left_type = unsafe { (*(left_ptr as *const ObjectHeader)).type_id };
+    let right_type = unsafe { (*(right_ptr as *const ObjectHeader)).type_id };
+    if left_type != TypeId::DICT || right_type != TypeId::DICT {
+        return None;
+    }
+
+    let left_dict = unsafe { &*(left_ptr as *const DictObject) };
+    let right_dict = unsafe { &*(right_ptr as *const DictObject) };
+    Some((left_dict, right_dict))
+}
+
+#[inline]
 fn boxed_set_result(mut set: SetObject, result_type: TypeId) -> Value {
     set.header.type_id = result_type;
     let ptr = Box::into_raw(Box::new(set));
     Value::object_ptr(ptr as *const ())
+}
+
+#[inline]
+fn boxed_dict_result(dict: DictObject) -> Value {
+    let ptr = Box::into_raw(Box::new(dict));
+    Value::object_ptr(ptr as *const ())
+}
+
+#[inline]
+fn bitwise_int_result(
+    op: &'static str,
+    left: Value,
+    right: Value,
+    compute: impl FnOnce(i64, i64) -> i64,
+) -> Result<Value, RuntimeError> {
+    let x = int_like_value(left).ok_or_else(|| {
+        RuntimeError::unsupported_operand(op, left.type_name(), right.type_name())
+    })?;
+    let y = int_like_value(right).ok_or_else(|| {
+        RuntimeError::unsupported_operand(op, left.type_name(), right.type_name())
+    })?;
+    let result = compute(x, y);
+    if left.is_bool() && right.is_bool() {
+        return Ok(Value::bool(result != 0));
+    }
+    Value::int(result).ok_or_else(|| RuntimeError::value_error("Integer too large"))
 }
 
 #[inline]
@@ -254,34 +338,32 @@ pub fn lt(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
+    if let Some(ordering) = compare_string_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(ordering.is_lt()));
+        return ControlFlow::Continue;
+    }
+
+    if let Some(ordering) = compare_bytes_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(ordering.is_lt()));
+        return ControlFlow::Continue;
+    }
+
     // Int comparison
-    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         frame.set_reg(inst.dst().0, Value::bool(x < y));
         return ControlFlow::Continue;
     }
 
-    // Float comparison (including int/float mixed)
-    let x = if let Some(f) = a.as_float() {
-        Some(f)
-    } else if let Some(i) = a.as_int() {
-        Some(i as f64)
-    } else {
-        None
-    };
-    let y = if let Some(f) = b.as_float() {
-        Some(f)
-    } else if let Some(i) = b.as_int() {
-        Some(i as f64)
-    } else {
-        None
-    };
-
-    match (x, y) {
+    match (float_like_value(a), float_like_value(b)) {
         (Some(x), Some(y)) => {
             frame.set_reg(inst.dst().0, Value::bool(x < y));
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand("<", "unknown", "unknown")),
+        _ => ControlFlow::Error(RuntimeError::unsupported_operand(
+            "<",
+            a.type_name(),
+            b.type_name(),
+        )),
     }
 }
 
@@ -343,20 +425,30 @@ pub fn le(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
-    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+    if let Some(ordering) = compare_string_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(!ordering.is_gt()));
+        return ControlFlow::Continue;
+    }
+
+    if let Some(ordering) = compare_bytes_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(!ordering.is_gt()));
+        return ControlFlow::Continue;
+    }
+
+    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         frame.set_reg(inst.dst().0, Value::bool(x <= y));
         return ControlFlow::Continue;
     }
 
-    let x = a.as_float().or_else(|| a.as_int().map(|i| i as f64));
-    let y = b.as_float().or_else(|| b.as_int().map(|i| i as f64));
-    match (x, y) {
+    match (float_like_value(a), float_like_value(b)) {
         (Some(x), Some(y)) => {
             frame.set_reg(inst.dst().0, Value::bool(x <= y));
             ControlFlow::Continue
         }
         _ => ControlFlow::Error(RuntimeError::unsupported_operand(
-            "<=", "unknown", "unknown",
+            "<=",
+            a.type_name(),
+            b.type_name(),
         )),
     }
 }
@@ -419,19 +511,31 @@ pub fn gt(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
-    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+    if let Some(ordering) = compare_string_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(ordering.is_gt()));
+        return ControlFlow::Continue;
+    }
+
+    if let Some(ordering) = compare_bytes_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(ordering.is_gt()));
+        return ControlFlow::Continue;
+    }
+
+    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         frame.set_reg(inst.dst().0, Value::bool(x > y));
         return ControlFlow::Continue;
     }
 
-    let x = a.as_float().or_else(|| a.as_int().map(|i| i as f64));
-    let y = b.as_float().or_else(|| b.as_int().map(|i| i as f64));
-    match (x, y) {
+    match (float_like_value(a), float_like_value(b)) {
         (Some(x), Some(y)) => {
             frame.set_reg(inst.dst().0, Value::bool(x > y));
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand(">", "unknown", "unknown")),
+        _ => ControlFlow::Error(RuntimeError::unsupported_operand(
+            ">",
+            a.type_name(),
+            b.type_name(),
+        )),
     }
 }
 
@@ -493,20 +597,30 @@ pub fn ge(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
-    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+    if let Some(ordering) = compare_string_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(!ordering.is_lt()));
+        return ControlFlow::Continue;
+    }
+
+    if let Some(ordering) = compare_bytes_values(a, b) {
+        frame.set_reg(inst.dst().0, Value::bool(!ordering.is_lt()));
+        return ControlFlow::Continue;
+    }
+
+    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         frame.set_reg(inst.dst().0, Value::bool(x >= y));
         return ControlFlow::Continue;
     }
 
-    let x = a.as_float().or_else(|| a.as_int().map(|i| i as f64));
-    let y = b.as_float().or_else(|| b.as_int().map(|i| i as f64));
-    match (x, y) {
+    match (float_like_value(a), float_like_value(b)) {
         (Some(x), Some(y)) => {
             frame.set_reg(inst.dst().0, Value::bool(x >= y));
             ControlFlow::Continue
         }
         _ => ControlFlow::Error(RuntimeError::unsupported_operand(
-            ">=", "unknown", "unknown",
+            ">=",
+            a.type_name(),
+            b.type_name(),
         )),
     }
 }
@@ -885,9 +999,7 @@ fn contains_value(
             _ => {}
         }
 
-        if matches!(type_id, TypeId::OBJECT | TypeId::TYPE)
-            || crate::ops::attribute::is_user_defined_type(type_id)
-        {
+        if supports_membership_iteration_fallback(type_id) {
             if let Some(result) =
                 contains_via_special_method(vm, needle, container).map_err(ControlFlow::Error)?
             {
@@ -945,7 +1057,7 @@ fn call_contains_method(
         }
     };
 
-    Ok(crate::truthiness::is_truthy(result))
+    crate::truthiness::try_is_truthy(vm, result)
 }
 
 #[inline]
@@ -972,7 +1084,7 @@ fn contains_via_iteration(
 /// - bool == int (True == 1, False == 0)
 /// - Object equality by reference (identity for objects)
 #[inline]
-fn values_equal(a: Value, b: Value) -> bool {
+pub(crate) fn values_equal(a: Value, b: Value) -> bool {
     let mut seen_pairs = FxHashSet::default();
     values_equal_inner(a, b, &mut seen_pairs)
 }
@@ -994,7 +1106,7 @@ fn values_equal_inner(a: Value, b: Value, seen_pairs: &mut FxHashSet<(usize, usi
     }
 
     // Integer equality
-    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         return x == y;
     }
 
@@ -1003,28 +1115,30 @@ fn values_equal_inner(a: Value, b: Value, seen_pairs: &mut FxHashSet<(usize, usi
         return x == y;
     }
 
-    // Cross-type: int-float comparison (Python semantics: 1 == 1.0)
-    if let (Some(i), Some(f)) = (a.as_int(), b.as_float()) {
+    // Cross-type: int/float comparison (Python semantics: 1 == 1.0)
+    if let (Some(i), Some(f)) = (int_like_value(a), b.as_float()) {
         return (i as f64) == f;
     }
-    if let (Some(f), Some(i)) = (a.as_float(), b.as_int()) {
+    if let (Some(f), Some(i)) = (a.as_float(), int_like_value(b)) {
         return f == (i as f64);
-    }
-
-    // Cross-type: bool-int comparison (Python semantics: True == 1)
-    if a.is_bool() {
-        if let Some(i) = b.as_int() {
-            return (crate::truthiness::is_truthy(a) as i64) == i;
-        }
-    }
-    if b.is_bool() {
-        if let Some(i) = a.as_int() {
-            return i == (crate::truthiness::is_truthy(b) as i64);
-        }
     }
 
     if let Some(equal) = string_values_equal(a, b) {
         return equal;
+    }
+
+    if let Some(equal) = bytes_values_equal(a, b) {
+        return equal;
+    }
+
+    if is_complex_value(a) || is_complex_value(b) {
+        let Some(left) = complex_like_parts(a) else {
+            return false;
+        };
+        let Some(right) = complex_like_parts(b) else {
+            return false;
+        };
+        return left.real == right.real && left.imag == right.imag;
     }
 
     if let (Some(pa), Some(pb)) = (a.as_object_ptr(), b.as_object_ptr()) {
@@ -1096,11 +1210,16 @@ fn values_equal_inner(a: Value, b: Value, seen_pairs: &mut FxHashSet<(usize, usi
 /// Not: dst = not src1
 #[inline(always)]
 pub fn not(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let a = frame.get_reg(inst.src1().0);
+    let a = vm.current_frame().get_reg(inst.src1().0);
 
-    frame.set_reg(inst.dst().0, Value::bool(!crate::truthiness::is_truthy(a)));
-    ControlFlow::Continue
+    match crate::truthiness::try_is_truthy(vm, a) {
+        Ok(result) => {
+            vm.current_frame_mut()
+                .set_reg(inst.dst().0, Value::bool(!result));
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
+    }
 }
 
 /// BitwiseAnd: dst = src1 & src2
@@ -1120,22 +1239,12 @@ pub fn bitwise_and(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     let frame = vm.current_frame_mut();
 
-    match (a.as_int(), b.as_int()) {
-        (Some(x), Some(y)) => match Value::int(x & y) {
-            Some(v) => {
-                frame.set_reg(dst, v);
-                ControlFlow::Continue
-            }
-            None => ControlFlow::Error(RuntimeError::value_error("Integer too large")),
-        },
-        // Bool & Bool
-        (None, None) if a.is_bool() && b.is_bool() => {
-            let x = crate::truthiness::is_truthy(a);
-            let y = crate::truthiness::is_truthy(b);
-            frame.set_reg(dst, Value::bool(x && y));
+    match bitwise_int_result("&", a, b, |x, y| x & y) {
+        Ok(value) => {
+            frame.set_reg(dst, value);
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand("&", "unknown", "unknown")),
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -1181,21 +1290,21 @@ pub fn bitwise_or(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
-    match (a.as_int(), b.as_int()) {
-        (Some(x), Some(y)) => match Value::int(x | y) {
-            Some(v) => {
-                vm.current_frame_mut().set_reg(dst, v);
-                ControlFlow::Continue
-            }
-            None => ControlFlow::Error(RuntimeError::value_error("Integer too large")),
-        },
-        (None, None) if a.is_bool() && b.is_bool() => {
-            let x = crate::truthiness::is_truthy(a);
-            let y = crate::truthiness::is_truthy(b);
-            vm.current_frame_mut().set_reg(dst, Value::bool(x || y));
+    if let Some((left, right)) = dict_binary_operands(a, b) {
+        let mut merged = DictObject::with_capacity(left.len() + right.len());
+        merged.update(left);
+        merged.update(right);
+        vm.current_frame_mut()
+            .set_reg(dst, boxed_dict_result(merged));
+        return ControlFlow::Continue;
+    }
+
+    match bitwise_int_result("|", a, b, |x, y| x | y) {
+        Ok(value) => {
+            vm.current_frame_mut().set_reg(dst, value);
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand("|", "unknown", "unknown")),
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -1216,39 +1325,41 @@ pub fn bitwise_xor(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     let frame = vm.current_frame_mut();
 
-    match (a.as_int(), b.as_int()) {
-        (Some(x), Some(y)) => match Value::int(x ^ y) {
-            Some(v) => {
-                frame.set_reg(dst, v);
-                ControlFlow::Continue
-            }
-            None => ControlFlow::Error(RuntimeError::value_error("Integer too large")),
-        },
-        (None, None) if a.is_bool() && b.is_bool() => {
-            let x = crate::truthiness::is_truthy(a);
-            let y = crate::truthiness::is_truthy(b);
-            frame.set_reg(dst, Value::bool(x != y));
+    match bitwise_int_result("^", a, b, |x, y| x ^ y) {
+        Ok(value) => {
+            frame.set_reg(dst, value);
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand("^", "unknown", "unknown")),
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
 /// BitwiseNot: dst = ~src1
 #[inline(always)]
 pub fn bitwise_not(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let a = frame.get_reg(inst.src1().0);
+    let (a, dst) = {
+        let frame = vm.current_frame();
+        (frame.get_reg(inst.src1().0), inst.dst().0)
+    };
 
-    match a.as_int() {
+    if a.is_bool()
+        && let Err(err) = emit_bool_invert_deprecation_warning(vm)
+    {
+        return ControlFlow::Error(err);
+    }
+
+    match int_like_value(a) {
         Some(x) => match Value::int(!x) {
             Some(v) => {
-                frame.set_reg(inst.dst().0, v);
+                vm.current_frame_mut().set_reg(dst, v);
                 ControlFlow::Continue
             }
             None => ControlFlow::Error(RuntimeError::value_error("Integer too large")),
         },
-        None => ControlFlow::Error(RuntimeError::type_error("bad operand type for unary ~")),
+        None => ControlFlow::Error(RuntimeError::type_error(format!(
+            "bad operand type for unary ~: '{}'",
+            a.type_name()
+        ))),
     }
 }
 
@@ -1348,6 +1459,10 @@ mod tests {
         execute_with_search_paths(source, &[])
     }
 
+    fn binary_inst(opcode: Opcode) -> Instruction {
+        Instruction::op_dss(opcode, Register::new(3), Register::new(1), Register::new(2))
+    }
+
     fn execute_with_search_paths(source: &str, search_paths: &[&Path]) -> Result<Value, String> {
         let module = parse(source).map_err(|err| format!("parse error: {err:?}"))?;
         let code = Compiler::compile_module(&module, "<comparison-test>")
@@ -1393,6 +1508,38 @@ mod tests {
 
         unsafe { drop_boxed(right_ptr) };
         unsafe { drop_boxed(other_ptr) };
+    }
+
+    #[test]
+    fn test_values_equal_uses_bytes_contents_across_bytes_and_bytearray() {
+        let (left, left_ptr) = boxed_object_value(BytesObject::from_slice(b"01\n"));
+        let (right, right_ptr) = boxed_object_value(BytesObject::from_slice(b"01\n"));
+        let (bytearray, bytearray_ptr) =
+            boxed_object_value(BytesObject::bytearray_from_slice(b"01\n"));
+        let (other, other_ptr) = boxed_object_value(BytesObject::from_slice(b"00\n"));
+
+        assert!(values_equal(left, right));
+        assert!(values_equal(left, bytearray));
+        assert!(!values_equal(left, other));
+
+        unsafe { drop_boxed(left_ptr) };
+        unsafe { drop_boxed(right_ptr) };
+        unsafe { drop_boxed(bytearray_ptr) };
+        unsafe { drop_boxed(other_ptr) };
+    }
+
+    #[test]
+    fn test_execute_supports_bytes_equality_and_ordering() {
+        let result = execute(
+            r#"
+assert b"abc" == b"abc"
+assert b"abc" == bytearray(b"abc")
+assert b"abc" < b"abd"
+assert b"abd" > b"abc"
+"#,
+        );
+
+        assert!(result.is_ok(), "Failed: {:?}", result);
     }
 
     #[test]
@@ -1532,6 +1679,86 @@ mod tests {
     }
 
     #[test]
+    fn test_lt_opcode_supports_string_values() {
+        let mut vm = vm_with_frame();
+        let left = Value::string(intern("alpha"));
+        let (right, right_ptr) = boxed_string_value("beta");
+        vm.current_frame_mut().set_reg(1, left);
+        vm.current_frame_mut().set_reg(2, right);
+
+        let inst = Instruction::op_dss(
+            Opcode::Lt,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(lt(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(3).as_bool(), Some(true));
+
+        unsafe { drop_boxed(right_ptr) };
+    }
+
+    #[test]
+    fn test_le_opcode_supports_string_values() {
+        let mut vm = vm_with_frame();
+        let (left, left_ptr) = boxed_string_value("beta");
+        let right = Value::string(intern("beta"));
+        vm.current_frame_mut().set_reg(1, left);
+        vm.current_frame_mut().set_reg(2, right);
+
+        let inst = Instruction::op_dss(
+            Opcode::Le,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(le(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(3).as_bool(), Some(true));
+
+        unsafe { drop_boxed(left_ptr) };
+    }
+
+    #[test]
+    fn test_gt_opcode_supports_string_values() {
+        let mut vm = vm_with_frame();
+        let (left, left_ptr) = boxed_string_value("gamma");
+        let right = Value::string(intern("beta"));
+        vm.current_frame_mut().set_reg(1, left);
+        vm.current_frame_mut().set_reg(2, right);
+
+        let inst = Instruction::op_dss(
+            Opcode::Gt,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(gt(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(3).as_bool(), Some(true));
+
+        unsafe { drop_boxed(left_ptr) };
+    }
+
+    #[test]
+    fn test_ge_opcode_supports_string_values() {
+        let mut vm = vm_with_frame();
+        let left = Value::string(intern("beta"));
+        let (right, right_ptr) = boxed_string_value("beta");
+        vm.current_frame_mut().set_reg(1, left);
+        vm.current_frame_mut().set_reg(2, right);
+
+        let inst = Instruction::op_dss(
+            Opcode::Ge,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(ge(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(3).as_bool(), Some(true));
+
+        unsafe { drop_boxed(right_ptr) };
+    }
+
+    #[test]
     fn test_bitwise_or_on_type_objects_produces_union_type() {
         let mut vm = vm_with_frame();
         vm.current_frame_mut()
@@ -1624,6 +1851,48 @@ mod tests {
         unsafe { drop_boxed(left_ptr) };
         unsafe { drop_boxed(right_ptr) };
         unsafe { drop_boxed(result_ptr as *mut SetObject) };
+    }
+
+    #[test]
+    fn test_bitwise_or_on_dicts_returns_merged_dict_with_right_overrides() {
+        let mut vm = vm_with_frame();
+        let mut left = DictObject::new();
+        left.set(Value::int_unchecked(1), Value::int_unchecked(10));
+        left.set(Value::int_unchecked(2), Value::int_unchecked(20));
+        let mut right = DictObject::new();
+        right.set(Value::int_unchecked(2), Value::int_unchecked(200));
+        right.set(Value::int_unchecked(3), Value::int_unchecked(30));
+        let (left, left_ptr) = boxed_object_value(left);
+        let (right, right_ptr) = boxed_object_value(right);
+        vm.current_frame_mut().set_reg(1, left);
+        vm.current_frame_mut().set_reg(2, right);
+
+        let inst = Instruction::op_dss(
+            Opcode::BitwiseOr,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(bitwise_or(&mut vm, inst), ControlFlow::Continue));
+
+        let result_ptr = vm.current_frame().get_reg(3).as_object_ptr().unwrap();
+        let result = unsafe { &*(result_ptr as *const DictObject) };
+        let items = result
+            .iter()
+            .map(|(key, value)| (key.as_int(), value.as_int()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items,
+            vec![
+                (Some(1), Some(10)),
+                (Some(2), Some(200)),
+                (Some(3), Some(30)),
+            ]
+        );
+
+        unsafe { drop_boxed(left_ptr) };
+        unsafe { drop_boxed(right_ptr) };
+        unsafe { drop_boxed(result_ptr as *mut DictObject) };
     }
 
     #[test]
@@ -1770,5 +2039,72 @@ assert 5 not in bucket
         );
 
         assert!(result.is_ok(), "iterator fallback failed: {result:?}");
+    }
+
+    #[test]
+    fn test_membership_supports_builtin_dict_key_views() {
+        let result = execute(
+            r#"
+view = {"alpha": 1, "beta": 2}.keys()
+assert "alpha" in view
+assert "gamma" not in view
+"#,
+        );
+
+        assert!(result.is_ok(), "dict_keys membership failed: {result:?}");
+    }
+
+    #[test]
+    fn test_membership_supports_iterator_objects_and_consumes_progress() {
+        let result = execute(
+            r#"
+it = iter([1, 2, 3])
+assert 2 in it
+assert list(it) == [3]
+"#,
+        );
+
+        assert!(result.is_ok(), "iterator membership failed: {result:?}");
+    }
+
+    #[test]
+    fn test_bool_ordering_uses_int_subtype_semantics() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(1, Value::bool(false));
+        vm.current_frame_mut().set_reg(2, Value::int(1).unwrap());
+
+        assert!(matches!(
+            lt(&mut vm, binary_inst(Opcode::Lt)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(3).as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_bitwise_and_with_bool_and_int_returns_int() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(1, Value::bool(true));
+        vm.current_frame_mut().set_reg(2, Value::int(1).unwrap());
+
+        assert!(matches!(
+            bitwise_and(&mut vm, binary_inst(Opcode::BitwiseAnd)),
+            ControlFlow::Continue
+        ));
+        let result = vm.current_frame().get_reg(3);
+        assert_eq!(result.as_int(), Some(1));
+        assert!(!result.is_bool());
+    }
+
+    #[test]
+    fn test_bitwise_xor_with_bool_pair_preserves_bool_result_type() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(1, Value::bool(true));
+        vm.current_frame_mut().set_reg(2, Value::bool(true));
+
+        assert!(matches!(
+            bitwise_xor(&mut vm, binary_inst(Opcode::BitwiseXor)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(3).as_bool(), Some(false));
     }
 }

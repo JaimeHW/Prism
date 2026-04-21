@@ -16,9 +16,11 @@
 //! path handles objects with `__index__` when the object system is wired.
 
 use super::BuiltinError;
+use crate::python_numeric::{ComplexParts, complex_like_parts, is_complex_value};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::complex::ComplexObject;
 
 // =============================================================================
 // Lookup Tables (Zero-Branch Hex Conversion)
@@ -355,9 +357,6 @@ fn interned_string_value(s: &str) -> Value {
 /// - `complex(1, 2)` → `(1+2j)`
 /// - `complex("1+2j")` → `(1+2j)` (string parsing)
 ///
-/// # Implementation Note
-/// Complex numbers require a ComplexObject type in the runtime.
-/// This is a placeholder until that type is implemented.
 pub fn builtin_complex(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
@@ -366,49 +365,44 @@ pub fn builtin_complex(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // Default values
-    let (real, imag) = match args.len() {
-        0 => (0.0_f64, 0.0_f64),
+    match args.len() {
+        0 => Ok(boxed_complex_value(0.0, 0.0)),
         1 => {
-            let r = extract_float_for_complex(&args[0], "real")?;
-            (r, 0.0)
+            if is_complex_value(args[0]) {
+                return Ok(args[0]);
+            }
+
+            let parts = extract_complex_parts(args[0], "real")?;
+            Ok(boxed_complex_value(parts.real, parts.imag))
         }
         2 => {
-            let r = extract_float_for_complex(&args[0], "real")?;
-            let i = extract_float_for_complex(&args[1], "imag")?;
-            (r, i)
+            let real = extract_complex_parts(args[0], "real")?;
+            let imag = extract_complex_parts(args[1], "imag")?;
+            Ok(boxed_complex_value(
+                real.real - imag.imag,
+                real.imag + imag.real,
+            ))
         }
         _ => unreachable!(),
-    };
-
-    // TODO: Create ComplexObject and return as Value
-    // For now, store as a tuple-like representation or placeholder
-    let _ = (real, imag);
-
-    Err(BuiltinError::NotImplemented(
-        "complex() requires ComplexObject type".to_string(),
-    ))
+    }
 }
 
-/// Extract a float value for complex number construction.
-///
-/// Accepts int, float, or bool. Returns error for other types.
 #[inline]
-fn extract_float_for_complex(val: &Value, part_name: &str) -> Result<f64, BuiltinError> {
-    if let Some(f) = val.as_float() {
-        return Ok(f);
-    }
-    if let Some(i) = val.as_int() {
-        return Ok(i as f64);
-    }
-    if let Some(b) = val.as_bool() {
-        return Ok(if b { 1.0 } else { 0.0 });
+fn boxed_complex_value(real: f64, imag: f64) -> Value {
+    let ptr = Box::into_raw(Box::new(ComplexObject::new(real, imag)));
+    Value::object_ptr(ptr as *const ())
+}
+
+#[inline]
+fn extract_complex_parts(value: Value, part_name: &str) -> Result<ComplexParts, BuiltinError> {
+    if let Some(parts) = complex_like_parts(value) {
+        return Ok(parts);
     }
 
     Err(BuiltinError::TypeError(format!(
         "complex() {} part must be a number, not '{}'",
         part_name,
-        type_name_of(val)
+        type_name_of(&value)
     )))
 }
 
@@ -969,26 +963,39 @@ mod tests {
     #[test]
     fn test_extract_float_from_int() {
         let val = Value::int(42).unwrap();
-        let result = extract_float_for_complex(&val, "test");
-        assert_eq!(result.unwrap(), 42.0);
+        let result = extract_complex_parts(val, "test");
+        assert_eq!(result.unwrap().real, 42.0);
     }
 
     #[test]
     fn test_extract_float_from_float() {
         let val = Value::float(3.14);
-        let result = extract_float_for_complex(&val, "test");
-        assert!((result.unwrap() - 3.14).abs() < 1e-10);
+        let result = extract_complex_parts(val, "test");
+        assert!((result.unwrap().real - 3.14).abs() < 1e-10);
     }
 
     #[test]
     fn test_extract_float_from_bool() {
         let val = Value::bool(true);
-        let result = extract_float_for_complex(&val, "test");
-        assert_eq!(result.unwrap(), 1.0);
+        let result = extract_complex_parts(val, "test");
+        assert_eq!(result.unwrap().real, 1.0);
 
         let val = Value::bool(false);
-        let result = extract_float_for_complex(&val, "test");
-        assert_eq!(result.unwrap(), 0.0);
+        let result = extract_complex_parts(val, "test");
+        assert_eq!(result.unwrap().real, 0.0);
+    }
+
+    #[test]
+    fn test_complex_bool_input_creates_complex_object() {
+        let value = builtin_complex(&[Value::bool(true)]).expect("complex(True) should succeed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("complex should allocate an object");
+        assert_eq!(crate::ops::objects::extract_type_id(ptr), TypeId::COMPLEX);
+
+        let complex = unsafe { &*(ptr as *const ComplexObject) };
+        assert_eq!(complex.real(), 1.0);
+        assert_eq!(complex.imag(), 0.0);
     }
 
     #[test]

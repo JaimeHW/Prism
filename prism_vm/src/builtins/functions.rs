@@ -2,21 +2,30 @@
 
 use super::BuiltinError;
 use crate::VirtualMachine;
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::python_numeric::int_like_value;
 use crate::stdlib::collections::deque::DequeObject;
+use num_bigint::Sign;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::MappingProxyObject;
 use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::int_value_to_string;
+use prism_runtime::types::int::{int_value_to_string, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::{object_ptr_as_string_ref, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 // =============================================================================
@@ -36,90 +45,26 @@ pub fn builtin_len(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let obj = args[0];
 
-    if let Some(string) = value_as_string_ref(obj) {
-        return len_to_value(string.len(), "str");
+    match exact_len(obj).map_err(super::runtime_error_to_builtin_error)? {
+        Some(len) => len_to_value(len, type_name_for_exact_len(obj)),
+        None => Err(BuiltinError::TypeError(format!(
+            "object of type '{}' has no len()",
+            value_type_name(obj)
+        ))),
+    }
+}
+
+/// VM-aware len builtin that honors the Python `__len__` protocol.
+pub fn builtin_len_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "len() takes exactly one argument ({} given)",
+            args.len()
+        )));
     }
 
-    // Heap objects (list/tuple/dict/set/str/range).
-    if let Some(ptr) = obj.as_object_ptr() {
-        use crate::ops::objects::extract_type_id;
-        let type_id = extract_type_id(ptr);
-
-        return match type_id {
-            TypeId::LIST => {
-                let list = unsafe { &*(ptr as *const ListObject) };
-                len_to_value(list.len(), "list")
-            }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                len_to_value(tuple.len(), "tuple")
-            }
-            TypeId::DICT => {
-                let dict = unsafe { &*(ptr as *const DictObject) };
-                len_to_value(dict.len(), "dict")
-            }
-            TypeId::MAPPING_PROXY => {
-                let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
-                let len = crate::builtins::builtin_mapping_proxy_len(proxy)
-                    .map_err(|err| BuiltinError::TypeError(err.to_string()))?;
-                len_to_value(len, "mappingproxy")
-            }
-            TypeId::SET => {
-                let set = unsafe { &*(ptr as *const SetObject) };
-                len_to_value(set.len(), "set")
-            }
-            TypeId::FROZENSET => {
-                let set = unsafe { &*(ptr as *const SetObject) };
-                len_to_value(set.len(), "frozenset")
-            }
-            TypeId::BYTES => {
-                let bytes = unsafe { &*(ptr as *const BytesObject) };
-                len_to_value(bytes.len(), "bytes")
-            }
-            TypeId::BYTEARRAY => {
-                let bytes = unsafe { &*(ptr as *const BytesObject) };
-                len_to_value(bytes.len(), "bytearray")
-            }
-            TypeId::DEQUE => {
-                let deque = unsafe { &*(ptr as *const DequeObject) };
-                len_to_value(deque.len(), "deque")
-            }
-            TypeId::RANGE => {
-                let range = unsafe { &*(ptr as *const RangeObject) };
-                let len = range.try_len().ok_or_else(|| {
-                    BuiltinError::OverflowError("range length overflow".to_string())
-                })?;
-                len_to_value(len, "range")
-            }
-            _ => Err(BuiltinError::TypeError(format!(
-                "object of type '{}' has no len()",
-                type_id.name()
-            ))),
-        };
-    }
-
-    if obj.is_none() {
-        return Err(BuiltinError::TypeError(
-            "object of type 'NoneType' has no len()".to_string(),
-        ));
-    }
-    if obj.is_int() {
-        return Err(BuiltinError::TypeError(
-            "object of type 'int' has no len()".to_string(),
-        ));
-    }
-    if obj.is_float() {
-        return Err(BuiltinError::TypeError(
-            "object of type 'float' has no len()".to_string(),
-        ));
-    }
-    if obj.is_bool() {
-        return Err(BuiltinError::TypeError(
-            "object of type 'bool' has no len()".to_string(),
-        ));
-    }
-
-    Err(BuiltinError::TypeError("object has no len()".to_string()))
+    let len = try_len_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
+    len_to_value(len, "object")
 }
 
 #[inline]
@@ -128,6 +73,138 @@ fn len_to_value(len: usize, type_name: &str) -> Result<Value, BuiltinError> {
         .map_err(|_| BuiltinError::OverflowError(format!("{} length overflow", type_name)))?;
     Value::int(len_i64)
         .ok_or_else(|| BuiltinError::OverflowError(format!("{} length overflow", type_name)))
+}
+
+pub(crate) fn try_len_value(vm: &mut VirtualMachine, value: Value) -> Result<usize, RuntimeError> {
+    if let Some(len) = exact_len(value)? {
+        return Ok(len);
+    }
+
+    let target = match resolve_special_method(value, "__len__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(no_len_runtime_error(value));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let len_value = invoke_zero_arg_bound_method(vm, target)?;
+    normalize_len_protocol_result(len_value)
+}
+
+#[inline]
+fn exact_len(value: Value) -> Result<Option<usize>, RuntimeError> {
+    if let Some(string) = value_as_string_ref(value) {
+        return Ok(Some(string.len()));
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(None);
+    };
+
+    use crate::ops::objects::extract_type_id;
+    if let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr) {
+        return Ok(Some(list.len()));
+    }
+    let type_id = extract_type_id(ptr);
+    match type_id {
+        TypeId::TUPLE => Ok(Some(unsafe { &*(ptr as *const TupleObject) }.len())),
+        TypeId::DICT => Ok(Some(unsafe { &*(ptr as *const DictObject) }.len())),
+        TypeId::MAPPING_PROXY => {
+            let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+            crate::builtins::builtin_mapping_proxy_len(proxy)
+                .map(Some)
+                .map_err(|err| RuntimeError::type_error(err.to_string()))
+        }
+        TypeId::SET | TypeId::FROZENSET => Ok(Some(unsafe { &*(ptr as *const SetObject) }.len())),
+        TypeId::BYTES | TypeId::BYTEARRAY => {
+            Ok(Some(unsafe { &*(ptr as *const BytesObject) }.len()))
+        }
+        TypeId::DEQUE => Ok(Some(unsafe { &*(ptr as *const DequeObject) }.len())),
+        TypeId::RANGE => {
+            let range = unsafe { &*(ptr as *const RangeObject) };
+            range
+                .try_len()
+                .ok_or_else(|| {
+                    RuntimeError::new(RuntimeErrorKind::OverflowError {
+                        message: "range length overflow".into(),
+                    })
+                })
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[inline]
+fn type_name_for_exact_len(value: Value) -> &'static str {
+    if value.is_string() {
+        return "str";
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return value_type_name(value);
+    };
+
+    if crate::ops::objects::list_storage_ref_from_ptr(ptr).is_some() {
+        return "list";
+    }
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::TUPLE => "tuple",
+        TypeId::DICT => "dict",
+        TypeId::MAPPING_PROXY => "mappingproxy",
+        TypeId::SET => "set",
+        TypeId::FROZENSET => "frozenset",
+        TypeId::BYTES => "bytes",
+        TypeId::BYTEARRAY => "bytearray",
+        TypeId::DEQUE => "deque",
+        TypeId::RANGE => "range",
+        other => other.name(),
+    }
+}
+
+#[inline]
+fn no_len_runtime_error(value: Value) -> RuntimeError {
+    RuntimeError::type_error(format!(
+        "object of type '{}' has no len()",
+        value_type_name(value)
+    ))
+}
+
+#[inline]
+fn invoke_zero_arg_bound_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, RuntimeError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+}
+
+#[inline]
+fn normalize_len_protocol_result(value: Value) -> Result<usize, RuntimeError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(usize::from(flag));
+    }
+
+    if let Some(length) = value_to_bigint(value) {
+        if length.sign() == Sign::Minus {
+            return Err(RuntimeError::value_error("__len__() should return >= 0"));
+        }
+
+        return length.to_usize().ok_or_else(|| {
+            RuntimeError::new(RuntimeErrorKind::OverflowError {
+                message: "cannot fit 'int' into an index-sized integer".into(),
+            })
+        });
+    }
+
+    Err(RuntimeError::type_error(format!(
+        "'{}' object cannot be interpreted as an integer",
+        value_type_name(value)
+    )))
 }
 
 // =============================================================================
@@ -147,7 +224,7 @@ pub fn builtin_abs(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let arg = args[0];
 
-    if let Some(i) = arg.as_int() {
+    if let Some(i) = int_like_value(arg) {
         return Value::int(i.abs()).ok_or_else(|| {
             BuiltinError::OverflowError("integer absolute value overflow".to_string())
         });
@@ -166,74 +243,364 @@ pub fn builtin_abs(args: &[Value]) -> Result<Value, BuiltinError> {
 // min / max
 // =============================================================================
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtremumKind {
+    Min,
+    Max,
+}
+
+impl ExtremumKind {
+    #[inline]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+
+    #[inline]
+    fn should_replace(self, ordering: Ordering) -> bool {
+        match self {
+            Self::Min => ordering == Ordering::Less,
+            Self::Max => ordering == Ordering::Greater,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ExtremumOptions {
+    default: Option<Value>,
+    key: Option<Value>,
+}
+
 /// Builtin min function.
 ///
 /// Returns the smallest item in an iterable or the smallest of two or more arguments.
 pub fn builtin_min(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.is_empty() {
-        return Err(BuiltinError::TypeError(
-            "min expected at least 1 argument, got 0".to_string(),
-        ));
-    }
-
-    let mut min_val = args[0];
-
-    for arg in &args[1..] {
-        // Compare integers
-        if let (Some(a), Some(b)) = (arg.as_int(), min_val.as_int()) {
-            if a < b {
-                min_val = *arg;
-            }
-            continue;
-        }
-
-        // Compare floats
-        if let (Some(a), Some(b)) = (arg.as_float_coerce(), min_val.as_float_coerce()) {
-            if a < b {
-                min_val = *arg;
-            }
-            continue;
-        }
-
-        // TODO: Support comparison protocol for objects
-    }
-
-    Ok(min_val)
+    select_extreme_without_vm(args, ExtremumKind::Min)
 }
 
 /// Builtin max function.
 ///
 /// Returns the largest item in an iterable or the largest of two or more arguments.
 pub fn builtin_max(args: &[Value]) -> Result<Value, BuiltinError> {
+    select_extreme_without_vm(args, ExtremumKind::Max)
+}
+
+/// VM-aware builtin min implementation with CPython-compatible keyword handling.
+pub fn builtin_min_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    select_extreme_with_vm(vm, args, keywords, ExtremumKind::Min)
+}
+
+/// VM-aware builtin max implementation with CPython-compatible keyword handling.
+pub fn builtin_max_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    select_extreme_with_vm(vm, args, keywords, ExtremumKind::Max)
+}
+
+fn select_extreme_without_vm(args: &[Value], kind: ExtremumKind) -> Result<Value, BuiltinError> {
     if args.is_empty() {
-        return Err(BuiltinError::TypeError(
-            "max expected at least 1 argument, got 0".to_string(),
-        ));
+        return Err(BuiltinError::TypeError(format!(
+            "{} expected at least 1 argument, got 0",
+            kind.name()
+        )));
     }
 
-    let mut max_val = args[0];
+    if args.len() == 1 {
+        let mut iterator = super::iter_dispatch::value_to_iterator(&args[0])?;
+        let Some(mut best) = iterator.next() else {
+            return Err(BuiltinError::ValueError(format!(
+                "{}() arg is an empty sequence",
+                kind.name()
+            )));
+        };
 
-    for arg in &args[1..] {
-        // Compare integers
-        if let (Some(a), Some(b)) = (arg.as_int(), max_val.as_int()) {
-            if a > b {
-                max_val = *arg;
+        while let Some(candidate) = iterator.next() {
+            let ordering = compare_extreme_values(candidate, best)?;
+            if kind.should_replace(ordering) {
+                best = candidate;
             }
-            continue;
         }
 
-        // Compare floats
-        if let (Some(a), Some(b)) = (arg.as_float_coerce(), max_val.as_float_coerce()) {
-            if a > b {
-                max_val = *arg;
-            }
-            continue;
-        }
-
-        // TODO: Support comparison protocol for objects
+        return Ok(best);
     }
 
-    Ok(max_val)
+    let mut best = args[0];
+    for &candidate in &args[1..] {
+        let ordering = compare_extreme_values(candidate, best)?;
+        if kind.should_replace(ordering) {
+            best = candidate;
+        }
+    }
+    Ok(best)
+}
+
+fn select_extreme_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    kind: ExtremumKind,
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "{} expected at least 1 argument, got 0",
+            kind.name()
+        )));
+    }
+
+    let options = parse_extremum_keywords(kind, args.len(), keywords)?;
+
+    if args.len() == 1 {
+        return select_extreme_from_iterable(vm, args[0], options, kind);
+    }
+
+    select_extreme_from_slice(vm, args, options, kind)
+}
+
+fn parse_extremum_keywords(
+    kind: ExtremumKind,
+    positional_count: usize,
+    keywords: &[(&str, Value)],
+) -> Result<ExtremumOptions, BuiltinError> {
+    let mut options = ExtremumOptions::default();
+    let mut default_seen = false;
+    let mut key_seen = false;
+
+    for (name, value) in keywords {
+        match *name {
+            "default" => {
+                if default_seen {
+                    return Err(BuiltinError::TypeError(format!(
+                        "{}() got multiple values for keyword argument 'default'",
+                        kind.name()
+                    )));
+                }
+                options.default = Some(*value);
+                default_seen = true;
+            }
+            "key" => {
+                if key_seen {
+                    return Err(BuiltinError::TypeError(format!(
+                        "{}() got multiple values for keyword argument 'key'",
+                        kind.name()
+                    )));
+                }
+                if !value.is_none() {
+                    options.key = Some(*value);
+                }
+                key_seen = true;
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{}() got an unexpected keyword argument '{}'",
+                    kind.name(),
+                    other
+                )));
+            }
+        }
+    }
+
+    if positional_count > 1 && options.default.is_some() {
+        return Err(BuiltinError::TypeError(format!(
+            "Cannot specify a default for {}() with multiple positional arguments",
+            kind.name()
+        )));
+    }
+
+    Ok(options)
+}
+
+fn select_extreme_from_iterable(
+    vm: &mut VirtualMachine,
+    iterable: Value,
+    options: ExtremumOptions,
+    kind: ExtremumKind,
+) -> Result<Value, BuiltinError> {
+    let iterator =
+        ensure_iterator_value(vm, iterable).map_err(super::runtime_error_to_builtin_error)?;
+    let Some((mut best_value, mut best_key)) = next_extreme_candidate(vm, iterator, options.key)?
+    else {
+        return options.default.ok_or_else(|| {
+            BuiltinError::ValueError(format!("{}() arg is an empty sequence", kind.name()))
+        });
+    };
+
+    loop {
+        let Some((candidate_value, candidate_key)) =
+            next_extreme_candidate(vm, iterator, options.key)?
+        else {
+            return Ok(best_value);
+        };
+
+        let ordering = compare_extreme_values_with_vm(vm, candidate_key, best_key)?;
+        if kind.should_replace(ordering) {
+            best_value = candidate_value;
+            best_key = candidate_key;
+        }
+    }
+}
+
+fn select_extreme_from_slice(
+    vm: &mut VirtualMachine,
+    values: &[Value],
+    options: ExtremumOptions,
+    kind: ExtremumKind,
+) -> Result<Value, BuiltinError> {
+    let mut best_value = values[0];
+    let mut best_key = apply_extremum_key(vm, options.key, best_value)?;
+
+    for &candidate_value in &values[1..] {
+        let candidate_key = apply_extremum_key(vm, options.key, candidate_value)?;
+        let ordering = compare_extreme_values_with_vm(vm, candidate_key, best_key)?;
+        if kind.should_replace(ordering) {
+            best_value = candidate_value;
+            best_key = candidate_key;
+        }
+    }
+
+    Ok(best_value)
+}
+
+fn next_extreme_candidate(
+    vm: &mut VirtualMachine,
+    iterator: Value,
+    key: Option<Value>,
+) -> Result<Option<(Value, Value)>, BuiltinError> {
+    match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
+        IterStep::Yielded(value) => {
+            let key_value = apply_extremum_key(vm, key, value)?;
+            Ok(Some((value, key_value)))
+        }
+        IterStep::Exhausted => Ok(None),
+    }
+}
+
+#[inline]
+fn apply_extremum_key(
+    vm: &mut VirtualMachine,
+    key: Option<Value>,
+    value: Value,
+) -> Result<Value, BuiltinError> {
+    match key {
+        Some(key_func) => invoke_callable_value(vm, key_func, &[value])
+            .map_err(super::runtime_error_to_builtin_error),
+        None => Ok(value),
+    }
+}
+
+#[inline]
+fn compare_extreme_values(left: Value, right: Value) -> Result<Ordering, BuiltinError> {
+    primitive_extreme_ordering(left, right).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "'<' not supported between instances of '{}' and '{}'",
+            left.type_name(),
+            right.type_name()
+        ))
+    })
+}
+
+#[inline]
+fn compare_extreme_values_with_vm(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Ordering, BuiltinError> {
+    if let Some(ordering) = primitive_extreme_ordering(left, right) {
+        return Ok(ordering);
+    }
+
+    let left_lt = rich_extremum_lt(vm, left, right)?;
+    if left_lt == Some(true) {
+        return Ok(Ordering::Less);
+    }
+
+    let right_lt = rich_extremum_lt(vm, right, left)?;
+    if right_lt == Some(true) {
+        return Ok(Ordering::Greater);
+    }
+
+    if left_lt.is_none() && right_lt.is_none() {
+        return Err(BuiltinError::TypeError(format!(
+            "'<' not supported between instances of '{}' and '{}'",
+            left.type_name(),
+            right.type_name()
+        )));
+    }
+
+    Ok(Ordering::Equal)
+}
+
+#[inline]
+fn primitive_extreme_ordering(left: Value, right: Value) -> Option<Ordering> {
+    if left == right {
+        return Some(Ordering::Equal);
+    }
+
+    let left_numeric = numeric_extreme_key(left);
+    let right_numeric = numeric_extreme_key(right);
+    if let (Some(left), Some(right)) = (left_numeric, right_numeric) {
+        return left.partial_cmp(&right);
+    }
+
+    match (value_as_string_ref(left), value_as_string_ref(right)) {
+        (Some(left), Some(right)) => Some(left.as_str().cmp(right.as_str())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn numeric_extreme_key(value: Value) -> Option<f64> {
+    if let Some(boolean) = value.as_bool() {
+        return Some(if boolean { 1.0 } else { 0.0 });
+    }
+    if let Some(integer) = value.as_int() {
+        return Some(integer as f64);
+    }
+    value.as_float()
+}
+
+#[inline]
+fn rich_extremum_lt(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Option<bool>, BuiltinError> {
+    match resolve_special_method(left, "__lt__") {
+        Ok(target) => {
+            let result = invoke_extremum_comparison_method(vm, target, right)?;
+            if result == super::builtin_not_implemented_value() {
+                return Ok(None);
+            }
+            crate::truthiness::try_is_truthy(vm, result)
+                .map(Some)
+                .map_err(super::runtime_error_to_builtin_error)
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => Ok(None),
+        Err(err) => Err(super::runtime_error_to_builtin_error(err)),
+    }
+}
+
+#[inline]
+fn invoke_extremum_comparison_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    operand: Value,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => {
+            invoke_callable_value(vm, target.callable, &[implicit_self, operand])
+                .map_err(super::runtime_error_to_builtin_error)
+        }
+        None => invoke_callable_value(vm, target.callable, &[operand])
+            .map_err(super::runtime_error_to_builtin_error),
+    }
 }
 
 // =============================================================================
@@ -853,6 +1220,20 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
 
 const MAX_REPR_DEPTH: usize = 12;
 
+fn repr_list_like(list: &ListObject, depth: usize) -> Result<String, BuiltinError> {
+    let mut out = String::from("[");
+    let mut first = true;
+    for item in list.iter() {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(&repr_value(*item, depth + 1)?);
+    }
+    out.push(']');
+    Ok(out)
+}
+
 fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
     if depth >= MAX_REPR_DEPTH {
         return Ok("...".to_string());
@@ -884,6 +1265,9 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
     let ptr = value
         .as_object_ptr()
         .ok_or_else(|| BuiltinError::TypeError("invalid object reference".to_string()))?;
+    if let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr) {
+        return repr_list_like(list, depth);
+    }
     let type_id = crate::ops::objects::extract_type_id(ptr);
     match type_id {
         TypeId::BYTES => {
@@ -896,20 +1280,6 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
                 "bytearray({})",
                 quote_python_bytes(bytes.as_bytes())
             ))
-        }
-        TypeId::LIST => {
-            let list = unsafe { &*(ptr as *const ListObject) };
-            let mut out = String::from("[");
-            let mut first = true;
-            for item in list.iter() {
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                out.push_str(&repr_value(*item, depth + 1)?);
-            }
-            out.push(']');
-            Ok(out)
         }
         TypeId::TUPLE => {
             let tuple = unsafe { &*(ptr as *const TupleObject) };
@@ -966,6 +1336,10 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
             let range = unsafe { &*(ptr as *const RangeObject) };
             Ok(range.to_string())
         }
+        TypeId::COMPLEX => {
+            let complex = unsafe { &*(ptr as *const ComplexObject) };
+            Ok(complex.to_string())
+        }
         TypeId::EXCEPTION => {
             let exception = unsafe { crate::builtins::ExceptionValue::from_value(value) }
                 .ok_or_else(|| BuiltinError::TypeError("invalid exception object".to_string()))?;
@@ -989,7 +1363,9 @@ fn quote_python_string(input: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&escape_char(c)),
+            c if c.is_control() || is_surrogate_carrier(c as u32) => {
+                out.push_str(&escape_char(c));
+            }
             c => out.push(c),
         }
     }
@@ -1044,14 +1420,7 @@ fn escape_non_ascii(input: &str) -> String {
 
 #[inline]
 fn escape_char(ch: char) -> String {
-    let code = ch as u32;
-    if code <= 0xFF {
-        format!("\\x{:02x}", code)
-    } else if code <= 0xFFFF {
-        format!("\\u{:04x}", code)
-    } else {
-        format!("\\U{:08x}", code)
-    }
+    python_char_escape(ch)
 }
 
 // =============================================================================
@@ -1065,6 +1434,7 @@ mod tests {
     use crate::builtins::itertools::{builtin_iter, builtin_next};
     use crate::import::ModuleObject;
     use prism_core::intern::intern;
+    use prism_core::python_unicode::encode_python_code_point;
     use prism_core::value::SMALL_INT_MAX;
     use prism_runtime::object::ObjectHeader;
     use prism_runtime::object::class::PyClassObject;
@@ -1234,6 +1604,13 @@ mod tests {
     }
 
     #[test]
+    fn test_abs_bool_returns_int_result() {
+        let result = builtin_abs(&[Value::bool(true)]).unwrap();
+        assert_eq!(result.as_int(), Some(1));
+        assert!(!result.is_bool());
+    }
+
+    #[test]
     fn test_abs_float() {
         let result = builtin_abs(&[Value::float(-3.14)]).unwrap();
         assert_eq!(result.as_float(), Some(3.14));
@@ -1265,6 +1642,70 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(result.as_int(), Some(8));
+    }
+
+    #[test]
+    fn test_max_iterable_uses_elements_instead_of_returning_the_iterable() {
+        let list = ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_max(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(3));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_max_iterable_supports_string_ordering() {
+        let values = SetObject::from_slice(&[
+            Value::string(intern("a")),
+            Value::string(intern("c")),
+            Value::string(intern("b")),
+        ]);
+        let (value, ptr) = boxed_value(values);
+        let result = builtin_max(&[value]).unwrap();
+        assert_eq!(value_as_string_ref(result).unwrap().as_str(), "c");
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_max_vm_supports_default_for_empty_iterable() {
+        let mut vm = VirtualMachine::new();
+        let list = ListObject::from_slice(&[]);
+        let (value, ptr) = boxed_value(list);
+        let fallback = Value::int(99).unwrap();
+        let result = builtin_max_vm_kw(&mut vm, &[value], &[("default", fallback)]).unwrap();
+        assert_eq!(result.as_int(), Some(99));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_max_vm_rejects_default_with_multiple_positional_arguments() {
+        let mut vm = VirtualMachine::new();
+        let error = builtin_max_vm_kw(
+            &mut vm,
+            &[Value::int(1).unwrap(), Value::int(2).unwrap()],
+            &[("default", Value::int(3).unwrap())],
+        )
+        .unwrap_err();
+        assert!(matches!(error, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_max_vm_honors_key_keyword() {
+        let mut vm = VirtualMachine::new();
+        let result = builtin_max_vm_kw(
+            &mut vm,
+            &[Value::int(0).unwrap(), Value::int(7).unwrap()],
+            &[(
+                "key",
+                crate::builtins::builtin_type_object_for_type_id(TypeId::BOOL),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result.as_int(), Some(7));
     }
 
     #[test]
@@ -1514,6 +1955,22 @@ mod tests {
     }
 
     #[test]
+    fn test_repr_and_ascii_escape_internal_surrogate_carriers_as_python_surrogates() {
+        let surrogate =
+            encode_python_code_point(0xDC80).expect("surrogate should map into carrier range");
+        let text = format!("A{surrogate}");
+        let (value, ptr) = boxed_value(StringObject::from_string(text));
+
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[value]).unwrap());
+        assert_eq!(repr, "'A\\udc80'");
+
+        let ascii = tagged_string_value_to_rust_string(builtin_ascii(&[value]).unwrap());
+        assert_eq!(ascii, "'A\\udc80'");
+
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
     fn test_repr_containers() {
         let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
         let (list_value, list_ptr) = boxed_value(list);
@@ -1548,6 +2005,14 @@ mod tests {
         let repr = tagged_string_value_to_rust_string(builtin_repr(&[range_value]).unwrap());
         assert_eq!(repr, "range(1, 6, 2)");
         unsafe { drop_boxed(range_ptr) };
+    }
+
+    #[test]
+    fn test_repr_complex_object() {
+        let (complex_value, complex_ptr) = boxed_value(ComplexObject::new(1.0, 0.0));
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[complex_value]).unwrap());
+        assert_eq!(repr, "(1+0j)");
+        unsafe { drop_boxed(complex_ptr) };
     }
 
     #[test]

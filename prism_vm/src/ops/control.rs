@@ -50,28 +50,30 @@ pub fn jump(_vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// JumpIfFalse: jump if register is falsy
 #[inline(always)]
 pub fn jump_if_false(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let value = frame.get_reg(inst.dst().0);
+    let value = vm.current_frame().get_reg(inst.dst().0);
 
-    if !crate::truthiness::is_truthy(value) {
-        let offset = inst.imm16() as i16;
-        ControlFlow::Jump(offset)
-    } else {
-        ControlFlow::Continue
+    match crate::truthiness::try_is_truthy(vm, value) {
+        Ok(false) => {
+            let offset = inst.imm16() as i16;
+            ControlFlow::Jump(offset)
+        }
+        Ok(true) => ControlFlow::Continue,
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
 /// JumpIfTrue: jump if register is truthy
 #[inline(always)]
 pub fn jump_if_true(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let value = frame.get_reg(inst.dst().0);
+    let value = vm.current_frame().get_reg(inst.dst().0);
 
-    if crate::truthiness::is_truthy(value) {
-        let offset = inst.imm16() as i16;
-        ControlFlow::Jump(offset)
-    } else {
-        ControlFlow::Continue
+    match crate::truthiness::try_is_truthy(vm, value) {
+        Ok(true) => {
+            let offset = inst.imm16() as i16;
+            ControlFlow::Jump(offset)
+        }
+        Ok(false) => ControlFlow::Continue,
+        Err(err) => ControlFlow::Error(err),
     }
 }
 

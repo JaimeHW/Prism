@@ -222,15 +222,14 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
         return Ok(IteratorObject::from_string_chars(*value));
     }
 
+    if prism_runtime::types::list::value_as_list_ref(*value).is_some() {
+        return Ok(IteratorObject::from_list(*value));
+    }
+
     // Fast path: Check if already an iterator
     if let Some(type_id) = get_type_id(value) {
         if type_id == TypeId::ITERATOR {
-            // Already an iterator - just return a clone of iterator state
-            // In practice we need to handle this carefully for mutability
-            // For now, return error - iter(iterator) should return same iterator
-            return Err(IterError::NotIterable(
-                "iter() of iterator not yet supported".into(),
-            ));
+            return Ok(IteratorObject::from_existing_iterator(*value));
         }
     }
 
@@ -246,11 +245,6 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
 
     // TypeId-based dispatch (jump table optimization)
     match type_id {
-        TypeId::LIST => value
-            .as_object_ptr()
-            .ok_or(IterError::InvalidObject)
-            .map(|_| IteratorObject::from_list(*value)),
-
         TypeId::TUPLE => value
             .as_object_ptr()
             .ok_or(IterError::InvalidObject)
@@ -1082,6 +1076,29 @@ mod tests {
         // Verify we can get the iterator back
         let iter_obj = get_iterator_mut(&iter_value);
         assert!(iter_obj.is_some());
+    }
+
+    #[test]
+    fn test_value_to_iterator_accepts_iterator_values() {
+        let list = ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let list_value = Value::object_ptr(ptr);
+
+        let iter_value = iterator_to_value(value_to_iterator(&list_value).unwrap());
+        let mut proxy =
+            value_to_iterator(&iter_value).expect("iterator values should remain iterable");
+
+        assert_eq!(proxy.next().unwrap().as_int(), Some(1));
+        assert_eq!(proxy.next().unwrap().as_int(), Some(2));
+
+        let underlying =
+            get_iterator_mut(&iter_value).expect("iterator value should remain mutable");
+        assert_eq!(underlying.next().unwrap().as_int(), Some(3));
+        assert!(proxy.next().is_none());
     }
 
     #[test]

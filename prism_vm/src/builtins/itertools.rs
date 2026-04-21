@@ -248,6 +248,35 @@ pub fn builtin_enumerate(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(super::iter_dispatch::iterator_to_value(enumerate))
 }
 
+/// VM-aware enumerate builtin.
+pub fn builtin_enumerate_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "enumerate expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let start = if args.len() == 2 {
+        args[1].as_int().ok_or_else(|| {
+            BuiltinError::TypeError("'start' argument must be an integer".to_string())
+        })?
+    } else {
+        0
+    };
+
+    let iterator =
+        ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
+    let enumerate = prism_runtime::types::iter::IteratorObject::enumerate(
+        prism_runtime::types::iter::IteratorObject::from_existing_iterator(iterator),
+        start,
+    );
+    Ok(super::iter_dispatch::iterator_to_value(enumerate))
+}
+
 // =============================================================================
 // zip
 // =============================================================================
@@ -641,7 +670,9 @@ pub fn builtin_all_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     loop {
         match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
             IterStep::Yielded(value) => {
-                if !crate::truthiness::is_truthy(value) {
+                if !crate::truthiness::try_is_truthy(vm, value)
+                    .map_err(super::runtime_error_to_builtin_error)?
+                {
                     return Ok(Value::bool(false));
                 }
             }
@@ -704,7 +735,9 @@ pub fn builtin_any_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     loop {
         match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
             IterStep::Yielded(value) => {
-                if crate::truthiness::is_truthy(value) {
+                if crate::truthiness::try_is_truthy(vm, value)
+                    .map_err(super::runtime_error_to_builtin_error)?
+                {
                     return Ok(Value::bool(true));
                 }
             }
@@ -721,8 +754,19 @@ pub fn builtin_any_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
 mod tests {
     use super::*;
     use crate::builtins::iter_dispatch;
+    use prism_compiler::Compiler;
+    use prism_parser::parse;
     use prism_runtime::types::int::{bigint_to_value, value_to_i64};
     use prism_runtime::types::list::ListObject;
+    use prism_runtime::types::tuple::TupleObject;
+    use std::sync::Arc;
+
+    fn execute(source: &str) -> Result<Value, String> {
+        let module = parse(source).map_err(|err| format!("parse error: {err:?}"))?;
+        let code = Compiler::compile_module(&module, "<itertools-test>")
+            .map_err(|err| format!("compile error: {err:?}"))?;
+        crate::run(Arc::new(code)).map_err(|err| format!("runtime error: {err:?}"))
+    }
 
     #[test]
     fn test_range_validation() {
@@ -813,6 +857,51 @@ mod tests {
 
         let result = builtin_all(&[value]).unwrap();
         assert!(!result.as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_filter_accepts_iterator_input() {
+        let list = ListObject::from_slice(&[
+            Value::int(0).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]);
+        let ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let iterator = builtin_iter(&[Value::object_ptr(ptr)]).expect("iter(list) should succeed");
+        let filter = builtin_filter(&[Value::none(), iterator])
+            .expect("filter should accept iterator inputs");
+        let mut filter =
+            iter_dispatch::get_iterator_mut(&filter).expect("filter should return iterator");
+
+        assert_eq!(filter.next().unwrap().as_int(), Some(1));
+        assert_eq!(filter.next().unwrap().as_int(), Some(2));
+        assert!(filter.next().is_none());
+    }
+
+    #[test]
+    fn test_enumerate_accepts_iterator_input() {
+        let list = ListObject::from_slice(&[Value::int(7).unwrap(), Value::int(8).unwrap()]);
+        let ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let iterator = builtin_iter(&[Value::object_ptr(ptr)]).expect("iter(list) should succeed");
+        let enumerate =
+            builtin_enumerate(&[iterator]).expect("enumerate should accept iterator inputs");
+        let mut enumerate =
+            iter_dispatch::get_iterator_mut(&enumerate).expect("enumerate should return iterator");
+
+        let first = enumerate.next().unwrap();
+        let first_ptr = first.as_object_ptr().expect("enumerate should yield tuple");
+        let first = unsafe { &*(first_ptr as *const TupleObject) };
+        assert_eq!(first.get(0).unwrap().as_int(), Some(0));
+        assert_eq!(first.get(1).unwrap().as_int(), Some(7));
+
+        let second = enumerate.next().unwrap();
+        let second_ptr = second
+            .as_object_ptr()
+            .expect("enumerate should yield tuple");
+        let second = unsafe { &*(second_ptr as *const TupleObject) };
+        assert_eq!(second.get(0).unwrap().as_int(), Some(1));
+        assert_eq!(second.get(1).unwrap().as_int(), Some(8));
+        assert!(enumerate.next().is_none());
     }
 
     #[test]
@@ -970,6 +1059,58 @@ mod tests {
         // Non-integer start should error
         let result = builtin_enumerate(&[value, Value::float(1.5)]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_enumerate_vm_supports_user_defined_iterables() {
+        let result = execute(
+            r#"
+class Iterable:
+    def __iter__(self):
+        return iter((10, 20))
+
+it = enumerate(Iterable(), 4)
+assert next(it) == (4, 10)
+assert next(it) == (5, 20)
+try:
+    next(it)
+except StopIteration:
+    pass
+else:
+    raise AssertionError("enumerate should stop")
+"#,
+        );
+
+        assert!(
+            result.is_ok(),
+            "enumerate should honor __iter__ protocol: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_enumerate_vm_supports_generator_inputs() {
+        let result = execute(
+            r#"
+def numbers():
+    yield 1
+    yield 2
+
+it = enumerate(numbers(), 9)
+assert next(it) == (9, 1)
+assert next(it) == (10, 2)
+try:
+    next(it)
+except StopIteration:
+    pass
+else:
+    raise AssertionError("generator-backed enumerate should stop")
+"#,
+        );
+
+        assert!(
+            result.is_ok(),
+            "enumerate should preserve lazy generator iteration: {result:?}"
+        );
     }
 
     // -------------------------------------------------------------------------

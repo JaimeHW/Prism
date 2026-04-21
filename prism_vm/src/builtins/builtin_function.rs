@@ -13,11 +13,16 @@ use std::sync::Arc;
 /// Type alias for builtin function pointers (mirrors mod.rs).
 type BuiltinFnPtr = fn(&[Value]) -> Result<Value, super::BuiltinError>;
 type VmBuiltinFnPtr = fn(&mut VirtualMachine, &[Value]) -> Result<Value, super::BuiltinError>;
+type BuiltinKwFnPtr = fn(&[Value], &[(&str, Value)]) -> Result<Value, super::BuiltinError>;
+type VmBuiltinKwFnPtr =
+    fn(&mut VirtualMachine, &[Value], &[(&str, Value)]) -> Result<Value, super::BuiltinError>;
 
 #[derive(Clone, Copy)]
 enum BuiltinCallable {
     Stateless(BuiltinFnPtr),
     WithVm(VmBuiltinFnPtr),
+    WithKeywords(BuiltinKwFnPtr),
+    WithVmAndKeywords(VmBuiltinKwFnPtr),
 }
 
 /// A builtin function object.
@@ -57,6 +62,26 @@ impl BuiltinFunctionObject {
         }
     }
 
+    /// Create a builtin function object that accepts keyword arguments.
+    pub fn new_kw(name: Arc<str>, func: BuiltinKwFnPtr) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::BUILTIN_FUNCTION),
+            name,
+            func: BuiltinCallable::WithKeywords(func),
+            bound_self: None,
+        }
+    }
+
+    /// Create a VM-aware builtin function object that accepts keyword arguments.
+    pub fn new_vm_kw(name: Arc<str>, func: VmBuiltinKwFnPtr) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::BUILTIN_FUNCTION),
+            name,
+            func: BuiltinCallable::WithVmAndKeywords(func),
+            bound_self: None,
+        }
+    }
+
     /// Create a builtin function object already bound to a receiver.
     pub fn new_bound(name: Arc<str>, func: BuiltinFnPtr, bound_self: Value) -> Self {
         Self {
@@ -77,6 +102,26 @@ impl BuiltinFunctionObject {
         }
     }
 
+    /// Create a keyword-aware builtin function object already bound to a receiver.
+    pub fn new_bound_kw(name: Arc<str>, func: BuiltinKwFnPtr, bound_self: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::BUILTIN_FUNCTION),
+            name,
+            func: BuiltinCallable::WithKeywords(func),
+            bound_self: Some(bound_self),
+        }
+    }
+
+    /// Create a VM-aware keyword-aware builtin function object already bound to a receiver.
+    pub fn new_bound_vm_kw(name: Arc<str>, func: VmBuiltinKwFnPtr, bound_self: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::BUILTIN_FUNCTION),
+            name,
+            func: BuiltinCallable::WithVmAndKeywords(func),
+            bound_self: Some(bound_self),
+        }
+    }
+
     /// Bind this builtin function to a receiver.
     pub fn bind(&self, bound_self: Value) -> Self {
         match self.func {
@@ -86,13 +131,19 @@ impl BuiltinFunctionObject {
             BuiltinCallable::WithVm(func) => {
                 Self::new_bound_vm(Arc::clone(&self.name), func, bound_self)
             }
+            BuiltinCallable::WithKeywords(func) => {
+                Self::new_bound_kw(Arc::clone(&self.name), func, bound_self)
+            }
+            BuiltinCallable::WithVmAndKeywords(func) => {
+                Self::new_bound_vm_kw(Arc::clone(&self.name), func, bound_self)
+            }
         }
     }
 
     /// Call the builtin function with arguments.
     #[inline]
     pub fn call(&self, args: &[Value]) -> Result<Value, super::BuiltinError> {
-        self.call_impl(None, args)
+        self.call_impl(None, args, &[])
     }
 
     /// Call the builtin function with VM context.
@@ -102,7 +153,37 @@ impl BuiltinFunctionObject {
         vm: &mut VirtualMachine,
         args: &[Value],
     ) -> Result<Value, super::BuiltinError> {
-        self.call_impl(Some(vm), args)
+        self.call_impl(Some(vm), args, &[])
+    }
+
+    /// Call the builtin function with keyword arguments.
+    #[inline]
+    pub fn call_with_keywords(
+        &self,
+        args: &[Value],
+        keywords: &[(&str, Value)],
+    ) -> Result<Value, super::BuiltinError> {
+        self.call_impl(None, args, keywords)
+    }
+
+    /// Call the builtin function with VM context and keyword arguments.
+    #[inline]
+    pub fn call_with_vm_and_keywords(
+        &self,
+        vm: &mut VirtualMachine,
+        args: &[Value],
+        keywords: &[(&str, Value)],
+    ) -> Result<Value, super::BuiltinError> {
+        self.call_impl(Some(vm), args, keywords)
+    }
+
+    /// Return whether this builtin can accept keyword arguments directly.
+    #[inline]
+    pub fn accepts_keywords(&self) -> bool {
+        matches!(
+            self.func,
+            BuiltinCallable::WithKeywords(_) | BuiltinCallable::WithVmAndKeywords(_)
+        )
     }
 
     #[inline]
@@ -110,15 +191,16 @@ impl BuiltinFunctionObject {
         &self,
         vm: Option<&mut VirtualMachine>,
         args: &[Value],
+        keywords: &[(&str, Value)],
     ) -> Result<Value, super::BuiltinError> {
         if let Some(bound_self) = self.bound_self {
             let mut bound_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
             bound_args.push(bound_self);
             bound_args.extend_from_slice(args);
-            return self.invoke(vm, &bound_args);
+            return self.invoke(vm, &bound_args, keywords);
         }
 
-        self.invoke(vm, args)
+        self.invoke(vm, args, keywords)
     }
 
     #[inline]
@@ -126,10 +208,26 @@ impl BuiltinFunctionObject {
         &self,
         vm: Option<&mut VirtualMachine>,
         args: &[Value],
+        keywords: &[(&str, Value)],
     ) -> Result<Value, super::BuiltinError> {
         match self.func {
-            BuiltinCallable::Stateless(func) => func(args),
+            BuiltinCallable::Stateless(func) => {
+                if keywords.is_empty() {
+                    func(args)
+                } else {
+                    Err(super::BuiltinError::TypeError(format!(
+                        "builtin '{}' does not accept keyword arguments",
+                        self.name
+                    )))
+                }
+            }
             BuiltinCallable::WithVm(func) => {
+                if !keywords.is_empty() {
+                    return Err(super::BuiltinError::TypeError(format!(
+                        "builtin '{}' does not accept keyword arguments",
+                        self.name
+                    )));
+                }
                 let Some(vm) = vm else {
                     return Err(super::BuiltinError::TypeError(format!(
                         "builtin '{}' requires VM context",
@@ -137,6 +235,16 @@ impl BuiltinFunctionObject {
                     )));
                 };
                 func(vm, args)
+            }
+            BuiltinCallable::WithKeywords(func) => func(args, keywords),
+            BuiltinCallable::WithVmAndKeywords(func) => {
+                let Some(vm) = vm else {
+                    return Err(super::BuiltinError::TypeError(format!(
+                        "builtin '{}' requires VM context",
+                        self.name
+                    )));
+                };
+                func(vm, args, keywords)
             }
         }
     }
@@ -176,6 +284,13 @@ mod tests {
         args: &[Value],
     ) -> Result<Value, super::super::BuiltinError> {
         Ok(Value::int(args.len() as i64).unwrap())
+    }
+
+    fn dummy_kw_builtin(
+        args: &[Value],
+        keywords: &[(&str, Value)],
+    ) -> Result<Value, super::super::BuiltinError> {
+        Ok(Value::int((args.len() + keywords.len()) as i64).unwrap())
     }
 
     #[test]
@@ -233,5 +348,25 @@ mod tests {
             .call_with_vm(&mut vm, &[Value::int(20).unwrap(), Value::int(30).unwrap()])
             .expect("vm-aware bound builtin should execute");
         assert_eq!(result.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_keyword_builtin_accepts_keywords_and_binding() {
+        let func = BuiltinFunctionObject::new_kw(Arc::from("capture.kw"), dummy_kw_builtin);
+        assert!(func.accepts_keywords());
+
+        let result = func
+            .call_with_keywords(
+                &[Value::int(1).unwrap()],
+                &[("name", Value::int(2).unwrap())],
+            )
+            .expect("keyword-aware builtin should execute");
+        assert_eq!(result.as_int(), Some(2));
+
+        let bound = func.bind(Value::int(10).unwrap());
+        let bound_result = bound
+            .call_with_keywords(&[], &[("flag", Value::bool(true))])
+            .expect("bound keyword-aware builtin should execute");
+        assert_eq!(bound_result.as_int(), Some(2));
     }
 }

@@ -8,9 +8,11 @@ use crate::error::RuntimeError;
 use crate::ops::iteration::collect_iterable_values;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::string::{StringObject, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::Arc;
 
@@ -150,31 +152,68 @@ pub fn build_dict(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// BuildString: dst = "".join(r(src1)..r(src1+src2))
 #[inline(always)]
 pub fn build_string(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
     let start_reg = inst.src1().0;
     let count = inst.src2().0 as usize;
     let dst = inst.dst().0;
 
-    // Collect string parts
-    let mut result = String::new();
-    for i in 0..count {
-        let val = frame.get_reg(start_reg + i as u8);
-        // Convert value to string representation
-        if let Some(s) = val.as_int() {
-            result.push_str(&s.to_string());
-        } else if let Some(f) = val.as_float() {
-            result.push_str(&f.to_string());
-        } else if val.is_none() {
-            result.push_str("None");
-        } else if let Some(b) = val.as_bool() {
-            result.push_str(if b { "True" } else { "False" });
-        }
-        // TODO: Handle string objects and other types
+    let values: Vec<Value> = {
+        let frame = vm.current_frame();
+        (0..count)
+            .map(|i| frame.get_reg(start_reg + i as u8))
+            .collect()
+    };
+
+    if values.is_empty() {
+        vm.current_frame_mut()
+            .set_reg(dst, Value::string(intern("")));
+        return ControlFlow::Continue;
     }
 
-    // TODO: Create StringObject when fully wired
-    // For now, store as a None placeholder
-    frame.set_reg(dst, Value::none());
+    if values.len() == 1 {
+        let value = values[0];
+        if value_as_string_ref(value).is_none() {
+            return ControlFlow::Error(RuntimeError::type_error(
+                "BUILD_STRING expects string operands",
+            ));
+        }
+        vm.current_frame_mut().set_reg(dst, value);
+        return ControlFlow::Continue;
+    }
+
+    let mut parts = Vec::with_capacity(values.len());
+    let mut total_len = 0usize;
+    for value in values {
+        let Some(part) = value_as_string_ref(value) else {
+            return ControlFlow::Error(RuntimeError::type_error(
+                "BUILD_STRING expects string operands",
+            ));
+        };
+        total_len += part.len();
+        parts.push(part);
+    }
+
+    let mut joined = String::with_capacity(total_len);
+    for part in parts {
+        joined.push_str(part.as_str());
+    }
+
+    if joined.is_empty() {
+        vm.current_frame_mut()
+            .set_reg(dst, Value::string(intern("")));
+        return ControlFlow::Continue;
+    }
+
+    let string = StringObject::from_string(joined);
+    let ptr = match vm.allocator().alloc(string) {
+        Some(p) => p as *const (),
+        None => {
+            return ControlFlow::Error(RuntimeError::internal(
+                "out of memory: failed to allocate joined string",
+            ));
+        }
+    };
+
+    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
     ControlFlow::Continue
 }
 

@@ -93,12 +93,181 @@ fn read_input<R: BufRead, W: Write>(
     Ok(Value::string(intern(&line)))
 }
 
-/// Builtin open function placeholder.
+/// Builtin open function.
 pub fn builtin_open(args: &[Value]) -> Result<Value, BuiltinError> {
-    let _ = args;
-    Err(BuiltinError::NotImplemented(
-        "open() not yet implemented".to_string(),
-    ))
+    builtin_open_with_keywords(args, &[])
+}
+
+/// VM-aware builtin open function with keyword argument support.
+pub fn builtin_open_vm_kw(
+    _vm: &mut crate::VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    builtin_open_with_keywords(args, keywords)
+}
+
+fn builtin_open_with_keywords(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.len() > 8 {
+        return Err(BuiltinError::TypeError(format!(
+            "open() takes at most 8 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut file = args.first().copied();
+    let mut mode = args.get(1).copied();
+    let mut buffering = args.get(2).copied();
+    let mut encoding = args.get(3).copied();
+    let mut errors = args.get(4).copied();
+    let mut newline = args.get(5).copied();
+    let mut closefd = args.get(6).copied();
+    let mut opener = args.get(7).copied();
+
+    for &(name, value) in keywords {
+        match name {
+            "file" => assign_open_keyword(&mut file, value, 0, args.len(), "file")?,
+            "mode" => assign_open_keyword(&mut mode, value, 1, args.len(), "mode")?,
+            "buffering" => assign_open_keyword(&mut buffering, value, 2, args.len(), "buffering")?,
+            "encoding" => assign_open_keyword(&mut encoding, value, 3, args.len(), "encoding")?,
+            "errors" => assign_open_keyword(&mut errors, value, 4, args.len(), "errors")?,
+            "newline" => assign_open_keyword(&mut newline, value, 5, args.len(), "newline")?,
+            "closefd" => assign_open_keyword(&mut closefd, value, 6, args.len(), "closefd")?,
+            "opener" => assign_open_keyword(&mut opener, value, 7, args.len(), "opener")?,
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "open() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    let file = file.ok_or_else(|| {
+        BuiltinError::TypeError("open() missing required argument 'file' (pos 1)".to_string())
+    })?;
+    let file_path = value_to_string(file).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "open() argument 'file' must be str, not {}",
+            file.type_name()
+        ))
+    })?;
+
+    let mode = match mode {
+        Some(value) => value_to_string(value).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "open() argument 'mode' must be str, not {}",
+                value.type_name()
+            ))
+        })?,
+        None => "r".to_string(),
+    };
+
+    if let Some(value) = buffering {
+        let _ = extract_int_like(value, "buffering")?;
+    }
+
+    let encoding = match encoding {
+        Some(value) if value.is_none() => None,
+        Some(value) => Some(value_to_string(value).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "open() argument 'encoding' must be str or None, not {}",
+                value.type_name()
+            ))
+        })?),
+        None => None,
+    };
+
+    if let Some(value) = errors {
+        if !value.is_none() {
+            let _ = value_to_string(value).ok_or_else(|| {
+                BuiltinError::TypeError(format!(
+                    "open() argument 'errors' must be str or None, not {}",
+                    value.type_name()
+                ))
+            })?;
+        }
+    }
+
+    if let Some(value) = newline {
+        if !value.is_none() {
+            let _ = value_to_string(value).ok_or_else(|| {
+                BuiltinError::TypeError(format!(
+                    "open() argument 'newline' must be str or None, not {}",
+                    value.type_name()
+                ))
+            })?;
+        }
+    }
+
+    if let Some(value) = closefd {
+        if !extract_bool_like(value, "closefd")? {
+            return Err(BuiltinError::NotImplemented(
+                "open() with closefd=False is not implemented yet".to_string(),
+            ));
+        }
+    }
+
+    if let Some(value) = opener {
+        if !value.is_none() {
+            return Err(BuiltinError::NotImplemented(
+                "open() with opener is not implemented yet".to_string(),
+            ));
+        }
+    }
+
+    crate::stdlib::io::open_file_stream_object(&file_path, &mode, encoding.as_deref())
+}
+
+fn assign_open_keyword(
+    slot: &mut Option<Value>,
+    value: Value,
+    positional_index: usize,
+    positional_len: usize,
+    name: &str,
+) -> Result<(), BuiltinError> {
+    if positional_len > positional_index {
+        return Err(BuiltinError::TypeError(format!(
+            "open() got multiple values for argument '{}'",
+            name
+        )));
+    }
+    if slot.replace(value).is_some() {
+        return Err(BuiltinError::TypeError(format!(
+            "open() got multiple values for argument '{}'",
+            name
+        )));
+    }
+    Ok(())
+}
+
+fn extract_int_like(value: Value, name: &str) -> Result<i64, BuiltinError> {
+    if let Some(number) = value.as_int() {
+        return Ok(number);
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+    Err(BuiltinError::TypeError(format!(
+        "open() argument '{}' must be an integer",
+        name
+    )))
+}
+
+fn extract_bool_like(value: Value, name: &str) -> Result<bool, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(boolean);
+    }
+    if let Some(number) = value.as_int() {
+        return Ok(number != 0);
+    }
+    Err(BuiltinError::TypeError(format!(
+        "open() argument '{}' must be bool-like",
+        name
+    )))
 }
 
 #[inline]

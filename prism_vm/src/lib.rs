@@ -62,6 +62,7 @@ pub mod ic_manager;
 pub mod inline_cache;
 pub mod osr_trigger;
 pub mod profiler;
+pub mod python_numeric;
 pub mod speculative;
 pub mod truthiness;
 pub mod type_feedback;
