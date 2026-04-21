@@ -1366,6 +1366,16 @@ assert f(2)(4) == 6\n",
     }
 
     #[test]
+    fn test_run_string_supports_debug_fstrings_with_default_repr_and_explicit_conversion() {
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_string(
+            "managername = 'Aqua'\nassert f\"{managername=}\" == \"managername='Aqua'\"\nassert f\"{managername = }\" == \"managername = 'Aqua'\"\nassert f\"{managername=!s}\" == \"managername=Aqua\"\n",
+            &config,
+        );
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
     fn test_run_string_supports_for_iterable_implicit_tuple_literals() {
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
         let code = run_string(
