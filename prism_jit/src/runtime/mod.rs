@@ -1,43 +1,12 @@
-//! JIT Runtime Integration Module
+//! JIT runtime integration.
 //!
-//! Provides the runtime infrastructure for executing JIT-compiled code,
-//! including code caching, background compilation, and entry/exit stubs.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────┐
-//! │                        JIT Runtime                                  │
-//! ├─────────────────────────────────────────────────────────────────────┤
-//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-//! │  │  CodeCache   │  │ CompilerTask │  │  EntryStub   │              │
-//! │  │              │  │              │  │              │              │
-//! │  │ Stores and   │  │ Background   │  │ Transitions  │              │
-//! │  │ indexes all  │  │ compilation  │  │ between      │              │
-//! │  │ compiled     │  │ of hot       │  │ interpreter  │              │
-//! │  │ functions    │  │ functions    │  │ and JIT      │              │
-//! │  └──────────────┘  └──────────────┘  └──────────────┘              │
-//! └─────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use prism_jit::runtime::{CodeCache, CompilerTask, RuntimeConfig};
-//!
-//! // Create a code cache
-//! let config = RuntimeConfig::default();
-//! let cache = CodeCache::new(config);
-//!
-//! // Check for compiled code
-//! if let Some(entry) = cache.lookup(code_id) {
-//!     // Execute via entry stub
-//!     entry.call(args);
-//! }
-//! ```
+//! This module exposes the executable code cache, entry/exit stubs, profiling
+//! data, and speculation feedback used by the Prism JIT at execution time.
+//! Background compilation is orchestrated by the VM's production compilation
+//! queue so the runtime surface here only exports components that are actually
+//! wired into execution.
 
 pub mod code_cache;
-pub mod compiler_thread;
 pub mod entry_stub;
 pub mod profile_collector;
 pub mod profile_data;
@@ -47,7 +16,6 @@ pub mod type_feedback;
 mod profile_data_tests;
 
 pub use code_cache::{CodeCache, CompiledEntry, DeoptSite, ReturnAbi};
-pub use compiler_thread::{CompilationRequest, CompilerThread};
 pub use entry_stub::{EntryStub, ExitReason};
 pub use profile_data::{
     AtomicBranchCounter, BranchProfile, CallProfile, CallTarget, ProfileData, ProfileError,
@@ -67,7 +35,7 @@ pub use type_feedback::{
 pub struct RuntimeConfig {
     /// Maximum size of code cache in bytes.
     pub max_code_size: usize,
-    /// Number of compiler threads (0 = synchronous compilation).
+    /// Number of background compiler threads requested by the embedding VM.
     pub compiler_threads: usize,
     /// Compilation tier-up threshold (execution count).
     pub tier_up_threshold: u32,

@@ -29,6 +29,7 @@
 //! - Slots table enables direct dispatch for special methods
 
 use crate::object::mro::{ClassId, Mro, MroError, compute_c3_mro};
+use crate::object::registry::global_registry;
 use crate::object::shape::Shape;
 use crate::object::type_obj::{TypeId, TypeSlots};
 use crate::object::{ObjectHeader, PyObject};
@@ -36,20 +37,15 @@ use prism_core::Value;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 // =============================================================================
 // Global Type ID Counter
 // =============================================================================
 
-/// Global counter for allocating unique TypeIds to user-defined classes.
-static NEXT_TYPE_ID: AtomicU32 = AtomicU32::new(TypeId::FIRST_USER_TYPE);
-
 /// Allocate a new unique TypeId for a user-defined class.
 fn allocate_type_id() -> TypeId {
-    let id = NEXT_TYPE_ID.fetch_add(1, Ordering::Relaxed);
-    TypeId::from_raw(id)
+    global_registry().allocate_type_id()
 }
 
 // =============================================================================

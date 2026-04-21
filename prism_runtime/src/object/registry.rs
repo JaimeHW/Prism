@@ -1,29 +1,46 @@
-//! Type registry for mapping TypeId to TypeObject.
+//! Type registry for mapping `TypeId` values to `TypeObject` metadata.
 //!
-//! Provides O(1) lookup of type objects by TypeId.
+//! The hot path uses a dense atomic table so common lookups stay lock-free. A
+//! small overflow side table handles extremely large `TypeId` values without
+//! penalizing the steady-state path.
 
 use crate::object::type_obj::{TypeId, TypeObject};
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use parking_lot::Mutex;
+use std::ptr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+
+const FAST_TABLE_CAPACITY: usize = 1 << 16;
+
+fn null_type_ptr() -> *mut TypeObject {
+    ptr::null_mut()
+}
 
 /// Global type registry.
 ///
 /// Holds references to all registered type objects.
 /// Built-in types are registered at startup; user types are added dynamically.
 pub struct TypeRegistry {
-    /// Map from TypeId to TypeObject.
-    types: RwLock<HashMap<TypeId, &'static TypeObject>>,
+    /// Dense lock-free lookup table for the common range of type IDs.
+    fast_table: Box<[AtomicPtr<TypeObject>]>,
+    /// Rare overflow storage for unusually large type IDs.
+    overflow: Mutex<Vec<usize>>,
     /// Counter for generating new TypeIds.
     next_id: AtomicU32,
+    /// Count of registered entries.
+    registered: AtomicU32,
 }
 
 impl TypeRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
+        let mut fast_table = Vec::with_capacity(FAST_TABLE_CAPACITY);
+        fast_table.resize_with(FAST_TABLE_CAPACITY, || AtomicPtr::new(null_type_ptr()));
         Self {
-            types: RwLock::new(HashMap::new()),
+            fast_table: fast_table.into_boxed_slice(),
+            overflow: Mutex::new(Vec::new()),
             next_id: AtomicU32::new(TypeId::FIRST_USER_TYPE),
+            registered: AtomicU32::new(0),
         }
     }
 
@@ -37,28 +54,89 @@ impl TypeRegistry {
     /// # Safety
     /// The type object must have a 'static lifetime.
     pub fn register(&self, type_id: TypeId, type_obj: &'static TypeObject) {
-        let mut types = self.types.write();
-        types.insert(type_id, type_obj);
+        let index = type_id.raw() as usize;
+        let new_ptr = type_obj as *const TypeObject as *mut TypeObject;
+
+        if let Some(slot) = self.fast_table.get(index) {
+            match slot.compare_exchange(
+                null_type_ptr(),
+                new_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.registered.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(existing) if existing == new_ptr => {}
+                Err(existing) => {
+                let existing = unsafe { &*existing };
+                panic!(
+                    "TypeId {:?} already registered to a different type object ({:?} vs {:?})",
+                    type_id,
+                    existing.name,
+                    type_obj.name
+                    );
+                }
+            }
+            return;
+        }
+
+        let overflow_index = index - self.fast_table.len();
+        let mut overflow = self.overflow.lock();
+        if overflow.len() <= overflow_index {
+            overflow.resize(overflow_index + 1, 0);
+        }
+
+        match overflow[overflow_index] {
+            0 => {
+                overflow[overflow_index] = new_ptr as usize;
+                self.registered.fetch_add(1, Ordering::Relaxed);
+            }
+            ptr if ptr == new_ptr as usize => {}
+            ptr => {
+                let existing = unsafe { &*(ptr as *const TypeObject) };
+                panic!(
+                    "TypeId {:?} already registered to a different type object ({:?} vs {:?})",
+                    type_id,
+                    existing.name,
+                    type_obj.name
+                );
+            }
+        }
     }
 
     /// Look up a type by ID.
     #[inline]
     pub fn get(&self, type_id: TypeId) -> Option<&'static TypeObject> {
-        let types = self.types.read();
-        types.get(&type_id).copied()
+        let index = type_id.raw() as usize;
+        if let Some(slot) = self.fast_table.get(index) {
+            let ptr = slot.load(Ordering::Acquire);
+            return if ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { &*ptr })
+            };
+        }
+
+        let overflow_index = index - self.fast_table.len();
+        let overflow = self.overflow.lock();
+        let ptr = *overflow.get(overflow_index)?;
+        if ptr == 0 {
+            None
+        } else {
+            Some(unsafe { &*(ptr as *const TypeObject) })
+        }
     }
 
     /// Check if a type is registered.
     #[inline]
     pub fn contains(&self, type_id: TypeId) -> bool {
-        let types = self.types.read();
-        types.contains_key(&type_id)
+        self.get(type_id).is_some()
     }
 
     /// Get the number of registered types.
     pub fn len(&self) -> usize {
-        let types = self.types.read();
-        types.len()
+        self.registered.load(Ordering::Relaxed) as usize
     }
 
     /// Check if registry is empty.
@@ -72,12 +150,6 @@ impl Default for TypeRegistry {
         Self::new()
     }
 }
-
-// =============================================================================
-// Global Registry Access
-// =============================================================================
-
-use std::sync::OnceLock;
 
 /// Global type registry singleton.
 static GLOBAL_REGISTRY: OnceLock<TypeRegistry> = OnceLock::new();
@@ -93,14 +165,27 @@ pub fn global_registry() -> &'static TypeRegistry {
 pub fn init_builtin_types() {
     let registry = global_registry();
 
-    // Built-in types will be registered here
-    // For now, we just ensure the registry is initialized
+    // Built-in types will be registered here.
     let _ = registry;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::type_obj::TypeFlags;
+    use prism_core::intern::intern;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn leaked_type(type_id: TypeId, name: &'static str) -> &'static TypeObject {
+        Box::leak(Box::new(TypeObject::new(
+            type_id,
+            intern(name),
+            None,
+            0,
+            TypeFlags::empty(),
+        )))
+    }
 
     #[test]
     fn test_registry_creation() {
@@ -116,5 +201,65 @@ mod tests {
         assert_eq!(id1.raw(), 256);
         assert_eq!(id2.raw(), 257);
         assert!(!id1.is_builtin());
+    }
+
+    #[test]
+    fn test_register_and_get_uses_dense_index() {
+        let registry = TypeRegistry::new();
+        let type_id = TypeId::from_raw(TypeId::FIRST_USER_TYPE + 1);
+        let type_obj = leaked_type(type_id, "DenseLookup");
+
+        registry.register(type_id, type_obj);
+
+        let loaded = registry.get(type_id).expect("registered type should be returned");
+        assert!(std::ptr::eq(loaded, type_obj));
+        assert!(registry.contains(type_id));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn test_register_uses_overflow_table_for_large_type_ids() {
+        let registry = TypeRegistry::new();
+        let type_id = TypeId::from_raw(TypeId::FIRST_USER_TYPE + FAST_TABLE_CAPACITY as u32 + 64);
+        let type_obj = leaked_type(type_id, "OverflowLookup");
+
+        registry.register(type_id, type_obj);
+
+        assert!(std::ptr::eq(registry.get(type_id).unwrap(), type_obj));
+    }
+
+    #[test]
+    fn test_register_same_type_is_idempotent() {
+        let registry = TypeRegistry::new();
+        let type_id = TypeId::from_raw(TypeId::FIRST_USER_TYPE + 8);
+        let type_obj = leaked_type(type_id, "Idempotent");
+
+        registry.register(type_id, type_obj);
+        registry.register(type_id, type_obj);
+
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_reads_are_lock_free_and_stable() {
+        let registry = Arc::new(TypeRegistry::new());
+        let type_id = TypeId::from_raw(TypeId::FIRST_USER_TYPE + 16);
+        let type_obj = leaked_type(type_id, "ConcurrentLookup");
+        registry.register(type_id, type_obj);
+
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let registry = Arc::clone(&registry);
+            threads.push(thread::spawn(move || {
+                for _ in 0..10_000 {
+                    let loaded = registry.get(type_id).expect("type should stay published");
+                    assert!(std::ptr::eq(loaded, type_obj));
+                }
+            }));
+        }
+
+        for handle in threads {
+            handle.join().expect("reader thread should complete");
+        }
     }
 }
