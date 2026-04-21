@@ -19,6 +19,7 @@
 pub mod aot;
 pub mod error;
 pub mod intern;
+pub mod python_unicode;
 pub mod small_int_cache;
 pub mod span;
 pub mod speculation;
