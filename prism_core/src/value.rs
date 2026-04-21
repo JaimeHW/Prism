@@ -187,11 +187,9 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn string(s: InternedString) -> Self {
-        // Store the Arc's data pointer (thin pointer to the str data)
-        let arc = s.clone_arc();
-        let ptr = arc.as_ptr() as *const u8 as usize as u64;
-        // Don't drop the Arc - leak it (we're storing the pointer)
-        std::mem::forget(arc);
+        // The interner owns the canonical Arc<str>, so the string data pointer
+        // stays stable for the lifetime of the program.
+        let ptr = s.as_str().as_ptr() as usize as u64;
         debug_assert!(ptr & !PAYLOAD_MASK == 0, "Pointer too large for NaN-boxing");
         Self {
             bits: QNAN | (TAG_STRING << TAG_SHIFT) | (ptr & PAYLOAD_MASK),
@@ -598,22 +596,11 @@ impl From<u8> for Value {
     }
 }
 
-// Helper for InternedString to avoid circular dependency
-impl InternedString {
-    /// Clone the underlying Arc for use in Value.
-    ///
-    /// This clones the Arc (incrementing the reference count) rather than
-    /// creating a new allocation. This is critical for Value's NaN-boxing
-    /// scheme: the data pointer stored in a Value must be the same for
-    /// equal interned strings, enabling O(1) equality via bit comparison.
-    pub(crate) fn clone_arc(&self) -> std::sync::Arc<str> {
-        self.get_arc()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intern::intern;
+    use std::sync::Arc;
 
     #[test]
     fn test_value_size() {
@@ -644,6 +631,19 @@ mod tests {
         assert!(v.is_bool());
         assert_eq!(v.as_bool(), Some(false));
         assert!(!v.is_truthy());
+    }
+
+    #[test]
+    fn test_string_does_not_bump_interned_arc_refcount() {
+        let interned = intern("stable-pointer");
+        let arc = interned.get_arc();
+        let baseline = Arc::strong_count(&arc);
+
+        for _ in 0..256 {
+            let _ = Value::string(interned.clone());
+        }
+
+        assert_eq!(Arc::strong_count(&arc), baseline);
     }
 
     #[test]
