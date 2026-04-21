@@ -8,12 +8,14 @@ use crate::import::ModuleObject;
 use prism_code::CodeObject;
 use prism_core::Value;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// Maximum recursion depth before RecursionError.
 pub const MAX_RECURSION_DEPTH: usize = 1000;
 
 /// Number of registers per frame.
 pub const REGISTER_COUNT: usize = 256;
+const REGISTER_WORD_COUNT: usize = REGISTER_COUNT / 64;
 
 #[derive(Clone, Copy)]
 pub struct RegisterSnapshot {
@@ -68,7 +70,10 @@ pub struct Frame {
     ///
     /// This lets the VM distinguish "never assigned" from an explicit
     /// `None` value for local-slot backed namespaces such as class bodies.
-    written_registers: [u64; REGISTER_COUNT / 64],
+    written_registers: [u64; REGISTER_WORD_COUNT],
+
+    /// Number of registers that must be cleared before reusing this frame.
+    active_register_count: u16,
 
     /// Optional live locals mapping for scopes that execute against a custom
     /// namespace object, such as metaclass `__prepare__` class bodies.
@@ -83,6 +88,55 @@ pub struct Frame {
 
     /// Inline cache for exception-handler lookup at this frame's current PC.
     pub handler_cache: InlineHandlerCache,
+}
+
+fn pooled_frame_code() -> Arc<CodeObject> {
+    static POOLED_FRAME_CODE: OnceLock<Arc<CodeObject>> = OnceLock::new();
+    Arc::clone(
+        POOLED_FRAME_CODE.get_or_init(|| Arc::new(CodeObject::new("<frame-pool>", "<internal>"))),
+    )
+}
+
+#[derive(Default)]
+pub struct FramePool {
+    free_frames: Vec<Frame>,
+}
+
+impl FramePool {
+    pub fn new() -> Self {
+        Self {
+            free_frames: Vec::with_capacity(64),
+        }
+    }
+
+    pub fn acquire(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_frame: Option<u32>,
+        return_reg: u8,
+        closure: Option<Arc<ClosureEnv>>,
+        module: Option<Arc<ModuleObject>>,
+    ) -> Frame {
+        if let Some(mut frame) = self.free_frames.pop() {
+            frame.reinitialize(code, return_frame, return_reg, closure, module);
+            frame
+        } else {
+            Frame::from_parts(code, return_frame, return_reg, closure, module)
+        }
+    }
+
+    pub fn release(&mut self, mut frame: Frame) {
+        if self.free_frames.len() >= MAX_RECURSION_DEPTH {
+            return;
+        }
+        frame.prepare_for_pool();
+        self.free_frames.push(frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.free_frames.len()
+    }
 }
 
 /// Closure environment holding captured variables.
@@ -247,6 +301,82 @@ impl std::fmt::Debug for ClosureEnv {
 }
 
 impl Frame {
+    fn blank() -> Self {
+        Self {
+            code: pooled_frame_code(),
+            ip: 0,
+            return_frame: None,
+            return_reg: 0,
+            module: None,
+            closure: None,
+            registers: [Value::none(); REGISTER_COUNT],
+            written_registers: [0; REGISTER_WORD_COUNT],
+            active_register_count: 0,
+            locals_mapping: None,
+            yield_point: 0,
+            handler_cache: InlineHandlerCache::new(),
+        }
+    }
+
+    #[inline]
+    fn active_register_count_for(code: &CodeObject) -> u16 {
+        code.register_count.max(1)
+    }
+
+    fn from_parts(
+        code: Arc<CodeObject>,
+        return_frame: Option<u32>,
+        return_reg: u8,
+        closure: Option<Arc<ClosureEnv>>,
+        module: Option<Arc<ModuleObject>>,
+    ) -> Self {
+        let mut frame = Self::blank();
+        frame.reinitialize(code, return_frame, return_reg, closure, module);
+        frame
+    }
+
+    fn reinitialize(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_frame: Option<u32>,
+        return_reg: u8,
+        closure: Option<Arc<ClosureEnv>>,
+        module: Option<Arc<ModuleObject>>,
+    ) {
+        self.code = code;
+        self.ip = 0;
+        self.return_frame = return_frame;
+        self.return_reg = return_reg;
+        self.module = module;
+        self.closure = closure;
+        self.active_register_count = Self::active_register_count_for(&self.code);
+        self.locals_mapping = None;
+        self.yield_point = 0;
+        self.handler_cache = InlineHandlerCache::new();
+    }
+
+    fn prepare_for_pool(&mut self) {
+        self.clear_register_window(self.active_register_count.into());
+        self.written_registers.fill(0);
+        self.code = pooled_frame_code();
+        self.ip = 0;
+        self.return_frame = None;
+        self.return_reg = 0;
+        self.module = None;
+        self.closure = None;
+        self.active_register_count = 0;
+        self.locals_mapping = None;
+        self.yield_point = 0;
+        self.handler_cache = InlineHandlerCache::new();
+    }
+
+    #[inline]
+    fn clear_register_window(&mut self, count: usize) {
+        if count > 0 {
+            self.registers[..count].fill(Value::none());
+        }
+    }
+
     /// Create a new frame for executing a code object.
     ///
     /// # Arguments
@@ -266,20 +396,7 @@ impl Frame {
         return_reg: u8,
         module: Option<Arc<ModuleObject>>,
     ) -> Self {
-        Self {
-            code,
-            ip: 0,
-            return_frame,
-            return_reg,
-            module,
-            closure: None,
-            // Initialize all registers to None for safety
-            registers: [Value::none(); REGISTER_COUNT],
-            written_registers: [0; REGISTER_COUNT / 64],
-            locals_mapping: None,
-            yield_point: 0,
-            handler_cache: InlineHandlerCache::new(),
-        }
+        Self::from_parts(code, return_frame, return_reg, None, module)
     }
 
     /// Create a frame with a closure environment.
@@ -302,19 +419,7 @@ impl Frame {
         closure: Arc<ClosureEnv>,
         module: Option<Arc<ModuleObject>>,
     ) -> Self {
-        Self {
-            code,
-            ip: 0,
-            return_frame,
-            return_reg,
-            module,
-            closure: Some(closure),
-            registers: [Value::none(); REGISTER_COUNT],
-            written_registers: [0; REGISTER_COUNT / 64],
-            locals_mapping: None,
-            yield_point: 0,
-            handler_cache: InlineHandlerCache::new(),
-        }
+        Self::from_parts(code, return_frame, return_reg, Some(closure), module)
     }
 
     // =========================================================================
@@ -379,6 +484,11 @@ impl Frame {
         let word = reg_idx / 64;
         let bit = reg_idx % 64;
         (self.written_registers[word] & (1u64 << bit)) != 0
+    }
+
+    #[inline(always)]
+    pub fn active_register_count(&self) -> u16 {
+        self.active_register_count
     }
 
     /// Return the live locals mapping for this frame, when one is active.
@@ -548,6 +658,71 @@ mod tests {
         assert_eq!(x.as_int(), Some(10));
         assert_eq!(y.as_int(), Some(20));
         assert_eq!(z.as_int(), Some(30));
+    }
+
+    #[test]
+    fn test_frame_tracks_active_register_count() {
+        let mut code = CodeObject::new("test", "test.py");
+        code.register_count = 7;
+        let frame = Frame::new(Arc::new(code), None, 0);
+        assert_eq!(frame.active_register_count(), 7);
+    }
+
+    #[test]
+    fn test_frame_pool_reuses_and_clears_live_window() {
+        let mut pool = FramePool::new();
+        let mut code = CodeObject::new("pool", "test.py");
+        code.register_count = 2;
+
+        let mut frame = pool.acquire(Arc::new(code), None, 0, None, None);
+        frame.set_reg(0, Value::int(41).unwrap());
+        frame.set_reg(1, Value::int(99).unwrap());
+        pool.release(frame);
+
+        assert_eq!(pool.len(), 1);
+
+        let mut code = CodeObject::new("pool-reuse", "test.py");
+        code.register_count = 2;
+        let frame = pool.acquire(Arc::new(code), None, 0, None, None);
+        assert!(frame.get_reg(0).is_none());
+        assert!(frame.get_reg(1).is_none());
+        assert!(!frame.reg_is_written(0));
+        assert!(!frame.reg_is_written(1));
+    }
+
+    #[test]
+    fn test_frame_pool_clears_registers_before_storing_frame() {
+        let mut pool = FramePool::new();
+        let mut code = CodeObject::new("pool-store", "test.py");
+        code.register_count = 3;
+
+        let mut frame = pool.acquire(Arc::new(code), None, 0, None, None);
+        frame.set_reg(0, Value::int(1).unwrap());
+        frame.set_reg(2, Value::int(3).unwrap());
+        pool.release(frame);
+
+        let pooled = pool.free_frames.last().expect("frame should be stored in pool");
+        assert!(pooled.get_reg(0).is_none());
+        assert!(pooled.get_reg(2).is_none());
+        assert!(!pooled.reg_is_written(0));
+        assert!(!pooled.reg_is_written(2));
+        assert_eq!(pooled.active_register_count(), 0);
+    }
+
+    #[test]
+    fn test_frame_pool_clears_larger_future_window() {
+        let mut pool = FramePool::new();
+
+        let mut large_code = CodeObject::new("large", "test.py");
+        large_code.register_count = 4;
+        let mut frame = pool.acquire(Arc::new(large_code), None, 0, None, None);
+        frame.set_reg(3, Value::int(7).unwrap());
+        pool.release(frame);
+
+        let mut small_code = CodeObject::new("small", "test.py");
+        small_code.register_count = 1;
+        let frame = pool.acquire(Arc::new(small_code), None, 0, None, None);
+        assert!(frame.get_reg(3).is_none());
     }
 
     #[test]

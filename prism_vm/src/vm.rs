@@ -8,7 +8,7 @@ use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
 use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
-use crate::frame::{ClosureEnv, Frame, MAX_RECURSION_DEPTH};
+use crate::frame::{ClosureEnv, Frame, FramePool, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
@@ -151,6 +151,8 @@ impl ExecutionBudget {
 pub struct VirtualMachine {
     /// Frame stack (limited by MAX_RECURSION_DEPTH).
     pub frames: Vec<Frame>,
+    /// Reusable frame storage for ordinary calls and JIT entry trampolines.
+    frame_pool: FramePool,
     /// Current frame index (frames.len() - 1).
     current_frame_idx: usize,
     /// Global scope.
@@ -1277,6 +1279,7 @@ impl VirtualMachine {
         let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
+            frame_pool: FramePool::new(),
             current_frame_idx: 0,
             globals: GlobalScope::new(),
             builtins,
@@ -1310,6 +1313,7 @@ impl VirtualMachine {
         let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
+            frame_pool: FramePool::new(),
             current_frame_idx: 0,
             globals: GlobalScope::new(),
             builtins,
@@ -1348,6 +1352,7 @@ impl VirtualMachine {
         let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
+            frame_pool: FramePool::new(),
             current_frame_idx: 0,
             globals: GlobalScope::new(),
             builtins,
@@ -1381,6 +1386,7 @@ impl VirtualMachine {
         let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
+            frame_pool: FramePool::new(),
             current_frame_idx: 0,
             globals,
             builtins,
@@ -1860,6 +1866,35 @@ impl VirtualMachine {
         self.resume_generator(generator, GeneratorResumeMode::Throw { exception, type_id })
     }
 
+    #[inline]
+    fn acquire_frame(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_frame: Option<u32>,
+        return_reg: u8,
+        closure: Option<Arc<ClosureEnv>>,
+        module: Option<Arc<ModuleObject>>,
+    ) -> Frame {
+        self.frame_pool
+            .acquire(code, return_frame, return_reg, closure, module)
+    }
+
+    #[inline]
+    fn recycle_frame(&mut self, frame: Frame) {
+        self.frame_pool.release(frame);
+    }
+
+    fn recycle_all_frames(&mut self) {
+        while let Some(frame) = self.frames.pop() {
+            self.recycle_frame(frame);
+        }
+    }
+
+    #[cfg(test)]
+    fn pooled_frame_count(&self) -> usize {
+        self.frame_pool.len()
+    }
+
     fn resume_generator(
         &mut self,
         generator: &mut GeneratorObject,
@@ -1923,22 +1958,13 @@ impl VirtualMachine {
         let caller_exception_context = self.capture_exception_context();
 
         let generator_module = self.module_from_globals_ptr(generator.module_ptr());
-        let mut frame = if let Some(closure) = generator.closure().cloned() {
-            Frame::with_closure_and_module(
-                Arc::clone(generator.code()),
-                Some(caller_idx as u32),
-                255,
-                closure,
-                generator_module,
-            )
-        } else {
-            Frame::new_with_module(
-                Arc::clone(generator.code()),
-                Some(caller_idx as u32),
-                255,
-                generator_module,
-            )
-        };
+        let mut frame = self.acquire_frame(
+            Arc::clone(generator.code()),
+            Some(caller_idx as u32),
+            255,
+            generator.closure().cloned(),
+            generator_module,
+        );
         frame.ip = if prev_state == RuntimeGeneratorState::Suspended {
             generator.ip()
         } else {
@@ -2225,69 +2251,93 @@ impl VirtualMachine {
 
         // Handle JIT: check for compiled code, handle tier-up, and try execution
         if allow_jit && closure.is_none() && self.execution_budget.step_limit().is_none() {
-            if let Some(jit) = &mut self.jit {
-                let tier_decision = jit.check_tier_up(&self.profiler, code_id);
+            enum JitDispatchOutcome {
+                Returned(Value),
+                Deopt(Frame),
+                Exception(RuntimeError),
+                Continue,
+            }
 
-                // Handle tier-up decision (may trigger compilation)
-                if tier_decision != TierUpDecision::None {
-                    jit.handle_tier_up(&code, tier_decision);
-                }
+            let return_frame_idx = if self.frames.is_empty() {
+                None
+            } else {
+                Some(self.current_frame_idx as u32)
+            };
 
-                // Get code pointer ID for cache lookup
-                let code_ptr_id = Arc::as_ptr(&code) as u64;
+            let jit_outcome = {
+                let profiler = &self.profiler;
+                let (frame_pool, jit_slot) = (&mut self.frame_pool, &mut self.jit);
 
-                // Try to execute compiled code if available
-                if jit.lookup(code_ptr_id).is_some() {
-                    // Create temporary frame for JIT execution
-                    let return_frame_idx = if self.frames.is_empty() {
-                        None
-                    } else {
-                        Some(self.current_frame_idx as u32)
-                    };
-                    let mut jit_frame = Frame::new_with_module(
-                        Arc::clone(&code),
-                        return_frame_idx,
-                        return_reg,
-                        module.clone(),
-                    );
+                if let Some(jit) = jit_slot.as_mut() {
+                    let tier_decision = jit.check_tier_up(profiler, code_id);
 
-                    // Execute compiled code
-                    match jit.try_execute(code_ptr_id, &mut jit_frame) {
-                        Some(ExecutionResult::Return(value)) => {
-                            // JIT completed successfully - handle return value
-                            if self.frames.is_empty() {
-                                // Root frame execution - store value for execute() to retrieve
-                                self.jit_return_value = Some(value);
-                            } else {
-                                // Nested call - store return value in caller's register
-                                self.frames[self.current_frame_idx].set_reg(return_reg, value);
+                    if tier_decision != TierUpDecision::None {
+                        jit.handle_tier_up(&code, tier_decision);
+                    }
+
+                    let code_ptr_id = Arc::as_ptr(&code) as u64;
+
+                    if jit.lookup(code_ptr_id).is_some() {
+                        let mut jit_frame = frame_pool.acquire(
+                            Arc::clone(&code),
+                            return_frame_idx,
+                            return_reg,
+                            None,
+                            module.clone(),
+                        );
+
+                        Some(match jit.try_execute(code_ptr_id, &mut jit_frame) {
+                            Some(ExecutionResult::Return(value)) => {
+                                frame_pool.release(jit_frame);
+                                JitDispatchOutcome::Returned(value)
                             }
-                            // Don't push a frame - JIT handled everything
-                            return Ok(());
-                        }
-                        Some(ExecutionResult::Deopt { bc_offset, reason }) => {
-                            // Deoptimization - resume interpreter at bc_offset
-                            jit.handle_deopt(code_ptr_id, reason);
-                            jit_frame.ip = bc_offset;
-                            self.frames.push(jit_frame);
-                            self.set_current_frame_idx(self.frames.len() - 1);
-                            return Ok(());
-                        }
-                        Some(ExecutionResult::Exception(err)) => {
-                            return Err(err);
-                        }
-                        Some(ExecutionResult::TailCall { .. }) => {
-                            // Tail call - fall through to interpreter for now
-                            // TODO: Implement tail call optimization
-                            jit.record_miss();
-                        }
-                        None => {
-                            // Execution didn't happen - fall through
-                            jit.record_miss();
-                        }
+                            Some(ExecutionResult::Deopt { bc_offset, reason }) => {
+                                jit.handle_deopt(code_ptr_id, reason);
+                                jit_frame.ip = bc_offset;
+                                JitDispatchOutcome::Deopt(jit_frame)
+                            }
+                            Some(ExecutionResult::Exception(err)) => {
+                                frame_pool.release(jit_frame);
+                                JitDispatchOutcome::Exception(err)
+                            }
+                            Some(ExecutionResult::TailCall { .. }) => {
+                                // TODO: Implement tail call optimization.
+                                frame_pool.release(jit_frame);
+                                jit.record_miss();
+                                JitDispatchOutcome::Continue
+                            }
+                            None => {
+                                frame_pool.release(jit_frame);
+                                jit.record_miss();
+                                JitDispatchOutcome::Continue
+                            }
+                        })
+                    } else {
+                        jit.record_miss();
+                        Some(JitDispatchOutcome::Continue)
                     }
                 } else {
-                    jit.record_miss();
+                    None
+                }
+            };
+
+            if let Some(outcome) = jit_outcome {
+                match outcome {
+                    JitDispatchOutcome::Returned(value) => {
+                        if self.frames.is_empty() {
+                            self.jit_return_value = Some(value);
+                        } else {
+                            self.frames[self.current_frame_idx].set_reg(return_reg, value);
+                        }
+                        return Ok(());
+                    }
+                    JitDispatchOutcome::Deopt(frame) => {
+                        self.frames.push(frame);
+                        self.set_current_frame_idx(self.frames.len() - 1);
+                        return Ok(());
+                    }
+                    JitDispatchOutcome::Exception(err) => return Err(err),
+                    JitDispatchOutcome::Continue => {}
                 }
             }
         }
@@ -2299,12 +2349,7 @@ impl VirtualMachine {
             Some(self.current_frame_idx as u32)
         };
 
-        let frame = match closure {
-            Some(closure_env) => {
-                Frame::with_closure_and_module(code, return_frame, return_reg, closure_env, module)
-            }
-            None => Frame::new_with_module(code, return_frame, return_reg, module),
-        };
+        let frame = self.acquire_frame(code, return_frame, return_reg, closure, module);
         self.frames.push(frame);
         self.set_current_frame_idx(self.frames.len() - 1);
 
@@ -2319,7 +2364,9 @@ impl VirtualMachine {
         let top_idx = self.frames.len() - 1;
         self.handler_stack.pop_frame_handlers(top_idx as u32);
         self.discard_except_handlers_for_frame(top_idx as u32);
-        self.frames.pop();
+        if let Some(frame) = self.frames.pop() {
+            self.recycle_frame(frame);
+        }
         self.set_current_frame_idx(self.frames.len().saturating_sub(1));
     }
 
@@ -2335,12 +2382,14 @@ impl VirtualMachine {
         self.handler_stack.pop_frame_handlers(top_idx as u32);
         self.discard_except_handlers_for_frame(top_idx as u32);
         let frame = self.frames.pop().expect("no frame to pop");
+        let return_frame = frame.return_frame;
+        self.recycle_frame(frame);
 
         if self.frames.is_empty() {
             self.set_current_frame_idx(0);
             Ok(true)
         } else {
-            let return_frame_idx = frame.return_frame.unwrap_or(0) as usize;
+            let return_frame_idx = return_frame.unwrap_or(0) as usize;
             self.set_current_frame_idx(return_frame_idx);
             Ok(false)
         }
@@ -2353,6 +2402,9 @@ impl VirtualMachine {
         self.handler_stack.pop_frame_handlers(top_idx as u32);
         self.discard_except_handlers_for_frame(top_idx as u32);
         let frame = self.frames.pop().expect("no frame to pop");
+        let return_frame_idx = frame.return_frame.unwrap_or(0) as usize;
+        let return_reg = frame.return_reg;
+        self.recycle_frame(frame);
 
         if self.frames.is_empty() {
             // This was the last frame - return final value
@@ -2360,9 +2412,6 @@ impl VirtualMachine {
             Ok(Some(return_value))
         } else {
             // Store return value in caller's register
-            let return_frame_idx = frame.return_frame.unwrap_or(0) as usize;
-            let return_reg = frame.return_reg;
-
             self.set_current_frame_idx(return_frame_idx);
             self.frames[return_frame_idx].set_reg(return_reg, return_value);
 
@@ -2400,7 +2449,7 @@ impl VirtualMachine {
 
     /// Reset VM state for reuse.
     pub fn reset(&mut self) {
-        self.frames.clear();
+        self.recycle_all_frames();
         self.set_current_frame_idx(0);
         self.function_closures.clear();
         self.globals = GlobalScope::new();
@@ -2415,7 +2464,7 @@ impl VirtualMachine {
 
     /// Clear only the frame stack (keep globals).
     pub fn clear_frames(&mut self) {
-        self.frames.clear();
+        self.recycle_all_frames();
         self.set_current_frame_idx(0);
         self.function_closures.clear();
         self.handler_stack.clear();
@@ -3720,6 +3769,35 @@ mod tests {
         assert!(!vm.has_exc_info());
         assert_eq!(vm.exception_state(), ExceptionState::Normal);
         assert_eq!(vm.globals.get("x").and_then(|v| v.as_int()), Some(42));
+    }
+
+    #[test]
+    fn test_reset_recycles_all_frames_into_pool() {
+        let mut vm = VirtualMachine::new();
+        let code = empty_code("reset-pool");
+        vm.push_frame(Arc::clone(&code), 0).unwrap();
+        vm.push_frame(code, 0).unwrap();
+
+        vm.reset();
+
+        assert_eq!(vm.call_depth(), 0);
+        assert_eq!(vm.pooled_frame_count(), 2);
+    }
+
+    #[test]
+    fn test_clear_frames_reuses_clean_pooled_frame() {
+        let mut vm = VirtualMachine::new();
+        let code = empty_code("pool-clean");
+        vm.push_frame(Arc::clone(&code), 0).unwrap();
+        vm.current_frame_mut().set_reg(0, Value::int(123).unwrap());
+
+        vm.clear_frames();
+        assert_eq!(vm.pooled_frame_count(), 1);
+
+        vm.push_frame(code, 0).unwrap();
+        assert_eq!(vm.pooled_frame_count(), 0);
+        assert!(vm.current_frame().get_reg(0).is_none());
+        assert!(!vm.current_frame().reg_is_written(0));
     }
 
     #[test]
