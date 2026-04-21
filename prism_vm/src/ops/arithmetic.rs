@@ -18,7 +18,7 @@ use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
 };
 use crate::type_feedback::BinaryOpFeedback;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
@@ -1390,7 +1390,7 @@ mod tests {
     use super::{add, modulo, mul, neg, pos, pos_int, pow, sub, true_div};
     use crate::ControlFlow;
     use crate::VirtualMachine;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_core::Value;
     use prism_core::intern::{intern, interned_by_ptr};
     use prism_runtime::object::type_obj::TypeId;

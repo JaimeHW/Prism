@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
-use prism_compiler::bytecode::KwNamesTuple;
-use prism_compiler::{CodeObject, Opcode};
+use prism_code::KwNamesTuple;
+use prism_code::{CodeObject, Opcode};
 use prism_core::Value;
 use prism_core::intern::interned_by_ptr;
 

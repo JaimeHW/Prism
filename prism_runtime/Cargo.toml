@@ -6,7 +6,7 @@ edition.workspace = true
 
 [dependencies]
 prism_core.workspace = true
-prism_compiler.workspace = true
+prism_code.workspace = true
 prism_gc.workspace = true
 parking_lot.workspace = true
 smallvec.workspace = true

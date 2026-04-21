@@ -51,7 +51,7 @@
 
 use std::sync::Arc;
 
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_core::Value;
 
 use crate::error::RuntimeError;

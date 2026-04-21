@@ -16,7 +16,7 @@
 //! - Allocation rate: > 100MB/s sustained
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -110,6 +110,8 @@ fn create_allocation_loop(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "allocation_loop".into(),
         flags: CodeFlags::NONE,
@@ -255,6 +257,8 @@ fn create_high_churn_code(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "high_churn".into(),
         flags: CodeFlags::NONE,

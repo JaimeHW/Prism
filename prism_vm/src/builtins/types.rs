@@ -869,7 +869,7 @@ fn resolve_super_type_arg(value: Value) -> Result<ClassId, BuiltinError> {
     Ok(ClassId(type_id.raw()))
 }
 
-fn resolve_super_class_cell_slot(code: &prism_compiler::bytecode::CodeObject) -> Option<usize> {
+fn resolve_super_class_cell_slot(code: &prism_code::CodeObject) -> Option<usize> {
     code.cellvars
         .iter()
         .position(|name| name.as_ref() == "__class__")

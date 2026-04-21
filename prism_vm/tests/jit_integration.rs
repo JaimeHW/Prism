@@ -1,4 +1,4 @@
-use prism_compiler::bytecode::{
+use prism_code::{
     CodeFlags, CodeObject, ExceptionEntry, Instruction, LineTableEntry, Opcode, Register,
 };
 use prism_core::Value;

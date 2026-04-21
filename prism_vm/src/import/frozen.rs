@@ -1,4 +1,4 @@
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use std::sync::Arc;
 
 /// Runtime-ready source module loaded from a frozen bundle.

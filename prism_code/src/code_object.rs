@@ -1,0 +1,437 @@
+//! Code object representation for compiled functions.
+//!
+//! A `CodeObject` contains all the compiled bytecode and metadata needed
+//! to execute a Python function. This is the fundamental unit of compilation.
+
+use super::instruction::Instruction;
+use prism_core::Value;
+use std::sync::Arc;
+
+/// A compiled code object representing a function or module.
+///
+/// Code objects are immutable once created and can be shared across threads.
+/// They contain:
+/// - Bytecode instructions
+/// - Constant pool
+/// - Name tables
+/// - Debug information
+/// - Execution metadata
+/// - Exception handling table (for zero-cost exceptions)
+#[derive(Debug, Clone)]
+pub struct CodeObject {
+    /// Function name (or `<module>` for module-level code).
+    pub name: Arc<str>,
+
+    /// Qualified name (includes enclosing class/function names).
+    pub qualname: Arc<str>,
+
+    /// Filename where this code was defined.
+    pub filename: Arc<str>,
+
+    /// First line number in source.
+    pub first_lineno: u32,
+
+    /// Bytecode instructions (32-bit each).
+    pub instructions: Box<[Instruction]>,
+
+    /// Constant pool (indexed by LoadConst).
+    pub constants: Box<[Value]>,
+
+    /// Local variable names (for debugging and closures).
+    pub locals: Box<[Arc<str>]>,
+
+    /// Global/attribute name strings (indexed by LoadGlobal, GetAttr, etc).
+    pub names: Box<[Arc<str>]>,
+
+    /// Free variable names (captured from enclosing scope).
+    pub freevars: Box<[Arc<str>]>,
+
+    /// Cell variable names (captured by nested functions).
+    pub cellvars: Box<[Arc<str>]>,
+
+    /// Number of positional parameters.
+    pub arg_count: u16,
+
+    /// Number of positional-only parameters.
+    pub posonlyarg_count: u16,
+
+    /// Number of keyword-only parameters.
+    pub kwonlyarg_count: u16,
+
+    /// Number of virtual registers used.
+    pub register_count: u16,
+
+    /// Code flags.
+    pub flags: CodeFlags,
+
+    /// Line number table (instruction index -> line number).
+    /// Stored as delta-encoded pairs for compactness.
+    pub line_table: Box<[LineTableEntry]>,
+
+    /// Exception handling table for zero-cost exceptions.
+    /// Sorted by start_pc for binary search during unwinding.
+    pub exception_table: Box<[ExceptionEntry]>,
+
+    /// Nested code objects (functions, classes, comprehensions defined in this code).
+    /// Stored separately from constants for test accessibility and debugging.
+    pub nested_code_objects: Box<[Arc<CodeObject>]>,
+}
+
+/// Code object flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CodeFlags(u32);
+
+impl CodeFlags {
+    /// No flags.
+    pub const NONE: CodeFlags = CodeFlags(0);
+    /// Function uses *args.
+    pub const VARARGS: CodeFlags = CodeFlags(1 << 0);
+    /// Function uses **kwargs.
+    pub const VARKEYWORDS: CodeFlags = CodeFlags(1 << 1);
+    /// Function is a generator.
+    pub const GENERATOR: CodeFlags = CodeFlags(1 << 2);
+    /// Function is a coroutine.
+    pub const COROUTINE: CodeFlags = CodeFlags(1 << 3);
+    /// Function is an async generator.
+    pub const ASYNC_GENERATOR: CodeFlags = CodeFlags(1 << 4);
+    /// Function is nested.
+    pub const NESTED: CodeFlags = CodeFlags(1 << 5);
+    /// Function has free variables.
+    pub const HAS_FREEVARS: CodeFlags = CodeFlags(1 << 6);
+    /// Function has cell variables.
+    pub const HAS_CELLVARS: CodeFlags = CodeFlags(1 << 7);
+    /// This is module-level code.
+    pub const MODULE: CodeFlags = CodeFlags(1 << 8);
+    /// This is class body code.
+    pub const CLASS: CodeFlags = CodeFlags(1 << 9);
+
+    /// Bitmask of all currently defined flags.
+    pub const ALL_BITS: u32 = Self::VARARGS.bits()
+        | Self::VARKEYWORDS.bits()
+        | Self::GENERATOR.bits()
+        | Self::COROUTINE.bits()
+        | Self::ASYNC_GENERATOR.bits()
+        | Self::NESTED.bits()
+        | Self::HAS_FREEVARS.bits()
+        | Self::HAS_CELLVARS.bits()
+        | Self::MODULE.bits()
+        | Self::CLASS.bits();
+
+    /// Check if a flag is set.
+    #[inline]
+    pub const fn contains(self, other: CodeFlags) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Combine flags.
+    #[inline]
+    pub const fn union(self, other: CodeFlags) -> CodeFlags {
+        CodeFlags(self.0 | other.0)
+    }
+
+    /// Get raw value.
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Construct flags from raw bits when every bit is known.
+    #[inline]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL_BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::ops::BitOr for CodeFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for CodeFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Line table entry mapping instruction ranges to source lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineTableEntry {
+    /// Starting instruction index (inclusive).
+    pub start_pc: u32,
+    /// Ending instruction index (exclusive).
+    pub end_pc: u32,
+    /// Source line number.
+    pub line: u32,
+}
+
+/// Exception handler entry for zero-cost exception handling.
+///
+/// During exception unwinding, the VM performs a binary search on these
+/// entries (sorted by start_pc) to find a matching handler. This enables
+/// true zero-cost exceptions: no overhead on the happy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionEntry {
+    /// Starting PC of the try block (inclusive).
+    pub start_pc: u32,
+    /// Ending PC of the try block (exclusive).
+    pub end_pc: u32,
+    /// Handler PC (start of except clause).
+    pub handler_pc: u32,
+    /// Finally block PC (if present).
+    /// A value of u32::MAX indicates no finally block.
+    pub finally_pc: u32,
+    /// Handler depth for nested handlers.
+    pub depth: u16,
+    /// Exception type constant index (for type matching).
+    /// A value of u16::MAX indicates bare `except:`.
+    pub exception_type_idx: u16,
+}
+
+impl CodeObject {
+    /// Create a new empty code object.
+    pub fn new(name: impl Into<Arc<str>>, filename: impl Into<Arc<str>>) -> Self {
+        let name = name.into();
+        CodeObject {
+            qualname: name.clone(),
+            name,
+            filename: filename.into(),
+            first_lineno: 1,
+            instructions: Box::new([]),
+            constants: Box::new([]),
+            locals: Box::new([]),
+            names: Box::new([]),
+            freevars: Box::new([]),
+            cellvars: Box::new([]),
+            arg_count: 0,
+            posonlyarg_count: 0,
+            kwonlyarg_count: 0,
+            register_count: 0,
+            flags: CodeFlags::NONE,
+            line_table: Box::new([]),
+            exception_table: Box::new([]),
+            nested_code_objects: Box::new([]),
+        }
+    }
+
+    /// Get the line number for a given instruction index.
+    pub fn line_for_pc(&self, pc: u32) -> Option<u32> {
+        for entry in self.line_table.iter() {
+            if entry.start_pc <= pc && pc < entry.end_pc {
+                return Some(entry.line);
+            }
+        }
+        None
+    }
+
+    /// Get the CPython-compatible source position tuple for an instruction.
+    ///
+    /// Prism currently tracks line granularity but not column offsets, so the
+    /// start/end columns remain `None`. When a line number is available we
+    /// mirror it into both the start and end line slots, matching CPython's
+    /// `co_positions()` shape.
+    #[inline]
+    pub fn position_for_pc(&self, pc: u32) -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
+        match self.line_for_pc(pc) {
+            Some(line) => (Some(line), Some(line), None, None),
+            None => (None, None, None, None),
+        }
+    }
+
+    /// Iterate over CPython-compatible source positions for each instruction.
+    #[inline]
+    pub fn positions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (Option<u32>, Option<u32>, Option<u32>, Option<u32>)> + '_
+    {
+        (0..self.instructions.len() as u32).map(|pc| self.position_for_pc(pc))
+    }
+
+    /// Check if this is a generator function.
+    #[inline]
+    pub fn is_generator(&self) -> bool {
+        self.flags.contains(CodeFlags::GENERATOR)
+    }
+
+    /// Check if this is a coroutine.
+    #[inline]
+    pub fn is_coroutine(&self) -> bool {
+        self.flags.contains(CodeFlags::COROUTINE)
+    }
+
+    /// Check if this is an async generator.
+    #[inline]
+    pub fn is_async_generator(&self) -> bool {
+        self.flags.contains(CodeFlags::ASYNC_GENERATOR)
+    }
+
+    /// Get the total parameter count (positional + keyword-only).
+    #[inline]
+    pub fn total_params(&self) -> u16 {
+        self.arg_count + self.kwonlyarg_count
+    }
+
+    /// Get number of closure variables (free + cell).
+    #[inline]
+    pub fn closure_size(&self) -> usize {
+        self.freevars.len() + self.cellvars.len()
+    }
+}
+
+/// Disassemble a code object to a string.
+pub fn disassemble(code: &CodeObject) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+
+    writeln!(output, "Code object: {}", code.name).unwrap();
+    writeln!(output, "  File: {}", code.filename).unwrap();
+    writeln!(output, "  First line: {}", code.first_lineno).unwrap();
+    writeln!(
+        output,
+        "  Args: {} (pos-only: {}, kw-only: {})",
+        code.arg_count, code.posonlyarg_count, code.kwonlyarg_count
+    )
+    .unwrap();
+    writeln!(output, "  Registers: {}", code.register_count).unwrap();
+    writeln!(output, "  Flags: {:08x}", code.flags.bits()).unwrap();
+
+    if !code.constants.is_empty() {
+        writeln!(output, "\nConstants:").unwrap();
+        for (i, c) in code.constants.iter().enumerate() {
+            writeln!(output, "  {:4}: {:?}", i, c).unwrap();
+        }
+    }
+
+    if !code.names.is_empty() {
+        writeln!(output, "\nNames:").unwrap();
+        for (i, n) in code.names.iter().enumerate() {
+            writeln!(output, "  {:4}: {}", i, n).unwrap();
+        }
+    }
+
+    if !code.locals.is_empty() {
+        writeln!(output, "\nLocals:").unwrap();
+        for (i, l) in code.locals.iter().enumerate() {
+            writeln!(output, "  {:4}: {}", i, l).unwrap();
+        }
+    }
+
+    writeln!(output, "\nDisassembly:").unwrap();
+    for (i, inst) in code.instructions.iter().enumerate() {
+        let line = code.line_for_pc(i as u32);
+        let line_str = line.map_or("    ".to_string(), |l| format!("{:4}", l));
+        writeln!(output, "{} {:4}: {}", line_str, i, inst).unwrap();
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instruction::Opcode;
+
+    #[test]
+    fn test_code_flags() {
+        let flags = CodeFlags::GENERATOR | CodeFlags::NESTED;
+        assert!(flags.contains(CodeFlags::GENERATOR));
+        assert!(flags.contains(CodeFlags::NESTED));
+        assert!(!flags.contains(CodeFlags::COROUTINE));
+    }
+
+    #[test]
+    fn test_code_flags_from_bits_accepts_known_flags() {
+        let bits = (CodeFlags::GENERATOR | CodeFlags::MODULE).bits();
+        let flags = CodeFlags::from_bits(bits).expect("known flag set should decode");
+        assert!(flags.contains(CodeFlags::GENERATOR));
+        assert!(flags.contains(CodeFlags::MODULE));
+    }
+
+    #[test]
+    fn test_code_flags_from_bits_rejects_unknown_flags() {
+        assert!(CodeFlags::from_bits(CodeFlags::ALL_BITS | (1 << 31)).is_none());
+    }
+
+    #[test]
+    fn test_code_object_new() {
+        let code = CodeObject::new("test_func", "test.py");
+        assert_eq!(&*code.name, "test_func");
+        assert_eq!(&*code.filename, "test.py");
+        assert_eq!(code.instructions.len(), 0);
+    }
+
+    #[test]
+    fn test_line_table_lookup() {
+        let mut code = CodeObject::new("test", "test.py");
+        code.line_table = vec![
+            LineTableEntry {
+                start_pc: 0,
+                end_pc: 5,
+                line: 10,
+            },
+            LineTableEntry {
+                start_pc: 5,
+                end_pc: 10,
+                line: 15,
+            },
+        ]
+        .into_boxed_slice();
+
+        assert_eq!(code.line_for_pc(0), Some(10));
+        assert_eq!(code.line_for_pc(4), Some(10));
+        assert_eq!(code.line_for_pc(5), Some(15));
+        assert_eq!(code.line_for_pc(9), Some(15));
+        assert_eq!(code.line_for_pc(10), None);
+    }
+
+    #[test]
+    fn test_code_positions_follow_instruction_line_ranges() {
+        let mut code = CodeObject::new("test", "test.py");
+        code.instructions = vec![
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+        ]
+        .into_boxed_slice();
+        code.line_table = vec![
+            LineTableEntry {
+                start_pc: 0,
+                end_pc: 1,
+                line: 10,
+            },
+            LineTableEntry {
+                start_pc: 1,
+                end_pc: 4,
+                line: 14,
+            },
+        ]
+        .into_boxed_slice();
+
+        let positions: Vec<_> = code.positions().collect();
+        assert_eq!(
+            positions,
+            vec![
+                (Some(10), Some(10), None, None),
+                (Some(14), Some(14), None, None),
+                (Some(14), Some(14), None, None),
+                (Some(14), Some(14), None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_code_position_defaults_to_unknown_when_line_is_missing() {
+        let mut code = CodeObject::new("test", "test.py");
+        code.instructions = vec![Instruction::op(Opcode::Nop)].into_boxed_slice();
+
+        assert_eq!(code.position_for_pc(0), (None, None, None, None));
+    }
+}

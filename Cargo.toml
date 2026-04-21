@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "prism_aot",
+    "prism_code",
     "prism_core",
     "prism_parser",
     "prism_compiler",
@@ -24,6 +25,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Internal crates
 prism_core = { path = "prism_core" }
+prism_code = { path = "prism_code" }
 prism_gc = { path = "prism_gc" }
 prism_parser = { path = "prism_parser" }
 prism_compiler = { path = "prism_compiler" }

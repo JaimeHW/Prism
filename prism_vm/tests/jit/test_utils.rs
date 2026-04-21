@@ -1,6 +1,6 @@
 //! Shared test utilities for JIT integration tests.
 
-use prism_compiler::bytecode::{
+use prism_code::{
     CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register,
 };
 use prism_core::Value;

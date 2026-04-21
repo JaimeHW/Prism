@@ -14,7 +14,7 @@ use crate::python_numeric::{
 };
 use crate::stdlib::_warnings::emit_bool_invert_deprecation_warning;
 use num_traits::ToPrimitive;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
@@ -1425,7 +1425,7 @@ mod tests {
     use crate::VirtualMachine;
     use crate::builtins::builtin_type_object_for_type_id;
     use prism_compiler::Compiler;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_core::intern::intern;
     use prism_parser::parse;
     use prism_runtime::object::shape::Shape;

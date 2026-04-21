@@ -6,7 +6,7 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::iteration::collect_iterable_values;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::types::dict::DictObject;
@@ -442,7 +442,7 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         let frame = vm.current_frame_mut();
         if (frame.ip as usize) < frame.code.instructions.len() {
             let next = frame.code.instructions[frame.ip as usize];
-            if next.opcode() == prism_compiler::bytecode::Opcode::CallKwEx as u8
+            if next.opcode() == prism_code::Opcode::CallKwEx as u8
                 && next.src1().0 == STEP_EXT_TAG_A
                 && next.src2().0 == STEP_EXT_TAG_B
             {

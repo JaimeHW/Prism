@@ -29,7 +29,7 @@
 //! - O(n) for polymorphic (n ≤ 4, ~20 cycles)
 //! - O(1) megamorphic fallback via global hash table (~100 cycles)
 
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_core::SpeculationProvider;
 
 use crate::ic::{IcManager, IcSite, ShapeVersion};
@@ -472,7 +472,7 @@ impl std::error::Error for CompilationError {}
 mod tests {
     use super::*;
     use crate::tier1::codegen::TemplateInstruction;
-    use prism_compiler::bytecode::{Instruction, Opcode, Register};
+    use prism_code::{Instruction, Opcode, Register};
     use prism_core::speculation::NoSpeculation;
 
     fn make_code(instructions: Vec<Instruction>) -> CodeObject {

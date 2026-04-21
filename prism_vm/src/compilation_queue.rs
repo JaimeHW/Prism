@@ -32,9 +32,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 #[cfg(test)]
-use prism_compiler::bytecode::Opcode;
+use prism_code::Opcode;
 use prism_jit::runtime::{CodeCache, CompiledEntry};
 use prism_jit::tier1::codegen::TemplateCompiler;
 
@@ -305,10 +305,10 @@ mod tests {
         // Create a simple code object with a return instruction
         let mut code = CodeObject::new("test_func", "<test>");
         code.register_count = 1;
-        use prism_compiler::bytecode::Instruction;
+        use prism_code::Instruction;
         code.instructions = vec![
-            Instruction::op_d(Opcode::LoadNone, prism_compiler::bytecode::Register::new(0)),
-            Instruction::op_d(Opcode::Return, prism_compiler::bytecode::Register::new(0)),
+            Instruction::op_d(Opcode::LoadNone, prism_code::Register::new(0)),
+            Instruction::op_d(Opcode::Return, prism_code::Register::new(0)),
         ]
         .into_boxed_slice();
 
@@ -348,10 +348,10 @@ mod tests {
         // Create a code object
         let mut code = CodeObject::new("already_compiled", "<test>");
         code.register_count = 1;
-        use prism_compiler::bytecode::Instruction;
+        use prism_code::Instruction;
         code.instructions = vec![
-            Instruction::op_d(Opcode::LoadNone, prism_compiler::bytecode::Register::new(0)),
-            Instruction::op_d(Opcode::Return, prism_compiler::bytecode::Register::new(0)),
+            Instruction::op_d(Opcode::LoadNone, prism_code::Register::new(0)),
+            Instruction::op_d(Opcode::Return, prism_code::Register::new(0)),
         ]
         .into_boxed_slice();
         let code = Arc::new(code);
@@ -390,10 +390,10 @@ mod tests {
             let name: Arc<str> = Arc::from(format!("func_{}", i).as_str());
             let mut code = CodeObject::new(name, "<test>");
             code.register_count = 1;
-            use prism_compiler::bytecode::Instruction;
+            use prism_code::Instruction;
             code.instructions = vec![
-                Instruction::op_d(Opcode::LoadNone, prism_compiler::bytecode::Register::new(0)),
-                Instruction::op_d(Opcode::Return, prism_compiler::bytecode::Register::new(0)),
+                Instruction::op_d(Opcode::LoadNone, prism_code::Register::new(0)),
+                Instruction::op_d(Opcode::Return, prism_code::Register::new(0)),
             ]
             .into_boxed_slice();
             let code = Arc::new(code);
@@ -457,10 +457,10 @@ mod tests {
         // Create a code object
         let mut code = CodeObject::new("upgrade_func", "<test>");
         code.register_count = 1;
-        use prism_compiler::bytecode::Instruction;
+        use prism_code::Instruction;
         code.instructions = vec![
-            Instruction::op_d(Opcode::LoadNone, prism_compiler::bytecode::Register::new(0)),
-            Instruction::op_d(Opcode::Return, prism_compiler::bytecode::Register::new(0)),
+            Instruction::op_d(Opcode::LoadNone, prism_code::Register::new(0)),
+            Instruction::op_d(Opcode::Return, prism_code::Register::new(0)),
         ]
         .into_boxed_slice();
         let code = Arc::new(code);

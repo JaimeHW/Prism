@@ -4,7 +4,7 @@ use crate::object::class::PyClassObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::Cell;
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use std::sync::Arc;

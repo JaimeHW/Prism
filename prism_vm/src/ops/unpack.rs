@@ -5,7 +5,7 @@
 //! - `BuildDictUnpack`: Builds a dict from multiple values, merging **dict mappings
 //! - `CallEx`: Calls a function with unpacked *args tuple and **kwargs dict
 
-use prism_compiler::bytecode::{Instruction, Opcode};
+use prism_code::{Instruction, Opcode};
 use prism_core::Value;
 use prism_core::intern::interned_by_ptr;
 use prism_runtime::object::ObjectHeader;
@@ -256,7 +256,7 @@ mod tests {
     use crate::VirtualMachine;
     use crate::builtins::{BuiltinError, BuiltinFunctionObject, builtin_iter, builtin_next};
     use crate::dispatch::ControlFlow;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
+    use prism_code::{CodeObject, Instruction, Opcode};
     use prism_core::Value;
     use prism_runtime::object::descriptor::BoundMethod;
     use prism_runtime::types::dict::DictObject;

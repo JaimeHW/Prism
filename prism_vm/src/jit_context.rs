@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_jit::runtime::CompiledEntry;
 
 use crate::error::RuntimeError;
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_handle_tier_up_tier2_compiles_tier2_in_sync_mode() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
         use prism_jit::runtime::ReturnAbi;
 
         let mut ctx = JitContext::for_testing();
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_handle_tier_up_tier2_failure_is_not_retried_for_same_code() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
         use prism_core::Value;
 
         let mut ctx = JitContext::for_testing();

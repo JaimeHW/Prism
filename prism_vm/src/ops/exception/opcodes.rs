@@ -54,7 +54,7 @@ use crate::error::RuntimeError;
 use crate::exception::HandlerFrame;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::objects::{snapshot_frame_globals_dict, snapshot_frame_locals_dict};
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
@@ -884,7 +884,7 @@ mod tests {
     use super::*;
     use crate::builtins::{ExceptionFlags, TYPE_ERROR, VALUE_ERROR};
     use crate::stdlib::exceptions::ExceptionTypeId;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use std::sync::Arc;
 
     fn push_test_frame(vm: &mut VirtualMachine) {
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_extract_type_id_no_type() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
 
         // Create instruction with NO_TYPE_ID
         let inst = Instruction::op_di(Opcode::Raise, Register(0), NO_TYPE_ID);

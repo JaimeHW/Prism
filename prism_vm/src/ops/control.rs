@@ -4,7 +4,7 @@
 
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 
 // =============================================================================
@@ -205,7 +205,7 @@ pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use std::sync::Arc;
 
     fn push_test_frame(vm: &mut VirtualMachine) {

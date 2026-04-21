@@ -5,7 +5,7 @@
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::dict::DictObject;
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
@@ -274,7 +274,7 @@ impl FunctionObject {
     pub fn has_varargs(&self) -> bool {
         self.code
             .flags
-            .contains(prism_compiler::bytecode::CodeFlags::VARARGS)
+            .contains(prism_code::CodeFlags::VARARGS)
     }
 
     /// Check if function takes **kwargs.
@@ -282,7 +282,7 @@ impl FunctionObject {
     pub fn has_varkw(&self) -> bool {
         self.code
             .flags
-            .contains(prism_compiler::bytecode::CodeFlags::VARKEYWORDS)
+            .contains(prism_code::CodeFlags::VARKEYWORDS)
     }
 
     /// Get default value for parameter at index.

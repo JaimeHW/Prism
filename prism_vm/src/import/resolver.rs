@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn test_frozen_module_registry() {
         let resolver = ImportResolver::new();
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = Arc::new(prism_code::CodeObject::new(
             "<module>", "<frozen>",
         ));
 

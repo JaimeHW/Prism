@@ -1,17 +1,22 @@
-//! Register-based bytecode system.
-//!
-//! This module provides the bytecode representation for Prism's register-based VM.
-//! Key components:
-//!
-//! - [`Instruction`] - 32-bit packed instruction format
-//! - [`Opcode`] - Enumeration of all bytecode operations
-//! - [`CodeObject`] - Compiled function representation
-//! - [`FunctionBuilder`] - High-level API for bytecode construction
+//! Compatibility re-exports for Prism's shared bytecode representation.
 
-mod builder;
-mod code_object;
-mod instruction;
+/// Compatibility re-exports for bytecode construction helpers.
+pub mod builder {
+    pub use prism_code::builder::*;
+}
 
-pub use builder::{FunctionBuilder, KwNamesTuple, Label};
-pub use code_object::{CodeFlags, CodeObject, ExceptionEntry, LineTableEntry, disassemble};
-pub use instruction::{ConstIndex, Instruction, InstructionFormat, LocalSlot, Opcode, Register};
+/// Compatibility re-exports for code-object metadata types.
+pub mod code_object {
+    pub use prism_code::code_object::*;
+}
+
+/// Compatibility re-exports for instruction encoding types.
+pub mod instruction {
+    pub use prism_code::instruction::*;
+}
+
+pub use prism_code::{
+    CodeFlags, CodeObject, ConstIndex, ExceptionEntry, FunctionBuilder, Instruction,
+    InstructionFormat, KwNamesTuple, Label, LineTableEntry, LocalSlot, Opcode, Register,
+    disassemble,
+};

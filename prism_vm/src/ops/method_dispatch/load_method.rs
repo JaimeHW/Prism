@@ -28,7 +28,7 @@ use crate::error::RuntimeError;
 use crate::ops::objects::{
     get_attribute_value, lookup_class_metaclass_attr, super_attribute_value_static,
 };
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
@@ -797,8 +797,8 @@ mod tests {
     use super::*;
     use crate::VirtualMachine;
     use crate::import::ModuleObject;
-    use prism_compiler::bytecode::CodeObject;
-    use prism_compiler::bytecode::{Instruction, Opcode, Register};
+    use prism_code::CodeObject;
+    use prism_code::{Instruction, Opcode, Register};
     use prism_core::intern::intern;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::mro::ClassId;

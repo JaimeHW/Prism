@@ -5,7 +5,7 @@
 
 use crate::exception::InlineHandlerCache;
 use crate::import::ModuleObject;
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_core::Value;
 use std::sync::Arc;
 
@@ -422,7 +422,7 @@ impl Frame {
 
     /// Fetch the current instruction and advance IP.
     #[inline(always)]
-    pub fn fetch(&mut self) -> prism_compiler::bytecode::Instruction {
+    pub fn fetch(&mut self) -> prism_code::Instruction {
         let inst = unsafe { *self.code.instructions.get_unchecked(self.ip as usize) };
         self.ip += 1;
         inst
@@ -430,7 +430,7 @@ impl Frame {
 
     /// Peek at the current instruction without advancing.
     #[inline(always)]
-    pub fn peek(&self) -> prism_compiler::bytecode::Instruction {
+    pub fn peek(&self) -> prism_code::Instruction {
         unsafe { *self.code.instructions.get_unchecked(self.ip as usize) }
     }
 

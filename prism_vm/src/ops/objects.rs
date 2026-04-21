@@ -20,7 +20,7 @@ use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::method_cache::method_cache;
 use crate::ops::method_dispatch::resolve_builtin_instance_method;
 use crate::stdlib::collections::deque::DequeObject;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::ObjectHeader;
@@ -1911,7 +1911,7 @@ mod tests {
     use crate::builtins::BuiltinFunctionObject;
     use crate::frame::ClosureEnv;
     use crate::import::ModuleObject;
-    use prism_compiler::bytecode::{
+    use prism_code::{
         CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode, Register,
     };
     use prism_core::Value;

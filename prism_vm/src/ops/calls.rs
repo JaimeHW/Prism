@@ -20,7 +20,7 @@ use crate::frame::{ClosureEnv, RegisterSnapshot};
 use crate::ops::kw_binding::{ArgumentBinder, BoundArguments};
 use crate::stdlib::generators::{GeneratorObject, LivenessMap};
 use crate::vm::NestedTargetFrameOutcome;
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction};
+use prism_code::{CodeFlags, CodeObject, Instruction};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
@@ -1148,7 +1148,7 @@ fn invoke_user_function_with_implicit_self(
                 ));
             };
             let kwnames =
-                unsafe { &*(kwnames_ptr as *const prism_compiler::bytecode::KwNamesTuple) };
+                unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
             let mut keyword_args: SmallVec<[(&str, Value); 4]> = SmallVec::with_capacity(kwargc);
             for i in 0..kwargc {
                 let kw_name = kwnames
@@ -1833,7 +1833,7 @@ fn collect_call_keyword_args(
             "Invalid keyword names in constant pool",
         ));
     };
-    let kwnames = unsafe { &*(kwnames_ptr as *const prism_compiler::bytecode::KwNamesTuple) };
+    let kwnames = unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
 
     let mut keyword_args: SmallVec<[(Arc<str>, Value); 4]> = SmallVec::with_capacity(kwargc);
     for i in 0..kwargc {
@@ -2363,7 +2363,7 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                             ));
                         };
                         let kwnames = unsafe {
-                            &*(kwnames_ptr as *const prism_compiler::bytecode::KwNamesTuple)
+                            &*(kwnames_ptr as *const prism_code::KwNamesTuple)
                         };
                         let mut keyword_args: SmallVec<[(&str, Value); 4]> =
                             SmallVec::with_capacity(kwargc);
@@ -2609,7 +2609,7 @@ fn call_kw_user_function(
 
         if let Some(kwnames_ptr) = kwnames_val.as_object_ptr() {
             let kwnames =
-                unsafe { &*(kwnames_ptr as *const prism_compiler::bytecode::KwNamesTuple) };
+                unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
 
             for i in 0..kwargc {
                 let kw_name = match kwnames.get(i) {
@@ -3394,7 +3394,7 @@ mod tests {
     use crate::VirtualMachine;
     use crate::builtins::{BuiltinError, BuiltinFunctionObject};
     use crate::dispatch::ControlFlow;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_core::Value;
     use prism_core::intern::intern;
     use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};

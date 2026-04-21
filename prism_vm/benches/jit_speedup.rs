@@ -22,7 +22,7 @@ use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
     measurement::WallTime,
 };
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -135,6 +135,8 @@ fn create_fib_iterative(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "fib_iterative".into(),
         flags: CodeFlags::NONE,
@@ -225,6 +227,8 @@ fn create_loop_sum(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "loop_sum".into(),
         flags: CodeFlags::NONE,
@@ -366,6 +370,8 @@ fn create_nested_loop(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "nested_loop".into(),
         flags: CodeFlags::NONE,

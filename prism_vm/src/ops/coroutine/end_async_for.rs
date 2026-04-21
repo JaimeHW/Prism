@@ -25,7 +25,7 @@ use crate::VirtualMachine;
 use crate::builtins::ExceptionValue;
 use crate::dispatch::ControlFlow;
 use crate::stdlib::exceptions::ExceptionTypeId;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 
 /// EndAsyncFor: Handle StopAsyncIteration in async for loop.

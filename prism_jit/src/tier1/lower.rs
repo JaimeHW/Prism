@@ -29,7 +29,7 @@
 //! This allows hot paths to use fast specialized code while cold paths
 //! remain correct via fallback to the slow path.
 
-use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
+use prism_code::{CodeObject, Instruction, Opcode};
 use prism_core::{SpeculationProvider, TypeHint};
 
 use super::codegen::TemplateInstruction;
@@ -1501,7 +1501,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_core::speculation::NoSpeculation;
 
     fn make_code(instructions: Vec<Instruction>) -> CodeObject {

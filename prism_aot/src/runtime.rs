@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use prism_compiler::bytecode::{
+use prism_code::{
     CodeFlags, CodeObject, ExceptionEntry, Instruction, KwNamesTuple, LineTableEntry,
 };
 use prism_core::Value;

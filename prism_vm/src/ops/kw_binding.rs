@@ -433,7 +433,7 @@ impl ArgumentBinder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{CodeFlags, CodeObject};
+    use prism_code::{CodeFlags, CodeObject};
 
     fn make_test_code(
         arg_count: u16,

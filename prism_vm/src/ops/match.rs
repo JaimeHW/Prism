@@ -18,7 +18,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::ops::objects::extract_type_id;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;

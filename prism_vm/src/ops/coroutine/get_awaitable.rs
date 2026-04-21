@@ -21,7 +21,7 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 
 use super::protocol::{call_unary_magic_method, is_iterator, lookup_magic_method, type_name};
@@ -155,7 +155,7 @@ fn call_await_method(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::CodeObject;
+    use prism_code::CodeObject;
     use std::sync::Arc;
 
     fn generator_value(flags: GeneratorFlags) -> Value {

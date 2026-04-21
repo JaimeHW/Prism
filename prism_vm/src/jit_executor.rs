@@ -497,7 +497,7 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let mut executor = JitExecutor::new(cache);
 
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = Arc::new(prism_code::CodeObject::new(
             "jit_raw_abi_test",
             "<test>",
         ));
@@ -518,7 +518,7 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let mut executor = JitExecutor::new(cache);
 
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = Arc::new(prism_code::CodeObject::new(
             "jit_encoded_abi_test",
             "<test>",
         ));
@@ -551,7 +551,7 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let mut executor = JitExecutor::new(cache);
 
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = Arc::new(prism_code::CodeObject::new(
             "jit_deopt_site_index_fallback",
             "<test>",
         ));
@@ -584,7 +584,7 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let mut executor = JitExecutor::new(cache);
 
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = Arc::new(prism_code::CodeObject::new(
             "jit_closure_pointer_test",
             "<test>",
         ));
@@ -603,7 +603,7 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let mut executor = JitExecutor::new(cache);
 
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = Arc::new(prism_code::CodeObject::new(
             "jit_no_closure_pointer_test",
             "<test>",
         ));

@@ -1055,7 +1055,7 @@ async def async_gen():
 
 mod code_flags_tests {
     use super::*;
-    use prism_compiler::bytecode::CodeFlags;
+    use prism_code::CodeFlags;
 
     fn get_code_flags(source: &str) -> Result<CodeFlags, String> {
         let module = parse(source).map_err(|e| format!("{:?}", e))?;
@@ -1137,7 +1137,7 @@ def gen():
 
 mod bytecode_tests {
     use super::*;
-    use prism_compiler::bytecode::Opcode;
+    use prism_code::Opcode;
 
     fn has_opcode(source: &str, target: Opcode) -> bool {
         let module = match parse(source) {

@@ -29,7 +29,7 @@ use crate::builtins::BuiltinFunctionObject;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::calls::{call_user_function_from_values, invoke_builtin, invoke_callable_value};
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::descriptor::BoundMethod;
@@ -263,7 +263,7 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 mod tests {
     use super::*;
     use crate::builtins::{BuiltinError, BuiltinFunctionObject};
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
+    use prism_code::{CodeObject, Instruction, Opcode};
     use prism_runtime::types::function::FunctionObject;
     use prism_runtime::types::list::ListObject;
     use std::sync::Arc;

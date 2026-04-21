@@ -34,7 +34,7 @@ use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
 use crate::ops::objects::{get_attribute_value, resolve_class_attribute};
-use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
+use prism_code::{CodeObject, Instruction, Opcode};
 use prism_core::Value;
 #[cfg(test)]
 use prism_core::intern::interned_by_ptr;
@@ -301,7 +301,7 @@ fn collect_class_keyword_args(
             "Invalid class keyword names in constant pool",
         ));
     };
-    let kwnames = unsafe { &*(kwnames_ptr as *const prism_compiler::bytecode::KwNamesTuple) };
+    let kwnames = unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
     let keyword_base = dst_reg + 1 + base_count as u8 + u8::from(has_explicit_metaclass);
 
     let mut keyword_args: SmallVec<[(Arc<str>, Value); 4]> = SmallVec::with_capacity(kwargc);

@@ -18,7 +18,7 @@ use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
     list_storage_mut_from_ptr, list_storage_ref_from_ptr,
 };
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
@@ -723,7 +723,7 @@ fn invoke_bound_method_with_args_allow_control_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{Instruction, Opcode, Register};
+    use prism_code::{Instruction, Opcode, Register};
     use prism_core::intern::intern;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::mro::ClassId;
@@ -1037,7 +1037,7 @@ mod tests {
     #[test]
     fn test_binary_subscr_reads_heap_dict_subclass_native_storage() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new("sub", "<test>"));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("sub", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let class = register_dict_subclass("BinaryDictSubclass");
@@ -1069,7 +1069,7 @@ mod tests {
     #[test]
     fn test_binary_subscr_on_type_object_produces_generic_alias() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new("sub", "<test>"));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("sub", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
         vm.current_frame_mut().set_reg(
             1,
@@ -1098,7 +1098,7 @@ mod tests {
     #[test]
     fn test_binary_subscr_on_mapping_proxy_returns_descriptor_view() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new("sub", "<test>"));
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("sub", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let mapping = crate::builtins::builtin_type_attribute_value(
@@ -1132,7 +1132,7 @@ mod tests {
     fn test_store_subscr_assigns_list_slice_from_iterable() {
         let mut vm = VirtualMachine::new();
         let code =
-            std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new("store", "<test>"));
+            std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let list = ListObject::from_iter(vec![
@@ -1179,7 +1179,7 @@ mod tests {
     fn test_store_subscr_updates_heap_dict_subclass_native_storage() {
         let mut vm = VirtualMachine::new();
         let code =
-            std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new("store", "<test>"));
+            std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let class = register_dict_subclass("StoreDictSubclass");
@@ -1211,7 +1211,7 @@ mod tests {
     fn test_store_subscr_rejects_mismatched_extended_slice_assignment() {
         let mut vm = VirtualMachine::new();
         let code =
-            std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new("store", "<test>"));
+            std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
 
         let list = ListObject::from_iter(vec![
@@ -1253,7 +1253,7 @@ mod tests {
     #[test]
     fn test_delete_subscr_removes_list_slice() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = std::sync::Arc::new(prism_code::CodeObject::new(
             "delete", "<test>",
         ));
         vm.push_frame(code, 0).expect("frame push failed");
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn test_delete_subscr_removes_heap_dict_subclass_native_storage_entry() {
         let mut vm = VirtualMachine::new();
-        let code = std::sync::Arc::new(prism_compiler::bytecode::CodeObject::new(
+        let code = std::sync::Arc::new(prism_code::CodeObject::new(
             "delete", "<test>",
         ));
         vm.push_frame(code, 0).expect("frame push failed");

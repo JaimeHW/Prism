@@ -8,7 +8,7 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::objects::{extract_type_id, get_attribute_value};
 use crate::stdlib::exceptions::ExceptionTypeId;
-use prism_compiler::bytecode::Instruction;
+use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
@@ -427,7 +427,7 @@ pub fn move_reg(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_core::Value;
     use prism_runtime::types::Cell;
     use std::sync::Arc;

@@ -3,7 +3,7 @@
 //! Measures execution performance of speculative operations.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -35,6 +35,8 @@ fn create_int_add_code(a: i64, b: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_int_add".into(),
         flags: CodeFlags::NONE,
@@ -65,6 +67,8 @@ fn create_float_add_code(a: f64, b: f64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_float_add".into(),
         flags: CodeFlags::NONE,
@@ -95,6 +99,8 @@ fn create_mul_code(a: i64, b: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_mul".into(),
         flags: CodeFlags::NONE,
@@ -164,6 +170,8 @@ fn create_hot_loop_code(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_hot_loop".into(),
         flags: CodeFlags::NONE,
@@ -287,6 +295,8 @@ fn bench_vm_overhead(c: &mut Criterion) {
             freevars: Box::new([]),
             cellvars: Box::new([]),
             line_table: Box::new([]),
+            exception_table: Box::new([]),
+            nested_code_objects: Box::new([]),
             filename: "bench.py".into(),
             qualname: "bench_return_const".into(),
             flags: CodeFlags::NONE,

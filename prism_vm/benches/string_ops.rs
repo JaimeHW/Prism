@@ -17,7 +17,7 @@
 //! - Interned strings: Hash-consing for deduplication
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_vm::{JitConfig, VirtualMachine};
@@ -51,6 +51,8 @@ fn create_string_concat_code(a: &str, b: &str) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_string_concat".into(),
         flags: CodeFlags::NONE,
@@ -82,6 +84,8 @@ fn create_string_repeat_code(s: &str, n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_string_repeat".into(),
         flags: CodeFlags::NONE,
@@ -113,6 +117,8 @@ fn create_string_compare_code(a: &str, b: &str) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_string_compare".into(),
         flags: CodeFlags::NONE,
@@ -212,6 +218,8 @@ fn create_string_build_loop(iterations: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "bench_string_build_loop".into(),
         flags: CodeFlags::NONE,

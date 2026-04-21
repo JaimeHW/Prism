@@ -3,7 +3,7 @@
 //! This module centralizes bytecode -> template lowering so sync and async
 //! compilation paths use identical semantics.
 
-use prism_compiler::bytecode::{CodeObject, Opcode};
+use prism_code::{CodeObject, Opcode};
 use prism_jit::tier1::codegen::TemplateInstruction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -755,7 +755,7 @@ fn jump_target(template: &TemplateInstruction) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::{Instruction, Register};
+    use prism_code::{Instruction, Register};
     use prism_core::Value;
 
     #[test]

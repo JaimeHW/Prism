@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 prism_core.workspace = true
+prism_code.workspace = true
 prism_parser.workspace = true
 prism_compiler.workspace = true
 prism_vm.workspace = true

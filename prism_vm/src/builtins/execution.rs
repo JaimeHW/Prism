@@ -263,7 +263,7 @@ fn compile_dynamic_module(
     source: &str,
     filename: &str,
     namespace_mode: ModuleNamespaceMode,
-) -> Result<Arc<prism_compiler::bytecode::CodeObject>, BuiltinError> {
+) -> Result<Arc<prism_code::CodeObject>, BuiltinError> {
     let parsed =
         parse_module_source(source).map_err(|err| BuiltinError::SyntaxError(err.to_string()))?;
     Compiler::compile_module_with_namespace_mode(
@@ -367,7 +367,7 @@ impl DynamicExecution {
 
 fn execute_dynamic_module(
     vm: &mut VirtualMachine,
-    code: Arc<prism_compiler::bytecode::CodeObject>,
+    code: Arc<prism_code::CodeObject>,
     globals_arg: Option<Value>,
     locals_arg: Option<Value>,
 ) -> Result<DynamicExecution, BuiltinError> {

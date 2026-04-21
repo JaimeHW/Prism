@@ -3424,7 +3424,7 @@ mod tests {
     use crate::builtins::iterator_to_value;
     use crate::error::RuntimeErrorKind;
     use crate::stdlib::exceptions::ExceptionTypeId;
-    use prism_compiler::bytecode::CodeObject;
+    use prism_code::CodeObject;
     use prism_core::intern::{intern, interned_by_ptr};
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::descriptor::BoundMethod;
@@ -5631,7 +5631,7 @@ mod tests {
 
     #[test]
     fn test_generator_close_exhausts_created_generator() {
-        let code = Arc::new(prism_compiler::bytecode::CodeObject::new("g", "<test>"));
+        let code = Arc::new(prism_code::CodeObject::new("g", "<test>"));
         let generator = Box::new(GeneratorObject::new(code));
         let ptr = Box::into_raw(generator);
         let value = Value::object_ptr(ptr as *const ());

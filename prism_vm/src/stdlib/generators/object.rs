@@ -23,7 +23,7 @@
 //! ```
 
 use crate::frame::ClosureEnv;
-use prism_compiler::bytecode::{CodeFlags, CodeObject};
+use prism_code::{CodeFlags, CodeObject};
 use prism_core::Value;
 use prism_gc::Trace;
 use prism_gc::trace::Tracer;
@@ -486,7 +486,7 @@ fn object_type_id(ptr: *const ()) -> TypeId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::CodeObject;
+    use prism_code::CodeObject;
     use std::sync::Arc;
 
     fn test_code() -> Arc<CodeObject> {

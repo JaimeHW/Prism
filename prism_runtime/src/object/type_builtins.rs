@@ -1480,7 +1480,7 @@ mod tests {
     use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
     use crate::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
     use crate::types::function::FunctionObject;
-    use prism_compiler::bytecode::CodeObject;
+    use prism_code::CodeObject;
     use prism_core::intern::intern;
     use std::sync::Arc;
 

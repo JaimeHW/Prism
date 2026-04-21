@@ -18,7 +18,7 @@
 use prism_core::Value;
 use std::sync::Arc;
 
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 
 use crate::ops::generator::{GeneratorContext, GeneratorExecutionState};
 use crate::stdlib::generators::{GeneratorFlags, GeneratorObject, LivenessMap};

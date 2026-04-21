@@ -129,7 +129,7 @@ impl FrameLayout {
     }
 
     /// Create a frame layout for a function from a CodeObject.
-    pub fn for_function(code: &prism_compiler::bytecode::CodeObject) -> Self {
+    pub fn for_function(code: &prism_code::CodeObject) -> Self {
         Self::minimal(code.register_count)
     }
 

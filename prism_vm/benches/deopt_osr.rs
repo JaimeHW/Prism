@@ -17,7 +17,7 @@
 //! - OSR warm entry: < 10μs
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -51,6 +51,8 @@ fn create_type_stable_code() -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "type_stable".into(),
         flags: CodeFlags::NONE,
@@ -86,6 +88,8 @@ fn create_type_varying_code(use_float: bool) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "type_varying".into(),
         flags: CodeFlags::NONE,
@@ -176,6 +180,8 @@ fn create_osr_candidate_loop(n: i64) -> Arc<CodeObject> {
         freevars: Box::new([]),
         cellvars: Box::new([]),
         line_table: Box::new([]),
+        exception_table: Box::new([]),
+        nested_code_objects: Box::new([]),
         filename: "bench.py".into(),
         qualname: "osr_loop".into(),
         flags: CodeFlags::NONE,

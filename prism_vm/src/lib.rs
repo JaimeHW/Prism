@@ -108,7 +108,7 @@ pub use vm::VirtualMachine;
 
 /// Convenience function to create and run a VM.
 pub fn run(
-    code: std::sync::Arc<prism_compiler::bytecode::CodeObject>,
+    code: std::sync::Arc<prism_code::CodeObject>,
 ) -> prism_core::PrismResult<prism_core::Value> {
     let mut vm = VirtualMachine::new();
     vm.execute(code)

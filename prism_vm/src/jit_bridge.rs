@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use prism_compiler::bytecode::CodeObject;
+use prism_code::CodeObject;
 use prism_jit::backend::x64::registers::Gpr;
 use prism_jit::gc::stackmap::StackMapRef;
 use prism_jit::gc::{SafePoint, StackMap, StackMapRegistry};
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_compile_tier2_sets_tier_and_raw_value_abi() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
         let mut code = CodeObject::new("tier2_test", "<test>");
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_compile_tier2_rejects_unsupported_generic_arithmetic() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
         use prism_core::Value;
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_compile_tier2_accepts_parameterized_graphs() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
         let mut code = CodeObject::new("tier2_param", "<test>");
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_compile_tier2_accepts_branching_control_flow() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
         let mut code = CodeObject::new("tier2_branch", "<test>");
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_compile_tier2_rejects_uninitialized_register_reads() {
-        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_code::{Instruction, Opcode, Register};
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
         let mut code = CodeObject::new("tier2_uninit", "<test>");

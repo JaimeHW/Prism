@@ -1,0 +1,8 @@
+[package]
+name = "prism_code"
+description = "Shared bytecode and code object representation for Prism"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prism_core.workspace = true

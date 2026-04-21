@@ -374,7 +374,7 @@ impl Default for ResumeTableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_compiler::bytecode::CodeObject;
+    use prism_code::CodeObject;
     use std::sync::Arc;
 
     fn test_code() -> Arc<CodeObject> {

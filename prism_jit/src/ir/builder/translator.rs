@@ -4,7 +4,7 @@ use crate::ir::builder::{
 };
 use crate::ir::graph::Graph;
 use crate::opt::speculation::SpeculationProvider;
-use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeObject, Instruction, Opcode, Register};
 
 /// Translator from Bytecode to Sea-of-Nodes IR.
 pub struct BytecodeTranslator<'a> {
@@ -514,7 +514,7 @@ impl<'a> BytecodeTranslator<'a> {
 mod tests {
     use super::*;
     use crate::ir::operators::{ArithOp, BitwiseOp, CallKind, CmpOp, Operator};
-    use prism_compiler::bytecode::Register;
+    use prism_code::Register;
 
     #[test]
     fn test_translate_simple_return_is_ok() {

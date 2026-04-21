@@ -22,7 +22,8 @@ use crate::speculative::SpeculationCache;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
-use prism_compiler::{OptimizationLevel, bytecode::CodeObject};
+use prism_code::CodeObject;
+use prism_compiler::OptimizationLevel;
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
 use prism_parser::parse as parse_module_source;
@@ -2863,7 +2864,7 @@ mod tests {
     use crate::builtins::builtin_getattr;
     use crate::exception::HandlerFrame;
     use crate::import::FrozenModuleSource;
-    use prism_compiler::bytecode::{CodeFlags, CodeObject, ExceptionEntry};
+    use prism_code::{CodeFlags, CodeObject, ExceptionEntry};
     use prism_compiler::{Compiler, OptimizationLevel};
     use prism_core::intern::intern;
     use prism_parser::parse;
