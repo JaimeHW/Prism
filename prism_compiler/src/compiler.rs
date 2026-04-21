@@ -10,7 +10,7 @@ use crate::bytecode::{
     CodeFlags, CodeObject, FunctionBuilder, Instruction, Label, LocalSlot, Opcode, Register,
 };
 use crate::function_compiler::{VarLocation, VariableEmitter};
-use crate::scope::{ClosureAnalyzer, ScopeAnalyzer, ScopeKind, SymbolTable};
+use crate::scope::{ClosureAnalyzer, ScopeAnalyzer, ScopeKind, SymbolFlags, SymbolTable};
 
 use prism_parser::ast::{
     AugOp, BinOp, BoolOp, CmpOp, ExceptHandler, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
@@ -65,6 +65,22 @@ pub enum OptimizationLevel {
     Full = 2,
 }
 
+/// Namespace semantics for module code generation.
+///
+/// Regular module compilation binds top-level assignments directly into module
+/// globals. Dynamic `exec`/`eval` with an explicit locals mapping instead needs
+/// name access that targets the provided mapping while still preserving module
+/// closure rules for nested functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModuleNamespaceMode {
+    /// Emit ordinary module-global name access.
+    #[default]
+    Standard,
+    /// Emit top-level local slots so execution can route name access through a
+    /// live locals mapping.
+    DynamicLocals,
+}
+
 // =============================================================================
 // Loop Context for break/continue
 // =============================================================================
@@ -107,6 +123,8 @@ pub struct Compiler {
     in_function_context: bool,
     /// Compiler optimization level.
     optimize: OptimizationLevel,
+    /// Namespace lowering policy for module-scope names.
+    module_namespace_mode: ModuleNamespaceMode,
     /// Path to the current scope in the symbol table.
     /// Empty path means module root scope.
     scope_path: Vec<usize>,
@@ -135,6 +153,7 @@ impl Compiler {
             in_async_context: false,
             in_function_context: false,
             optimize,
+            module_namespace_mode: ModuleNamespaceMode::Standard,
             scope_path: Vec::new(),
             scope_child_offsets: vec![0],
         }
@@ -145,11 +164,12 @@ impl Compiler {
         Self::compile_module_with_optimization(module, filename, OptimizationLevel::None)
     }
 
-    /// Compile a module to bytecode with an explicit optimization level.
-    pub fn compile_module_with_optimization(
+    /// Compile a module to bytecode with explicit namespace lowering semantics.
+    pub fn compile_module_with_namespace_mode(
         module: &Module,
         filename: &str,
         optimize: OptimizationLevel,
+        module_namespace_mode: ModuleNamespaceMode,
     ) -> CompileResult<CodeObject> {
         // Phase 1: Scope analysis
         let mut symbol_table = ScopeAnalyzer::new().analyze(module, "<module>");
@@ -164,6 +184,7 @@ impl Compiler {
             in_async_context: false,
             in_function_context: false,
             optimize,
+            module_namespace_mode,
             scope_path: Vec::new(),
             scope_child_offsets: vec![0],
         };
@@ -182,6 +203,20 @@ impl Compiler {
         compiler.builder.emit_return_none();
 
         Ok(compiler.builder.finish())
+    }
+
+    /// Compile a module to bytecode with an explicit optimization level.
+    pub fn compile_module_with_optimization(
+        module: &Module,
+        filename: &str,
+        optimize: OptimizationLevel,
+    ) -> CompileResult<CodeObject> {
+        Self::compile_module_with_namespace_mode(
+            module,
+            filename,
+            optimize,
+            ModuleNamespaceMode::Standard,
+        )
     }
 
     /// Whether this statement is a docstring candidate.
@@ -205,8 +240,11 @@ impl Compiler {
     /// parameters and locals defined via define_local().
     fn resolve_variable(&mut self, name: &str) -> VarLocation {
         let in_module_scope = self.current_scope().kind == ScopeKind::Module;
+        let use_dynamic_module_locals =
+            in_module_scope && self.module_namespace_mode == ModuleNamespaceMode::DynamicLocals;
         let symbol_info = self.current_scope().lookup(name).map(|symbol| {
             (
+                symbol.flags.contains(SymbolFlags::GLOBAL_EXPLICIT),
                 symbol.is_cell(),
                 symbol.is_free(),
                 symbol.is_local(),
@@ -214,14 +252,21 @@ impl Compiler {
             )
         });
 
-        if let Some((is_cell, is_free, is_local, closure_slot)) = symbol_info {
+        if let Some((is_explicit_global, is_cell, is_free, is_local, closure_slot)) = symbol_info {
             if (is_cell || is_free) && closure_slot.is_some() {
                 return VarLocation::Closure(closure_slot.unwrap());
             }
 
+            if use_dynamic_module_locals && !is_explicit_global {
+                if let Some(slot) = self.builder.lookup_local(name) {
+                    return VarLocation::Local(slot.0);
+                }
+                return VarLocation::Local(self.builder.define_local(name).0);
+            }
+
             if is_local && !is_cell {
                 // Module-scope names are always global namespace entries.
-                if in_module_scope {
+                if in_module_scope && !use_dynamic_module_locals {
                     return VarLocation::Global;
                 }
                 if let Some(slot) = self.builder.lookup_local(name) {
@@ -232,7 +277,7 @@ impl Compiler {
             }
         }
 
-        if !in_module_scope {
+        if !in_module_scope || use_dynamic_module_locals {
             if let Some(slot) = self.builder.lookup_local(name) {
                 return VarLocation::Local(slot.0);
             }
@@ -430,7 +475,9 @@ impl Compiler {
             } => {
                 // Compile iterator
                 let iter_reg = self.compile_expr(iter)?;
-                let iterator_reg = self.builder.alloc_register();
+                let loop_regs = self.builder.alloc_register_block(2);
+                let iterator_reg = loop_regs;
+                let item_reg = Register::new(loop_regs.0 + 1);
                 self.builder.emit_get_iter(iterator_reg, iter_reg);
                 self.builder.free_register(iter_reg);
 
@@ -448,9 +495,7 @@ impl Compiler {
                 self.builder.bind_label(loop_start);
 
                 // Get next item
-                let item_reg = self.builder.alloc_register();
-                self.builder
-                    .emit_for_iter(item_reg, iterator_reg, loop_else);
+                self.builder.emit_for_iter(item_reg, loop_else);
 
                 // Store to target
                 self.compile_store(target, item_reg)?;
@@ -1092,6 +1137,37 @@ impl Compiler {
         Ok(reg)
     }
 
+    fn compile_large_dict_literal_into(
+        &mut self,
+        dst: Register,
+        keys: &[Option<Expr>],
+        values: &[Expr],
+    ) -> CompileResult<()> {
+        self.builder
+            .emit(Instruction::new(Opcode::BuildDict, dst.0, dst.0, 0));
+
+        for (key_expr, value_expr) in keys.iter().zip(values.iter()) {
+            let key_expr = key_expr
+                .as_ref()
+                .expect("large dict literal fallback only supports concrete keys");
+
+            let key_reg = self.compile_expr(key_expr)?;
+            let value_reg = self.compile_expr(value_expr)?;
+
+            self.builder.emit(Instruction::new(
+                Opcode::DictSet,
+                key_reg.0,
+                dst.0,
+                value_reg.0,
+            ));
+
+            self.builder.free_register(key_reg);
+            self.builder.free_register(value_reg);
+        }
+
+        Ok(())
+    }
+
     /// Compile an expression into a specific destination register.
     fn compile_expr_into(&mut self, expr: &Expr, reg: Register) -> CompileResult<()> {
         match &expr.kind {
@@ -1103,6 +1179,11 @@ impl Compiler {
             ExprKind::Float(n) => {
                 let idx = self.builder.add_float(*n);
                 self.builder.emit_load_const(reg, idx);
+            }
+
+            ExprKind::Complex { real, imag } => {
+                self.compile_complex_literal(*real, *imag, reg)?;
+                return Ok(());
             }
 
             ExprKind::Bool(b) => {
@@ -1127,6 +1208,20 @@ impl Compiler {
                 self.compile_bytes_literal(bytes, reg)?;
             }
 
+            ExprKind::JoinedStr(parts) => {
+                self.compile_joined_str(parts, reg, expr.span.start)?;
+                return Ok(());
+            }
+
+            ExprKind::FormattedValue {
+                value,
+                conversion,
+                format_spec,
+            } => {
+                self.compile_formatted_value(value, *conversion, format_spec.as_deref(), reg)?;
+                return Ok(());
+            }
+
             ExprKind::Name(name) => {
                 // Use scope-aware variable resolution
                 let location = self.resolve_variable(name);
@@ -1149,7 +1244,7 @@ impl Compiler {
 
                 match op {
                     UnaryOp::USub => self.builder.emit_neg(reg, operand_reg),
-                    UnaryOp::UAdd => self.builder.emit_move(reg, operand_reg),
+                    UnaryOp::UAdd => self.builder.emit_pos(reg, operand_reg),
                     UnaryOp::Not => self.builder.emit_not(reg, operand_reg),
                     UnaryOp::Invert => self.builder.emit_bitwise_not(reg, operand_reg),
                 }
@@ -1496,11 +1591,8 @@ impl Compiler {
                     if !has_unpack {
                         // Fast path: direct BuildDict from contiguous [k0, v0, k1, v1, ...].
                         if entry_count > (u8::MAX as usize / 2) {
-                            return Err(CompileError {
-                                message: "dict literal has too many entries".to_string(),
-                                line: expr.span.start,
-                                column: 0,
-                            });
+                            self.compile_large_dict_literal_into(reg, keys, values)?;
+                            return Ok(());
                         }
 
                         let pair_regs = (entry_count * 2) as u8;
@@ -1770,11 +1862,49 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_load_builtin_name(&mut self, dst: Register, name: &str) {
+        let name_idx = self.builder.add_name(name);
+        self.builder.emit_load_builtin(dst, name_idx);
+    }
+
+    fn compile_complex_literal(
+        &mut self,
+        real: f64,
+        imag: f64,
+        dst: Register,
+    ) -> CompileResult<()> {
+        let mut ctor_reg = self.builder.alloc_register();
+        self.emit_load_builtin_name(ctor_reg, "complex");
+
+        let call_block = self.builder.alloc_register_block(3);
+        let call_block_end = call_block.0 + 3;
+        if ctor_reg.0 >= call_block.0 && ctor_reg.0 < call_block_end {
+            let safe_reg = self.builder.alloc_register();
+            self.builder.emit_move(safe_reg, ctor_reg);
+            self.builder.free_register(ctor_reg);
+            ctor_reg = safe_reg;
+        }
+
+        let real_reg = Register::new(call_block.0 + 1);
+        let imag_reg = Register::new(call_block.0 + 2);
+
+        let real_idx = self.builder.add_float(real);
+        self.builder.emit_load_const(real_reg, real_idx);
+
+        let imag_idx = self.builder.add_float(imag);
+        self.builder.emit_load_const(imag_reg, imag_idx);
+
+        self.builder.emit_call(call_block, ctor_reg, 2);
+        self.builder.emit_move(dst, call_block);
+
+        self.builder.free_register(ctor_reg);
+        self.builder.free_register_block(call_block, 3);
+        Ok(())
+    }
+
     fn compile_bytes_literal(&mut self, bytes: &[u8], dst: Register) -> CompileResult<()> {
         let mut ctor_reg = self.builder.alloc_register();
-        let location = self.resolve_variable("bytes");
-        self.builder
-            .emit_load_var(ctor_reg, location, Some("bytes"));
+        self.emit_load_builtin_name(ctor_reg, "bytes");
 
         if bytes.is_empty() {
             self.builder.emit_call(dst, ctor_reg, 0);
@@ -1811,6 +1941,146 @@ impl Compiler {
         self.builder.free_register(ctor_reg);
         self.builder.free_register_block(call_block, 3);
 
+        Ok(())
+    }
+
+    fn compile_joined_str(
+        &mut self,
+        parts: &[Expr],
+        dst: Register,
+        line: u32,
+    ) -> CompileResult<()> {
+        if parts.len() > u8::MAX as usize {
+            return Err(CompileError {
+                message: "f-string has too many parts".to_string(),
+                line,
+                column: 0,
+            });
+        }
+
+        if parts.is_empty() {
+            let empty_idx = self.builder.add_string("");
+            self.builder.emit_load_const(dst, empty_idx);
+            return Ok(());
+        }
+
+        let count = parts.len() as u8;
+        let first_part = self.builder.alloc_register_block(count);
+        for (index, part) in parts.iter().enumerate() {
+            let part_reg = Register::new(first_part.0 + index as u8);
+            self.compile_expr_into(part, part_reg)?;
+        }
+
+        self.builder.emit(Instruction::new(
+            Opcode::BuildString,
+            dst.0,
+            first_part.0,
+            count,
+        ));
+        self.builder.free_register_block(first_part, count);
+        Ok(())
+    }
+
+    fn compile_formatted_value(
+        &mut self,
+        value: &Expr,
+        conversion: i8,
+        format_spec: Option<&Expr>,
+        dst: Register,
+    ) -> CompileResult<()> {
+        let mut current_reg = self.compile_expr(value)?;
+
+        if conversion >= 0 {
+            let builtin_name = match conversion as u8 as char {
+                's' => "str",
+                'r' => "repr",
+                'a' => "ascii",
+                other => {
+                    return Err(CompileError {
+                        message: format!("unsupported f-string conversion '!{other}'"),
+                        line: value.span.start,
+                        column: 0,
+                    });
+                }
+            };
+
+            let converted_reg = self.builder.alloc_register();
+            self.emit_named_call_from_regs(builtin_name, &[current_reg], converted_reg)?;
+            self.builder.free_register(current_reg);
+            current_reg = converted_reg;
+        }
+
+        let formatted_reg = if let Some(spec_expr) = format_spec {
+            let spec_reg = self.compile_expr(spec_expr)?;
+            let result_reg = self.builder.alloc_register();
+            self.emit_named_call_from_regs("format", &[current_reg, spec_reg], result_reg)?;
+            self.builder.free_register(spec_reg);
+            result_reg
+        } else {
+            let result_reg = self.builder.alloc_register();
+            self.emit_named_call_from_regs("format", &[current_reg], result_reg)?;
+            result_reg
+        };
+
+        self.builder.free_register(current_reg);
+        if formatted_reg != dst {
+            self.builder.emit_move(dst, formatted_reg);
+            self.builder.free_register(formatted_reg);
+        }
+
+        Ok(())
+    }
+
+    fn emit_named_call_from_regs(
+        &mut self,
+        name: &str,
+        args: &[Register],
+        dst: Register,
+    ) -> CompileResult<()> {
+        if args.len() > u8::MAX as usize {
+            return Err(CompileError {
+                message: format!("too many arguments for builtin call '{name}'"),
+                line: 0,
+                column: 0,
+            });
+        }
+
+        let mut func_reg = self.builder.alloc_register();
+        let location = self.resolve_variable(name);
+        self.builder.emit_load_var(func_reg, location, Some(name));
+
+        if args.is_empty() {
+            self.builder.emit_call(dst, func_reg, 0);
+            self.builder.free_register(func_reg);
+            return Ok(());
+        }
+
+        let block_size = 1 + args.len() as u8;
+        let call_block = self.builder.alloc_register_block(block_size);
+        let call_block_end = call_block.0 + block_size;
+
+        if func_reg.0 >= call_block.0 && func_reg.0 < call_block_end {
+            let safe_reg = self.builder.alloc_register();
+            self.builder.emit_move(safe_reg, func_reg);
+            self.builder.free_register(func_reg);
+            func_reg = safe_reg;
+        }
+
+        for (index, arg) in args.iter().enumerate() {
+            let dst_reg = Register::new(call_block.0 + 1 + index as u8);
+            if *arg != dst_reg {
+                self.builder.emit_move(dst_reg, *arg);
+            }
+        }
+
+        self.builder
+            .emit_call(call_block, func_reg, args.len() as u8);
+        if call_block != dst {
+            self.builder.emit_move(dst, call_block);
+        }
+
+        self.builder.free_register(func_reg);
+        self.builder.free_register_block(call_block, block_size);
         Ok(())
     }
 
@@ -2729,14 +2999,11 @@ impl Compiler {
         let exc_val_reg = self.builder.alloc_register();
         let exc_tb_reg = self.builder.alloc_register();
 
-        // LoadException gets the current exception value
+        // Load the active exception instance and compute its concrete class for
+        // __exit__(exc_type, exc, tb) compatibility with unittest/assertRaises.
         self.builder
             .emit(Instruction::op_d(Opcode::LoadException, exc_val_reg));
-
-        // For now, we'll pass the exception value for all three
-        // A full implementation would extract type and traceback
-        self.builder
-            .emit(Instruction::op_ds(Opcode::Move, exc_type_reg, exc_val_reg));
+        self.emit_named_call_from_regs("type", &[exc_val_reg], exc_type_reg)?;
         self.builder
             .emit(Instruction::op_d(Opcode::LoadNone, exc_tb_reg));
 
@@ -2763,8 +3030,9 @@ impl Compiler {
         // Pop exception info
         self.builder.emit(Instruction::op(Opcode::PopExcInfo));
 
-        // If __exit__ returns true, suppress the exception; otherwise reraise
-        self.builder.emit_jump_if_true(suppress_reg, end_label);
+        // A truthy __exit__ suppresses the active exception entirely.
+        let suppress_label = self.builder.create_label();
+        self.builder.emit_jump_if_true(suppress_reg, suppress_label);
 
         self.builder.free_register(exc_type_reg);
         self.builder.free_register(exc_val_reg);
@@ -2773,6 +3041,9 @@ impl Compiler {
 
         // Reraise the exception
         self.builder.emit(Instruction::op(Opcode::Reraise));
+
+        self.builder.bind_label(suppress_label);
+        self.builder.emit(Instruction::op(Opcode::ClearException));
 
         // Step 12: End label
         self.builder.bind_label(end_label);
@@ -2941,8 +3212,7 @@ impl Compiler {
 
         self.builder
             .emit(Instruction::op_d(Opcode::LoadException, exc_val_reg));
-        self.builder
-            .emit(Instruction::op_ds(Opcode::Move, exc_type_reg, exc_val_reg));
+        self.emit_named_call_from_regs("type", &[exc_val_reg], exc_type_reg)?;
         self.builder
             .emit(Instruction::op_d(Opcode::LoadNone, exc_tb_reg));
 
@@ -2983,8 +3253,9 @@ impl Compiler {
         // Pop exception info
         self.builder.emit(Instruction::op(Opcode::PopExcInfo));
 
-        // If __aexit__ returns true, suppress the exception; otherwise reraise
-        self.builder.emit_jump_if_true(suppress_reg, end_label);
+        // A truthy __aexit__ suppresses the active exception entirely.
+        let suppress_label = self.builder.create_label();
+        self.builder.emit_jump_if_true(suppress_reg, suppress_label);
 
         self.builder.free_register(exc_type_reg);
         self.builder.free_register(exc_val_reg);
@@ -2993,6 +3264,9 @@ impl Compiler {
 
         // Reraise the exception
         self.builder.emit(Instruction::op(Opcode::Reraise));
+
+        self.builder.bind_label(suppress_label);
+        self.builder.emit(Instruction::op(Opcode::ClearException));
 
         // Step 11: End label
         self.builder.bind_label(end_label);
@@ -3507,18 +3781,26 @@ impl Compiler {
             func_builder.define_local(name);
         }
 
-        // Register cell and free variables from scope analysis
-        let mut has_closure = false;
+        // Register cell and free variables from scope analysis.
+        // Cellvars are materialized per invocation, while freevars require
+        // definition-time capture from the enclosing scope.
+        let has_cellvars = !func_cellvars.is_empty();
+        let captures_freevars = !func_freevars.is_empty();
         // Cell variables: locals captured by inner functions
         for name in func_cellvars {
             func_builder.add_cellvar(name);
-            has_closure = true;
         }
 
         // Free variables: captured from outer scopes
         for name in func_freevars {
             func_builder.add_freevar(name);
-            has_closure = true;
+        }
+
+        if has_cellvars {
+            func_builder.add_flags(CodeFlags::HAS_CELLVARS);
+        }
+        if captures_freevars {
+            func_builder.add_flags(CodeFlags::HAS_FREEVARS);
         }
 
         // Set generator flag from scope analysis
@@ -3532,7 +3814,7 @@ impl Compiler {
             }
         }
 
-        if has_closure {
+        if has_cellvars || captures_freevars {
             func_builder.add_flags(CodeFlags::NESTED);
         }
 
@@ -3587,10 +3869,9 @@ impl Compiler {
         // Emit function/closure creation
         let func_reg = self.builder.alloc_register();
 
-        if has_closure {
-            // MakeClosure: needs to capture variables from current scope
-            // The instruction format is: dst = closure, imm16 = code index
-            // Free variables must be loaded from current scope and packed
+        if captures_freevars {
+            // MakeClosure is only needed when freevars must be captured from
+            // the enclosing scope. Cellvars are created fresh for each call.
             self.builder.emit(Instruction::op_di(
                 Opcode::MakeClosure,
                 func_reg,
@@ -3798,15 +4079,22 @@ impl Compiler {
             lambda_builder.define_local(name);
         }
 
-        // Register cell and free variables from scope analysis
-        let mut has_closure = false;
+        // Register cell and free variables from scope analysis.
+        // Cellvars are invocation-local; only freevars require MakeClosure.
+        let has_cellvars = !lambda_cellvars.is_empty();
+        let captures_freevars = !lambda_freevars.is_empty();
         for name in lambda_cellvars {
             lambda_builder.add_cellvar(name);
-            has_closure = true;
         }
         for name in lambda_freevars {
             lambda_builder.add_freevar(name);
-            has_closure = true;
+        }
+
+        if has_cellvars {
+            lambda_builder.add_flags(CodeFlags::HAS_CELLVARS);
+        }
+        if captures_freevars {
+            lambda_builder.add_flags(CodeFlags::HAS_FREEVARS);
         }
 
         // Swap builders to compile lambda body
@@ -3844,7 +4132,7 @@ impl Compiler {
         let kw_defaults_reg = self.compile_kw_defaults_dict(&args.kwonlyargs, &args.kw_defaults)?;
 
         // Emit function/closure creation
-        if has_closure {
+        if captures_freevars {
             self.builder
                 .emit(Instruction::op_di(Opcode::MakeClosure, dst, code_const_idx));
         } else {
@@ -4025,14 +4313,20 @@ impl Compiler {
             gen_builder.define_local(name);
         }
 
-        let mut has_closure = false;
+        let has_cellvars = !gen_cellvars.is_empty();
+        let captures_freevars = !gen_freevars.is_empty();
         for name in gen_cellvars {
             gen_builder.add_cellvar(name);
-            has_closure = true;
         }
         for name in gen_freevars {
             gen_builder.add_freevar(name);
-            has_closure = true;
+        }
+
+        if has_cellvars {
+            gen_builder.add_flags(CodeFlags::HAS_CELLVARS);
+        }
+        if captures_freevars {
+            gen_builder.add_flags(CodeFlags::HAS_FREEVARS);
         }
 
         // Swap builders
@@ -4048,6 +4342,7 @@ impl Compiler {
 
         // Compile generator loops (yields instead of appending)
         self.compile_genexp_generators(elt, generators, 0, iter_reg)?;
+        self.builder.free_register(iter_reg);
 
         // Return None at end
         self.builder.emit_return_none();
@@ -4064,7 +4359,7 @@ impl Compiler {
         let code_idx = self.builder.add_code_object(Arc::new(gen_code));
         let mut func_reg = self.builder.alloc_register();
         self.builder.emit(Instruction::op_di(
-            if has_closure {
+            if captures_freevars {
                 Opcode::MakeClosure
             } else {
                 Opcode::MakeFunction
@@ -4139,7 +4434,9 @@ impl Compiler {
 
         // Compile iterator
         let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
-        let iter_reg = self.builder.alloc_register();
+        let loop_regs = self.builder.alloc_register_block(2);
+        let iter_reg = loop_regs;
+        let item_reg = Register::new(loop_regs.0 + 1);
 
         // Get iterator (sync or async)
         if comp_gen.is_async {
@@ -4167,7 +4464,6 @@ impl Compiler {
         self.builder.bind_label(loop_start);
 
         // Get next item
-        let item_reg = self.builder.alloc_register();
         if comp_gen.is_async {
             self.builder
                 .emit(Instruction::op_ds(Opcode::GetANext, item_reg, iter_reg));
@@ -4177,7 +4473,7 @@ impl Compiler {
             self.builder
                 .emit(Instruction::op_ds(Opcode::YieldFrom, item_reg, item_reg));
         } else {
-            self.builder.emit_for_iter(item_reg, iter_reg, loop_end);
+            self.builder.emit_for_iter(item_reg, loop_end);
         }
 
         // Unpack target
@@ -4226,7 +4522,9 @@ impl Compiler {
 
         // Compile iterator
         let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
-        let iter_reg = self.builder.alloc_register();
+        let loop_regs = self.builder.alloc_register_block(2);
+        let iter_reg = loop_regs;
+        let item_reg = Register::new(loop_regs.0 + 1);
 
         if comp_gen.is_async {
             if !self.in_async_context {
@@ -4253,7 +4551,6 @@ impl Compiler {
         self.builder.bind_label(loop_start);
 
         // Get next item
-        let item_reg = self.builder.alloc_register();
         if comp_gen.is_async {
             self.builder
                 .emit(Instruction::op_ds(Opcode::GetANext, item_reg, iter_reg));
@@ -4262,7 +4559,7 @@ impl Compiler {
             self.builder
                 .emit(Instruction::op_ds(Opcode::YieldFrom, item_reg, item_reg));
         } else {
-            self.builder.emit_for_iter(item_reg, iter_reg, loop_end);
+            self.builder.emit_for_iter(item_reg, loop_end);
         }
 
         // Unpack target
@@ -4311,15 +4608,16 @@ impl Compiler {
         let rest = &generators[1..];
 
         // For depth > 0, compile iterator; depth 0 uses passed-in iter_reg
-        let actual_iter = if depth == 0 {
-            iter_reg
+        let loop_regs = self.builder.alloc_register_block(2);
+        let actual_iter = loop_regs;
+        let item_reg = Register::new(loop_regs.0 + 1);
+        if depth == 0 {
+            self.builder.emit_move(actual_iter, iter_reg);
         } else {
             let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
-            let new_iter = self.builder.alloc_register();
-            self.builder.emit_get_iter(new_iter, iter_expr_reg);
+            self.builder.emit_get_iter(actual_iter, iter_expr_reg);
             self.builder.free_register(iter_expr_reg);
-            new_iter
-        };
+        }
 
         // Create loop labels
         let loop_start = self.builder.create_label();
@@ -4328,8 +4626,7 @@ impl Compiler {
         self.builder.bind_label(loop_start);
 
         // Get next item
-        let item_reg = self.builder.alloc_register();
-        self.builder.emit_for_iter(item_reg, actual_iter, loop_end);
+        self.builder.emit_for_iter(item_reg, loop_end);
 
         // Unpack target
         self.compile_store(&comp_gen.target, item_reg)?;
@@ -4341,26 +4638,17 @@ impl Compiler {
             self.builder.free_register(cond_reg);
         }
 
-        // Recurse for nested generators
-        let next_iter = self.builder.alloc_register();
-        if !rest.is_empty() {
-            let iter_expr_reg = self.compile_expr(&rest[0].iter)?;
-            self.builder.emit_get_iter(next_iter, iter_expr_reg);
-            self.builder.free_register(iter_expr_reg);
-        }
-        self.compile_genexp_generators(elt, rest, depth + 1, next_iter)?;
-        if !rest.is_empty() {
-            self.builder.free_register(next_iter);
-        }
+        // Recurse for nested generators.
+        // Deeper recursion compiles each nested iterator expression in the
+        // current loop scope, so only the root generator consumes `iter_reg`.
+        self.compile_genexp_generators(elt, rest, depth + 1, Register::new(0))?;
 
         // Jump back to loop start
         self.builder.emit_jump(loop_start);
 
         self.builder.bind_label(loop_end);
-        if depth > 0 {
-            self.builder.free_register(actual_iter);
-        }
         self.builder.free_register(item_reg);
+        self.builder.free_register(actual_iter);
 
         Ok(())
     }
@@ -4380,6 +4668,17 @@ mod tests {
     fn compile(source: &str) -> CodeObject {
         let module = prism_parser::parse(source).expect("parse error");
         Compiler::compile_module(&module, "<test>").expect("compile error")
+    }
+
+    fn compile_with_dynamic_locals(source: &str) -> CodeObject {
+        let module = prism_parser::parse(source).expect("parse error");
+        Compiler::compile_module_with_namespace_mode(
+            &module,
+            "<test>",
+            OptimizationLevel::None,
+            ModuleNamespaceMode::DynamicLocals,
+        )
+        .expect("compile error")
     }
 
     fn large_call_then_functools_style_listcomp_source() -> String {
@@ -4590,8 +4889,40 @@ def value(self, new_value):
             "bytes literal should call bytes(..., encoding)"
         );
         assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::LoadBuiltin as u8),
+            "bytes literal lowering should bypass shadowable globals"
+        );
+        assert!(
             code.names.iter().any(|name| &**name == "bytes"),
             "bytes constructor should be resolved by name"
+        );
+    }
+
+    #[test]
+    fn test_compile_complex_literal_uses_builtin_constructor_lowering() {
+        let code = compile("value = 0j");
+        let call = code
+            .instructions
+            .iter()
+            .find(|inst| inst.opcode() == Opcode::Call as u8)
+            .expect("expected complex literal lowering to emit a call");
+
+        assert_eq!(
+            call.src2().0,
+            2,
+            "complex literal lowering should call complex(real, imag)"
+        );
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::LoadBuiltin as u8),
+            "complex literal lowering should bypass shadowable globals"
+        );
+        assert!(
+            code.names.iter().any(|name| &**name == "complex"),
+            "complex constructor should be resolved by name"
         );
     }
 
@@ -5138,9 +5469,21 @@ class Child(Base1, Base2):
             .find(|inst| inst.opcode() == Opcode::BuildClass as u8)
             .expect("expected BUILD_CLASS instruction");
 
-        assert_eq!(build_class.src2().0, 2, "base count must match source");
+        let build_index = code
+            .instructions
+            .iter()
+            .position(|inst| inst.opcode() == Opcode::BuildClass as u8)
+            .expect("expected BUILD_CLASS instruction");
+        let meta = code
+            .instructions
+            .get(build_index + 1)
+            .copied()
+            .expect("BUILD_CLASS should be followed by ClassMeta");
 
-        let code_idx = build_class.src1().0 as usize;
+        assert_eq!(meta.opcode(), Opcode::ClassMeta as u8);
+        assert_eq!(meta.dst().0, 2, "base count must match source");
+
+        let code_idx = build_class.imm16() as usize;
         let code_const = code
             .constants
             .get(code_idx)
@@ -5210,7 +5553,7 @@ class Child(Base, answer=42):
             .expect("expected BUILD_CLASS instruction");
         let ext = code
             .instructions
-            .get(build_index + 1)
+            .get(build_index + 2)
             .copied()
             .expect("BUILD_CLASS with keywords must be followed by metadata");
 
@@ -5355,6 +5698,83 @@ class Example:
                 .iter()
                 .any(|inst| inst.opcode() == Opcode::DeleteGlobal as u8),
             "class body deletes should not be lowered as global deletes"
+        );
+    }
+
+    #[test]
+    fn test_compile_dynamic_locals_binds_module_assignments_as_locals() {
+        let code = compile_with_dynamic_locals(
+            r#"
+x = 1
+y = x
+"#,
+        );
+
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::StoreLocal as u8),
+            "dynamic-locals compilation should route module assignments through local slots",
+        );
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::LoadLocal as u8),
+            "dynamic-locals compilation should route module lookups through local slots",
+        );
+        assert!(
+            !code
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::StoreGlobal as u8),
+            "ordinary dynamic-locals bindings should not be lowered as global stores",
+        );
+    }
+
+    #[test]
+    fn test_compile_dynamic_locals_preserves_explicit_global_bindings() {
+        let code = compile_with_dynamic_locals(
+            r#"
+global shared
+x = 1
+shared = x
+"#,
+        );
+
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::StoreLocal as u8),
+            "local dynamic bindings should still use local slots when globals are declared elsewhere",
+        );
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::StoreGlobal as u8),
+            "explicit global statements must continue to target module globals",
+        );
+    }
+
+    #[test]
+    fn test_compile_dynamic_locals_uses_local_lookups_for_unbound_names() {
+        let code = compile_with_dynamic_locals(
+            r#"
+result = missing_name
+"#,
+        );
+
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::LoadLocal as u8),
+            "dynamic-locals compilation should use locals-first lookups even for unbound names",
+        );
+        assert!(
+            !code
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::LoadGlobal as u8),
+            "unbound dynamic-locals lookups should not bypass the locals mapping",
         );
     }
 

@@ -287,6 +287,21 @@ pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 }
 
+/// LoadBuiltin: dst = builtins[names[imm16]]
+#[inline(always)]
+pub fn load_builtin(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    let frame = vm.current_frame();
+    let name = frame.get_name(inst.imm16()).clone();
+
+    match vm.builtins.get(&name) {
+        Some(value) => {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            ControlFlow::Continue
+        }
+        None => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
+    }
+}
+
 /// StoreGlobal: globals[names[imm16]] = dst-register
 #[inline(always)]
 pub fn store_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
@@ -622,6 +637,24 @@ mod tests {
     }
 
     #[test]
+    fn test_load_builtin_bypasses_shadowed_globals() {
+        let mut code = CodeObject::new("test_load_builtin", "<test>");
+        code.names = vec!["complex".into()].into_boxed_slice();
+
+        let mut vm = vm_with_frame(code);
+        vm.globals.set("complex".into(), Value::int(99).unwrap());
+
+        let inst = Instruction::op_di(Opcode::LoadBuiltin, Register::new(4), 0);
+        assert!(matches!(load_builtin(&mut vm, inst), ControlFlow::Continue));
+
+        let value = vm.current_frame().get_reg(4);
+        let ptr = value
+            .as_object_ptr()
+            .expect("builtin complex should be callable");
+        assert_eq!(extract_type_id(ptr), TypeId::TYPE);
+    }
+
+    #[test]
     fn test_store_closure_uses_dst_register_for_source() {
         use crate::frame::ClosureEnv;
 
@@ -668,6 +701,14 @@ mod tests {
         assert_eq!(inst.imm16(), 2);
     }
 
+    #[test]
+    fn test_load_builtin_instruction_format() {
+        let inst = Instruction::op_di(Opcode::LoadBuiltin, Register::new(2), 11);
+        assert_eq!(inst.opcode(), Opcode::LoadBuiltin as u8);
+        assert_eq!(inst.dst().0, 2);
+        assert_eq!(inst.imm16(), 11);
+    }
+
     // ==========================================================================
     // Opcode Registration Tests
     // ==========================================================================
@@ -694,6 +735,7 @@ mod tests {
             Opcode::LoadClosure,
             Opcode::StoreClosure,
             Opcode::DeleteClosure,
+            Opcode::LoadBuiltin,
         ];
 
         for op in opcodes {

@@ -170,6 +170,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::LoadClosure as usize] = load_store::load_closure;
     table[Opcode::StoreClosure as usize] = load_store::store_closure;
     table[Opcode::LoadGlobal as usize] = load_store::load_global;
+    table[Opcode::LoadBuiltin as usize] = load_store::load_builtin;
     table[Opcode::StoreGlobal as usize] = load_store::store_global;
     table[Opcode::DeleteLocal as usize] = load_store::delete_local;
     table[Opcode::DeleteGlobal as usize] = load_store::delete_global;
@@ -205,6 +206,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::Mod as usize] = arithmetic::modulo;
     table[Opcode::Pow as usize] = arithmetic::pow;
     table[Opcode::Neg as usize] = arithmetic::neg;
+    table[Opcode::Pos as usize] = arithmetic::pos;
 
     // Comparison (0x40-0x4F)
     table[Opcode::Lt as usize] = comparison::lt;
@@ -241,6 +243,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::LoadMethod as usize] = method_dispatch::load_method;
     table[Opcode::BuildClass as usize] = class::build_class;
     table[Opcode::BuildClassWithMeta as usize] = class::build_class_with_metaclass;
+    table[Opcode::ClassMeta as usize] = class::class_meta;
 
     // Function Calls (0x70-0x7F)
     table[Opcode::Call as usize] = calls::call;

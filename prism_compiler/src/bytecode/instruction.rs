@@ -301,6 +301,8 @@ pub enum Opcode {
     Move = 0x1C,
     /// Delete closure variable: del closure[imm16].
     DeleteClosure = 0x1D,
+    /// Load builtin directly from the builtin registry: dst = builtins[names[imm16]].
+    LoadBuiltin = 0x1E,
 
     // =========================================================================
     // Integer Arithmetic (0x20-0x2F)
@@ -401,6 +403,8 @@ pub enum Opcode {
     Shl = 0x54,
     /// Right shift: dst = src1 >> src2.
     Shr = 0x55,
+    /// Generic unary plus: dst = +src.
+    Pos = 0x56,
     /// Logical not: dst = not src.
     Not = 0x57,
 
@@ -421,21 +425,25 @@ pub enum Opcode {
     DelItem = 0x65,
     /// Get iterator: dst = iter(src).
     GetIter = 0x66,
-    /// Get next from iterator: dst = next(src), jumps on StopIteration.
+    /// Get next from iterator: dst = next(dst - 1), jumps on StopIteration.
     ForIter = 0x67,
     /// Get length: dst = len(src).
     Len = 0x68,
     /// Check if callable: dst = callable(src).
     IsCallable = 0x69,
-    /// Build class: dst = class body in src1, name_idx in imm16.
-    /// Bases are in registers starting at dst+1, count in src2.
+    /// Build class: dst = class object, imm16 = class-body code constant index.
+    /// The following `ClassMeta` instruction carries the base-count metadata.
     BuildClass = 0x6A,
     /// Load method for super(): dst = super().method lookup.
     LoadMethod = 0x6B,
     /// Build class with an explicit metaclass value.
-    /// Bases are in registers starting at dst+1 and the metaclass value is
-    /// stored immediately after the final base register.
+    /// Bases are in registers starting at dst+1, the metaclass value is stored
+    /// immediately after the final base register, and the following
+    /// `ClassMeta` instruction carries the base-count metadata.
     BuildClassWithMeta = 0x6C,
+    /// Build class metadata extension: dst = base count.
+    /// Always follows `BuildClass` / `BuildClassWithMeta` in newly emitted code.
+    ClassMeta = 0x6D,
 
     // =========================================================================
     // Function Calls (0x70-0x7F)
@@ -644,6 +652,7 @@ impl Opcode {
             0x1B => Some(Opcode::DeleteGlobal),
             0x1C => Some(Opcode::Move),
             0x1D => Some(Opcode::DeleteClosure),
+            0x1E => Some(Opcode::LoadBuiltin),
 
             0x20 => Some(Opcode::AddInt),
             0x21 => Some(Opcode::SubInt),
@@ -689,6 +698,7 @@ impl Opcode {
             0x53 => Some(Opcode::BitwiseNot),
             0x54 => Some(Opcode::Shl),
             0x55 => Some(Opcode::Shr),
+            0x56 => Some(Opcode::Pos),
             0x57 => Some(Opcode::Not),
 
             0x60 => Some(Opcode::GetAttr),
@@ -704,6 +714,7 @@ impl Opcode {
             0x6A => Some(Opcode::BuildClass),
             0x6B => Some(Opcode::LoadMethod),
             0x6C => Some(Opcode::BuildClassWithMeta),
+            0x6D => Some(Opcode::ClassMeta),
 
             0x70 => Some(Opcode::Call),
             0x71 => Some(Opcode::CallKw),
@@ -786,15 +797,14 @@ impl Opcode {
 
             // Load/store with 16-bit index
             LoadConst | LoadLocal | StoreLocal | LoadClosure | StoreClosure | LoadGlobal
-            | StoreGlobal | DeleteLocal | DeleteGlobal | DeleteClosure => DstImm16,
+            | StoreGlobal | DeleteLocal | DeleteGlobal | DeleteClosure | LoadBuiltin => DstImm16,
 
             // Move
             Move => DstSrc,
 
             // Unary operations
-            NegInt | PosInt | NegFloat | Neg | BitwiseNot | Not | GetIter | Len | IsCallable => {
-                DstSrc
-            }
+            NegInt | PosInt | NegFloat | Neg | BitwiseNot | Pos | Not | GetIter | Len
+            | IsCallable => DstSrc,
 
             // Binary operations
             AddInt | SubInt | MulInt | FloorDivInt | ModInt | PowInt | AddFloat | SubFloat
@@ -816,9 +826,10 @@ impl Opcode {
             BuildTupleUnpack | BuildDictUnpack | SetFunctionDefaults => DstSrcSrc, // dst, base_reg, count
 
             // Class operations
-            BuildClass => DstSrcSrc, // dst = class, src1 = class-body code const index (u8), src2 = base count
+            BuildClass => DstImm16, // dst = class, imm16 = class-body code const index
             LoadMethod => DstSrcSrc, // dst = method, src1 = object, src2 = name_idx
-            BuildClassWithMeta => DstSrcSrc, // dst = class, src1 = class-body code const index, src2 = base count
+            BuildClassWithMeta => DstImm16, // dst = class, imm16 = class-body code const index
+            ClassMeta => Dst,       // dst = base count for the preceding BuildClass opcode
 
             // Container ops
             BuildList | BuildTuple | BuildSet | BuildDict | BuildString | UnpackSequence

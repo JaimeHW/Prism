@@ -607,6 +607,11 @@ impl FunctionBuilder {
         self.emit(Instruction::op_di(Opcode::LoadGlobal, dst, name_idx));
     }
 
+    /// Load a builtin directly from the builtin registry into a register.
+    pub fn emit_load_builtin(&mut self, dst: Register, name_idx: u16) {
+        self.emit(Instruction::op_di(Opcode::LoadBuiltin, dst, name_idx));
+    }
+
     /// Store a register into a global variable.
     pub fn emit_store_global(&mut self, name_idx: u16, src: Register) {
         self.emit(Instruction::op_di(Opcode::StoreGlobal, src, name_idx));
@@ -686,54 +691,34 @@ impl FunctionBuilder {
 
     // --- Class Construction ---
 
-    /// Emit BUILD_CLASS instruction.
+    /// Emit BUILD_CLASS and its metadata extension.
     ///
-    /// Creates a class object from a class body code object and base classes.
-    ///
-    /// # Parameters
-    /// - `dst`: Register to store the resulting class object
-    /// - `code_idx`: Constant index of the class body code object
-    /// - `base_count`: Number of base classes (stored in consecutive registers starting at dst+1)
-    ///
-    /// # Encoding
-    /// Uses DstSrcSrc format:
-    /// - `dst` = result class object
-    /// - `src1` = class body code object constant index (8-bit)
-    /// - `src2` = base class count
-    ///
-    /// # Panics
-    /// Panics if `code_idx > 255` because the current opcode encoding stores
-    /// the code constant index in an 8-bit field.
+    /// The primary instruction stores the class-body code constant index in a
+    /// full 16-bit immediate. A trailing `ClassMeta` extension stores the base
+    /// count, keeping class construction resilient to large constant pools in
+    /// real stdlib modules.
     pub fn emit_build_class(&mut self, dst: Register, code_idx: u16, base_count: u8) {
-        assert!(
-            code_idx <= u8::MAX as u16,
-            "BUILD_CLASS code index {} exceeds 8-bit encoding",
-            code_idx
-        );
-        self.emit(Instruction::op_dss(
-            Opcode::BuildClass,
-            dst,
-            Register::new(code_idx as u8),
+        self.emit(Instruction::op_di(Opcode::BuildClass, dst, code_idx));
+        self.emit(Instruction::op_d(
+            Opcode::ClassMeta,
             Register::new(base_count),
         ));
     }
 
-    /// Emit BUILD_CLASS_WITH_META for class definitions with an explicit metaclass.
+    /// Emit BUILD_CLASS_WITH_META and its metadata extension.
     ///
     /// Register layout:
     /// - `dst` = result class object
     /// - `dst+1..dst+base_count` = base classes
     /// - `dst+1+base_count` = explicit metaclass value
     pub fn emit_build_class_with_meta(&mut self, dst: Register, code_idx: u16, base_count: u8) {
-        assert!(
-            code_idx <= u8::MAX as u16,
-            "BUILD_CLASS_WITH_META code index {} exceeds 8-bit encoding",
-            code_idx
-        );
-        self.emit(Instruction::op_dss(
+        self.emit(Instruction::op_di(
             Opcode::BuildClassWithMeta,
             dst,
-            Register::new(code_idx as u8),
+            code_idx,
+        ));
+        self.emit(Instruction::op_d(
+            Opcode::ClassMeta,
             Register::new(base_count),
         ));
     }
@@ -785,6 +770,11 @@ impl FunctionBuilder {
     /// Generic negate: dst = -src.
     pub fn emit_neg(&mut self, dst: Register, src: Register) {
         self.emit(Instruction::op_ds(Opcode::Neg, dst, src));
+    }
+
+    /// Generic unary plus: dst = +src.
+    pub fn emit_pos(&mut self, dst: Register, src: Register) {
+        self.emit(Instruction::op_ds(Opcode::Pos, dst, src));
     }
 
     // --- Comparison ---
@@ -1190,11 +1180,17 @@ impl FunctionBuilder {
         self.emit(Instruction::op_ds(Opcode::GetIter, dst, src));
     }
 
-    /// For iteration: dst = next(iter_src), jump to label on StopIteration.
-    pub fn emit_for_iter(&mut self, dst: Register, iter_src: Register, label: Label) {
+    /// For iteration: dst = next(iter), jump to label on StopIteration.
+    ///
+    /// The iterator source is encoded implicitly in the preceding register
+    /// (`dst - 1`), preserving the full 16-bit jump offset for large loop bodies.
+    pub fn emit_for_iter(&mut self, dst: Register, label: Label) {
+        debug_assert!(
+            dst.0 > 0,
+            "ForIter requires the destination register to follow the iterator register",
+        );
         let inst_idx = self.instructions.len();
-        // Encode dst and iter_src; imm16 will be patched with jump offset
-        self.emit(Instruction::op_ds(Opcode::ForIter, dst, iter_src));
+        self.emit(Instruction::op_d(Opcode::ForIter, dst));
         self.forward_refs.push(ForwardRef {
             instruction_index: inst_idx,
             label,
@@ -1339,19 +1335,7 @@ impl FunctionBuilder {
             // Encode offset as signed 16-bit
             let offset_u16 = offset as i16 as u16;
 
-            // ForIter needs special handling: preserve src1 (iterator register)
-            // Use the upper byte of offset_u16 for src1, lower byte for offset
-            // Instruction format: [opcode:8][dst:8][src1:8][offset:8]
-            let patched = if opcode == Opcode::ForIter {
-                // ForIter encodes src1 in imm16 high byte, offset in low byte
-                // For now, just encode the offset in src2 position (8 bits signed)
-                let src1 = old.src1();
-                let offset_i8 = offset as i8 as u8;
-                Instruction::new(opcode, dst.0, src1.0, offset_i8)
-            } else {
-                // Standard jump: opcode, dst, imm16
-                Instruction::op_di(opcode, dst, offset_u16)
-            };
+            let patched = Instruction::op_di(opcode, dst, offset_u16);
 
             self.instructions[fwd.instruction_index] = patched;
         }
@@ -1457,6 +1441,27 @@ mod tests {
 
         let code = builder.finish();
         assert_eq!(code.instructions.len(), 4);
+    }
+
+    #[test]
+    fn test_emit_for_iter_preserves_full_i16_jump_offset() {
+        let mut builder = FunctionBuilder::new("for_iter_long_jump");
+        let pair = builder.alloc_register_block(2);
+        let item = Register::new(pair.0 + 1);
+        let loop_end = builder.create_label();
+
+        builder.emit_for_iter(item, loop_end);
+        for _ in 0..300 {
+            builder.emit_nop();
+        }
+        builder.bind_label(loop_end);
+        builder.emit_return_none();
+
+        let code = builder.finish();
+        let inst = code.instructions[0];
+        assert_eq!(inst.opcode(), Opcode::ForIter as u8);
+        assert_eq!(inst.dst().0, item.0);
+        assert_eq!(inst.imm16() as i16, 300);
     }
 
     #[test]
@@ -1572,11 +1577,13 @@ mod tests {
         builder.emit_build_class(dst, 0x2A, 3);
         let code = builder.finish();
         let inst = code.instructions[0];
+        let meta = code.instructions[1];
 
         assert_eq!(inst.opcode(), Opcode::BuildClass as u8);
         assert_eq!(inst.dst().0, dst.0);
-        assert_eq!(inst.src1().0, 0x2A);
-        assert_eq!(inst.src2().0, 3);
+        assert_eq!(inst.imm16(), 0x2A);
+        assert_eq!(meta.opcode(), Opcode::ClassMeta as u8);
+        assert_eq!(meta.dst().0, 3);
     }
 
     #[test]
@@ -1587,19 +1594,23 @@ mod tests {
         builder.emit_build_class_with_meta(dst, 0x19, 2);
         let code = builder.finish();
         let inst = code.instructions[0];
+        let meta = code.instructions[1];
 
         assert_eq!(inst.opcode(), Opcode::BuildClassWithMeta as u8);
         assert_eq!(inst.dst().0, dst.0);
-        assert_eq!(inst.src1().0, 0x19);
-        assert_eq!(inst.src2().0, 2);
+        assert_eq!(inst.imm16(), 0x19);
+        assert_eq!(meta.opcode(), Opcode::ClassMeta as u8);
+        assert_eq!(meta.dst().0, 2);
     }
 
     #[test]
-    #[should_panic(expected = "BUILD_CLASS code index")]
-    fn test_emit_build_class_panics_for_out_of_range_code_index() {
-        let mut builder = FunctionBuilder::new("class_builder_overflow");
+    fn test_emit_build_class_supports_full_u16_code_index() {
+        let mut builder = FunctionBuilder::new("class_builder_u16");
         let dst = builder.alloc_register();
         builder.emit_build_class(dst, 256, 0);
+        let code = builder.finish();
+        assert_eq!(code.instructions[0].imm16(), 256);
+        assert_eq!(code.instructions[1].opcode(), Opcode::ClassMeta as u8);
     }
 
     // =========================================================================

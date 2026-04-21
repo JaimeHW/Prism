@@ -1181,7 +1181,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         iter: u8,
-        offset: i8, // Jump offset on StopIteration
+        offset: i16, // Jump offset on StopIteration
     },
 
     // Utility operations

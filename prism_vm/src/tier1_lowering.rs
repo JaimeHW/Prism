@@ -83,6 +83,9 @@ pub(crate) fn lower_code_to_templates(
                 set_reg_type(&mut reg_types, dst, ty);
                 template
             }
+            Opcode::LoadBuiltin => {
+                return Err("Tier1 lowering does not yet support LoadBuiltin".to_string());
+            }
             Opcode::LoadNone => {
                 let dst = inst.dst().0;
                 set_reg_type(&mut reg_types, dst, KnownType::None);

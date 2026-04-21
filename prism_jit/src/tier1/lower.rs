@@ -654,12 +654,15 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                 });
             }
             Some(Opcode::ForIter) => {
-                // ForIter: dst = next(src1), offset in src2 (as i8)
+                let dst = inst.dst().0;
+                let iter = dst
+                    .checked_sub(1)
+                    .expect("ForIter destination register must follow its iterator register");
                 self.output.push(TemplateInstruction::ForIter {
                     bc_offset,
-                    dst: inst.dst().0,
-                    iter: inst.src1().0,
-                    offset: inst.src2().0 as i8,
+                    dst,
+                    iter,
+                    offset: inst.imm16() as i16,
                 });
             }
 
@@ -4537,13 +4540,8 @@ mod tests {
 
     #[test]
     fn test_lower_for_iter_basic() {
-        // ForIter: dst = next(iter), jump offset in src2
-        let code = make_code(vec![Instruction::op_dss(
-            Opcode::ForIter,
-            Register(3),
-            Register(1),
-            Register(10), // offset as u8 (treated as i8)
-        )]);
+        // ForIter: dst = next(dst - 1), jump offset in imm16
+        let code = make_code(vec![Instruction::op_di(Opcode::ForIter, Register(3), 10)]);
         let speculation = NoSpeculation;
         let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
 
@@ -4553,7 +4551,7 @@ mod tests {
             ir[0],
             TemplateInstruction::ForIter {
                 dst: 3,
-                iter: 1,
+                iter: 2,
                 offset: 10,
                 ..
             }
@@ -4625,21 +4623,21 @@ mod tests {
     fn test_lower_all_iteration_ops() {
         // Verify all iteration opcodes produce output
         let iter_ops = [
-            ("GetIter", Opcode::GetIter, true),
-            ("ForIter", Opcode::ForIter, false),
-        ];
-
-        for (name, opcode, is_ds) in iter_ops {
-            let code = if is_ds {
-                make_code(vec![Instruction::op_ds(opcode, Register(0), Register(1))])
-            } else {
-                make_code(vec![Instruction::op_dss(
-                    opcode,
+            (
+                "GetIter",
+                make_code(vec![Instruction::op_ds(
+                    Opcode::GetIter,
                     Register(0),
                     Register(1),
-                    Register(2),
-                )])
-            };
+                )]),
+            ),
+            (
+                "ForIter",
+                make_code(vec![Instruction::op_di(Opcode::ForIter, Register(2), 7)]),
+            ),
+        ];
+
+        for (name, code) in iter_ops {
             let speculation = NoSpeculation;
             let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
             let ir = lowerer.lower(&code);
@@ -4668,7 +4666,7 @@ mod tests {
             // iter = iter(list)
             Instruction::op_ds(Opcode::GetIter, Register(1), Register(0)),
             // item = next(iter), jump on StopIteration
-            Instruction::op_dss(Opcode::ForIter, Register(2), Register(1), Register(5)),
+            Instruction::op_di(Opcode::ForIter, Register(2), 5),
         ]);
         let speculation = NoSpeculation;
         let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());
@@ -4711,11 +4709,10 @@ mod tests {
     #[test]
     fn test_lower_negative_for_iter_offset() {
         // ForIter with negative offset (backward jump for continue)
-        let code = make_code(vec![Instruction::op_dss(
+        let code = make_code(vec![Instruction::op_di(
             Opcode::ForIter,
-            Register(0),
-            Register(1),
-            Register(0xFB), // -5 as u8
+            Register(2),
+            (-5i16) as u16,
         )]);
         let speculation = NoSpeculation;
         let mut lowerer = BytecodeLowerer::new(&speculation, 0, LoweringConfig::default());

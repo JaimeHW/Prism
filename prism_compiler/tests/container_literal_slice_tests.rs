@@ -14,6 +14,13 @@ fn has_opcode(code: &prism_compiler::CodeObject, opcode: Opcode) -> bool {
         .any(|inst| inst.opcode() == opcode as u8)
 }
 
+fn opcode_count(code: &prism_compiler::CodeObject, opcode: Opcode) -> usize {
+    code.instructions
+        .iter()
+        .filter(|inst| inst.opcode() == opcode as u8)
+        .count()
+}
+
 #[test]
 fn test_set_literal_emits_build_set() {
     let code = compile_source("x = {1, 2, 3}");
@@ -30,6 +37,20 @@ fn test_dict_literal_emits_build_dict() {
 fn test_dict_literal_unpack_emits_build_dict_unpack() {
     let code = compile_source("x = {'a': 1, **y}");
     assert!(has_opcode(&code, Opcode::BuildDictUnpack));
+}
+
+#[test]
+fn test_large_dict_literal_falls_back_to_incremental_dict_set() {
+    let entries = (0..128)
+        .map(|index| format!("'k{index}': {index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("x = {{{entries}}}");
+
+    let code = compile_source(&source);
+
+    assert!(has_opcode(&code, Opcode::BuildDict));
+    assert_eq!(opcode_count(&code, Opcode::DictSet), 128);
 }
 
 #[test]

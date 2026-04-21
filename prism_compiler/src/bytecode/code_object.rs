@@ -230,6 +230,29 @@ impl CodeObject {
         None
     }
 
+    /// Get the CPython-compatible source position tuple for an instruction.
+    ///
+    /// Prism currently tracks line granularity but not column offsets, so the
+    /// start/end columns remain `None`. When a line number is available we
+    /// mirror it into both the start and end line slots, matching CPython's
+    /// `co_positions()` shape.
+    #[inline]
+    pub fn position_for_pc(&self, pc: u32) -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
+        match self.line_for_pc(pc) {
+            Some(line) => (Some(line), Some(line), None, None),
+            None => (None, None, None, None),
+        }
+    }
+
+    /// Iterate over CPython-compatible source positions for each instruction.
+    #[inline]
+    pub fn positions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (Option<u32>, Option<u32>, Option<u32>, Option<u32>)> + '_
+    {
+        (0..self.instructions.len() as u32).map(|pc| self.position_for_pc(pc))
+    }
+
     /// Check if this is a generator function.
     #[inline]
     pub fn is_generator(&self) -> bool {
@@ -313,6 +336,7 @@ pub fn disassemble(code: &CodeObject) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytecode::instruction::Opcode;
 
     #[test]
     fn test_code_flags() {
@@ -365,5 +389,49 @@ mod tests {
         assert_eq!(code.line_for_pc(5), Some(15));
         assert_eq!(code.line_for_pc(9), Some(15));
         assert_eq!(code.line_for_pc(10), None);
+    }
+
+    #[test]
+    fn test_code_positions_follow_instruction_line_ranges() {
+        let mut code = CodeObject::new("test", "test.py");
+        code.instructions = vec![
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+        ]
+        .into_boxed_slice();
+        code.line_table = vec![
+            LineTableEntry {
+                start_pc: 0,
+                end_pc: 1,
+                line: 10,
+            },
+            LineTableEntry {
+                start_pc: 1,
+                end_pc: 4,
+                line: 14,
+            },
+        ]
+        .into_boxed_slice();
+
+        let positions: Vec<_> = code.positions().collect();
+        assert_eq!(
+            positions,
+            vec![
+                (Some(10), Some(10), None, None),
+                (Some(14), Some(14), None, None),
+                (Some(14), Some(14), None, None),
+                (Some(14), Some(14), None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_code_position_defaults_to_unknown_when_line_is_missing() {
+        let mut code = CodeObject::new("test", "test.py");
+        code.instructions = vec![Instruction::op(Opcode::Nop)].into_boxed_slice();
+
+        assert_eq!(code.position_for_pc(0), (None, None, None, None));
     }
 }
