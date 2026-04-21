@@ -8,6 +8,8 @@ use super::{
 use crate::VirtualMachine;
 use crate::error::RuntimeErrorKind;
 use crate::stdlib::collections::deque::{builtin_deque, builtin_deque_kw, builtin_deque_with_vm};
+use num_bigint::{BigInt, Sign};
+use num_traits::Zero;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
@@ -24,10 +26,11 @@ use prism_runtime::object::type_builtins::{
     type_new_with_metaclass, unregister_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::object::views::UnionTypeObject;
+use prism_runtime::object::views::{MappingProxyObject, UnionTypeObject};
+use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
-use prism_runtime::types::int::is_int_value;
+use prism_runtime::types::int::{bigint_to_value, is_int_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::slice::SliceObject;
@@ -572,6 +575,7 @@ pub(crate) fn call_builtin_type(type_id: TypeId, args: &[Value]) -> Result<Value
     match type_id {
         TypeId::INT => builtin_int(args),
         TypeId::FLOAT => builtin_float(args),
+        TypeId::COMPLEX => super::numeric::builtin_complex(args),
         TypeId::STR => builtin_str(args),
         TypeId::BOOL => builtin_bool(args),
         TypeId::BYTES => super::string::builtin_bytes(args),
@@ -586,6 +590,7 @@ pub(crate) fn call_builtin_type(type_id: TypeId, args: &[Value]) -> Result<Value
         TypeId::RANGE => super::itertools::builtin_range(args),
         TypeId::BYTEARRAY => super::string::builtin_bytearray(args),
         TypeId::MEMORYVIEW => builtin_memoryview(args),
+        TypeId::MAPPING_PROXY => builtin_mappingproxy(args),
         TypeId::DEQUE => builtin_deque(args),
         TypeId::CLASSMETHOD => builtin_classmethod(args),
         TypeId::STATICMETHOD => builtin_staticmethod(args),
@@ -609,7 +614,9 @@ pub(crate) fn call_builtin_type_with_vm(
     match type_id {
         TypeId::TYPE => builtin_type_with_vm(vm, args),
         TypeId::SUPER => builtin_super(vm, args),
+        TypeId::MAPPING_PROXY => builtin_mappingproxy(args),
         TypeId::DEQUE => builtin_deque_with_vm(vm, args),
+        TypeId::BOOL => builtin_bool_vm(vm, args),
         TypeId::LIST => {
             if args.len() > 1 {
                 return Err(BuiltinError::TypeError(format!(
@@ -710,6 +717,30 @@ pub(crate) fn call_builtin_type_with_vm(
             Ok(to_frozenset_value(SetObject::from_iter(values)))
         }
         _ => call_builtin_type(type_id, args),
+    }
+}
+
+fn builtin_mappingproxy(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "mappingproxy() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let mapping = args[0];
+    let Some(ptr) = mapping.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(
+            "mappingproxy() argument must be a mapping".to_string(),
+        ));
+    };
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::DICT => Ok(to_object_value(MappingProxyObject::for_mapping(mapping))),
+        TypeId::MAPPING_PROXY => Ok(mapping),
+        _ => Err(BuiltinError::TypeError(
+            "mappingproxy() argument must be a mapping".to_string(),
+        )),
     }
 }
 
@@ -940,6 +971,7 @@ pub(crate) fn call_builtin_type_kw_with_vm(
     match type_id {
         TypeId::TYPE => builtin_type_kw_with_vm(vm, positional, keywords),
         TypeId::PROPERTY => builtin_property_kw(positional, keywords),
+        TypeId::DICT => builtin_dict_kw(positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
             "{}() does not accept keyword arguments yet",
@@ -959,6 +991,7 @@ pub(crate) fn call_builtin_type_kw(
 
     match type_id {
         TypeId::PROPERTY => builtin_property_kw(positional, keywords),
+        TypeId::DICT => builtin_dict_kw(positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
             "{}() does not accept keyword arguments yet",
@@ -1067,7 +1100,24 @@ pub fn builtin_int(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
+
     let arg = args[0];
+    let explicit_base = if args.len() == 2 {
+        Some(parse_int_base_argument(args[1])?)
+    } else {
+        None
+    };
+
+    if let Some(text_arg) = int_text_argument(arg) {
+        return parse_int_text_argument(&text_arg, explicit_base.unwrap_or(10));
+    }
+
+    if explicit_base.is_some() {
+        return Err(BuiltinError::TypeError(
+            "int() can't convert non-string with explicit base".to_string(),
+        ));
+    }
+
     if is_int_value(arg) {
         return Ok(arg);
     }
@@ -1078,9 +1128,378 @@ pub fn builtin_int(args: &[Value]) -> Result<Value, BuiltinError> {
     if let Some(b) = arg.as_bool() {
         return Ok(Value::int(if b { 1 } else { 0 }).unwrap());
     }
-    Err(BuiltinError::TypeError(
-        "int() argument must be a string or number".to_string(),
-    ))
+    Err(BuiltinError::TypeError(format!(
+        "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+        arg.type_name()
+    )))
+}
+
+enum IntTextArgument {
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+impl IntTextArgument {
+    #[inline]
+    fn raw_bytes(&self) -> &[u8] {
+        match self {
+            Self::Str(text) => text.as_bytes(),
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+
+    fn invalid_literal(&self, base: u32) -> BuiltinError {
+        match self {
+            Self::Str(text) => BuiltinError::ValueError(format!(
+                "invalid literal for int() with base {base}: {:?}",
+                text
+            )),
+            Self::Bytes(bytes) => {
+                let text = String::from_utf8_lossy(bytes);
+                BuiltinError::ValueError(format!(
+                    "invalid literal for int() with base {base}: b{:?}",
+                    text
+                ))
+            }
+        }
+    }
+}
+
+#[inline]
+fn int_text_argument(value: Value) -> Option<IntTextArgument> {
+    if let Some(text) = value_to_owned_string(value) {
+        return Some(IntTextArgument::Str(text));
+    }
+
+    let ptr = value.as_object_ptr()?;
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::BYTES | TypeId::BYTEARRAY => {
+            let bytes = unsafe { &*(ptr as *const BytesObject) };
+            Some(IntTextArgument::Bytes(bytes.as_bytes().to_vec()))
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_int_base_argument(value: Value) -> Result<u32, BuiltinError> {
+    let base = if let Some(integer) = prism_runtime::types::int::value_to_i64(value) {
+        integer
+    } else if let Some(boolean) = value.as_bool() {
+        if boolean { 1 } else { 0 }
+    } else {
+        return Err(BuiltinError::TypeError(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value.type_name()
+        )));
+    };
+
+    if base == 0 || (2..=36).contains(&base) {
+        Ok(base as u32)
+    } else {
+        Err(BuiltinError::ValueError(
+            "int() base must be >= 2 and <= 36, or 0".to_string(),
+        ))
+    }
+}
+
+fn parse_int_text_argument(argument: &IntTextArgument, base: u32) -> Result<Value, BuiltinError> {
+    let trimmed = trim_ascii_whitespace(argument.raw_bytes());
+    if trimmed.is_empty() {
+        return Err(argument.invalid_literal(base));
+    }
+
+    let (negative, digits) = match trimmed[0] {
+        b'+' => (false, &trimmed[1..]),
+        b'-' => (true, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    if digits.is_empty() {
+        return Err(argument.invalid_literal(base));
+    }
+
+    let (resolved_base, digits, allow_leading_underscore) = resolve_int_parse_base(base, digits);
+    let normalized = normalize_int_digits(digits, resolved_base, allow_leading_underscore)
+        .ok_or_else(|| argument.invalid_literal(resolved_base))?;
+
+    let mut value = BigInt::parse_bytes(&normalized, resolved_base)
+        .ok_or_else(|| argument.invalid_literal(resolved_base))?;
+    if negative {
+        value = -value;
+    }
+    Ok(bigint_to_value(value))
+}
+
+#[inline]
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+#[inline]
+fn resolve_int_parse_base(base: u32, digits: &[u8]) -> (u32, &[u8], bool) {
+    if let Some((prefixed_base, prefix_len)) = int_base_prefix(digits) {
+        if base == 0 {
+            return (prefixed_base, &digits[prefix_len..], true);
+        }
+        if prefixed_base == base {
+            return (base, &digits[prefix_len..], true);
+        }
+    }
+
+    if base == 0 {
+        (10, digits, false)
+    } else {
+        (base, digits, false)
+    }
+}
+
+#[inline]
+fn int_base_prefix(bytes: &[u8]) -> Option<(u32, usize)> {
+    if bytes.len() < 2 || bytes[0] != b'0' {
+        return None;
+    }
+
+    match bytes[1] {
+        b'b' | b'B' => Some((2, 2)),
+        b'o' | b'O' => Some((8, 2)),
+        b'x' | b'X' => Some((16, 2)),
+        _ => None,
+    }
+}
+
+fn normalize_int_digits(
+    digits: &[u8],
+    base: u32,
+    allow_leading_underscore: bool,
+) -> Option<Vec<u8>> {
+    let mut normalized = Vec::with_capacity(digits.len());
+    let mut saw_digit = false;
+    let mut previous_was_underscore = false;
+    let mut leading_underscore_allowed = allow_leading_underscore;
+
+    for &byte in digits {
+        if byte == b'_' {
+            if previous_was_underscore || (!saw_digit && !leading_underscore_allowed) {
+                return None;
+            }
+            previous_was_underscore = true;
+            leading_underscore_allowed = false;
+            continue;
+        }
+
+        let digit = ascii_digit_value(byte)?;
+        if digit >= base {
+            return None;
+        }
+
+        normalized.push(byte.to_ascii_lowercase());
+        saw_digit = true;
+        previous_was_underscore = false;
+        leading_underscore_allowed = false;
+    }
+
+    if !saw_digit || previous_was_underscore {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+#[inline]
+fn ascii_digit_value(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as u32),
+        b'a'..=b'z' => Some((byte - b'a') as u32 + 10),
+        b'A'..=b'Z' => Some((byte - b'A') as u32 + 10),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteOrder {
+    Big,
+    Little,
+}
+
+pub(crate) fn builtin_int_from_bytes(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "from_bytes() descriptor requires a type receiver".to_string(),
+        ));
+    }
+
+    if args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "from_bytes() takes at most 2 positional arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver_type = int_from_bytes_receiver_type(args[0])?;
+    let mut bytes_arg = args.get(1).copied();
+    let mut byteorder_arg = args.get(2).copied();
+    let mut signed_arg: Option<Value> = None;
+
+    for &(name, value) in keywords {
+        match name {
+            "bytes" => assign_from_bytes_keyword(&mut bytes_arg, value, 1, args.len(), "bytes")?,
+            "byteorder" => {
+                assign_from_bytes_keyword(&mut byteorder_arg, value, 2, args.len(), "byteorder")?
+            }
+            "signed" => {
+                if signed_arg.replace(value).is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "from_bytes() got multiple values for argument 'signed'".to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "from_bytes() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    let bytes_arg = bytes_arg.ok_or_else(|| {
+        BuiltinError::TypeError(
+            "from_bytes() missing required argument 'bytes' (pos 1)".to_string(),
+        )
+    })?;
+    let byteorder = match byteorder_arg {
+        Some(value) => parse_from_bytes_byteorder(value)?,
+        None => ByteOrder::Big,
+    };
+    let signed = signed_arg
+        .map(crate::truthiness::is_truthy)
+        .unwrap_or(false);
+
+    let bytes = value_to_byte_sequence(bytes_arg, "from_bytes() argument 1")?;
+    let value = decode_bigint_from_bytes(&bytes, byteorder, signed);
+
+    match receiver_type {
+        TypeId::BOOL => Ok(Value::bool(!value.is_zero())),
+        TypeId::INT => Ok(bigint_to_value(value)),
+        other => unreachable!("unexpected int.from_bytes receiver type: {other:?}"),
+    }
+}
+
+fn int_from_bytes_receiver_type(receiver: Value) -> Result<TypeId, BuiltinError> {
+    let class_type = class_value_to_type_id(receiver).ok_or_else(|| {
+        BuiltinError::TypeError("from_bytes() descriptor requires a type receiver".to_string())
+    })?;
+
+    match class_type {
+        TypeId::INT | TypeId::BOOL => Ok(class_type),
+        _ if class_value_is_subtype(receiver, TypeId::INT) => Err(BuiltinError::NotImplemented(
+            "from_bytes() for int subclasses is not implemented yet".to_string(),
+        )),
+        _ => Err(BuiltinError::TypeError(
+            "from_bytes() requires the built-in int or bool type".to_string(),
+        )),
+    }
+}
+
+fn assign_from_bytes_keyword(
+    slot: &mut Option<Value>,
+    value: Value,
+    positional_index: usize,
+    positional_len: usize,
+    name: &str,
+) -> Result<(), BuiltinError> {
+    if positional_len > positional_index {
+        return Err(BuiltinError::TypeError(format!(
+            "from_bytes() got multiple values for argument '{}'",
+            name
+        )));
+    }
+
+    if slot.replace(value).is_some() {
+        return Err(BuiltinError::TypeError(format!(
+            "from_bytes() got multiple values for argument '{}'",
+            name
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_from_bytes_byteorder(value: Value) -> Result<ByteOrder, BuiltinError> {
+    let Some(byteorder) = value_to_owned_string(value) else {
+        return Err(BuiltinError::TypeError(format!(
+            "from_bytes() argument 'byteorder' must be str, not {}",
+            value.type_name()
+        )));
+    };
+
+    match byteorder.as_str() {
+        "big" => Ok(ByteOrder::Big),
+        "little" => Ok(ByteOrder::Little),
+        _ => Err(BuiltinError::ValueError(
+            "byteorder must be either 'little' or 'big'".to_string(),
+        )),
+    }
+}
+
+fn value_to_byte_sequence(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
+    if let Some(ptr) = value.as_object_ptr() {
+        match crate::ops::objects::extract_type_id(ptr) {
+            TypeId::BYTES | TypeId::BYTEARRAY => {
+                return Ok(unsafe { &*(ptr as *const BytesObject) }.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    let values = iter_values(value).map_err(|_| {
+        BuiltinError::TypeError(format!(
+            "{context} must be a bytes-like object or iterable of integers"
+        ))
+    })?;
+
+    let mut bytes = Vec::with_capacity(values.len());
+    for item in values {
+        bytes.push(value_to_single_byte(item, context)?);
+    }
+    Ok(bytes)
+}
+
+fn value_to_single_byte(value: Value, context: &str) -> Result<u8, BuiltinError> {
+    if let Some(number) = value_to_bigint(value) {
+        if (BigInt::from(0_u8)..=BigInt::from(u8::MAX)).contains(&number) {
+            return Ok(number
+                .try_into()
+                .expect("validated byte-sized bigint should convert to u8"));
+        }
+    } else if let Some(boolean) = value.as_bool() {
+        return Ok(u8::from(boolean));
+    }
+
+    Err(BuiltinError::ValueError(format!(
+        "{context} must yield integers in range(0, 256)"
+    )))
+}
+
+fn decode_bigint_from_bytes(bytes: &[u8], byteorder: ByteOrder, signed: bool) -> BigInt {
+    match (byteorder, signed) {
+        (ByteOrder::Big, true) => BigInt::from_signed_bytes_be(bytes),
+        (ByteOrder::Little, true) => BigInt::from_signed_bytes_le(bytes),
+        (ByteOrder::Big, false) => BigInt::from_bytes_be(Sign::Plus, bytes),
+        (ByteOrder::Little, false) => BigInt::from_bytes_le(Sign::Plus, bytes),
+    }
 }
 
 /// Builtin float constructor.
@@ -1107,6 +1526,53 @@ pub fn builtin_float(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::TypeError(
         "float() argument must be a string or number".to_string(),
     ))
+}
+
+#[inline]
+fn native_float_format_description() -> &'static str {
+    if cfg!(target_endian = "little") {
+        "IEEE, little-endian"
+    } else {
+        "IEEE, big-endian"
+    }
+}
+
+/// Builtin implementation backing `float.__getformat__`.
+pub(crate) fn builtin_float_getformat(args: &[Value]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "float.__getformat__() takes exactly 1 argument ({} given)",
+            given
+        )));
+    }
+
+    let receiver = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError(
+            "descriptor '__getformat__' for 'float' objects doesn't apply to a non-type object"
+                .to_string(),
+        )
+    })?;
+    if crate::ops::objects::extract_type_id(receiver) != TypeId::TYPE {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__getformat__' for 'float' objects doesn't apply to a non-type object"
+                .to_string(),
+        ));
+    }
+
+    let Some(kind) = value_to_owned_string(args[1]) else {
+        return Err(BuiltinError::TypeError(format!(
+            "float.__getformat__() argument 1 must be str, not {}",
+            args[1].type_name()
+        )));
+    };
+
+    match kind.as_str() {
+        "double" | "float" => Ok(Value::string(intern(native_float_format_description()))),
+        _ => Err(BuiltinError::ValueError(
+            "__getformat__() argument 1 must be 'double' or 'float'".to_string(),
+        )),
+    }
 }
 
 /// Builtin str constructor.
@@ -1158,6 +1624,22 @@ pub fn builtin_bool(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     Ok(Value::bool(crate::truthiness::is_truthy(args[0])))
+}
+
+pub fn builtin_bool_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Ok(Value::bool(false));
+    }
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "bool() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    crate::truthiness::try_is_truthy(vm, args[0])
+        .map(Value::bool)
+        .map_err(super::runtime_error_to_builtin_error)
 }
 
 /// Builtin list constructor.
@@ -1230,6 +1712,23 @@ pub fn builtin_dict(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     Ok(to_object_value(dict))
+}
+
+fn builtin_dict_kw(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let dict_value = builtin_dict(positional)?;
+    let dict_ptr = dict_value
+        .as_object_ptr()
+        .expect("builtin_dict should return an object-backed dict");
+    let dict = unsafe { &mut *(dict_ptr as *mut DictObject) };
+
+    for (name, value) in keywords {
+        dict.set(Value::string(intern(name)), *value);
+    }
+
+    Ok(dict_value)
 }
 
 /// Builtin implementation backing `dict.fromkeys`.
@@ -1479,6 +1978,10 @@ pub fn builtin_type_with_vm(
         unregister_global_class(class_id);
         return Err(runtime_error_to_builtin_error(err));
     }
+    if let Err(err) = crate::ops::class::invoke_init_subclass_hook(vm, class_value, &[]) {
+        unregister_global_class(class_id);
+        return Err(runtime_error_to_builtin_error(err));
+    }
 
     Ok(Value::object_ptr(
         std::sync::Arc::into_raw(result.class) as *const ()
@@ -1558,6 +2061,10 @@ pub(crate) fn builtin_type_new_with_vm(
         unregister_global_class(class_id);
         return Err(runtime_error_to_builtin_error(err));
     }
+    if let Err(err) = crate::ops::class::invoke_init_subclass_hook(vm, class_value, &[]) {
+        unregister_global_class(class_id);
+        return Err(runtime_error_to_builtin_error(err));
+    }
 
     Ok(Value::object_ptr(
         std::sync::Arc::into_raw(result.class) as *const ()
@@ -1617,19 +2124,31 @@ pub fn builtin_object(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn class_uses_native_dict_storage(class: &PyClassObject) -> bool {
-    global_class_bitmap(class.class_id()).is_some_and(|bitmap| bitmap.is_subclass_of(TypeId::DICT))
+fn class_uses_native_storage(class: &PyClassObject, builtin_type: TypeId) -> bool {
+    global_class_bitmap(class.class_id()).is_some_and(|bitmap| bitmap.is_subclass_of(builtin_type))
         || class
             .mro()
             .iter()
             .copied()
-            .any(|class_id| class_id == ClassId(TypeId::DICT.raw()))
+            .any(|class_id| class_id == ClassId(builtin_type.raw()))
+}
+
+#[inline]
+fn class_uses_native_dict_storage(class: &PyClassObject) -> bool {
+    class_uses_native_storage(class, TypeId::DICT)
+}
+
+#[inline]
+fn class_uses_native_list_storage(class: &PyClassObject) -> bool {
+    class_uses_native_storage(class, TypeId::LIST)
 }
 
 #[inline]
 pub(crate) fn allocate_heap_instance_for_class(class: &PyClassObject) -> ShapedObject {
     if class_uses_native_dict_storage(class) {
         ShapedObject::new_dict_backed(class.class_type_id(), class.instance_shape().clone())
+    } else if class_uses_native_list_storage(class) {
+        ShapedObject::new_list_backed(class.class_type_id(), class.instance_shape().clone())
     } else {
         ShapedObject::new(class.class_type_id(), class.instance_shape().clone())
     }
@@ -1657,6 +2176,9 @@ fn builtin_constructor_new(
     }
 
     if class_value_is_subtype(args[0], target) {
+        if let Some(err) = builtin_constructor_subtype_error(target, class_type) {
+            return Err(err);
+        }
         return Err(BuiltinError::NotImplemented(format!(
             "{type_name}.__new__() for {type_name} subclasses is not implemented yet"
         )));
@@ -1665,6 +2187,16 @@ fn builtin_constructor_new(
     Err(BuiltinError::TypeError(format!(
         "{type_name}.__new__(X): X is not a subtype of {type_name}"
     )))
+}
+
+#[inline]
+fn builtin_constructor_subtype_error(target: TypeId, receiver: TypeId) -> Option<BuiltinError> {
+    match (target, receiver) {
+        (TypeId::INT, TypeId::BOOL) => Some(BuiltinError::TypeError(
+            "int.__new__(bool) is not safe, use bool.__new__()".to_string(),
+        )),
+        _ => None,
+    }
 }
 
 pub(crate) fn builtin_int_new(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -1785,6 +2317,31 @@ pub(crate) fn builtin_object_init(args: &[Value]) -> Result<Value, BuiltinError>
     if crate::ops::objects::extract_type_id(self_ptr) == TypeId::TYPE {
         return Err(BuiltinError::TypeError(
             "object.__init__() is not valid for type instances".to_string(),
+        ));
+    }
+
+    Ok(Value::none())
+}
+
+pub(crate) fn builtin_object_init_subclass(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(
+            "object.__init_subclass__() takes no arguments".to_string(),
+        ));
+    }
+
+    if class_value_to_type_id(args[0]).is_none() {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__init_subclass__' requires a type object".to_string(),
+        ));
+    }
+
+    if !keywords.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "object.__init_subclass__() takes no keyword arguments".to_string(),
         ));
     }
 
@@ -2270,6 +2827,7 @@ mod tests {
     use prism_core::intern::interned_by_ptr;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::type_builtins::builtin_class_mro;
+    use prism_runtime::types::bytes::BytesObject;
     use prism_runtime::types::iter::IteratorObject;
     use prism_runtime::types::string::StringObject;
     use std::sync::Arc;
@@ -2343,6 +2901,36 @@ mod tests {
     }
 
     #[test]
+    fn test_object_new_allocates_native_list_backing_for_heap_list_subclass() {
+        let class = PyClassObject::new(
+            intern("ListSubclass"),
+            &[ClassId(TypeId::LIST.raw())],
+            |id| {
+                (id.0 < TypeId::FIRST_USER_TYPE).then(|| {
+                    builtin_class_mro(TypeId::from_raw(id.0))
+                        .into_iter()
+                        .collect()
+                })
+            },
+        )
+        .expect("list subclass should build");
+        let (class_value, class_ptr) = class_value(class);
+
+        let result = builtin_object_new(&[class_value]).expect("object.__new__ should succeed");
+        let result_ptr = result
+            .as_object_ptr()
+            .expect("object.__new__ should return a heap instance");
+        let shaped = unsafe { &*(result_ptr as *const ShapedObject) };
+
+        assert!(shaped.has_list_backing());
+
+        unsafe {
+            drop_boxed(result_ptr as *mut ShapedObject);
+            drop_class(class_ptr);
+        }
+    }
+
+    #[test]
     fn test_int_from_int() {
         let result = builtin_int(&[Value::int(42).unwrap()]).unwrap();
         assert_eq!(result.as_int(), Some(42));
@@ -2352,6 +2940,54 @@ mod tests {
     fn test_int_from_float() {
         let result = builtin_int(&[Value::float(3.9)]).unwrap();
         assert_eq!(result.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_int_from_ascii_string_default_base() {
+        let result = builtin_int(&[Value::string(intern("42"))]).unwrap();
+        assert_eq!(result.as_int(), Some(42));
+
+        let signed = builtin_int(&[Value::string(intern("  -17 "))]).unwrap();
+        assert_eq!(signed.as_int(), Some(-17));
+    }
+
+    #[test]
+    fn test_int_from_bytes_and_bytearray_default_base() {
+        let (bytes_value, bytes_ptr) = boxed_value(BytesObject::from_slice(b"01"));
+        let bytes_result = builtin_int(&[bytes_value]).unwrap();
+        assert_eq!(bytes_result.as_int(), Some(1));
+
+        let (bytearray_value, bytearray_ptr) =
+            boxed_value(BytesObject::bytearray_from_slice(b"255"));
+        let bytearray_result = builtin_int(&[bytearray_value]).unwrap();
+        assert_eq!(bytearray_result.as_int(), Some(255));
+
+        unsafe {
+            drop_boxed(bytes_ptr);
+            drop_boxed(bytearray_ptr);
+        }
+    }
+
+    #[test]
+    fn test_int_with_explicit_base_parses_prefixed_text() {
+        let value =
+            builtin_int(&[Value::string(intern("0x_FF")), Value::int(16).unwrap()]).unwrap();
+        assert_eq!(value.as_int(), Some(255));
+
+        let (bytes_value, bytes_ptr) = boxed_value(BytesObject::from_slice(b"0b_1010"));
+        let binary = builtin_int(&[bytes_value, Value::int(0).unwrap()]).unwrap();
+        assert_eq!(binary.as_int(), Some(10));
+
+        unsafe {
+            drop_boxed(bytes_ptr);
+        }
+    }
+
+    #[test]
+    fn test_int_rejects_non_string_with_explicit_base() {
+        let err = builtin_int(&[Value::int(12).unwrap(), Value::int(10).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(err.to_string().contains("explicit base"));
     }
 
     #[test]
@@ -2434,6 +3070,68 @@ mod tests {
             err.to_string()
                 .contains("property() got multiple values for argument 'doc'")
         );
+    }
+
+    #[test]
+    fn test_dict_constructor_accepts_keyword_arguments() {
+        let result = call_builtin_type_kw(
+            TypeId::DICT,
+            &[],
+            &[
+                ("alpha", Value::int(1).unwrap()),
+                ("beta", Value::int(2).unwrap()),
+            ],
+        )
+        .expect("dict(alpha=1, beta=2) should succeed");
+        let ptr = result
+            .as_object_ptr()
+            .expect("dict() should return a dict object");
+        let dict = unsafe { &*(ptr as *const DictObject) };
+
+        assert_eq!(
+            dict.get(Value::string(intern("alpha")))
+                .and_then(|value| value.as_int()),
+            Some(1)
+        );
+        assert_eq!(
+            dict.get(Value::string(intern("beta")))
+                .and_then(|value| value.as_int()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_dict_constructor_keywords_override_positional_mapping_entries() {
+        let mut source = DictObject::new();
+        source.set(Value::string(intern("alpha")), Value::int(1).unwrap());
+        source.set(Value::string(intern("gamma")), Value::int(3).unwrap());
+        let source_ptr = Box::into_raw(Box::new(source));
+
+        let result = call_builtin_type_kw(
+            TypeId::DICT,
+            &[Value::object_ptr(source_ptr as *const ())],
+            &[("alpha", Value::int(9).unwrap())],
+        )
+        .expect("dict(mapping, alpha=9) should succeed");
+        let ptr = result
+            .as_object_ptr()
+            .expect("dict() should return a dict object");
+        let dict = unsafe { &*(ptr as *const DictObject) };
+
+        assert_eq!(
+            dict.get(Value::string(intern("alpha")))
+                .and_then(|value| value.as_int()),
+            Some(9)
+        );
+        assert_eq!(
+            dict.get(Value::string(intern("gamma")))
+                .and_then(|value| value.as_int()),
+            Some(3)
+        );
+
+        unsafe {
+            drop(Box::from_raw(source_ptr));
+        }
     }
 
     #[test]
@@ -2710,6 +3408,38 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_float_getformat_reports_native_layout() {
+        let float_type = builtin_type_object_for_type_id(TypeId::FLOAT);
+        let expected = Value::string(intern(native_float_format_description()));
+
+        let double_format = builtin_float_getformat(&[float_type, Value::string(intern("double"))])
+            .expect("float.__getformat__('double') should succeed");
+        assert_eq!(double_format, expected);
+
+        let float_format = builtin_float_getformat(&[float_type, Value::string(intern("float"))])
+            .expect("float.__getformat__('float') should succeed");
+        assert_eq!(float_format, expected);
+    }
+
+    #[test]
+    fn test_builtin_float_getformat_rejects_invalid_arguments() {
+        let float_type = builtin_type_object_for_type_id(TypeId::FLOAT);
+
+        let invalid_kind =
+            builtin_float_getformat(&[float_type, Value::string(intern("bogus"))]).unwrap_err();
+        assert!(matches!(invalid_kind, BuiltinError::ValueError(_)));
+        assert!(invalid_kind.to_string().contains("'double' or 'float'"));
+
+        let invalid_type =
+            builtin_float_getformat(&[float_type, Value::int(1).unwrap()]).unwrap_err();
+        assert!(matches!(invalid_type, BuiltinError::TypeError(_)));
+
+        let missing_arg = builtin_float_getformat(&[float_type]).unwrap_err();
+        assert!(matches!(missing_arg, BuiltinError::TypeError(_)));
+        assert!(missing_arg.to_string().contains("takes exactly 1 argument"));
+    }
+
+    #[test]
     fn test_str_new_builds_heap_subclass_instances_with_native_string_storage() {
         let str_type = builtin_type_object_for_type_id(TypeId::STR);
         let (bases_value, bases_ptr) = boxed_value(TupleObject::from_slice(&[str_type]));
@@ -2753,6 +3483,16 @@ mod tests {
         assert!(matches!(err, BuiltinError::TypeError(_)));
         assert!(err.to_string().contains("int.__new__(X): X must be a type"));
 
+        let bool_type = builtin_type_object_for_type_id(TypeId::BOOL);
+        let err = builtin_int_new(&[bool_type, Value::int(0).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        match err {
+            BuiltinError::TypeError(message) => {
+                assert_eq!(message, "int.__new__(bool) is not safe, use bool.__new__()");
+            }
+            _ => panic!("expected TypeError for int.__new__(bool, 0)"),
+        }
+
         let err = builtin_list_new(&[]).unwrap_err();
         assert!(matches!(err, BuiltinError::TypeError(_)));
         assert!(
@@ -2774,6 +3514,27 @@ mod tests {
         let err = builtin_object_init(&[instance, Value::int(1).unwrap()]).unwrap_err();
         assert!(matches!(err, BuiltinError::TypeError(_)));
         assert!(err.to_string().contains("object.__init__()"));
+    }
+
+    #[test]
+    fn test_object_init_subclass_accepts_single_class_receiver() {
+        let object_type = builtin_type_object_for_type_id(TypeId::OBJECT);
+        let result = builtin_object_init_subclass(&[object_type], &[])
+            .expect("object.__init_subclass__ should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_object_init_subclass_rejects_keyword_arguments() {
+        let object_type = builtin_type_object_for_type_id(TypeId::OBJECT);
+        let err =
+            builtin_object_init_subclass(&[object_type], &[("token", Value::int(1).unwrap())])
+                .unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(
+            err.to_string()
+                .contains("object.__init_subclass__() takes no keyword arguments")
+        );
     }
 
     #[test]
@@ -2800,6 +3561,44 @@ mod tests {
         unsafe { drop_class(type_value.as_object_ptr().unwrap() as *const PyClassObject) };
         unsafe { drop_boxed(namespace_ptr as *mut DictObject) };
         unsafe { drop_boxed(bases_ptr) };
+    }
+
+    #[test]
+    fn test_mappingproxy_type_wraps_dict_arguments() {
+        let mut dict = DictObject::new();
+        dict.set(Value::string(intern("token")), Value::int(7).unwrap());
+        let dict_value = to_object_value(dict);
+
+        let proxy = builtin_mappingproxy(&[dict_value]).expect("mappingproxy(dict) should succeed");
+        let proxy_ptr = proxy
+            .as_object_ptr()
+            .expect("mappingproxy should allocate a proxy object");
+        assert_eq!(
+            crate::ops::objects::extract_type_id(proxy_ptr),
+            TypeId::MAPPING_PROXY
+        );
+
+        let proxy = unsafe { &*(proxy_ptr as *const MappingProxyObject) };
+        assert_eq!(
+            crate::builtins::builtin_mapping_proxy_get_item_static(
+                proxy,
+                Value::string(intern("token"))
+            )
+            .expect("proxy lookup should succeed"),
+            Some(Value::int(7).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_mappingproxy_type_rejects_non_mappings() {
+        let err = builtin_mappingproxy(&[Value::int(3).unwrap()])
+            .expect_err("mappingproxy(int) should fail");
+        match err {
+            BuiltinError::TypeError(message) => {
+                assert!(message.contains("must be a mapping"));
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
     }
 
     #[test]

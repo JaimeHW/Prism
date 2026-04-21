@@ -208,15 +208,9 @@ pub fn build_exc_info_explicit(type_id: u16, exc_value: Value, exc_traceback: Va
 /// or used with `isinstance()`.
 #[inline]
 fn build_type_value(type_id: u16) -> Value {
-    // Convert type ID to ExceptionTypeId
-    match ExceptionTypeId::from_u8(type_id as u8) {
-        Some(_exc_type) => {
-            // TODO: Create proper type object Value
-            // For now, use an int as a placeholder for the type ID
-            Value::int(type_id as i64).unwrap_or_else(Value::none)
-        }
-        None => Value::none(),
-    }
+    ExceptionTypeId::from_u8(type_id as u8)
+        .and_then(|_| crate::builtins::exception_type_value_for_id(type_id))
+        .unwrap_or_else(Value::none)
 }
 
 /// Build a traceback Value from an exception value.

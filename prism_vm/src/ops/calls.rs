@@ -93,6 +93,19 @@ fn restore_direct_call_caller_state(
     }
 }
 
+#[inline(always)]
+fn should_restore_direct_call_caller_state(
+    vm: &VirtualMachine,
+    stop_depth: usize,
+    result: &Result<InvokeCallableOutcome, RuntimeError>,
+) -> bool {
+    if vm.call_depth() != stop_depth {
+        return false;
+    }
+
+    !matches!(result, Ok(InvokeCallableOutcome::ControlTransferred))
+}
+
 // =============================================================================
 // Type ID Extraction Helper
 // =============================================================================
@@ -1117,7 +1130,7 @@ fn invoke_user_function_with_implicit_self(
 ) -> Result<Value, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = vm.lookup_function_closure(func_ptr);
+    let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
     let module = resolve_function_module(vm, func);
 
     let bound = {
@@ -1317,7 +1330,10 @@ pub(crate) fn call_user_function_from_values(
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
     let module_ptr = function_module_ptr(vm, func);
-    let closure = vm.lookup_function_closure(func_ptr);
+    let closure = match materialize_function_invocation_closure(vm, func_ptr, &code) {
+        Ok(closure) => closure,
+        Err(err) => return ControlFlow::Error(err),
+    };
     let is_generator_function = is_generator_code(&code);
     let defaults_empty = func.defaults.as_ref().is_none_or(|d| d.is_empty());
     let kwdefaults_empty = func.kwdefaults.as_ref().is_none_or(|d| d.is_empty());
@@ -1385,7 +1401,6 @@ pub(crate) fn call_user_function_from_values(
         );
     }
 
-    let closure = vm.lookup_function_closure(func_ptr);
     let module = resolve_function_module(vm, func);
     if let Err(err) =
         vm.push_frame_with_closure_and_module(Arc::clone(&code), dst_reg, closure, module)
@@ -1428,7 +1443,7 @@ fn invoke_user_function_direct_impl(
 ) -> Result<InvokeCallableOutcome, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = vm.lookup_function_closure(func_ptr);
+    let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
     let module = resolve_function_module(vm, func);
 
     let mut bound = ArgumentBinder::bind(func, args.iter().copied(), std::iter::empty())
@@ -1475,7 +1490,14 @@ fn invoke_user_function_direct_impl(
             )),
         }
     };
-    restore_direct_call_caller_state(vm, stop_depth, saved_caller_frame, saved_exception_context);
+    if should_restore_direct_call_caller_state(vm, stop_depth, &result) {
+        restore_direct_call_caller_state(
+            vm,
+            stop_depth,
+            saved_caller_frame,
+            saved_exception_context,
+        );
+    }
 
     result
 }
@@ -1488,7 +1510,7 @@ fn invoke_user_function_direct_with_keywords(
 ) -> Result<Value, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = vm.lookup_function_closure(func_ptr);
+    let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
     let module = resolve_function_module(vm, func);
 
     let mut bound = ArgumentBinder::bind(func, args.iter().copied(), keywords.iter().copied())
@@ -1839,6 +1861,9 @@ fn invoke_builtin_with_keywords(
         }
         "type.__init__" => invoke_type_init_builtin_with_keywords(builtin, args, keywords),
         "type.__new__" => invoke_type_new_builtin_with_keywords(builtin, args, keywords),
+        _ if builtin.accepts_keywords() => builtin
+            .call_with_vm_and_keywords(vm, args, keywords)
+            .map_err(RuntimeError::from),
         name => Err(RuntimeError::type_error(format!(
             "keyword arguments for builtin '{name}' are not implemented yet",
         ))),
@@ -2181,7 +2206,10 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             TypeId::FUNCTION | TypeId::CLOSURE => {
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 let code = &func.code;
-                let closure = vm.lookup_function_closure(ptr);
+                let closure = match materialize_function_invocation_closure(vm, ptr, code) {
+                    Ok(closure) => closure,
+                    Err(err) => return ControlFlow::Error(err),
+                };
                 let is_generator_function = is_generator_code(code);
 
                 // Fast path for exact-arity positional calls without advanced binding.
@@ -2492,7 +2520,10 @@ fn call_kw_user_function(
 ) -> ControlFlow {
     let func = unsafe { &*(ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = vm.lookup_function_closure(ptr);
+    let closure = match materialize_function_invocation_closure(vm, ptr, &code) {
+        Ok(closure) => closure,
+        Err(err) => return ControlFlow::Error(err),
+    };
     let module = resolve_function_module(vm, func);
 
     // Extract function signature metadata
@@ -3124,7 +3155,7 @@ pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 
 /// MakeClosure: create closure with captured variables
 ///
-/// Creates a FunctionObject with a captured closure environment.
+/// Creates a FunctionObject with captured freevars from the enclosing scope.
 #[inline(always)]
 pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let code_idx = inst.imm16();
@@ -3139,7 +3170,7 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     };
 
-    let captured_closure = match capture_closure_environment(vm.current_frame(), &code_clone) {
+    let captured_closure = match capture_function_freevars(vm.current_frame(), &code_clone) {
         Ok(env) => env,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -3157,13 +3188,78 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     };
 
-    vm.register_function_closure(func_ptr, Arc::clone(&captured_closure));
+    if let Some(captured_closure) = captured_closure {
+        vm.register_function_closure(func_ptr, captured_closure);
+    }
     vm.current_frame_mut()
         .set_reg(dst, Value::object_ptr(func_ptr));
     ControlFlow::Continue
 }
 
-/// Capture closure cells for a new closure function object.
+#[inline]
+fn materialize_function_invocation_closure(
+    vm: &VirtualMachine,
+    func_ptr: *const (),
+    code: &Arc<CodeObject>,
+) -> Result<Option<Arc<ClosureEnv>>, RuntimeError> {
+    materialize_invocation_closure(code, vm.lookup_function_closure(func_ptr))
+}
+
+#[inline]
+fn materialize_invocation_closure(
+    code: &Arc<CodeObject>,
+    captured_freevars: Option<Arc<ClosureEnv>>,
+) -> Result<Option<Arc<ClosureEnv>>, RuntimeError> {
+    let captured_freevar_count = captured_freevars.as_ref().map_or(0, |env| env.len());
+    if captured_freevar_count != code.freevars.len() {
+        return Err(RuntimeError::internal(format!(
+            "closure environment mismatch in {}: expected {} freevars, found {}",
+            code.qualname,
+            code.freevars.len(),
+            captured_freevar_count
+        )));
+    }
+
+    if code.cellvars.is_empty() {
+        return Ok(captured_freevars.filter(|env| !env.is_empty()));
+    }
+
+    let mut cells = Vec::with_capacity(code.cellvars.len() + captured_freevar_count);
+    for _ in code.cellvars.iter() {
+        cells.push(Arc::new(Cell::unbound()));
+    }
+
+    if let Some(captured_freevars) = captured_freevars.as_ref() {
+        for idx in 0..captured_freevars.len() {
+            cells.push(Arc::clone(captured_freevars.get_cell(idx)));
+        }
+    }
+
+    Ok(Some(Arc::new(ClosureEnv::new(cells))))
+}
+
+#[inline]
+fn capture_function_freevars(
+    frame: &crate::frame::Frame,
+    code: &Arc<CodeObject>,
+) -> Result<Option<Arc<ClosureEnv>>, RuntimeError> {
+    if code.freevars.is_empty() {
+        return Ok(None);
+    }
+
+    let mut cells = Vec::with_capacity(code.freevars.len());
+    for freevar in code.freevars.iter() {
+        if let Some(cell) = capture_parent_cell(frame, freevar.as_ref()) {
+            cells.push(cell);
+        } else {
+            return Err(RuntimeError::name_error(Arc::clone(freevar)));
+        }
+    }
+
+    Ok(Some(Arc::new(ClosureEnv::new(cells))))
+}
+
+/// Capture a full frame closure environment for nested non-function scopes.
 pub(crate) fn capture_closure_environment(
     frame: &crate::frame::Frame,
     code: &Arc<CodeObject>,
@@ -3618,6 +3714,34 @@ mod tests {
         let shaped = unsafe { &*(instance_ptr as *const ShapedObject) };
 
         assert!(shaped.has_dict_backing());
+    }
+
+    #[test]
+    fn test_instantiate_user_defined_list_subclass_allocates_native_list_backing() {
+        let mut vm = VirtualMachine::new();
+        let class = PyClassObject::new(
+            intern("ListSubclass"),
+            &[ClassId(TypeId::LIST.raw())],
+            |id| {
+                Some(
+                    builtin_class_mro(class_id_to_type_id(id))
+                        .into_iter()
+                        .collect(),
+                )
+            },
+        )
+        .expect("list subclass should build");
+        let class = register_test_class(class);
+
+        let instance =
+            super::instantiate_user_defined_class_from_values(&mut vm, class.as_ref(), &[])
+                .expect("list subclass instantiation should succeed");
+        let instance_ptr = instance
+            .as_object_ptr()
+            .expect("instantiation should return a heap instance");
+        let shaped = unsafe { &*(instance_ptr as *const ShapedObject) };
+
+        assert!(shaped.has_list_backing());
     }
 
     #[test]

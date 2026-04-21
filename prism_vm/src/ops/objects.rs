@@ -13,7 +13,8 @@ use crate::builtins::{
     exception_type_attribute_value, heap_type_attribute_value,
 };
 use crate::dispatch::ControlFlow;
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::frame::{Frame, REGISTER_COUNT};
 use crate::ops::attribute::is_user_defined_type;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::method_cache::method_cache;
@@ -38,12 +39,13 @@ use prism_runtime::object::views::{
 };
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
+use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // =============================================================================
 // Type Extraction
@@ -87,6 +89,16 @@ pub(crate) fn dict_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut D
         }
         _ => None,
     }
+}
+
+#[inline]
+pub(crate) fn list_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static ListObject> {
+    prism_runtime::types::list::object_ptr_as_list_ref(ptr)
+}
+
+#[inline]
+pub(crate) fn list_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut ListObject> {
+    prism_runtime::types::list::object_ptr_as_list_mut(ptr as *mut ())
 }
 
 #[inline]
@@ -350,7 +362,56 @@ where
         })
 }
 
-fn snapshot_module_dict(module: &crate::import::ModuleObject) -> DictObject {
+static CODE_CO_POSITIONS_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("code.co_positions"), code_co_positions));
+
+#[inline]
+fn optional_u32_to_value(value: Option<u32>) -> Value {
+    value
+        .and_then(|value| Value::int(value as i64))
+        .unwrap_or_else(Value::none)
+}
+
+fn code_co_positions(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "code.co_positions() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let receiver_ptr = receiver
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("descriptor requires a 'code' receiver".into()))?;
+    if extract_type_id(receiver_ptr) != TypeId::CODE {
+        return Err(BuiltinError::TypeError(
+            "descriptor requires a 'code' receiver".into(),
+        ));
+    }
+
+    let code = unsafe { &*(receiver_ptr as *const CodeObjectView) }.code();
+    let positions = code
+        .positions()
+        .map(
+            |(lineno, end_lineno, col_offset, end_col_offset)| -> Value {
+                let tuple = TupleObject::from_slice(&[
+                    optional_u32_to_value(lineno),
+                    optional_u32_to_value(end_lineno),
+                    optional_u32_to_value(col_offset),
+                    optional_u32_to_value(end_col_offset),
+                ]);
+                Value::object_ptr(Box::into_raw(Box::new(tuple)) as *const ())
+            },
+        )
+        .collect();
+
+    Ok(crate::builtins::iterator_to_value(
+        IteratorObject::from_values(positions),
+    ))
+}
+
+pub(crate) fn snapshot_module_dict(module: &crate::import::ModuleObject) -> DictObject {
     let attrs = module.all_attrs();
     let mut dict = DictObject::with_capacity(attrs.len());
     for (name, value) in attrs {
@@ -359,7 +420,7 @@ fn snapshot_module_dict(module: &crate::import::ModuleObject) -> DictObject {
     dict
 }
 
-fn snapshot_current_globals_dict(vm: &VirtualMachine) -> DictObject {
+pub(crate) fn snapshot_current_globals_dict(vm: &VirtualMachine) -> DictObject {
     if let Some(module) = vm.current_module_cloned() {
         return snapshot_module_dict(module.as_ref());
     }
@@ -367,6 +428,42 @@ fn snapshot_current_globals_dict(vm: &VirtualMachine) -> DictObject {
     let mut dict = DictObject::with_capacity(vm.globals.len());
     for (name, value) in vm.globals.iter() {
         dict.set(Value::string(intern(name.as_ref())), *value);
+    }
+    dict
+}
+
+#[inline]
+fn snapshot_dict_storage(storage: &DictObject) -> DictObject {
+    let mut snapshot = DictObject::with_capacity(storage.len());
+    snapshot.update(storage);
+    snapshot
+}
+
+pub(crate) fn snapshot_frame_globals_dict(vm: &VirtualMachine, frame: &Frame) -> DictObject {
+    if let Some(module) = frame.module.as_ref() {
+        return snapshot_module_dict(module.as_ref());
+    }
+
+    snapshot_current_globals_dict(vm)
+}
+
+pub(crate) fn snapshot_frame_locals_dict(frame: &Frame) -> DictObject {
+    if let Some(mapping) = frame.locals_mapping()
+        && let Some(ptr) = mapping.as_object_ptr()
+        && let Some(storage) = dict_storage_ref_from_ptr(ptr)
+    {
+        return snapshot_dict_storage(storage);
+    }
+
+    let mut dict = DictObject::with_capacity(frame.code.locals.len());
+    for (slot, name) in frame.code.locals.iter().enumerate() {
+        if slot >= REGISTER_COUNT || !frame.reg_is_written(slot as u8) {
+            continue;
+        }
+        dict.set(
+            Value::string(intern(name.as_ref())),
+            frame.get_reg(slot as u8),
+        );
     }
     dict
 }
@@ -460,6 +557,106 @@ fn function_attr_value_in_vm(
 
             let tuple = TupleObject::from_vec(items);
             Ok(Some(alloc_heap_value(vm, tuple, "closure tuple")?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn method_attr_value_in_vm(
+    vm: &mut VirtualMachine,
+    method: &BoundMethod,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    match name.as_str() {
+        "__self__" => Ok(Some(method.instance())),
+        "__func__" | "__wrapped__" => Ok(Some(method.function())),
+        _ => {
+            let Some(func_ptr) = method.function().as_object_ptr() else {
+                return Ok(None);
+            };
+
+            match extract_type_id(func_ptr) {
+                TypeId::FUNCTION | TypeId::CLOSURE => {
+                    let func = unsafe { &*(func_ptr as *const FunctionObject) };
+                    function_attr_value_in_vm(vm, func_ptr, func, name)
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+fn code_string_tuple_value(
+    vm: &mut VirtualMachine,
+    values: &[Arc<str>],
+    context: &'static str,
+) -> Result<Value, RuntimeError> {
+    let items = values
+        .iter()
+        .map(|value| Value::string(intern(value.as_ref())))
+        .collect();
+    alloc_heap_value(vm, TupleObject::from_vec(items), context)
+}
+
+fn code_attr_value_in_vm(
+    vm: &mut VirtualMachine,
+    code_value: Value,
+    code_view: &CodeObjectView,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let code = code_view.code();
+    match name.as_str() {
+        "co_name" => Ok(Some(Value::string(intern(code.name.as_ref())))),
+        "co_qualname" => Ok(Some(Value::string(intern(code.qualname.as_ref())))),
+        "co_filename" => Ok(Some(Value::string(intern(code.filename.as_ref())))),
+        "co_firstlineno" => Ok(Some(
+            Value::int(code.first_lineno as i64).unwrap_or_else(Value::none),
+        )),
+        "co_argcount" => Ok(Some(
+            Value::int(code.arg_count as i64).unwrap_or_else(Value::none),
+        )),
+        "co_posonlyargcount" => Ok(Some(
+            Value::int(code.posonlyarg_count as i64).unwrap_or_else(Value::none),
+        )),
+        "co_kwonlyargcount" => Ok(Some(
+            Value::int(code.kwonlyarg_count as i64).unwrap_or_else(Value::none),
+        )),
+        "co_nlocals" => Ok(Some(
+            Value::int(code.locals.len() as i64).unwrap_or_else(Value::none),
+        )),
+        "co_flags" => Ok(Some(
+            Value::int(code.flags.bits() as i64).unwrap_or_else(Value::none),
+        )),
+        "co_consts" => Ok(Some(alloc_heap_value(
+            vm,
+            TupleObject::from_vec(code.constants.to_vec()),
+            "code constants tuple",
+        )?)),
+        "co_varnames" => Ok(Some(code_string_tuple_value(
+            vm,
+            &code.locals,
+            "code varnames tuple",
+        )?)),
+        "co_names" => Ok(Some(code_string_tuple_value(
+            vm,
+            &code.names,
+            "code names tuple",
+        )?)),
+        "co_freevars" => Ok(Some(code_string_tuple_value(
+            vm,
+            &code.freevars,
+            "code freevars tuple",
+        )?)),
+        "co_cellvars" => Ok(Some(code_string_tuple_value(
+            vm,
+            &code.cellvars,
+            "code cellvars tuple",
+        )?)),
+        "co_positions" => {
+            let bound = Box::leak(Box::new(CODE_CO_POSITIONS_METHOD.bind(code_value)));
+            Ok(Some(Value::object_ptr(
+                bound as *mut BuiltinFunctionObject as *const (),
+            )))
         }
         _ => Ok(None),
     }
@@ -710,6 +907,152 @@ fn lookup_builtin_primitive_attr(
     Ok(None)
 }
 
+#[inline]
+fn user_defined_instance_type_name(type_id: TypeId) -> Arc<str> {
+    global_class(ClassId(type_id.raw()))
+        .map(|class| Arc::<str>::from(class.name().as_str()))
+        .unwrap_or_else(|| Arc::<str>::from(type_id.name()))
+}
+
+#[inline]
+fn user_defined_attribute_error(type_id: TypeId, name: &InternedString) -> RuntimeError {
+    RuntimeError::attribute_error(user_defined_instance_type_name(type_id), name.as_str())
+}
+
+fn lookup_user_defined_instance_attribute_default(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    ptr: *const (),
+    type_id: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if name.as_str() == "__class__" {
+        return Ok(class_id_to_value(ClassId(type_id.raw())));
+    }
+
+    let class_attr = lookup_instance_class_attr(type_id, name);
+    if let Some(descriptor) = class_attr.and_then(property_descriptor_from_value) {
+        return invoke_property_getter(vm, descriptor, obj).map(Some);
+    }
+
+    let shaped = unsafe { &*(ptr as *const ShapedObject) };
+    if let Some(value) = shaped.get_property_interned(name) {
+        return Ok(Some(value));
+    }
+
+    if let Some(value) = class_attr {
+        return Ok(Some(bind_instance_attribute(value, obj)));
+    }
+
+    if let Some(value) = lookup_builtin_base_instance_attr(obj, type_id, name)? {
+        return Ok(Some(value));
+    }
+
+    Ok(None)
+}
+
+fn invoke_user_defined_getattr(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    type_id: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if name.as_str() == "__getattr__" {
+        return Ok(None);
+    }
+
+    let Some(getattr_value) = lookup_instance_class_attr(type_id, &intern("__getattr__")) else {
+        return Ok(None);
+    };
+
+    crate::ops::calls::invoke_callable_value(
+        vm,
+        bind_instance_attribute(getattr_value, obj),
+        &[Value::string(name.clone())],
+    )
+    .map(Some)
+}
+
+fn lookup_user_defined_instance_attribute(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    ptr: *const (),
+    type_id: TypeId,
+    name: &InternedString,
+) -> Result<Value, RuntimeError> {
+    if let Some(getattribute_value) =
+        lookup_instance_class_attr(type_id, &intern("__getattribute__"))
+    {
+        let getattribute = bind_instance_attribute(getattribute_value, obj);
+        return match crate::ops::calls::invoke_callable_value(
+            vm,
+            getattribute,
+            &[Value::string(name.clone())],
+        ) {
+            Ok(value) => Ok(value),
+            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+                if let Some(value) = invoke_user_defined_getattr(vm, obj, type_id, name)? {
+                    return Ok(value);
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        };
+    }
+
+    match lookup_user_defined_instance_attribute_default(vm, obj, ptr, type_id, name) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => {
+            if let Some(value) = invoke_user_defined_getattr(vm, obj, type_id, name)? {
+                return Ok(value);
+            }
+            Err(user_defined_attribute_error(type_id, name))
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            if let Some(value) = invoke_user_defined_getattr(vm, obj, type_id, name)? {
+                return Ok(value);
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn object_getattribute_default(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    name: &InternedString,
+) -> Result<Value, RuntimeError> {
+    if let Some(ptr) = obj.as_object_ptr() {
+        let type_id = extract_type_id(ptr);
+        if type_id == TypeId::OBJECT {
+            if name.as_str() == "__class__" {
+                return Ok(crate::builtins::builtin_type_object_for_type_id(
+                    TypeId::OBJECT,
+                ));
+            }
+
+            let shaped = unsafe { &*(ptr as *const ShapedObject) };
+            if let Some(value) = shaped.get_property_interned(name) {
+                return Ok(value);
+            }
+
+            if let Some(value) = builtin_instance_attribute_value(vm, TypeId::OBJECT, obj, name)? {
+                return Ok(value);
+            }
+
+            return Err(RuntimeError::attribute_error("object", name.as_str()));
+        }
+
+        if is_user_defined_type(type_id) {
+            return lookup_user_defined_instance_attribute_default(vm, obj, ptr, type_id, name)?
+                .ok_or_else(|| user_defined_attribute_error(type_id, name));
+        }
+    }
+
+    get_attribute_value(vm, obj, name)
+}
+
 pub(crate) fn get_attribute_value(
     vm: &mut VirtualMachine,
     obj: Value,
@@ -730,6 +1073,12 @@ pub(crate) fn get_attribute_value(
 
         return match type_id {
             TypeId::OBJECT => {
+                if name.as_str() == "__class__" {
+                    return Ok(crate::builtins::builtin_type_object_for_type_id(
+                        TypeId::OBJECT,
+                    ));
+                }
+
                 let shaped = unsafe { &*(ptr as *const ShapedObject) };
                 if let Some(value) = shaped.get_property_interned(name) {
                     return Ok(value);
@@ -756,6 +1105,16 @@ pub(crate) fn get_attribute_value(
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 function_attr_value_in_vm(vm, ptr, func, name)?
                     .ok_or_else(|| RuntimeError::attribute_error("function", name.as_str()))
+            }
+            TypeId::METHOD => {
+                let method = unsafe { &*(ptr as *const BoundMethod) };
+                method_attr_value_in_vm(vm, method, name)?
+                    .ok_or_else(|| RuntimeError::attribute_error("method", name.as_str()))
+            }
+            TypeId::CODE => {
+                let code = unsafe { &*(ptr as *const CodeObjectView) };
+                code_attr_value_in_vm(vm, obj, code, name)?
+                    .ok_or_else(|| RuntimeError::attribute_error("code", name.as_str()))
             }
             TypeId::EXCEPTION => {
                 let exc = unsafe { &*(ptr as *const ExceptionValue) };
@@ -803,7 +1162,7 @@ pub(crate) fn get_attribute_value(
                         Ok(Value::bool(exc.flags.has(ExceptionFlags::SUPPRESS_CONTEXT)))
                     }
                     _ => Err(RuntimeError::attribute_error(
-                        "BaseException",
+                        exc.type_name(),
                         name.as_str(),
                     )),
                 }
@@ -858,6 +1217,8 @@ pub(crate) fn get_attribute_value(
                         Ok(Value::int(frame.line_number() as i64).unwrap_or_else(Value::none))
                     }
                     "f_lasti" => Ok(Value::int(frame.lasti() as i64).unwrap_or_else(Value::none)),
+                    "f_globals" => Ok(frame.globals()),
+                    "f_locals" => Ok(frame.locals()),
                     "f_back" => Ok(Value::none()),
                     _ => Err(RuntimeError::attribute_error("frame", name.as_str())),
                 }
@@ -907,23 +1268,7 @@ pub(crate) fn get_attribute_value(
                 }
 
                 if is_user_defined_type(type_id) {
-                    let class_attr = lookup_instance_class_attr(type_id, name);
-                    if let Some(descriptor) = class_attr.and_then(property_descriptor_from_value) {
-                        return invoke_property_getter(vm, descriptor, obj);
-                    }
-
-                    let shaped = unsafe { &*(ptr as *const ShapedObject) };
-                    if let Some(value) = shaped.get_property_interned(name) {
-                        return Ok(value);
-                    }
-
-                    if let Some(value) = class_attr {
-                        return Ok(bind_instance_attribute(value, obj));
-                    }
-
-                    if let Some(value) = lookup_builtin_base_instance_attr(obj, type_id, name)? {
-                        return Ok(value);
-                    }
+                    return lookup_user_defined_instance_attribute(vm, obj, ptr, type_id, name);
                 }
 
                 Err(RuntimeError::attribute_error(type_id.name(), name.as_str()))
@@ -968,7 +1313,8 @@ pub(crate) fn set_attribute_value(
             | TypeId::DICT
             | TypeId::LIST
             | TypeId::TUPLE
-            | TypeId::SET => Err(RuntimeError::attribute_error(
+            | TypeId::SET
+            | TypeId::METHOD => Err(RuntimeError::attribute_error(
                 type_id.name(),
                 format!(
                     "'{}' object attribute '{}' is read-only",
@@ -980,6 +1326,21 @@ pub(crate) fn set_attribute_value(
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 func.set_attr(name.clone(), value);
                 Ok(())
+            }
+            TypeId::EXCEPTION => {
+                let exc = unsafe {
+                    ExceptionValue::from_value_mut(obj)
+                        .ok_or_else(|| RuntimeError::internal("expected exception instance"))?
+                };
+                match name.as_str() {
+                    "__traceback__" => exc
+                        .replace_traceback(value)
+                        .map_err(RuntimeError::type_error),
+                    _ => Err(RuntimeError::attribute_error(
+                        exc.type_name(),
+                        name.as_str(),
+                    )),
+                }
             }
             TypeId::TYPE => {
                 let Some(class) = class_object_from_type_ptr(ptr) else {
@@ -1069,7 +1430,8 @@ pub(crate) fn delete_attribute_value(
             | TypeId::DICT
             | TypeId::LIST
             | TypeId::TUPLE
-            | TypeId::SET => Err(RuntimeError::attribute_error(
+            | TypeId::SET
+            | TypeId::METHOD => Err(RuntimeError::attribute_error(
                 type_id.name(),
                 format!(
                     "cannot delete attribute '{}' of '{}' object",
@@ -1231,20 +1593,20 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = container.as_object_ptr() {
         let type_id = extract_type_id(ptr);
 
-        match type_id {
-            TypeId::LIST => {
-                let list = unsafe { &*(ptr as *const ListObject) };
-                if let Some(idx) = key.as_int() {
-                    if let Some(val) = list.get(idx) {
-                        frame.set_reg(dst, val);
-                        ControlFlow::Continue
-                    } else {
-                        ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
-                    }
+        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+            return if let Some(idx) = key.as_int() {
+                if let Some(val) = list.get(idx) {
+                    frame.set_reg(dst, val);
+                    ControlFlow::Continue
                 } else {
-                    ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+                    ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
                 }
-            }
+            } else {
+                ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+            };
+        }
+
+        match type_id {
             TypeId::TUPLE => {
                 let tuple = unsafe { &*(ptr as *const TupleObject) };
                 if let Some(idx) = key.as_int() {
@@ -1316,19 +1678,19 @@ pub fn set_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = container.as_object_ptr() {
         let type_id = extract_type_id(ptr);
 
-        match type_id {
-            TypeId::LIST => {
-                let list = unsafe { &mut *(ptr as *mut ListObject) };
-                if let Some(idx) = key.as_int() {
-                    if list.set(idx, value) {
-                        ControlFlow::Continue
-                    } else {
-                        ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
-                    }
+        if let Some(list) = list_storage_mut_from_ptr(ptr) {
+            return if let Some(idx) = key.as_int() {
+                if list.set(idx, value) {
+                    ControlFlow::Continue
                 } else {
-                    ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+                    ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
                 }
-            }
+            } else {
+                ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+            };
+        }
+
+        match type_id {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
                 dict.set(key, value);
@@ -1367,19 +1729,19 @@ pub fn del_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = container.as_object_ptr() {
         let type_id = extract_type_id(ptr);
 
-        match type_id {
-            TypeId::LIST => {
-                let list = unsafe { &mut *(ptr as *mut ListObject) };
-                if let Some(idx) = key.as_int() {
-                    if list.remove(idx).is_some() {
-                        ControlFlow::Continue
-                    } else {
-                        ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
-                    }
+        if let Some(list) = list_storage_mut_from_ptr(ptr) {
+            return if let Some(idx) = key.as_int() {
+                if list.remove(idx).is_some() {
+                    ControlFlow::Continue
                 } else {
-                    ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+                    ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
                 }
-            }
+            } else {
+                ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+            };
+        }
+
+        match type_id {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
                 if dict.remove(key).is_some() {
@@ -1441,10 +1803,14 @@ pub fn get_iter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Advances the iterator and jumps to offset if exhausted.
 #[inline(always)]
 pub fn for_iter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let iter_val = vm.current_frame().get_reg(inst.src1().0);
     let dst = inst.dst().0;
-    // Offset is encoded in src2 position as 8-bit signed
-    let offset = inst.src2().0 as i8 as i16;
+    let Some(iter_reg) = dst.checked_sub(1) else {
+        return ControlFlow::Error(RuntimeError::internal(
+            "ForIter destination register must follow its iterator register",
+        ));
+    };
+    let iter_val = vm.current_frame().get_reg(iter_reg);
+    let offset = inst.imm16() as i16;
 
     match next_step(vm, iter_val) {
         Ok(IterStep::Yielded(value)) => {
@@ -1476,43 +1842,43 @@ pub fn len(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     } else if let Some(ptr) = obj.as_object_ptr() {
         let type_id = extract_type_id(ptr);
 
-        let len_val = match type_id {
-            TypeId::DEQUE => {
-                let deque = unsafe { &*(ptr as *const DequeObject) };
-                deque.len() as i64
-            }
-            TypeId::LIST => {
-                let list = unsafe { &*(ptr as *const ListObject) };
-                list.len() as i64
-            }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                tuple.len() as i64
-            }
-            TypeId::DICT => {
-                let dict = unsafe { &*(ptr as *const DictObject) };
-                dict.len() as i64
-            }
-            TypeId::SET => {
-                let set = unsafe { &*(ptr as *const SetObject) };
-                set.len() as i64
-            }
-            TypeId::RANGE => {
-                let range = unsafe { &*(ptr as *const RangeObject) };
-                let Some(len) = range.try_len() else {
-                    return ControlFlow::Error(RuntimeError::new(
-                        crate::error::RuntimeErrorKind::OverflowError {
-                            message: "range length overflow".into(),
-                        },
-                    ));
-                };
-                len as i64
-            }
-            _ => {
-                return ControlFlow::Error(RuntimeError::type_error(format!(
-                    "object of type '{}' has no len()",
-                    type_id.name()
-                )));
+        let len_val = if let Some(list) = list_storage_ref_from_ptr(ptr) {
+            list.len() as i64
+        } else {
+            match type_id {
+                TypeId::DEQUE => {
+                    let deque = unsafe { &*(ptr as *const DequeObject) };
+                    deque.len() as i64
+                }
+                TypeId::TUPLE => {
+                    let tuple = unsafe { &*(ptr as *const TupleObject) };
+                    tuple.len() as i64
+                }
+                TypeId::DICT => {
+                    let dict = unsafe { &*(ptr as *const DictObject) };
+                    dict.len() as i64
+                }
+                TypeId::SET => {
+                    let set = unsafe { &*(ptr as *const SetObject) };
+                    set.len() as i64
+                }
+                TypeId::RANGE => {
+                    let range = unsafe { &*(ptr as *const RangeObject) };
+                    let Some(len) = range.try_len() else {
+                        return ControlFlow::Error(RuntimeError::new(
+                            crate::error::RuntimeErrorKind::OverflowError {
+                                message: "range length overflow".into(),
+                            },
+                        ));
+                    };
+                    len as i64
+                }
+                _ => {
+                    return ControlFlow::Error(RuntimeError::type_error(format!(
+                        "object of type '{}' has no len()",
+                        type_id.name()
+                    )));
+                }
             }
         };
 
@@ -1547,7 +1913,9 @@ mod tests {
     use crate::builtins::BuiltinFunctionObject;
     use crate::frame::ClosureEnv;
     use crate::import::ModuleObject;
-    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use prism_compiler::bytecode::{
+        CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode, Register,
+    };
     use prism_core::Value;
     use prism_core::intern::intern;
     use prism_runtime::object::ObjectHeader;
@@ -1559,7 +1927,9 @@ mod tests {
         SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
     };
     use prism_runtime::object::type_obj::TypeId;
+    use prism_runtime::object::views::{CodeObjectView, FrameViewObject};
     use prism_runtime::types::Cell;
+    use prism_runtime::types::dict::DictObject;
     use prism_runtime::types::function::FunctionObject;
     use prism_runtime::types::set::SetObject;
     use prism_runtime::types::string::StringObject;
@@ -1997,6 +2367,39 @@ mod tests {
     }
 
     #[test]
+    fn test_get_attribute_value_exposes_bound_method_metadata() {
+        let mut vm = vm_with_names(&[]);
+        let (func_ptr, func_value) = make_test_function_value("metadata_method");
+        let instance = Value::int(7).unwrap();
+        let method_value = bind_instance_attribute(func_value, instance);
+
+        assert_eq!(
+            get_attribute_value(&mut vm, method_value, &intern("__self__"))
+                .expect("__self__ should resolve"),
+            instance
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, method_value, &intern("__func__"))
+                .expect("__func__ should resolve"),
+            func_value
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, method_value, &intern("__name__"))
+                .expect("__name__ should resolve"),
+            Value::string(intern("metadata_method"))
+        );
+        assert!(
+            get_attribute_value(&mut vm, method_value, &intern("__doc__"))
+                .expect("__doc__ should resolve")
+                .is_none()
+        );
+
+        unsafe {
+            drop(Box::from_raw(func_ptr));
+        }
+    }
+
+    #[test]
     fn test_get_attr_binds_builtin_dict_items_method_for_dict_subclass() {
         let mut vm = vm_with_names(&["items"]);
         let class = register_dict_subclass("DictSubclassAttr");
@@ -2274,6 +2677,222 @@ mod tests {
     }
 
     #[test]
+    fn test_get_attr_exposes_code_object_metadata_used_by_warnings() {
+        let mut code = CodeObject::new("warnsite", "warning_probe.py");
+        code.qualname = Arc::from("WarningProbe.warnsite");
+        code.first_lineno = 27;
+        code.arg_count = 2;
+        code.posonlyarg_count = 1;
+        code.kwonlyarg_count = 1;
+        code.flags = CodeFlags::MODULE;
+        code.locals = vec![Arc::from("alpha"), Arc::from("beta")].into_boxed_slice();
+        code.names = vec![Arc::from("__warningregistry__")].into_boxed_slice();
+        code.freevars = vec![Arc::from("captured")].into_boxed_slice();
+        code.cellvars = vec![Arc::from("cell")].into_boxed_slice();
+        code.constants = vec![Value::none(), Value::int(7).unwrap()].into_boxed_slice();
+
+        let (code_value, code_ptr) = boxed_value(CodeObjectView::new(Arc::new(code)));
+        let mut vm = vm_with_frame();
+
+        assert_eq!(
+            get_attribute_value(&mut vm, code_value, &intern("co_filename"))
+                .expect("co_filename should be readable"),
+            Value::string(intern("warning_probe.py"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, code_value, &intern("co_name"))
+                .expect("co_name should be readable"),
+            Value::string(intern("warnsite"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, code_value, &intern("co_qualname"))
+                .expect("co_qualname should be readable"),
+            Value::string(intern("WarningProbe.warnsite"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, code_value, &intern("co_firstlineno"))
+                .expect("co_firstlineno should be readable")
+                .as_int(),
+            Some(27)
+        );
+
+        let varnames = get_attribute_value(&mut vm, code_value, &intern("co_varnames"))
+            .expect("co_varnames should be readable");
+        let varnames_ptr = varnames
+            .as_object_ptr()
+            .expect("co_varnames should be a tuple");
+        let varnames = unsafe { &*(varnames_ptr as *const TupleObject) };
+        assert_eq!(
+            varnames.as_slice(),
+            &[
+                Value::string(intern("alpha")),
+                Value::string(intern("beta"))
+            ]
+        );
+
+        let consts = get_attribute_value(&mut vm, code_value, &intern("co_consts"))
+            .expect("co_consts should be readable");
+        let consts_ptr = consts.as_object_ptr().expect("co_consts should be a tuple");
+        let consts = unsafe { &*(consts_ptr as *const TupleObject) };
+        assert_eq!(consts.as_slice(), &[Value::none(), Value::int(7).unwrap()]);
+
+        unsafe {
+            drop_boxed(code_ptr);
+        }
+    }
+
+    #[test]
+    fn test_get_attr_exposes_code_positions_iterator_used_by_traceback() {
+        let mut code = CodeObject::new("warnsite", "warning_probe.py");
+        code.instructions = vec![
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+            Instruction::op(Opcode::Nop),
+        ]
+        .into_boxed_slice();
+        code.line_table = vec![
+            LineTableEntry {
+                start_pc: 0,
+                end_pc: 1,
+                line: 27,
+            },
+            LineTableEntry {
+                start_pc: 1,
+                end_pc: 3,
+                line: 31,
+            },
+        ]
+        .into_boxed_slice();
+
+        let (code_value, code_ptr) = boxed_value(CodeObjectView::new(Arc::new(code)));
+        let mut vm = vm_with_frame();
+
+        let method = get_attribute_value(&mut vm, code_value, &intern("co_positions"))
+            .expect("co_positions should be readable");
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("co_positions should bind a builtin");
+        assert_eq!(extract_type_id(method_ptr), TypeId::BUILTIN_FUNCTION);
+
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "code.co_positions");
+
+        let iter_value = builtin
+            .call(&[])
+            .expect("co_positions() should return an iterator");
+        let iter = crate::builtins::get_iterator_mut(&iter_value)
+            .expect("co_positions() result should be iterable");
+
+        let first = unsafe {
+            &*(iter
+                .next()
+                .expect("first position should exist")
+                .as_object_ptr()
+                .expect("position entries should be tuples") as *const TupleObject)
+        };
+        assert_eq!(
+            first.as_slice(),
+            &[
+                Value::int(27).unwrap(),
+                Value::int(27).unwrap(),
+                Value::none(),
+                Value::none(),
+            ]
+        );
+
+        let second = unsafe {
+            &*(iter
+                .next()
+                .expect("second position should exist")
+                .as_object_ptr()
+                .expect("position entries should be tuples") as *const TupleObject)
+        };
+        assert_eq!(
+            second.as_slice(),
+            &[
+                Value::int(31).unwrap(),
+                Value::int(31).unwrap(),
+                Value::none(),
+                Value::none(),
+            ]
+        );
+
+        let third = unsafe {
+            &*(iter
+                .next()
+                .expect("third position should exist")
+                .as_object_ptr()
+                .expect("position entries should be tuples") as *const TupleObject)
+        };
+        assert_eq!(
+            third.as_slice(),
+            &[
+                Value::int(31).unwrap(),
+                Value::int(31).unwrap(),
+                Value::none(),
+                Value::none(),
+            ]
+        );
+        assert!(iter.next().is_none(), "iterator should be exhausted");
+
+        unsafe {
+            drop_boxed(code_ptr);
+        }
+    }
+
+    #[test]
+    fn test_get_attr_exposes_frame_globals_and_locals_snapshots() {
+        let mut globals = DictObject::new();
+        globals.set(
+            Value::string(intern("__name__")),
+            Value::string(intern("warning_probe")),
+        );
+        let (globals_value, globals_ptr) = boxed_value(globals);
+
+        let mut locals = DictObject::new();
+        locals.set(Value::string(intern("flag")), Value::bool(true));
+        let (locals_value, locals_ptr) = boxed_value(locals);
+
+        let (frame_value, frame_ptr) = boxed_value(FrameViewObject::new(
+            None,
+            globals_value,
+            locals_value,
+            19,
+            5,
+        ));
+        let mut vm = vm_with_frame();
+
+        assert_eq!(
+            get_attribute_value(&mut vm, frame_value, &intern("f_globals"))
+                .expect("f_globals should be readable"),
+            globals_value
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, frame_value, &intern("f_locals"))
+                .expect("f_locals should be readable"),
+            locals_value
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, frame_value, &intern("f_lineno"))
+                .expect("f_lineno should be readable")
+                .as_int(),
+            Some(19)
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, frame_value, &intern("f_lasti"))
+                .expect("f_lasti should be readable")
+                .as_int(),
+            Some(5)
+        );
+
+        unsafe {
+            drop_boxed(frame_ptr);
+            drop_boxed(globals_ptr);
+            drop_boxed(locals_ptr);
+        }
+    }
+
+    #[test]
     fn test_get_attr_reads_closure_and_cell_contents() {
         let (func_ptr, func_value) = make_test_function_value("inner");
         let mut vm = vm_with_names(&["__closure__", "cell_contents"]);
@@ -2415,6 +3034,24 @@ mod tests {
             extract_type_id(vm.current_frame().get_reg(14).as_object_ptr().unwrap()),
             TypeId::MEMBER_DESCRIPTOR
         );
+    }
+
+    #[test]
+    fn test_get_attr_exposes___class___for_user_defined_instances() {
+        let class = register_test_class(PyClassObject::new_simple(intern("HeapCarrier")));
+        let (instance_ptr, instance_value) = instance_value(&class);
+        let mut vm = vm_with_names(&[]);
+
+        let class_value = get_attribute_value(&mut vm, instance_value, &intern("__class__"))
+            .expect("__class__ should be readable on heap instances");
+        assert_eq!(
+            class_value.as_object_ptr(),
+            Some(Arc::as_ptr(&class) as *const ()),
+        );
+
+        unsafe {
+            drop_boxed(instance_ptr);
+        }
     }
 
     #[test]

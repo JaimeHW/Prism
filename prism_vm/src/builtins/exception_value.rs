@@ -10,13 +10,15 @@
 //! - **Flyweight pattern**: Common exceptions (StopIteration) use singletons
 //! - **Zero-alloc type_id**: Uses u16 discriminant from ExceptionTypeId
 
+use super::{BuiltinError, BuiltinFunctionObject};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::interned_by_ptr;
+use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::string::StringObject;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // =============================================================================
 // ExceptionValue
@@ -81,6 +83,15 @@ pub struct ExceptionValue {
     /// Reserved for future fields.
     _reserved: u32,
 }
+
+static EXCEPTION_WITH_TRACEBACK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("BaseException.with_traceback"),
+        builtin_exception_with_traceback,
+    )
+});
+
+const TRACEBACK_TYPE_ERROR_MESSAGE: &str = "__traceback__ must be a traceback or None";
 
 // =============================================================================
 // Flags
@@ -271,6 +282,16 @@ impl ExceptionValue {
         self.traceback_id = 0;
     }
 
+    /// Replace the attached traceback using CPython's BaseException validation
+    /// rules.
+    pub fn replace_traceback(&mut self, traceback: Value) -> Result<(), &'static str> {
+        match normalize_traceback_value(traceback)? {
+            Some(traceback) => self.set_traceback(traceback),
+            None => self.clear_traceback(),
+        }
+        Ok(())
+    }
+
     /// Check if this is a subclass of another exception type.
     #[inline]
     pub fn is_subclass_of(&self, base: ExceptionTypeId) -> bool {
@@ -324,6 +345,21 @@ impl ExceptionValue {
         // SAFETY: We've verified this is an exception type
         Some(unsafe { &*(ptr as *const ExceptionValue) })
     }
+
+    /// Try to extract a mutable ExceptionValue from a Value.
+    ///
+    /// # Safety
+    /// The Value must refer to a valid, uniquely mutable exception instance.
+    pub unsafe fn from_value_mut(value: Value) -> Option<&'static mut ExceptionValue> {
+        let ptr = value.as_object_ptr()?;
+        let header = ptr as *const ObjectHeader;
+
+        if unsafe { (*header).type_id } != TypeId::EXCEPTION {
+            return None;
+        }
+
+        Some(unsafe { &mut *(ptr as *mut ExceptionValue) })
+    }
 }
 
 impl std::fmt::Debug for ExceptionValue {
@@ -366,6 +402,58 @@ fn owned_string_value(value: Value) -> Option<String> {
             .as_str()
             .to_string(),
     )
+}
+
+#[inline]
+fn builtin_method_value(function: &'static BuiltinFunctionObject) -> Value {
+    Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+#[inline]
+fn normalize_traceback_value(traceback: Value) -> Result<Option<Value>, &'static str> {
+    if traceback.is_none() {
+        return Ok(None);
+    }
+
+    let ptr = traceback
+        .as_object_ptr()
+        .ok_or(TRACEBACK_TYPE_ERROR_MESSAGE)?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::TRACEBACK {
+        return Err(TRACEBACK_TYPE_ERROR_MESSAGE);
+    }
+
+    Ok(Some(traceback))
+}
+
+fn builtin_exception_with_traceback(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "BaseException.with_traceback() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let Some(exception) = (unsafe { ExceptionValue::from_value_mut(receiver) }) else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'with_traceback' for 'BaseException' objects doesn't apply to a '{}' object",
+            receiver.type_name()
+        )));
+    };
+
+    exception
+        .replace_traceback(args[1])
+        .map_err(|message| BuiltinError::TypeError(message.to_string()))?;
+    Ok(receiver)
+}
+
+#[inline]
+pub(crate) fn exception_method_value(name: &str) -> Option<Value> {
+    match name {
+        "with_traceback" => Some(builtin_method_value(&EXCEPTION_WITH_TRACEBACK_METHOD)),
+        _ => None,
+    }
 }
 
 #[inline]
@@ -440,9 +528,8 @@ fn quote_python_string(input: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            other if other.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\x{:02x}", other as u32);
+            other if other.is_control() || is_surrogate_carrier(other as u32) => {
+                out.push_str(&python_char_escape(other));
             }
             other => out.push(other),
         }
@@ -487,6 +574,7 @@ pub fn create_exception_with_import_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_runtime::object::views::TracebackViewObject;
 
     // ════════════════════════════════════════════════════════════════════════
     // Construction Tests
@@ -613,6 +701,34 @@ mod tests {
         assert_eq!(exc.traceback_id, 0);
     }
 
+    #[test]
+    fn test_exception_replace_traceback_accepts_traceback_objects_and_none() {
+        let traceback = Value::object_ptr(Box::into_raw(Box::new(TracebackViewObject::new(
+            Value::none(),
+            None,
+            12,
+            3,
+        ))) as *const ());
+        let mut exc = ExceptionValue::new(ExceptionTypeId::ValueError, None);
+
+        exc.replace_traceback(traceback)
+            .expect("traceback objects should be accepted");
+        assert_eq!(exc.traceback(), Some(traceback));
+
+        exc.replace_traceback(Value::none())
+            .expect("None should clear traceback");
+        assert!(exc.traceback().is_none());
+    }
+
+    #[test]
+    fn test_exception_replace_traceback_rejects_non_tracebacks() {
+        let mut exc = ExceptionValue::new(ExceptionTypeId::ValueError, None);
+        let err = exc
+            .replace_traceback(Value::int(7).unwrap())
+            .expect_err("non-traceback values should be rejected");
+        assert_eq!(err, TRACEBACK_TYPE_ERROR_MESSAGE);
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // Subclass Tests
     // ════════════════════════════════════════════════════════════════════════
@@ -668,6 +784,28 @@ mod tests {
         let recovered = recovered.unwrap();
         assert_eq!(recovered.type_id(), ExceptionTypeId::IndexError);
         assert_eq!(recovered.message(), Some("out of range"));
+    }
+
+    #[test]
+    fn test_exception_from_value_mut_allows_in_place_traceback_updates() {
+        let traceback = Value::object_ptr(Box::into_raw(Box::new(TracebackViewObject::new(
+            Value::none(),
+            None,
+            21,
+            5,
+        ))) as *const ());
+        let value = ExceptionValue::new(ExceptionTypeId::RuntimeError, None).into_value();
+
+        let exception = unsafe {
+            ExceptionValue::from_value_mut(value).expect("exception value should downcast mutably")
+        };
+        exception
+            .replace_traceback(traceback)
+            .expect("mutable exception should accept traceback");
+
+        let observed =
+            unsafe { ExceptionValue::from_value(value).expect("exception should remain valid") };
+        assert_eq!(observed.traceback(), Some(traceback));
     }
 
     #[test]
@@ -766,6 +904,17 @@ mod tests {
         let args = vec![Value::string(prism_core::intern::intern("boom"))].into_boxed_slice();
         let exc = ExceptionValue::with_args(ExceptionTypeId::ValueError, None, args);
         assert_eq!(exc.repr_text(), "ValueError('boom')");
+    }
+
+    #[test]
+    fn test_exception_method_value_exposes_with_traceback_builtin() {
+        let method = exception_method_value("with_traceback")
+            .expect("with_traceback should resolve to a builtin");
+        let ptr = method
+            .as_object_ptr()
+            .expect("with_traceback should be heap allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "BaseException.with_traceback");
     }
 
     // ════════════════════════════════════════════════════════════════════════

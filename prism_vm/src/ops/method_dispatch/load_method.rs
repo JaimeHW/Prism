@@ -25,9 +25,12 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::ops::objects::{lookup_class_metaclass_attr, super_attribute_value_static};
+use crate::ops::objects::{
+    get_attribute_value, lookup_class_metaclass_attr, super_attribute_value_static,
+};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
@@ -120,6 +123,34 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             return apply_cached_method(vm, dst, obj, cached);
         }
 
+        if type_id.raw() >= TypeId::FIRST_USER_TYPE {
+            return match resolve_user_defined_method(obj, type_id, &name) {
+                Ok(cached) => {
+                    method_cache().insert(type_id, name_ptr, cached);
+                    apply_cached_method(vm, dst, obj, cached)
+                }
+                Err(err)
+                    if matches!(
+                        err.kind,
+                        crate::error::RuntimeErrorKind::AttributeError { .. }
+                    ) =>
+                {
+                    match get_attribute_value(vm, obj, &intern(&name)) {
+                        Ok(value) => apply_bound_method_target(
+                            vm,
+                            dst,
+                            bind_cached_method_target(
+                                obj,
+                                cached_method_from_instance_value(value),
+                            ),
+                        ),
+                        Err(fallback) => ControlFlow::Error(fallback),
+                    }
+                }
+                Err(err) => ControlFlow::Error(err),
+            };
+        }
+
         // Slow path: resolve method through type system
         match resolve_method(vm, obj, type_id, &name) {
             Ok(cached) => {
@@ -127,7 +158,22 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 method_cache().insert(type_id, name_ptr, cached);
                 apply_cached_method(vm, dst, obj, cached)
             }
-            Err(e) => ControlFlow::Error(e),
+            Err(err)
+                if matches!(
+                    err.kind,
+                    crate::error::RuntimeErrorKind::AttributeError { .. }
+                ) =>
+            {
+                match get_attribute_value(vm, obj, &intern(&name)) {
+                    Ok(value) => apply_bound_method_target(
+                        vm,
+                        dst,
+                        bind_cached_method_target(obj, cached_method_from_instance_value(value)),
+                    ),
+                    Err(fallback) => ControlFlow::Error(fallback),
+                }
+            }
+            Err(err) => ControlFlow::Error(err),
         }
     } else {
         // Primitive type - get type from value and look up method
@@ -194,6 +240,18 @@ fn apply_cached_method(
     ControlFlow::Continue
 }
 
+#[inline]
+fn apply_bound_method_target(
+    vm: &mut VirtualMachine,
+    dst: u8,
+    bound: BoundMethodTarget,
+) -> ControlFlow {
+    let frame = vm.current_frame_mut();
+    frame.set_reg(dst, bound.callable);
+    frame.set_reg(dst + 1, bound.implicit_self.unwrap_or_else(Value::none));
+    ControlFlow::Continue
+}
+
 pub(crate) fn resolve_special_method(
     obj: Value,
     name: &str,
@@ -204,7 +262,7 @@ pub(crate) fn resolve_special_method(
     let type_id = extract_type_id(ptr);
 
     let cached = match type_id {
-        TypeId::TYPE => resolve_type_object_method(obj, name)?,
+        TypeId::TYPE => resolve_type_object_special_method(obj, name)?,
         TypeId::OBJECT => resolve_object_instance_method(obj, name)?,
         _ if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
             if let Some(cached) = resolve_user_defined_instance_method(obj, name) {
@@ -217,6 +275,26 @@ pub(crate) fn resolve_special_method(
     };
 
     Ok(bind_cached_method_target(obj, cached))
+}
+
+fn resolve_type_object_special_method(
+    obj: Value,
+    name: &str,
+) -> Result<CachedMethod, RuntimeError> {
+    let ptr = obj
+        .as_object_ptr()
+        .ok_or_else(|| RuntimeError::attribute_error("type", name))?;
+    let interned_name = prism_core::intern::intern(name);
+
+    if let Some(class) = class_object_from_type_ptr(ptr)
+        && let Some(value) = lookup_class_metaclass_attr(class, &interned_name)
+    {
+        return Ok(cached_method_from_value(value));
+    }
+
+    crate::builtins::builtin_bound_type_attribute_value_static(TypeId::TYPE, obj, &interned_name)?
+        .map(cached_method_from_value)
+        .ok_or_else(|| RuntimeError::attribute_error("type", name))
 }
 
 pub(crate) fn bind_cached_method_target(obj: Value, cached: CachedMethod) -> BoundMethodTarget {
@@ -336,8 +414,12 @@ fn resolve_method(
         TypeId::LIST => resolve_list_method(name),
         TypeId::DICT => resolve_dict_method(name),
         TypeId::MAPPING_PROXY => resolve_mapping_proxy_method(name),
+        TypeId::BYTES => resolve_bytes_method(name),
         TypeId::BYTEARRAY => resolve_bytearray_method(name),
         TypeId::PROPERTY => resolve_property_method(name),
+        TypeId::ITERATOR => builtin_methods::resolve_iterator_method(name)
+            .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
+        TypeId::EXCEPTION => resolve_exception_method(obj, name),
         TypeId::TUPLE => resolve_tuple_method(name),
         TypeId::STR => resolve_str_method(name),
         TypeId::SET | TypeId::FROZENSET => resolve_set_method(type_id, name),
@@ -445,12 +527,10 @@ fn resolve_list_method(name: &str) -> Result<CachedMethod, RuntimeError> {
     }
 
     match name {
-        "insert" | "remove" | "pop" | "clear" | "index" | "count" | "sort" | "reverse" | "copy" => {
-            Err(RuntimeError::attribute_error(
-                "list",
-                format!("{} (not yet implemented)", name),
-            ))
-        }
+        "pop" | "clear" | "index" | "count" => Err(RuntimeError::attribute_error(
+            "list",
+            format!("{} (not yet implemented)", name),
+        )),
         _ => Err(RuntimeError::attribute_error("list", name)),
     }
 }
@@ -518,6 +598,15 @@ fn resolve_mapping_proxy_method(name: &str) -> Result<CachedMethod, RuntimeError
         }
         _ => Err(RuntimeError::attribute_error("mappingproxy", name)),
     }
+}
+
+/// Resolve builtin bytearray methods.
+fn resolve_bytes_method(name: &str) -> Result<CachedMethod, RuntimeError> {
+    if let Some(cached) = builtin_methods::resolve_bytes_method(name) {
+        return Ok(cached);
+    }
+
+    Err(RuntimeError::attribute_error("bytes", name))
 }
 
 /// Resolve builtin bytearray methods.
@@ -623,7 +712,7 @@ fn resolve_generator_method(name: &str) -> Result<CachedMethod, RuntimeError> {
     }
 
     match name {
-        "send" | "throw" => Err(RuntimeError::attribute_error(
+        "send" => Err(RuntimeError::attribute_error(
             "generator",
             format!("{} (not yet implemented)", name),
         )),
@@ -638,6 +727,19 @@ fn resolve_property_method(name: &str) -> Result<CachedMethod, RuntimeError> {
     }
 
     Err(RuntimeError::attribute_error("property", name))
+}
+
+fn resolve_exception_method(obj: Value, name: &str) -> Result<CachedMethod, RuntimeError> {
+    if let Some(cached) = builtin_methods::resolve_exception_method(name) {
+        return Ok(cached);
+    }
+
+    let type_name = unsafe {
+        crate::builtins::ExceptionValue::from_value(obj)
+            .map(|exception| exception.type_name())
+            .unwrap_or("BaseException")
+    };
+    Err(RuntimeError::attribute_error(type_name, name))
 }
 
 /// Resolve builtin bool methods.
@@ -705,6 +807,8 @@ mod tests {
     use prism_runtime::object::type_builtins::{
         SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
     };
+    use prism_runtime::object::views::CodeObjectView;
+    use prism_runtime::types::bytes::BytesObject;
     use prism_runtime::types::function::FunctionObject;
     use std::sync::Arc;
 
@@ -804,6 +908,12 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_bytes_method_known() {
+        let result = resolve_bytes_method("decode");
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_resolve_str_method_known() {
         let result = resolve_str_method("upper");
         assert!(result.is_ok());
@@ -836,6 +946,12 @@ mod tests {
     #[test]
     fn test_resolve_generator_close_method_known() {
         let result = resolve_generator_method("close");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_generator_throw_method_known() {
+        let result = resolve_generator_method("throw");
         assert!(result.is_ok());
     }
 
@@ -887,6 +1003,36 @@ mod tests {
     }
 
     #[test]
+    fn test_load_method_resolves_bytes_decode_with_implicit_self() {
+        let mut vm = vm_with_names(&["decode"]);
+        let bytes_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"abc")));
+        let bytes_value = Value::object_ptr(bytes_ptr as *const ());
+        vm.current_frame_mut().set_reg(1, bytes_value);
+
+        let inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+        assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
+
+        let method_value = vm.current_frame().get_reg(2);
+        let method_ptr = method_value
+            .as_object_ptr()
+            .expect("bytes.decode should resolve to a builtin function");
+        let builtin = unsafe { &*(method_ptr as *const crate::builtins::BuiltinFunctionObject) };
+
+        assert_eq!(extract_type_id(method_ptr), TypeId::BUILTIN_FUNCTION);
+        assert_eq!(builtin.name(), "bytes.decode");
+        assert_eq!(vm.current_frame().get_reg(3), bytes_value);
+
+        unsafe {
+            drop(Box::from_raw(bytes_ptr));
+        }
+    }
+
+    #[test]
     fn test_load_method_resolves_none_new_without_implicit_self() {
         let mut vm = vm_with_names(&["__new__"]);
         vm.current_frame_mut().set_reg(1, Value::none());
@@ -908,6 +1054,33 @@ mod tests {
         assert_eq!(extract_type_id(method_ptr), TypeId::BUILTIN_FUNCTION);
         assert_eq!(builtin.name(), "object.__new__");
         assert!(builtin.bound_self().is_none());
+        assert!(vm.current_frame().get_reg(3).is_none());
+    }
+
+    #[test]
+    fn test_load_method_resolves_code_positions_without_implicit_self() {
+        let mut vm = vm_with_names(&["co_positions"]);
+        let code_view = CodeObjectView::new(Arc::new(CodeObject::new("trace_target", "<test>")));
+        let code_value = Value::object_ptr(Box::into_raw(Box::new(code_view)) as *const ());
+        vm.current_frame_mut().set_reg(1, code_value);
+
+        let inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+        assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
+
+        let method_value = vm.current_frame().get_reg(2);
+        let method_ptr = method_value
+            .as_object_ptr()
+            .expect("code.co_positions should resolve to a builtin function");
+        let builtin = unsafe { &*(method_ptr as *const crate::builtins::BuiltinFunctionObject) };
+
+        assert_eq!(extract_type_id(method_ptr), TypeId::BUILTIN_FUNCTION);
+        assert_eq!(builtin.name(), "code.co_positions");
+        assert_eq!(builtin.bound_self(), Some(code_value));
         assert!(vm.current_frame().get_reg(3).is_none());
     }
 

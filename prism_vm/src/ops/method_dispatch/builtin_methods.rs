@@ -6,15 +6,24 @@
 
 use crate::VirtualMachine;
 use crate::builtins::{
-    BuiltinError, BuiltinFunctionObject, builtin_mapping_proxy_contains_key,
-    builtin_mapping_proxy_entries_static, builtin_mapping_proxy_get_item_static,
-    builtin_mapping_proxy_len, builtin_not_implemented_value, get_iterator_mut, value_to_iterator,
+    BuiltinError, BuiltinFunctionObject, EXCEPTION_TYPE_ID, ExceptionTypeObject, ExceptionValue,
+    builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
+    builtin_mapping_proxy_get_item_static, builtin_mapping_proxy_len,
+    builtin_not_implemented_value, get_exception_type, get_iterator_mut, value_to_iterator,
 };
+use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
+use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
-use crate::ops::objects::{dict_storage_mut_from_ptr, dict_storage_ref_from_ptr};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::objects::{
+    dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, list_storage_mut_from_ptr,
+    list_storage_ref_from_ptr, object_getattribute_default,
+};
 use crate::stdlib::collections::deque::DequeObject;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{CloseResult, GeneratorObject, prepare_close};
+use crate::vm::GeneratorResumeOutcome;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
@@ -30,6 +39,7 @@ use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
+use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
 use unicode_xid::UnicodeXID;
 
@@ -39,8 +49,18 @@ static LIST_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.append"), list_append));
 static LIST_EXTEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.extend"), list_extend_with_vm));
+static LIST_INSERT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.insert"), list_insert));
+static LIST_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.remove"), list_remove));
+static LIST_POP_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.pop"), list_pop));
 static LIST_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.copy"), list_copy));
+static LIST_REVERSE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.reverse"), list_reverse));
+static LIST_SORT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm_kw(Arc::from("list.sort"), list_sort_with_vm));
 static DEQUE_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.append"), deque_append));
 static DEQUE_APPENDLEFT_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -71,6 +91,18 @@ static REGEX_MATCH_GROUP_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new
     BuiltinFunctionObject::new_vm(
         Arc::from("Match.group"),
         crate::stdlib::re::builtin_match_group,
+    )
+});
+static REGEX_MATCH_GROUPS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Match.groups"),
+        crate::stdlib::re::builtin_match_groups,
+    )
+});
+static REGEX_MATCH_GROUPDICT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Match.groupdict"),
+        crate::stdlib::re::builtin_match_groupdict,
     )
 });
 static REGEX_MATCH_START_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -141,6 +173,9 @@ static OBJECT_EQ_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__eq__"), object_eq));
 static OBJECT_NE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__ne__"), object_ne));
+static OBJECT_GETATTRIBUTE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("object.__getattribute__"), object_getattribute)
+});
 static OBJECT_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__repr__"), value_repr));
 static OBJECT_STR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -173,6 +208,16 @@ static STR_STR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.__str__"), value_str));
 static STR_FORMAT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.__format__"), value_format));
+static STR_FORMAT_CALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("str.format"),
+        crate::stdlib::_string::builtin_str_format_method,
+    )
+});
+static STR_ENCODE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.encode"), str_encode));
+static BYTES_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.decode"), bytes_decode));
 static STR_UPPER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.upper"), str_upper));
 static STR_LOWER_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -181,6 +226,16 @@ static STR_REPLACE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.replace"), str_replace));
 static STR_SPLIT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.split"), str_split));
+static STR_FIND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.find"), str_find));
+static STR_RFIND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.rfind"), str_rfind));
+static STR_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.index"), str_index));
+static STR_RINDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.rindex"), str_rindex));
+static STR_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.count"), str_count));
 static STR_STRIP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.strip"), str_strip));
 static STR_LSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -191,14 +246,59 @@ static STR_JOIN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("str.join"), str_join_with_vm));
 static STR_ISIDENTIFIER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isidentifier"), str_isidentifier));
+static STR_ISALPHA_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isalpha"), str_isalpha));
+static STR_ISDIGIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isdigit"), str_isdigit));
+static STR_ISALNUM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isalnum"), str_isalnum));
+static STR_ISSPACE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isspace"), str_isspace));
+static STR_ISUPPER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isupper"), str_isupper));
+static STR_ISLOWER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.islower"), str_islower));
+static STR_ISDECIMAL_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isdecimal"), str_isdecimal));
+static STR_ISNUMERIC_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.isnumeric"), str_isnumeric));
+static STR_ISTITLE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.istitle"), str_istitle));
 static STR_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.startswith"), str_startswith));
 static STR_ENDSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.endswith"), str_endswith));
 static SET_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.add"), set_add));
+static SET_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.remove"), set_remove));
+static SET_DISCARD_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.discard"), set_discard));
 static SET_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.pop"), set_pop));
+static SET_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.clear"), set_clear));
+static SET_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("set.update"), set_update_with_vm));
+static SET_DIFFERENCE_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("set.difference_update"),
+        set_difference_update_with_vm,
+    )
+});
+static SET_INTERSECTION_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("set.intersection_update"),
+        set_intersection_update_with_vm,
+    )
+});
+static SET_SYMMETRIC_DIFFERENCE_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_vm(
+            Arc::from("set.symmetric_difference_update"),
+            set_symmetric_difference_update_with_vm,
+        )
+    });
 static SET_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.copy"), set_copy));
 static SET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -210,8 +310,16 @@ static FROZENSET_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("frozenset.copy"), frozenset_copy));
 static BYTEARRAY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.copy"), bytearray_copy));
+static BYTEARRAY_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.decode"), bytearray_decode));
+static ITERATOR_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("iterator.__iter__"), iterator_iter));
+static ITERATOR_NEXT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("iterator.__next__"), iterator_next));
 static GENERATOR_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("generator.close"), generator_close));
+static GENERATOR_THROW_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("generator.throw"), generator_throw));
 static FUNCTION_GET_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("function.__get__"), function_get));
 static PROPERTY_GETTER_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -232,8 +340,21 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
         "extend" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_EXTEND_METHOD,
         ))),
+        "insert" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_INSERT_METHOD,
+        ))),
+        "remove" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_REMOVE_METHOD,
+        ))),
+        "pop" => Some(CachedMethod::simple(builtin_method_value(&LIST_POP_METHOD))),
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_COPY_METHOD,
+        ))),
+        "reverse" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_REVERSE_METHOD,
+        ))),
+        "sort" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_SORT_METHOD,
         ))),
         _ => None,
     }
@@ -279,6 +400,12 @@ pub fn resolve_regex_match_method(name: &str) -> Option<CachedMethod> {
     match name {
         "group" => Some(CachedMethod::simple(builtin_method_value(
             &REGEX_MATCH_GROUP_METHOD,
+        ))),
+        "groups" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_MATCH_GROUPS_METHOD,
+        ))),
+        "groupdict" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_MATCH_GROUPDICT_METHOD,
         ))),
         "start" => Some(CachedMethod::simple(builtin_method_value(
             &REGEX_MATCH_START_METHOD,
@@ -373,6 +500,9 @@ pub fn resolve_object_method(name: &str) -> Option<CachedMethod> {
         "__ne__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_NE_METHOD,
         ))),
+        "__getattribute__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_GETATTRIBUTE_METHOD,
+        ))),
         "__repr__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_REPR_METHOD,
         ))),
@@ -419,6 +549,10 @@ pub fn resolve_bool_method(name: &str) -> Option<CachedMethod> {
     }
 }
 
+pub fn resolve_exception_method(name: &str) -> Option<CachedMethod> {
+    crate::builtins::exception_method_value(name).map(CachedMethod::simple)
+}
+
 pub fn resolve_float_method(name: &str) -> Option<CachedMethod> {
     match name {
         "__repr__" => Some(CachedMethod::simple(builtin_method_value(
@@ -460,6 +594,12 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         "__format__" => Some(CachedMethod::simple(builtin_method_value(
             &STR_FORMAT_METHOD,
         ))),
+        "format" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_FORMAT_CALL_METHOD,
+        ))),
+        "encode" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ENCODE_METHOD,
+        ))),
         "upper" => Some(CachedMethod::simple(builtin_method_value(
             &STR_UPPER_METHOD,
         ))),
@@ -471,6 +611,19 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         ))),
         "split" => Some(CachedMethod::simple(builtin_method_value(
             &STR_SPLIT_METHOD,
+        ))),
+        "find" => Some(CachedMethod::simple(builtin_method_value(&STR_FIND_METHOD))),
+        "rfind" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_RFIND_METHOD,
+        ))),
+        "index" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_INDEX_METHOD,
+        ))),
+        "rindex" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_RINDEX_METHOD,
+        ))),
+        "count" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_COUNT_METHOD,
         ))),
         "strip" => Some(CachedMethod::simple(builtin_method_value(
             &STR_STRIP_METHOD,
@@ -485,6 +638,33 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         "isidentifier" => Some(CachedMethod::simple(builtin_method_value(
             &STR_ISIDENTIFIER_METHOD,
         ))),
+        "isalpha" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISALPHA_METHOD,
+        ))),
+        "isdigit" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISDIGIT_METHOD,
+        ))),
+        "isalnum" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISALNUM_METHOD,
+        ))),
+        "isspace" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISSPACE_METHOD,
+        ))),
+        "isupper" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISUPPER_METHOD,
+        ))),
+        "islower" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISLOWER_METHOD,
+        ))),
+        "isdecimal" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISDECIMAL_METHOD,
+        ))),
+        "isnumeric" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISNUMERIC_METHOD,
+        ))),
+        "istitle" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ISTITLE_METHOD,
+        ))),
         "startswith" => Some(CachedMethod::simple(builtin_method_value(
             &STR_STARTSWITH_METHOD,
         ))),
@@ -495,11 +675,42 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
     }
 }
 
+/// Resolve builtin bytes methods backed by static builtin function objects.
+pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "decode" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_DECODE_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
 /// Resolve builtin set and frozenset methods backed by static builtin function objects.
 pub fn resolve_set_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {
     match (type_id, name) {
         (TypeId::SET, "add") => Some(CachedMethod::simple(builtin_method_value(&SET_ADD_METHOD))),
+        (TypeId::SET, "remove") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_REMOVE_METHOD,
+        ))),
+        (TypeId::SET, "discard") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_DISCARD_METHOD,
+        ))),
         (TypeId::SET, "pop") => Some(CachedMethod::simple(builtin_method_value(&SET_POP_METHOD))),
+        (TypeId::SET, "clear") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_CLEAR_METHOD,
+        ))),
+        (TypeId::SET, "update") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_UPDATE_METHOD,
+        ))),
+        (TypeId::SET, "difference_update") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_DIFFERENCE_UPDATE_METHOD,
+        ))),
+        (TypeId::SET, "intersection_update") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_INTERSECTION_UPDATE_METHOD,
+        ))),
+        (TypeId::SET, "symmetric_difference_update") => Some(CachedMethod::simple(
+            builtin_method_value(&SET_SYMMETRIC_DIFFERENCE_UPDATE_METHOD),
+        )),
         (TypeId::SET, "copy") => Some(CachedMethod::simple(builtin_method_value(&SET_COPY_METHOD))),
         (TypeId::SET, "__contains__") => Some(CachedMethod::simple(builtin_method_value(
             &SET_CONTAINS_METHOD,
@@ -520,6 +731,22 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_COPY_METHOD,
         ))),
+        "decode" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_DECODE_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+/// Resolve builtin iterator methods backed by static builtin function objects.
+pub fn resolve_iterator_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "__iter__" => Some(CachedMethod::simple(builtin_method_value(
+            &ITERATOR_ITER_METHOD,
+        ))),
+        "__next__" => Some(CachedMethod::simple(builtin_method_value(
+            &ITERATOR_NEXT_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -529,6 +756,9 @@ pub fn resolve_generator_method(name: &str) -> Option<CachedMethod> {
     match name {
         "close" => Some(CachedMethod::simple(builtin_method_value(
             &GENERATOR_CLOSE_METHOD,
+        ))),
+        "throw" => Some(CachedMethod::simple(builtin_method_value(
+            &GENERATOR_THROW_METHOD,
         ))),
         _ => None,
     }
@@ -598,10 +828,270 @@ fn extend_list_with_values(receiver: Value, items: Vec<Value>) -> Result<Value, 
 }
 
 #[inline]
+fn list_insert(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "insert", args, 2)?;
+    let index = expect_integer_like_index(args[1])?;
+    let list = expect_list_mut(args[0], "insert")?;
+    list.insert(index, args[2]);
+    Ok(Value::none())
+}
+
+#[inline]
+fn list_remove(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "remove", args, 1)?;
+
+    let remove_index = {
+        let list = expect_list_ref(args[0], "remove")?;
+        list.as_slice()
+            .iter()
+            .copied()
+            .position(|item| crate::ops::comparison::values_equal(item, args[1]))
+    };
+
+    let Some(index) = remove_index else {
+        return Err(BuiltinError::ValueError(
+            "list.remove(x): x not in list".to_string(),
+        ));
+    };
+
+    let list = expect_list_mut(args[0], "remove")?;
+    list.remove(i64::try_from(index).expect("list.remove index should fit in i64"))
+        .expect("validated list.remove index should be in bounds");
+    Ok(Value::none())
+}
+
+#[inline]
+fn list_pop(args: &[Value]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "list.pop() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let list = expect_list_mut(args[0], "pop")?;
+    if list.is_empty() {
+        return Err(BuiltinError::IndexError("pop from empty list".to_string()));
+    }
+
+    if given == 0 {
+        return list
+            .pop()
+            .ok_or_else(|| BuiltinError::IndexError("pop from empty list".to_string()));
+    }
+
+    let index = expect_integer_like_index(args[1])?;
+    list.remove(index)
+        .ok_or_else(|| BuiltinError::IndexError("pop index out of range".to_string()))
+}
+
+#[inline]
 fn list_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "copy", args, 0)?;
     let list = expect_list_ref(args[0], "copy")?;
     Ok(to_object_value(ListObject::from_slice(list.as_slice())))
+}
+
+#[inline]
+fn list_reverse(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "reverse", args, 0)?;
+    let list = expect_list_mut(args[0], "reverse")?;
+    list.reverse();
+    Ok(Value::none())
+}
+
+#[inline]
+fn list_sort_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "sort", args, 0)?;
+    let (key_func, reverse) = parse_list_sort_keywords(vm, keywords)?;
+    let values = {
+        let list = expect_list_ref(args[0], "sort")?;
+        list.as_slice().to_vec()
+    };
+
+    let mut decorated = Vec::with_capacity(values.len());
+    for value in values {
+        let sort_key = match key_func {
+            Some(callable) => invoke_callable_value(vm, callable, &[value])
+                .map_err(runtime_error_to_builtin_error)?,
+            None => value,
+        };
+        decorated.push((sort_key, value));
+    }
+
+    let mut compare_error = None;
+    decorated.sort_by(|(left_key, _), (right_key, _)| {
+        if compare_error.is_some() {
+            return Ordering::Equal;
+        }
+
+        match compare_sort_keys(vm, *left_key, *right_key) {
+            Ok(ordering) => ordering,
+            Err(err) => {
+                compare_error = Some(err);
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(err) = compare_error {
+        return Err(err);
+    }
+
+    if reverse {
+        decorated.reverse();
+    }
+
+    let list = expect_list_mut(args[0], "sort")?;
+    list.clear();
+    list.extend(decorated.into_iter().map(|(_, value)| value));
+    Ok(Value::none())
+}
+
+#[inline]
+fn parse_list_sort_keywords(
+    vm: &mut VirtualMachine,
+    keywords: &[(&str, Value)],
+) -> Result<(Option<Value>, bool), BuiltinError> {
+    let mut key = None;
+    let mut key_seen = false;
+    let mut reverse = false;
+    let mut reverse_seen = false;
+
+    for (name, value) in keywords {
+        match *name {
+            "key" => {
+                if key_seen {
+                    return Err(BuiltinError::TypeError(
+                        "list.sort() got multiple values for keyword argument 'key'".to_string(),
+                    ));
+                }
+                if !value.is_none() {
+                    key = Some(*value);
+                }
+                key_seen = true;
+            }
+            "reverse" => {
+                if reverse_seen {
+                    return Err(BuiltinError::TypeError(
+                        "list.sort() got multiple values for keyword argument 'reverse'"
+                            .to_string(),
+                    ));
+                }
+                reverse = crate::truthiness::try_is_truthy(vm, *value)
+                    .map_err(runtime_error_to_builtin_error)?;
+                reverse_seen = true;
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "list.sort() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    Ok((key, reverse))
+}
+
+#[inline]
+fn compare_sort_keys(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Ordering, BuiltinError> {
+    if let Some(ordering) = primitive_sort_ordering(left, right) {
+        return Ok(ordering);
+    }
+
+    let left_lt = rich_lt(vm, left, right)?;
+    if left_lt == Some(true) {
+        return Ok(Ordering::Less);
+    }
+
+    let right_lt = rich_lt(vm, right, left)?;
+    if right_lt == Some(true) {
+        return Ok(Ordering::Greater);
+    }
+
+    if left_lt.is_none() && right_lt.is_none() {
+        return Err(BuiltinError::TypeError(format!(
+            "'<' not supported between instances of '{}' and '{}'",
+            left.type_name(),
+            right.type_name()
+        )));
+    }
+
+    Ok(Ordering::Equal)
+}
+
+#[inline]
+fn primitive_sort_ordering(left: Value, right: Value) -> Option<Ordering> {
+    if left == right {
+        return Some(Ordering::Equal);
+    }
+
+    let left_numeric = numeric_sort_key(left);
+    let right_numeric = numeric_sort_key(right);
+    if let (Some(left), Some(right)) = (left_numeric, right_numeric) {
+        return left.partial_cmp(&right);
+    }
+
+    match (value_as_string_ref(left), value_as_string_ref(right)) {
+        (Some(left), Some(right)) => Some(left.as_str().cmp(right.as_str())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn numeric_sort_key(value: Value) -> Option<f64> {
+    if let Some(boolean) = value.as_bool() {
+        return Some(if boolean { 1.0 } else { 0.0 });
+    }
+    if let Some(integer) = value.as_int() {
+        return Some(integer as f64);
+    }
+    value.as_float()
+}
+
+#[inline]
+fn rich_lt(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Option<bool>, BuiltinError> {
+    match resolve_special_method(left, "__lt__") {
+        Ok(target) => {
+            let result = invoke_comparison_method(vm, target, right)?;
+            if result == builtin_not_implemented_value() {
+                return Ok(None);
+            }
+            crate::truthiness::try_is_truthy(vm, result)
+                .map(Some)
+                .map_err(runtime_error_to_builtin_error)
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => Ok(None),
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
+    }
+}
+
+#[inline]
+fn invoke_comparison_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    operand: Value,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => {
+            invoke_callable_value(vm, target.callable, &[implicit_self, operand])
+                .map_err(runtime_error_to_builtin_error)
+        }
+        None => invoke_callable_value(vm, target.callable, &[operand])
+            .map_err(runtime_error_to_builtin_error),
+    }
 }
 
 #[inline]
@@ -866,6 +1356,18 @@ fn object_ne(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 }
 
+fn object_getattribute(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__getattribute__", args, 1)?;
+    let Some(name) = value_as_string_ref(args[1]) else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    object_getattribute_default(vm, args[0], &intern(name.as_str()))
+        .map_err(runtime_error_to_builtin_error)
+}
+
 #[inline]
 fn value_repr(args: &[Value]) -> Result<Value, BuiltinError> {
     crate::builtins::builtin_repr(args)
@@ -981,6 +1483,74 @@ fn string_value_text(value: Value) -> Option<String> {
             .as_str()
             .to_string(),
     )
+}
+
+#[inline]
+fn str_encode(args: &[Value]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "encode() takes at most 2 arguments ({given} given)"
+        )));
+    }
+
+    let encoding = args
+        .get(1)
+        .copied()
+        .map(|value| expect_method_string_arg(value, "str", "encode", 1))
+        .transpose()?;
+    let errors = args
+        .get(2)
+        .copied()
+        .map(|value| expect_method_string_arg(value, "str", "encode", 2))
+        .transpose()?;
+
+    with_str_receiver(args[0], "encode", |value| {
+        crate::builtins::encode_text_to_value(
+            value,
+            encoding.as_deref(),
+            errors.as_deref(),
+            TypeId::BYTES,
+        )
+    })
+}
+
+#[inline]
+fn bytes_decode(args: &[Value]) -> Result<Value, BuiltinError> {
+    decode_bytes_method(args, "bytes", expect_bytes_ref)
+}
+
+#[inline]
+fn bytearray_decode(args: &[Value]) -> Result<Value, BuiltinError> {
+    decode_bytes_method(args, "bytearray", expect_bytearray_ref)
+}
+
+#[inline]
+fn decode_bytes_method(
+    args: &[Value],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "decode() takes at most 2 arguments ({given} given)"
+        )));
+    }
+
+    let encoding = args
+        .get(1)
+        .copied()
+        .map(|value| expect_method_string_arg(value, receiver_name, "decode", 1))
+        .transpose()?;
+    let errors = args
+        .get(2)
+        .copied()
+        .map(|value| expect_method_string_arg(value, receiver_name, "decode", 2))
+        .transpose()?;
+
+    let bytes = receiver(args[0], "decode")?;
+    crate::builtins::decode_bytes_to_value(bytes.as_bytes(), encoding.as_deref(), errors.as_deref())
 }
 
 #[inline]
@@ -1113,6 +1683,73 @@ fn str_split(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn str_find(args: &[Value]) -> Result<Value, BuiltinError> {
+    string_find_like(
+        args,
+        "find",
+        SearchDirection::Forward,
+        MissingNeedle::ReturnMinusOne,
+    )
+}
+
+#[inline]
+fn str_rfind(args: &[Value]) -> Result<Value, BuiltinError> {
+    string_find_like(
+        args,
+        "rfind",
+        SearchDirection::Reverse,
+        MissingNeedle::ReturnMinusOne,
+    )
+}
+
+#[inline]
+fn str_index(args: &[Value]) -> Result<Value, BuiltinError> {
+    string_find_like(
+        args,
+        "index",
+        SearchDirection::Forward,
+        MissingNeedle::RaiseValueError,
+    )
+}
+
+#[inline]
+fn str_rindex(args: &[Value]) -> Result<Value, BuiltinError> {
+    string_find_like(
+        args,
+        "rindex",
+        SearchDirection::Reverse,
+        MissingNeedle::RaiseValueError,
+    )
+}
+
+#[inline]
+fn str_count(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "str.count() takes from 1 to 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let needle = expect_str_method_string_arg(args[1], "count", 1)?;
+    with_str_receiver(args[0], "count", |value| {
+        let bounds = normalize_slice_bounds_with_chars(
+            value,
+            args.get(2).copied(),
+            args.get(3).copied(),
+            "count",
+        )?;
+        let slice = &value[bounds.start_byte..bounds.end_byte];
+        let count = if needle.is_empty() {
+            bounds.end_char - bounds.start_char + 1
+        } else {
+            slice.matches(&needle).count()
+        };
+        Ok(Value::int(count as i64).expect("substring count should fit in tagged int"))
+    })
+}
+
+#[inline]
 fn str_strip(args: &[Value]) -> Result<Value, BuiltinError> {
     strip_method(args, "strip", StripDirection::Both)
 }
@@ -1165,6 +1802,54 @@ fn str_isidentifier(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("str", "isidentifier", args, 0)?;
     with_str_receiver(args[0], "isidentifier", |value| {
         Ok(Value::bool(is_python_identifier(value)))
+    })
+}
+
+#[inline]
+fn str_isalpha(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_char_property(args, "isalpha", |ch| ch.is_alphabetic())
+}
+
+#[inline]
+fn str_isdigit(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_char_property(args, "isdigit", |ch| ch.to_digit(10).is_some())
+}
+
+#[inline]
+fn str_isalnum(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_char_property(args, "isalnum", |ch| ch.is_alphanumeric())
+}
+
+#[inline]
+fn str_isspace(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_char_property(args, "isspace", |ch| ch.is_whitespace())
+}
+
+#[inline]
+fn str_isupper(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_cased_property(args, "isupper", StringCaseProperty::Upper)
+}
+
+#[inline]
+fn str_islower(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_cased_property(args, "islower", StringCaseProperty::Lower)
+}
+
+#[inline]
+fn str_isdecimal(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_char_property(args, "isdecimal", |ch| ch.to_digit(10).is_some())
+}
+
+#[inline]
+fn str_isnumeric(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_char_property(args, "isnumeric", |ch| ch.is_numeric())
+}
+
+#[inline]
+fn str_istitle(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", "istitle", args, 0)?;
+    with_str_receiver(args[0], "istitle", |value| {
+        Ok(Value::bool(is_titlecase_string(value)))
     })
 }
 
@@ -1281,24 +1966,106 @@ fn str_affix_type_error(method_name: &'static str, actual_type: &str) -> Builtin
 }
 
 #[inline]
+fn string_find_like(
+    args: &[Value],
+    method_name: &'static str,
+    direction: SearchDirection,
+    missing: MissingNeedle,
+) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "str.{method_name}() takes from 1 to 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let needle = expect_str_method_string_arg(args[1], method_name, 1)?;
+    with_str_receiver(args[0], method_name, |value| {
+        let bounds = normalize_slice_bounds_with_chars(
+            value,
+            args.get(2).copied(),
+            args.get(3).copied(),
+            method_name,
+        )?;
+        let slice = &value[bounds.start_byte..bounds.end_byte];
+        let match_index = match direction {
+            SearchDirection::Forward => slice.find(&needle),
+            SearchDirection::Reverse => slice.rfind(&needle),
+        }
+        .map(|byte_offset| bounds.start_char + slice[..byte_offset].chars().count());
+
+        match match_index {
+            Some(index) => {
+                Ok(Value::int(index as i64).expect("substring index should fit in tagged int"))
+            }
+            None => match missing {
+                MissingNeedle::ReturnMinusOne => Ok(Value::int(-1).unwrap()),
+                MissingNeedle::RaiseValueError => {
+                    Err(BuiltinError::ValueError("substring not found".to_string()))
+                }
+            },
+        }
+    })
+}
+
+#[inline]
+fn str_char_property(
+    args: &[Value],
+    method_name: &'static str,
+    predicate: impl Fn(char) -> bool,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", method_name, args, 0)?;
+    with_str_receiver(args[0], method_name, |value| {
+        Ok(Value::bool(
+            !value.is_empty() && value.chars().all(&predicate),
+        ))
+    })
+}
+
+#[inline]
+fn str_cased_property(
+    args: &[Value],
+    method_name: &'static str,
+    expected_case: StringCaseProperty,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", method_name, args, 0)?;
+    with_str_receiver(args[0], method_name, |value| {
+        Ok(Value::bool(matches_cased_property(value, expected_case)))
+    })
+}
+
+#[inline]
 fn normalize_slice_bounds(
     value: &str,
     start: Option<Value>,
     end: Option<Value>,
     method_name: &'static str,
 ) -> Result<(usize, usize), BuiltinError> {
+    let bounds = normalize_slice_bounds_with_chars(value, start, end, method_name)?;
+    Ok((bounds.start_byte, bounds.end_byte))
+}
+
+#[inline]
+fn normalize_slice_bounds_with_chars(
+    value: &str,
+    start: Option<Value>,
+    end: Option<Value>,
+    method_name: &'static str,
+) -> Result<SliceBounds, BuiltinError> {
     let char_len = value.chars().count();
-    let start = clamp_slice_index(parse_slice_bound(start, 0, method_name)?, char_len);
-    let end = clamp_slice_index(
+    let start_char = clamp_slice_index(parse_slice_bound(start, 0, method_name)?, char_len);
+    let end_char = clamp_slice_index(
         parse_slice_bound(end, char_len as isize, method_name)?,
         char_len,
     );
-    let start = start.min(end);
-    let end = end.max(start);
-    Ok((
-        char_index_to_byte_offset(value, start),
-        char_index_to_byte_offset(value, end),
-    ))
+    let start_char = start_char.min(end_char);
+    let end_char = end_char.max(start_char);
+    Ok(SliceBounds {
+        start_char,
+        end_char,
+        start_byte: char_index_to_byte_offset(value, start_char),
+        end_byte: char_index_to_byte_offset(value, end_char),
+    })
 }
 
 #[inline]
@@ -1329,6 +2096,54 @@ fn clamp_slice_index(index: isize, char_len: usize) -> usize {
 }
 
 #[inline]
+fn matches_cased_property(value: &str, expected_case: StringCaseProperty) -> bool {
+    let mut saw_cased = false;
+
+    for ch in value.chars() {
+        if ch.is_uppercase() {
+            saw_cased = true;
+            if expected_case == StringCaseProperty::Lower {
+                return false;
+            }
+        } else if ch.is_lowercase() {
+            saw_cased = true;
+            if expected_case == StringCaseProperty::Upper {
+                return false;
+            }
+        }
+    }
+
+    saw_cased
+}
+
+#[inline]
+fn is_titlecase_string(value: &str) -> bool {
+    let mut saw_cased = false;
+    let mut expect_titlecase = true;
+
+    for ch in value.chars() {
+        let is_upper = ch.is_uppercase();
+        let is_lower = ch.is_lowercase();
+        if !is_upper && !is_lower {
+            expect_titlecase = true;
+            continue;
+        }
+
+        saw_cased = true;
+        if expect_titlecase {
+            if !is_upper {
+                return false;
+            }
+            expect_titlecase = false;
+        } else if !is_lower {
+            return false;
+        }
+    }
+
+    saw_cased
+}
+
+#[inline]
 fn char_index_to_byte_offset(value: &str, index: usize) -> usize {
     if value.is_ascii() {
         return index.min(value.len());
@@ -1344,9 +2159,45 @@ fn char_index_to_byte_offset(value: &str, index: usize) -> usize {
         .map_or(value.len(), |(offset, _)| offset)
 }
 
+#[derive(Clone, Copy)]
+enum SearchDirection {
+    Forward,
+    Reverse,
+}
+
+#[derive(Clone, Copy)]
+enum MissingNeedle {
+    ReturnMinusOne,
+    RaiseValueError,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringCaseProperty {
+    Upper,
+    Lower,
+}
+
+#[derive(Clone, Copy)]
+struct SliceBounds {
+    start_char: usize,
+    end_char: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 #[inline]
 fn expect_str_method_string_arg(
     value: Value,
+    method_name: &'static str,
+    position: usize,
+) -> Result<String, BuiltinError> {
+    expect_method_string_arg(value, "str", method_name, position)
+}
+
+#[inline]
+fn expect_method_string_arg(
+    value: Value,
+    receiver_name: &'static str,
     method_name: &'static str,
     position: usize,
 ) -> Result<String, BuiltinError> {
@@ -1354,7 +2205,7 @@ fn expect_str_method_string_arg(
         .map(|string: StringObject| string.as_str().to_string())
         .map_err(|_| {
             BuiltinError::TypeError(format!(
-                "str.{method_name}() argument {position} must be str, not {}",
+                "{receiver_name}.{method_name}() argument {position} must be str, not {}",
                 value.type_name()
             ))
         })
@@ -1687,11 +2538,38 @@ fn set_add(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "remove", args, 1)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "remove")?;
+    if set.remove(args[1]) {
+        Ok(Value::none())
+    } else {
+        Err(BuiltinError::KeyError(args[1].to_string()))
+    }
+}
+
+#[inline]
+fn set_discard(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "discard", args, 1)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "discard")?;
+    set.discard(args[1]);
+    Ok(Value::none())
+}
+
+#[inline]
 fn set_pop(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "pop", args, 0)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "pop")?;
     set.pop()
         .ok_or_else(|| BuiltinError::KeyError("pop from an empty set".to_string()))
+}
+
+#[inline]
+fn set_clear(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "clear", args, 0)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "clear")?;
+    set.clear();
+    Ok(Value::none())
 }
 
 #[inline]
@@ -1712,6 +2590,80 @@ fn set_copy(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn set_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    let set = expect_set_mut_receiver(
+        *args
+            .first()
+            .ok_or_else(|| BuiltinError::TypeError("unbound set.update()".to_string()))?,
+        TypeId::SET,
+        "update",
+    )?;
+
+    for iterable in &args[1..] {
+        for value in collect_iterable_values_with_vm(vm, *iterable)? {
+            set.add(value);
+        }
+    }
+
+    Ok(Value::none())
+}
+
+#[inline]
+fn set_difference_update_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let set = expect_set_mut_receiver(
+        *args.first().ok_or_else(|| {
+            BuiltinError::TypeError("unbound set.difference_update()".to_string())
+        })?,
+        TypeId::SET,
+        "difference_update",
+    )?;
+
+    for iterable in &args[1..] {
+        for value in collect_iterable_values_with_vm(vm, *iterable)? {
+            set.discard(value);
+        }
+    }
+
+    Ok(Value::none())
+}
+
+#[inline]
+fn set_intersection_update_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let set = expect_set_mut_receiver(
+        *args.first().ok_or_else(|| {
+            BuiltinError::TypeError("unbound set.intersection_update()".to_string())
+        })?,
+        TypeId::SET,
+        "intersection_update",
+    )?;
+
+    for iterable in &args[1..] {
+        let other = SetObject::from_iter(collect_iterable_values_with_vm(vm, *iterable)?);
+        set.intersection_update(&other);
+    }
+
+    Ok(Value::none())
+}
+
+#[inline]
+fn set_symmetric_difference_update_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "symmetric_difference_update", args, 1)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "symmetric_difference_update")?;
+    let other = SetObject::from_iter(collect_iterable_values_with_vm(vm, args[1])?);
+    set.symmetric_difference_update(&other);
+    Ok(Value::none())
+}
+
+#[inline]
 fn frozenset_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("frozenset", "copy", args, 0)?;
     expect_set_receiver(args[0], TypeId::FROZENSET, "copy")?;
@@ -1723,6 +2675,19 @@ fn bytearray_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("bytearray", "copy", args, 0)?;
     let bytearray = expect_bytearray_ref(args[0], "copy")?;
     Ok(to_object_value(bytearray.clone()))
+}
+
+fn iterator_iter(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("iterator", "__iter__", args, 0)?;
+    Ok(args[0])
+}
+
+fn iterator_next(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("iterator", "__next__", args, 0)?;
+    let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
+    })?;
+    iter.next().ok_or(BuiltinError::StopIteration)
 }
 
 #[inline]
@@ -1757,6 +2722,126 @@ fn expect_method_arg_count(
     Err(BuiltinError::TypeError(format!(
         "{receiver_name}.{method_name}() takes exactly {explicit_count} {noun} ({given} given)"
     )))
+}
+
+#[inline]
+fn expect_method_arg_range(
+    receiver_name: &'static str,
+    method_name: &'static str,
+    args: &[Value],
+    min_count: usize,
+    max_count: usize,
+) -> Result<(), BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given < min_count {
+        let noun = if min_count == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.{method_name}() takes at least {min_count} {noun} ({given} given)"
+        )));
+    }
+    if given > max_count {
+        let noun = if max_count == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.{method_name}() takes at most {max_count} {noun} ({given} given)"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn normalize_generator_throw_arguments(args: &[Value]) -> Result<(Value, u16), BuiltinError> {
+    let typ = args[0];
+    let value = args.get(1).copied();
+    let traceback = args.get(2).copied();
+
+    let exception = if unsafe { ExceptionValue::from_value(typ) }.is_some() {
+        if value.is_some_and(|separate| !separate.is_none()) {
+            return Err(BuiltinError::TypeError(
+                "instance exception may not have a separate value".to_string(),
+            ));
+        }
+        typ
+    } else if let Some(exception_type) = exception_type_from_value(typ) {
+        match value {
+            Some(arg) if !arg.is_none() => {
+                let constructor_args = [arg];
+                exception_type.construct(&constructor_args)
+            }
+            _ => exception_type.construct(&[]),
+        }
+    } else {
+        return Err(BuiltinError::TypeError(format!(
+            "exceptions must be classes or instances deriving from BaseException, not {}",
+            typ.type_name()
+        )));
+    };
+
+    if let Some(traceback) = traceback {
+        let Some(exception_value) = (unsafe { ExceptionValue::from_value_mut(exception) }) else {
+            return Err(BuiltinError::TypeError(
+                "exceptions must derive from BaseException".to_string(),
+            ));
+        };
+        exception_value.replace_traceback(traceback).map_err(|_| {
+            BuiltinError::TypeError("throw() third argument must be a traceback object".to_string())
+        })?;
+    }
+
+    let type_id = unsafe { ExceptionValue::from_value(exception) }
+        .map(|normalized| normalized.exception_type_id)
+        .ok_or_else(|| {
+            BuiltinError::TypeError("exceptions must derive from BaseException".to_string())
+        })?;
+    Ok((exception, type_id))
+}
+
+#[inline]
+fn exception_type_from_value(value: Value) -> Option<&'static ExceptionTypeObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != EXCEPTION_TYPE_ID {
+        return None;
+    }
+    Some(unsafe { &*(ptr as *const ExceptionTypeObject) })
+}
+
+#[inline]
+fn exception_runtime_error_message(value: Value) -> Arc<str> {
+    unsafe { ExceptionValue::from_value(value) }
+        .map(|exception| {
+            let message = exception.display_text();
+            if message.is_empty() {
+                Arc::<str>::from(exception.repr_text())
+            } else {
+                Arc::<str>::from(message)
+            }
+        })
+        .unwrap_or_else(|| Arc::<str>::from("Uncaught exception"))
+}
+
+#[inline]
+fn stop_iteration_runtime_error(value: Value) -> RuntimeError {
+    let stop_iteration_type = get_exception_type("StopIteration")
+        .expect("StopIteration exception type must exist in the builtin registry");
+    let exception = if value.is_none() {
+        stop_iteration_type.construct(&[])
+    } else {
+        let constructor_args = [value];
+        stop_iteration_type.construct(&constructor_args)
+    };
+    RuntimeError::raised_exception(
+        ExceptionTypeId::StopIteration.as_u8() as u16,
+        exception,
+        exception_runtime_error_message(exception),
+    )
 }
 
 #[inline]
@@ -1917,14 +3002,14 @@ fn expect_list_mut(
     };
 
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::LIST {
+    let Some(list) = list_storage_mut_from_ptr(ptr) else {
         return Err(BuiltinError::TypeError(format!(
             "descriptor 'list.{method_name}' requires a 'list' object but received '{}'",
             header.type_id.name()
         )));
-    }
+    };
 
-    Ok(unsafe { &mut *(ptr as *mut ListObject) })
+    Ok(list)
 }
 
 #[inline]
@@ -1940,14 +3025,30 @@ fn expect_list_ref(
     };
 
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::LIST {
+    let Some(list) = list_storage_ref_from_ptr(ptr) else {
         return Err(BuiltinError::TypeError(format!(
             "descriptor 'list.{method_name}' requires a 'list' object but received '{}'",
             header.type_id.name()
         )));
+    };
+
+    Ok(list)
+}
+
+#[inline]
+fn expect_integer_like_index(value: Value) -> Result<i64, BuiltinError> {
+    if let Some(index) = value.as_int() {
+        return Ok(index);
     }
 
-    Ok(unsafe { &*(ptr as *const ListObject) })
+    if let Some(boolean) = value.as_bool() {
+        return Ok(if boolean { 1 } else { 0 });
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        value.type_name()
+    )))
 }
 
 #[inline]
@@ -2121,6 +3222,29 @@ fn expect_bytearray_ref(
 }
 
 #[inline]
+fn expect_bytes_ref(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static BytesObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'bytes.{method_name}' requires a 'bytes' object but received '{}'",
+            value.type_name()
+        )));
+    };
+
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::BYTES {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'bytes.{method_name}' requires a 'bytes' object but received '{}'",
+            header.type_id.name()
+        )));
+    }
+
+    Ok(unsafe { &*(ptr as *const BytesObject) })
+}
+
+#[inline]
 fn to_object_value<T>(object: T) -> Value {
     let ptr = Box::leak(Box::new(object)) as *mut T as *const ();
     Value::object_ptr(ptr)
@@ -2171,6 +3295,20 @@ fn generator_close(args: &[Value]) -> Result<Value, BuiltinError> {
         CloseResult::YieldedInFinally(_) => Err(BuiltinError::ValueError(
             "generator ignored GeneratorExit".to_string(),
         )),
+    }
+}
+
+#[inline]
+fn generator_throw(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("generator", "throw", args, 1, 3)?;
+    let generator = expect_generator_mut(args[0], "throw")?;
+    let (exception, type_id) = normalize_generator_throw_arguments(&args[1..])?;
+    match vm.resume_generator_for_throw(generator, exception, type_id) {
+        Ok(GeneratorResumeOutcome::Yielded(value)) => Ok(value),
+        Ok(GeneratorResumeOutcome::Returned(value)) => {
+            Err(BuiltinError::Raised(stop_iteration_runtime_error(value)))
+        }
+        Err(err) => Err(BuiltinError::Raised(err)),
     }
 }
 
@@ -2284,6 +3422,8 @@ fn function_get(args: &[Value]) -> Result<Value, BuiltinError> {
 mod tests {
     use super::*;
     use crate::builtins::iterator_to_value;
+    use crate::error::RuntimeErrorKind;
+    use crate::stdlib::exceptions::ExceptionTypeId;
     use prism_compiler::bytecode::CodeObject;
     use prism_core::intern::{intern, interned_by_ptr};
     use prism_runtime::object::class::PyClassObject;
@@ -2327,17 +3467,51 @@ mod tests {
         string.as_str().to_string()
     }
 
+    fn byte_values(value: Value) -> Vec<u8> {
+        let ptr = value
+            .as_object_ptr()
+            .expect("byte result should be an object");
+        let bytes = unsafe { &*(ptr as *const BytesObject) };
+        bytes.as_bytes().to_vec()
+    }
+
+    fn assert_unicode_encode_error(err: BuiltinError, expected_message: &str) {
+        match err {
+            BuiltinError::Raised(runtime_err) => match runtime_err.kind {
+                RuntimeErrorKind::Exception { type_id, message } => {
+                    assert_eq!(type_id, ExceptionTypeId::UnicodeEncodeError.as_u8() as u16);
+                    assert_eq!(&*message, expected_message);
+                }
+                kind => panic!("expected UnicodeEncodeError, got {kind:?}"),
+            },
+            other => panic!("expected UnicodeEncodeError, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn test_resolve_list_method_returns_builtin_for_append_extend_and_copy() {
+    fn test_resolve_list_method_returns_builtin_for_append_extend_insert_remove_pop_copy_and_reverse()
+     {
         let append = resolve_list_method("append").expect("append should resolve");
         let extend = resolve_list_method("extend").expect("extend should resolve");
+        let insert = resolve_list_method("insert").expect("insert should resolve");
+        let remove = resolve_list_method("remove").expect("remove should resolve");
+        let pop = resolve_list_method("pop").expect("pop should resolve");
         let copy = resolve_list_method("copy").expect("copy should resolve");
+        let reverse = resolve_list_method("reverse").expect("reverse should resolve");
         assert!(append.method.as_object_ptr().is_some());
         assert!(extend.method.as_object_ptr().is_some());
+        assert!(insert.method.as_object_ptr().is_some());
+        assert!(remove.method.as_object_ptr().is_some());
+        assert!(pop.method.as_object_ptr().is_some());
         assert!(copy.method.as_object_ptr().is_some());
+        assert!(reverse.method.as_object_ptr().is_some());
         assert!(!append.is_descriptor);
         assert!(!extend.is_descriptor);
+        assert!(!insert.is_descriptor);
+        assert!(!remove.is_descriptor);
+        assert!(!pop.is_descriptor);
         assert!(!copy.is_descriptor);
+        assert!(!reverse.is_descriptor);
     }
 
     #[test]
@@ -2350,6 +3524,33 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_methods_accept_heap_list_subclasses_with_native_backing() {
+        let object = Box::into_raw(Box::new(ShapedObject::new_list_backed(
+            TypeId::from_raw(512),
+            Shape::empty(),
+        )));
+        let value = Value::object_ptr(object as *const ());
+
+        list_append(&[value, Value::int(7).unwrap()]).expect("append should work on subclasses");
+        let copied = list_copy(&[value]).expect("copy should work on subclasses");
+        let copied_ptr = copied
+            .as_object_ptr()
+            .expect("list.copy should still return a concrete list")
+            as *mut ListObject;
+
+        let backing = unsafe { &*object }
+            .list_backing()
+            .expect("list backing should exist");
+        assert_eq!(backing.as_slice(), &[Value::int(7).unwrap()]);
+        assert_eq!(list_values(copied_ptr), vec![7]);
+
+        unsafe {
+            drop(Box::from_raw(copied_ptr));
+            drop(Box::from_raw(object));
         }
     }
 
@@ -2372,6 +3573,281 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(copied_ptr));
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_remove_deletes_first_matching_value_and_returns_none() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        let result = list_remove(&[list_value, Value::int(2).unwrap()])
+            .expect("remove should delete the first matching value");
+        assert!(result.is_none());
+        assert_eq!(list_values(list_ptr), vec![1, 2, 3]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_pop_without_index_returns_last_item() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        let popped = list_pop(&[list_value]).expect("pop should remove the tail element");
+        assert_eq!(popped.as_int(), Some(3));
+        assert_eq!(list_values(list_ptr), vec![1, 2]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_pop_with_index_supports_negative_offsets() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(10).unwrap(),
+            Value::int(20).unwrap(),
+            Value::int(30).unwrap(),
+        ]));
+
+        let popped =
+            list_pop(&[list_value, Value::int(-2).unwrap()]).expect("pop should honor negatives");
+        assert_eq!(popped.as_int(), Some(20));
+        assert_eq!(list_values(list_ptr), vec![10, 30]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_pop_empty_and_out_of_range_match_cpython_messages() {
+        let (empty_value, empty_ptr) = boxed_list_value(ListObject::new());
+        let empty_err = list_pop(&[empty_value]).expect_err("empty pop should fail");
+        match empty_err {
+            BuiltinError::IndexError(message) => assert_eq!(message, "pop from empty list"),
+            other => panic!("expected IndexError, got {other:?}"),
+        }
+
+        let indexed_empty_err = list_pop(&[empty_value, Value::int(0).unwrap()])
+            .expect_err("indexed empty pop should fail");
+        match indexed_empty_err {
+            BuiltinError::IndexError(message) => assert_eq!(message, "pop from empty list"),
+            other => panic!("expected IndexError, got {other:?}"),
+        }
+
+        let (list_value, list_ptr) =
+            boxed_list_value(ListObject::from_slice(&[Value::int(1).unwrap()]));
+        let range_err = list_pop(&[list_value, Value::int(4).unwrap()])
+            .expect_err("out-of-range pop should fail");
+        match range_err {
+            BuiltinError::IndexError(message) => assert_eq!(message, "pop index out of range"),
+            other => panic!("expected IndexError, got {other:?}"),
+        }
+        assert_eq!(list_values(list_ptr), vec![1]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+            drop(Box::from_raw(empty_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_insert_inserts_at_requested_position_and_returns_none() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        let result = list_insert(&[list_value, Value::int(1).unwrap(), Value::int(2).unwrap()])
+            .expect("insert should place the value before the requested index");
+        assert!(result.is_none());
+        assert_eq!(list_values(list_ptr), vec![1, 2, 3]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_insert_clamps_indices_to_list_bounds() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        list_insert(&[list_value, Value::int(-10).unwrap(), Value::int(1).unwrap()])
+            .expect("insert should clamp large negative indices to the start");
+        list_insert(&[list_value, Value::int(99).unwrap(), Value::int(4).unwrap()])
+            .expect("insert should clamp large positive indices to the end");
+        assert_eq!(list_values(list_ptr), vec![1, 2, 3, 4]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_insert_rejects_non_integer_indices() {
+        let (list_value, list_ptr) =
+            boxed_list_value(ListObject::from_slice(&[Value::int(1).unwrap()]));
+
+        let err = list_insert(&[
+            list_value,
+            Value::string(intern("bad")),
+            Value::int(2).unwrap(),
+        ])
+        .expect_err("insert should reject non-integer indices");
+        match err {
+            BuiltinError::TypeError(message) => {
+                assert_eq!(message, "'str' object cannot be interpreted as an integer");
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+        assert_eq!(list_values(list_ptr), vec![1]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_remove_uses_runtime_string_equality() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::string(intern("needle")),
+            Value::string(intern("other")),
+        ]));
+        let needle_ptr = Box::into_raw(Box::new(StringObject::new("needle")));
+        let needle = Value::object_ptr(needle_ptr as *const ());
+
+        let result = list_remove(&[list_value, needle])
+            .expect("remove should match strings across runtime representations");
+        assert!(result.is_none());
+
+        let remaining = unsafe { &*list_ptr }
+            .as_slice()
+            .iter()
+            .copied()
+            .map(string_value)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["other".to_string()]);
+
+        unsafe {
+            drop(Box::from_raw(needle_ptr));
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_remove_raises_value_error_when_item_is_missing() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]));
+
+        let err = list_remove(&[list_value, Value::int(9).unwrap()])
+            .expect_err("remove should fail when the value is absent");
+        match err {
+            BuiltinError::ValueError(message) => {
+                assert_eq!(message, "list.remove(x): x not in list");
+            }
+            other => panic!("expected ValueError, got {other:?}"),
+        }
+        assert_eq!(list_values(list_ptr), vec![1, 2]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_reverse_mutates_in_place_and_returns_none() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        let result = list_reverse(&[list_value]).expect("reverse should work");
+        assert!(result.is_none());
+        assert_eq!(list_values(list_ptr), vec![3, 2, 1]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_sort_orders_numeric_values_in_place() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(3).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]));
+        let mut vm = VirtualMachine::default();
+
+        let result = list_sort_with_vm(&mut vm, &[list_value], &[]).expect("sort should succeed");
+        assert!(result.is_none());
+        assert_eq!(list_values(list_ptr), vec![1, 2, 3]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_sort_honors_reverse_keyword() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(3).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]));
+        let mut vm = VirtualMachine::default();
+
+        let result = list_sort_with_vm(&mut vm, &[list_value], &[("reverse", Value::bool(true))])
+            .expect("sort(reverse=True) should succeed");
+        assert!(result.is_none());
+        assert_eq!(list_values(list_ptr), vec![3, 2, 1]);
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_sort_honors_key_keyword_with_builtin_callable() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(2).unwrap(),
+            Value::int(0).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(1).unwrap(),
+        ]));
+        let mut vm = VirtualMachine::default();
+
+        let result = list_sort_with_vm(
+            &mut vm,
+            &[list_value],
+            &[(
+                "key",
+                crate::builtins::builtin_type_object_for_type_id(TypeId::BOOL),
+            )],
+        )
+        .expect("sort(key=bool) should succeed");
+        assert!(result.is_none());
+        assert_eq!(list_values(list_ptr), vec![0, 2, 3, 1]);
+
+        unsafe {
             drop(Box::from_raw(list_ptr));
         }
     }
@@ -2685,6 +4161,19 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_exception_method_returns_builtin_for_with_traceback() {
+        let with_traceback =
+            resolve_exception_method("with_traceback").expect("with_traceback should resolve");
+        let ptr = with_traceback
+            .method
+            .as_object_ptr()
+            .expect("with_traceback should be allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "BaseException.with_traceback");
+        assert!(!with_traceback.is_descriptor);
+    }
+
+    #[test]
     fn test_object_rich_comparisons_follow_identity_default() {
         let same = Value::int(7).unwrap();
         assert_eq!(
@@ -2740,7 +4229,10 @@ mod tests {
     fn test_resolve_str_method_returns_builtin_for_strip_family() {
         for name in ["strip", "lstrip", "rstrip"] {
             let method = resolve_str_method(name).expect("strip-family method should resolve");
-            assert!(method.method.as_object_ptr().is_some(), "{name} should resolve");
+            assert!(
+                method.method.as_object_ptr().is_some(),
+                "{name} should resolve"
+            );
             assert!(!method.is_descriptor, "{name} should not be a descriptor");
         }
     }
@@ -2750,6 +4242,13 @@ mod tests {
         let join = resolve_str_method("join").expect("join should resolve");
         assert!(join.method.as_object_ptr().is_some());
         assert!(!join.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_str_method_returns_builtin_for_format() {
+        let format = resolve_str_method("format").expect("format should resolve");
+        assert!(format.method.as_object_ptr().is_some());
+        assert!(!format.is_descriptor);
     }
 
     #[test]
@@ -2767,6 +4266,31 @@ mod tests {
         assert!(endswith.method.as_object_ptr().is_some());
         assert!(!startswith.is_descriptor);
         assert!(!endswith.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_str_method_returns_builtin_for_find_family_and_predicates() {
+        for name in [
+            "find",
+            "rfind",
+            "index",
+            "rindex",
+            "count",
+            "isalpha",
+            "isdigit",
+            "isalnum",
+            "isspace",
+            "isupper",
+            "islower",
+            "isdecimal",
+            "isnumeric",
+            "istitle",
+        ] {
+            let method =
+                resolve_str_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
     }
 
     #[test]
@@ -2968,11 +4492,8 @@ mod tests {
             .expect("strip should trim surrounding whitespace");
         assert_eq!(string_value(stripped), "alpha");
 
-        let none_chars = str_lstrip(&[
-            Value::string(intern("\n\t alpha")),
-            Value::none(),
-        ])
-        .expect("lstrip should accept None as the default whitespace matcher");
+        let none_chars = str_lstrip(&[Value::string(intern("\n\t alpha")), Value::none()])
+            .expect("lstrip should accept None as the default whitespace matcher");
         assert_eq!(string_value(none_chars), "alpha");
 
         let explicit = str_rstrip(&[
@@ -2990,22 +4511,73 @@ mod tests {
         let unchanged = str_strip(&[receiver]).expect("strip should succeed");
         assert_eq!(unchanged, receiver);
 
-        let empty_chars = str_rstrip(&[
-            receiver,
-            Value::string(intern("")),
-        ])
-        .expect("rstrip with empty char set should be a no-op");
+        let empty_chars = str_rstrip(&[receiver, Value::string(intern(""))])
+            .expect("rstrip with empty char set should be a no-op");
         assert_eq!(empty_chars, receiver);
     }
 
     #[test]
     fn test_str_strip_family_rejects_non_string_char_sets() {
-        let err = str_strip(&[
-            Value::string(intern("value")),
-            Value::int(1).unwrap(),
+        let err = str_strip(&[Value::string(intern("value")), Value::int(1).unwrap()])
+            .expect_err("strip chars must be strings or None");
+        assert!(
+            err.to_string()
+                .contains("str.strip() argument 1 must be str")
+        );
+    }
+
+    #[test]
+    fn test_str_encode_resolves_and_supports_default_and_explicit_codecs() {
+        assert!(resolve_str_method("encode").is_some());
+
+        let default_encoded = str_encode(&[Value::string(intern("h\u{00e9}"))])
+            .expect("encode should default to utf-8");
+        assert_eq!(byte_values(default_encoded), "h\u{00e9}".as_bytes());
+
+        let latin1_encoded = str_encode(&[
+            Value::string(intern("\u{00e9}")),
+            Value::string(intern("latin-1")),
         ])
-        .expect_err("strip chars must be strings or None");
-        assert!(err.to_string().contains("str.strip() argument 1 must be str"));
+        .expect("encode should support latin-1");
+        assert_eq!(byte_values(latin1_encoded), vec![0xe9]);
+
+        let ignored = str_encode(&[
+            Value::string(intern("A\u{00e9}")),
+            Value::string(intern("ascii")),
+            Value::string(intern("ignore")),
+        ])
+        .expect("encode should honor ignore errors");
+        assert_eq!(byte_values(ignored), b"A");
+    }
+
+    #[test]
+    fn test_str_encode_raises_unicode_encode_error_for_strict_failures() {
+        let err = str_encode(&[
+            Value::string(intern("A\u{00e9}")),
+            Value::string(intern("ascii")),
+        ])
+        .expect_err("strict ascii encoding should fail");
+
+        assert_unicode_encode_error(
+            err,
+            "'ascii' codec can't encode character '\\xe9' in position 1: ordinal not in range(128)",
+        );
+    }
+
+    #[test]
+    fn test_str_encode_rejects_too_many_arguments() {
+        let err = str_encode(&[
+            Value::string(intern("abc")),
+            Value::string(intern("utf-8")),
+            Value::string(intern("strict")),
+            Value::string(intern("extra")),
+        ])
+        .expect_err("encode should reject too many arguments");
+
+        assert_eq!(
+            err.to_string(),
+            "TypeError: encode() takes at most 2 arguments (3 given)"
+        );
     }
 
     #[test]
@@ -3140,6 +4712,114 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(bounded, Value::bool(true));
+    }
+
+    #[test]
+    fn test_str_find_family_supports_bounds_and_missing_substrings() {
+        assert_eq!(
+            str_find(&[
+                Value::string(intern("prefix_suffix_suffix")),
+                Value::string(intern("suffix")),
+            ])
+            .unwrap(),
+            Value::int(7).unwrap()
+        );
+        assert_eq!(
+            str_rfind(&[
+                Value::string(intern("prefix_suffix_suffix")),
+                Value::string(intern("suffix")),
+            ])
+            .unwrap(),
+            Value::int(14).unwrap()
+        );
+        assert_eq!(
+            str_find(&[
+                Value::string(intern("prefix_suffix_suffix")),
+                Value::string(intern("suffix")),
+                Value::int(8).unwrap(),
+                Value::int(20).unwrap(),
+            ])
+            .unwrap(),
+            Value::int(14).unwrap()
+        );
+        assert_eq!(
+            str_find(&[
+                Value::string(intern("prefix_suffix")),
+                Value::string(intern("missing")),
+            ])
+            .unwrap(),
+            Value::int(-1).unwrap()
+        );
+        assert_eq!(
+            str_count(&[Value::string(intern("aaaa")), Value::string(intern("aa")),]).unwrap(),
+            Value::int(2).unwrap()
+        );
+        assert_eq!(
+            str_count(&[Value::string(intern("abc")), Value::string(intern("")),]).unwrap(),
+            Value::int(4).unwrap()
+        );
+
+        let index_err = str_index(&[
+            Value::string(intern("prefix_suffix")),
+            Value::string(intern("missing")),
+        ])
+        .expect_err("index should raise when substring is absent");
+        assert!(index_err.to_string().contains("substring not found"));
+
+        let rindex_err = str_rindex(&[
+            Value::string(intern("prefix_suffix")),
+            Value::string(intern("missing")),
+        ])
+        .expect_err("rindex should raise when substring is absent");
+        assert!(rindex_err.to_string().contains("substring not found"));
+    }
+
+    #[test]
+    fn test_str_character_predicates_match_python_truthiness_rules() {
+        assert_eq!(
+            str_isalpha(&[Value::string(intern("Prism"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_isdigit(&[Value::string(intern("0123"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_isdecimal(&[Value::string(intern("0123"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_isnumeric(&[Value::string(intern("0123"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_isalnum(&[Value::string(intern("Prism3"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_isspace(&[Value::string(intern("\u{3000}"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_isupper(&[Value::string(intern("PRISM 3"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_islower(&[Value::string(intern("prism 3"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_istitle(&[Value::string(intern("Prism Runtime"))]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            str_istitle(&[Value::string(intern("prism Runtime"))]).unwrap(),
+            Value::bool(false)
+        );
+        assert_eq!(
+            str_isalpha(&[Value::string(intern(""))]).unwrap(),
+            Value::bool(false)
+        );
     }
 
     #[test]
@@ -3439,26 +5119,38 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_set_method_returns_builtin_for_membership_copy_and_pop() {
-        let set_add = resolve_set_method(TypeId::SET, "add").expect("set.add should resolve");
-        let set_pop = resolve_set_method(TypeId::SET, "pop").expect("set.pop should resolve");
-        let set_copy = resolve_set_method(TypeId::SET, "copy").expect("set.copy should resolve");
-        let set_contains =
-            resolve_set_method(TypeId::SET, "__contains__").expect("set membership should resolve");
+    fn test_resolve_set_method_returns_builtin_for_mutation_and_membership_surface() {
+        for name in [
+            "add",
+            "remove",
+            "discard",
+            "pop",
+            "clear",
+            "update",
+            "difference_update",
+            "intersection_update",
+            "symmetric_difference_update",
+            "copy",
+            "__contains__",
+        ] {
+            let method = resolve_set_method(TypeId::SET, name)
+                .unwrap_or_else(|| panic!("set.{name} should resolve"));
+            assert!(
+                method.method.as_object_ptr().is_some(),
+                "set.{name} should be heap backed"
+            );
+            assert!(
+                !method.is_descriptor,
+                "set.{name} should not be a descriptor"
+            );
+        }
+
         let frozenset_copy =
             resolve_set_method(TypeId::FROZENSET, "copy").expect("frozenset.copy should resolve");
         let frozenset_contains = resolve_set_method(TypeId::FROZENSET, "__contains__")
             .expect("frozenset membership should resolve");
-        assert!(set_add.method.as_object_ptr().is_some());
-        assert!(set_pop.method.as_object_ptr().is_some());
-        assert!(set_copy.method.as_object_ptr().is_some());
-        assert!(set_contains.method.as_object_ptr().is_some());
         assert!(frozenset_copy.method.as_object_ptr().is_some());
         assert!(frozenset_contains.method.as_object_ptr().is_some());
-        assert!(!set_add.is_descriptor);
-        assert!(!set_pop.is_descriptor);
-        assert!(!set_copy.is_descriptor);
-        assert!(!set_contains.is_descriptor);
         assert!(!frozenset_copy.is_descriptor);
         assert!(!frozenset_contains.is_descriptor);
     }
@@ -3472,6 +5164,36 @@ mod tests {
         let result = set_add(&[value, Value::int(11).unwrap()]).expect("add should work");
         assert!(result.is_none());
         assert!(unsafe { &*ptr }.contains(Value::int(11).unwrap()));
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_set_remove_discard_and_clear_follow_python_mutation_rules() {
+        let set = SetObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let ptr = Box::into_raw(Box::new(set));
+        let value = Value::object_ptr(ptr as *const ());
+
+        assert!(
+            set_remove(&[value, Value::int(1).unwrap()])
+                .expect("remove should succeed")
+                .is_none()
+        );
+        assert!(!unsafe { &*ptr }.contains(Value::int(1).unwrap()));
+
+        assert!(
+            set_discard(&[value, Value::int(9).unwrap()])
+                .expect("discard should ignore missing values")
+                .is_none()
+        );
+
+        let error = set_remove(&[value, Value::int(9).unwrap()]).expect_err("remove should fail");
+        assert!(matches!(error, BuiltinError::KeyError(_)));
+
+        assert!(set_clear(&[value]).expect("clear should succeed").is_none());
+        assert!(unsafe { &*ptr }.is_empty());
 
         unsafe {
             drop(Box::from_raw(ptr));
@@ -3502,6 +5224,51 @@ mod tests {
         let error = set_pop(&[value]).expect_err("empty set.pop should fail");
         assert!(matches!(error, BuiltinError::KeyError(_)));
         assert_eq!(error.to_string(), "KeyError: pop from an empty set");
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_set_update_family_consumes_iterables_with_vm_support() {
+        let set = SetObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let ptr = Box::into_raw(Box::new(set));
+        let value = Value::object_ptr(ptr as *const ());
+        let mut vm = VirtualMachine::new();
+
+        let update_items = to_object_value(ListObject::from_slice(&[
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+        set_update_with_vm(&mut vm, &[value, update_items]).expect("update should work");
+        assert!(unsafe { &*ptr }.contains(Value::int(3).unwrap()));
+
+        let difference_items = to_object_value(TupleObject::from_slice(&[
+            Value::int(2).unwrap(),
+            Value::int(7).unwrap(),
+        ]));
+        set_difference_update_with_vm(&mut vm, &[value, difference_items])
+            .expect("difference_update should work");
+        assert!(!unsafe { &*ptr }.contains(Value::int(2).unwrap()));
+
+        let intersection_items = to_object_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(9).unwrap(),
+        ]));
+        set_intersection_update_with_vm(&mut vm, &[value, intersection_items])
+            .expect("intersection_update should work");
+        assert!(unsafe { &*ptr }.contains(Value::int(1).unwrap()));
+        assert!(!unsafe { &*ptr }.contains(Value::int(3).unwrap()));
+
+        let symmetric_items = to_object_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(5).unwrap(),
+        ]));
+        set_symmetric_difference_update_with_vm(&mut vm, &[value, symmetric_items])
+            .expect("symmetric_difference_update should work");
+        assert!(!unsafe { &*ptr }.contains(Value::int(1).unwrap()));
+        assert!(unsafe { &*ptr }.contains(Value::int(5).unwrap()));
 
         unsafe {
             drop(Box::from_raw(ptr));
@@ -3566,10 +5333,34 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_bytes_method_returns_builtin_for_decode() {
+        let decode = resolve_bytes_method("decode").expect("bytes.decode should resolve");
+        assert!(decode.method.as_object_ptr().is_some());
+        assert!(!decode.is_descriptor);
+    }
+
+    #[test]
     fn test_resolve_bytearray_method_returns_builtin_for_copy() {
         let copy = resolve_bytearray_method("copy").expect("bytearray.copy should resolve");
         assert!(copy.method.as_object_ptr().is_some());
         assert!(!copy.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_bytearray_method_returns_builtin_for_decode() {
+        let decode = resolve_bytearray_method("decode").expect("bytearray.decode should resolve");
+        assert!(decode.method.as_object_ptr().is_some());
+        assert!(!decode.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_iterator_method_returns_builtin_for_iter_and_next() {
+        for name in ["__iter__", "__next__"] {
+            let method =
+                resolve_iterator_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
     }
 
     #[test]
@@ -3593,6 +5384,66 @@ mod tests {
             drop(Box::from_raw(copied_ptr));
             drop(Box::from_raw(ptr));
         }
+    }
+
+    #[test]
+    fn test_bytes_decode_supports_utf8_surrogatepass() {
+        let bytes = BytesObject::from_slice(&[0x41, 0xED, 0xB2, 0x80]);
+        let ptr = Box::into_raw(Box::new(bytes));
+        let value = Value::object_ptr(ptr as *const ());
+
+        let decoded = bytes_decode(&[
+            value,
+            Value::string(intern("utf-8")),
+            Value::string(intern("surrogatepass")),
+        ])
+        .expect("bytes.decode should support surrogatepass");
+
+        let expected =
+            prism_core::python_unicode::encode_python_code_point(0xDC80).expect("surrogate");
+        assert_eq!(string_value(decoded), format!("A{expected}"));
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_bytearray_decode_supports_utf8_surrogatepass() {
+        let bytearray = BytesObject::bytearray_from_slice(&[0x41, 0xED, 0xB2, 0x80]);
+        let ptr = Box::into_raw(Box::new(bytearray));
+        let value = Value::object_ptr(ptr as *const ());
+
+        let decoded = bytearray_decode(&[
+            value,
+            Value::string(intern("utf-8")),
+            Value::string(intern("surrogatepass")),
+        ])
+        .expect("bytearray.decode should support surrogatepass");
+
+        let expected =
+            prism_core::python_unicode::encode_python_code_point(0xDC80).expect("surrogate");
+        assert_eq!(string_value(decoded), format!("A{expected}"));
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_iterator_iter_and_next_follow_python_protocol() {
+        let iter_value = iterator_to_value(IteratorObject::from_values(vec![
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ]));
+
+        assert_eq!(iterator_iter(&[iter_value]).unwrap(), iter_value);
+        assert_eq!(iterator_next(&[iter_value]).unwrap().as_int(), Some(1));
+        assert_eq!(iterator_next(&[iter_value]).unwrap().as_int(), Some(2));
+        assert!(matches!(
+            iterator_next(&[iter_value]),
+            Err(BuiltinError::StopIteration)
+        ));
     }
 
     #[test]
@@ -3649,6 +5500,13 @@ mod tests {
         let extend_err = list_extend(&[list_value]).expect_err("extend should require an iterable");
         assert!(extend_err.to_string().contains("list.extend()"));
 
+        let pop_err = list_pop(&[list_value, Value::int(1).unwrap(), Value::int(2).unwrap()])
+            .expect_err("pop should reject multiple indices");
+        assert_eq!(
+            pop_err.to_string(),
+            "TypeError: list.pop() takes at most 1 argument (2 given)"
+        );
+
         unsafe {
             drop(Box::from_raw(list_ptr));
         }
@@ -3659,6 +5517,13 @@ mod tests {
         let close = resolve_generator_method("close").expect("close should resolve");
         assert!(close.method.as_object_ptr().is_some());
         assert!(!close.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_generator_method_returns_builtin_for_throw() {
+        let throw = resolve_generator_method("throw").expect("throw should resolve");
+        assert!(throw.method.as_object_ptr().is_some());
+        assert!(!throw.is_descriptor);
     }
 
     #[test]

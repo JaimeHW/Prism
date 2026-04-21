@@ -33,7 +33,7 @@ use crate::builtins::{builtin_type_object_for_type_id, builtin_type_object_type_
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
-use crate::ops::objects::get_attribute_value;
+use crate::ops::objects::{get_attribute_value, resolve_class_attribute};
 use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
 use prism_core::Value;
 #[cfg(test)]
@@ -60,9 +60,9 @@ use std::sync::Arc;
 /// BuildClass: Create a new class from bases and body code object.
 ///
 /// # Opcode Format (DstSrcSrc)
-/// - dst: Destination register for the new class object
-/// - src1: Class body `CodeObject` constant index (8-bit)
-/// - src2: Number of base classes
+/// - primary instruction dst: Destination register for the new class object
+/// - primary instruction imm16: Class body `CodeObject` constant index
+/// - trailing `ClassMeta` dst: Number of base classes
 ///
 /// # Register Layout
 /// ```text
@@ -87,31 +87,46 @@ use std::sync::Arc;
 /// - MRO computation failure (diamond inheritance conflicts)
 #[inline(always)]
 pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    build_class_impl(vm, inst, None)
+    let metadata = match read_class_metadata(vm, inst) {
+        Ok(metadata) => metadata,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    build_class_impl(vm, inst, metadata, None)
 }
 
 /// Build a new class using an explicitly supplied metaclass value.
 #[inline(always)]
 pub fn build_class_with_metaclass(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let base_count = inst.src2().0 as usize;
+    let metadata = match read_class_metadata(vm, inst) {
+        Ok(metadata) => metadata,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    let base_count = metadata.base_count;
     let metaclass_reg = inst.dst().0 + 1 + base_count as u8;
     let explicit_metaclass = vm.current_frame().get_reg(metaclass_reg);
-    build_class_impl(vm, inst, Some(explicit_metaclass))
+    build_class_impl(vm, inst, metadata, Some(explicit_metaclass))
+}
+
+/// Class metadata extensions should be consumed by the preceding build opcode.
+#[inline(always)]
+pub fn class_meta(_vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
+    ControlFlow::Error(RuntimeError::internal(
+        "CLASS_META executed without a preceding BUILD_CLASS consumer",
+    ))
 }
 
 #[inline(always)]
 fn build_class_impl(
     vm: &mut VirtualMachine,
     inst: Instruction,
+    metadata: ClassMetadata,
     explicit_metaclass: Option<Value>,
 ) -> ControlFlow {
     let dst_reg = inst.dst().0;
-    let code_idx = inst.src1().0 as u16;
-    let base_count = inst.src2().0 as usize;
-    let (kwargc, kwnames_idx) = match read_class_keyword_metadata(vm) {
-        Ok(metadata) => metadata,
-        Err(err) => return ControlFlow::Error(err),
-    };
+    let code_idx = metadata.code_idx;
+    let base_count = metadata.base_count;
+    let kwargc = metadata.kwargc;
+    let kwnames_idx = metadata.kwnames_idx;
 
     // Resolve the class body code object and class name from the constant pool.
     let class_body = {
@@ -213,21 +228,59 @@ fn build_class_impl(
     ControlFlow::Continue
 }
 
+#[derive(Clone, Copy)]
+struct ClassMetadata {
+    code_idx: u16,
+    base_count: usize,
+    kwargc: usize,
+    kwnames_idx: u16,
+}
+
 #[inline]
-fn read_class_keyword_metadata(vm: &mut VirtualMachine) -> Result<(usize, u16), RuntimeError> {
+fn read_class_metadata(
+    vm: &mut VirtualMachine,
+    inst: Instruction,
+) -> Result<ClassMetadata, RuntimeError> {
     let frame = vm.current_frame_mut();
-    let ip = frame.ip as usize;
+    let mut code_idx = inst.src1().0 as u16;
+    let mut base_count = inst.src2().0 as usize;
+    let mut ip = frame.ip as usize;
+
+    if let Some(meta_inst) = frame.code.instructions.get(ip).copied()
+        && meta_inst.opcode() == Opcode::ClassMeta as u8
+    {
+        code_idx = inst.imm16();
+        base_count = meta_inst.dst().0 as usize;
+        ip += 1;
+        frame.ip = ip as u32;
+    }
+
     let Some(ext_inst) = frame.code.instructions.get(ip).copied() else {
-        return Ok((0, 0));
+        return Ok(ClassMetadata {
+            code_idx,
+            base_count,
+            kwargc: 0,
+            kwnames_idx: 0,
+        });
     };
     if ext_inst.opcode() != Opcode::CallKwEx as u8 {
-        return Ok((0, 0));
+        return Ok(ClassMetadata {
+            code_idx,
+            base_count,
+            kwargc: 0,
+            kwnames_idx: 0,
+        });
     }
 
     frame.ip = (ip + 1) as u32;
     let kwargc = ext_inst.dst().0 as usize;
     let kwnames_idx = (ext_inst.src1().0 as u16) | ((ext_inst.src2().0 as u16) << 8);
-    Ok((kwargc, kwnames_idx))
+    Ok(ClassMetadata {
+        code_idx,
+        base_count,
+        kwargc,
+        kwnames_idx,
+    })
 }
 
 fn collect_class_keyword_args(
@@ -304,11 +357,15 @@ fn construct_class_value(
             metaclass,
             global_class_registry(),
         )
-        .map_err(|err| RuntimeError::type_error(format!("cannot create class: {}", err)))?;
+        .map_err(|err| RuntimeError::type_error(err.to_string()))?;
         let class_value = Value::object_ptr(Arc::as_ptr(&result.class) as *const ());
         let class_id = result.class.class_id();
         register_global_class(result.class.clone(), result.bitmap);
         if let Err(err) = invoke_descriptor_set_name_hooks(vm, class_value, namespace) {
+            unregister_global_class(class_id);
+            return Err(err);
+        }
+        if let Err(err) = invoke_init_subclass_hook(vm, class_value, &[]) {
             unregister_global_class(class_id);
             return Err(err);
         }
@@ -374,6 +431,67 @@ pub(crate) fn invoke_descriptor_set_name_hooks(
     }
 
     Ok(())
+}
+
+pub(crate) fn invoke_init_subclass_hook(
+    vm: &mut VirtualMachine,
+    class_value: Value,
+    class_keywords: &[(&str, Value)],
+) -> Result<(), RuntimeError> {
+    let Some(class_ptr) = class_value.as_object_ptr() else {
+        return Ok(());
+    };
+    if extract_type_id(class_ptr) != TypeId::TYPE {
+        return Ok(());
+    }
+
+    let class = unsafe { &*(class_ptr as *const PyClassObject) };
+    let hook_name = intern("__init_subclass__");
+
+    for &class_id in class.mro().iter().skip(1) {
+        if class_id.0 < TypeId::FIRST_USER_TYPE {
+            continue;
+        }
+
+        let Some(parent) = global_class(class_id) else {
+            continue;
+        };
+        let Some(raw_hook) = parent.get_attr(&hook_name) else {
+            continue;
+        };
+        return invoke_init_subclass_callable(vm, class_value, raw_hook, class_keywords);
+    }
+
+    match crate::builtins::builtin_bound_type_attribute_value(
+        vm,
+        TypeId::OBJECT,
+        class_value,
+        &hook_name,
+    )? {
+        Some(callable) => {
+            invoke_callable_value_with_keywords(vm, callable, &[], class_keywords).map(|_| ())
+        }
+        None => Ok(()),
+    }
+}
+
+fn invoke_init_subclass_callable(
+    vm: &mut VirtualMachine,
+    class_value: Value,
+    raw_hook: Value,
+    class_keywords: &[(&str, Value)],
+) -> Result<(), RuntimeError> {
+    let callable = resolve_class_attribute(raw_hook, class_value);
+    let needs_explicit_cls_arg = raw_hook
+        .as_object_ptr()
+        .is_some_and(|ptr| matches!(extract_type_id(ptr), TypeId::FUNCTION | TypeId::CLOSURE));
+
+    if needs_explicit_cls_arg {
+        invoke_callable_value_with_keywords(vm, callable, &[class_value], class_keywords)
+            .map(|_| ())
+    } else {
+        invoke_callable_value_with_keywords(vm, callable, &[], class_keywords).map(|_| ())
+    }
 }
 
 fn prepare_class_namespace(

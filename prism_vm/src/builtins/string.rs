@@ -18,8 +18,15 @@
 //! - `format()` - String formatting (simplified)
 
 use super::BuiltinError;
+use crate::error::RuntimeError;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
+use prism_core::python_unicode::{
+    PYTHON_SURROGATE_END, PYTHON_SURROGATE_START, contains_surrogate_carriers,
+    encode_python_code_point, is_python_surrogate, logical_python_code_point,
+    python_code_point_escape,
+};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::string::StringObject;
@@ -32,10 +39,10 @@ use prism_runtime::types::string::StringObject;
 const MAX_UNICODE_CODE_POINT: u32 = 0x10FFFF;
 
 /// Start of surrogate range (not valid for encoding).
-const SURROGATE_START: u32 = 0xD800;
+const SURROGATE_START: u32 = PYTHON_SURROGATE_START;
 
 /// End of surrogate range (not valid for encoding).
-const SURROGATE_END: u32 = 0xDFFF;
+const SURROGATE_END: u32 = PYTHON_SURROGATE_END;
 
 /// ASCII printable range end.
 const ASCII_MAX: u32 = 0x7F;
@@ -76,10 +83,61 @@ impl ByteSequenceKind {
 
     #[inline]
     fn from_data(self, data: Vec<u8>) -> Value {
-        let obj = BytesObject::from_vec_with_type(data, self.type_id());
-        let ptr = Box::leak(Box::new(obj)) as *mut BytesObject as *const ();
-        Value::object_ptr(ptr)
+        byte_sequence_value(self.type_id(), data)
     }
+}
+
+#[inline]
+pub(crate) fn byte_sequence_value(type_id: TypeId, data: Vec<u8>) -> Value {
+    let obj = BytesObject::from_vec_with_type(data, type_id);
+    let ptr = Box::leak(Box::new(obj)) as *mut BytesObject as *const ();
+    Value::object_ptr(ptr)
+}
+
+#[inline]
+pub(crate) fn encode_text_to_data(
+    input: &str,
+    encoding: Option<&str>,
+    errors: Option<&str>,
+) -> Result<Vec<u8>, BuiltinError> {
+    encode_string(
+        input,
+        encoding.unwrap_or("utf-8"),
+        errors.unwrap_or("strict"),
+    )
+}
+
+#[inline]
+pub(crate) fn encode_text_to_value(
+    input: &str,
+    encoding: Option<&str>,
+    errors: Option<&str>,
+    type_id: TypeId,
+) -> Result<Value, BuiltinError> {
+    let data = encode_text_to_data(input, encoding, errors)?;
+    Ok(byte_sequence_value(type_id, data))
+}
+
+#[inline]
+pub(crate) fn decode_bytes_to_text(
+    input: &[u8],
+    encoding: Option<&str>,
+    errors: Option<&str>,
+) -> Result<String, BuiltinError> {
+    decode_string(
+        input,
+        encoding.unwrap_or("utf-8"),
+        errors.unwrap_or("strict"),
+    )
+}
+
+#[inline]
+pub(crate) fn decode_bytes_to_value(
+    input: &[u8],
+    encoding: Option<&str>,
+    errors: Option<&str>,
+) -> Result<Value, BuiltinError> {
+    Ok(text_value(decode_bytes_to_text(input, encoding, errors)?))
 }
 
 // =============================================================================
@@ -142,7 +200,7 @@ pub fn ord_from_str(s: &str) -> Result<u32, BuiltinError> {
                     s.chars().count()
                 )));
             }
-            Ok(c as u32)
+            Ok(logical_python_code_point(c as u32))
         }
     }
 }
@@ -220,7 +278,7 @@ fn extract_code_point(val: &Value) -> Result<u32, BuiltinError> {
 #[inline]
 pub fn chr_from_code_point(code_point: u32) -> Result<char, BuiltinError> {
     // Check for surrogate range (U+D800 to U+DFFF)
-    if code_point >= SURROGATE_START && code_point <= SURROGATE_END {
+    if is_python_surrogate(code_point) {
         return Err(BuiltinError::ValueError(format!(
             "chr() arg not in range(0x110000): {} (surrogate)",
             code_point
@@ -320,8 +378,7 @@ fn build_byte_sequence(args: &[Value], kind: ByteSequenceKind) -> Result<Value, 
             "strict".to_string()
         };
 
-        let data = encode_string(&source, &encoding, &errors, fn_name)?;
-        return Ok(kind.from_data(data));
+        return encode_text_to_value(&source, Some(&encoding), Some(&errors), kind.type_id());
     }
 
     // Single-argument form.
@@ -420,19 +477,23 @@ fn i64_to_byte(value: i64, kind: ByteSequenceKind) -> Result<u8, BuiltinError> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum EncodingErrorPolicy {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextCodecErrorPolicy {
     Strict,
     Ignore,
     Replace,
+    SurrogateEscape,
+    SurrogatePass,
 }
 
 #[inline]
-fn parse_encoding_error_policy(errors: &str) -> Result<EncodingErrorPolicy, BuiltinError> {
+fn parse_encoding_error_policy(errors: &str) -> Result<TextCodecErrorPolicy, BuiltinError> {
     match errors.to_ascii_lowercase().as_str() {
-        "strict" => Ok(EncodingErrorPolicy::Strict),
-        "ignore" => Ok(EncodingErrorPolicy::Ignore),
-        "replace" => Ok(EncodingErrorPolicy::Replace),
+        "strict" => Ok(TextCodecErrorPolicy::Strict),
+        "ignore" => Ok(TextCodecErrorPolicy::Ignore),
+        "replace" => Ok(TextCodecErrorPolicy::Replace),
+        "surrogateescape" => Ok(TextCodecErrorPolicy::SurrogateEscape),
+        "surrogatepass" => Ok(TextCodecErrorPolicy::SurrogatePass),
         _ => Err(BuiltinError::ValueError(format!(
             "unknown error handler name '{}'",
             errors
@@ -440,19 +501,14 @@ fn parse_encoding_error_policy(errors: &str) -> Result<EncodingErrorPolicy, Buil
     }
 }
 
-fn encode_string(
-    input: &str,
-    encoding: &str,
-    errors: &str,
-    fn_name: &str,
-) -> Result<Vec<u8>, BuiltinError> {
+fn encode_string(input: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, BuiltinError> {
     let normalized = encoding.trim().to_ascii_lowercase().replace('_', "-");
     let policy = parse_encoding_error_policy(errors)?;
 
     match normalized.as_str() {
-        "utf8" | "utf-8" => Ok(input.as_bytes().to_vec()),
-        "ascii" => encode_ascii(input, policy, fn_name),
-        "latin1" | "latin-1" | "iso-8859-1" => encode_latin1(input, policy, fn_name),
+        "utf8" | "utf-8" => encode_utf8(input, policy, "utf-8"),
+        "ascii" => encode_ascii(input, policy, "ascii"),
+        "latin1" | "latin-1" | "iso-8859-1" => encode_latin1(input, policy, "latin-1"),
         _ => Err(BuiltinError::ValueError(format!(
             "unknown encoding: {}",
             encoding
@@ -460,27 +516,107 @@ fn encode_string(
     }
 }
 
+fn decode_string(input: &[u8], encoding: &str, errors: &str) -> Result<String, BuiltinError> {
+    let normalized = encoding.trim().to_ascii_lowercase().replace('_', "-");
+    let policy = parse_encoding_error_policy(errors)?;
+
+    match normalized.as_str() {
+        "utf8" | "utf-8" => decode_utf8(input, policy, "utf-8"),
+        "ascii" => decode_ascii(input, policy, "ascii"),
+        "latin1" | "latin-1" | "iso-8859-1" => decode_latin1(input),
+        _ => Err(BuiltinError::ValueError(format!(
+            "unknown encoding: {}",
+            encoding
+        ))),
+    }
+}
+
+fn encode_utf8(
+    input: &str,
+    policy: TextCodecErrorPolicy,
+    codec_name: &'static str,
+) -> Result<Vec<u8>, BuiltinError> {
+    if !contains_surrogate_carriers(input) {
+        return Ok(input.as_bytes().to_vec());
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    for (position, ch) in input.chars().enumerate() {
+        let code = logical_python_code_point(ch as u32);
+        if is_python_surrogate(code) {
+            match policy {
+                TextCodecErrorPolicy::Strict => {
+                    return Err(unicode_encode_error(
+                        codec_name,
+                        ch,
+                        position,
+                        "surrogates not allowed",
+                    ));
+                }
+                TextCodecErrorPolicy::Ignore => continue,
+                TextCodecErrorPolicy::Replace => {
+                    out.push(b'?');
+                    continue;
+                }
+                TextCodecErrorPolicy::SurrogateEscape => {
+                    if let Some(byte) = surrogateescape_byte(code) {
+                        out.push(byte);
+                        continue;
+                    }
+                    return Err(unicode_encode_error(
+                        codec_name,
+                        ch,
+                        position,
+                        "surrogates not allowed",
+                    ));
+                }
+                TextCodecErrorPolicy::SurrogatePass => {
+                    append_utf8_code_point(code, &mut out);
+                    continue;
+                }
+            }
+        }
+
+        append_utf8_code_point(code, &mut out);
+    }
+    Ok(out)
+}
+
 fn encode_ascii(
     input: &str,
-    policy: EncodingErrorPolicy,
-    fn_name: &str,
+    policy: TextCodecErrorPolicy,
+    codec_name: &'static str,
 ) -> Result<Vec<u8>, BuiltinError> {
     let mut out = Vec::with_capacity(input.len());
-    for ch in input.chars() {
-        let code = ch as u32;
+    for (position, ch) in input.chars().enumerate() {
+        let code = logical_python_code_point(ch as u32);
         if code <= 0x7f {
             out.push(code as u8);
             continue;
         }
         match policy {
-            EncodingErrorPolicy::Strict => {
-                return Err(BuiltinError::ValueError(format!(
-                    "{}() could not encode character U+{:04X} with ascii codec",
-                    fn_name, code
-                )));
+            TextCodecErrorPolicy::Strict | TextCodecErrorPolicy::SurrogatePass => {
+                return Err(unicode_encode_error(
+                    codec_name,
+                    ch,
+                    position,
+                    "ordinal not in range(128)",
+                ));
             }
-            EncodingErrorPolicy::Ignore => {}
-            EncodingErrorPolicy::Replace => out.push(b'?'),
+            TextCodecErrorPolicy::Ignore => {}
+            TextCodecErrorPolicy::Replace => out.push(b'?'),
+            TextCodecErrorPolicy::SurrogateEscape => {
+                if let Some(byte) = surrogateescape_byte(code) {
+                    out.push(byte);
+                } else {
+                    return Err(unicode_encode_error(
+                        codec_name,
+                        ch,
+                        position,
+                        "ordinal not in range(128)",
+                    ));
+                }
+            }
         }
     }
     Ok(out)
@@ -488,28 +624,334 @@ fn encode_ascii(
 
 fn encode_latin1(
     input: &str,
-    policy: EncodingErrorPolicy,
-    fn_name: &str,
+    policy: TextCodecErrorPolicy,
+    codec_name: &'static str,
 ) -> Result<Vec<u8>, BuiltinError> {
     let mut out = Vec::with_capacity(input.len());
-    for ch in input.chars() {
-        let code = ch as u32;
+    for (position, ch) in input.chars().enumerate() {
+        let code = logical_python_code_point(ch as u32);
         if code <= 0xff {
             out.push(code as u8);
             continue;
         }
         match policy {
-            EncodingErrorPolicy::Strict => {
-                return Err(BuiltinError::ValueError(format!(
-                    "{}() could not encode character U+{:04X} with latin-1 codec",
-                    fn_name, code
-                )));
+            TextCodecErrorPolicy::Strict | TextCodecErrorPolicy::SurrogatePass => {
+                return Err(unicode_encode_error(
+                    codec_name,
+                    ch,
+                    position,
+                    "ordinal not in range(256)",
+                ));
             }
-            EncodingErrorPolicy::Ignore => {}
-            EncodingErrorPolicy::Replace => out.push(b'?'),
+            TextCodecErrorPolicy::Ignore => {}
+            TextCodecErrorPolicy::Replace => out.push(b'?'),
+            TextCodecErrorPolicy::SurrogateEscape => {
+                if let Some(byte) = surrogateescape_byte(code) {
+                    out.push(byte);
+                } else {
+                    return Err(unicode_encode_error(
+                        codec_name,
+                        ch,
+                        position,
+                        "ordinal not in range(256)",
+                    ));
+                }
+            }
         }
     }
     Ok(out)
+}
+
+fn decode_ascii(
+    input: &[u8],
+    policy: TextCodecErrorPolicy,
+    codec_name: &'static str,
+) -> Result<String, BuiltinError> {
+    let mut out = String::with_capacity(input.len());
+    for (position, &byte) in input.iter().enumerate() {
+        if byte <= ASCII_MAX as u8 {
+            out.push(byte as char);
+            continue;
+        }
+
+        match policy {
+            TextCodecErrorPolicy::Strict | TextCodecErrorPolicy::SurrogatePass => {
+                return Err(unicode_decode_error(
+                    codec_name,
+                    byte,
+                    position,
+                    "ordinal not in range(128)",
+                ));
+            }
+            TextCodecErrorPolicy::Ignore => {}
+            TextCodecErrorPolicy::Replace => out.push('\u{FFFD}'),
+            TextCodecErrorPolicy::SurrogateEscape => {
+                push_python_code_point(&mut out, 0xDC00 + u32::from(byte));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+fn decode_latin1(input: &[u8]) -> Result<String, BuiltinError> {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input {
+        out.push(byte as char);
+    }
+    Ok(out)
+}
+
+fn decode_utf8(
+    input: &[u8],
+    policy: TextCodecErrorPolicy,
+    codec_name: &'static str,
+) -> Result<String, BuiltinError> {
+    let mut out = String::with_capacity(input.len());
+    let allow_surrogates = matches!(policy, TextCodecErrorPolicy::SurrogatePass);
+    let mut index = 0usize;
+
+    while index < input.len() {
+        match decode_utf8_code_point(&input[index..], allow_surrogates) {
+            Ok((code_point, len)) => {
+                push_python_code_point(&mut out, code_point);
+                index += len;
+            }
+            Err(err) => {
+                let error_index = index + err.byte_offset;
+                let offending = input[error_index];
+                match policy {
+                    TextCodecErrorPolicy::Strict | TextCodecErrorPolicy::SurrogatePass => {
+                        return Err(unicode_decode_error(
+                            codec_name,
+                            offending,
+                            error_index,
+                            err.reason,
+                        ));
+                    }
+                    TextCodecErrorPolicy::Ignore => {
+                        index += 1;
+                    }
+                    TextCodecErrorPolicy::Replace => {
+                        out.push('\u{FFFD}');
+                        index += 1;
+                    }
+                    TextCodecErrorPolicy::SurrogateEscape => {
+                        push_python_code_point(&mut out, 0xDC00 + u32::from(input[index]));
+                        index += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Utf8DecodeSequenceError {
+    byte_offset: usize,
+    reason: &'static str,
+}
+
+fn decode_utf8_code_point(
+    input: &[u8],
+    allow_surrogates: bool,
+) -> Result<(u32, usize), Utf8DecodeSequenceError> {
+    let first = input[0];
+    match first {
+        0x00..=0x7F => Ok((u32::from(first), 1)),
+        0xC2..=0xDF => {
+            let second = required_continuation(input, 1)?;
+            Ok(((u32::from(first & 0x1F) << 6) | u32::from(second & 0x3F), 2))
+        }
+        0xE0 => {
+            let second = required_byte_in_range(input, 1, 0xA0..=0xBF)?;
+            let third = required_continuation(input, 2)?;
+            Ok((
+                (u32::from(first & 0x0F) << 12)
+                    | (u32::from(second & 0x3F) << 6)
+                    | u32::from(third & 0x3F),
+                3,
+            ))
+        }
+        0xE1..=0xEC | 0xEE..=0xEF => {
+            let second = required_continuation(input, 1)?;
+            let third = required_continuation(input, 2)?;
+            Ok((
+                (u32::from(first & 0x0F) << 12)
+                    | (u32::from(second & 0x3F) << 6)
+                    | u32::from(third & 0x3F),
+                3,
+            ))
+        }
+        0xED => {
+            let second = if allow_surrogates {
+                required_continuation(input, 1)?
+            } else {
+                required_byte_in_range(input, 1, 0x80..=0x9F)?
+            };
+            let third = required_continuation(input, 2)?;
+            Ok((
+                (u32::from(first & 0x0F) << 12)
+                    | (u32::from(second & 0x3F) << 6)
+                    | u32::from(third & 0x3F),
+                3,
+            ))
+        }
+        0xF0 => {
+            let second = required_byte_in_range(input, 1, 0x90..=0xBF)?;
+            let third = required_continuation(input, 2)?;
+            let fourth = required_continuation(input, 3)?;
+            Ok((
+                (u32::from(first & 0x07) << 18)
+                    | (u32::from(second & 0x3F) << 12)
+                    | (u32::from(third & 0x3F) << 6)
+                    | u32::from(fourth & 0x3F),
+                4,
+            ))
+        }
+        0xF1..=0xF3 => {
+            let second = required_continuation(input, 1)?;
+            let third = required_continuation(input, 2)?;
+            let fourth = required_continuation(input, 3)?;
+            Ok((
+                (u32::from(first & 0x07) << 18)
+                    | (u32::from(second & 0x3F) << 12)
+                    | (u32::from(third & 0x3F) << 6)
+                    | u32::from(fourth & 0x3F),
+                4,
+            ))
+        }
+        0xF4 => {
+            let second = required_byte_in_range(input, 1, 0x80..=0x8F)?;
+            let third = required_continuation(input, 2)?;
+            let fourth = required_continuation(input, 3)?;
+            Ok((
+                (u32::from(first & 0x07) << 18)
+                    | (u32::from(second & 0x3F) << 12)
+                    | (u32::from(third & 0x3F) << 6)
+                    | u32::from(fourth & 0x3F),
+                4,
+            ))
+        }
+        _ => Err(Utf8DecodeSequenceError {
+            byte_offset: 0,
+            reason: "invalid start byte",
+        }),
+    }
+}
+
+#[inline]
+fn required_continuation(input: &[u8], offset: usize) -> Result<u8, Utf8DecodeSequenceError> {
+    required_byte_in_range(input, offset, 0x80..=0xBF)
+}
+
+#[inline]
+fn required_byte_in_range(
+    input: &[u8],
+    offset: usize,
+    range: std::ops::RangeInclusive<u8>,
+) -> Result<u8, Utf8DecodeSequenceError> {
+    let Some(&byte) = input.get(offset) else {
+        return Err(Utf8DecodeSequenceError {
+            byte_offset: input.len().saturating_sub(1),
+            reason: "unexpected end of data",
+        });
+    };
+
+    if range.contains(&byte) {
+        Ok(byte)
+    } else {
+        Err(Utf8DecodeSequenceError {
+            byte_offset: offset,
+            reason: "invalid continuation byte",
+        })
+    }
+}
+
+#[inline]
+fn append_utf8_code_point(code_point: u32, out: &mut Vec<u8>) {
+    match code_point {
+        0x0000..=0x007F => out.push(code_point as u8),
+        0x0080..=0x07FF => {
+            out.push(0xC0 | ((code_point >> 6) as u8));
+            out.push(0x80 | ((code_point & 0x3F) as u8));
+        }
+        0x0800..=0xFFFF => {
+            out.push(0xE0 | ((code_point >> 12) as u8));
+            out.push(0x80 | (((code_point >> 6) & 0x3F) as u8));
+            out.push(0x80 | ((code_point & 0x3F) as u8));
+        }
+        _ => {
+            out.push(0xF0 | ((code_point >> 18) as u8));
+            out.push(0x80 | (((code_point >> 12) & 0x3F) as u8));
+            out.push(0x80 | (((code_point >> 6) & 0x3F) as u8));
+            out.push(0x80 | ((code_point & 0x3F) as u8));
+        }
+    }
+}
+
+#[inline]
+fn push_python_code_point(out: &mut String, code_point: u32) {
+    let ch = encode_python_code_point(code_point).expect("valid Python code point should encode");
+    out.push(ch);
+}
+
+#[inline]
+fn surrogateescape_byte(code_point: u32) -> Option<u8> {
+    if (0xDC80..=0xDCFF).contains(&code_point) {
+        Some((code_point - 0xDC00) as u8)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn text_value(text: String) -> Value {
+    if text.is_ascii() {
+        return Value::string(intern(&text));
+    }
+
+    let ptr =
+        Box::leak(Box::new(StringObject::from_string(text))) as *mut StringObject as *const ();
+    Value::object_ptr(ptr)
+}
+
+#[inline]
+fn unicode_encode_error(
+    codec_name: &'static str,
+    ch: char,
+    position: usize,
+    reason: &'static str,
+) -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::UnicodeEncodeError.as_u8() as u16,
+        format!(
+            "'{codec_name}' codec can't encode character '{}' in position {position}: {reason}",
+            python_unicode_escape(ch)
+        ),
+    ))
+}
+
+#[inline]
+fn unicode_decode_error(
+    codec_name: &'static str,
+    byte: u8,
+    position: usize,
+    reason: &'static str,
+) -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::UnicodeDecodeError.as_u8() as u16,
+        format!(
+            "'{codec_name}' codec can't decode byte 0x{byte:02x} in position {position}: {reason}",
+        ),
+    ))
+}
+
+#[inline]
+fn python_unicode_escape(ch: char) -> String {
+    python_code_point_escape(ch as u32)
 }
 
 // =============================================================================
@@ -563,6 +1005,10 @@ fn format_value(value: Value, format_spec: &str) -> Result<Value, BuiltinError> 
         return super::types::builtin_str(&[value]);
     }
 
+    if let Some(boolean) = value.as_bool() {
+        return format_int(if boolean { 1 } else { 0 }, format_spec);
+    }
+
     // Integer formatting
     if let Some(i) = value.as_int() {
         return format_int(i, format_spec);
@@ -579,46 +1025,159 @@ fn format_value(value: Value, format_spec: &str) -> Result<Value, BuiltinError> 
     )))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NumericFormatSpec {
+    alternate_form: bool,
+    zero_pad: bool,
+    width: Option<usize>,
+    grouping: Option<char>,
+    precision: Option<usize>,
+    ty: Option<char>,
+}
+
+impl NumericFormatSpec {
+    #[inline]
+    fn parse(format_spec: &str) -> Result<Self, BuiltinError> {
+        let mut chars = format_spec.chars().peekable();
+
+        if matches!(chars.clone().nth(1), Some('<' | '>' | '^' | '=')) {
+            chars.next();
+            chars.next();
+        } else if matches!(chars.peek(), Some('<' | '>' | '^' | '=')) {
+            chars.next();
+        }
+
+        if matches!(chars.peek(), Some('+' | '-' | ' ')) {
+            chars.next();
+        }
+
+        let alternate_form = matches!(chars.peek(), Some('#'));
+        if alternate_form {
+            chars.next();
+        }
+
+        let zero_pad = matches!(chars.peek(), Some('0'));
+        if zero_pad {
+            chars.next();
+        }
+
+        let mut width_digits = String::new();
+        while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+            width_digits.push(chars.next().expect("peeked digit must exist"));
+        }
+        let width = (!width_digits.is_empty())
+            .then(|| width_digits.parse::<usize>())
+            .transpose()
+            .map_err(|_| {
+                BuiltinError::ValueError(format!("invalid format specifier '{format_spec}'"))
+            })?;
+
+        let grouping = if matches!(chars.peek(), Some(',' | '_')) {
+            chars.next()
+        } else {
+            None
+        };
+
+        let precision = if matches!(chars.peek(), Some('.')) {
+            chars.next();
+            let mut digits = String::new();
+            while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+                digits.push(chars.next().expect("peeked digit must exist"));
+            }
+            Some(digits.parse::<usize>().map_err(|_| {
+                BuiltinError::ValueError(format!("invalid format specifier '{format_spec}'"))
+            })?)
+        } else {
+            None
+        };
+
+        let ty = chars.next();
+        if chars.next().is_some() {
+            return Err(BuiltinError::ValueError(format!(
+                "invalid format specifier '{format_spec}'"
+            )));
+        }
+
+        Ok(Self {
+            alternate_form,
+            zero_pad,
+            width,
+            grouping,
+            precision,
+            ty,
+        })
+    }
+}
+
 /// Format an integer according to format_spec.
 #[inline]
 fn format_int(n: i64, format_spec: &str) -> Result<Value, BuiltinError> {
-    let formatted = match format_spec {
-        "b" => format!("{:b}", n),   // Binary
-        "#b" => format!("{:#b}", n), // Binary with prefix
-        "o" => format!("{:o}", n),   // Octal
-        "#o" => format!("{:#o}", n), // Octal with prefix
-        "x" => format!("{:x}", n),   // Hex lowercase
-        "#x" => format!("{:#x}", n), // Hex lowercase with prefix
-        "X" => format!("{:X}", n),   // Hex uppercase
-        "#X" => format!("{:#X}", n), // Hex uppercase with prefix
-        "d" => format!("{}", n),     // Decimal
-        "c" => {
-            // Character (for integer code point)
+    let spec = NumericFormatSpec::parse(format_spec)?;
+    let negative = n < 0;
+    let magnitude = if negative {
+        n.checked_abs().ok_or_else(|| {
+            BuiltinError::OverflowError("integer absolute value overflow".to_string())
+        })? as u64
+    } else {
+        n as u64
+    };
+
+    let (mut prefix, mut digits) = match spec.ty.unwrap_or('d') {
+        'b' => (
+            if spec.alternate_form { "0b" } else { "" },
+            format!("{:b}", magnitude),
+        ),
+        'o' => (
+            if spec.alternate_form { "0o" } else { "" },
+            format!("{:o}", magnitude),
+        ),
+        'x' => (
+            if spec.alternate_form { "0x" } else { "" },
+            format!("{:x}", magnitude),
+        ),
+        'X' => (
+            if spec.alternate_form { "0X" } else { "" },
+            format!("{:X}", magnitude),
+        ),
+        'c' => {
             if n < 0 || n > MAX_UNICODE_CODE_POINT as i64 {
                 return Err(BuiltinError::OverflowError(
                     "%c arg not in range(0x110000)".to_string(),
                 ));
             }
-            match char::from_u32(n as u32) {
-                Some(c) => c.to_string(),
-                None => {
-                    return Err(BuiltinError::OverflowError(
-                        "%c arg not in range(0x110000)".to_string(),
-                    ));
-                }
-            }
+            let ch = char::from_u32(n as u32).ok_or_else(|| {
+                BuiltinError::OverflowError("%c arg not in range(0x110000)".to_string())
+            })?;
+            ("", ch.to_string())
         }
-        "," => format_with_thousands_separator(n),
-        "_" => format_with_underscore_separator(n),
-        _ if format_spec.contains('.') => {
-            // Precision specification (for integers, pads with zeros)
-            if let Some(precision) = parse_precision(format_spec) {
-                format!("{:0width$}", n, width = precision)
-            } else {
-                format!("{}", n)
-            }
+        'd' | 'n' => ("", format_decimal_digits(magnitude, spec.grouping)),
+        other => {
+            return Err(BuiltinError::ValueError(format!(
+                "unknown format code '{other}' for object of type 'int'"
+            )));
         }
-        _ => format!("{}", n),
+    };
+
+    if let Some(precision) = spec.precision {
+        digits = format!(
+            "{}{digits}",
+            "0".repeat(precision.saturating_sub(digits.len()))
+        );
+    }
+
+    let sign = if negative { "-" } else { "" };
+    let core_len = sign.len() + prefix.len() + digits.len();
+    let width = spec.width.unwrap_or(0);
+    let padding_len = width.saturating_sub(core_len);
+    let formatted = if spec.zero_pad && spec.precision.is_none() && spec.ty != Some('c') {
+        format!("{sign}{prefix}{}{digits}", "0".repeat(padding_len))
+    } else {
+        let mut rendered = String::with_capacity(width.max(core_len));
+        rendered.push_str(&" ".repeat(padding_len));
+        rendered.push_str(sign);
+        rendered.push_str(prefix);
+        rendered.push_str(&digits);
+        rendered
     };
 
     Ok(Value::string(intern(&formatted)))
@@ -703,6 +1262,28 @@ fn format_with_underscore_separator(n: i64) -> String {
     result
 }
 
+#[inline]
+fn format_decimal_digits(n: u64, grouping: Option<char>) -> String {
+    match grouping {
+        Some(',') => format_unsigned_with_separator(n, ','),
+        Some('_') => format_unsigned_with_separator(n, '_'),
+        _ => n.to_string(),
+    }
+}
+
+#[inline]
+fn format_unsigned_with_separator(n: u64, separator: char) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (index, ch) in s.chars().enumerate() {
+        if index > 0 && (s.len() - index) % 3 == 0 {
+            result.push(separator);
+        }
+        result.push(ch);
+    }
+    result
+}
+
 // =============================================================================
 // ASCII Fast Path Utilities
 // =============================================================================
@@ -716,14 +1297,13 @@ pub const fn is_ascii(code_point: u32) -> bool {
 /// Check if a code point is a valid Unicode scalar value.
 #[inline(always)]
 pub const fn is_valid_code_point(code_point: u32) -> bool {
-    code_point <= MAX_UNICODE_CODE_POINT
-        && !(code_point >= SURROGATE_START && code_point <= SURROGATE_END)
+    code_point <= MAX_UNICODE_CODE_POINT && !is_python_surrogate(code_point)
 }
 
 /// Check if a code point is in the surrogate range.
 #[inline(always)]
 pub const fn is_surrogate(code_point: u32) -> bool {
-    code_point >= SURROGATE_START && code_point <= SURROGATE_END
+    is_python_surrogate(code_point)
 }
 
 #[inline]
@@ -768,7 +1348,10 @@ fn type_name_of(value: Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RuntimeErrorKind;
+    use crate::stdlib::exceptions::ExceptionTypeId;
     use prism_core::intern::{intern, interned_by_ptr};
+    use prism_core::python_unicode::encode_python_code_point;
     use prism_runtime::types::bytes::BytesObject;
     use prism_runtime::types::string::StringObject;
 
@@ -818,6 +1401,32 @@ mod tests {
             .as_object_ptr()
             .expect("byte sequence should be object-backed");
         crate::ops::objects::extract_type_id(ptr)
+    }
+
+    fn assert_unicode_encode_error(err: BuiltinError, expected_message: &str) {
+        match err {
+            BuiltinError::Raised(runtime_err) => match runtime_err.kind {
+                RuntimeErrorKind::Exception { type_id, message } => {
+                    assert_eq!(type_id, ExceptionTypeId::UnicodeEncodeError.as_u8() as u16);
+                    assert_eq!(&*message, expected_message);
+                }
+                kind => panic!("expected UnicodeEncodeError, got {kind:?}"),
+            },
+            other => panic!("expected UnicodeEncodeError, got {other:?}"),
+        }
+    }
+
+    fn assert_unicode_decode_error(err: BuiltinError, expected_message: &str) {
+        match err {
+            BuiltinError::Raised(runtime_err) => match runtime_err.kind {
+                RuntimeErrorKind::Exception { type_id, message } => {
+                    assert_eq!(type_id, ExceptionTypeId::UnicodeDecodeError.as_u8() as u16);
+                    assert_eq!(&*message, expected_message);
+                }
+                kind => panic!("expected UnicodeDecodeError, got {kind:?}"),
+            },
+            other => panic!("expected UnicodeDecodeError, got {other:?}"),
+        }
     }
 
     // =========================================================================
@@ -901,6 +1510,14 @@ mod tests {
         assert_eq!(ord_from_str("中").unwrap(), 20013); // Chinese
         assert_eq!(ord_from_str("日").unwrap(), 26085); // Japanese
         assert_eq!(ord_from_str("한").unwrap(), 54620); // Korean
+    }
+
+    #[test]
+    fn test_ord_from_str_maps_internal_surrogate_carriers_back_to_python_code_points() {
+        let surrogate =
+            encode_python_code_point(0xDC80).expect("surrogate should map into carrier range");
+        let text = surrogate.to_string();
+        assert_eq!(ord_from_str(&text).unwrap(), 0xDC80);
     }
 
     #[test]
@@ -1155,7 +1772,10 @@ mod tests {
             Value::string(intern("ascii")),
         ])
         .unwrap_err();
-        assert!(matches!(strict_err, BuiltinError::ValueError(_)));
+        assert_unicode_encode_error(
+            strict_err,
+            "'ascii' codec can't encode character '\\xe9' in position 1: ordinal not in range(128)",
+        );
 
         let ignore = builtin_bytes(&[
             Value::string(intern("A\u{00e9}")),
@@ -1175,14 +1795,87 @@ mod tests {
     }
 
     #[test]
+    fn test_bytes_utf8_strict_rejects_internal_surrogate_carriers() {
+        let surrogate =
+            encode_python_code_point(0xDC80).expect("surrogate should map into carrier range");
+        let text = format!("A{surrogate}");
+        let (heap_string, heap_ptr) = boxed_value(StringObject::from_string(text));
+
+        let err = builtin_bytes(&[heap_string, Value::string(intern("utf-8"))]).unwrap_err();
+        assert_unicode_encode_error(
+            err,
+            "'utf-8' codec can't encode character '\\udc80' in position 1: surrogates not allowed",
+        );
+
+        unsafe { drop_boxed(heap_ptr) };
+    }
+
+    #[test]
+    fn test_bytes_utf8_surrogatepass_encodes_internal_surrogate_carriers() {
+        let surrogate =
+            encode_python_code_point(0xDC80).expect("surrogate should map into carrier range");
+        let text = format!("A{surrogate}");
+        let (heap_string, heap_ptr) = boxed_value(StringObject::from_string(text));
+
+        let encoded = builtin_bytes(&[
+            heap_string,
+            Value::string(intern("utf-8")),
+            Value::string(intern("surrogatepass")),
+        ])
+        .expect("surrogatepass should encode surrogate carriers");
+        assert_eq!(value_to_byte_vec(encoded), vec![0x41, 0xED, 0xB2, 0x80]);
+
+        unsafe { drop_boxed(heap_ptr) };
+    }
+
+    #[test]
+    fn test_decode_bytes_utf8_surrogatepass_roundtrips_python_surrogate_code_points() {
+        let decoded = decode_bytes_to_value(
+            &[0x41, 0xED, 0xB2, 0x80],
+            Some("utf-8"),
+            Some("surrogatepass"),
+        )
+        .expect("surrogatepass should decode surrogate UTF-8 sequences");
+
+        let expected_surrogate =
+            encode_python_code_point(0xDC80).expect("surrogate should map into carrier range");
+        assert_eq!(
+            value_to_rust_string(decoded),
+            format!("A{expected_surrogate}")
+        );
+    }
+
+    #[test]
+    fn test_decode_bytes_utf8_surrogateescape_maps_invalid_bytes_to_surrogate_carriers() {
+        let decoded =
+            decode_bytes_to_value(&[0x41, 0xFF, 0x42], Some("utf-8"), Some("surrogateescape"))
+                .expect("surrogateescape should preserve invalid bytes");
+
+        let escaped = encode_python_code_point(0xDCFF).expect("surrogate should map");
+        assert_eq!(value_to_rust_string(decoded), format!("A{escaped}B"));
+    }
+
+    #[test]
+    fn test_decode_bytes_utf8_strict_reports_unicode_decode_error() {
+        let err = decode_bytes_to_value(&[0xFF], Some("utf-8"), Some("strict"))
+            .expect_err("invalid UTF-8 should raise UnicodeDecodeError");
+        assert_unicode_decode_error(
+            err,
+            "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+        );
+    }
+
+    #[test]
     fn test_bytes_latin1_strict_error() {
         let err = builtin_bytes(&[
             Value::string(intern("\u{20ac}")),
             Value::string(intern("latin-1")),
         ])
         .unwrap_err();
-        assert!(matches!(err, BuiltinError::ValueError(_)));
-        assert!(err.to_string().contains("latin-1"));
+        assert_unicode_encode_error(
+            err,
+            "'latin-1' codec can't encode character '\\u20ac' in position 0: ordinal not in range(256)",
+        );
     }
 
     #[test]
@@ -1414,6 +2107,10 @@ mod tests {
 
         let hex = builtin_format(&[Value::int(255).unwrap(), Value::string(intern("#x"))]).unwrap();
         assert_eq!(value_to_rust_string(hex), "0xff");
+
+        let padded_hex =
+            builtin_format(&[Value::int(255).unwrap(), Value::string(intern("08X"))]).unwrap();
+        assert_eq!(value_to_rust_string(padded_hex), "000000FF");
 
         let grouped =
             builtin_format(&[Value::int(1_234_567).unwrap(), Value::string(intern(","))]).unwrap();

@@ -90,12 +90,34 @@ pub fn builtin_dir_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     }
 
     if args.is_empty() {
-        return Err(BuiltinError::NotImplemented(
-            "dir() without argument requires frame introspection".to_string(),
-        ));
+        return dir_of_current_scope(vm);
     }
 
     dir_of_value_vm(vm, args[0])
+}
+
+#[inline]
+fn dir_of_current_scope(vm: &VirtualMachine) -> Result<Value, BuiltinError> {
+    let mut names = Vec::new();
+    let mut seen = FxHashSet::default();
+
+    if let Some(module) = vm.current_module() {
+        for name in module.dir() {
+            push_unique_name(&mut names, &mut seen, name);
+        }
+    }
+
+    let frame = vm.current_frame();
+    if frame.locals_mapping().is_none() {
+        for (slot, name) in frame.code.locals.iter().enumerate() {
+            let slot = slot as u8;
+            if frame.reg_is_written(slot) {
+                push_unique_name(&mut names, &mut seen, intern(name.as_ref()));
+            }
+        }
+    }
+
+    dir_from_names(names)
 }
 
 /// Get directory (attributes) of a value.

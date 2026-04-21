@@ -4,7 +4,7 @@
 //! Errors are designed for minimal allocation and fast construction on hot paths.
 
 use crate::builtins::BuiltinError;
-use prism_core::{PrismError, Span};
+use prism_core::{PrismError, Span, Value};
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub struct RuntimeError {
     /// Error kind
     pub kind: RuntimeErrorKind,
+    /// Preserved Python exception instance for exact-object propagation.
+    pub raised_value: Option<Value>,
     /// Source location (if available)
     pub span: Option<Span>,
     /// Traceback frames
@@ -118,6 +120,7 @@ impl RuntimeError {
     pub fn new(kind: RuntimeErrorKind) -> Self {
         Self {
             kind,
+            raised_value: None,
             span: None,
             traceback: Vec::new(),
         }
@@ -128,6 +131,7 @@ impl RuntimeError {
     pub fn with_span(kind: RuntimeErrorKind, span: Span) -> Self {
         Self {
             kind,
+            raised_value: None,
             span: Some(span),
             traceback: Vec::new(),
         }
@@ -275,6 +279,14 @@ impl RuntimeError {
             message: message.into(),
         })
     }
+
+    /// Create an exception error while preserving the original Python object.
+    #[inline]
+    pub fn raised_exception(type_id: u16, value: Value, message: impl Into<Arc<str>>) -> Self {
+        let mut err = Self::exception(type_id, message);
+        err.raised_value = Some(value);
+        err
+    }
 }
 
 impl fmt::Display for RuntimeError {
@@ -384,6 +396,9 @@ impl From<BuiltinError> for RuntimeError {
         match err {
             BuiltinError::TypeError(message) => Self::type_error(message),
             BuiltinError::ValueError(message) => Self::value_error(message),
+            BuiltinError::SyntaxError(message) => {
+                Self::exception(ExceptionTypeId::SyntaxError.as_u8() as u16, message)
+            }
             BuiltinError::OSError(message) => {
                 Self::exception(ExceptionTypeId::OSError.as_u8() as u16, message)
             }
@@ -406,8 +421,79 @@ impl From<BuiltinError> for RuntimeError {
             BuiltinError::OverflowError(message) => {
                 Self::exception(ExceptionTypeId::OverflowError.as_u8() as u16, message)
             }
+            BuiltinError::Raised(err) => err,
             BuiltinError::NotImplemented(message) => {
                 Self::exception(ExceptionTypeId::NotImplementedError.as_u8() as u16, message)
+            }
+        }
+    }
+}
+
+impl From<PrismError> for RuntimeError {
+    fn from(err: PrismError) -> Self {
+        use crate::stdlib::exceptions::types::ExceptionTypeId;
+
+        match err {
+            PrismError::LexError { message, .. }
+            | PrismError::SyntaxError { message, .. }
+            | PrismError::CompileError { message, .. } => {
+                Self::exception(ExceptionTypeId::SyntaxError.as_u8() as u16, message)
+            }
+            PrismError::RuntimeError { kind, message } => {
+                let type_id = match kind {
+                    prism_core::error::RuntimeErrorKind::Runtime => ExceptionTypeId::RuntimeError,
+                    prism_core::error::RuntimeErrorKind::Exception => ExceptionTypeId::Exception,
+                    prism_core::error::RuntimeErrorKind::SystemExit => ExceptionTypeId::SystemExit,
+                    prism_core::error::RuntimeErrorKind::KeyboardInterrupt => {
+                        ExceptionTypeId::KeyboardInterrupt
+                    }
+                    prism_core::error::RuntimeErrorKind::GeneratorExit => {
+                        ExceptionTypeId::GeneratorExit
+                    }
+                };
+                Self::exception(type_id.as_u8() as u16, message)
+            }
+            PrismError::NameError { name } => Self::exception(
+                ExceptionTypeId::NameError.as_u8() as u16,
+                format!("name '{name}' is not defined"),
+            ),
+            PrismError::TypeError { message } => {
+                Self::exception(ExceptionTypeId::TypeError.as_u8() as u16, message)
+            }
+            PrismError::ValueError { message } => {
+                Self::exception(ExceptionTypeId::ValueError.as_u8() as u16, message)
+            }
+            PrismError::AttributeError { message } => {
+                Self::exception(ExceptionTypeId::AttributeError.as_u8() as u16, message)
+            }
+            PrismError::IndexError { message } => {
+                Self::exception(ExceptionTypeId::IndexError.as_u8() as u16, message)
+            }
+            PrismError::KeyError { key } => {
+                Self::exception(ExceptionTypeId::KeyError.as_u8() as u16, key)
+            }
+            PrismError::ZeroDivisionError { message } => {
+                Self::exception(ExceptionTypeId::ZeroDivisionError.as_u8() as u16, message)
+            }
+            PrismError::ImportError { message } => {
+                Self::exception(ExceptionTypeId::ImportError.as_u8() as u16, message)
+            }
+            PrismError::AssertionError { message } => {
+                Self::exception(ExceptionTypeId::AssertionError.as_u8() as u16, message)
+            }
+            PrismError::StopIteration => Self::stop_iteration(),
+            PrismError::OverflowError { message } => {
+                Self::exception(ExceptionTypeId::OverflowError.as_u8() as u16, message)
+            }
+            PrismError::RecursionError => Self::exception(
+                ExceptionTypeId::RecursionError.as_u8() as u16,
+                "maximum recursion depth exceeded",
+            ),
+            PrismError::MemoryError { message } => {
+                Self::exception(ExceptionTypeId::MemoryError.as_u8() as u16, message)
+            }
+            PrismError::InternalError { message } => {
+                Self::exception(ExceptionTypeId::SystemError.as_u8() as u16, message)
             }
         }
     }

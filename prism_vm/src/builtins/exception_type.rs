@@ -534,6 +534,16 @@ define_exception_type!(
 );
 define_exception_type!(RUNTIME_ERROR, ExceptionTypeId::RuntimeError, "RuntimeError");
 define_exception_type!(
+    BASE_EXCEPTION_GROUP,
+    ExceptionTypeId::BaseExceptionGroup,
+    "BaseExceptionGroup"
+);
+define_exception_type!(
+    EXCEPTION_GROUP,
+    ExceptionTypeId::ExceptionGroup,
+    "ExceptionGroup"
+);
+define_exception_type!(
     STOP_ASYNC_ITERATION,
     ExceptionTypeId::StopAsyncIteration,
     "StopAsyncIteration"
@@ -545,6 +555,7 @@ define_exception_type!(
 );
 define_exception_type!(SYNTAX_ERROR, ExceptionTypeId::SyntaxError, "SyntaxError");
 define_exception_type!(TAB_ERROR, ExceptionTypeId::TabError, "TabError");
+define_exception_type!(SYSTEM_ERROR, ExceptionTypeId::SystemError, "SystemError");
 define_exception_type!(TIMEOUT_ERROR, ExceptionTypeId::TimeoutError, "TimeoutError");
 define_exception_type!(TYPE_ERROR, ExceptionTypeId::TypeError, "TypeError");
 define_exception_type!(
@@ -646,10 +657,13 @@ pub static EXCEPTION_TYPE_TABLE: &[(&str, &std::sync::LazyLock<ExceptionTypeObje
     ("RecursionError", &RECURSION_ERROR),
     ("ReferenceError", &REFERENCE_ERROR),
     ("RuntimeError", &RUNTIME_ERROR),
+    ("BaseExceptionGroup", &BASE_EXCEPTION_GROUP),
+    ("ExceptionGroup", &EXCEPTION_GROUP),
     ("StopAsyncIteration", &STOP_ASYNC_ITERATION),
     ("StopIteration", &STOP_ITERATION),
     ("SyntaxError", &SYNTAX_ERROR),
     ("TabError", &TAB_ERROR),
+    ("SystemError", &SYSTEM_ERROR),
     ("TimeoutError", &TIMEOUT_ERROR),
     ("TypeError", &TYPE_ERROR),
     ("UnboundLocalError", &UNBOUND_LOCAL_ERROR),
@@ -719,30 +733,76 @@ fn exception_type_base_value(exception_type: &ExceptionTypeObject) -> Value {
 }
 
 #[inline]
-fn exception_type_bases_tuple_value(exception_type: &ExceptionTypeObject) -> Value {
-    let base = exception_type_base_value(exception_type);
-    if base.is_none() {
-        boxed_tuple_value(Vec::new())
-    } else {
-        boxed_tuple_value(vec![base])
+fn exception_type_direct_base_values(exception_type: &ExceptionTypeObject) -> Vec<Value> {
+    let Some(kind) = exception_type.exception_type() else {
+        return Vec::new();
+    };
+
+    if kind == ExceptionTypeId::BaseException {
+        return vec![crate::builtins::builtin_type_object_for_type_id(
+            TypeId::OBJECT,
+        )];
     }
+
+    let mut bases = Vec::with_capacity(2);
+    for base in [kind.parent(), kind.secondary_parent()]
+        .into_iter()
+        .flatten()
+    {
+        let Some(base_type) = get_exception_type_by_id(base as u16) else {
+            continue;
+        };
+        let value = exception_type_value(base_type);
+        if !bases.contains(&value) {
+            bases.push(value);
+        }
+    }
+
+    bases
+}
+
+#[inline]
+fn exception_type_bases_tuple_value(exception_type: &ExceptionTypeObject) -> Value {
+    boxed_tuple_value(exception_type_direct_base_values(exception_type))
 }
 
 #[inline]
 fn exception_type_mro_tuple_value(exception_type: &'static ExceptionTypeObject) -> Value {
     let mut mro = vec![exception_type_value(exception_type)];
-    let mut current = exception_type.exception_type();
+    let Some(kind) = exception_type.exception_type() else {
+        mro.push(crate::builtins::builtin_type_object_for_type_id(
+            TypeId::OBJECT,
+        ));
+        return boxed_tuple_value(mro);
+    };
 
-    while let Some(parent) = current.and_then(|kind| kind.parent()) {
-        let parent_type = get_exception_type_by_id(parent as u16)
-            .expect("parent exception type should always be registered");
-        mro.push(exception_type_value(parent_type));
-        current = Some(parent);
+    fn append_exception_mro(kind: ExceptionTypeId, mro: &mut Vec<Value>) {
+        for base in [kind.parent(), kind.secondary_parent()]
+            .into_iter()
+            .flatten()
+        {
+            let base_type = get_exception_type_by_id(base as u16)
+                .expect("parent exception type should always be registered");
+            let value = exception_type_value(base_type);
+            if !mro.contains(&value) {
+                mro.push(value);
+            }
+        }
+
+        for base in [kind.parent(), kind.secondary_parent()]
+            .into_iter()
+            .flatten()
+        {
+            append_exception_mro(base, mro);
+        }
     }
 
-    mro.push(crate::builtins::builtin_type_object_for_type_id(
-        TypeId::OBJECT,
-    ));
+    append_exception_mro(kind, &mut mro);
+
+    let object_type = crate::builtins::builtin_type_object_for_type_id(TypeId::OBJECT);
+    if !mro.contains(&object_type) {
+        mro.push(object_type);
+    }
     boxed_tuple_value(mro)
 }
 
@@ -751,6 +811,7 @@ pub(crate) fn exception_type_attribute_value(
     name: &InternedString,
 ) -> Option<Value> {
     match name.as_str() {
+        "with_traceback" => super::exception_method_value("with_traceback"),
         "__name__" | "__qualname__" => Some(Value::string(intern(exception_type.name()))),
         "__module__" => Some(Value::string(intern("builtins"))),
         "__bases__" => Some(exception_type_bases_tuple_value(exception_type)),
@@ -760,12 +821,30 @@ pub(crate) fn exception_type_attribute_value(
     }
 }
 
+#[inline]
+fn exception_proxy_base_ids(exception_type_id: ExceptionTypeId) -> Vec<ClassId> {
+    let mut bases = Vec::with_capacity(2);
+    for base in [
+        exception_type_id.parent(),
+        exception_type_id.secondary_parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let class_id = exception_proxy_class(base).class_id();
+        if !bases.contains(&class_id) {
+            bases.push(class_id);
+        }
+    }
+    bases
+}
+
 fn build_exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClassObject> {
-    let bases = exception_type_id
-        .parent()
-        .map(|parent| vec![exception_proxy_class(parent).class_id()])
-        .unwrap_or_default();
+    let bases = exception_proxy_base_ids(exception_type_id);
     let namespace = ClassDict::new();
+    if let Some(with_traceback) = super::exception_method_value("with_traceback") {
+        namespace.set(intern("with_traceback"), with_traceback);
+    }
     let name = intern(
         get_exception_type_by_id(exception_type_id as u16)
             .expect("every ExceptionTypeId should resolve to a registered exception type")
@@ -788,6 +867,9 @@ pub(crate) fn exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<P
     }
 
     if let Some(parent) = exception_type_id.parent() {
+        let _ = exception_proxy_class(parent);
+    }
+    if let Some(parent) = exception_type_id.secondary_parent() {
         let _ = exception_proxy_class(parent);
     }
 
@@ -814,6 +896,15 @@ pub(crate) fn exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<P
 pub(crate) fn exception_proxy_class_id(exception_type_id: u16) -> Option<ClassId> {
     let exception_type = ExceptionTypeId::from_u8(exception_type_id as u8)?;
     Some(exception_proxy_class(exception_type).class_id())
+}
+
+#[inline]
+pub(crate) fn exception_type_id_for_proxy_class_id(class_id: ClassId) -> Option<u16> {
+    EXCEPTION_TYPE_IDS_BY_PROXY_CLASS
+        .lock()
+        .expect("exception proxy reverse cache lock poisoned")
+        .get(&class_id.0)
+        .copied()
 }
 
 #[inline]
@@ -1051,6 +1142,14 @@ mod tests {
         assert!(exc_type.is_subclass_of(ExceptionTypeId::LookupError as u16));
     }
 
+    #[test]
+    fn test_exception_group_is_subclass_of_exception_and_base_exception_group() {
+        let exc_type = ExceptionTypeObject::new(ExceptionTypeId::ExceptionGroup, "ExceptionGroup");
+        assert!(exc_type.is_subclass_of(ExceptionTypeId::Exception as u16));
+        assert!(exc_type.is_subclass_of(ExceptionTypeId::BaseExceptionGroup as u16));
+        assert!(exc_type.is_subclass_of(ExceptionTypeId::BaseException as u16));
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // Construction/Call Tests
     // ════════════════════════════════════════════════════════════════════════
@@ -1204,6 +1303,22 @@ mod tests {
     }
 
     #[test]
+    fn test_exception_group_proxy_class_preserves_dual_exception_bases() {
+        let exception_id =
+            exception_proxy_class_id(ExceptionTypeId::Exception as u16).expect("Exception proxy");
+        let base_group_id = exception_proxy_class_id(ExceptionTypeId::BaseExceptionGroup as u16)
+            .expect("BaseExceptionGroup proxy");
+        let group_id = exception_proxy_class_id(ExceptionTypeId::ExceptionGroup as u16)
+            .expect("ExceptionGroup proxy");
+
+        let group_bitmap = prism_runtime::object::type_builtins::global_class_bitmap(group_id)
+            .expect("ExceptionGroup proxy should be registered");
+
+        assert!(group_bitmap.is_subclass_of(TypeId::from_raw(exception_id.0)));
+        assert!(group_bitmap.is_subclass_of(TypeId::from_raw(base_group_id.0)));
+    }
+
+    #[test]
     fn test_exception_proxy_class_id_round_trips_to_builtin_exception_value() {
         let runtime_error_id = exception_proxy_class_id(ExceptionTypeId::RuntimeError as u16)
             .expect("RuntimeError proxy");
@@ -1249,6 +1364,70 @@ mod tests {
             .expect("base should be an exception type object");
         let base = unsafe { &*(base_ptr as *const ExceptionTypeObject) };
         assert_eq!(base.name(), "Exception");
+    }
+
+    #[test]
+    fn test_exception_group_type_metadata_exposes_both_bases_and_full_mro() {
+        let exc_group =
+            get_exception_type("ExceptionGroup").expect("ExceptionGroup type should exist");
+
+        let bases = exception_type_attribute_value(exc_group, &intern("__bases__"))
+            .expect("__bases__ should exist");
+        let bases_ptr = bases
+            .as_object_ptr()
+            .expect("__bases__ should be a tuple object");
+        let bases = unsafe { &*(bases_ptr as *const TupleObject) };
+        assert_eq!(bases.len(), 2);
+
+        let first_base = unsafe {
+            &*(bases.as_slice()[0]
+                .as_object_ptr()
+                .expect("first base should be an exception type object")
+                as *const ExceptionTypeObject)
+        };
+        let second_base = unsafe {
+            &*(bases.as_slice()[1]
+                .as_object_ptr()
+                .expect("second base should be an exception type object")
+                as *const ExceptionTypeObject)
+        };
+        assert_eq!(first_base.name(), "BaseExceptionGroup");
+        assert_eq!(second_base.name(), "Exception");
+
+        let mro = exception_type_attribute_value(exc_group, &intern("__mro__"))
+            .expect("__mro__ should exist");
+        let mro_ptr = mro
+            .as_object_ptr()
+            .expect("__mro__ should be a tuple object");
+        let mro = unsafe { &*(mro_ptr as *const TupleObject) };
+        let mro_names = mro
+            .as_slice()
+            .iter()
+            .map(|value| {
+                let ptr = value
+                    .as_object_ptr()
+                    .expect("mro entries should be type objects");
+                if crate::ops::objects::extract_type_id(ptr) == TypeId::TYPE
+                    && let Some(type_id) = crate::builtins::builtin_type_object_type_id(ptr)
+                {
+                    return type_id.name().to_string();
+                }
+
+                unsafe { &*(ptr as *const ExceptionTypeObject) }
+                    .name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mro_names,
+            vec![
+                "ExceptionGroup",
+                "BaseExceptionGroup",
+                "Exception",
+                "BaseException",
+                "object",
+            ]
+        );
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1340,6 +1519,7 @@ mod tests {
             "AttributeError",
             "NameError",
             "RuntimeError",
+            "SystemError",
             "StopIteration",
             "OSError",
             "ZeroDivisionError",

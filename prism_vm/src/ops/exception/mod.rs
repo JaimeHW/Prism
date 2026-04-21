@@ -169,7 +169,7 @@ mod tests {
         // Test tuple matching (currently returns false due to stub)
         let exc_type = ExceptionTypeId::TypeError as u16;
         let tuple = Value::none(); // Not a real tuple
-        assert!(!check_tuple_match(exc_type, &tuple));
+        assert!(!check_tuple_match(None, exc_type, &tuple));
     }
 
     // ════════════════════════════════════════════════════════════════════════

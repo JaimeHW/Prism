@@ -37,6 +37,11 @@
 
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class;
+use prism_runtime::object::type_obj::TypeId;
 
 // =============================================================================
 // Constants
@@ -100,8 +105,6 @@ pub fn extract_type_id_from_value(value: &Value) -> u16 {
 #[inline(always)]
 fn try_extract_exception_type_id(value: &Value) -> Option<u16> {
     use crate::builtins::ExceptionValue;
-    use prism_runtime::object::ObjectHeader;
-    use prism_runtime::object::type_obj::TypeId;
 
     // Check if this is a pointer value that could be an exception
     if !value.is_object() {
@@ -122,6 +125,11 @@ fn try_extract_exception_type_id(value: &Value) -> Option<u16> {
         return Some(exc_value.exception_type_id);
     }
 
+    if header.type_id.raw() >= TypeId::FIRST_USER_TYPE {
+        let class = global_class(ClassId(header.type_id.raw()))?;
+        return heap_exception_type_id_for_class(class.as_ref());
+    }
+
     None
 }
 
@@ -136,7 +144,6 @@ fn try_extract_exception_type_id(value: &Value) -> Option<u16> {
 #[inline(always)]
 fn try_extract_type_object_id(value: &Value) -> Option<u16> {
     use crate::builtins::{EXCEPTION_TYPE_ID, ExceptionTypeObject};
-    use prism_runtime::object::ObjectHeader;
 
     // Check if this is an object
     if !value.is_object() {
@@ -179,6 +186,10 @@ fn try_extract_type_object_id(value: &Value) -> Option<u16> {
         }
     }
 
+    if let Some(class) = heap_exception_class_from_value(value) {
+        return heap_exception_type_id_for_class(class);
+    }
+
     None
 }
 
@@ -210,6 +221,79 @@ pub fn extract_type_from_type_value(type_value: &Value) -> Option<u16> {
     None
 }
 
+#[inline]
+fn heap_exception_type_id_for_class(class: &PyClassObject) -> Option<u16> {
+    class
+        .mro()
+        .iter()
+        .find_map(|&class_id| crate::builtins::exception_type_id_for_proxy_class_id(class_id))
+}
+
+#[inline]
+fn heap_exception_class_from_value(value: &Value) -> Option<&'static PyClassObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::TYPE || crate::builtins::builtin_type_object_type_id(ptr).is_some()
+    {
+        return None;
+    }
+
+    let class = unsafe { &*(ptr as *const PyClassObject) };
+    heap_exception_type_id_for_class(class).map(|_| class)
+}
+
+#[inline]
+fn heap_exception_class_id(value: &Value) -> Option<ClassId> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return None;
+    }
+
+    let class_id = ClassId(header.type_id.raw());
+    let class = global_class(class_id)?;
+    heap_exception_type_id_for_class(class.as_ref()).map(|_| class_id)
+}
+
+#[inline]
+fn heap_exception_matches_class(active_exception: &Value, target_class: &PyClassObject) -> bool {
+    let Some(active_class_id) = heap_exception_class_id(active_exception) else {
+        return false;
+    };
+    let Some(active_class) = global_class(active_class_id) else {
+        return false;
+    };
+
+    active_class
+        .mro()
+        .iter()
+        .any(|&class_id| class_id == target_class.class_id())
+}
+
+#[inline]
+fn heap_exception_matches_builtin_type(active_exception: &Value, target_type_id: u16) -> bool {
+    let Some(active_class_id) = heap_exception_class_id(active_exception) else {
+        return false;
+    };
+    let Some(active_class) = global_class(active_class_id) else {
+        return false;
+    };
+
+    active_class.mro().iter().any(|&class_id| {
+        crate::builtins::exception_type_id_for_proxy_class_id(class_id) == Some(target_type_id)
+    })
+}
+
+#[inline]
+pub(crate) fn is_exception_instance_value(value: &Value) -> bool {
+    try_extract_exception_type_id(value).is_some()
+}
+
+#[inline]
+pub(crate) fn is_exception_class_value(value: &Value) -> bool {
+    try_extract_type_object_id(value).is_some() || heap_exception_class_from_value(value).is_some()
+}
+
 // =============================================================================
 // Dynamic Matching
 // =============================================================================
@@ -234,7 +318,23 @@ pub fn extract_type_from_type_value(type_value: &Value) -> Option<u16> {
 ///
 /// True if the exception is an instance of the specified type (including subclasses).
 #[inline]
-pub fn check_dynamic_match(exc_type_id: u16, type_value: &Value) -> bool {
+pub fn check_dynamic_match(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    type_value: &Value,
+) -> bool {
+    if let Some(target_class) = heap_exception_class_from_value(type_value) {
+        return active_exception
+            .is_some_and(|value| heap_exception_matches_class(value, target_class));
+    }
+
+    if let Some(active_exception) = active_exception
+        && let Some(target_type_id) = try_extract_type_object_id(type_value)
+        && heap_exception_matches_builtin_type(active_exception, target_type_id)
+    {
+        return true;
+    }
+
     // Extract type ID from the type value
     let match_type_id = match extract_type_from_type_value(type_value) {
         Some(id) => id,
@@ -282,7 +382,11 @@ pub fn is_subclass(exc_type: u16, parent_type: u16) -> bool {
 ///
 /// True if the exception matches any type in the tuple.
 #[inline]
-pub fn check_tuple_match(exc_type_id: u16, types_tuple: &Value) -> bool {
+pub fn check_tuple_match(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    types_tuple: &Value,
+) -> bool {
     // Early exit for non-tuple values
     if !types_tuple.is_object() {
         return false;
@@ -298,45 +402,53 @@ pub fn check_tuple_match(exc_type_id: u16, types_tuple: &Value) -> bool {
 
     // Unrolled check for small tuples (common case)
     if len <= INLINE_TUPLE_CHECK_SIZE {
-        return match_tuple_inline(exc_type_id, &elements);
+        return match_tuple_inline(active_exception, exc_type_id, &elements);
     }
 
     // Loop for larger tuples
-    match_tuple_loop(exc_type_id, &elements)
+    match_tuple_loop(active_exception, exc_type_id, &elements)
 }
 
 /// Inline tuple matching for small tuples.
 ///
 /// Unrolled loop for tuples with ≤4 elements.
 #[inline(always)]
-fn match_tuple_inline(exc_type_id: u16, elements: &[Value]) -> bool {
+fn match_tuple_inline(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    elements: &[Value],
+) -> bool {
     match elements.len() {
         0 => false,
-        1 => check_dynamic_match(exc_type_id, &elements[0]),
+        1 => check_dynamic_match(active_exception, exc_type_id, &elements[0]),
         2 => {
-            check_dynamic_match(exc_type_id, &elements[0])
-                || check_dynamic_match(exc_type_id, &elements[1])
+            check_dynamic_match(active_exception, exc_type_id, &elements[0])
+                || check_dynamic_match(active_exception, exc_type_id, &elements[1])
         }
         3 => {
-            check_dynamic_match(exc_type_id, &elements[0])
-                || check_dynamic_match(exc_type_id, &elements[1])
-                || check_dynamic_match(exc_type_id, &elements[2])
+            check_dynamic_match(active_exception, exc_type_id, &elements[0])
+                || check_dynamic_match(active_exception, exc_type_id, &elements[1])
+                || check_dynamic_match(active_exception, exc_type_id, &elements[2])
         }
         4 => {
-            check_dynamic_match(exc_type_id, &elements[0])
-                || check_dynamic_match(exc_type_id, &elements[1])
-                || check_dynamic_match(exc_type_id, &elements[2])
-                || check_dynamic_match(exc_type_id, &elements[3])
+            check_dynamic_match(active_exception, exc_type_id, &elements[0])
+                || check_dynamic_match(active_exception, exc_type_id, &elements[1])
+                || check_dynamic_match(active_exception, exc_type_id, &elements[2])
+                || check_dynamic_match(active_exception, exc_type_id, &elements[3])
         }
-        _ => match_tuple_loop(exc_type_id, elements),
+        _ => match_tuple_loop(active_exception, exc_type_id, elements),
     }
 }
 
 /// Loop-based tuple matching for larger tuples.
 #[inline(never)]
-fn match_tuple_loop(exc_type_id: u16, elements: &[Value]) -> bool {
+fn match_tuple_loop(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    elements: &[Value],
+) -> bool {
     for type_value in elements {
-        if check_dynamic_match(exc_type_id, type_value) {
+        if check_dynamic_match(active_exception, exc_type_id, type_value) {
             return true;
         }
     }
@@ -542,7 +654,7 @@ mod tests {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let type_value = Value::none();
         // None is not a valid type, should return false
-        assert!(!check_dynamic_match(exc_type_id, &type_value));
+        assert!(!check_dynamic_match(None, exc_type_id, &type_value));
     }
 
     #[test]
@@ -550,21 +662,21 @@ mod tests {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let type_value = Value::int(42).unwrap();
         // Int is not a valid type, should return false
-        assert!(!check_dynamic_match(exc_type_id, &type_value));
+        assert!(!check_dynamic_match(None, exc_type_id, &type_value));
     }
 
     #[test]
     fn test_check_dynamic_match_type_object_direct_match() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let type_value = exception_type_value("TypeError");
-        assert!(check_dynamic_match(exc_type_id, &type_value));
+        assert!(check_dynamic_match(None, exc_type_id, &type_value));
     }
 
     #[test]
     fn test_check_dynamic_match_type_object_subclass_match() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let type_value = exception_type_value("Exception");
-        assert!(check_dynamic_match(exc_type_id, &type_value));
+        assert!(check_dynamic_match(None, exc_type_id, &type_value));
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -576,7 +688,7 @@ mod tests {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let types_tuple = Value::none();
         // None is not a tuple, should return false
-        assert!(!check_tuple_match(exc_type_id, &types_tuple));
+        assert!(!check_tuple_match(None, exc_type_id, &types_tuple));
     }
 
     #[test]
@@ -584,14 +696,14 @@ mod tests {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let types_tuple = Value::int(42).unwrap();
         // Int is not a tuple, should return false
-        assert!(!check_tuple_match(exc_type_id, &types_tuple));
+        assert!(!check_tuple_match(None, exc_type_id, &types_tuple));
     }
 
     #[test]
     fn test_check_tuple_match_bool() {
         let exc_type_id = ExceptionTypeId::ValueError as u16;
         let types_tuple = Value::bool(true);
-        assert!(!check_tuple_match(exc_type_id, &types_tuple));
+        assert!(!check_tuple_match(None, exc_type_id, &types_tuple));
     }
 
     #[test]
@@ -600,7 +712,7 @@ mod tests {
         let value_error = exception_type_value("ValueError");
         let type_error = exception_type_value("TypeError");
         let types_tuple = tuple_value(&[value_error, type_error]);
-        assert!(check_tuple_match(exc_type_id, &types_tuple));
+        assert!(check_tuple_match(None, exc_type_id, &types_tuple));
 
         let tuple_ptr =
             types_tuple.as_object_ptr().expect("tuple should be object") as *mut TupleObject;
@@ -614,28 +726,28 @@ mod tests {
     #[test]
     fn test_match_tuple_inline_empty() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
-        assert!(!match_tuple_inline(exc_type_id, &[]));
+        assert!(!match_tuple_inline(None, exc_type_id, &[]));
     }
 
     #[test]
     fn test_match_tuple_inline_one_no_match() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let elements = [Value::none()];
-        assert!(!match_tuple_inline(exc_type_id, &elements));
+        assert!(!match_tuple_inline(None, exc_type_id, &elements));
     }
 
     #[test]
     fn test_match_tuple_inline_two_no_match() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let elements = [Value::none(), Value::int(1).unwrap()];
-        assert!(!match_tuple_inline(exc_type_id, &elements));
+        assert!(!match_tuple_inline(None, exc_type_id, &elements));
     }
 
     #[test]
     fn test_match_tuple_inline_three_no_match() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let elements = [Value::none(), Value::int(1).unwrap(), Value::bool(false)];
-        assert!(!match_tuple_inline(exc_type_id, &elements));
+        assert!(!match_tuple_inline(None, exc_type_id, &elements));
     }
 
     #[test]
@@ -647,7 +759,7 @@ mod tests {
             Value::bool(false),
             Value::float(3.14),
         ];
-        assert!(!match_tuple_inline(exc_type_id, &elements));
+        assert!(!match_tuple_inline(None, exc_type_id, &elements));
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -657,14 +769,14 @@ mod tests {
     #[test]
     fn test_match_tuple_loop_empty() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
-        assert!(!match_tuple_loop(exc_type_id, &[]));
+        assert!(!match_tuple_loop(None, exc_type_id, &[]));
     }
 
     #[test]
     fn test_match_tuple_loop_no_match() {
         let exc_type_id = ExceptionTypeId::TypeError as u16;
         let elements: Vec<Value> = (0..10).map(|i| Value::int(i).unwrap()).collect();
-        assert!(!match_tuple_loop(exc_type_id, &elements));
+        assert!(!match_tuple_loop(None, exc_type_id, &elements));
     }
 
     // ════════════════════════════════════════════════════════════════════════

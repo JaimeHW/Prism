@@ -52,14 +52,20 @@ use crate::builtins::{EXCEPTION_TYPE_ID, ExceptionTypeObject, ExceptionValue};
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::exception::HandlerFrame;
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::objects::{snapshot_frame_globals_dict, snapshot_frame_locals_dict};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
 use std::sync::Arc;
 
-use super::helpers::{check_dynamic_match, check_tuple_match};
+use super::helpers::{
+    check_dynamic_match, check_tuple_match, extract_type_id_from_value, is_exception_class_value,
+    is_exception_instance_value,
+};
 
 // =============================================================================
 // Constants
@@ -97,7 +103,7 @@ pub fn raise(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let exc_value = frame.get_reg(inst.dst().0);
 
-    let (exc_value, type_id) = match normalize_exception_value(exc_value, inst) {
+    let (exc_value, type_id) = match normalize_exception_value(vm, exc_value, inst) {
         Ok(result) => result,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -130,15 +136,15 @@ pub fn raise_with_cause(vm: &mut VirtualMachine, inst: Instruction) -> ControlFl
     let exc_value = frame.get_reg(inst.dst().0);
     let cause_value = frame.get_reg(inst.src1().0);
 
-    let (exc_value, type_id) = match normalize_exception_value(exc_value, inst) {
+    let (exc_value, type_id) = match normalize_exception_value(vm, exc_value, inst) {
         Ok(result) => result,
         Err(err) => return ControlFlow::Error(err),
     };
-    let cause_value = match normalize_exception_cause_value(cause_value) {
+    let cause_value = match normalize_exception_cause_value(vm, cause_value) {
         Ok(value) => value,
         Err(err) => return ControlFlow::Error(err),
     };
-    if let Err(err) = attach_exception_cause(exc_value, cause_value) {
+    if let Err(err) = attach_exception_cause(vm, exc_value, cause_value) {
         return ControlFlow::Error(err);
     }
     if let Err(err) = attach_exception_traceback(vm, exc_value) {
@@ -294,7 +300,8 @@ pub fn check_exc_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
         // Slow path: Get type from register and compare dynamically
         let frame = vm.current_frame();
         let type_value = frame.get_reg(inst.src1().0);
-        check_dynamic_match(exc_type_id, &type_value)
+        let active_exception = vm.get_active_exception();
+        check_dynamic_match(active_exception, exc_type_id, &type_value)
     };
 
     vm.current_frame_mut()
@@ -329,7 +336,8 @@ pub fn check_exc_match_tuple(vm: &mut VirtualMachine, inst: Instruction) -> Cont
     let types_tuple = frame.get_reg(inst.src1().0);
 
     // Check if exception matches any type in the tuple
-    let matches = check_tuple_match(exc_type_id, &types_tuple);
+    let active_exception = vm.get_active_exception();
+    let matches = check_tuple_match(active_exception, exc_type_id, &types_tuple);
     vm.current_frame_mut()
         .set_reg(dst_reg, Value::bool(matches));
     ControlFlow::Continue
@@ -508,14 +516,7 @@ fn extract_type_id(inst: Instruction, value: &Value) -> u16 {
     // Both NO_TYPE_ID (0xFFFF) and 0 indicate "not specified in instruction"
     // 0 is common because op_d doesn't set imm16, defaulting to 0
     if type_id == NO_TYPE_ID || type_id == 0 {
-        // Try to extract type ID from the exception value itself
-        // SAFETY: The value should be an exception object from raise expression
-        if let Some(exc) = unsafe { ExceptionValue::from_value(*value) } {
-            exc.exception_type_id
-        } else {
-            // Fallback to generic Exception type if not a proper exception object
-            4 // ExceptionTypeId::Exception
-        }
+        extract_type_id_from_value(value)
     } else {
         type_id
     }
@@ -540,37 +541,33 @@ fn is_subclass(exc_type: u16, parent_type: u16) -> bool {
 
 #[inline(always)]
 fn normalize_exception_value(
+    vm: &mut VirtualMachine,
     exc_value: Value,
     inst: Instruction,
 ) -> Result<(Value, u16), RuntimeError> {
     let normalized =
-        normalize_exception_instance(exc_value, "exceptions must derive from BaseException")?;
+        normalize_exception_instance(vm, exc_value, "exceptions must derive from BaseException")?;
     let type_id = extract_type_id(inst, &normalized);
     Ok((normalized, type_id))
 }
 
 #[inline(always)]
 fn normalize_exception_instance(
+    vm: &mut VirtualMachine,
     value: Value,
     invalid_message: &'static str,
 ) -> Result<Value, RuntimeError> {
-    if unsafe { ExceptionValue::from_value(value) }.is_some() {
+    if is_exception_instance_value(&value) {
         return Ok(value);
     }
 
-    let Some(ptr) = value.as_object_ptr() else {
-        return Err(RuntimeError::type_error(invalid_message));
-    };
-
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != EXCEPTION_TYPE_ID {
+    if !is_exception_class_value(&value) {
         return Err(RuntimeError::type_error(invalid_message));
     }
 
-    let exc_type = unsafe { &*(ptr as *const ExceptionTypeObject) };
-    let normalized = exc_type.construct(&[]);
+    let normalized = invoke_callable_value(vm, value, &[])?;
 
-    if unsafe { ExceptionValue::from_value(normalized) }.is_none() {
+    if !is_exception_instance_value(&normalized) {
         return Err(RuntimeError::internal(
             "exception type construction must yield an exception instance",
         ));
@@ -580,12 +577,16 @@ fn normalize_exception_instance(
 }
 
 #[inline(always)]
-fn normalize_exception_cause_value(cause_value: Value) -> Result<Option<Value>, RuntimeError> {
+fn normalize_exception_cause_value(
+    vm: &mut VirtualMachine,
+    cause_value: Value,
+) -> Result<Option<Value>, RuntimeError> {
     if cause_value.is_none() {
         return Ok(None);
     }
 
     normalize_exception_instance(
+        vm,
         cause_value,
         "exception causes must derive from BaseException",
     )
@@ -605,29 +606,39 @@ fn exception_value_mut(value: Value) -> Option<&'static mut ExceptionValue> {
 
 #[inline(always)]
 fn attach_exception_cause(
+    vm: &mut VirtualMachine,
     exc_value: Value,
     cause_value: Option<Value>,
 ) -> Result<(), RuntimeError> {
-    let Some(exc) = exception_value_mut(exc_value) else {
-        return Err(RuntimeError::internal(
-            "normalized exception must be an exception instance",
-        ));
-    };
+    if let Some(exc) = exception_value_mut(exc_value) {
+        match cause_value {
+            Some(cause_value) => {
+                let cause =
+                    unsafe { ExceptionValue::from_value(cause_value) }.ok_or_else(|| {
+                        RuntimeError::internal(
+                            "normalized exception cause must be an exception instance",
+                        )
+                    })?;
+                exc.set_cause(cause as *const ExceptionValue);
+                exc.suppress_context();
+            }
+            None => {
+                exc.suppress_context();
+            }
+        }
 
-    match cause_value {
-        Some(cause_value) => {
-            let cause = unsafe { ExceptionValue::from_value(cause_value) }.ok_or_else(|| {
-                RuntimeError::internal("normalized exception cause must be an exception instance")
-            })?;
-            exc.set_cause(cause as *const ExceptionValue);
-            exc.suppress_context();
-        }
-        None => {
-            exc.suppress_context();
-        }
+        return Ok(());
     }
 
-    Ok(())
+    if let Some(cause_value) = cause_value {
+        crate::ops::objects::set_attribute_value(vm, exc_value, &intern("__cause__"), cause_value)?;
+    }
+    crate::ops::objects::set_attribute_value(
+        vm,
+        exc_value,
+        &intern("__suppress_context__"),
+        Value::bool(true),
+    )
 }
 
 #[inline(always)]
@@ -637,32 +648,46 @@ fn leak_object_value<T>(object: T) -> Value {
 }
 
 #[inline(always)]
-fn attach_exception_traceback(vm: &VirtualMachine, exc_value: Value) -> Result<(), RuntimeError> {
-    let (code, line_number, lasti) = {
+fn attach_exception_traceback(
+    vm: &mut VirtualMachine,
+    exc_value: Value,
+) -> Result<(), RuntimeError> {
+    let (code, globals, locals, line_number, lasti) = {
         let frame = vm.current_frame();
         (
             Arc::clone(&frame.code),
+            leak_object_value(snapshot_frame_globals_dict(vm, frame)),
+            leak_object_value(snapshot_frame_locals_dict(frame)),
             frame.code.first_lineno,
-            frame.ip.saturating_sub(1),
+            frame.ip.saturating_sub(1).saturating_mul(2),
         )
     };
 
-    let Some(exc) = exception_value_mut(exc_value) else {
-        return Err(RuntimeError::internal(
-            "normalized exception must be an exception instance",
-        ));
-    };
-
-    let frame_value = leak_object_value(FrameViewObject::new(Some(code), line_number, lasti));
+    let frame_value = leak_object_value(FrameViewObject::new(
+        Some(code),
+        globals,
+        locals,
+        line_number,
+        lasti,
+    ));
     let traceback_value = leak_object_value(TracebackViewObject::new(
         frame_value,
         None,
         line_number,
         lasti,
     ));
-    exc.set_traceback(traceback_value);
 
-    Ok(())
+    if let Some(exc) = exception_value_mut(exc_value) {
+        exc.set_traceback(traceback_value);
+        Ok(())
+    } else {
+        crate::ops::objects::set_attribute_value(
+            vm,
+            exc_value,
+            &intern("__traceback__"),
+            traceback_value,
+        )
+    }
 }
 
 // Dynamic match and tuple match functions are implemented in helpers.rs
@@ -743,6 +768,7 @@ pub fn raise_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let exc_value = frame.get_reg(exc_reg);
     let cause_value = frame.get_reg(cause_reg);
     let exc_value = match normalize_exception_instance(
+        vm,
         exc_value,
         "exceptions must derive from BaseException",
     ) {
@@ -752,11 +778,11 @@ pub fn raise_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let type_id = unsafe { ExceptionValue::from_value(exc_value) }
         .map(|exc| exc.exception_type_id)
         .unwrap_or(4);
-    let cause_value = match normalize_exception_cause_value(cause_value) {
+    let cause_value = match normalize_exception_cause_value(vm, cause_value) {
         Ok(value) => value,
         Err(err) => return ControlFlow::Error(err),
     };
-    if let Err(err) = attach_exception_cause(exc_value, cause_value) {
+    if let Err(err) = attach_exception_cause(vm, exc_value, cause_value) {
         return ControlFlow::Error(err);
     }
     if let Err(err) = attach_exception_traceback(vm, exc_value) {
@@ -827,6 +853,7 @@ pub fn exception_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
 
     // Get the active exception type
     let exc_type_id = vm.get_active_exception_type_id().unwrap_or(0);
+    let active_exception = vm.get_active_exception();
 
     // Try to match against the provided type
     // First check if it's encoded as a type ID in the value
@@ -834,12 +861,12 @@ pub fn exception_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
         is_subclass(exc_type_id, target_type_id as u16)
     } else {
         // Try dynamic matching first (single exception type)
-        let single_match = check_dynamic_match(exc_type_id, &type_value);
+        let single_match = check_dynamic_match(active_exception, exc_type_id, &type_value);
         if single_match {
             true
         } else {
             // Fall back to tuple matching for `except (TypeError, ValueError):` syntax
-            check_tuple_match(exc_type_id, &type_value)
+            check_tuple_match(active_exception, exc_type_id, &type_value)
         }
     };
 
@@ -965,13 +992,13 @@ mod tests {
     #[test]
     fn test_check_dynamic_match_returns_false() {
         // Currently unimplemented, should return false
-        assert!(!check_dynamic_match(4, &Value::none()));
+        assert!(!check_dynamic_match(None, 4, &Value::none()));
     }
 
     #[test]
     fn test_check_tuple_match_returns_false() {
         // Currently unimplemented, should return false
-        assert!(!check_tuple_match(4, &Value::none()));
+        assert!(!check_tuple_match(None, 4, &Value::none()));
     }
 
     // ════════════════════════════════════════════════════════════════════════

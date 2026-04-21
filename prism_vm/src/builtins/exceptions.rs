@@ -184,6 +184,11 @@ exception_constructor!(
     builtin_not_implemented_error,
     ExceptionTypeId::NotImplementedError
 );
+exception_constructor!(
+    builtin_base_exception_group,
+    ExceptionTypeId::BaseExceptionGroup
+);
+exception_constructor!(builtin_exception_group, ExceptionTypeId::ExceptionGroup);
 
 // =============================================================================
 // Syntax/Value Error Constructors (48-55)
@@ -282,6 +287,8 @@ pub const EXCEPTION_CONSTRUCTORS: &[(&str, BuiltinFn)] = &[
     ("RuntimeError", builtin_runtime_error),
     ("RecursionError", builtin_recursion_error),
     ("NotImplementedError", builtin_not_implemented_error),
+    ("BaseExceptionGroup", builtin_base_exception_group),
+    ("ExceptionGroup", builtin_exception_group),
     // Syntax/Value errors
     ("SyntaxError", builtin_syntax_error),
     ("IndentationError", builtin_indentation_error),
@@ -512,6 +519,8 @@ mod tests {
         assert!(names.contains(&"ZeroDivisionError"));
         assert!(names.contains(&"Exception"));
         assert!(names.contains(&"BaseException"));
+        assert!(names.contains(&"BaseExceptionGroup"));
+        assert!(names.contains(&"ExceptionGroup"));
     }
 
     #[test]
@@ -576,6 +585,17 @@ mod tests {
         assert!(exc.is_subclass_of(ExceptionTypeId::UnicodeError));
         assert!(exc.is_subclass_of(ExceptionTypeId::ValueError));
         assert!(exc.is_subclass_of(ExceptionTypeId::Exception));
+    }
+
+    #[test]
+    fn test_exception_group_hierarchy() {
+        let result = builtin_exception_group(&[]).unwrap();
+        let exc = unsafe { ExceptionValue::from_value(result).unwrap() };
+
+        assert!(exc.is_subclass_of(ExceptionTypeId::ExceptionGroup));
+        assert!(exc.is_subclass_of(ExceptionTypeId::BaseExceptionGroup));
+        assert!(exc.is_subclass_of(ExceptionTypeId::Exception));
+        assert!(exc.is_subclass_of(ExceptionTypeId::BaseException));
     }
 
     // ════════════════════════════════════════════════════════════════════════

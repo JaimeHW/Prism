@@ -10,9 +10,14 @@ use crate::VirtualMachine;
 use crate::builtins::{builtin_mapping_proxy_get_item, value_to_iterator};
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::ops::calls::{InvokeCallableOutcome, invoke_callable_value, invoke_callable_value_with_control_transfer};
+use crate::ops::calls::{
+    InvokeCallableOutcome, invoke_callable_value, invoke_callable_value_with_control_transfer,
+};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
-use crate::ops::objects::{dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id};
+use crate::ops::objects::{
+    dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
+    list_storage_mut_from_ptr, list_storage_ref_from_ptr,
+};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
@@ -21,6 +26,7 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{GenericAliasObject, MappingProxyObject};
+use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::slice::SliceObject;
@@ -40,6 +46,8 @@ use prism_runtime::types::tuple::TupleObject;
 enum SubscriptResult {
     /// A Value that can be returned directly (no allocation needed).
     Value(Value),
+    /// A bytes or bytearray object that needs GC allocation.
+    AllocBytes(BytesObject),
     /// A StringObject that needs GC allocation.
     AllocString(StringObject),
     /// A ListObject that needs GC allocation (from slice operation).
@@ -184,6 +192,14 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 fn finish_subscr(vm: &mut VirtualMachine, dst: u8, result: SubscriptResult) -> ControlFlow {
     let value = match result {
         SubscriptResult::Value(v) => v,
+        SubscriptResult::AllocBytes(bytes) => match vm.allocator().alloc(bytes) {
+            Some(ptr) => Value::object_ptr(ptr as *const ()),
+            None => {
+                return ControlFlow::Error(RuntimeError::internal(
+                    "out of memory: failed to allocate bytes",
+                ));
+            }
+        },
         SubscriptResult::AllocString(s) => match vm.allocator().alloc(s) {
             Some(ptr) => Value::object_ptr(ptr as *const ()),
             None => {
@@ -226,13 +242,23 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
+        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+            if let Some(value) = list.get(index) {
+                return Ok(Some(SubscriptResult::Value(value)));
+            }
+            let len = list.len();
+            return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
+        }
+
         match header.type_id {
-            TypeId::LIST => {
-                let list = unsafe { &*(ptr as *const ListObject) };
-                if let Some(value) = list.get(index) {
-                    return Ok(Some(SubscriptResult::Value(value)));
+            TypeId::BYTES | TypeId::BYTEARRAY => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                if let Some(value) = bytes.get(index) {
+                    return Ok(Some(SubscriptResult::Value(Value::int_unchecked(
+                        i64::from(value),
+                    ))));
                 }
-                let len = list.len();
+                let len = bytes.len();
                 return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
             }
             TypeId::TUPLE => {
@@ -284,11 +310,16 @@ fn subscr_slice(
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
+        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+            let result = list_slice(list, slice);
+            return Ok(Some(SubscriptResult::AllocList(result)));
+        }
+
         match header.type_id {
-            TypeId::LIST => {
-                let list = unsafe { &*(ptr as *const ListObject) };
-                let result = list_slice(list, slice);
-                return Ok(Some(SubscriptResult::AllocList(result)));
+            TypeId::BYTES | TypeId::BYTEARRAY => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                let result = bytes.slice(slice);
+                return Ok(Some(SubscriptResult::AllocBytes(result)));
             }
             TypeId::TUPLE => {
                 let tuple = unsafe { &*(ptr as *const TupleObject) };
@@ -445,37 +476,35 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
-        match header.type_id {
-            TypeId::LIST => {
-                // List[int] = value
-                if let Some(index) = key.as_int() {
-                    let list = unsafe { &mut *(ptr as *mut ListObject) };
-                    if list.set(index, value) {
-                        return ControlFlow::Continue;
-                    }
-                    let len = list.len();
-                    return ControlFlow::Error(RuntimeError::index_error(index, len));
+        if let Some(list) = list_storage_mut_from_ptr(ptr) {
+            if let Some(index) = key.as_int() {
+                if list.set(index, value) {
+                    return ControlFlow::Continue;
                 }
-
-                if let Some(slice) = slice_from_value(key) {
-                    let mut iterator = match value_to_iterator(&value) {
-                        Ok(iter) => iter,
-                        Err(err) => {
-                            return ControlFlow::Error(RuntimeError::type_error(err.to_string()));
-                        }
-                    };
-                    let replacement = iterator.collect_remaining();
-                    let list = unsafe { &mut *(ptr as *mut ListObject) };
-                    return match list.assign_slice(slice, replacement) {
-                        Ok(()) => ControlFlow::Continue,
-                        Err(err) => ControlFlow::Error(RuntimeError::value_error(err.to_string())),
-                    };
-                }
-
-                return ControlFlow::Error(RuntimeError::type_error(
-                    "list indices must be integers or slices",
-                ));
+                let len = list.len();
+                return ControlFlow::Error(RuntimeError::index_error(index, len));
             }
+
+            if let Some(slice) = slice_from_value(key) {
+                let mut iterator = match value_to_iterator(&value) {
+                    Ok(iter) => iter,
+                    Err(err) => {
+                        return ControlFlow::Error(RuntimeError::type_error(err.to_string()));
+                    }
+                };
+                let replacement = iterator.collect_remaining();
+                return match list.assign_slice(slice, replacement) {
+                    Ok(()) => ControlFlow::Continue,
+                    Err(err) => ControlFlow::Error(RuntimeError::value_error(err.to_string())),
+                };
+            }
+
+            return ControlFlow::Error(RuntimeError::type_error(
+                "list indices must be integers or slices",
+            ));
+        }
+
+        match header.type_id {
             TypeId::DICT => {
                 // Dict[key] = value
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
@@ -517,27 +546,26 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
-        match header.type_id {
-            TypeId::LIST => {
-                if let Some(index) = key.as_int() {
-                    let list = unsafe { &mut *(ptr as *mut ListObject) };
-                    if list.remove(index).is_some() {
-                        return ControlFlow::Continue;
-                    }
-                    let len = list.len();
-                    return ControlFlow::Error(RuntimeError::index_error(index, len));
-                }
-
-                if let Some(slice) = slice_from_value(key) {
-                    let list = unsafe { &mut *(ptr as *mut ListObject) };
-                    list.delete_slice(slice);
+        if let Some(list) = list_storage_mut_from_ptr(ptr) {
+            if let Some(index) = key.as_int() {
+                if list.remove(index).is_some() {
                     return ControlFlow::Continue;
                 }
-
-                return ControlFlow::Error(RuntimeError::type_error(
-                    "list indices must be integers or slices",
-                ));
+                let len = list.len();
+                return ControlFlow::Error(RuntimeError::index_error(index, len));
             }
+
+            if let Some(slice) = slice_from_value(key) {
+                list.delete_slice(slice);
+                return ControlFlow::Continue;
+            }
+
+            return ControlFlow::Error(RuntimeError::type_error(
+                "list indices must be integers or slices",
+            ));
+        }
+
+        match header.type_id {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
                 if dict.remove(key).is_some() {
@@ -668,9 +696,11 @@ fn invoke_bound_method_with_args_allow_control_transfer(
         (Some(implicit_self), []) => {
             invoke_callable_value_with_control_transfer(vm, target.callable, &[implicit_self])
         }
-        (Some(implicit_self), [arg0]) => {
-            invoke_callable_value_with_control_transfer(vm, target.callable, &[implicit_self, *arg0])
-        }
+        (Some(implicit_self), [arg0]) => invoke_callable_value_with_control_transfer(
+            vm,
+            target.callable,
+            &[implicit_self, *arg0],
+        ),
         (Some(implicit_self), [arg0, arg1]) => invoke_callable_value_with_control_transfer(
             vm,
             target.callable,
@@ -920,6 +950,7 @@ mod tests {
         match result {
             Some(SubscriptResult::AllocString(string)) => assert_eq!(string.as_str(), "e"),
             Some(SubscriptResult::Value(_)) => panic!("expected allocated string result"),
+            Some(SubscriptResult::AllocBytes(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected allocated string result"),
             None => panic!("expected integer fast path"),
@@ -934,6 +965,7 @@ mod tests {
         match result {
             Some(SubscriptResult::AllocString(string)) => assert_eq!(string.as_str(), "o"),
             Some(SubscriptResult::Value(_)) => panic!("expected allocated string result"),
+            Some(SubscriptResult::AllocBytes(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected allocated string result"),
             None => panic!("expected integer fast path"),
@@ -949,8 +981,55 @@ mod tests {
         match result {
             Some(SubscriptResult::AllocString(string)) => assert_eq!(string.as_str(), "ell"),
             Some(SubscriptResult::Value(_)) => panic!("expected allocated string result"),
+            Some(SubscriptResult::AllocBytes(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected allocated string result"),
+            None => panic!("expected slice fast path"),
+        }
+    }
+
+    #[test]
+    fn test_bytes_integer_subscript_returns_int_value() {
+        let bytes = BytesObject::from_slice(b"abc");
+        let bytes_ptr = Box::leak(Box::new(bytes)) as *mut BytesObject as *const ();
+        let result =
+            subscr_integer(Value::object_ptr(bytes_ptr), 1).expect("bytes indexing should succeed");
+
+        match result {
+            Some(SubscriptResult::Value(value)) => {
+                assert_eq!(value.as_int(), Some(i64::from(b'b')))
+            }
+            Some(SubscriptResult::AllocBytes(_)) => panic!("expected integer value result"),
+            Some(SubscriptResult::AllocString(_)) => panic!("expected integer value result"),
+            Some(SubscriptResult::AllocList(_)) => panic!("expected integer value result"),
+            Some(SubscriptResult::AllocTuple(_)) => panic!("expected integer value result"),
+            None => panic!("expected integer fast path"),
+        }
+    }
+
+    #[test]
+    fn test_bytearray_slice_preserves_concrete_type() {
+        let bytes = BytesObject::bytearray_from_slice(b"abcd");
+        let bytes_ptr = Box::leak(Box::new(bytes)) as *mut BytesObject as *const ();
+        let slice = SliceObject::new(None, None, Some(-1));
+        let result = subscr_slice(Value::object_ptr(bytes_ptr), &slice)
+            .expect("bytearray slicing should succeed");
+
+        match result {
+            Some(SubscriptResult::AllocBytes(bytes)) => {
+                assert!(bytes.is_bytearray());
+                assert_eq!(bytes.as_bytes(), b"dcba");
+            }
+            Some(SubscriptResult::Value(_)) => panic!("expected allocated byte sequence result"),
+            Some(SubscriptResult::AllocString(_)) => {
+                panic!("expected allocated byte sequence result")
+            }
+            Some(SubscriptResult::AllocList(_)) => {
+                panic!("expected allocated byte sequence result")
+            }
+            Some(SubscriptResult::AllocTuple(_)) => {
+                panic!("expected allocated byte sequence result")
+            }
             None => panic!("expected slice fast path"),
         }
     }
