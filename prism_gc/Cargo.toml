@@ -1,13 +1,13 @@
 [package]
 name = "prism_gc"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "High-performance generational garbage collector for Prism Python runtime"
-authors = ["Prism Team"]
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
-prism_core = { path = "../prism_core" }
+prism_core.workspace = true
 
 # Fast atomic operations
 crossbeam-utils = "0.8"
@@ -16,13 +16,13 @@ crossbeam-utils = "0.8"
 crossbeam-deque = "0.8"
 
 # Fast hash maps for object tracking
-rustc-hash = "2.1"
+rustc-hash.workspace = true
 
 # Parking lot for fast mutexes (write barrier synchronization)
-parking_lot = "0.12"
+parking_lot.workspace = true
 
 # Bit manipulation for card tables
-bitflags = "2.4"
+bitflags.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"

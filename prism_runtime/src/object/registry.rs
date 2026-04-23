@@ -155,16 +155,6 @@ pub fn global_registry() -> &'static TypeRegistry {
     GLOBAL_REGISTRY.get_or_init(TypeRegistry::new)
 }
 
-/// Initialize the type registry with built-in types.
-///
-/// This should be called once at startup.
-pub fn init_builtin_types() {
-    let registry = global_registry();
-
-    // Built-in types will be registered here.
-    let _ = registry;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

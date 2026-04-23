@@ -95,8 +95,10 @@ impl<T> GcArray<T> {
     /// - The caller must ensure the memory is zeroed or properly initialized.
     pub unsafe fn init_at(ptr: NonNull<Self>, capacity: usize) {
         let array = ptr.as_ptr();
-        (*array).capacity = capacity.min(u32::MAX as usize) as u32;
-        (*array).len = 0;
+        unsafe {
+            (*array).capacity = capacity.min(u32::MAX as usize) as u32;
+            (*array).len = 0;
+        }
     }
 
     /// Get the capacity of this array.
@@ -176,7 +178,7 @@ impl<T> GcArray<T> {
     /// The caller must ensure that `index < self.len()`.
     #[inline]
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
-        &*self.data_ptr().add(index)
+        unsafe { &*self.data_ptr().add(index) }
     }
 
     /// Get a mutable reference to an element without bounds checking.
@@ -186,7 +188,7 @@ impl<T> GcArray<T> {
     /// The caller must ensure that `index < self.len()`.
     #[inline]
     pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T {
-        &mut *self.data_ptr_mut().add(index)
+        unsafe { &mut *self.data_ptr_mut().add(index) }
     }
 
     /// Set an element at the given index.

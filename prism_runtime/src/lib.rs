@@ -22,7 +22,7 @@ pub mod pinned_store;
 pub mod types;
 
 // Re-export commonly used items
-pub use object::registry::{TypeRegistry, global_registry, init_builtin_types};
+pub use object::registry::{TypeRegistry, global_registry};
 pub use object::type_obj::{TypeFlags, TypeId, TypeObject, TypeSlots};
 pub use object::{GcColor, GcFlags, HASH_NOT_COMPUTED, ObjectHeader, PyObject};
 

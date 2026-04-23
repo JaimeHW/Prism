@@ -41,7 +41,7 @@ impl<T: Trace> GcRef<T> {
     /// The pointer must point to a valid, GC-managed object of type T.
     pub unsafe fn from_raw(ptr: *mut T) -> Self {
         Self {
-            ptr: NonNull::new_unchecked(ptr),
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
             _marker: PhantomData,
         }
     }

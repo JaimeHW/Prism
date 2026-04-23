@@ -76,7 +76,7 @@ impl<T> GcHandle<T> {
     ///
     /// The pointer must point to a valid T that is managed by the GC.
     pub unsafe fn from_non_null(ptr: NonNull<T>) -> Self {
-        Self::from_raw(ptr.as_ptr())
+        unsafe { Self::from_raw(ptr.as_ptr()) }
     }
 
     /// Get the raw handle.
@@ -90,7 +90,7 @@ impl<T> GcHandle<T> {
     ///
     /// The object must still be alive (not collected).
     pub unsafe fn get(&self) -> &T {
-        &*(self.raw.ptr as *const T)
+        unsafe { &*(self.raw.ptr as *const T) }
     }
 
     /// Get a mutable reference to the object.
@@ -100,7 +100,7 @@ impl<T> GcHandle<T> {
     /// The object must still be alive, and no other references
     /// to it may exist.
     pub unsafe fn get_mut(&mut self) -> &mut T {
-        &mut *(self.raw.ptr as *mut T)
+        unsafe { &mut *(self.raw.ptr as *mut T) }
     }
 
     /// Get the raw pointer.
@@ -147,7 +147,7 @@ impl HandleScope {
     pub unsafe fn create_handle<T>(&mut self, ptr: *const T) -> GcHandle<T> {
         let raw = RawHandle::new(ptr as *const ());
         self.handles.push(raw);
-        GcHandle::from_raw(ptr)
+        unsafe { GcHandle::from_raw(ptr) }
     }
 
     /// Create a handle from a Value.
