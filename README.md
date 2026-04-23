@@ -1,279 +1,264 @@
 <p align="center">
-  <h1 align="center">⬡ Prism</h1>
-  <p align="center"><i>A high-performance Python runtime with JIT compilation</i></p>
+  <h1 align="center">Prism</h1>
+  <p align="center">
+    A high-performance Python 3.12 runtime written from scratch in Rust.
+    <br />
+    <em>NaN-boxed values · Register-based VM · Tiered JIT · Generational GC</em>
+  </p>
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#building">Building</a> •
-  <a href="#project-status">Status</a> •
-  <a href="#contributing">Contributing</a>
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#tooling">Tooling</a> ·
+  <a href="#building">Building</a> ·
+  <a href="#project-status">Status</a> ·
+  <a href="#license">License</a>
 </p>
 
 ---
 
-Prism is a from-scratch implementation of the Python 3.12 runtime, engineered for performance through a custom multi-tier JIT compiler. Written entirely in Rust, Prism combines a register-based bytecode interpreter with an optimizing compiler that generates native x64 machine code.
+Prism is a ground-up Python 3.12 implementation—parser, compiler, virtual machine, garbage collector, JIT compiler, standard library, and AOT tooling—designed to explore how far a Rust-native runtime can push Python performance.
 
-## Features
+The codebase spans **~350 k lines of Rust** across 11 workspace crates.
 
-### Multi-Tier Execution Engine
-- **Tier 0 Interpreter** — Register-based bytecode VM with static dispatch tables and arithmetic fast-paths
-- **Tier 1 Template JIT** — Direct bytecode-to-machine-code translation with inline caching, type specialization, and deoptimization IC
-- **Tier 2 Optimizing JIT** — Sea-of-Nodes IR with aggressive optimizations and profile-guided compilation
-
-### Advanced Optimizations
-- **Inline Caching** — Monomorphic, polymorphic, and megamorphic caches for property access, method calls, and type dispatch
-- **Type Speculation** — Profile-driven type guards with fast-path specialization for dict, list, and string operations
-- **Profile-Guided Optimization** — Branch probability annotation and hot/cold code splitting from runtime profiles
-- **On-Stack Replacement** — Mid-loop tier-up from interpreter to optimized code
-- **Loop Optimizations** — LICM, Range Check Elimination, loop unrolling, and induction variable analysis
-- **Function Inlining** — Budget-based graph merging with escape analysis
-- **Strength Reduction** — Magic number division, multiplication decomposition into shifts/adds
-- **Global Value Numbering** — Common subexpression elimination across the IR graph
-- **Partial Redundancy Elimination** — Optimal code motion with PRE
-- **Sparse Conditional Constant Propagation** — Aggressive constant folding with branch elimination
-- **Instruction Combining** — Peephole optimizations on instruction sequences
-- **Tail Call Optimization** — Stack frame reuse for tail-recursive functions
-- **Dead Store Elimination** — Removal of stores that are never read
-- **Auto-Vectorization** — SIMD transformation for compatible loops
-
-### SIMD Acceleration
-- **AVX2 Support** — 256-bit vector operations with YMM registers
-- **AVX-512 Support** — 512-bit vector operations with ZMM registers and EVEX encoding
-- **Opmask Predication** — Hardware-accelerated conditional vector operations (k0-k7)
-- **Width-Aware Spill Slots** — Correct stack allocation for 128/256/512-bit vectors
-
-### High-Performance Memory Management
-- **Generational GC** — Immix-based heap with opportunistic evacuation and line-level marking
-- **Thread-Local Allocation** — Zero-synchronization bump allocation via TLABs
-- **Precise Stack Scanning** — Stackmap-driven root identification in JIT frames
-- **Page-Protection Safepoints** — Minimal-overhead stop-the-world coordination
-
-### V8-Style Object Model
-- **Hidden Classes (Shapes)** — O(1) property access through inline slots and transition chains
-- **NaN-Boxing** — Efficient 64-bit value representation for primitives and pointers
-- **Small Integer Cache** — Pre-allocated integers from -5 to 256
-- **Descriptor Protocol** — Full implementation of `@property`, `__slots__`, bound methods, and classmethod/staticmethod
-
-### Zero-Cost Exception Handling
-- **Table-Based Unwinding** — Zero runtime overhead for code paths that don't raise
-- **Nested Handler Resolution** — Inner-first linear scan for try/except block matching
-- **Exception Chaining** — Full `raise ... from ...` semantics with `__cause__` and `__context__`
-- **Traceback System** — Complete stack trace generation with source coordinates
-- **Flyweight Exception References** — Zero-copy exception propagation with inline caching
-- **Exception State FSM** — Deterministic state machine for exception lifecycle
-- **CPython 3.11+ Compatibility** — Full `PushExcInfo`/`PopExcInfo` semantics for `finally` blocks
-
-### Generator Protocol
-- **Stackless State Machines** — Minimal-overhead state capture and restoration
-- **Liveness-Aware Frames** — Only live variables captured across yield points
-- **Iterator Integration** — Full `__iter__`/`__next__` protocol support
-
-### Structural Pattern Matching (PEP 634)
-- **Decision Tree Compilation** — Maranget algorithm for optimal pattern dispatch
-- **Full Pattern Support** — Literals, captures, wildcards, sequences, mappings, class patterns, OR/AS patterns
-- **Guard Expressions** — Conditional pattern matching with arbitrary Python expressions
-
-### I/O System
-- **Layered Architecture** — `FileIO` → `BufferedIO` → `TextIO` stack
-- **Buffer Pooling** — High-throughput file operations via reusable buffers
-- **Thread-Safe Streams** — `sys.stdin`, `sys.stdout`, `sys.stderr` with locking
-
-### Python 3.12 Compatibility
-- **Complete Parser** — Pratt parser with 16 precedence tiers for Python's complex grammar
-- **Scope Analysis** — Deep binding analysis with Local/Global/Cell/Free variable resolution
-- **Arbitrary Precision Integers** — Full `BigInt` support for Python integer semantics
-- **Standard Library** — `math`, `sys`, `os`, `time`, `re`, `json`, `collections`, `functools`, `itertools`, `io`, generators, and exception hierarchy modules
-
-## Quick Start
-
-Run a Python script:
+## Quickstart
 
 ```bash
-prism script.py
+# Run a script
+cargo run -p prism_cli --bin prism -- script.py
+
+# Execute an inline expression
+cargo run -p prism_cli --bin prism -- -c "print('hello from Prism')"
+
+# Run a module
+cargo run -p prism_cli --bin prism -- -m package.module
+
+# Start the REPL
+cargo run -p prism_cli --bin prism
 ```
-
-Start the interactive REPL:
-
-```bash
-prism
-```
-
-## CPython Suite Harness
-
-Run Prism against the CPython 3.12 regression tests with the dedicated harness:
-
-```bash
-cargo run -p prism_cli --bin prism-test -- --cpython-root C:\Users\James\Desktop\cpython-3.12 --list-tests test_grammar
-```
-
-Execute a focused smoke test:
-
-```bash
-cargo run -p prism_cli --bin prism-test -- --cpython-root C:\Users\James\Desktop\cpython-3.12 --runner import --timeout 30 test_grammar
-```
-
-Write a machine-readable report for CI or compatibility tracking:
-
-```bash
-cargo run -p prism_cli --bin prism-test -- --cpython-root C:\Users\James\Desktop\cpython-3.12 --json-report artifacts/cpython-smoke.json test_grammar test_math
-```
-
-The harness mirrors CPython-style test discovery, expands split test packages such as
-`test_asyncio`, creates isolated per-test work directories, and records structured
-results so Prism compatibility gaps can be tracked over time.
 
 ## Architecture
 
-Prism is organized as a modular Rust workspace:
+```text
+                    ┌──────────────────────────────────────────────────────┐
+                    │                    prism_cli                        │
+                    │         prism · prismc · prism-test                 │
+                    └────────────┬──────────────┬──────────────┬──────────┘
+                                 │              │              │
+                    ┌────────────▼──┐    ┌──────▼──────┐  ┌────▼──────┐
+                    │   prism_vm    │    │  prism_aot  │  │prism_code │
+                    │  interpreter  │    │  AOT driver │  │ bytecode  │
+                    │  stdlib · IC  │    └─────────────┘  │  format   │
+                    │  import sys   │                     └───────────┘
+                    └──┬─────┬─────┘
+                       │     │
+          ┌────────────▼┐  ┌─▼────────────┐
+          │  prism_jit   │  │prism_runtime │
+          │  Sea-of-Nodes│  │ object model │
+          │  IR + x64    │  │ type system  │
+          └──────┬───────┘  └──────┬───────┘
+                 │                 │
+          ┌──────▼─────────────────▼───────┐
+          │           prism_gc             │
+          │   generational collector       │
+          └────────────┬───────────────────┘
+                       │
+          ┌────────────▼───────────────────┐
+          │          prism_core            │
+          │  NaN-boxed values · interning  │
+          │  spans · errors · speculation  │
+          └────────────────────────────────┘
 
-```
-prism/
-├── prism_core      # Fundamental types: Value (NaN-boxing), Span, Error, Interning, Speculation
-├── prism_parser    # Python 3.12 grammar and AST construction
-├── prism_compiler  # Scope analysis, pattern matching, register-based bytecode emission
-├── prism_vm        # Execution engine, interpreter, JIT bridge, stdlib modules
-├── prism_jit       # Multi-tier JIT: IR, optimization passes, x64/ARM64 codegen, SIMD
-├── prism_runtime   # Object system, shapes, types (list, dict, set, string, etc.)
-├── prism_gc        # Generational Immix collector with TLABs and write barriers
-├── prism_builtins  # Builtin function implementations
-└── prism_cli       # Command-line interface
-```
-
-### Execution Pipeline
-
-```
-                              ┌─────────────────────────────────────────┐
-                              │              Tier 2 JIT                 │
-                              │  ┌─────────┐  ┌─────────┐  ┌─────────┐  │
-                              │  │   GVN   │─▶│  LICM   │─▶│   RCE   │  │
-                              │  └─────────┘  └─────────┘  └─────────┘  │
-                              │         │                       │       │
-                              │         ▼                       ▼       │
-                              │  ┌─────────────────────────────────┐    │
-                              │  │      Register Allocation        │    │
-Source ─▶ Parser ─▶ Compiler ─┼─▶│    (Linear Scan + SIMD Regs)    │────┼──▶ Native x64
-   │                          │  └─────────────────────────────────┘    │
-   │                          └─────────────────▲───────────────────────┘
-   │                                            │ OSR (hot loops)
-   │                          ┌─────────────────┴───────────────────────┐
-   │                          │           Tier 1 Template JIT           │
-   │                          │  Bytecode → x64 · IC · Type Specialize  │
-   │                          └─────────────────▲───────────────────────┘
-   │                                            │ tier-up (hot functions)
-   │                          ┌─────────────────┴───────────────────────┐
-   └─────────────────────────▶│          Tier 0 Interpreter             │
-                              │   Static dispatch · Type profiling      │
-                              └─────────────────────────────────────────┘
+  prism_parser ──► prism_compiler ──► prism_code
+    lexer/AST      scope analysis      bytecode
+                   code generation     code objects
 ```
 
-### Optimization Pipeline
+### Crate Overview
 
-The Tier 2 JIT runs a 15-pass optimization pipeline across 6 phases:
+| Crate | Purpose |
+|---|---|
+| **prism_core** | NaN-boxed value representation, string interning, error types, span tracking, speculation primitives |
+| **prism_code** | Shared bytecode instruction set and `CodeObject` format |
+| **prism_parser** | Full Python 3.12 lexer, parser, and AST (f-strings, pattern matching, type params) |
+| **prism_compiler** | Two-phase compiler: scope analysis → register-based bytecode emission |
+| **prism_runtime** | Python object model—`ObjectHeader`, type slots, descriptors, metaclasses, hidden classes (shapes), GC integration |
+| **prism_gc** | Generational garbage collector: nursery (copying), tenured (mark-sweep/compact), large-object space, card-table write barriers, TLABs |
+| **prism_jit** | Tiered JIT: Sea-of-Nodes IR, 18 optimization passes, graph-coloring register allocation, x64 native code generation, precise GC stack maps |
+| **prism_vm** | Bytecode interpreter, inline caching, profiling & tier-up, JIT bridge & OSR, import system, 40+ native stdlib modules |
+| **prism_aot** | Ahead-of-time build planner, frozen-module bundler, manifest emitter, Windows object-file generator |
+| **prism_builtins** | Shared builtin runtime helpers |
+| **prism_cli** | `prism` (interpreter), `prismc` (AOT driver), `prism-test` (CPython compat harness) |
 
-| Phase | Pass | Description |
-|:------|:-----|:------------|
-| **Canonicalization** | SCCP | Sparse Conditional Constant Propagation |
-| | Simplify | Algebraic identities, constant folding |
-| | InstCombine | Peephole optimizations on instruction sequences |
-| **Profile-Guided** | Branch Probability | Annotate branches with measured/estimated weights |
-| | Hot/Cold Split | Partition code by execution temperature |
-| **Local** | Copy Prop | Copy Propagation — eliminate redundant moves |
-| | GVN | Global Value Numbering — CSE across the graph |
-| | DSE | Dead Store Elimination |
-| | PRE | Partial Redundancy Elimination |
-| | Strength Reduce | Division → multiplication, mul → shift/add |
-| **Loop** | LICM | Loop-Invariant Code Motion |
-| | Unroll | Loop body replication to reduce overhead |
-| | RCE | Range Check Elimination |
-| **Interprocedural** | Inline | Budget-based function inlining |
-| | Escape | Escape analysis for stack allocation |
-| | Tail Call | Tail call optimization |
-| **Cleanup** | DCE | Dead Code Elimination |
+---
 
-### JIT Tier Details
+## Key Design Decisions
 
-| Tier | Strategy | Trigger | Key Capabilities |
-|:-----|:---------|:--------|:-----------------|
-| **0** | Interpreter | Default | Inline caches, type feedback collection |
-| **1** | Template | ~100 calls | Direct translation, IC fast paths, type specialization (dict/list/string) |
-| **2** | Optimizing | ~1000 calls or hot loop | Full optimization pipeline, PGO, SIMD codegen |
+### NaN-Boxed Values
 
-### Object Model
+Every Python value fits in a single 64-bit word. IEEE 754 quiet-NaN bit patterns encode type tags (None, bool, int, float, object pointer, interned string) with zero-cost unboxing for the hot float path and 48-bit inline small integers (±140 trillion).
 
-Prism implements a V8-style hidden class system:
+### Register-Based VM
 
+256 registers per call frame, inlined on the stack for L1-cache locality. Static dispatch table for O(1) opcode lookup. Monomorphic and polymorphic inline caches accelerate attribute access and call sites.
+
+### Tiered JIT Compilation
+
+| Tier | Role |
+|---|---|
+| **Tier 0** | Bytecode interpreter with profiling counters and type feedback |
+| **Tier 1** | Baseline JIT—fast template compilation with deoptimization guards |
+| **Tier 2** | Optimizing JIT—Sea-of-Nodes IR with full optimization pipeline and PGO |
+
+The **optimization pipeline** runs 18 passes across six ordered phases:
+
+| Phase | Passes |
+|---|---|
+| Canonicalization | SCCP, algebraic simplification, instruction combining |
+| Profile-Guided | Branch probability estimation, hot/cold splitting |
+| Local | Copy propagation, GVN, dead store elimination, PRE, strength reduction |
+| Loop | LICM, loop unrolling, range-check elimination |
+| Interprocedural | Inlining, escape analysis, tail-call optimization |
+| Cleanup | Dead-code elimination |
+
+On-stack replacement (OSR) promotes hot loops from interpreter to JIT mid-execution. Deoptimization safely falls back to the interpreter when speculative guards fail.
+
+### Generational Garbage Collector
+
+- **Nursery**: bump-pointer allocation, copying collection, TLAB support
+- **Tenured**: mark-sweep with optional compaction (triggered at 30% fragmentation)
+- **Large object space**: direct allocation for objects > 8 KB
+- **Write barriers**: card-table tracked old→young references
+- **Tri-color marking**: supports concurrent marking infrastructure
+- **JIT integration**: precise GC via stack maps and safepoints; write-barrier emission in generated code
+
+### Hidden Classes (Shapes)
+
+Objects share structural metadata through shape transitions, enabling inline caches to resolve attribute offsets in constant time without dictionary lookups.
+
+---
+
+## Tooling
+
+### `prism` — Interpreter
+
+Drop-in CLI compatible with CPython's argument surface:
+
+```bash
+prism script.py                # Run a file
+prism -c "expr"                # Execute a string
+prism -m module                # Run a module
+prism                          # Interactive REPL
 ```
-                    ┌──────────────────┐
-                    │      Shape       │
-                    │  (Hidden Class)  │
-                    ├──────────────────┤
-                    │ property: "x"    │────┐
-                    │ slot: 0          │    │ transition
-                    │ parent: ─────────┼────┘
-                    └──────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-    ┌──────────────────┐            ┌──────────────────┐
-    │     Object A     │            │     Object B     │
-    ├──────────────────┤            ├──────────────────┤
-    │ header (16 bytes)│            │ header (16 bytes)│
-    │ slot[0]: 42      │            │ slot[0]: 100     │
-    │ slot[1]: ...     │            │ slot[1]: ...     │
-    └──────────────────┘            └──────────────────┘
+
+Supported flags: `-O`, `-OO`, `-B`, `-E`, `-s`, `-S`, `-u`, `-v`, `-W`, `-X`.  
+JIT controls via `-X jit=on`, `-X jit=off`, `-X nojit`.
+
+### `prismc` — AOT Compiler
+
+Build planner and frozen-module artifact generator:
+
+```bash
+prismc build app.py -O
+prismc build -m pkg.tool -I vendor -OO
 ```
 
-Objects with identical property insertion order share the same Shape, enabling O(1) property access through fixed inline slots.
+Outputs (under `prism-build/`):
+- `build-plan.json` — deterministic build manifest
+- `frozen-modules.prism` — serialized bytecode bundle
+- `frozen-modules.obj` — Windows PE object for embedding
+
+### `prism-test` — CPython Compatibility Harness
+
+Runs Prism against a CPython 3.12 source checkout:
+
+```bash
+prism-test --cpython-root /path/to/cpython-3.12 test_grammar test_math
+prism-test --cpython-root /path/to/cpython-3.12 --json-report results.json test_grammar
+```
+
+Supports multiple runner modes (`import`, `suite`, `test-main`), per-test isolation, timeout control, and JSON reporting.
+
+---
+
+## Standard Library
+
+Prism ships native Rust implementations for core modules and can fall back to CPython's source stdlib when available on `sys.path`.
+
+<details>
+<summary><strong>Native modules (40+)</strong></summary>
+
+**Core**: `builtins`, `sys`, `gc`, `marshal`, `inspect`, `typing`, `signal`, `atexit`
+
+**Data & Math**: `math`, `itertools`, `collections`, `re`, `functools`, `fnmatch`
+
+**I/O & System**: `io`, `time`, `os`, `nt`, `errno`, `json`
+
+**Cryptography & Random**: `_sha2`, `_random`, `_secrets`
+
+**Internals**: `_abc`, `_ast`, `_codecs`, `_contextvars`, `_imp`, `_string`, `_struct`, `_thread`, `_tokenize`, `_warnings`, `_weakref`, `weakref`
+
+**Windows**: `nt`, `winreg`, `_winapi`
+
+</details>
+
+Modules like `os`, `os.path`, `json`, and `functools` can prefer filesystem-backed CPython source when it improves correctness. The import system supports frozen source modules, enabling the AOT pipeline to bundle code without runtime filesystem access.
+
+---
 
 ## Building
 
 ### Prerequisites
 
-- **Rust 1.85+** (2024 Edition)
-- **x64 architecture** (primary), ARM64 backend in progress
+- **Rust 1.85+** (2024 edition)
+- **x86-64** target (primary platform; ARM64 backend is in progress)
+- *Optional*: CPython 3.12 source checkout for `prism-test`
 
-### Build
+### Build, Test, Bench
 
 ```bash
-# Debug build
-cargo build --workspace
-
-# Release build (recommended for benchmarking)
-cargo build --workspace --release
-
-# Run tests
-cargo test --workspace
+cargo build --workspace            # Debug build
+cargo build --workspace --release  # Optimized build (LTO + single codegen unit)
+cargo test  --workspace            # Run test suite
+cargo bench --workspace            # Criterion benchmarks
 ```
+
+Benchmarks cover JIT speedup, GC pause times, deoptimization/OSR, speculation, string operations, hidden-class shapes, and small-integer caching.
+
+---
 
 ## Project Status
 
-Prism is under active development. Current status:
+Prism is under **active development**. The runtime is architecturally complete—parser through JIT—and runs meaningful end-to-end Python programs. Compatibility work continues across the broader standard library and CPython edge-case semantics.
 
-| Component | Status | Tests |
-|:----------|:-------|------:|
-| Parser | ✅ Complete | 167 |
-| Compiler | ✅ Complete | 693 |
-| Core Types & Values | ✅ Complete | 244 |
-| VM & Interpreter | ✅ Complete | 3,927 |
-| Object System (Shapes) | ✅ Complete | — |
-| Descriptor Protocol | ✅ Complete | — |
-| Pattern Matching | ✅ Complete | — |
-| Exception Handling | ✅ Complete | — |
-| JIT Tier 1 & 2 | ✅ Complete | 2,967 |
-| SIMD Backend (AVX2/AVX-512) | ✅ Complete | — |
-| Garbage Collector | ✅ Complete | 84 |
-| Runtime Types | ✅ Complete | 789 |
+**What works today:**
+- Full Python 3.12 syntax (comprehensions, pattern matching, async/await, f-strings, decorators, metaclasses, generators, `yield from`)
+- Tiered execution from interpreter through optimizing JIT
+- Generational GC with write barriers and JIT safepoints
+- 40+ native stdlib modules
+- AOT build planning with frozen-module bundling
+- CPython compatibility testing harness
 
-**Total test coverage: 8,800+ tests**
+**What's in progress:**
+- Broader CPython stdlib coverage and behavioral edge cases
+- ARM64 JIT backend
+- Concurrent GC marking
+- Standalone executable packaging from the AOT pipeline
+
+For the most current picture of runtime behavior, see the integration tests in [`prism_vm/tests`](prism_vm/tests), CLI tests in [`prism_cli`](prism_cli/src/cpython_tests.rs), and the `prism-test` harness for CPython regression tracking.
+
+---
 
 ## License
 
 Licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
 
 at your option.
+
+## Contributing
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.
