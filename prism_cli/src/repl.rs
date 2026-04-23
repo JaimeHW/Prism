@@ -111,34 +111,21 @@ pub fn run_repl(config: &RuntimeConfig) -> ExitCode {
 
 /// Execute a single REPL input, displaying results or errors.
 fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine, config: &RuntimeConfig) {
-    // Parse.
-    let module = match prism_parser::parse(source) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{}", e);
-            return;
-        }
-    };
-
-    // Compile.
-    let optimize = match config.optimize {
-        crate::args::OptimizationLevel::None => prism_compiler::OptimizationLevel::None,
-        crate::args::OptimizationLevel::Basic => prism_compiler::OptimizationLevel::Basic,
-        crate::args::OptimizationLevel::Full => prism_compiler::OptimizationLevel::Full,
-    };
-    let code = match prism_compiler::Compiler::compile_module_with_optimization(
-        &module, "<stdin>", optimize,
-    ) {
+    let optimize = crate::pipeline::compiler_optimization_level(config.optimize);
+    let code = match prism_compiler::compile_source_code(source, "<stdin>", optimize) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("SyntaxError: {}", e.message);
+            eprint!(
+                "{}",
+                crate::error::format_source_compile_error_string(&e, Some(source), "<stdin>")
+            );
             return;
         }
     };
 
     // Execute.
-    let code = Arc::new(code);
-    match vm.execute(code) {
+    let main_module = repl_main_module(vm);
+    match vm.execute_in_module(code, main_module) {
         Ok(result) => {
             // Display non-None results (matching CPython REPL behavior).
             if !result.is_none() {
@@ -149,6 +136,21 @@ fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine, config: &
             eprintln!("{}", e);
         }
     }
+}
+
+fn repl_main_module(vm: &mut prism_vm::VirtualMachine) -> Arc<prism_vm::import::ModuleObject> {
+    if let Some(module) = vm.import_resolver.get_cached("__main__") {
+        return module;
+    }
+
+    let module = Arc::new(prism_vm::import::ModuleObject::with_metadata(
+        Arc::from("__main__"),
+        None,
+        Some(Arc::from("<stdin>")),
+        Some(Arc::from("")),
+    ));
+    vm.bind_module(Arc::clone(&module));
+    module
 }
 
 /// Check if a line needs continuation (starts a compound statement).
@@ -418,5 +420,27 @@ mod tests {
         let mut vm = prism_vm::VirtualMachine::new();
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
         execute_repl_input("def foo():\n    return 42\n\n", &mut vm, &config);
+    }
+
+    #[test]
+    fn test_execute_repl_preserves_main_module_state_between_inputs() {
+        let mut vm = prism_vm::VirtualMachine::new();
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+
+        execute_repl_input("x = 41\n", &mut vm, &config);
+        execute_repl_input("y = x + 1\n", &mut vm, &config);
+
+        let main = vm
+            .import_resolver
+            .get_cached("__main__")
+            .expect("repl should cache a persistent __main__ module");
+        assert_eq!(
+            main.get_attr("x").and_then(|value| value.as_int()),
+            Some(41)
+        );
+        assert_eq!(
+            main.get_attr("y").and_then(|value| value.as_int()),
+            Some(42)
+        );
     }
 }

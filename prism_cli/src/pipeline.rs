@@ -179,29 +179,23 @@ fn execute_source_entry(
     search_paths: &[PathBuf],
     main_module: ModuleExecutionSpec,
 ) -> ExitCode {
-    // Phase 1: Parse.
-    let module = match prism_parser::parse(source) {
-        Ok(m) => m,
-        Err(e) => {
-            return error::format_prism_error(&e, Some(source), main_module.filename.as_ref());
-        }
-    };
-
-    // Phase 2: Compile.
     let optimize = compiler_optimization_level(config.optimize);
-    let code = match prism_compiler::Compiler::compile_module_with_optimization(
-        &module,
+    let code = match prism_compiler::compile_source_code(
+        source,
         main_module.filename.as_ref(),
         optimize,
     ) {
         Ok(c) => c,
         Err(e) => {
-            return error::format_compile_error(&e, Some(source), main_module.filename.as_ref());
+            return error::format_source_compile_error(
+                &e,
+                Some(source),
+                main_module.filename.as_ref(),
+            );
         }
     };
 
-    // Phase 3: Execute.
-    let code = Arc::new(code);
+    // Phase 2: Execute.
     let mut vm = if config.jit_enabled() {
         prism_vm::VirtualMachine::with_jit()
     } else {
@@ -291,7 +285,9 @@ fn build_module_argv(module_path: &Path, script_args: &[String]) -> Vec<String> 
 }
 
 #[inline]
-fn compiler_optimization_level(level: CliOptimizationLevel) -> prism_compiler::OptimizationLevel {
+pub(crate) fn compiler_optimization_level(
+    level: CliOptimizationLevel,
+) -> prism_compiler::OptimizationLevel {
     match level {
         CliOptimizationLevel::None => prism_compiler::OptimizationLevel::None,
         CliOptimizationLevel::Basic => prism_compiler::OptimizationLevel::Basic,

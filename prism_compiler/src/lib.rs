@@ -46,6 +46,7 @@ pub mod exception_compiler;
 pub mod function_compiler;
 pub mod match_compiler;
 pub mod scope;
+pub mod source;
 
 // Re-export main types
 pub use bytecode::{
@@ -53,7 +54,12 @@ pub use bytecode::{
     InstructionFormat, Label, LineTableEntry, LocalSlot, Opcode, Register, disassemble,
 };
 pub use class_compiler::{ClassCompiler, ClassInfo};
-pub use compiler::{Compiler, ModuleNamespaceMode, OptimizationLevel};
+pub use compiler::{CompileError, Compiler, ModuleNamespaceMode, OptimizationLevel};
 pub use function_compiler::{
     ClosureInfo, FunctionContext, VarLocation, VariableEmitter, VariableResolver,
+};
+pub use source::{
+    SourceCompilation, SourceCompileError, compile_source_code,
+    compile_source_code_with_namespace_mode, compile_source_module,
+    compile_source_module_with_namespace_mode,
 };

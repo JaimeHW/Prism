@@ -23,10 +23,9 @@ use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
 use prism_code::CodeObject;
-use prism_compiler::OptimizationLevel;
+use prism_compiler::{OptimizationLevel, compile_source_code};
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
-use prism_parser::parse as parse_module_source;
 use prism_runtime::allocation_context::RuntimeHeapBinding;
 use prism_runtime::object::class::ClassDict;
 use std::collections::HashMap;
@@ -427,16 +426,8 @@ impl VirtualMachine {
         source: &str,
         filename: &str,
     ) -> VmResult<Arc<CodeObject>> {
-        let parsed = parse_module_source(source)
-            .map_err(|err| RuntimeError::import_error(module_name, Arc::from(err.to_string())))?;
-
-        prism_compiler::Compiler::compile_module_with_optimization(
-            &parsed,
-            filename,
-            self.compiler_optimization,
-        )
-        .map(Arc::new)
-        .map_err(|err| RuntimeError::import_error(module_name, Arc::from(err.to_string())))
+        compile_source_code(source, filename, self.compiler_optimization)
+            .map_err(|err| RuntimeError::import_error(module_name, Arc::from(err.to_string())))
     }
 
     fn run_nested_module_until_depth(&mut self, stop_depth: usize) -> VmResult<()> {

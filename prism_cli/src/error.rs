@@ -126,6 +126,37 @@ pub fn format_compile_error_string(
     }
 }
 
+/// Format a high-level source compilation error to stderr.
+pub fn format_source_compile_error(
+    error: &prism_compiler::SourceCompileError,
+    source: Option<&str>,
+    filename: &str,
+) -> ExitCode {
+    let output = format_source_compile_error_string(error, source, filename);
+    eprint!("{}", output);
+    ExitCode::from(EXIT_ERROR)
+}
+
+/// Format a high-level source compilation error into a string.
+pub fn format_source_compile_error_string(
+    error: &prism_compiler::SourceCompileError,
+    source: Option<&str>,
+    filename: &str,
+) -> String {
+    if let Some(parse_error) = error.as_parse_error() {
+        format_error_string(parse_error, source, filename)
+    } else if let Some(compile_error) = error.as_compile_error() {
+        format_compile_error_string(compile_error, source, filename)
+    } else {
+        format!(
+            "{}\n  File \"{}\"\nSyntaxError: {}\n",
+            diagnostics::render_traceback_header(),
+            filename,
+            error,
+        )
+    }
+}
+
 /// Map a `PrismError` to its exit code.
 #[inline]
 fn exit_code_for_error(error: &PrismError) -> ExitCode {
@@ -286,6 +317,27 @@ mod tests {
         let output = format_compile_error_string(&err, None, "test.py");
         assert!(output.contains("File \"test.py\", line 5"));
         assert!(output.contains("SyntaxError: unknown error"));
+    }
+
+    #[test]
+    fn test_format_source_compile_error_string_for_parse_error() {
+        let err = prism_compiler::SourceCompileError::Parse(PrismError::syntax(
+            "unexpected EOF",
+            Span::new(0, 1),
+        ));
+        let output = format_source_compile_error_string(&err, Some("def"), "test.py");
+        assert!(output.contains("SyntaxError: unexpected EOF"));
+    }
+
+    #[test]
+    fn test_format_source_compile_error_string_for_compile_error() {
+        let err = prism_compiler::SourceCompileError::Compile(prism_compiler::CompileError {
+            message: "continue outside loop".to_string(),
+            line: 1,
+            column: 0,
+        });
+        let output = format_source_compile_error_string(&err, Some("continue"), "test.py");
+        assert!(output.contains("SyntaxError: continue outside loop"));
     }
 
     // =========================================================================
