@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use prism_compiler::{Compiler, OptimizationLevel};
-use prism_vm::stdlib::StdlibRegistry;
+use prism_compiler::{OptimizationLevel, SourceCompileError, compile_source_module};
 
 use crate::bundle::CodeImage;
 use crate::error::AotError;
@@ -125,7 +124,6 @@ impl BuildPlan {
 /// Planner for Prism's whole-program native build pipeline.
 pub struct BuildPlanner {
     options: BuildOptions,
-    stdlib: StdlibRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,10 +148,7 @@ struct ResolvedEntry {
 impl BuildPlanner {
     /// Create a new planner with explicit build options.
     pub fn new(options: BuildOptions) -> Self {
-        Self {
-            options,
-            stdlib: StdlibRegistry::new(),
-        }
+        Self { options }
     }
 
     /// Plan a whole-program build from the provided entrypoint.
@@ -180,7 +175,7 @@ impl BuildPlanner {
                 continue;
             }
 
-            if self.stdlib.contains(&module_name) {
+            if prism_stdlib::is_native_stdlib_module(&module_name) {
                 planned_modules.insert(
                     module_name.clone(),
                     PlannedModule {
@@ -401,25 +396,28 @@ impl BuildPlanner {
             path: resolved.path.clone(),
             message: err.to_string(),
         })?;
-        let parsed = prism_parser::parse(&source).map_err(|err| AotError::Parse {
-            module: resolved.module_name.clone(),
-            path: resolved.path.clone(),
-            message: err.to_string(),
-        })?;
-        let code = Compiler::compile_module_with_optimization(
-            &parsed,
+        let compilation = compile_source_module(
+            &source,
             &resolved.path.display().to_string(),
             self.options.optimize,
         )
-        .map_err(|err| AotError::Compile {
-            module: resolved.module_name.clone(),
-            path: resolved.path.clone(),
-            message: err.to_string(),
+        .map_err(|err| match err {
+            SourceCompileError::Parse(err) => AotError::Parse {
+                module: resolved.module_name.clone(),
+                path: resolved.path.clone(),
+                message: err.to_string(),
+            },
+            SourceCompileError::Compile(err) => AotError::Compile {
+                module: resolved.module_name.clone(),
+                path: resolved.path.clone(),
+                message: err.to_string(),
+            },
         })?;
-        let static_imports = collect_static_imports(&parsed, &resolved.package_name)?;
-        let code_image = CodeImage::from_code_object(&resolved.module_name, &code)?;
+        let static_imports = collect_static_imports(&compilation.module, &resolved.package_name)?;
+        let code_image =
+            CodeImage::from_code_object(&resolved.module_name, compilation.code.as_ref())?;
         let (native_init, native_init_diagnostic) =
-            match NativeModuleInitPlan::lower(&resolved.module_name, &parsed) {
+            match NativeModuleInitPlan::lower(&resolved.module_name, &compilation.module) {
                 Ok(plan) => (Some(plan), None),
                 Err(err) => (None, Some(err.to_string())),
             };
@@ -430,9 +428,9 @@ impl BuildPlanner {
             source_path: Some(resolved.path.clone()),
             package_name: resolved.package_name.clone(),
             is_package: resolved.is_package,
-            instruction_count: Some(code.instructions.len()),
-            constant_count: Some(code.constants.len()),
-            nested_code_object_count: Some(code.nested_code_objects.len()),
+            instruction_count: Some(compilation.code.instructions.len()),
+            constant_count: Some(compilation.code.constants.len()),
+            nested_code_object_count: Some(compilation.code.nested_code_objects.len()),
             static_imports: static_imports.required_modules,
             from_import_candidates: static_imports.from_import_candidates,
             code_image: Some(code_image),
@@ -456,7 +454,7 @@ impl BuildPlanner {
     }
 
     fn module_exists(&self, module: &str, search_paths: &[PathBuf]) -> bool {
-        self.stdlib.contains(module)
+        prism_stdlib::is_native_stdlib_module(module)
             || self
                 .resolve_dependency_in_paths(module, search_paths)
                 .is_some()

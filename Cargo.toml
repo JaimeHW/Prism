@@ -6,11 +6,11 @@ members = [
     "prism_core",
     "prism_parser",
     "prism_compiler",
+    "prism_stdlib",
     "prism_gc",
     "prism_vm",
     "prism_jit",
     "prism_runtime",
-    "prism_builtins",
     "prism_cli",
 ]
 
@@ -29,10 +29,10 @@ prism_code = { path = "prism_code" }
 prism_gc = { path = "prism_gc" }
 prism_parser = { path = "prism_parser" }
 prism_compiler = { path = "prism_compiler" }
+prism_stdlib = { path = "prism_stdlib" }
 prism_vm = { path = "prism_vm" }
 prism_jit = { path = "prism_jit" }
 prism_runtime = { path = "prism_runtime" }
-prism_builtins = { path = "prism_builtins" }
 prism_aot = { path = "prism_aot" }
 
 # External dependencies
