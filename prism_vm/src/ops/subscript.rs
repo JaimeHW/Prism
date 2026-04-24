@@ -16,8 +16,9 @@ use crate::ops::calls::{
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
-    list_storage_mut_from_ptr, list_storage_ref_from_ptr,
+    list_storage_mut_from_ptr, list_storage_ref_from_ptr, tuple_storage_ref_from_ptr,
 };
+use num_traits::ToPrimitive;
 use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
@@ -26,9 +27,11 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{GenericAliasObject, MappingProxyObject};
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::memoryview::MemoryViewObject;
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -242,11 +245,21 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
-        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+        let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+
+        if has_builtin_sequence_layout && let Some(list) = list_storage_ref_from_ptr(ptr) {
             if let Some(value) = list.get(index) {
                 return Ok(Some(SubscriptResult::Value(value)));
             }
             let len = list.len();
+            return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
+        }
+
+        if has_builtin_sequence_layout && let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            if let Some(value) = tuple.get(index) {
+                return Ok(Some(SubscriptResult::Value(value)));
+            }
+            let len = tuple.len();
             return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
         }
 
@@ -261,12 +274,17 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
                 let len = bytes.len();
                 return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
             }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                if let Some(value) = tuple.get(index) {
+            TypeId::MEMORYVIEW => {
+                let view = unsafe { &*(ptr as *const MemoryViewObject) };
+                if view.released() {
+                    return Err(ControlFlow::Error(RuntimeError::value_error(
+                        "operation forbidden on released memoryview object",
+                    )));
+                }
+                if let Some(value) = view.get(index) {
                     return Ok(Some(SubscriptResult::Value(value)));
                 }
-                let len = tuple.len();
+                let len = view.len();
                 return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
             }
             TypeId::STR => {
@@ -310,9 +328,16 @@ fn subscr_slice(
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
-        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+        let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+
+        if has_builtin_sequence_layout && let Some(list) = list_storage_ref_from_ptr(ptr) {
             let result = list_slice(list, slice);
             return Ok(Some(SubscriptResult::AllocList(result)));
+        }
+
+        if has_builtin_sequence_layout && let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            let result = tuple_slice(tuple, slice);
+            return Ok(Some(SubscriptResult::AllocTuple(result)));
         }
 
         match header.type_id {
@@ -321,10 +346,16 @@ fn subscr_slice(
                 let result = bytes.slice(slice);
                 return Ok(Some(SubscriptResult::AllocBytes(result)));
             }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                let result = tuple_slice(tuple, slice);
-                return Ok(Some(SubscriptResult::AllocTuple(result)));
+            TypeId::MEMORYVIEW => {
+                let view = unsafe { &*(ptr as *const MemoryViewObject) };
+                if view.released() {
+                    return Err(ControlFlow::Error(RuntimeError::value_error(
+                        "operation forbidden on released memoryview object",
+                    )));
+                }
+                let result = view.slice(slice);
+                let value = Value::object_ptr(Box::into_raw(Box::new(result)) as *const ());
+                return Ok(Some(SubscriptResult::Value(value)));
             }
             TypeId::STR => {
                 let string = unsafe { &*(ptr as *const StringObject) };
@@ -453,6 +484,46 @@ fn string_slice_str(string: &str, slice: &SliceObject) -> StringObject {
     StringObject::from_string(result)
 }
 
+#[inline]
+fn bytearray_assignment_byte(value: Value) -> Result<u8, RuntimeError> {
+    let integer = if let Some(flag) = value.as_bool() {
+        if flag { 1 } else { 0 }
+    } else {
+        value_to_bigint(value)
+            .and_then(|integer| integer.to_i64())
+            .ok_or_else(|| RuntimeError::type_error("an integer is required"))?
+    };
+
+    u8::try_from(integer).map_err(|_| RuntimeError::value_error("byte must be in range(0, 256)"))
+}
+
+fn bytearray_replacement_bytes(value: Value) -> Result<Vec<u8>, RuntimeError> {
+    if let Some(bytes) = value_as_bytes_ref(value) {
+        return Ok(bytes.to_vec());
+    }
+
+    if let Some(ptr) = value.as_object_ptr() {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        if header.type_id == TypeId::MEMORYVIEW {
+            let view = unsafe { &*(ptr as *const MemoryViewObject) };
+            if view.released() {
+                return Err(RuntimeError::value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            return Ok(view.to_vec());
+        }
+    }
+
+    let mut iterator =
+        value_to_iterator(&value).map_err(|err| RuntimeError::type_error(err.to_string()))?;
+    iterator
+        .collect_remaining()
+        .into_iter()
+        .map(bytearray_assignment_byte)
+        .collect()
+}
+
 // =============================================================================
 // StoreSubscr: container[key] = value
 // =============================================================================
@@ -505,6 +576,35 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
 
         match header.type_id {
+            TypeId::BYTEARRAY => {
+                let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
+                if let Some(index) = key.as_int() {
+                    let byte = match bytearray_assignment_byte(value) {
+                        Ok(byte) => byte,
+                        Err(err) => return ControlFlow::Error(err),
+                    };
+                    if bytes.set(index, byte) {
+                        return ControlFlow::Continue;
+                    }
+                    let len = bytes.len();
+                    return ControlFlow::Error(RuntimeError::index_error(index, len));
+                }
+
+                if let Some(slice) = slice_from_value(key) {
+                    let replacement = match bytearray_replacement_bytes(value) {
+                        Ok(bytes) => bytes,
+                        Err(err) => return ControlFlow::Error(err),
+                    };
+                    return match bytes.assign_slice(slice, &replacement) {
+                        Ok(()) => ControlFlow::Continue,
+                        Err(err) => ControlFlow::Error(RuntimeError::value_error(err.to_string())),
+                    };
+                }
+
+                return ControlFlow::Error(RuntimeError::type_error(
+                    "bytearray indices must be integers or slices",
+                ));
+            }
             TypeId::DICT => {
                 // Dict[key] = value
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
@@ -727,6 +827,7 @@ mod tests {
     use prism_core::intern::intern;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::mro::ClassId;
+    use prism_runtime::object::shape::Shape;
     use prism_runtime::object::shaped_object::ShapedObject;
     use prism_runtime::object::type_builtins::{
         SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
@@ -760,6 +861,15 @@ mod tests {
         let ptr = Box::into_raw(Box::new(ShapedObject::new_dict_backed(
             class.class_type_id(),
             class.instance_shape().clone(),
+        )));
+        (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn tuple_backed_object_value(items: &[Value]) -> (*mut ShapedObject, Value) {
+        let ptr = Box::into_raw(Box::new(ShapedObject::new_tuple_backed(
+            TypeId::OBJECT,
+            Shape::empty(),
+            TupleObject::from_slice(items),
         )));
         (ptr, Value::object_ptr(ptr as *const ()))
     }
@@ -891,6 +1001,53 @@ mod tests {
         assert_eq!(result.get(0).unwrap().as_int(), Some(3));
         assert_eq!(result.get(1).unwrap().as_int(), Some(2));
         assert_eq!(result.get(2).unwrap().as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_tuple_backed_object_integer_subscript() {
+        let (ptr, value) = tuple_backed_object_value(&[
+            Value::int_unchecked(10),
+            Value::int_unchecked(20),
+            Value::int_unchecked(30),
+        ]);
+
+        let result = subscr_integer(value, -1).expect("tuple-backed object should index");
+        match result {
+            Some(SubscriptResult::Value(value)) => assert_eq!(value.as_int(), Some(30)),
+            Some(_) => panic!("expected direct tuple item result"),
+            None => panic!("expected tuple-backed integer fast path"),
+        }
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_tuple_backed_object_slice_subscript() {
+        let (ptr, value) = tuple_backed_object_value(&[
+            Value::int_unchecked(0),
+            Value::int_unchecked(1),
+            Value::int_unchecked(2),
+            Value::int_unchecked(3),
+        ]);
+        let slice = SliceObject::full(1, 4, 2);
+
+        let result = subscr_slice(value, &slice).expect("tuple-backed object should slice");
+        match result {
+            Some(SubscriptResult::AllocTuple(tuple)) => {
+                assert_eq!(
+                    tuple.as_slice(),
+                    &[Value::int_unchecked(1), Value::int_unchecked(3)]
+                );
+            }
+            Some(_) => panic!("expected allocated tuple slice"),
+            None => panic!("expected tuple-backed slice fast path"),
+        }
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
     }
 
     // ==========================================================================
@@ -1172,6 +1329,91 @@ mod tests {
                 Value::int_unchecked(3),
             ]
         );
+    }
+
+    #[test]
+    fn test_store_subscr_updates_bytearray_index_and_slice() {
+        let mut vm = VirtualMachine::new();
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
+        vm.push_frame(code, 0).expect("frame push failed");
+
+        let bytearray = BytesObject::bytearray_from_slice(b"MYAAAAAA");
+        let bytearray_ptr = Box::leak(Box::new(bytearray)) as *mut BytesObject as *const ();
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(bytearray_ptr));
+        vm.current_frame_mut().set_reg(2, Value::int_unchecked(90));
+        vm.current_frame_mut().set_reg(3, Value::int_unchecked(0));
+
+        let item_inst = Instruction::op_dss(
+            Opcode::SetItem,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(
+            store_subscr(&mut vm, item_inst),
+            ControlFlow::Continue
+        ));
+
+        let slice = SliceObject::new(Some(-6), None, None);
+        let slice_ptr = Box::leak(Box::new(slice)) as *mut SliceObject as *const ();
+        let replacement = BytesObject::from_slice(b"======");
+        let replacement_ptr = Box::leak(Box::new(replacement)) as *mut BytesObject as *const ();
+        vm.current_frame_mut()
+            .set_reg(2, Value::object_ptr(replacement_ptr));
+        vm.current_frame_mut()
+            .set_reg(3, Value::object_ptr(slice_ptr));
+
+        let slice_inst = Instruction::op_dss(
+            Opcode::SetItem,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        assert!(matches!(
+            store_subscr(&mut vm, slice_inst),
+            ControlFlow::Continue
+        ));
+
+        let stored = unsafe { &*(bytearray_ptr as *const BytesObject) };
+        assert_eq!(stored.as_bytes(), b"ZY======");
+    }
+
+    #[test]
+    fn test_store_subscr_rejects_mismatched_bytearray_extended_slice_assignment() {
+        let mut vm = VirtualMachine::new();
+        let code = std::sync::Arc::new(prism_code::CodeObject::new("store", "<test>"));
+        vm.push_frame(code, 0).expect("frame push failed");
+
+        let bytearray = BytesObject::bytearray_from_slice(b"abcdef");
+        let bytearray_ptr = Box::leak(Box::new(bytearray)) as *mut BytesObject as *const ();
+        let slice = SliceObject::full(0, 6, 2);
+        let slice_ptr = Box::leak(Box::new(slice)) as *mut SliceObject as *const ();
+        let replacement = BytesObject::from_slice(b"xy");
+        let replacement_ptr = Box::leak(Box::new(replacement)) as *mut BytesObject as *const ();
+
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(bytearray_ptr));
+        vm.current_frame_mut()
+            .set_reg(2, Value::object_ptr(replacement_ptr));
+        vm.current_frame_mut()
+            .set_reg(3, Value::object_ptr(slice_ptr));
+
+        let inst = Instruction::op_dss(
+            Opcode::SetItem,
+            Register::new(3),
+            Register::new(1),
+            Register::new(2),
+        );
+        match store_subscr(&mut vm, inst) {
+            ControlFlow::Error(error) => match error.kind {
+                crate::error::RuntimeErrorKind::ValueError { ref message } => {
+                    assert!(message.contains("extended slice"));
+                }
+                other => panic!("expected ValueError, got {:?}", other),
+            },
+            other => panic!("expected error, got {:?}", other),
+        }
     }
 
     #[test]

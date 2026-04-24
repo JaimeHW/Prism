@@ -32,7 +32,7 @@ use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::class::{MethodSlot, PyClassObject};
 use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -92,11 +92,8 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
         let type_id = extract_type_id(ptr);
 
-        if type_id == TypeId::TYPE {
-            return match resolve_method(vm, obj, type_id, &name) {
-                Ok(cached) => apply_cached_method(vm, dst, obj, cached),
-                Err(e) => ControlFlow::Error(e),
-            };
+        if matches!(type_id, TypeId::TYPE | TypeId::EXCEPTION_TYPE) {
+            return load_runtime_attribute(vm, dst, obj, &name);
         }
 
         if type_id == TypeId::OBJECT {
@@ -123,6 +120,9 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         let name_ptr = name.as_ptr() as u64;
         let cache_version = method_cache_version(type_id);
         if let Some(cached) = method_cache().get(type_id, name_ptr, cache_version) {
+            if type_id.raw() >= TypeId::FIRST_USER_TYPE && cached.is_descriptor {
+                return load_runtime_attribute(vm, dst, obj, &name);
+            }
             return apply_cached_method(vm, dst, obj, cached);
         }
 
@@ -130,7 +130,11 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             return match resolve_user_defined_method(obj, type_id, &name) {
                 Ok(cached) => {
                     method_cache().insert(type_id, name_ptr, cache_version, cached);
-                    apply_cached_method(vm, dst, obj, cached)
+                    if cached.is_descriptor {
+                        load_runtime_attribute(vm, dst, obj, &name)
+                    } else {
+                        apply_cached_method(vm, dst, obj, cached)
+                    }
                 }
                 Err(err)
                     if matches!(
@@ -155,7 +159,7 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
 
         // Slow path: resolve method through type system
-        match resolve_method(vm, obj, type_id, &name) {
+        match resolve_method(obj, type_id, &name) {
             Ok(cached) => {
                 // Populate cache for future calls
                 method_cache().insert(type_id, name_ptr, cache_version, cached);
@@ -189,7 +193,7 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
 
         // Resolve method on primitive type
-        match resolve_primitive_method(vm, obj, prim_type_id, &name) {
+        match resolve_primitive_method(obj, prim_type_id, &name) {
             Ok(cached) => {
                 method_cache().insert(prim_type_id, name_ptr, cache_version, cached);
                 apply_cached_method(vm, dst, obj, cached)
@@ -265,28 +269,41 @@ fn apply_bound_method_target(
     ControlFlow::Continue
 }
 
+#[inline]
+fn load_runtime_attribute(vm: &mut VirtualMachine, dst: u8, obj: Value, name: &str) -> ControlFlow {
+    match get_attribute_value(vm, obj, &intern(name)) {
+        Ok(value) => apply_bound_method_target(
+            vm,
+            dst,
+            BoundMethodTarget {
+                callable: value,
+                implicit_self: None,
+            },
+        ),
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
 pub(crate) fn resolve_special_method(
     obj: Value,
     name: &str,
 ) -> Result<BoundMethodTarget, RuntimeError> {
-    let ptr = obj
-        .as_object_ptr()
-        .ok_or_else(|| RuntimeError::attribute_error(obj.type_name(), name))?;
-    let type_id = extract_type_id(ptr);
-
-    let cached = match type_id {
-        TypeId::TYPE => resolve_type_object_special_method(obj, name)?,
-        TypeId::OBJECT => resolve_object_instance_method(obj, name)?,
-        _ if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
-            if let Some(cached) = resolve_user_defined_instance_method(obj, name) {
-                cached
-            } else {
+    if let Some(ptr) = obj.as_object_ptr() {
+        let type_id = extract_type_id(ptr);
+        let cached = match type_id {
+            TypeId::TYPE | TypeId::EXCEPTION_TYPE => resolve_type_object_special_method(obj, name)?,
+            TypeId::SUPER => resolve_super_method(obj, name)?,
+            _ if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
                 resolve_user_defined_method(obj, type_id, name)?
             }
-        }
-        _ => return Err(RuntimeError::attribute_error(type_id.name(), name)),
-    };
+            _ => resolve_method(obj, type_id, name)?,
+        };
 
+        return Ok(bind_cached_method_target(obj, cached));
+    }
+
+    let type_id = get_primitive_type_id(obj);
+    let cached = resolve_primitive_method(obj, type_id, name)?;
     Ok(bind_cached_method_target(obj, cached))
 }
 
@@ -367,10 +384,32 @@ fn cached_method_from_value(value: Value) -> CachedMethod {
     };
 
     match extract_type_id(ptr) {
-        TypeId::FUNCTION | TypeId::CLOSURE | TypeId::BUILTIN_FUNCTION => {
-            CachedMethod::simple(value)
-        }
+        // Only Python function objects participate in method binding when
+        // stored directly in a Python class dictionary. Plain builtin function
+        // objects must stay unbound here so callbacks like
+        // `re.compile(...).match` and class attributes such as `helper = len`
+        // keep their original call signatures.
+        TypeId::FUNCTION | TypeId::CLOSURE => CachedMethod::simple(value),
         _ => CachedMethod::descriptor(value),
+    }
+}
+
+#[inline]
+fn cached_method_from_user_class_slot(slot: MethodSlot) -> CachedMethod {
+    let Some(ptr) = slot.value.as_object_ptr() else {
+        return CachedMethod::descriptor(slot.value);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => CachedMethod::simple(slot.value),
+        TypeId::BUILTIN_FUNCTION
+            if slot.defining_class.0 >= TypeId::FIRST_USER_TYPE
+                && global_class(slot.defining_class)
+                    .is_some_and(|class| class.is_native_heaptype()) =>
+        {
+            CachedMethod::simple(slot.value)
+        }
+        _ => CachedMethod::descriptor(slot.value),
     }
 }
 
@@ -410,17 +449,14 @@ fn resolve_user_defined_instance_method(obj: Value, name: &str) -> Option<Cached
 }
 
 /// Resolve a method on a heap object by traversing its type's MRO.
-fn resolve_method(
-    vm: &VirtualMachine,
-    obj: Value,
-    type_id: TypeId,
-    name: &str,
-) -> Result<CachedMethod, RuntimeError> {
+fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMethod, RuntimeError> {
     // For dict objects, check __dict__ first
     // TODO: Implement full MRO traversal when type system is complete
 
     // Check for builtin methods based on type
     match type_id {
+        TypeId::OBJECT => super::resolve_builtin_instance_method(TypeId::OBJECT, name)
+            .ok_or_else(|| RuntimeError::attribute_error("object", name)),
         TypeId::DEQUE => resolve_deque_method(name),
         TypeId::REGEX_PATTERN => resolve_regex_pattern_method(name),
         TypeId::REGEX_MATCH => resolve_regex_match_method(name),
@@ -429,6 +465,8 @@ fn resolve_method(
         TypeId::MAPPING_PROXY => resolve_mapping_proxy_method(name),
         TypeId::BYTES => resolve_bytes_method(name),
         TypeId::BYTEARRAY => resolve_bytearray_method(name),
+        TypeId::MEMORYVIEW => builtin_methods::resolve_memoryview_method(name)
+            .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
         TypeId::PROPERTY => resolve_property_method(name),
         TypeId::ITERATOR => builtin_methods::resolve_iterator_method(name)
             .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
@@ -440,6 +478,10 @@ fn resolve_method(
         TypeId::FLOAT => resolve_float_method(name),
         TypeId::GENERATOR => resolve_generator_method(name),
         TypeId::FUNCTION | TypeId::CLOSURE => resolve_function_method(name),
+        TypeId::CLASSMETHOD | TypeId::STATICMETHOD => {
+            super::resolve_builtin_instance_method(type_id, name)
+                .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name))
+        }
         TypeId::TYPE => resolve_type_object_method(obj, name),
         _ if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
             resolve_user_defined_method(obj, type_id, name)
@@ -496,7 +538,6 @@ fn resolve_type_object_method(obj: Value, name: &str) -> Result<CachedMethod, Ru
 
 /// Resolve a method on a primitive value.
 fn resolve_primitive_method(
-    _vm: &VirtualMachine,
     obj: Value,
     type_id: TypeId,
     name: &str,
@@ -639,13 +680,8 @@ fn resolve_bytearray_method(name: &str) -> Result<CachedMethod, RuntimeError> {
 
 /// Resolve builtin tuple methods.
 fn resolve_tuple_method(name: &str) -> Result<CachedMethod, RuntimeError> {
-    match name {
-        "count" | "index" => Err(RuntimeError::attribute_error(
-            "tuple",
-            format!("{} (not yet implemented)", name),
-        )),
-        _ => Err(RuntimeError::attribute_error("tuple", name)),
-    }
+    builtin_methods::resolve_tuple_method(name)
+        .ok_or_else(|| RuntimeError::attribute_error("tuple", name))
 }
 
 /// Resolve builtin str methods.
@@ -698,6 +734,10 @@ fn resolve_set_method(type_id: TypeId, name: &str) -> Result<CachedMethod, Runti
 
 /// Resolve builtin int methods.
 fn resolve_int_method(name: &str) -> Result<CachedMethod, RuntimeError> {
+    if let Some(cached) = builtin_methods::resolve_int_method(name) {
+        return Ok(cached);
+    }
+
     match name {
         "bit_length" | "bit_count" | "to_bytes" | "from_bytes" | "conjugate" | "numerator"
         | "denominator" | "real" | "imag" => Err(RuntimeError::attribute_error(
@@ -778,7 +818,7 @@ fn resolve_user_defined_method(
     let interned_name = prism_core::intern::intern(name);
 
     if let Some(slot) = class.lookup_method_published(&interned_name) {
-        return Ok(cached_method_from_value(slot.value));
+        return Ok(cached_method_from_user_class_slot(slot));
     }
 
     for &class_id in class.mro().iter().skip(1) {
@@ -809,10 +849,13 @@ fn resolve_user_defined_method(
 mod tests {
     use super::*;
     use crate::VirtualMachine;
+    use crate::builtins::BuiltinFunctionObject;
     use crate::import::ModuleObject;
+    use crate::ops::method_dispatch::call_method::call_method;
     use prism_code::CodeObject;
     use prism_code::{Instruction, Opcode, Register};
     use prism_core::intern::intern;
+    use prism_runtime::object::class::ClassFlags;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::mro::ClassId;
     use prism_runtime::object::shape::shape_registry;
@@ -846,6 +889,32 @@ mod tests {
             None,
         ));
         let ptr = Box::into_raw(func);
+        (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn builtin_arg_count(args: &[Value]) -> Result<Value, crate::builtins::BuiltinError> {
+        Ok(Value::int(args.len() as i64).unwrap())
+    }
+
+    fn make_test_builtin_value(name: &str) -> (*mut BuiltinFunctionObject, Value) {
+        let builtin = Box::new(BuiltinFunctionObject::new(
+            Arc::from(name),
+            builtin_arg_count,
+        ));
+        let ptr = Box::into_raw(builtin);
+        (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn make_test_bound_builtin_value(
+        name: &str,
+        bound_self: Value,
+    ) -> (*mut BuiltinFunctionObject, Value) {
+        let builtin = Box::new(BuiltinFunctionObject::new_bound(
+            Arc::from(name),
+            builtin_arg_count,
+            bound_self,
+        ));
+        let ptr = Box::into_raw(builtin);
         (ptr, Value::object_ptr(ptr as *const ()))
     }
 
@@ -936,7 +1005,7 @@ mod tests {
     fn test_resolve_primitive_method_inherits_object_new_for_none() {
         let vm = vm_with_names(&[]);
 
-        let cached = resolve_primitive_method(&vm, Value::none(), TypeId::NONE, "__new__")
+        let cached = resolve_primitive_method(Value::none(), TypeId::NONE, "__new__")
             .expect("None should inherit object.__new__ for method calls");
         let method_ptr = cached
             .method
@@ -952,8 +1021,8 @@ mod tests {
 
     #[test]
     fn test_resolve_int_method_known() {
-        let result = resolve_int_method("bit_length");
-        assert!(result.is_err());
+        let result = resolve_int_method("to_bytes");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1325,6 +1394,101 @@ mod tests {
     }
 
     #[test]
+    fn test_load_method_does_not_share_type_object_cache_between_heap_classes() {
+        method_cache().clear();
+
+        let (first_ptr, first_value) = make_test_function_value("type_method_v1");
+        let (second_ptr, second_value) = make_test_function_value("type_method_v2");
+
+        let mut first = PyClassObject::new_simple(intern("TypeLoadOne"));
+        first.set_attr(intern("method"), first_value);
+        let first = register_test_class(first);
+
+        let mut second = PyClassObject::new_simple(intern("TypeLoadTwo"));
+        second.set_attr(intern("method"), second_value);
+        let second = register_test_class(second);
+
+        let mut vm = vm_with_names(&["method"]);
+        let inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(Arc::as_ptr(&first) as *const ()));
+        assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2), first_value);
+        assert!(vm.current_frame().get_reg(3).is_none());
+
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(Arc::as_ptr(&second) as *const ()));
+        vm.current_frame_mut().set_reg(2, Value::none());
+        vm.current_frame_mut().set_reg(3, Value::none());
+        assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2), second_value);
+        assert!(vm.current_frame().get_reg(3).is_none());
+        assert_eq!(method_cache().len(), 0);
+
+        unsafe {
+            drop(Box::from_raw(first_ptr));
+            drop(Box::from_raw(second_ptr));
+        }
+
+        method_cache().clear();
+    }
+
+    #[test]
+    fn test_resolve_special_method_on_plain_object_uses_builtin_object_methods() {
+        let registry = shape_registry();
+        let object = ShapedObject::with_empty_shape(registry.empty_shape());
+        let object_ptr = Box::into_raw(Box::new(object));
+        let object_value = Value::object_ptr(object_ptr as *const ());
+
+        let bound = resolve_special_method(object_value, "__ne__")
+            .expect("plain object special lookup should inherit object.__ne__");
+        let method_ptr = bound
+            .callable
+            .as_object_ptr()
+            .expect("object.__ne__ should be heap allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+
+        assert_eq!(builtin.name(), "object.__ne__");
+        assert_eq!(bound.implicit_self, Some(object_value));
+
+        unsafe {
+            drop(Box::from_raw(object_ptr));
+        }
+    }
+
+    #[test]
+    fn test_resolve_special_method_bypasses_instance_attributes_for_heap_types() {
+        let (class_func_ptr, class_func_value) = make_test_function_value("class_len");
+        let (instance_func_ptr, instance_func_value) = make_test_function_value("instance_len");
+
+        let mut class = PyClassObject::new_simple(intern("SpecialLookupCarrier"));
+        class.set_attr(intern("__len__"), class_func_value);
+        let class = register_test_class(class);
+
+        let mut instance = ShapedObject::new(class.class_type_id(), class.instance_shape().clone());
+        instance.set_property(intern("__len__"), instance_func_value, shape_registry());
+        let instance_ptr = Box::into_raw(Box::new(instance));
+        let instance_value = Value::object_ptr(instance_ptr as *const ());
+
+        let bound = resolve_special_method(instance_value, "__len__")
+            .expect("special lookup should resolve through the type");
+        assert_eq!(bound.callable, class_func_value);
+        assert_eq!(bound.implicit_self, Some(instance_value));
+
+        unsafe {
+            drop(Box::from_raw(instance_ptr));
+            drop(Box::from_raw(class_func_ptr));
+            drop(Box::from_raw(instance_func_ptr));
+        }
+    }
+
+    #[test]
     fn test_resolve_object_instance_method_returns_callable_instance_property_unbound() {
         let (func_ptr, func_value) = make_test_function_value("instance_method");
         let registry = shape_registry();
@@ -1370,6 +1534,147 @@ mod tests {
         unsafe {
             drop(Box::from_raw(instance_ptr));
             drop(Box::from_raw(func_ptr));
+        }
+    }
+
+    #[test]
+    fn test_load_method_leaves_plain_builtin_class_attributes_unbound() {
+        let (builtin_ptr, builtin_value) = make_test_builtin_value("count_args");
+
+        let mut class = PyClassObject::new_simple(intern("PlainBuiltinLoadMethod"));
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+
+        let instance = ShapedObject::new(class.class_type_id(), class.instance_shape().clone());
+        let instance_ptr = Box::into_raw(Box::new(instance));
+        let instance_value = Value::object_ptr(instance_ptr as *const ());
+
+        let mut vm = vm_with_names(&["helper"]);
+        vm.current_frame_mut().set_reg(1, instance_value);
+
+        let load_inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+        assert!(matches!(
+            load_method(&mut vm, load_inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(2), builtin_value);
+        assert!(vm.current_frame().get_reg(3).is_none());
+
+        vm.current_frame_mut().set_reg(4, Value::int(7).unwrap());
+        let call_inst = Instruction::op_dss(
+            Opcode::CallMethod,
+            Register::new(5),
+            Register::new(2),
+            Register::new(1),
+        );
+        assert!(matches!(
+            call_method(&mut vm, call_inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(5).as_int(), Some(1));
+
+        unsafe {
+            drop(Box::from_raw(instance_ptr));
+            drop(Box::from_raw(builtin_ptr));
+        }
+    }
+
+    #[test]
+    fn test_load_method_preserves_prebound_builtin_class_attributes() {
+        let (builtin_ptr, builtin_value) =
+            make_test_bound_builtin_value("count_args", Value::int(99).unwrap());
+
+        let mut class = PyClassObject::new_simple(intern("BoundBuiltinLoadMethod"));
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+
+        let instance = ShapedObject::new(class.class_type_id(), class.instance_shape().clone());
+        let instance_ptr = Box::into_raw(Box::new(instance));
+        let instance_value = Value::object_ptr(instance_ptr as *const ());
+
+        let mut vm = vm_with_names(&["helper"]);
+        vm.current_frame_mut().set_reg(1, instance_value);
+
+        let load_inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+        assert!(matches!(
+            load_method(&mut vm, load_inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(2), builtin_value);
+        assert!(vm.current_frame().get_reg(3).is_none());
+
+        let call_inst = Instruction::op_dss(
+            Opcode::CallMethod,
+            Register::new(5),
+            Register::new(2),
+            Register::new(0),
+        );
+        assert!(matches!(
+            call_method(&mut vm, call_inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(5).as_int(), Some(1));
+
+        unsafe {
+            drop(Box::from_raw(instance_ptr));
+            drop(Box::from_raw(builtin_ptr));
+        }
+    }
+
+    #[test]
+    fn test_load_method_binds_builtin_class_attributes_for_native_heap_classes() {
+        let (builtin_ptr, builtin_value) = make_test_builtin_value("count_args");
+
+        let mut class = PyClassObject::new_simple(intern("NativeBuiltinLoadMethod"));
+        class.add_flags(ClassFlags::NATIVE_HEAPTYPE);
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+
+        let instance = ShapedObject::new(class.class_type_id(), class.instance_shape().clone());
+        let instance_ptr = Box::into_raw(Box::new(instance));
+        let instance_value = Value::object_ptr(instance_ptr as *const ());
+
+        let mut vm = vm_with_names(&["helper"]);
+        vm.current_frame_mut().set_reg(1, instance_value);
+
+        let load_inst = Instruction::op_dss(
+            Opcode::LoadMethod,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+        assert!(matches!(
+            load_method(&mut vm, load_inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(2), builtin_value);
+        assert_eq!(vm.current_frame().get_reg(3), instance_value);
+
+        let call_inst = Instruction::op_dss(
+            Opcode::CallMethod,
+            Register::new(5),
+            Register::new(2),
+            Register::new(0),
+        );
+        assert!(matches!(
+            call_method(&mut vm, call_inst),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(5).as_int(), Some(1));
+
+        unsafe {
+            drop(Box::from_raw(instance_ptr));
+            drop(Box::from_raw(builtin_ptr));
         }
     }
 }

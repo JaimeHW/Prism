@@ -208,6 +208,9 @@ fn call_bound_method(
         TypeId::BUILTIN_FUNCTION => {
             call_builtin_function(vm, func_ptr, Some(instance), dst, method_reg, argc)
         }
+        _ if crate::ops::calls::value_supports_call_protocol(func) => {
+            call_generic_callable(vm, func, Some(instance), dst, method_reg, argc)
+        }
         _ => ControlFlow::Error(RuntimeError::type_error(format!(
             "bound method wraps non-callable '{}' object",
             type_id.name()
@@ -448,5 +451,39 @@ mod tests {
             .as_object_ptr()
             .expect("dict() should return a heap object");
         assert_eq!(extract_type_id(result_ptr), TypeId::DICT);
+    }
+
+    #[test]
+    fn test_call_method_supports_nested_bound_methods() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, "caller");
+
+        let (builtin_ptr, builtin_value) = make_builtin_value("argc");
+        let inner_ptr = Box::into_raw(Box::new(BoundMethod::new(
+            builtin_value,
+            Value::int(11).unwrap(),
+        )));
+        let inner_value = Value::object_ptr(inner_ptr as *const ());
+        let outer_ptr = Box::into_raw(Box::new(BoundMethod::new(
+            inner_value,
+            Value::int(22).unwrap(),
+        )));
+        let outer_value = Value::object_ptr(outer_ptr as *const ());
+
+        vm.current_frame_mut().set_reg(1, outer_value);
+        vm.current_frame_mut().set_reg(2, Value::none());
+        vm.current_frame_mut().set_reg(3, Value::int(99).unwrap());
+
+        let inst = Instruction::new(Opcode::CallMethod, 0, 1, 1);
+        let control = call_method(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(3));
+
+        vm.clear_frames();
+        unsafe {
+            drop(Box::from_raw(outer_ptr));
+            drop(Box::from_raw(inner_ptr));
+            drop(Box::from_raw(builtin_ptr));
+        }
     }
 }

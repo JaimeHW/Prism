@@ -652,14 +652,22 @@ fn attach_exception_traceback(
     vm: &mut VirtualMachine,
     exc_value: Value,
 ) -> Result<(), RuntimeError> {
-    let (code, globals, locals, line_number, lasti) = {
+    let (code, globals, locals, line_number, lasti, next_traceback) = {
         let frame = vm.current_frame();
+        let pc = frame.ip.saturating_sub(1);
+        let line_number = frame
+            .code
+            .line_for_pc(pc)
+            .unwrap_or(frame.code.first_lineno);
         (
             Arc::clone(&frame.code),
             leak_object_value(snapshot_frame_globals_dict(vm, frame)),
             leak_object_value(snapshot_frame_locals_dict(frame)),
-            frame.code.first_lineno,
-            frame.ip.saturating_sub(1).saturating_mul(2),
+            line_number,
+            pc.saturating_mul(2),
+            exception_value_mut(exc_value)
+                .and_then(|exc| exc.traceback())
+                .filter(|value| !value.is_none()),
         )
     };
 
@@ -669,10 +677,11 @@ fn attach_exception_traceback(
         locals,
         line_number,
         lasti,
+        None,
     ));
     let traceback_value = leak_object_value(TracebackViewObject::new(
         frame_value,
-        None,
+        next_traceback,
         line_number,
         lasti,
     ));

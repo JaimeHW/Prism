@@ -5,6 +5,7 @@ use crate::builtins::{iterator_to_value, value_to_iterator};
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::protocols::invoke_bound_method_with_operand;
 use crate::stdlib::generators::GeneratorObject;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
@@ -37,10 +38,20 @@ pub(crate) fn ensure_iterator_value(
         return Ok(iterator_to_value(iter));
     }
 
-    let bound = resolve_special_method(value, "__iter__").map_err(|_| {
-        RuntimeError::type_error(format!("'{}' object is not iterable", value.type_name()))
-    })?;
-    let iterator = call_bound_method_target(vm, bound)?;
+    let iterator = match resolve_special_method(value, "__iter__") {
+        Ok(bound) => call_bound_method_target(vm, bound)?,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return iterator_from_sequence_getitem(vm, value)?.ok_or_else(|| {
+                RuntimeError::type_error(format!("'{}' object is not iterable", value.type_name()))
+            });
+        }
+        Err(_) => {
+            return Err(RuntimeError::type_error(format!(
+                "'{}' object is not iterable",
+                value.type_name()
+            )));
+        }
+    };
 
     if supports_next_protocol(iterator) {
         Ok(iterator)
@@ -141,6 +152,40 @@ fn call_bound_method_target(
         Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
         None => invoke_callable_value(vm, target.callable, &[]),
     }
+}
+
+fn iterator_from_sequence_getitem(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let bound = match resolve_special_method(value, "__getitem__") {
+        Ok(bound) => bound,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    if bound.callable.is_none() {
+        return Ok(None);
+    }
+
+    let mut values = Vec::new();
+    let mut index = 0_i64;
+
+    loop {
+        let index_value = Value::int(index)
+            .ok_or_else(|| RuntimeError::value_error("sequence index overflow"))?;
+        match invoke_bound_method_with_operand(vm, bound, index_value) {
+            Ok(item) => values.push(item),
+            Err(err) if matches!(err.kind, RuntimeErrorKind::IndexError { .. }) => break,
+            Err(err) if matches!(err.kind, RuntimeErrorKind::StopIteration) => break,
+            Err(err) => return Err(err),
+        }
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::value_error("sequence index overflow"))?;
+    }
+
+    Ok(Some(iterator_to_value(IteratorObject::from_values(values))))
 }
 
 fn supports_next_protocol(value: Value) -> bool {

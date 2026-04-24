@@ -33,7 +33,7 @@ use crate::builtins::{builtin_type_object_for_type_id, builtin_type_object_type_
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
-use crate::ops::objects::{get_attribute_value, resolve_class_attribute};
+use crate::ops::objects::{get_attribute_value, resolve_class_attribute_in_vm};
 use prism_code::{CodeObject, Instruction, Opcode};
 use prism_core::Value;
 #[cfg(test)]
@@ -481,7 +481,7 @@ fn invoke_init_subclass_callable(
     raw_hook: Value,
     class_keywords: &[(&str, Value)],
 ) -> Result<(), RuntimeError> {
-    let callable = resolve_class_attribute(raw_hook, class_value);
+    let callable = resolve_class_attribute_in_vm(vm, raw_hook, class_value)?;
     let needs_explicit_cls_arg = raw_hook
         .as_object_ptr()
         .is_some_and(|ptr| matches!(extract_type_id(ptr), TypeId::FUNCTION | TypeId::CLOSURE));

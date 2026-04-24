@@ -8,7 +8,7 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::objects::{extract_type_id, get_attribute_value};
 use crate::stdlib::exceptions::ExceptionTypeId;
-use prism_code::Instruction;
+use prism_code::{CodeFlags, Instruction};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
@@ -72,6 +72,20 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
             Err(err) => ControlFlow::Error(err),
         };
+    }
+
+    {
+        let frame = vm.current_frame();
+        if frame.code.flags.contains(CodeFlags::CLASS) && !frame.reg_is_written(slot) {
+            let name = mapped_local_name(frame, slot);
+            return match load_module_or_builtin(vm, &name) {
+                Ok(value) => {
+                    vm.current_frame_mut().set_reg(dst, value);
+                    ControlFlow::Continue
+                }
+                Err(err) => ControlFlow::Error(err),
+            };
+        }
     }
 
     let frame = vm.current_frame_mut();
@@ -146,6 +160,10 @@ fn load_mapped_local(
         return Ok(value);
     }
 
+    load_module_or_builtin(vm, name)
+}
+
+fn load_module_or_builtin(vm: &mut VirtualMachine, name: &Arc<str>) -> Result<Value, RuntimeError> {
     if let Some(value) = vm.module_scope_value(name) {
         return Ok(value);
     }
@@ -266,8 +284,20 @@ fn is_missing_mapping_key_error(err: &RuntimeError) -> bool {
 /// LoadGlobal: dst = globals[names[imm16]]
 #[inline(always)]
 pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let name = frame.get_name(inst.imm16()).clone();
+    let (name, locals_mapping) = {
+        let frame = vm.current_frame();
+        (frame.get_name(inst.imm16()).clone(), frame.locals_mapping())
+    };
+
+    if let Some(mapping) = locals_mapping {
+        return match load_mapped_local(vm, mapping, &name) {
+            Ok(value) => {
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
+                ControlFlow::Continue
+            }
+            Err(err) => ControlFlow::Error(err),
+        };
+    }
 
     match vm.module_scope_value(&name) {
         Some(value) => {
