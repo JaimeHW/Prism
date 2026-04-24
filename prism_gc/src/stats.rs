@@ -140,11 +140,7 @@ impl GcStats {
     pub fn allocation_rate(&self, elapsed: Duration) -> f64 {
         let bytes = self.bytes_allocated.load(Ordering::Relaxed) as f64;
         let seconds = elapsed.as_secs_f64();
-        if seconds > 0.0 {
-            bytes / seconds
-        } else {
-            0.0
-        }
+        if seconds > 0.0 { bytes / seconds } else { 0.0 }
     }
 
     /// Reset all statistics.
