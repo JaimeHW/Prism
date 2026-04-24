@@ -37,6 +37,9 @@ pub enum ImportError {
 
     /// Error executing module code.
     ExecutionError { module: Arc<str>, message: Arc<str> },
+
+    /// Error resolving the export set for `from module import *`.
+    StarImportError { module: Arc<str>, message: Arc<str> },
 }
 
 impl std::fmt::Display for ImportError {
@@ -62,6 +65,13 @@ impl std::fmt::Display for ImportError {
                 write!(
                     f,
                     "ImportError: failed to execute '{}': {}",
+                    module, message
+                )
+            }
+            ImportError::StarImportError { module, message } => {
+                write!(
+                    f,
+                    "ImportError: cannot import * from '{}': {}",
                     module, message
                 )
             }
@@ -496,7 +506,12 @@ impl ImportResolver {
         &self,
         module: &Arc<ModuleObject>,
     ) -> Result<Vec<(InternedString, Value)>, ImportError> {
-        Ok(module.public_attrs())
+        module
+            .public_attrs()
+            .map_err(|err| ImportError::StarImportError {
+                module: Arc::from(module.name()),
+                message: Arc::from(err.to_string()),
+            })
     }
 
     #[inline]

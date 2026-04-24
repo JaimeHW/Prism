@@ -372,9 +372,8 @@ pub fn spec_floor_div_int(a: Value, b: Value) -> (SpecResult, Value) {
         if y == 0 {
             return (SpecResult::Overflow, Value::none()); // Division by zero
         }
-        // Python floor division: always rounds toward negative infinity
-        let result = x.div_euclid(y);
-        if let Some(v) = Value::int(result) {
+        let (quotient, _) = i64_floor_divmod(x, y);
+        if let Some(v) = Value::int(quotient) {
             return (SpecResult::Success, v);
         }
         return (SpecResult::Overflow, Value::none());
@@ -389,13 +388,24 @@ pub fn spec_mod_int(a: Value, b: Value) -> (SpecResult, Value) {
         if y == 0 {
             return (SpecResult::Overflow, Value::none()); // Division by zero
         }
-        let result = x.rem_euclid(y);
-        if let Some(v) = Value::int(result) {
+        let (_, remainder) = i64_floor_divmod(x, y);
+        if let Some(v) = Value::int(remainder) {
             return (SpecResult::Success, v);
         }
         return (SpecResult::Overflow, Value::none());
     }
     (SpecResult::Deopt, Value::none())
+}
+
+#[inline(always)]
+fn i64_floor_divmod(left: i64, right: i64) -> (i64, i64) {
+    let mut quotient = left / right;
+    let mut remainder = left % right;
+    if remainder != 0 && remainder.signum() != right.signum() {
+        quotient -= 1;
+        remainder += right;
+    }
+    (quotient, remainder)
 }
 
 /// Speculative integer power.
@@ -700,7 +710,7 @@ pub fn spec_str_repeat(
 
 /// Speculative string length.
 ///
-/// Returns the byte length of a string as an integer.
+/// Returns the Python character length of a string as an integer.
 ///
 /// # Performance
 ///
@@ -708,7 +718,7 @@ pub fn spec_str_repeat(
 #[inline(always)]
 pub fn spec_str_len(a: Value) -> (SpecResult, Value) {
     if let Some(string) = value_as_string_ref(a) {
-        let len = string.len();
+        let len = string.char_count();
         if let Some(v) = Value::int(len as i64) {
             return (SpecResult::Success, v);
         }
@@ -930,6 +940,28 @@ mod tests {
     }
 
     #[test]
+    fn test_spec_floor_div_int_uses_python_negative_divisor_rules() {
+        let (result, value) = spec_floor_div_int(Value::int(10).unwrap(), Value::int(-3).unwrap());
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value.as_int(), Some(-4));
+
+        let (result, value) = spec_floor_div_int(Value::int(-10).unwrap(), Value::int(-3).unwrap());
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_spec_mod_int_uses_python_negative_divisor_rules() {
+        let (result, value) = spec_mod_int(Value::int(10).unwrap(), Value::int(-3).unwrap());
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value.as_int(), Some(-2));
+
+        let (result, value) = spec_mod_int(Value::int(-10).unwrap(), Value::int(-3).unwrap());
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value.as_int(), Some(-1));
+    }
+
+    #[test]
     fn test_spec_pow_int() {
         let a = Value::int(2).unwrap();
         let b = Value::int(10).unwrap();
@@ -1085,5 +1117,21 @@ mod tests {
         let (result, value) = spec_str_len(Value::string(intern("hello")));
         assert_eq!(result, SpecResult::Success);
         assert_eq!(value.as_int(), Some(5));
+    }
+
+    #[test]
+    fn test_spec_str_len_counts_unicode_scalar_values() {
+        let str_obj = StringObject::new("hé 🦀");
+        let boxed = Box::new(str_obj);
+        let ptr = Box::into_raw(boxed) as *const ();
+        let a = Value::object_ptr(ptr);
+
+        let (result, value) = spec_str_len(a);
+        assert_eq!(result, SpecResult::Success);
+        assert_eq!(value.as_int(), Some(4));
+
+        unsafe {
+            drop(Box::from_raw(ptr as *mut StringObject));
+        }
     }
 }
