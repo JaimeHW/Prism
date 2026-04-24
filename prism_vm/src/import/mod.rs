@@ -30,6 +30,6 @@ pub mod resolver;
 mod tests;
 
 pub use frozen::FrozenModuleSource;
-pub use module_object::ModuleObject;
+pub use module_object::{ModuleExportError, ModuleObject};
 pub use package::{DottedName, resolve_relative_import};
 pub use resolver::{ImportError, ImportResolver, SourceModuleLocation};
