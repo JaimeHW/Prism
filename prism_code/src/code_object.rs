@@ -4,8 +4,18 @@
 //! to execute a Python function. This is the fundamental unit of compilation.
 
 use super::instruction::Instruction;
+use num_bigint::BigInt;
 use prism_core::Value;
 use std::sync::Arc;
+
+/// Constant pool entry stored in compiled bytecode.
+#[derive(Debug, Clone)]
+pub enum Constant {
+    /// Fully materialized runtime value.
+    Value(Value),
+    /// Arbitrary-precision integer literal materialized by the VM at load time.
+    BigInt(BigInt),
+}
 
 /// A compiled code object representing a function or module.
 ///
@@ -35,7 +45,7 @@ pub struct CodeObject {
     pub instructions: Box<[Instruction]>,
 
     /// Constant pool (indexed by LoadConst).
-    pub constants: Box<[Value]>,
+    pub constants: Box<[Constant]>,
 
     /// Local variable names (for debugging and closures).
     pub locals: Box<[Arc<str>]>,
