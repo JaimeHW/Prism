@@ -115,6 +115,17 @@ enum IterKind {
     // =========================================================================
     // Composite iterators (Phase 3.4 Extensions)
     // =========================================================================
+    /// Chain iterator - yields all values from each source iterator in order.
+    ///
+    /// # Performance
+    /// - O(1) per yielded value
+    /// - O(k) construction for k source iterables
+    /// - Lazy: advances each source only when needed
+    Chain {
+        iterators: Vec<IteratorObject>,
+        current: usize,
+    },
+
     /// Enumerate iterator - yields (index, value) tuples.
     ///
     /// # Performance
@@ -600,6 +611,20 @@ impl IteratorObject {
         self.exhausted
     }
 
+    /// Create a chain iterator over a sequence of iterators.
+    #[inline]
+    pub fn chain(iterators: Vec<IteratorObject>) -> Self {
+        let exhausted = iterators.is_empty();
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::Chain {
+                iterators,
+                current: 0,
+            },
+            exhausted,
+        }
+    }
+
     /// Get the next value from the iterator.
     ///
     /// Returns `Some(value)` if there are more elements, `None` if exhausted.
@@ -728,6 +753,18 @@ impl IteratorObject {
             // =================================================================
             // Composite iterator implementations
             // =================================================================
+            IterKind::Chain { iterators, current } => {
+                while *current < iterators.len() {
+                    if let Some(value) = iterators[*current].next() {
+                        return Some(value);
+                    }
+                    *current += 1;
+                }
+
+                self.exhausted = true;
+                None
+            }
+
             IterKind::Enumerate { inner, index } => {
                 match inner.next() {
                     Some(value) => {
@@ -938,6 +975,13 @@ impl IteratorObject {
             IterKind::Empty => Some(0),
 
             // Composite iterators
+            IterKind::Chain { iterators, current } => {
+                let mut total = 0usize;
+                for iterator in iterators.iter().skip(*current) {
+                    total = total.checked_add(iterator.size_hint()?)?;
+                }
+                Some(total)
+            }
             IterKind::Enumerate { inner, .. } => inner.size_hint(),
             IterKind::Zip { iterators } => {
                 // Minimum of all iterator size hints
@@ -1049,6 +1093,17 @@ impl IteratorObject {
                     }
                 }
             },
+            IterKind::Chain { iterators, current } => {
+                while *current < iterators.len() {
+                    match iterators[*current].next_with(invoke, is_truthy, advance_iterator)? {
+                        Some(value) => return Ok(Some(value)),
+                        None => *current += 1,
+                    }
+                }
+
+                self.exhausted = true;
+                return Ok(None);
+            }
             IterKind::ISlice {
                 inner,
                 next_yield,
@@ -1104,6 +1159,7 @@ impl fmt::Debug for IteratorObject {
             IterKind::SharedIterator { .. } => "iterator",
             IterKind::Empty => "empty_iterator",
             // Composite iterators
+            IterKind::Chain { .. } => "chain",
             IterKind::Enumerate { .. } => "enumerate",
             IterKind::Zip { .. } => "zip",
             IterKind::Map { .. } => "map",
@@ -1294,6 +1350,36 @@ mod tests {
         assert_eq!(iter.next().unwrap().as_int(), Some(5));
         assert_eq!(iter.next().unwrap().as_int(), Some(7));
         assert!(!iter.is_exhausted());
+    }
+
+    #[test]
+    fn test_chain_iterator_yields_sources_in_order() {
+        let first = IteratorObject::from_values(vec![Value::int(1).unwrap()]);
+        let second =
+            IteratorObject::from_values(vec![Value::int(2).unwrap(), Value::int(3).unwrap()]);
+        let mut iter = IteratorObject::chain(vec![first, second]);
+
+        assert_eq!(format!("{:?}", iter), "<chain>");
+        assert_eq!(iter.size_hint(), Some(3));
+        assert_eq!(iter.next().unwrap().as_int(), Some(1));
+        assert_eq!(iter.size_hint(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(2));
+        assert_eq!(iter.next().unwrap().as_int(), Some(3));
+        assert_eq!(iter.size_hint(), Some(0));
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn test_chain_iterator_skips_empty_sources() {
+        let first = IteratorObject::empty();
+        let second = IteratorObject::from_values(vec![Value::int(42).unwrap()]);
+        let third = IteratorObject::empty();
+        let mut iter = IteratorObject::chain(vec![first, second, third]);
+
+        assert_eq!(iter.next().unwrap().as_int(), Some(42));
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
     }
 
     #[test]

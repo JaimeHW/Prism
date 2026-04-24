@@ -6,6 +6,7 @@
 //! while preserving the fast small-int representation.
 
 use crate::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::pinned_store::PinnedObjectStore;
@@ -63,10 +64,30 @@ pub fn value_as_heap_int(value: Value) -> Option<&'static IntObject> {
     Some(unsafe { &*(ptr as *const IntObject) })
 }
 
+/// Borrow the native integer payload for exact ints and heap `int` subclasses.
+#[inline]
+pub fn value_as_int_ref(value: Value) -> Option<&'static BigInt> {
+    let ptr = value.as_object_ptr()?;
+    object_ptr_as_int_ref(ptr)
+}
+
+/// Borrow the native integer payload for an object pointer.
+#[inline]
+pub fn object_ptr_as_int_ref(ptr: *const ()) -> Option<&'static BigInt> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::INT => Some(unsafe { &*(ptr as *const IntObject) }.value()),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&*(ptr as *const ShapedObject)).int_backing()
+        },
+        _ => None,
+    }
+}
+
 /// Returns true when `value` is any Python integer, inline or heap-backed.
 #[inline]
 pub fn is_int_value(value: Value) -> bool {
-    value.as_int().is_some() || value_as_heap_int(value).is_some()
+    value.as_int().is_some() || value_as_int_ref(value).is_some()
 }
 
 /// Convert a Python integer value into a bigint.
@@ -75,7 +96,7 @@ pub fn value_to_bigint(value: Value) -> Option<BigInt> {
     if let Some(i) = value.as_int() {
         return Some(BigInt::from(i));
     }
-    value_as_heap_int(value).map(|obj| obj.value().clone())
+    value_as_int_ref(value).cloned()
 }
 
 /// Convert a Python integer value into `i64` when it fits.
@@ -84,7 +105,7 @@ pub fn value_to_i64(value: Value) -> Option<i64> {
     if let Some(i) = value.as_int() {
         return Some(i);
     }
-    value_as_heap_int(value).and_then(|obj| obj.value().to_i64())
+    value_as_int_ref(value).and_then(ToPrimitive::to_i64)
 }
 
 /// Format a Python integer value using Python `int.__repr__` semantics.
@@ -93,7 +114,7 @@ pub fn int_value_to_string(value: Value) -> Option<String> {
     if let Some(i) = value.as_int() {
         return Some(i.to_string());
     }
-    value_as_heap_int(value).map(|obj| obj.value().to_string())
+    value_as_int_ref(value).map(ToString::to_string)
 }
 
 /// Convert a bigint into the most efficient Prism value representation.
@@ -160,5 +181,23 @@ mod tests {
         assert_eq!(PINNED_INT_OBJECTS.len(), baseline);
         let obj = value_as_heap_int(value).expect("bound heap should allocate managed int");
         assert_eq!(obj.value(), &big);
+    }
+
+    #[test]
+    fn test_value_to_bigint_reads_int_subclass_native_storage() {
+        let big = BigInt::from(1_u8) << 88_u32;
+        let object = ShapedObject::new_int_backed(
+            TypeId::from_raw(512),
+            crate::object::shape::Shape::empty(),
+            big.clone(),
+        );
+        let ptr = Box::into_raw(Box::new(object));
+        let value = Value::object_ptr(ptr as *const ());
+
+        assert!(is_int_value(value));
+        assert_eq!(value_to_bigint(value), Some(big.clone()));
+        assert_eq!(int_value_to_string(value), Some(big.to_string()));
+
+        unsafe { drop(Box::from_raw(ptr)) };
     }
 }

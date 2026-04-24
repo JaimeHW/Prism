@@ -2,6 +2,7 @@
 //!
 //! Immutable sequence type with fixed size.
 
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use prism_core::Value;
@@ -11,6 +12,7 @@ use prism_core::Value;
 /// Immutable sequence with inline storage for small tuples.
 /// Uses Box<[Value]> for zero-copy sharing.
 #[repr(C)]
+#[derive(Debug)]
 pub struct TupleObject {
     /// Object header.
     pub header: ObjectHeader,
@@ -158,6 +160,28 @@ impl TupleObject {
     }
 }
 
+/// Borrow native tuple storage from exact tuples and heap/object values that
+/// carry tuple-compatible native backing.
+#[inline(always)]
+pub fn value_as_tuple_ref(value: Value) -> Option<&'static TupleObject> {
+    let ptr = value.as_object_ptr()?;
+    object_ptr_as_tuple_ref(ptr)
+}
+
+/// Borrow native tuple storage from an object pointer.
+#[inline(always)]
+pub fn object_ptr_as_tuple_ref(ptr: *const ()) -> Option<&'static TupleObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::TUPLE => Some(unsafe { &*(ptr as *const TupleObject) }),
+        TypeId::OBJECT => unsafe { (&*(ptr as *const ShapedObject)).tuple_backing() },
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&*(ptr as *const ShapedObject)).tuple_backing()
+        },
+        _ => None,
+    }
+}
+
 impl PyObject for TupleObject {
     fn header(&self) -> &ObjectHeader {
         &self.header
@@ -185,6 +209,8 @@ pub fn empty_tuple() -> TupleObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::shape::Shape;
+    use crate::object::shaped_object::ShapedObject;
 
     #[test]
     fn test_tuple_basic() {
@@ -198,6 +224,25 @@ mod tests {
         assert_eq!(tuple.get(0).unwrap().as_int(), Some(1));
         assert_eq!(tuple.get(1).unwrap().as_int(), Some(2));
         assert_eq!(tuple.get(2).unwrap().as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_object_ptr_as_tuple_ref_supports_tuple_backed_objects() {
+        let object = Box::into_raw(Box::new(ShapedObject::new_tuple_backed(
+            TypeId::OBJECT,
+            Shape::empty(),
+            TupleObject::from_slice(&[Value::int(5).unwrap(), Value::int(8).unwrap()]),
+        )));
+
+        let tuple = object_ptr_as_tuple_ref(object as *const ())
+            .expect("tuple-backed object should expose native tuple storage");
+        assert_eq!(tuple.len(), 2);
+        assert_eq!(tuple.get(0).and_then(|value| value.as_int()), Some(5));
+        assert_eq!(tuple.get(1).and_then(|value| value.as_int()), Some(8));
+
+        unsafe {
+            drop(Box::from_raw(object));
+        }
     }
 
     #[test]

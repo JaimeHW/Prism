@@ -30,6 +30,8 @@
 use smallvec::SmallVec;
 use std::fmt;
 
+use crate::object::type_obj::TypeId;
+
 /// Type representing a class/type in the MRO computation.
 /// Uses a newtype pattern for type safety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,10 +40,10 @@ pub struct ClassId(pub u32);
 
 impl ClassId {
     /// Built-in object class ID.
-    pub const OBJECT: ClassId = ClassId(0);
+    pub const OBJECT: ClassId = ClassId(TypeId::OBJECT.raw());
 
     /// Built-in type class ID.
-    pub const TYPE: ClassId = ClassId(1);
+    pub const TYPE: ClassId = ClassId(TypeId::TYPE.raw());
 
     /// Sentinel value for no class / invalid class.
     pub const NONE: ClassId = ClassId(u32::MAX);
@@ -461,7 +463,7 @@ mod tests {
         // Test a chain of 10 classes
         // A -> B -> C -> D -> E -> F -> G -> H -> I -> J
 
-        let classes: Vec<ClassId> = (10..20).map(ClassId).collect();
+        let classes: Vec<ClassId> = (300..310).map(ClassId).collect();
         let mut mros = HashMap::new();
 
         // First class inherits from nothing

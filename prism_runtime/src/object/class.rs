@@ -81,6 +81,9 @@ bitflags::bitflags! {
         const HAS_FINALIZER = 1 << 9;
         /// Class can itself be used as a metaclass.
         const METACLASS = 1 << 10;
+        /// Runtime-native heap type whose builtin function class attributes
+        /// should bind like method descriptors on instance access.
+        const NATIVE_HEAPTYPE = 1 << 11;
     }
 }
 
@@ -644,6 +647,12 @@ impl PyClassObject {
     #[inline]
     pub fn is_initialized(&self) -> bool {
         self.flags.contains(ClassFlags::INITIALIZED)
+    }
+
+    /// Check if this is a runtime-native heap type.
+    #[inline]
+    pub fn is_native_heaptype(&self) -> bool {
+        self.flags.contains(ClassFlags::NATIVE_HEAPTYPE)
     }
 
     /// Set __slots__ names.

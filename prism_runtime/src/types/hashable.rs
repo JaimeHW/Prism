@@ -7,8 +7,10 @@
 use crate::object::ObjectHeader;
 use crate::object::descriptor::BoundMethod;
 use crate::object::type_obj::TypeId;
+use crate::types::int::value_to_bigint;
 use crate::types::string::value_as_string_ref;
 use crate::types::tuple::TupleObject;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use std::hash::{Hash, Hasher};
 
@@ -33,9 +35,6 @@ impl Hash for HashableValue {
 #[inline]
 fn hashable_value_eq(left: Value, right: Value) -> bool {
     if left.raw_bits() == right.raw_bits() {
-        if left.is_float() {
-            return left.as_float().is_some_and(|f| !f.is_nan());
-        }
         return true;
     }
 
@@ -64,6 +63,10 @@ fn hashable_value_eq(left: Value, right: Value) -> bool {
 
 #[inline]
 fn numeric_eq(left: Value, right: Value) -> bool {
+    if let (Some(a), Some(b)) = (value_to_bigint(left), value_to_bigint(right)) {
+        return a == b;
+    }
+
     if let (Some(a), Some(b)) = (numeric_as_f64(left), numeric_as_f64(right)) {
         return a == b;
     }
@@ -78,6 +81,9 @@ fn numeric_as_f64(value: Value) -> Option<f64> {
     if let Some(i) = value.as_int() {
         return Some(i as f64);
     }
+    if let Some(i) = value_to_bigint(value) {
+        return i.to_f64();
+    }
     value.as_float()
 }
 
@@ -90,6 +96,16 @@ fn hash_hashable_value<H: Hasher>(value: Value, state: &mut H) {
 
     if let Some(i) = value.as_int() {
         i.hash(state);
+        return;
+    }
+
+    if let Some(i) = value_to_bigint(value) {
+        if let Some(small) = i.to_i64() {
+            small.hash(state);
+        } else {
+            0x69u8.hash(state);
+            i.hash(state);
+        }
         return;
     }
 
@@ -190,8 +206,12 @@ fn type_id_of(ptr: *const ()) -> TypeId {
 mod tests {
     use super::HashableValue;
     use crate::object::descriptor::BoundMethod;
+    use crate::object::shape::Shape;
+    use crate::object::shaped_object::ShapedObject;
+    use crate::object::type_obj::TypeId;
     use crate::types::string::StringObject;
     use crate::types::tuple::TupleObject;
+    use num_bigint::BigInt;
     use prism_core::Value;
     use prism_core::intern::intern;
     use std::collections::HashSet;
@@ -238,5 +258,28 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(HashableValue(Value::object_ptr(method_a as *const ())));
         assert!(set.contains(&HashableValue(Value::object_ptr(method_b as *const ()))));
+    }
+
+    #[test]
+    fn hashable_value_matches_identical_nan_bits() {
+        let nan = Value::float(f64::NAN);
+        let mut set = HashSet::new();
+        set.insert(HashableValue(nan));
+        assert!(set.contains(&HashableValue(nan)));
+    }
+
+    #[test]
+    fn hashable_value_matches_int_subclasses_by_numeric_payload() {
+        let object =
+            ShapedObject::new_int_backed(TypeId::from_raw(512), Shape::empty(), BigInt::from(7));
+        let ptr = Box::into_raw(Box::new(object));
+        let value = Value::object_ptr(ptr as *const ());
+
+        let mut set = HashSet::new();
+        set.insert(HashableValue(value));
+        assert!(set.contains(&HashableValue(Value::int(7).unwrap())));
+        assert!(set.contains(&HashableValue(Value::float(7.0))));
+
+        unsafe { drop(Box::from_raw(ptr)) };
     }
 }

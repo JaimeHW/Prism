@@ -377,6 +377,7 @@ pub struct FrameViewObject {
     locals: Value,
     line_number: u32,
     lasti: u32,
+    back: Option<Value>,
 }
 
 impl FrameViewObject {
@@ -387,6 +388,7 @@ impl FrameViewObject {
         locals: Value,
         line_number: u32,
         lasti: u32,
+        back: Option<Value>,
     ) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::FRAME),
@@ -395,6 +397,7 @@ impl FrameViewObject {
             locals,
             line_number,
             lasti,
+            back,
         }
     }
 
@@ -421,6 +424,11 @@ impl FrameViewObject {
     #[inline]
     pub fn lasti(&self) -> u32 {
         self.lasti
+    }
+
+    #[inline]
+    pub fn back(&self) -> Option<Value> {
+        self.back
     }
 }
 
@@ -503,7 +511,7 @@ mod tests {
         let code = Arc::new(CodeObject::new("demo", "<test>"));
         let globals = Value::int(11).unwrap();
         let locals = Value::int(13).unwrap();
-        let view = FrameViewObject::new(Some(Arc::clone(&code)), globals, locals, 12, 7);
+        let view = FrameViewObject::new(Some(Arc::clone(&code)), globals, locals, 12, 7, None);
         assert_eq!(view.header().type_id, TypeId::FRAME);
         assert!(Arc::ptr_eq(
             view.code().expect("code should be present"),
@@ -513,6 +521,7 @@ mod tests {
         assert_eq!(view.locals(), locals);
         assert_eq!(view.line_number(), 12);
         assert_eq!(view.lasti(), 7);
+        assert_eq!(view.back(), None);
     }
 
     #[test]

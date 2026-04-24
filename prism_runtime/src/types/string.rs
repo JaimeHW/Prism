@@ -158,6 +158,16 @@ impl StringValueRef<'_> {
     pub fn len(&self) -> usize {
         self.as_str().len()
     }
+
+    #[inline(always)]
+    pub fn char_count(&self) -> usize {
+        match self {
+            Self::Heap(string) => string.char_count(),
+            Self::Interned(interned) => {
+                crate::types::simd::validation::utf8_char_count(interned.as_str().as_bytes())
+            }
+        }
+    }
 }
 
 #[inline(always)]

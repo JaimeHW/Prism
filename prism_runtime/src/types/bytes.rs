@@ -4,9 +4,11 @@
 //! `bytearray` values. Both are represented by the same storage layout and
 //! distinguished by `header.type_id`.
 
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::slice::SliceObject;
+use prism_core::Value;
 use std::fmt;
 
 /// Shared object backing for `bytes` and `bytearray`.
@@ -231,9 +233,37 @@ impl PyObject for BytesObject {
     }
 }
 
+/// Borrow native byte-sequence storage from exact `bytes`/`bytearray` values
+/// and heap subclasses backed by native byte storage.
+#[inline]
+pub fn value_as_bytes_ref(value: Value) -> Option<&'static BytesObject> {
+    let ptr = value.as_object_ptr()?;
+    object_ptr_as_bytes_ref(ptr)
+}
+
+/// Borrow native byte-sequence storage from an object pointer.
+#[inline]
+pub fn object_ptr_as_bytes_ref(ptr: *const ()) -> Option<&'static BytesObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::BYTES | TypeId::BYTEARRAY => Some(unsafe { &*(ptr as *const BytesObject) }),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&*(ptr as *const ShapedObject)).bytes_backing()
+        },
+        _ => None,
+    }
+}
+
+/// Clone the native byte-sequence payload from exact objects or subclasses.
+#[inline]
+pub fn clone_bytes_value(value: Value) -> Option<BytesObject> {
+    value_as_bytes_ref(value).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::shape::Shape;
 
     #[test]
     fn test_new_bytes_empty() {
@@ -416,5 +446,28 @@ mod tests {
         let bytes = BytesObject::from_slice(&[1, 2, 3]);
         let dbg = format!("{:?}", bytes);
         assert!(dbg.contains("bytes"));
+    }
+
+    #[test]
+    fn test_value_as_bytes_ref_reads_heap_subclass_native_storage() {
+        let object = ShapedObject::new_bytes_backed(
+            TypeId::from_raw(TypeId::FIRST_USER_TYPE + 50),
+            Shape::empty(),
+            BytesObject::from_slice(b"payload"),
+        );
+        let value = Value::object_ptr(Box::into_raw(Box::new(object)) as *const ());
+
+        assert_eq!(
+            value_as_bytes_ref(value)
+                .expect("bytes backing should be visible")
+                .as_bytes(),
+            b"payload"
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                value.as_object_ptr().unwrap() as *mut ShapedObject
+            ));
+        }
     }
 }
