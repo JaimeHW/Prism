@@ -259,8 +259,9 @@ fn parse_string_content(
 
         // Handle escapes
         if c == '\\' && !is_raw {
-            let escaped = parse_escape(cursor)?;
-            content.push(escaped);
+            if let Some(escaped) = parse_escape(cursor)? {
+                content.push(escaped);
+            }
         } else if c == '\\' && is_raw {
             // Raw strings: backslash is literal, but \' and \" still need handling
             content.push('\\');
@@ -276,37 +277,37 @@ fn parse_string_content(
 }
 
 /// Parse an escape sequence.
-fn parse_escape(cursor: &mut Cursor<'_>) -> Result<char, String> {
+fn parse_escape(cursor: &mut Cursor<'_>) -> Result<Option<char>, String> {
     let c = cursor.bump_or_eof();
     match c {
-        '\\' => Ok('\\'),
-        '\'' => Ok('\''),
-        '"' => Ok('"'),
-        'n' => Ok('\n'),
-        'r' => Ok('\r'),
-        't' => Ok('\t'),
-        'b' => Ok('\x08'), // backspace
-        'f' => Ok('\x0C'), // form feed
-        'v' => Ok('\x0B'), // vertical tab
-        '0' => Ok('\0'),
-        'a' => Ok('\x07'), // bell
-        '\n' => Ok(' '),   // line continuation, return space as placeholder
+        '\\' => Ok(Some('\\')),
+        '\'' => Ok(Some('\'')),
+        '"' => Ok(Some('"')),
+        'n' => Ok(Some('\n')),
+        'r' => Ok(Some('\r')),
+        't' => Ok(Some('\t')),
+        'b' => Ok(Some('\x08')), // backspace
+        'f' => Ok(Some('\x0C')), // form feed
+        'v' => Ok(Some('\x0B')), // vertical tab
+        '0' => Ok(Some('\0')),
+        'a' => Ok(Some('\x07')), // bell
+        '\n' => Ok(None),
         '\r' => {
             // Handle \r\n
             if cursor.first() == '\n' {
                 cursor.bump();
             }
-            Ok(' ') // placeholder for line continuation
+            Ok(None)
         }
-        'x' => parse_hex_escape(cursor, 2),
-        'u' => parse_hex_escape(cursor, 4),
-        'U' => parse_hex_escape(cursor, 8),
-        'N' => parse_unicode_name_escape(cursor),
-        _ if c.is_ascii_digit() => parse_octal_escape(cursor, c),
+        'x' => parse_hex_escape(cursor, 2).map(Some),
+        'u' => parse_hex_escape(cursor, 4).map(Some),
+        'U' => parse_hex_escape(cursor, 8).map(Some),
+        'N' => parse_unicode_name_escape(cursor).map(Some),
+        _ if c.is_ascii_digit() => parse_octal_escape(cursor, c).map(Some),
         EOF_CHAR => Err("unterminated escape sequence".to_string()),
         _ => {
             // Python keeps unrecognized escapes as-is
-            Ok(c)
+            Ok(Some(c))
         }
     }
 }
@@ -444,8 +445,9 @@ fn scan_fstring_content(
         cursor.bump();
 
         if c == '\\' && !is_raw {
-            let escaped = parse_escape(cursor)?;
-            content.push(escaped);
+            if let Some(escaped) = parse_escape(cursor)? {
+                content.push(escaped);
+            }
         } else if c == '\\' && is_raw {
             content.push('\\');
             if cursor.first() == quote_char {
@@ -704,6 +706,30 @@ mod tests {
     fn test_triple_quote() {
         let result = lex_string("\"\"\"hello\nworld\"\"\"");
         assert_eq!(result, TokenKind::String("hello\nworld".to_string()));
+    }
+
+    #[test]
+    fn test_backslash_newline_continuation_is_elided() {
+        let result = lex_string("\"hello\\\nworld\"");
+        assert_eq!(result, TokenKind::String("helloworld".to_string()));
+    }
+
+    #[test]
+    fn test_triple_quote_initial_backslash_newline_is_elided() {
+        let result = lex_string("\"\"\"\\\nNAME=Fedora\"\"\"");
+        assert_eq!(result, TokenKind::String("NAME=Fedora".to_string()));
+    }
+
+    #[test]
+    fn test_fstring_backslash_newline_continuation_is_elided() {
+        let result = lex_string_with_prefix("\"hello\\\n{name}\"", "f");
+        assert_eq!(result, TokenKind::FString("hello{name}".to_string()));
+    }
+
+    #[test]
+    fn test_byte_string_backslash_newline_continuation_is_elided() {
+        let result = lex_string_with_prefix("\"hello\\\nworld\"", "b");
+        assert_eq!(result, TokenKind::Bytes(b"helloworld".to_vec()));
     }
 
     #[test]
