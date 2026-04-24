@@ -18,12 +18,13 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinFunctionObject, get_iterator_mut, value_to_iterator};
+use crate::builtins::BuiltinFunctionObject;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::calls::{
     call_callable_value_with_keywords_from_values, invoke_builtin, invoke_callable_value,
 };
+use crate::ops::iteration::collect_iterable_values;
 
 fn keyword_key_to_name(key: Value) -> Result<Arc<str>, RuntimeError> {
     if let Some(ptr) = key.as_string_object_ptr() {
@@ -84,20 +85,12 @@ pub fn build_tuple_unpack(vm: &mut VirtualMachine, inst: Instruction) -> Control
         let should_unpack = (unpack_flags & (1 << i)) != 0;
 
         if should_unpack {
-            if let Some(iterator) = get_iterator_mut(&value) {
-                while let Some(item) = iterator.next() {
-                    result.push(item);
-                }
-            } else {
-                let mut iterator = match value_to_iterator(&value) {
-                    Ok(iterator) => iterator,
-                    Err(err) => {
-                        return ControlFlow::Error(RuntimeError::type_error(err.to_string()));
-                    }
-                };
-                while let Some(item) = iterator.next() {
-                    result.push(item);
-                }
+            let values = match collect_iterable_values(vm, value) {
+                Ok(values) => values,
+                Err(err) => return ControlFlow::Error(err),
+            };
+            for item in values {
+                result.push(item);
             }
         } else {
             // Regular value - add directly

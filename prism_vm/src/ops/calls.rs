@@ -71,6 +71,21 @@ static TUPLE_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
         crate::builtins::builtin_tuple_new,
     )
 });
+static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("int.__new__"), crate::builtins::builtin_int_new)
+});
+static BYTES_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("bytes.__new__"),
+        crate::builtins::builtin_bytes_new,
+    )
+});
+static BYTEARRAY_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("bytearray.__new__"),
+        crate::builtins::builtin_bytearray_new,
+    )
+});
 
 const DIRECT_CALL_RETURN_REG: u8 = u8::MAX;
 
@@ -103,7 +118,24 @@ fn should_restore_direct_call_caller_state(
         return false;
     }
 
-    !matches!(result, Ok(InvokeCallableOutcome::ControlTransferred))
+    match result {
+        Ok(InvokeCallableOutcome::ControlTransferred) => false,
+        Err(err) if err.is_control_transferred() => false,
+        _ => true,
+    }
+}
+
+#[inline(always)]
+fn should_restore_direct_call_caller_state_for_value_result(
+    vm: &VirtualMachine,
+    stop_depth: usize,
+    result: &Result<Value, RuntimeError>,
+) -> bool {
+    if vm.call_depth() != stop_depth {
+        return false;
+    }
+
+    !matches!(result, Err(err) if err.is_control_transferred())
 }
 
 // =============================================================================
@@ -162,6 +194,7 @@ pub(crate) fn value_supports_call_protocol(value: Value) -> bool {
         TypeId::FUNCTION
         | TypeId::METHOD
         | TypeId::CLOSURE
+        | TypeId::STATICMETHOD
         | TypeId::TYPE
         | TypeId::BUILTIN_FUNCTION
         | TypeId::EXCEPTION_TYPE => true,
@@ -351,6 +384,10 @@ fn snapshot_frame_locals_dict(frame: &crate::frame::Frame) -> DictObject {
 }
 
 fn current_globals_value(vm: &mut VirtualMachine) -> Result<Value, RuntimeError> {
+    if let Some(module) = vm.current_module_cloned() {
+        return Ok(module.dict_value());
+    }
+
     let dict = snapshot_globals_dict(vm);
     alloc_heap_value(vm, dict, "globals dict snapshot")
 }
@@ -360,6 +397,10 @@ fn current_locals_value(vm: &mut VirtualMachine) -> Result<Value, RuntimeError> 
         let frame = vm.current_frame();
         frame.return_frame.is_none() && frame.module.is_some()
     };
+    if is_module_frame && let Some(module) = vm.current_module_cloned() {
+        return Ok(module.dict_value());
+    }
+
     let dict = if is_module_frame {
         snapshot_globals_dict(vm)
     } else {
@@ -430,6 +471,9 @@ fn builtin_instantiation_slot_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::TYPE, "__new__") => Some(builtin_slot_value(&TYPE_NEW_SLOT_FUNCTION)),
         (TypeId::TYPE, "__init__") => Some(builtin_slot_value(&TYPE_INIT_SLOT_FUNCTION)),
         (TypeId::TUPLE, "__new__") => Some(builtin_slot_value(&TUPLE_NEW_SLOT_FUNCTION)),
+        (TypeId::INT, "__new__") => Some(builtin_slot_value(&INT_NEW_SLOT_FUNCTION)),
+        (TypeId::BYTES, "__new__") => Some(builtin_slot_value(&BYTES_NEW_SLOT_FUNCTION)),
+        (TypeId::BYTEARRAY, "__new__") => Some(builtin_slot_value(&BYTEARRAY_NEW_SLOT_FUNCTION)),
         _ => None,
     }
 }
@@ -743,7 +787,8 @@ fn invoke_class_new(
     kwargc: usize,
     kwnames_idx: u16,
 ) -> Result<Value, RuntimeError> {
-    let callable = crate::ops::objects::resolve_class_attribute(new_callable, class_value);
+    let callable =
+        crate::ops::objects::resolve_class_attribute_in_vm(vm, new_callable, class_value)?;
     invoke_callable_with_implicit_self(
         vm,
         callable,
@@ -762,7 +807,8 @@ fn invoke_class_new_direct(
     new_callable: Value,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
-    let callable = crate::ops::objects::resolve_class_attribute(new_callable, class_value);
+    let callable =
+        crate::ops::objects::resolve_class_attribute_in_vm(vm, new_callable, class_value)?;
     invoke_callable_with_implicit_self_values(vm, callable, class_value, args, "__new__")
 }
 
@@ -773,7 +819,8 @@ fn invoke_class_new_direct_with_keywords(
     args: &[Value],
     keywords: &[(&str, Value)],
 ) -> Result<Value, RuntimeError> {
-    let callable = crate::ops::objects::resolve_class_attribute(new_callable, class_value);
+    let callable =
+        crate::ops::objects::resolve_class_attribute_in_vm(vm, new_callable, class_value)?;
     invoke_callable_with_implicit_self_values_with_keywords(
         vm,
         callable,
@@ -794,7 +841,8 @@ fn invoke_class_init(
     kwnames_idx: u16,
     init_arg_policy: InitArgPolicy,
 ) -> Result<(), RuntimeError> {
-    let bound_init = crate::ops::objects::bind_instance_attribute(init_callable, instance);
+    let bound_init =
+        crate::ops::objects::bind_instance_attribute_in_vm(vm, init_callable, instance)?;
     let init_result = match init_arg_policy {
         InitArgPolicy::ForwardConstructorArgs => invoke_callable_with_implicit_self(
             vm,
@@ -828,7 +876,8 @@ fn invoke_class_init_direct(
     args: &[Value],
     init_arg_policy: InitArgPolicy,
 ) -> Result<(), RuntimeError> {
-    let bound_init = crate::ops::objects::bind_instance_attribute(init_callable, instance);
+    let bound_init =
+        crate::ops::objects::bind_instance_attribute_in_vm(vm, init_callable, instance)?;
     let init_result = match init_arg_policy {
         InitArgPolicy::ForwardConstructorArgs => {
             invoke_callable_with_implicit_self_values(vm, bound_init, instance, args, "__init__")?
@@ -856,7 +905,8 @@ fn invoke_class_init_direct_with_keywords(
     keywords: &[(&str, Value)],
     init_arg_policy: InitArgPolicy,
 ) -> Result<(), RuntimeError> {
-    let bound_init = crate::ops::objects::bind_instance_attribute(init_callable, instance);
+    let bound_init =
+        crate::ops::objects::bind_instance_attribute_in_vm(vm, init_callable, instance)?;
     let init_result = match init_arg_policy {
         InitArgPolicy::ForwardConstructorArgs => {
             invoke_callable_with_implicit_self_values_with_keywords(
@@ -939,6 +989,33 @@ fn invoke_callable_with_implicit_self(
                 slot_name,
             )
         }
+        _ if value_supports_call_protocol(callable) => {
+            let (args, keyword_args) = {
+                let caller_frame = &vm.frames[vm.call_depth() - 1];
+                let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(posargc + 1);
+                args.push(implicit_self);
+                for i in 0..posargc {
+                    args.push(caller_frame.get_reg(dst_reg + 1 + i as u8));
+                }
+
+                let keyword_args = if kwargc == 0 {
+                    SmallVec::new()
+                } else {
+                    collect_call_keyword_args(caller_frame, dst_reg, posargc, kwargc, kwnames_idx)?
+                };
+                (args, keyword_args)
+            };
+
+            if keyword_args.is_empty() {
+                invoke_callable_value(vm, callable, &args)
+            } else {
+                let keyword_refs: SmallVec<[(&str, Value); 4]> = keyword_args
+                    .iter()
+                    .map(|(name, value)| (name.as_ref(), *value))
+                    .collect();
+                invoke_callable_value_with_keywords(vm, callable, &args, &keyword_refs)
+            }
+        }
         type_id => Err(RuntimeError::type_error(format!(
             "{slot_name} is not callable (got '{}')",
             type_id.name()
@@ -988,6 +1065,12 @@ fn invoke_callable_with_implicit_self_values(
                 args,
                 slot_name,
             )
+        }
+        _ if value_supports_call_protocol(callable) => {
+            let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
+            all_args.push(implicit_self);
+            all_args.extend_from_slice(args);
+            invoke_callable_value(vm, callable, &all_args)
         }
         type_id => Err(RuntimeError::type_error(format!(
             "{slot_name} is not callable (got '{}')",
@@ -1050,6 +1133,12 @@ fn invoke_callable_with_implicit_self_values_with_keywords(
                 keywords,
                 slot_name,
             )
+        }
+        _ if value_supports_call_protocol(callable) => {
+            let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
+            all_args.push(implicit_self);
+            all_args.extend_from_slice(args);
+            invoke_callable_value_with_keywords(vm, callable, &all_args, keywords)
         }
         type_id => Err(RuntimeError::type_error(format!(
             "{slot_name} is not callable (got '{}')",
@@ -1198,7 +1287,11 @@ fn invoke_user_function_with_implicit_self(
     }
 
     initialize_closure_cellvars_from_locals(new_frame, local_idx as usize);
-    vm.execute_until_stack_depth_restored(stop_depth, dst_reg)
+    let target_frame_id = vm.current_frame_id();
+    match vm.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)? {
+        NestedTargetFrameOutcome::Returned(value) => Ok(value),
+        NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::control_transferred()),
+    }
 }
 
 fn allocate_bound_variadics(
@@ -1428,9 +1521,7 @@ fn invoke_user_function_direct(
 ) -> Result<Value, RuntimeError> {
     match invoke_user_function_direct_impl(vm, func_ptr, args, false)? {
         InvokeCallableOutcome::Returned(value) => Ok(value),
-        InvokeCallableOutcome::ControlTransferred => Err(RuntimeError::internal(
-            "nested callable transferred control to caller frame",
-        )),
+        InvokeCallableOutcome::ControlTransferred => Err(RuntimeError::control_transferred()),
     }
 }
 
@@ -1456,6 +1547,39 @@ fn invoke_user_function_direct_impl(
 
     let saved_caller_register = vm.current_frame().snapshot_register(DIRECT_CALL_RETURN_REG);
     let saved_exception_context = vm.capture_exception_context();
+    let arg_count = code.arg_count as usize;
+    let (varargs_value, varkw_value) = allocate_bound_variadics(vm, &mut bound)?;
+
+    if is_generator_code(&code) {
+        let result = match create_generator_from_bound_arguments(
+            vm,
+            &code,
+            DIRECT_CALL_RETURN_REG,
+            function_module_ptr(vm, func),
+            closure.clone(),
+            &bound,
+            varargs_value,
+            varkw_value,
+        ) {
+            ControlFlow::Continue => Ok(InvokeCallableOutcome::Returned(
+                vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG),
+            )),
+            ControlFlow::Error(err) => Err(err),
+            ControlFlow::Jump(_) => Err(RuntimeError::internal(
+                "generator direct call produced unexpected jump control flow",
+            )),
+            _ => Err(RuntimeError::internal(
+                "generator direct call produced unexpected jump control flow",
+            )),
+        };
+        restore_direct_call_caller_state(
+            vm,
+            vm.call_depth(),
+            saved_caller_register,
+            saved_exception_context,
+        );
+        return result;
+    }
 
     let stop_depth = vm.call_depth();
     vm.push_frame_with_closure_and_module(
@@ -1465,8 +1589,6 @@ fn invoke_user_function_direct_impl(
         module,
     )?;
 
-    let arg_count = code.arg_count as usize;
-    let (varargs_value, varkw_value) = allocate_bound_variadics(vm, &mut bound)?;
     let initialized_local_count = {
         let new_frame = vm.current_frame_mut();
         write_bound_arguments_to_frame(new_frame, &bound, arg_count, varargs_value, varkw_value)
@@ -1484,9 +1606,9 @@ fn invoke_user_function_direct_impl(
             NestedTargetFrameOutcome::ControlTransferred if allow_control_transfer => {
                 Ok(InvokeCallableOutcome::ControlTransferred)
             }
-            NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::internal(
-                "nested callable transferred control to caller frame",
-            )),
+            NestedTargetFrameOutcome::ControlTransferred => {
+                Err(RuntimeError::control_transferred())
+            }
         }
     };
     if should_restore_direct_call_caller_state(vm, stop_depth, &result) {
@@ -1523,6 +1645,37 @@ fn invoke_user_function_direct_with_keywords(
 
     let saved_caller_register = vm.current_frame().snapshot_register(DIRECT_CALL_RETURN_REG);
     let saved_exception_context = vm.capture_exception_context();
+    let arg_count = code.arg_count as usize;
+    let (varargs_value, varkw_value) = allocate_bound_variadics(vm, &mut bound)?;
+
+    if is_generator_code(&code) {
+        let result = match create_generator_from_bound_arguments(
+            vm,
+            &code,
+            DIRECT_CALL_RETURN_REG,
+            function_module_ptr(vm, func),
+            closure.clone(),
+            &bound,
+            varargs_value,
+            varkw_value,
+        ) {
+            ControlFlow::Continue => Ok(vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG)),
+            ControlFlow::Error(err) => Err(err),
+            ControlFlow::Jump(_) => Err(RuntimeError::internal(
+                "generator direct call produced unexpected jump control flow",
+            )),
+            _ => Err(RuntimeError::internal(
+                "generator direct call produced unexpected jump control flow",
+            )),
+        };
+        restore_direct_call_caller_state(
+            vm,
+            vm.call_depth(),
+            saved_caller_register,
+            saved_exception_context,
+        );
+        return result;
+    }
 
     let stop_depth = vm.call_depth();
     vm.push_frame_with_closure_and_module(
@@ -1532,8 +1685,6 @@ fn invoke_user_function_direct_with_keywords(
         module,
     )?;
 
-    let arg_count = code.arg_count as usize;
-    let (varargs_value, varkw_value) = allocate_bound_variadics(vm, &mut bound)?;
     let initialized_local_count = {
         let new_frame = vm.current_frame_mut();
         write_bound_arguments_to_frame(new_frame, &bound, arg_count, varargs_value, varkw_value)
@@ -1546,12 +1697,14 @@ fn invoke_user_function_direct_with_keywords(
         let target_frame_id = vm.current_frame_id();
         vm.execute_until_target_frame_returns(stop_depth, target_frame_id)
     };
-    restore_direct_call_caller_state(
-        vm,
-        stop_depth,
-        saved_caller_register,
-        saved_exception_context,
-    );
+    if should_restore_direct_call_caller_state_for_value_result(vm, stop_depth, &result) {
+        restore_direct_call_caller_state(
+            vm,
+            stop_depth,
+            saved_caller_register,
+            saved_exception_context,
+        );
+    }
 
     result
 }
@@ -1595,6 +1748,10 @@ fn invoke_callable_value_impl(
         TypeId::FUNCTION | TypeId::CLOSURE => {
             invoke_user_function_direct_impl(vm, ptr, args, allow_control_transfer)
         }
+        TypeId::STATICMETHOD => {
+            let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            invoke_callable_value_impl(vm, descriptor.function(), args, allow_control_transfer)
+        }
         TypeId::METHOD => {
             let bound = unsafe { &*(ptr as *const BoundMethod) };
             let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
@@ -1634,9 +1791,7 @@ pub(crate) fn invoke_callable_value(
 ) -> Result<Value, RuntimeError> {
     match invoke_callable_value_impl(vm, callable, args, false)? {
         InvokeCallableOutcome::Returned(value) => Ok(value),
-        InvokeCallableOutcome::ControlTransferred => Err(RuntimeError::internal(
-            "nested callable transferred control to caller frame",
-        )),
+        InvokeCallableOutcome::ControlTransferred => Err(RuntimeError::control_transferred()),
     }
 }
 
@@ -1687,6 +1842,10 @@ pub(crate) fn invoke_callable_value_with_keywords(
         }
         TypeId::FUNCTION | TypeId::CLOSURE => {
             invoke_user_function_direct_with_keywords(vm, ptr, args, keywords)
+        }
+        TypeId::STATICMETHOD => {
+            let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            invoke_callable_value_with_keywords(vm, descriptor.function(), args, keywords)
         }
         TypeId::METHOD => {
             let bound = unsafe { &*(ptr as *const BoundMethod) };
@@ -2259,6 +2418,20 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     call_kw_user_function(vm, ptr, dst_reg, argc, 0, 0)
                 }
             }
+            TypeId::STATICMETHOD => {
+                let frame = vm.current_frame();
+                let args: Vec<Value> = (0..argc)
+                    .map(|i| frame.get_reg(dst_reg + 1 + i as u8))
+                    .collect();
+
+                match invoke_callable_value(vm, func_val, &args) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(e) => ControlFlow::Error(e),
+                }
+            }
             TypeId::METHOD => {
                 let bound = unsafe { &*(ptr as *const BoundMethod) };
                 match invoke_callable_with_implicit_self(
@@ -2396,6 +2569,35 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
             TypeId::FUNCTION | TypeId::CLOSURE => {
                 call_kw_user_function(vm, ptr, dst_reg, posargc, kwargc, kwnames_idx)
+            }
+            TypeId::STATICMETHOD => {
+                let caller_frame = &vm.frames[vm.call_depth() - 1];
+                let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(posargc);
+                for i in 0..posargc {
+                    args.push(caller_frame.get_reg(dst_reg + 1 + i as u8));
+                }
+                let keyword_args = match collect_call_keyword_args(
+                    caller_frame,
+                    dst_reg,
+                    posargc,
+                    kwargc,
+                    kwnames_idx,
+                ) {
+                    Ok(keyword_args) => keyword_args,
+                    Err(err) => return ControlFlow::Error(err),
+                };
+                let keyword_refs: SmallVec<[(&str, Value); 4]> = keyword_args
+                    .iter()
+                    .map(|(name, value)| (name.as_ref(), *value))
+                    .collect();
+
+                match invoke_callable_value_with_keywords(vm, func_val, &args, &keyword_refs) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(err) => ControlFlow::Error(err),
+                }
             }
             TypeId::METHOD => {
                 let bound = unsafe { &*(ptr as *const BoundMethod) };
@@ -3394,7 +3596,7 @@ mod tests {
     use prism_core::Value;
     use prism_core::intern::intern;
     use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};
-    use prism_runtime::object::descriptor::BoundMethod;
+    use prism_runtime::object::descriptor::{BoundMethod, StaticMethodDescriptor};
     use prism_runtime::object::mro::ClassId;
     use prism_runtime::object::shape::shape_registry;
     use prism_runtime::object::shaped_object::ShapedObject;
@@ -3402,6 +3604,7 @@ mod tests {
         SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
     };
     use prism_runtime::object::type_obj::TypeId;
+    use prism_runtime::types::bytes::BytesObject;
     use prism_runtime::types::dict::DictObject;
     use prism_runtime::types::function::FunctionObject;
     use prism_runtime::types::list::ListObject;
@@ -3666,6 +3869,50 @@ mod tests {
         }
     }
 
+    fn staticmethod_identity(args: &[Value]) -> Result<Value, BuiltinError> {
+        Ok(args.first().copied().unwrap_or_else(Value::none))
+    }
+
+    #[test]
+    fn test_staticmethod_values_are_callable() {
+        let builtin_ptr = Box::into_raw(Box::new(BuiltinFunctionObject::new(
+            Arc::from("test.staticmethod_identity"),
+            staticmethod_identity,
+        )));
+        let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(
+            Value::object_ptr(builtin_ptr as *const ()),
+        )));
+        let staticmethod_value = Value::object_ptr(staticmethod_ptr as *const ());
+        let mut vm = VirtualMachine::new();
+
+        assert!(value_supports_call_protocol(staticmethod_value));
+        assert_eq!(
+            invoke_callable_value(&mut vm, staticmethod_value, &[Value::int(7).unwrap()])
+                .expect("staticmethod should be directly callable")
+                .as_int(),
+            Some(7)
+        );
+
+        vm.push_frame(Arc::new(CodeObject::new("call_staticmethod", "<test>")), 0)
+            .expect("frame push should succeed");
+        vm.current_frame_mut().set_reg(1, staticmethod_value);
+        vm.current_frame_mut().set_reg(3, Value::int(11).unwrap());
+
+        let inst = Instruction::op_dss(
+            Opcode::Call,
+            Register::new(2),
+            Register::new(1),
+            Register::new(1),
+        );
+        assert!(matches!(call(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(11));
+
+        unsafe {
+            drop(Box::from_raw(staticmethod_ptr));
+            drop(Box::from_raw(builtin_ptr));
+        }
+    }
+
     #[test]
     fn test_invoke_callable_value_executes_reflected_wrapper_descriptor() {
         let mut vm = VirtualMachine::new();
@@ -3761,6 +4008,83 @@ mod tests {
     }
 
     #[test]
+    fn test_invoke_callable_value_instantiates_int_subclass_with_native_new() {
+        let mut vm = VirtualMachine::new();
+        let class =
+            PyClassObject::new(intern("IntSubclass"), &[ClassId(TypeId::INT.raw())], |id| {
+                Some(builtin_class_mro(class_id_to_type_id(id)).into())
+            })
+            .expect("int subclass mro should be valid");
+        let class = register_test_class(class);
+
+        let instance = super::invoke_callable_value(
+            &mut vm,
+            Value::object_ptr(Arc::as_ptr(&class) as *const ()),
+            &[Value::int(42).unwrap()],
+        )
+        .expect("int subclass call should succeed without object.__init__ seeing constructor args");
+
+        let instance_ptr = instance
+            .as_object_ptr()
+            .expect("int subclass call should return an instance");
+        assert_eq!(super::extract_type_id(instance_ptr), class.class_type_id());
+        let shaped = unsafe { &*(instance_ptr as *const ShapedObject) };
+        assert_eq!(
+            shaped
+                .int_backing()
+                .expect("int backing should exist")
+                .to_string(),
+            "42"
+        );
+
+        unsafe {
+            drop(Box::from_raw(instance_ptr as *mut ShapedObject));
+        }
+    }
+
+    #[test]
+    fn test_invoke_callable_value_instantiates_bytes_subclass_with_native_new() {
+        let mut vm = VirtualMachine::new();
+        let class = PyClassObject::new(
+            intern("BytesSubclass"),
+            &[ClassId(TypeId::BYTES.raw())],
+            |id| Some(builtin_class_mro(class_id_to_type_id(id)).into()),
+        )
+        .expect("bytes subclass mro should be valid");
+        let class = register_test_class(class);
+        let source = Value::object_ptr(
+            Box::into_raw(Box::new(BytesObject::from_slice(b"auth"))) as *const ()
+        );
+
+        let instance = super::invoke_callable_value(
+            &mut vm,
+            Value::object_ptr(Arc::as_ptr(&class) as *const ()),
+            &[source],
+        )
+        .expect("bytes subclass call should succeed");
+
+        let instance_ptr = instance
+            .as_object_ptr()
+            .expect("bytes subclass call should return an instance");
+        assert_eq!(super::extract_type_id(instance_ptr), class.class_type_id());
+        let shaped = unsafe { &*(instance_ptr as *const ShapedObject) };
+        assert_eq!(
+            shaped
+                .bytes_backing()
+                .expect("bytes backing should exist")
+                .as_bytes(),
+            b"auth"
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                source.as_object_ptr().unwrap() as *mut BytesObject
+            ));
+            drop(Box::from_raw(instance_ptr as *mut ShapedObject));
+        }
+    }
+
+    #[test]
     fn test_instantiate_user_defined_dict_subclass_allocates_native_dict_backing() {
         let mut vm = VirtualMachine::new();
         let class = PyClassObject::new(
@@ -3852,6 +4176,51 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(iterable_ptr));
+            drop(Box::from_raw(sorted_ptr));
+            drop(Box::from_raw(result_ptr as *mut ListObject));
+        }
+    }
+
+    #[test]
+    fn test_invoke_callable_value_with_keywords_forwards_staticmethod_keywords() {
+        let mut vm = VirtualMachine::new();
+        let sorted_ptr = Box::into_raw(Box::new(BuiltinFunctionObject::new(
+            Arc::from("sorted"),
+            crate::builtins::builtin_sorted,
+        )));
+        let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(
+            Value::object_ptr(sorted_ptr as *const ()),
+        )));
+        let iterable_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(2).unwrap(),
+        ])));
+
+        let result = invoke_callable_value_with_keywords(
+            &mut vm,
+            Value::object_ptr(staticmethod_ptr as *const ()),
+            &[Value::object_ptr(iterable_ptr as *const ())],
+            &[("reverse", Value::bool(true))],
+        )
+        .expect("staticmethod should forward keyword calls");
+
+        let result_ptr = result
+            .as_object_ptr()
+            .expect("sorted should return a list object");
+        let result_list = unsafe { &*(result_ptr as *const ListObject) };
+        assert_eq!(
+            result_list.as_slice(),
+            &[
+                Value::int(3).unwrap(),
+                Value::int(2).unwrap(),
+                Value::int(1).unwrap()
+            ]
+        );
+
+        unsafe {
+            drop(Box::from_raw(iterable_ptr));
+            drop(Box::from_raw(staticmethod_ptr));
             drop(Box::from_raw(sorted_ptr));
             drop(Box::from_raw(result_ptr as *mut ListObject));
         }

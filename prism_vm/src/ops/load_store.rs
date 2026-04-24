@@ -266,8 +266,20 @@ fn is_missing_mapping_key_error(err: &RuntimeError) -> bool {
 /// LoadGlobal: dst = globals[names[imm16]]
 #[inline(always)]
 pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let name = frame.get_name(inst.imm16()).clone();
+    let (name, locals_mapping) = {
+        let frame = vm.current_frame();
+        (frame.get_name(inst.imm16()).clone(), frame.locals_mapping())
+    };
+
+    if let Some(mapping) = locals_mapping {
+        return match load_mapped_local(vm, mapping, &name) {
+            Ok(value) => {
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
+                ControlFlow::Continue
+            }
+            Err(err) => ControlFlow::Error(err),
+        };
+    }
 
     match vm.module_scope_value(&name) {
         Some(value) => {

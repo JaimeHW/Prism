@@ -44,6 +44,7 @@ pub(crate) fn resolve_builtin_instance_method(type_id: TypeId, name: &str) -> Op
         TypeId::REGEX_MATCH => builtin_methods::resolve_regex_match_method(name),
         TypeId::EXCEPTION => builtin_methods::resolve_exception_method(name),
         TypeId::LIST => builtin_methods::resolve_list_method(name),
+        TypeId::TUPLE => builtin_methods::resolve_tuple_method(name),
         TypeId::DICT => builtin_methods::resolve_dict_method(name),
         TypeId::MAPPING_PROXY => builtin_methods::resolve_mapping_proxy_method(name),
         TypeId::BYTES => builtin_methods::resolve_bytes_method(name),
@@ -54,6 +55,8 @@ pub(crate) fn resolve_builtin_instance_method(type_id: TypeId, name: &str) -> Op
         TypeId::SET | TypeId::FROZENSET => builtin_methods::resolve_set_method(type_id, name),
         TypeId::GENERATOR => builtin_methods::resolve_generator_method(name),
         TypeId::FUNCTION | TypeId::CLOSURE => builtin_methods::resolve_function_method(name),
+        TypeId::CLASSMETHOD => builtin_methods::resolve_classmethod_method(name),
+        TypeId::STATICMETHOD => builtin_methods::resolve_staticmethod_method(name),
         _ => None,
     };
     resolved.or_else(|| builtin_methods::resolve_generic_dunder_method(type_id, name))

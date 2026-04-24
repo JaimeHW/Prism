@@ -20,6 +20,7 @@ pub mod load_store;
 pub mod r#match;
 pub mod method_dispatch;
 pub mod objects;
+pub mod protocols;
 pub mod subscript;
 pub mod unpack;
 

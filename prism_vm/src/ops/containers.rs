@@ -14,7 +14,6 @@ use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
-use std::sync::Arc;
 
 // =============================================================================
 // Container Construction
@@ -560,30 +559,12 @@ pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    match vm.import_resolver.import_from(&module, &attr_name) {
+    match vm.import_from_module(&module, &attr_name) {
         Ok(value) => {
             vm.current_frame_mut().set_reg(dst.0, value);
             ControlFlow::Continue
         }
-        Err(_) => {
-            let submodule_name = format!("{}.{}", module.name(), attr_name);
-            match vm.import_module_named(&submodule_name) {
-                Ok(submodule) => {
-                    let value = Value::object_ptr(Arc::as_ptr(&submodule) as *const ());
-                    module.set_attr(&attr_name, value);
-                    vm.current_frame_mut().set_reg(dst.0, value);
-                    ControlFlow::Continue
-                }
-                Err(_) => ControlFlow::Error(RuntimeError::import_error(
-                    module.name(),
-                    format!(
-                        "cannot import name '{}' from '{}'",
-                        attr_name,
-                        module.name()
-                    ),
-                )),
-            }
-        }
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -612,11 +593,12 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    // Get all public names from the module
-    // If __all__ is defined, use it; otherwise use all non-underscore names
-    vm.import_star_into_current_scope(&module);
-
-    ControlFlow::Continue
+    // Get all public names from the module. If __all__ is defined, use it
+    // exactly; otherwise use all non-underscore names.
+    match vm.import_star_into_current_scope(&module) {
+        Ok(()) => ControlFlow::Continue,
+        Err(err) => ControlFlow::Error(err),
+    }
 }
 
 #[cfg(test)]

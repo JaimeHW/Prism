@@ -3,7 +3,15 @@
 //! Handles jumps, returns, and exception handling.
 
 use crate::VirtualMachine;
+use crate::builtins::ExceptionValue;
 use crate::dispatch::ControlFlow;
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::stdlib::exceptions::ExceptionTypeId;
+use crate::stdlib::generators::GeneratorObject;
+use crate::vm::GeneratorResumeOutcome;
 use prism_code::Instruction;
 use prism_core::Value;
 
@@ -184,28 +192,126 @@ pub fn yield_value(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// `ControlFlow::Yield` with the value from the sub-generator.
 #[inline(always)]
 pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let sub_gen = frame.get_reg(inst.src1().0);
-    let resume_point = inst.dst().0 as u32;
+    let dst = inst.dst().0;
+    let src = inst.src1().0;
 
-    // For yield from, we need to:
-    // 1. Get the next value from the sub-generator
-    // 2. If StopIteration, continue execution (extract return value)
-    // 3. Otherwise, yield the value to our caller
-
-    // For now, treat the sub_gen value as the immediate yield value
-    // Full implementation requires integration with the iterator protocol
-    // and proper StopIteration handling
-    ControlFlow::Yield {
-        value: sub_gen,
-        resume_point,
+    let delegated = vm.current_frame().get_reg(src);
+    let iterator = match ensure_iterator_value(vm, delegated) {
+        Ok(iterator) => iterator,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    if iterator != delegated {
+        vm.current_frame_mut().set_reg(src, iterator);
     }
+
+    let send_value = vm.current_frame().get_reg(dst);
+    match drive_yield_from_delegate(vm, iterator, send_value) {
+        Ok(YieldFromStep::Yielded(value)) => {
+            rewind_current_instruction(vm);
+            ControlFlow::Yield {
+                value,
+                resume_point: dst as u32,
+            }
+        }
+        Ok(YieldFromStep::Returned(value)) => {
+            vm.current_frame_mut().set_reg(dst, value);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
+enum YieldFromStep {
+    Yielded(Value),
+    Returned(Value),
+}
+
+fn drive_yield_from_delegate(
+    vm: &mut VirtualMachine,
+    iterator: Value,
+    send_value: Value,
+) -> Result<YieldFromStep, RuntimeError> {
+    if let Some(generator) = GeneratorObject::from_value_mut(iterator) {
+        return match vm.resume_generator_for_send(generator, send_value) {
+            Ok(GeneratorResumeOutcome::Yielded(value)) => Ok(YieldFromStep::Yielded(value)),
+            Ok(GeneratorResumeOutcome::Returned(value)) => Ok(YieldFromStep::Returned(value)),
+            Err(err) if is_stop_iteration(&err) => Ok(YieldFromStep::Returned(
+                stop_iteration_value(&err).unwrap_or_else(Value::none),
+            )),
+            Err(err) => Err(err),
+        };
+    }
+
+    if send_value.is_none() {
+        return match next_step(vm, iterator)? {
+            IterStep::Yielded(value) => Ok(YieldFromStep::Yielded(value)),
+            IterStep::Exhausted => Ok(YieldFromStep::Returned(Value::none())),
+        };
+    }
+
+    let send_target = resolve_special_method(iterator, "send")?;
+    match invoke_bound_method_target(vm, send_target, &[send_value]) {
+        Ok(value) => Ok(YieldFromStep::Yielded(value)),
+        Err(err) if is_stop_iteration(&err) => Ok(YieldFromStep::Returned(
+            stop_iteration_value(&err).unwrap_or_else(Value::none),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+fn invoke_bound_method_target(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    match (target.implicit_self, args.len()) {
+        (Some(implicit_self), 0) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        (Some(implicit_self), 1) => {
+            invoke_callable_value(vm, target.callable, &[implicit_self, args[0]])
+        }
+        (Some(implicit_self), _) => {
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            call_args.push(implicit_self);
+            call_args.extend_from_slice(args);
+            invoke_callable_value(vm, target.callable, &call_args)
+        }
+        (None, _) => invoke_callable_value(vm, target.callable, args),
+    }
+}
+
+fn is_stop_iteration(err: &RuntimeError) -> bool {
+    matches!(err.kind, RuntimeErrorKind::StopIteration)
+        || matches!(
+            err.kind,
+            RuntimeErrorKind::Exception { type_id, .. }
+                if type_id == ExceptionTypeId::StopIteration.as_u8() as u16
+        )
+}
+
+fn stop_iteration_value(err: &RuntimeError) -> Option<Value> {
+    let RuntimeErrorKind::Exception { type_id, .. } = err.kind else {
+        return None;
+    };
+    if type_id != ExceptionTypeId::StopIteration.as_u8() as u16 {
+        return None;
+    }
+
+    let raised = err.raised_value?;
+    let exc = unsafe { ExceptionValue::from_value(raised)? };
+    exc.args.as_deref().and_then(|args| args.first()).copied()
+}
+
+fn rewind_current_instruction(vm: &mut VirtualMachine) {
+    let frame = vm.current_frame_mut();
+    frame.ip = frame.ip.saturating_sub(1);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::create_exception_with_args;
     use prism_code::{CodeObject, Instruction, Opcode, Register};
+    use prism_core::Value;
     use std::sync::Arc;
 
     fn push_test_frame(vm: &mut VirtualMachine) {
@@ -243,5 +349,24 @@ mod tests {
         let inst = Instruction::op(Opcode::Reraise);
         let control = reraise(&mut vm, inst);
         assert!(matches!(control, ControlFlow::Error(_)));
+    }
+
+    #[test]
+    fn test_stop_iteration_value_reads_exception_payload() {
+        let exc = create_exception_with_args(
+            ExceptionTypeId::StopIteration,
+            None,
+            vec![Value::int(99).unwrap()].into_boxed_slice(),
+        );
+        let err = RuntimeError::raised_exception(
+            ExceptionTypeId::StopIteration.as_u8() as u16,
+            exc,
+            "stop iteration",
+        );
+
+        assert_eq!(
+            stop_iteration_value(&err).and_then(|value| value.as_int()),
+            Some(99)
+        );
     }
 }

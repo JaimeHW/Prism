@@ -14,16 +14,20 @@ use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::protocols::binary_special_method;
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
 };
 use crate::type_feedback::BinaryOpFeedback;
+use num_bigint::BigInt;
+use num_traits::Zero;
 use prism_code::Instruction;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::{
     StringObject, concat_string_objects, repeat_string_object, value_as_string_ref,
@@ -42,17 +46,25 @@ pub fn add_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     // Fast path: both are integers
     match (int_like_value(a), int_like_value(b)) {
-        (Some(x), Some(y)) => match x.checked_add(y) {
-            Some(result) => match Value::int(result) {
-                Some(v) => {
-                    frame.set_reg(inst.dst().0, v);
-                    ControlFlow::Continue
-                }
-                None => ControlFlow::Error(RuntimeError::value_error("Integer too large for i48")),
-            },
-            None => ControlFlow::Error(RuntimeError::value_error("Integer overflow")),
+        (Some(x), Some(y)) => {
+            if let Some(result) = x.checked_add(y).and_then(Value::int) {
+                frame.set_reg(inst.dst().0, result);
+                return ControlFlow::Continue;
+            }
+
+            frame.set_reg(
+                inst.dst().0,
+                bigint_to_value(BigInt::from(x) + BigInt::from(y)),
+            );
+            ControlFlow::Continue
+        }
+        _ => match integer_bigint_operands(a, b) {
+            Some((x, y)) => {
+                frame.set_reg(inst.dst().0, bigint_to_value(x + y));
+                ControlFlow::Continue
+            }
+            None => ControlFlow::Error(RuntimeError::type_error("AddInt requires integers")),
         },
-        _ => ControlFlow::Error(RuntimeError::type_error("AddInt requires integers")),
     }
 }
 
@@ -63,17 +75,25 @@ pub fn sub_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
 
     match (int_like_value(a), int_like_value(b)) {
-        (Some(x), Some(y)) => match x.checked_sub(y) {
-            Some(result) => match Value::int(result) {
-                Some(v) => {
-                    frame.set_reg(inst.dst().0, v);
-                    ControlFlow::Continue
-                }
-                None => ControlFlow::Error(RuntimeError::value_error("Integer too large for i48")),
-            },
-            None => ControlFlow::Error(RuntimeError::value_error("Integer overflow")),
+        (Some(x), Some(y)) => {
+            if let Some(result) = x.checked_sub(y).and_then(Value::int) {
+                frame.set_reg(inst.dst().0, result);
+                return ControlFlow::Continue;
+            }
+
+            frame.set_reg(
+                inst.dst().0,
+                bigint_to_value(BigInt::from(x) - BigInt::from(y)),
+            );
+            ControlFlow::Continue
+        }
+        _ => match integer_bigint_operands(a, b) {
+            Some((x, y)) => {
+                frame.set_reg(inst.dst().0, bigint_to_value(x - y));
+                ControlFlow::Continue
+            }
+            None => ControlFlow::Error(RuntimeError::type_error("SubInt requires integers")),
         },
-        _ => ControlFlow::Error(RuntimeError::type_error("SubInt requires integers")),
     }
 }
 
@@ -84,17 +104,25 @@ pub fn mul_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
 
     match (int_like_value(a), int_like_value(b)) {
-        (Some(x), Some(y)) => match x.checked_mul(y) {
-            Some(result) => match Value::int(result) {
-                Some(v) => {
-                    frame.set_reg(inst.dst().0, v);
-                    ControlFlow::Continue
-                }
-                None => ControlFlow::Error(RuntimeError::value_error("Integer too large for i48")),
-            },
-            None => ControlFlow::Error(RuntimeError::value_error("Integer overflow")),
+        (Some(x), Some(y)) => {
+            if let Some(result) = x.checked_mul(y).and_then(Value::int) {
+                frame.set_reg(inst.dst().0, result);
+                return ControlFlow::Continue;
+            }
+
+            frame.set_reg(
+                inst.dst().0,
+                bigint_to_value(BigInt::from(x) * BigInt::from(y)),
+            );
+            ControlFlow::Continue
+        }
+        _ => match integer_bigint_operands(a, b) {
+            Some((x, y)) => {
+                frame.set_reg(inst.dst().0, bigint_to_value(x * y));
+                ControlFlow::Continue
+            }
+            None => ControlFlow::Error(RuntimeError::type_error("MulInt requires integers")),
         },
-        _ => ControlFlow::Error(RuntimeError::type_error("MulInt requires integers")),
     }
 }
 
@@ -107,17 +135,28 @@ pub fn floor_div_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     match (int_like_value(a), int_like_value(b)) {
         (Some(_), Some(0)) => ControlFlow::Error(RuntimeError::zero_division()),
         (Some(x), Some(y)) => {
-            // Python-style floor division
-            let result = x.div_euclid(y);
-            match Value::int(result) {
-                Some(v) => {
-                    frame.set_reg(inst.dst().0, v);
+            if x == i64::MIN && y == -1 {
+                frame.set_reg(inst.dst().0, bigint_to_value(-BigInt::from(x)));
+                return ControlFlow::Continue;
+            }
+
+            let (quotient, _) = i64_floor_divmod(x, y);
+            frame.set_reg(
+                inst.dst().0,
+                Value::int(quotient).expect("floor division result should fit in i64"),
+            );
+            ControlFlow::Continue
+        }
+        _ => match integer_bigint_operands(a, b) {
+            Some((x, y)) => match bigint_floor_divmod(&x, &y) {
+                Some((quotient, _)) => {
+                    frame.set_reg(inst.dst().0, bigint_to_value(quotient));
                     ControlFlow::Continue
                 }
-                None => ControlFlow::Error(RuntimeError::value_error("Integer too large for i48")),
-            }
-        }
-        _ => ControlFlow::Error(RuntimeError::type_error("FloorDivInt requires integers")),
+                None => ControlFlow::Error(RuntimeError::zero_division()),
+            },
+            None => ControlFlow::Error(RuntimeError::type_error("FloorDivInt requires integers")),
+        },
     }
 }
 
@@ -130,51 +169,73 @@ pub fn mod_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     match (int_like_value(a), int_like_value(b)) {
         (Some(_), Some(0)) => ControlFlow::Error(RuntimeError::zero_division()),
         (Some(x), Some(y)) => {
-            // Python-style modulo
-            let result = x.rem_euclid(y);
-            match Value::int(result) {
-                Some(v) => {
-                    frame.set_reg(inst.dst().0, v);
+            if x == i64::MIN && y == -1 {
+                frame.set_reg(inst.dst().0, Value::int(0).expect("zero should fit in i64"));
+                return ControlFlow::Continue;
+            }
+
+            let (_, remainder) = i64_floor_divmod(x, y);
+            frame.set_reg(
+                inst.dst().0,
+                Value::int(remainder).expect("modulo result should fit in i64"),
+            );
+            ControlFlow::Continue
+        }
+        _ => match integer_bigint_operands(a, b) {
+            Some((x, y)) => match bigint_floor_divmod(&x, &y) {
+                Some((_, remainder)) => {
+                    frame.set_reg(inst.dst().0, bigint_to_value(remainder));
                     ControlFlow::Continue
                 }
-                None => ControlFlow::Error(RuntimeError::value_error("Integer too large for i48")),
-            }
-        }
-        _ => ControlFlow::Error(RuntimeError::type_error("ModInt requires integers")),
+                None => ControlFlow::Error(RuntimeError::zero_division()),
+            },
+            None => ControlFlow::Error(RuntimeError::type_error("ModInt requires integers")),
+        },
     }
 }
 
 /// PowInt: dst = src1 ** src2
 #[inline(always)]
 pub fn pow_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let (a, b) = {
+        let frame = vm.current_frame_mut();
+        frame.get_regs2(inst.src1().0, inst.src2().0)
+    };
 
     match (int_like_value(a), int_like_value(b)) {
         (Some(base), Some(exp)) => {
             if exp < 0 {
                 // Negative exponent produces float
                 let result = (base as f64).powi(exp as i32);
-                frame.set_reg(inst.dst().0, Value::float(result));
-                ControlFlow::Continue
-            } else {
-                match (base as i128).checked_pow(exp as u32) {
-                    Some(result) if result >= i64::MIN as i128 && result <= i64::MAX as i128 => {
-                        match Value::int(result as i64) {
-                            Some(v) => {
-                                frame.set_reg(inst.dst().0, v);
-                                ControlFlow::Continue
-                            }
-                            None => ControlFlow::Error(RuntimeError::value_error(
-                                "Integer too large for i48",
-                            )),
+                vm.current_frame_mut()
+                    .set_reg(inst.dst().0, Value::float(result));
+                return ControlFlow::Continue;
+            }
+
+            if let Ok(exp_u32) = u32::try_from(exp) {
+                if let Some(result) = (base as i128).checked_pow(exp_u32) {
+                    if result >= i64::MIN as i128 && result <= i64::MAX as i128 {
+                        if let Some(value) = Value::int(result as i64) {
+                            vm.current_frame_mut().set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
                         }
                     }
-                    _ => ControlFlow::Error(RuntimeError::value_error("Integer overflow")),
                 }
             }
         }
-        _ => ControlFlow::Error(RuntimeError::type_error("PowInt requires integers")),
+        _ => {
+            if integer_bigint_operands(a, b).is_none() {
+                return ControlFlow::Error(RuntimeError::type_error("PowInt requires integers"));
+            }
+        }
+    }
+
+    match crate::builtins::builtin_pow_vm(vm, &[a, b]) {
+        Ok(value) => {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err.into()),
     }
 }
 
@@ -185,17 +246,22 @@ pub fn neg_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let a = frame.get_reg(inst.src1().0);
 
     match int_like_value(a) {
-        Some(x) => match x.checked_neg() {
-            Some(result) => match Value::int(result) {
-                Some(v) => {
-                    frame.set_reg(inst.dst().0, v);
-                    ControlFlow::Continue
-                }
-                None => ControlFlow::Error(RuntimeError::value_error("Integer too large for i48")),
-            },
-            None => ControlFlow::Error(RuntimeError::value_error("Integer overflow")),
+        Some(x) => {
+            if let Some(result) = x.checked_neg().and_then(Value::int) {
+                frame.set_reg(inst.dst().0, result);
+                return ControlFlow::Continue;
+            }
+
+            frame.set_reg(inst.dst().0, bigint_to_value(-BigInt::from(x)));
+            ControlFlow::Continue
+        }
+        None => match value_to_bigint(a) {
+            Some(value) => {
+                frame.set_reg(inst.dst().0, bigint_to_value(-value));
+                ControlFlow::Continue
+            }
+            None => ControlFlow::Error(RuntimeError::type_error("NegInt requires integers")),
         },
-        None => ControlFlow::Error(RuntimeError::type_error("NegInt requires integers")),
     }
 }
 
@@ -204,12 +270,19 @@ pub fn neg_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 pub fn pos_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame_mut();
     let value = frame.get_reg(inst.src1().0);
-    match int_like_value(value).and_then(Value::int) {
-        Some(result) => {
+    match value.as_bool() {
+        Some(boolean) => {
+            let result = Value::int(i64::from(boolean)).expect("bool coerces to inline int");
             frame.set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
-        None => ControlFlow::Error(RuntimeError::type_error("PosInt requires integers")),
+        None => match value_to_bigint(value) {
+            Some(_) => {
+                frame.set_reg(inst.dst().0, value);
+                ControlFlow::Continue
+            }
+            None => ControlFlow::Error(RuntimeError::type_error("PosInt requires integers")),
+        },
     }
 }
 
@@ -358,10 +431,11 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     };
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // =========================================================================
@@ -434,13 +508,16 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     // Try int + int
     if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
-        if let Some(result) = x.checked_add(y) {
-            if let Some(v) = Value::int(result) {
-                vm.current_frame_mut().set_reg(inst.dst().0, v);
-                return ControlFlow::Continue;
-            }
+        if let Some(value) = x.checked_add(y).and_then(Value::int) {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
         }
-        return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+    }
+
+    if let Some((x, y)) = integer_bigint_operands(a, b) {
+        vm.current_frame_mut()
+            .set_reg(inst.dst().0, bigint_to_value(x + y));
+        return ControlFlow::Continue;
     }
 
     if let Some(value) = try_add_complex_values(a, b) {
@@ -490,6 +567,12 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 .set_reg(inst.dst().0, Value::object_ptr(ptr));
             return ControlFlow::Continue;
         }
+    }
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__add__", "__radd__") {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
     }
 
     // Try float + float or mixed int/float
@@ -611,6 +694,63 @@ fn try_sub_complex_values(left: Value, right: Value) -> Option<Value> {
 }
 
 #[inline]
+fn integer_like_bigint(value: Value) -> Option<BigInt> {
+    value
+        .as_bool()
+        .map(|boolean| BigInt::from(u8::from(boolean)))
+        .or_else(|| value_to_bigint(value))
+}
+
+#[inline]
+fn integer_bigint_operands(left: Value, right: Value) -> Option<(BigInt, BigInt)> {
+    Some((integer_like_bigint(left)?, integer_like_bigint(right)?))
+}
+
+#[inline]
+fn bigint_floor_divmod(left: &BigInt, right: &BigInt) -> Option<(BigInt, BigInt)> {
+    if right.is_zero() {
+        return None;
+    }
+
+    let mut quotient = left / right;
+    let mut remainder = left % right;
+    if !remainder.is_zero() && remainder.sign() != right.sign() {
+        quotient -= 1;
+        remainder += right;
+    }
+
+    Some((quotient, remainder))
+}
+
+#[inline]
+fn i64_floor_divmod(left: i64, right: i64) -> (i64, i64) {
+    let mut quotient = left / right;
+    let mut remainder = left % right;
+    if remainder != 0 && remainder.signum() != right.signum() {
+        quotient -= 1;
+        remainder += right;
+    }
+    (quotient, remainder)
+}
+
+#[inline]
+fn try_binary_special_method_result(
+    vm: &mut VirtualMachine,
+    dst: u8,
+    left: Value,
+    right: Value,
+    left_method: &'static str,
+    right_method: &'static str,
+) -> Result<bool, RuntimeError> {
+    if let Some(value) = binary_special_method(vm, left, right, left_method, right_method)? {
+        vm.current_frame_mut().set_reg(dst, value);
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+#[inline]
 fn value_as_byte_sequence_ref(value: Value) -> Option<&'static BytesObject> {
     let ptr = value.as_object_ptr()?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
@@ -630,10 +770,11 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use crate::speculative::{SpecResult, Speculation, spec_sub_float, spec_sub_int};
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // Speculative Fast Path
@@ -675,22 +816,37 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    let frame = vm.current_frame_mut();
-
     if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
-        if let Some(result) = x.checked_sub(y) {
-            if let Some(v) = Value::int(result) {
-                frame.set_reg(inst.dst().0, v);
-                return ControlFlow::Continue;
-            }
+        if let Some(value) = x.checked_sub(y).and_then(Value::int) {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
         }
-        return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+    }
+
+    if let Some((x, y)) = integer_bigint_operands(a, b) {
+        vm.current_frame_mut()
+            .set_reg(inst.dst().0, bigint_to_value(x - y));
+        return ControlFlow::Continue;
     }
 
     if let Some(value) = try_sub_complex_values(a, b) {
-        frame.set_reg(inst.dst().0, value);
+        vm.current_frame_mut().set_reg(inst.dst().0, value);
         return ControlFlow::Continue;
     }
+
+    if let Some((left, right, result_type)) = crate::ops::comparison::set_binary_operands(a, b) {
+        let value = crate::ops::comparison::boxed_set_result(left.difference(right), result_type);
+        vm.current_frame_mut().set_reg(inst.dst().0, value);
+        return ControlFlow::Continue;
+    }
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__sub__", "__rsub__") {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
+    let frame = vm.current_frame_mut();
 
     let Some(x) = float_like_value(a) else {
         return ControlFlow::Error(RuntimeError::unsupported_operand(
@@ -722,10 +878,11 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     };
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // Speculative Fast Path
@@ -784,13 +941,16 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
-        if let Some(result) = x.checked_mul(y) {
-            if let Some(v) = Value::int(result) {
-                vm.current_frame_mut().set_reg(inst.dst().0, v);
-                return ControlFlow::Continue;
-            }
+        if let Some(value) = x.checked_mul(y).and_then(Value::int) {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
         }
-        return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+    }
+
+    if let Some((x, y)) = integer_bigint_operands(a, b) {
+        vm.current_frame_mut()
+            .set_reg(inst.dst().0, bigint_to_value(x * y));
+        return ControlFlow::Continue;
     }
 
     if let Some(n) = int_like_value(b) {
@@ -828,6 +988,12 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             Ok(None) => {}
             Err(err) => return ControlFlow::Error(err),
         }
+    }
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mul__", "__rmul__") {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
     }
 
     let Some(x) = float_like_value(a) else {
@@ -913,10 +1079,11 @@ pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use crate::speculative::{SpecResult, Speculation, spec_div_float};
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // Speculative Fast Path (true_div always returns float)
@@ -944,6 +1111,12 @@ pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let spec = Speculation::from_operand_pair(pair);
     if spec != Speculation::None {
         vm.speculation_cache.insert(site, spec);
+    }
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__truediv__", "__rtruediv__") {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
     }
 
     let frame = vm.current_frame_mut();
@@ -981,10 +1154,11 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use crate::speculative::{SpecResult, Speculation, spec_floor_div_float, spec_floor_div_int};
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // =========================================================================
@@ -1052,12 +1226,36 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         if y == 0 {
             return ControlFlow::Error(RuntimeError::zero_division());
         }
-        if let Some(v) = Value::int(x.div_euclid(y)) {
-            frame.set_reg(inst.dst().0, v);
+        if x == i64::MIN && y == -1 {
+            frame.set_reg(inst.dst().0, bigint_to_value(-BigInt::from(x)));
             return ControlFlow::Continue;
         }
-        return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+        let (quotient, _) = i64_floor_divmod(x, y);
+        frame.set_reg(
+            inst.dst().0,
+            Value::int(quotient).expect("floor division result should fit in i64"),
+        );
+        return ControlFlow::Continue;
     }
+
+    if let Some((x, y)) = integer_bigint_operands(a, b) {
+        let Some((quotient, _)) = bigint_floor_divmod(&x, &y) else {
+            return ControlFlow::Error(RuntimeError::zero_division());
+        };
+        frame.set_reg(inst.dst().0, bigint_to_value(quotient));
+        return ControlFlow::Continue;
+    }
+
+    let _ = frame;
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__floordiv__", "__rfloordiv__")
+    {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
+    let frame = vm.current_frame_mut();
 
     // Otherwise returns float
     let Some(x) = float_like_value(a) else {
@@ -1093,10 +1291,11 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use crate::speculative::{SpecResult, Speculation, spec_mod_float, spec_mod_int};
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // =========================================================================
@@ -1168,16 +1367,49 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     }
 
+    if let Some(template) = value_as_byte_sequence_ref(a) {
+        match crate::builtins::percent_format_bytes(template, b) {
+            Ok(value) => {
+                frame.set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            Err(err) => return ControlFlow::Error(err.into()),
+        }
+    }
+
     if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
         if y == 0 {
             return ControlFlow::Error(RuntimeError::zero_division());
         }
-        if let Some(v) = Value::int(x.rem_euclid(y)) {
-            frame.set_reg(inst.dst().0, v);
+        if x == i64::MIN && y == -1 {
+            frame.set_reg(inst.dst().0, Value::int(0).expect("zero should fit in i64"));
             return ControlFlow::Continue;
         }
-        return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+        let (_, remainder) = i64_floor_divmod(x, y);
+        frame.set_reg(
+            inst.dst().0,
+            Value::int(remainder).expect("modulo result should fit in i64"),
+        );
+        return ControlFlow::Continue;
     }
+
+    if let Some((x, y)) = integer_bigint_operands(a, b) {
+        let Some((_, remainder)) = bigint_floor_divmod(&x, &y) else {
+            return ControlFlow::Error(RuntimeError::zero_division());
+        };
+        frame.set_reg(inst.dst().0, bigint_to_value(remainder));
+        return ControlFlow::Continue;
+    }
+
+    let _ = frame;
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mod__", "__rmod__") {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
+    let frame = vm.current_frame_mut();
 
     let Some(x) = float_like_value(a) else {
         return ControlFlow::Error(RuntimeError::unsupported_operand(
@@ -1213,10 +1445,11 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use crate::speculative::{SpecResult, Speculation, spec_pow_float, spec_pow_int};
     use crate::type_feedback::OperandPair;
 
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
-    let code_id = frame.code_id();
-    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let (a, b, code_id, bc_offset) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
+    };
     let site = ICSiteId::new(code_id, bc_offset);
 
     // =========================================================================
@@ -1270,21 +1503,34 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    let frame = vm.current_frame_mut();
-
     // int ** positive int returns int
     if let (Some(base), Some(exp)) = (int_like_value(a), int_like_value(b)) {
         if exp >= 0 && exp <= 63 {
             if let Some(result) = (base as i128).checked_pow(exp as u32) {
                 if result >= i64::MIN as i128 && result <= i64::MAX as i128 {
-                    if let Some(v) = Value::int(result as i64) {
-                        frame.set_reg(inst.dst().0, v);
+                    if let Some(value) = Value::int(result as i64) {
+                        vm.current_frame_mut().set_reg(inst.dst().0, value);
                         return ControlFlow::Continue;
                     }
                 }
             }
         }
-        // Fall through to float for large or negative exponents
+    }
+
+    if integer_bigint_operands(a, b).is_some() {
+        match crate::builtins::builtin_pow_vm(vm, &[a, b]) {
+            Ok(value) => {
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            Err(err) => return ControlFlow::Error(err.into()),
+        }
+    }
+
+    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__pow__", "__rpow__") {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
     }
 
     let Some(x) = float_like_value(a) else {
@@ -1302,7 +1548,8 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    frame.set_reg(inst.dst().0, Value::float(x.powf(y)));
+    vm.current_frame_mut()
+        .set_reg(inst.dst().0, Value::float(x.powf(y)));
     ControlFlow::Continue
 }
 
@@ -1313,13 +1560,15 @@ pub fn neg(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let a = frame.get_reg(inst.src1().0);
 
     if let Some(x) = int_like_value(a) {
-        if let Some(result) = x.checked_neg() {
-            if let Some(v) = Value::int(result) {
-                frame.set_reg(inst.dst().0, v);
-                return ControlFlow::Continue;
-            }
+        if let Some(value) = x.checked_neg().and_then(Value::int) {
+            frame.set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
         }
-        return ControlFlow::Error(RuntimeError::value_error("Integer overflow"));
+    }
+
+    if let Some(value) = value_to_bigint(a) {
+        frame.set_reg(inst.dst().0, bigint_to_value(-value));
+        return ControlFlow::Continue;
     }
 
     if let Some(x) = a.as_float() {
@@ -1345,9 +1594,13 @@ pub fn pos(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
 #[inline]
 fn pos_value(vm: &mut VirtualMachine, value: Value) -> Result<Value, RuntimeError> {
-    if let Some(integer) = int_like_value(value) {
-        return Value::int(integer)
+    if let Some(boolean) = value.as_bool() {
+        return Value::int(i64::from(boolean))
             .ok_or_else(|| RuntimeError::value_error("Integer too large for i48"));
+    }
+
+    if value_to_bigint(value).is_some() {
+        return Ok(value);
     }
 
     if let Some(float_value) = value.as_float() {
@@ -1387,15 +1640,21 @@ fn invoke_zero_arg_bound_method(
 
 #[cfg(test)]
 mod tests {
-    use super::{add, modulo, mul, neg, pos, pos_int, pow, sub, true_div};
+    use super::{add, floor_div, modulo, mul, neg, pos, pos_int, pow, sub, true_div};
     use crate::ControlFlow;
     use crate::VirtualMachine;
+    use num_bigint::BigInt;
     use prism_code::{CodeObject, Instruction, Opcode, Register};
+    use prism_compiler::Compiler;
     use prism_core::Value;
     use prism_core::intern::{intern, interned_by_ptr};
+    use prism_core::value::SMALL_INT_MAX;
+    use prism_parser::parse;
     use prism_runtime::object::type_obj::TypeId;
     use prism_runtime::types::bytes::BytesObject;
+    use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
     use prism_runtime::types::list::ListObject;
+    use prism_runtime::types::set::SetObject;
     use prism_runtime::types::string::value_as_string_ref;
     use prism_runtime::types::tuple::TupleObject;
     use std::sync::Arc;
@@ -1437,6 +1696,20 @@ mod tests {
 
     fn unary_inst(opcode: Opcode) -> Instruction {
         Instruction::op_ds(opcode, Register::new(0), Register::new(1))
+    }
+
+    fn promoted_int(value: BigInt) -> Value {
+        bigint_to_value(value)
+    }
+
+    fn execute(source: &str) -> Result<Value, String> {
+        let module = parse(source).map_err(|err| format!("parse error: {err:?}"))?;
+        let code = Compiler::compile_module(&module, "<arithmetic-test>")
+            .map_err(|err| format!("compile error: {err:?}"))?;
+
+        let mut vm = VirtualMachine::new();
+        vm.execute(Arc::new(code))
+            .map_err(|err| format!("runtime error: {err:?}"))
     }
 
     #[test]
@@ -1500,6 +1773,168 @@ mod tests {
             value_to_rust_string(vm.current_frame().get_reg(0)),
             "hello world"
         );
+    }
+
+    #[test]
+    fn test_add_promotes_inline_integer_overflow_to_heap_int() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(
+            1,
+            Value::int(SMALL_INT_MAX).expect("small int max fits inline"),
+        );
+        vm.current_frame_mut()
+            .set_reg(2, Value::int(1).expect("small int fits inline"));
+
+        assert!(matches!(
+            add(&mut vm, binary_inst(Opcode::Add)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            value_to_bigint(vm.current_frame().get_reg(0)),
+            Some(BigInt::from(SMALL_INT_MAX) + BigInt::from(1_i64))
+        );
+    }
+
+    #[test]
+    fn test_sub_supports_heap_backed_integers() {
+        let mut vm = vm_with_frame();
+        let left = (BigInt::from(1_u8) << 80_u32) + BigInt::from(9_u8);
+        vm.current_frame_mut()
+            .set_reg(1, promoted_int(left.clone()));
+        vm.current_frame_mut()
+            .set_reg(2, Value::int(4).expect("small int fits inline"));
+
+        assert!(matches!(
+            sub(&mut vm, binary_inst(Opcode::Sub)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            value_to_bigint(vm.current_frame().get_reg(0)),
+            Some(left - BigInt::from(4_u8))
+        );
+    }
+
+    #[test]
+    fn test_sub_on_sets_returns_difference_with_left_operand_type() {
+        let mut vm = vm_with_frame();
+        let mut left_set = SetObject::from_slice(&[
+            Value::int_unchecked(1),
+            Value::int_unchecked(2),
+            Value::int_unchecked(3),
+        ]);
+        left_set.header.type_id = TypeId::FROZENSET;
+        let right_set = SetObject::from_slice(&[Value::int_unchecked(2), Value::int_unchecked(4)]);
+        let left_ptr = Box::into_raw(Box::new(left_set));
+        let right_ptr = Box::into_raw(Box::new(right_set));
+
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(left_ptr as *const ()));
+        vm.current_frame_mut()
+            .set_reg(2, Value::object_ptr(right_ptr as *const ()));
+
+        assert!(matches!(
+            sub(&mut vm, binary_inst(Opcode::Sub)),
+            ControlFlow::Continue
+        ));
+
+        let result_ptr = vm.current_frame().get_reg(0).as_object_ptr().unwrap();
+        let result = unsafe { &*(result_ptr as *const SetObject) };
+        assert_eq!(
+            crate::ops::objects::extract_type_id(result_ptr),
+            TypeId::FROZENSET
+        );
+        assert!(result.contains(Value::int_unchecked(1)));
+        assert!(result.contains(Value::int_unchecked(3)));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_mul_supports_heap_backed_integers() {
+        let mut vm = vm_with_frame();
+        let left = (BigInt::from(1_u8) << 72_u32) + BigInt::from(3_u8);
+        vm.current_frame_mut()
+            .set_reg(1, promoted_int(left.clone()));
+        vm.current_frame_mut()
+            .set_reg(2, Value::int(8).expect("small int fits inline"));
+
+        assert!(matches!(
+            mul(&mut vm, binary_inst(Opcode::Mul)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            value_to_bigint(vm.current_frame().get_reg(0)),
+            Some(left * BigInt::from(8_u8))
+        );
+    }
+
+    #[test]
+    fn test_modulo_and_floor_div_support_heap_backed_integers() {
+        let dividend = -((BigInt::from(1_u8) << 80_u32) + BigInt::from(5_u8));
+
+        let mut div_vm = vm_with_frame();
+        div_vm
+            .current_frame_mut()
+            .set_reg(1, promoted_int(dividend.clone()));
+        div_vm
+            .current_frame_mut()
+            .set_reg(2, Value::int(8).expect("small int fits inline"));
+
+        assert!(matches!(
+            super::floor_div(&mut div_vm, binary_inst(Opcode::FloorDiv)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            value_to_bigint(div_vm.current_frame().get_reg(0)),
+            Some(-((BigInt::from(1_u8) << 77_u32) + BigInt::from(1_u8)))
+        );
+
+        let mut mod_vm = vm_with_frame();
+        mod_vm
+            .current_frame_mut()
+            .set_reg(1, promoted_int(dividend));
+        mod_vm
+            .current_frame_mut()
+            .set_reg(2, Value::int(8).expect("small int fits inline"));
+
+        assert!(matches!(
+            modulo(&mut mod_vm, binary_inst(Opcode::Mod)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            value_to_bigint(mod_vm.current_frame().get_reg(0)),
+            Some(BigInt::from(3_u8))
+        );
+    }
+
+    #[test]
+    fn test_pow_promotes_large_integer_results() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut()
+            .set_reg(1, Value::int(2).expect("small int fits inline"));
+        vm.current_frame_mut()
+            .set_reg(2, Value::int(100).expect("small int fits inline"));
+
+        assert!(matches!(
+            pow(&mut vm, binary_inst(Opcode::Pow)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            value_to_bigint(vm.current_frame().get_reg(0)),
+            Some(BigInt::from(1_u8) << 100_u32)
+        );
+    }
+
+    #[test]
+    fn test_pos_preserves_heap_backed_int_value() {
+        let mut vm = vm_with_frame();
+        let value = promoted_int(BigInt::from(1_u8) << 90_u32);
+        vm.current_frame_mut().set_reg(1, value);
+
+        assert!(matches!(
+            pos(&mut vm, unary_inst(Opcode::Pos)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(0), value);
     }
 
     #[test]
@@ -1902,6 +2337,37 @@ mod tests {
     }
 
     #[test]
+    fn test_modulo_formats_bytes_with_raw_byte_argument() {
+        let mut vm = vm_with_frame();
+        let template_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"[xxx%sxxx]")));
+        let argument_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"libc.so.1.2.5")));
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(template_ptr as *const ()));
+        vm.current_frame_mut()
+            .set_reg(2, Value::object_ptr(argument_ptr as *const ()));
+
+        assert!(matches!(
+            modulo(&mut vm, binary_inst(Opcode::Mod)),
+            ControlFlow::Continue
+        ));
+
+        let result = vm.current_frame().get_reg(0);
+        assert_eq!(byte_sequence_type(result), TypeId::BYTES);
+        assert_eq!(value_to_byte_vec(result), b"[xxxlibc.so.1.2.5xxx]");
+
+        unsafe {
+            drop(Box::from_raw(template_ptr));
+            drop(Box::from_raw(argument_ptr));
+            drop(Box::from_raw(
+                result
+                    .as_object_ptr()
+                    .expect("bytes format result should be boxed")
+                    as *mut BytesObject,
+            ));
+        }
+    }
+
+    #[test]
     fn test_bool_sub_uses_int_semantics() {
         let mut vm = vm_with_frame();
         vm.current_frame_mut().set_reg(1, Value::bool(true));
@@ -1978,5 +2444,100 @@ mod tests {
         let result = vm.current_frame().get_reg(0);
         assert_eq!(result.as_int(), Some(1));
         assert!(!result.is_bool());
+    }
+
+    #[test]
+    fn test_binary_ops_use_user_defined_special_methods() {
+        let result = execute(
+            r#"
+class Left:
+    def __sub__(self, other):
+        return 7
+
+class Right:
+    def __rtruediv__(self, other):
+        return 11
+
+class Mul:
+    def __mul__(self, other):
+        return 13
+
+class Floor:
+    def __rfloordiv__(self, other):
+        return 17
+
+class Mod:
+    def __rmod__(self, other):
+        return 19
+
+assert Left() - 2 == 7
+assert 5 / Right() == 11
+assert Mul() * 3 == 13
+assert 23 // Floor() == 17
+assert 29 % Mod() == 19
+"#,
+        );
+
+        assert!(result.is_ok(), "special-method dispatch failed: {result:?}");
+    }
+
+    #[test]
+    fn test_binary_ops_prefer_reflected_methods_for_proper_subtypes() {
+        let result = execute(
+            r#"
+calls = []
+
+class Base:
+    def __add__(self, other):
+        calls.append("Base.__add__")
+        return NotImplemented
+
+class Derived(Base):
+    def __radd__(self, other):
+        calls.append("Derived.__radd__")
+        return 41
+
+assert Base() + Derived() == 41
+assert calls == ["Derived.__radd__"]
+"#,
+        );
+
+        assert!(
+            result.is_ok(),
+            "reflected dispatch ordering failed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_floor_div_and_mod_follow_python_sign_rules() {
+        let mut vm = vm_with_frame();
+
+        vm.current_frame_mut().set_reg(1, Value::int(10).unwrap());
+        vm.current_frame_mut().set_reg(2, Value::int(-3).unwrap());
+        assert!(matches!(
+            floor_div(&mut vm, binary_inst(Opcode::FloorDiv)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(-4));
+
+        assert!(matches!(
+            modulo(&mut vm, binary_inst(Opcode::Mod)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(-2));
+
+        vm.current_frame_mut().set_reg(1, Value::int(-10).unwrap());
+        vm.current_frame_mut().set_reg(2, Value::int(3).unwrap());
+        assert!(matches!(
+            floor_div(&mut vm, binary_inst(Opcode::FloorDiv)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(-4));
+
+        assert!(matches!(
+            modulo(&mut vm, binary_inst(Opcode::Mod)),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(2));
     }
 }

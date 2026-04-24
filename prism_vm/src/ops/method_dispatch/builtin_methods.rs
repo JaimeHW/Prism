@@ -7,9 +7,10 @@
 use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, EXCEPTION_TYPE_ID, ExceptionTypeObject, ExceptionValue,
-    builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
+    builtin_hash, builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
     builtin_mapping_proxy_get_item_static, builtin_mapping_proxy_len,
-    builtin_not_implemented_value, get_exception_type, get_iterator_mut, value_to_iterator,
+    builtin_not_implemented_value, get_exception_type, get_iterator_mut, iterator_to_value,
+    value_to_iterator,
 };
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
@@ -17,8 +18,9 @@ use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
-    dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, list_storage_mut_from_ptr,
-    list_storage_ref_from_ptr, object_getattribute_default,
+    delete_attribute_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
+    get_attribute_value, list_storage_mut_from_ptr, list_storage_ref_from_ptr,
+    object_getattribute_default, set_attribute_value, tuple_storage_ref_from_ptr,
 };
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
@@ -28,13 +30,18 @@ use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
-use prism_runtime::object::descriptor::PropertyDescriptor;
+use prism_runtime::object::descriptor::{
+    ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
+};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
+use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
@@ -57,10 +64,24 @@ static LIST_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.pop"), list_pop));
 static LIST_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.copy"), list_copy));
+static LIST_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.count"), list_count));
+static LIST_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.index"), list_index));
 static LIST_REVERSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.reverse"), list_reverse));
 static LIST_SORT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm_kw(Arc::from("list.sort"), list_sort_with_vm));
+static TUPLE_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.__iter__"), tuple_iter));
+static TUPLE_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.__len__"), tuple_len));
+static TUPLE_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.__getitem__"), tuple_getitem));
+static TUPLE_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.count"), tuple_count));
+static TUPLE_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.index"), tuple_index));
 static DEQUE_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.append"), deque_append));
 static DEQUE_APPENDLEFT_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -85,6 +106,36 @@ static REGEX_PATTERN_FULLMATCH_METHOD: LazyLock<BuiltinFunctionObject> = LazyLoc
     BuiltinFunctionObject::new_vm(
         Arc::from("Pattern.fullmatch"),
         crate::stdlib::re::builtin_pattern_fullmatch,
+    )
+});
+static REGEX_PATTERN_FINDALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Pattern.findall"),
+        crate::stdlib::re::builtin_pattern_findall,
+    )
+});
+static REGEX_PATTERN_FINDITER_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Pattern.finditer"),
+        crate::stdlib::re::builtin_pattern_finditer,
+    )
+});
+static REGEX_PATTERN_SUB_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Pattern.sub"),
+        crate::stdlib::re::builtin_pattern_sub,
+    )
+});
+static REGEX_PATTERN_SUBN_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Pattern.subn"),
+        crate::stdlib::re::builtin_pattern_subn,
+    )
+});
+static REGEX_PATTERN_SPLIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Pattern.split"),
+        crate::stdlib::re::builtin_pattern_split,
     )
 });
 static REGEX_MATCH_GROUP_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -140,6 +191,8 @@ static DICT_DELITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__delitem__"), dict_delitem));
 static DICT_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.pop"), dict_pop));
+static DICT_POPITEM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.popitem"), dict_popitem));
 static DICT_SETDEFAULT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.setdefault"), dict_setdefault));
 static DICT_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -172,9 +225,15 @@ static MAPPING_PROXY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
 static OBJECT_EQ_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__eq__"), object_eq));
 static OBJECT_NE_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__ne__"), object_ne));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("object.__ne__"), object_ne));
 static OBJECT_GETATTRIBUTE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("object.__getattribute__"), object_getattribute)
+});
+static OBJECT_SETATTR_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("object.__setattr__"), object_setattr)
+});
+static OBJECT_DELATTR_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("object.__delattr__"), object_delattr)
 });
 static OBJECT_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__repr__"), value_repr));
@@ -182,6 +241,9 @@ static OBJECT_STR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__str__"), value_str));
 static OBJECT_FORMAT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__format__"), value_format));
+static OBJECT_REDUCE_EX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("object.__reduce_ex__"), value_reduce_ex)
+});
 static TYPE_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("type.__repr__"), type_repr));
 static INT_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -190,6 +252,18 @@ static INT_STR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.__str__"), value_str));
 static INT_FORMAT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.__format__"), value_format));
+static INT_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.__add__"), int_add));
+static INT_BIT_LENGTH_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.bit_length"), int_bit_length));
+static INT_BIT_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.bit_count"), int_bit_count));
+static INT_TO_BYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(
+        Arc::from("int.to_bytes"),
+        crate::builtins::builtin_int_to_bytes,
+    )
+});
 static BOOL_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bool.__repr__"), value_repr));
 static BOOL_STR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -218,14 +292,30 @@ static STR_ENCODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.encode"), str_encode));
 static BYTES_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.decode"), bytes_decode));
+static BYTES_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.startswith"), bytes_startswith));
+static BYTES_ENDSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.endswith"), bytes_endswith));
 static STR_UPPER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.upper"), str_upper));
 static STR_LOWER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.lower"), str_lower));
+static STR_CAPITALIZE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.capitalize"), str_capitalize));
 static STR_REPLACE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.replace"), str_replace));
+static STR_REMOVEPREFIX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.removeprefix"), str_removeprefix));
+static STR_REMOVESUFFIX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.removesuffix"), str_removesuffix));
 static STR_SPLIT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.split"), str_split));
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.split"), str_split_kw));
+static STR_RSPLIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.rsplit"), str_rsplit_kw));
+static STR_SPLITLINES_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.splitlines"), str_splitlines_kw));
+static STR_EXPANDTABS_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.expandtabs"), str_expandtabs_kw));
 static STR_FIND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.find"), str_find));
 static STR_RFIND_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -268,6 +358,8 @@ static STR_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.startswith"), str_startswith));
 static STR_ENDSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.endswith"), str_endswith));
+static STR_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.rpartition"), str_rpartition));
 static SET_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.add"), set_add));
 static SET_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -301,6 +393,29 @@ static SET_SYMMETRIC_DIFFERENCE_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> =
     });
 static SET_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.copy"), set_copy));
+static SET_UNION_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("set.union"), set_union_with_vm));
+static SET_INTERSECTION_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.intersection"), set_intersection_with_vm)
+});
+static SET_DIFFERENCE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.difference"), set_difference_with_vm)
+});
+static SET_SYMMETRIC_DIFFERENCE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("set.symmetric_difference"),
+        set_symmetric_difference_with_vm,
+    )
+});
+static SET_ISDISJOINT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.isdisjoint"), set_isdisjoint_with_vm)
+});
+static SET_ISSUBSET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.issubset"), set_issubset_with_vm)
+});
+static SET_ISSUPERSET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.issuperset"), set_issuperset_with_vm)
+});
 static SET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.__contains__"), set_contains));
 static FROZENSET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -308,20 +423,79 @@ static FROZENSET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::ne
 });
 static FROZENSET_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("frozenset.copy"), frozenset_copy));
+static FROZENSET_UNION_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("frozenset.union"), frozenset_union_with_vm)
+});
+static FROZENSET_INTERSECTION_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("frozenset.intersection"),
+        frozenset_intersection_with_vm,
+    )
+});
+static FROZENSET_DIFFERENCE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("frozenset.difference"),
+        frozenset_difference_with_vm,
+    )
+});
+static FROZENSET_SYMMETRIC_DIFFERENCE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_vm(
+            Arc::from("frozenset.symmetric_difference"),
+            frozenset_symmetric_difference_with_vm,
+        )
+    });
+static FROZENSET_ISDISJOINT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("frozenset.isdisjoint"),
+        frozenset_isdisjoint_with_vm,
+    )
+});
+static FROZENSET_ISSUBSET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("frozenset.issubset"), frozenset_issubset_with_vm)
+});
+static FROZENSET_ISSUPERSET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("frozenset.issuperset"),
+        frozenset_issuperset_with_vm,
+    )
+});
 static BYTEARRAY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.copy"), bytearray_copy));
 static BYTEARRAY_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.decode"), bytearray_decode));
+static BYTEARRAY_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.startswith"), bytearray_startswith)
+});
+static BYTEARRAY_ENDSWITH_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.endswith"), bytearray_endswith)
+});
 static ITERATOR_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("iterator.__iter__"), iterator_iter));
 static ITERATOR_NEXT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("iterator.__next__"), iterator_next));
+static ITERATOR_LENGTH_HINT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("iterator.__length_hint__"), iterator_length_hint)
+});
 static GENERATOR_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("generator.close"), generator_close));
 static GENERATOR_THROW_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("generator.throw"), generator_throw));
 static FUNCTION_GET_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("function.__get__"), function_get));
+static CLASSMETHOD_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("classmethod.__get__"), classmethod_get)
+});
+static STATICMETHOD_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("staticmethod.__get__"), staticmethod_get)
+});
+static PROPERTY_GET_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("property.__get__"), property_get));
+static PROPERTY_SET_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("property.__set__"), property_set));
+static PROPERTY_DELETE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("property.__delete__"), property_delete)
+});
 static PROPERTY_GETTER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("property.getter"), property_getter));
 static PROPERTY_SETTER_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -350,11 +524,39 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_COPY_METHOD,
         ))),
+        "count" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_COUNT_METHOD,
+        ))),
+        "index" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_INDEX_METHOD,
+        ))),
         "reverse" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_REVERSE_METHOD,
         ))),
         "sort" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_SORT_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+/// Resolve builtin tuple methods backed by native tuple storage.
+pub fn resolve_tuple_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "__iter__" => Some(CachedMethod::simple(builtin_method_value(
+            &TUPLE_ITER_METHOD,
+        ))),
+        "__len__" => Some(CachedMethod::simple(builtin_method_value(
+            &TUPLE_LEN_METHOD,
+        ))),
+        "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &TUPLE_GETITEM_METHOD,
+        ))),
+        "count" => Some(CachedMethod::simple(builtin_method_value(
+            &TUPLE_COUNT_METHOD,
+        ))),
+        "index" => Some(CachedMethod::simple(builtin_method_value(
+            &TUPLE_INDEX_METHOD,
         ))),
         _ => None,
     }
@@ -390,6 +592,21 @@ pub fn resolve_regex_pattern_method(name: &str) -> Option<CachedMethod> {
         ))),
         "fullmatch" => Some(CachedMethod::simple(builtin_method_value(
             &REGEX_PATTERN_FULLMATCH_METHOD,
+        ))),
+        "findall" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_PATTERN_FINDALL_METHOD,
+        ))),
+        "finditer" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_PATTERN_FINDITER_METHOD,
+        ))),
+        "sub" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_PATTERN_SUB_METHOD,
+        ))),
+        "subn" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_PATTERN_SUBN_METHOD,
+        ))),
+        "split" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_PATTERN_SPLIT_METHOD,
         ))),
         _ => None,
     }
@@ -447,6 +664,9 @@ pub fn resolve_dict_method(name: &str) -> Option<CachedMethod> {
             &DICT_ITEMS_METHOD,
         ))),
         "pop" => Some(CachedMethod::simple(builtin_method_value(&DICT_POP_METHOD))),
+        "popitem" => Some(CachedMethod::simple(builtin_method_value(
+            &DICT_POPITEM_METHOD,
+        ))),
         "setdefault" => Some(CachedMethod::simple(builtin_method_value(
             &DICT_SETDEFAULT_METHOD,
         ))),
@@ -503,6 +723,12 @@ pub fn resolve_object_method(name: &str) -> Option<CachedMethod> {
         "__getattribute__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_GETATTRIBUTE_METHOD,
         ))),
+        "__setattr__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_SETATTR_METHOD,
+        ))),
+        "__delattr__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_DELATTR_METHOD,
+        ))),
         "__repr__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_REPR_METHOD,
         ))),
@@ -532,6 +758,16 @@ pub fn resolve_int_method(name: &str) -> Option<CachedMethod> {
         "__format__" => Some(CachedMethod::simple(builtin_method_value(
             &INT_FORMAT_METHOD,
         ))),
+        "__add__" => Some(CachedMethod::simple(builtin_method_value(&INT_ADD_METHOD))),
+        "bit_length" => Some(CachedMethod::simple(builtin_method_value(
+            &INT_BIT_LENGTH_METHOD,
+        ))),
+        "bit_count" => Some(CachedMethod::simple(builtin_method_value(
+            &INT_BIT_COUNT_METHOD,
+        ))),
+        "to_bytes" => Some(CachedMethod::simple(builtin_method_value(
+            &INT_TO_BYTES_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -545,7 +781,7 @@ pub fn resolve_bool_method(name: &str) -> Option<CachedMethod> {
         "__format__" => Some(CachedMethod::simple(builtin_method_value(
             &BOOL_FORMAT_METHOD,
         ))),
-        _ => None,
+        _ => resolve_int_method(name),
     }
 }
 
@@ -569,11 +805,16 @@ pub fn resolve_float_method(name: &str) -> Option<CachedMethod> {
 }
 
 pub fn resolve_generic_dunder_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {
+    if name == "__reduce_ex__" {
+        return Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_REDUCE_EX_METHOD,
+        )));
+    }
+
     let (name, function): (&'static str, fn(&[Value]) -> Result<Value, BuiltinError>) = match name {
         "__repr__" => ("__repr__", value_repr),
         "__str__" => ("__str__", value_str),
         "__format__" => ("__format__", value_format),
-        "__reduce_ex__" => ("__reduce_ex__", value_reduce_ex),
         _ => return None,
     };
 
@@ -606,11 +847,29 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         "lower" => Some(CachedMethod::simple(builtin_method_value(
             &STR_LOWER_METHOD,
         ))),
+        "capitalize" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_CAPITALIZE_METHOD,
+        ))),
         "replace" => Some(CachedMethod::simple(builtin_method_value(
             &STR_REPLACE_METHOD,
         ))),
+        "removeprefix" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_REMOVEPREFIX_METHOD,
+        ))),
+        "removesuffix" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_REMOVESUFFIX_METHOD,
+        ))),
         "split" => Some(CachedMethod::simple(builtin_method_value(
             &STR_SPLIT_METHOD,
+        ))),
+        "rsplit" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_RSPLIT_METHOD,
+        ))),
+        "splitlines" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_SPLITLINES_METHOD,
+        ))),
+        "expandtabs" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_EXPANDTABS_METHOD,
         ))),
         "find" => Some(CachedMethod::simple(builtin_method_value(&STR_FIND_METHOD))),
         "rfind" => Some(CachedMethod::simple(builtin_method_value(
@@ -671,6 +930,9 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         "endswith" => Some(CachedMethod::simple(builtin_method_value(
             &STR_ENDSWITH_METHOD,
         ))),
+        "rpartition" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_RPARTITION_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -680,6 +942,12 @@ pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
     match name {
         "decode" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_DECODE_METHOD,
+        ))),
+        "startswith" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_STARTSWITH_METHOD,
+        ))),
+        "endswith" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ENDSWITH_METHOD,
         ))),
         _ => None,
     }
@@ -712,8 +980,50 @@ pub fn resolve_set_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {
             builtin_method_value(&SET_SYMMETRIC_DIFFERENCE_UPDATE_METHOD),
         )),
         (TypeId::SET, "copy") => Some(CachedMethod::simple(builtin_method_value(&SET_COPY_METHOD))),
+        (TypeId::SET, "union") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_UNION_METHOD,
+        ))),
+        (TypeId::SET, "intersection") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_INTERSECTION_METHOD,
+        ))),
+        (TypeId::SET, "difference") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_DIFFERENCE_METHOD,
+        ))),
+        (TypeId::SET, "symmetric_difference") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_SYMMETRIC_DIFFERENCE_METHOD,
+        ))),
+        (TypeId::SET, "isdisjoint") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_ISDISJOINT_METHOD,
+        ))),
+        (TypeId::SET, "issubset") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_ISSUBSET_METHOD,
+        ))),
+        (TypeId::SET, "issuperset") => Some(CachedMethod::simple(builtin_method_value(
+            &SET_ISSUPERSET_METHOD,
+        ))),
         (TypeId::SET, "__contains__") => Some(CachedMethod::simple(builtin_method_value(
             &SET_CONTAINS_METHOD,
+        ))),
+        (TypeId::FROZENSET, "union") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_UNION_METHOD,
+        ))),
+        (TypeId::FROZENSET, "intersection") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_INTERSECTION_METHOD,
+        ))),
+        (TypeId::FROZENSET, "difference") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_DIFFERENCE_METHOD,
+        ))),
+        (TypeId::FROZENSET, "symmetric_difference") => Some(CachedMethod::simple(
+            builtin_method_value(&FROZENSET_SYMMETRIC_DIFFERENCE_METHOD),
+        )),
+        (TypeId::FROZENSET, "isdisjoint") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_ISDISJOINT_METHOD,
+        ))),
+        (TypeId::FROZENSET, "issubset") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_ISSUBSET_METHOD,
+        ))),
+        (TypeId::FROZENSET, "issuperset") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_ISSUPERSET_METHOD,
         ))),
         (TypeId::FROZENSET, "copy") => Some(CachedMethod::simple(builtin_method_value(
             &FROZENSET_COPY_METHOD,
@@ -734,6 +1044,12 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
         "decode" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_DECODE_METHOD,
         ))),
+        "startswith" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_STARTSWITH_METHOD,
+        ))),
+        "endswith" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ENDSWITH_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -746,6 +1062,9 @@ pub fn resolve_iterator_method(name: &str) -> Option<CachedMethod> {
         ))),
         "__next__" => Some(CachedMethod::simple(builtin_method_value(
             &ITERATOR_NEXT_METHOD,
+        ))),
+        "__length_hint__" => Some(CachedMethod::simple(builtin_method_value(
+            &ITERATOR_LENGTH_HINT_METHOD,
         ))),
         _ => None,
     }
@@ -774,9 +1093,36 @@ pub fn resolve_function_method(name: &str) -> Option<CachedMethod> {
     }
 }
 
+pub fn resolve_classmethod_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "__get__" => Some(CachedMethod::simple(builtin_method_value(
+            &CLASSMETHOD_GET_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+pub fn resolve_staticmethod_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "__get__" => Some(CachedMethod::simple(builtin_method_value(
+            &STATICMETHOD_GET_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
 /// Resolve builtin property methods backed by static builtin function objects.
 pub fn resolve_property_method(name: &str) -> Option<CachedMethod> {
     match name {
+        "__get__" => Some(CachedMethod::simple(builtin_method_value(
+            &PROPERTY_GET_METHOD,
+        ))),
+        "__set__" => Some(CachedMethod::simple(builtin_method_value(
+            &PROPERTY_SET_METHOD,
+        ))),
+        "__delete__" => Some(CachedMethod::simple(builtin_method_value(
+            &PROPERTY_DELETE_METHOD,
+        ))),
         "getter" => Some(CachedMethod::simple(builtin_method_value(
             &PROPERTY_GETTER_METHOD,
         ))),
@@ -793,6 +1139,11 @@ pub fn resolve_property_method(name: &str) -> Option<CachedMethod> {
 #[inline(always)]
 fn builtin_method_value(method: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(method as *const BuiltinFunctionObject as *const ())
+}
+
+#[inline]
+fn ensure_hashable(value: Value) -> Result<(), BuiltinError> {
+    builtin_hash(&[value]).map(|_| ())
 }
 
 #[inline]
@@ -890,6 +1241,213 @@ fn list_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "copy", args, 0)?;
     let list = expect_list_ref(args[0], "copy")?;
     Ok(to_object_value(ListObject::from_slice(list.as_slice())))
+}
+
+#[inline]
+fn list_count(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "count", args, 1)?;
+    let list = expect_list_ref(args[0], "count")?;
+    let count = list
+        .as_slice()
+        .iter()
+        .copied()
+        .filter(|item| crate::ops::comparison::values_equal(*item, args[1]))
+        .count();
+    Ok(Value::int(i64::try_from(count).unwrap_or(i64::MAX)).expect("count should fit"))
+}
+
+#[inline]
+fn list_index(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("list", "index", args, 1, 3)?;
+    let list = expect_list_ref(args[0], "index")?;
+    let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+    let start = if args.len() >= 3 {
+        normalize_search_bound(expect_integer_like_index(args[2])?, len)
+    } else {
+        0
+    };
+    let stop = if args.len() >= 4 {
+        normalize_search_bound(expect_integer_like_index(args[3])?, len)
+    } else {
+        len
+    };
+
+    for index in start..stop {
+        let item = list
+            .get(index)
+            .expect("normalized list.index bounds should stay in range");
+        if crate::ops::comparison::values_equal(item, args[1]) {
+            return Ok(Value::int(index).expect("list.index result should fit"));
+        }
+    }
+
+    Err(BuiltinError::ValueError(
+        "list.index(x): x not in list".to_string(),
+    ))
+}
+
+#[inline]
+fn tuple_iter(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("tuple", "__iter__", args, 0)?;
+    let tuple = expect_tuple_ref(args[0], "__iter__")?;
+    Ok(iterator_to_value(IteratorObject::from_values(
+        tuple.as_slice().to_vec(),
+    )))
+}
+
+#[inline]
+fn tuple_len(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("tuple", "__len__", args, 0)?;
+    let tuple = expect_tuple_ref(args[0], "__len__")?;
+    Ok(Value::int(i64::try_from(tuple.len()).unwrap_or(i64::MAX))
+        .expect("tuple length should fit in tagged int"))
+}
+
+#[inline]
+fn tuple_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("tuple", "__getitem__", args, 1)?;
+    let tuple = expect_tuple_ref(args[0], "__getitem__")?;
+
+    if let Some(index) = args[1]
+        .as_object_ptr()
+        .and_then(slice_object_from_value_ptr)
+    {
+        let indices = index.indices(tuple.len());
+        let mut values = Vec::with_capacity(indices.length);
+        for index in indices.iter() {
+            values.push(tuple.as_slice()[index]);
+        }
+        return Ok(to_object_value(TupleObject::from_vec(values)));
+    }
+
+    let index = expect_integer_like_index(args[1])?;
+    tuple
+        .get(index)
+        .ok_or_else(|| BuiltinError::IndexError("tuple index out of range".to_string()))
+}
+
+#[inline]
+fn tuple_count(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("tuple", "count", args, 1)?;
+    let tuple = expect_tuple_ref(args[0], "count")?;
+    let count = tuple
+        .as_slice()
+        .iter()
+        .copied()
+        .filter(|item| crate::ops::comparison::values_equal(*item, args[1]))
+        .count();
+    Ok(Value::int(i64::try_from(count).unwrap_or(i64::MAX)).expect("count should fit"))
+}
+
+#[inline]
+fn tuple_index(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("tuple", "index", args, 1, 3)?;
+    let tuple = expect_tuple_ref(args[0], "index")?;
+    let len = i64::try_from(tuple.len()).unwrap_or(i64::MAX);
+    let start = if args.len() >= 3 {
+        normalize_search_bound(expect_integer_like_index(args[2])?, len)
+    } else {
+        0
+    };
+    let stop = if args.len() >= 4 {
+        normalize_search_bound(expect_integer_like_index(args[3])?, len)
+    } else {
+        len
+    };
+
+    for index in start..stop {
+        let item = tuple.as_slice()[index as usize];
+        if crate::ops::comparison::values_equal(item, args[1]) {
+            return Ok(Value::int(index).expect("tuple.index result should fit"));
+        }
+    }
+
+    Err(BuiltinError::ValueError(
+        "tuple.index(x): x not in tuple".to_string(),
+    ))
+}
+
+#[inline]
+fn slice_object_from_value_ptr(ptr: *const ()) -> Option<&'static SliceObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    (header.type_id == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
+}
+
+#[inline]
+fn int_receiver_magnitude(value: Value, method_name: &'static str) -> Result<u64, BuiltinError> {
+    if let Some(int_value) = value.as_int() {
+        return Ok(int_value.unsigned_abs());
+    }
+    if let Some(bool_value) = value.as_bool() {
+        return Ok(u64::from(bool_value));
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "descriptor 'int.{method_name}' requires an 'int' object but received '{}'",
+        value.type_name()
+    )))
+}
+
+#[inline]
+fn int_operand_bigint(value: Value) -> Option<num_bigint::BigInt> {
+    if let Some(bool_value) = value.as_bool() {
+        return Some(num_bigint::BigInt::from(i64::from(bool_value)));
+    }
+
+    value_to_bigint(value)
+}
+
+#[inline]
+fn int_receiver_bigint(
+    value: Value,
+    method_name: &'static str,
+) -> Result<num_bigint::BigInt, BuiltinError> {
+    int_operand_bigint(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor 'int.{method_name}' requires an 'int' object but received '{}'",
+            value.type_name()
+        ))
+    })
+}
+
+#[inline]
+fn int_add(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("int", "__add__", args, 1)?;
+    let left = int_receiver_bigint(args[0], "__add__")?;
+    let Some(right) = int_operand_bigint(args[1]) else {
+        return Ok(builtin_not_implemented_value());
+    };
+
+    Ok(bigint_to_value(left + right))
+}
+
+#[inline]
+fn int_bit_length(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("int", "bit_length", args, 0)?;
+    let magnitude = int_receiver_magnitude(args[0], "bit_length")?;
+    let bits = if magnitude == 0 {
+        0
+    } else {
+        u64::BITS - magnitude.leading_zeros()
+    };
+    Ok(Value::int(i64::from(bits)).expect("bit length should fit"))
+}
+
+#[inline]
+fn int_bit_count(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("int", "bit_count", args, 0)?;
+    let count = int_receiver_magnitude(args[0], "bit_count")?.count_ones();
+    Ok(Value::int(i64::from(count)).expect("bit count should fit"))
+}
+
+#[inline]
+fn normalize_search_bound(index: i64, len: i64) -> i64 {
+    let normalized = if index < 0 {
+        len.saturating_add(index)
+    } else {
+        index
+    };
+    normalized.clamp(0, len)
 }
 
 #[inline]
@@ -1139,6 +1697,7 @@ fn dict_keys(args: &[Value]) -> Result<Value, BuiltinError> {
 fn dict_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__getitem__", args, 1)?;
     let dict = expect_dict_ref(args[0], "__getitem__")?;
+    ensure_hashable(args[1])?;
     dict.get(args[1])
         .ok_or_else(|| BuiltinError::KeyError("key not found".to_string()))
 }
@@ -1147,6 +1706,7 @@ fn dict_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
 fn dict_contains(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__contains__", args, 1)?;
     let dict = expect_dict_ref(args[0], "__contains__")?;
+    ensure_hashable(args[1])?;
     Ok(Value::bool(dict.get(args[1]).is_some()))
 }
 
@@ -1154,6 +1714,7 @@ fn dict_contains(args: &[Value]) -> Result<Value, BuiltinError> {
 fn dict_setitem(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__setitem__", args, 2)?;
     let dict = expect_dict_mut(args[0], "__setitem__")?;
+    ensure_hashable(args[1])?;
     dict.set(args[1], args[2]);
     Ok(Value::none())
 }
@@ -1162,6 +1723,7 @@ fn dict_setitem(args: &[Value]) -> Result<Value, BuiltinError> {
 fn dict_delitem(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__delitem__", args, 1)?;
     let dict = expect_dict_mut(args[0], "__delitem__")?;
+    ensure_hashable(args[1])?;
     dict.remove(args[1])
         .map(|_| Value::none())
         .ok_or_else(|| BuiltinError::KeyError("key not found".to_string()))
@@ -1187,6 +1749,7 @@ fn dict_get(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let dict = expect_dict_ref(args[0], "get")?;
+    ensure_hashable(args[1])?;
     let default = args.get(2).copied().unwrap_or_else(Value::none);
     Ok(dict.get(args[1]).unwrap_or(default))
 }
@@ -1208,6 +1771,7 @@ fn dict_pop(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let dict = expect_dict_mut(args[0], "pop")?;
+    ensure_hashable(args[1])?;
     if let Some(value) = dict.remove(args[1]) {
         return Ok(value);
     }
@@ -1220,6 +1784,16 @@ fn dict_pop(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn dict_popitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("dict", "popitem", args, 0)?;
+    let dict = expect_dict_mut(args[0], "popitem")?;
+    let (key, value) = dict
+        .popitem()
+        .ok_or_else(|| BuiltinError::KeyError("popitem(): dictionary is empty".to_string()))?;
+    Ok(to_object_value(TupleObject::from_slice(&[key, value])))
+}
+
+#[inline]
 fn dict_setdefault(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         let given = args.len().saturating_sub(1);
@@ -1229,6 +1803,7 @@ fn dict_setdefault(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let dict = expect_dict_mut(args[0], "setdefault")?;
+    ensure_hashable(args[1])?;
     let default = args.get(2).copied().unwrap_or_else(Value::none);
     Ok(dict.setdefault(args[1], default))
 }
@@ -1258,6 +1833,7 @@ fn dict_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
     let entries = collect_dict_update_entries(vm, args[1])?;
     let dict = expect_dict_mut(args[0], "update")?;
     for (key, value) in entries {
+        ensure_hashable(key)?;
         dict.set(key, value);
     }
     Ok(Value::none())
@@ -1347,13 +1923,26 @@ fn object_eq(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn object_ne(args: &[Value]) -> Result<Value, BuiltinError> {
+fn object_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("object", "__ne__", args, 1)?;
-    if args[0] == args[1] {
-        Ok(Value::bool(false))
-    } else {
-        Ok(builtin_not_implemented_value())
+    match resolve_special_method(args[0], "__eq__") {
+        Ok(eq) => {
+            let result = invoke_comparison_method(vm, eq, args[1])?;
+            if result != builtin_not_implemented_value() {
+                return crate::truthiness::try_is_truthy(vm, result)
+                    .map(|truthy| Value::bool(!truthy))
+                    .map_err(runtime_error_to_builtin_error);
+            }
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {}
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
     }
+
+    if let Some(equal) = crate::ops::comparison::builtin_eq_fallback(args[0], args[1]) {
+        return Ok(Value::bool(!equal));
+    }
+
+    Ok(builtin_not_implemented_value())
 }
 
 fn object_getattribute(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -1366,6 +1955,32 @@ fn object_getattribute(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
 
     object_getattribute_default(vm, args[0], &intern(name.as_str()))
         .map_err(runtime_error_to_builtin_error)
+}
+
+fn object_setattr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__setattr__", args, 2)?;
+    let Some(name) = value_as_string_ref(args[1]) else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    set_attribute_value(vm, args[0], &intern(name.as_str()), args[2])
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
+}
+
+fn object_delattr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__delattr__", args, 1)?;
+    let Some(name) = value_as_string_ref(args[1]) else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    delete_attribute_value(vm, args[0], &intern(name.as_str()))
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
 }
 
 #[inline]
@@ -1383,7 +1998,7 @@ fn value_format(args: &[Value]) -> Result<Value, BuiltinError> {
     crate::builtins::builtin_format(args)
 }
 
-fn value_reduce_ex(args: &[Value]) -> Result<Value, BuiltinError> {
+fn value_reduce_ex(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         let given = args.len().saturating_sub(1);
         return Err(BuiltinError::TypeError(format!(
@@ -1391,9 +2006,18 @@ fn value_reduce_ex(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    Err(BuiltinError::NotImplemented(
-        "pickle protocol support is not implemented yet".to_string(),
-    ))
+    let reduce_name = intern("__reduce__");
+    let reduce = match get_attribute_value(vm, args[0], &reduce_name) {
+        Ok(reduce) => reduce,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(BuiltinError::NotImplemented(
+                "pickle protocol support is not implemented yet".to_string(),
+            ));
+        }
+        Err(err) => return Err(crate::builtins::runtime_error_to_builtin_error(err)),
+    };
+
+    invoke_callable_value(vm, reduce, &[]).map_err(crate::builtins::runtime_error_to_builtin_error)
 }
 
 fn generic_dunder_method_value(
@@ -1526,6 +2150,50 @@ fn bytearray_decode(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn bytes_startswith(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_affix_match(
+        args,
+        "bytes",
+        "startswith",
+        expect_bytes_ref,
+        |value, affix| value.starts_with(affix),
+    )
+}
+
+#[inline]
+fn bytes_endswith(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_affix_match(
+        args,
+        "bytes",
+        "endswith",
+        expect_bytes_ref,
+        |value, affix| value.ends_with(affix),
+    )
+}
+
+#[inline]
+fn bytearray_startswith(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_affix_match(
+        args,
+        "bytearray",
+        "startswith",
+        expect_bytearray_ref,
+        |value, affix| value.starts_with(affix),
+    )
+}
+
+#[inline]
+fn bytearray_endswith(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_affix_match(
+        args,
+        "bytearray",
+        "endswith",
+        expect_bytearray_ref,
+        |value, affix| value.ends_with(affix),
+    )
+}
+
+#[inline]
 fn decode_bytes_method(
     args: &[Value],
     receiver_name: &'static str,
@@ -1551,6 +2219,106 @@ fn decode_bytes_method(
 
     let bytes = receiver(args[0], "decode")?;
     crate::builtins::decode_bytes_to_value(bytes.as_bytes(), encoding.as_deref(), errors.as_deref())
+}
+
+#[inline]
+fn byte_sequence_affix_match(
+    args: &[Value],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    matcher: impl Fn(&[u8], &[u8]) -> bool,
+) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.{method_name}() takes from 1 to 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let bytes = receiver(args[0], method_name)?;
+    let byte_len = bytes.len();
+    let start = clamp_slice_index(
+        parse_slice_bound(args.get(2).copied(), 0, receiver_name, method_name)?,
+        byte_len,
+    );
+    let end = clamp_slice_index(
+        parse_slice_bound(
+            args.get(3).copied(),
+            byte_len as isize,
+            receiver_name,
+            method_name,
+        )?,
+        byte_len,
+    );
+    let start = start.min(end);
+    let end = end.max(start);
+    let slice = &bytes.as_bytes()[start..end];
+
+    Ok(Value::bool(match_byte_sequence_affixes(
+        args[1],
+        method_name,
+        |candidate| matcher(slice, candidate),
+    )?))
+}
+
+#[inline]
+fn match_byte_sequence_affixes(
+    affixes: Value,
+    method_name: &'static str,
+    mut matcher: impl FnMut(&[u8]) -> bool,
+) -> Result<bool, BuiltinError> {
+    if let Some(candidate) = byte_sequence_object_from_value(affixes) {
+        return Ok(matcher(candidate.as_bytes()));
+    }
+
+    let Some(ptr) = affixes.as_object_ptr() else {
+        return Err(byte_sequence_affix_type_error(
+            method_name,
+            affixes.type_name(),
+        ));
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::TUPLE {
+        return Err(byte_sequence_affix_type_error(
+            method_name,
+            affixes.type_name(),
+        ));
+    }
+
+    let tuple = unsafe { &*(ptr as *const TupleObject) };
+    for index in 0..tuple.len() {
+        let candidate = tuple
+            .get(index as i64)
+            .expect("tuple index should be valid");
+        let Some(candidate) = byte_sequence_object_from_value(candidate) else {
+            return Err(BuiltinError::TypeError(format!(
+                "a bytes-like object is required, not '{}'",
+                candidate.type_name()
+            )));
+        };
+        if matcher(candidate.as_bytes()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[inline]
+fn byte_sequence_affix_type_error(method_name: &'static str, actual_type: &str) -> BuiltinError {
+    BuiltinError::TypeError(format!(
+        "{method_name} first arg must be bytes or a tuple of bytes, not {actual_type}"
+    ))
+}
+
+#[inline]
+fn byte_sequence_object_from_value(value: Value) -> Option<&'static BytesObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::BYTES | TypeId::BYTEARRAY => Some(unsafe { &*(ptr as *const BytesObject) }),
+        _ => None,
+    }
 }
 
 #[inline]
@@ -1614,6 +2382,54 @@ fn str_lower(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn str_capitalize(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", "capitalize", args, 0)?;
+    with_str_receiver(args[0], "capitalize", |value| {
+        if value.is_empty() {
+            return Ok(args[0]);
+        }
+
+        if value.is_ascii() {
+            let mut bytes = value.as_bytes().to_vec();
+            let mut changed = false;
+            if let Some(first) = bytes.first_mut() {
+                let upper = first.to_ascii_uppercase();
+                changed |= upper != *first;
+                *first = upper;
+            }
+            for byte in bytes.iter_mut().skip(1) {
+                let lower = byte.to_ascii_lowercase();
+                changed |= lower != *byte;
+                *byte = lower;
+            }
+
+            return if changed {
+                let capitalized = unsafe { String::from_utf8_unchecked(bytes) };
+                Ok(Value::string(intern(&capitalized)))
+            } else {
+                Ok(args[0])
+            };
+        }
+
+        let mut chars = value.chars();
+        let Some(first) = chars.next() else {
+            return Ok(args[0]);
+        };
+        let mut capitalized = String::with_capacity(value.len());
+        capitalized.extend(first.to_uppercase());
+        for ch in chars {
+            capitalized.extend(ch.to_lowercase());
+        }
+
+        if capitalized == value {
+            Ok(args[0])
+        } else {
+            Ok(Value::string(intern(&capitalized)))
+        }
+    })
+}
+
+#[inline]
 fn str_replace(args: &[Value]) -> Result<Value, BuiltinError> {
     let given = args.len().saturating_sub(1);
     if !(2..=3).contains(&given) {
@@ -1657,7 +2473,22 @@ fn str_replace(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn str_removeprefix(args: &[Value]) -> Result<Value, BuiltinError> {
+    remove_affix(args, "removeprefix", RemoveAffixDirection::Prefix)
+}
+
+#[inline]
+fn str_removesuffix(args: &[Value]) -> Result<Value, BuiltinError> {
+    remove_affix(args, "removesuffix", RemoveAffixDirection::Suffix)
+}
+
+#[inline]
 fn str_split(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_split_kw(args, &[])
+}
+
+#[inline]
+fn str_split_kw(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
     let given = args.len().saturating_sub(1);
     if given > 2 {
         return Err(BuiltinError::TypeError(format!(
@@ -1665,12 +2496,14 @@ fn str_split(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let separator = match args.get(1).copied() {
+    let (separator_arg, maxsplit_arg) =
+        bind_split_keyword_args(args, keywords, "split", "str.split")?;
+    let separator = match separator_arg {
         None => None,
         Some(value) if value.is_none() => None,
         Some(value) => Some(expect_str_method_string_arg(value, "split", 1)?),
     };
-    let maxsplit = parse_split_count(args.get(2).copied(), "split", 2)?;
+    let maxsplit = parse_split_count(maxsplit_arg, "split", 2)?;
 
     with_str_receiver(args[0], "split", |value| {
         let parts = match separator.as_deref() {
@@ -1679,6 +2512,121 @@ fn str_split(args: &[Value]) -> Result<Value, BuiltinError> {
         };
 
         Ok(to_object_value(ListObject::from_slice(parts.as_slice())))
+    })
+}
+
+#[inline]
+fn str_rsplit(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_rsplit_kw(args, &[])
+}
+
+#[inline]
+fn str_rsplit_kw(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "str.rsplit() takes at most 2 arguments ({given} given)"
+        )));
+    }
+
+    let (separator_arg, maxsplit_arg) =
+        bind_split_keyword_args(args, keywords, "rsplit", "str.rsplit")?;
+    let separator = match separator_arg {
+        None => None,
+        Some(value) if value.is_none() => None,
+        Some(value) => Some(expect_str_method_string_arg(value, "rsplit", 1)?),
+    };
+    let maxsplit = parse_split_count(maxsplit_arg, "rsplit", 2)?;
+
+    with_str_receiver(args[0], "rsplit", |value| {
+        let parts = match separator.as_deref() {
+            Some(separator) => rsplit_with_separator(value, separator, maxsplit)?,
+            None => rsplit_on_whitespace(value, maxsplit),
+        };
+
+        Ok(to_object_value(ListObject::from_slice(parts.as_slice())))
+    })
+}
+
+#[inline]
+fn str_splitlines(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_splitlines_kw(args, &[])
+}
+
+#[inline]
+fn str_expandtabs(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_expandtabs_kw(args, &[])
+}
+
+#[inline]
+fn str_expandtabs_kw(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    let positional = args.len().saturating_sub(1);
+    let total = positional + keywords.len();
+    if total > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "expandtabs() takes at most 1 argument ({total} given)"
+        )));
+    }
+
+    let mut tabsize_arg = args.get(1).copied();
+    for (name, value) in keywords {
+        if *name != "tabsize" {
+            return Err(BuiltinError::TypeError(format!(
+                "expandtabs() got an unexpected keyword argument '{}'",
+                name
+            )));
+        }
+        tabsize_arg = Some(*value);
+    }
+
+    let tabsize = tabsize_arg
+        .map(expect_integer_like_index)
+        .transpose()?
+        .unwrap_or(8);
+    with_str_receiver(args[0], "expandtabs", |value| {
+        if !value.contains('\t') {
+            return Ok(args[0]);
+        }
+
+        let expanded = expand_tabs(value, tabsize);
+        if expanded == value {
+            Ok(args[0])
+        } else {
+            Ok(Value::string(intern(&expanded)))
+        }
+    })
+}
+
+#[inline]
+fn str_splitlines_kw(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "str.splitlines() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let mut keepends_arg = args.get(1).copied();
+    for (name, value) in keywords {
+        if *name != "keepends" {
+            return Err(BuiltinError::TypeError(format!(
+                "splitlines() got an unexpected keyword argument '{}'",
+                name
+            )));
+        }
+        if keepends_arg.is_some() {
+            return Err(BuiltinError::TypeError(
+                "splitlines() got multiple values for argument 'keepends'".to_string(),
+            ));
+        }
+        keepends_arg = Some(*value);
+    }
+
+    let keepends = parse_keepends_flag(keepends_arg, "splitlines", 1)?;
+    with_str_receiver(args[0], "splitlines", |value| {
+        Ok(to_object_value(ListObject::from_slice(
+            split_lines(value, keepends).as_slice(),
+        )))
     })
 }
 
@@ -1861,6 +2809,65 @@ fn str_startswith(args: &[Value]) -> Result<Value, BuiltinError> {
 #[inline]
 fn str_endswith(args: &[Value]) -> Result<Value, BuiltinError> {
     affix_match(args, "endswith", |value, affix| value.ends_with(affix))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoveAffixDirection {
+    Prefix,
+    Suffix,
+}
+
+#[inline]
+fn remove_affix(
+    args: &[Value],
+    method_name: &'static str,
+    direction: RemoveAffixDirection,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", method_name, args, 1)?;
+    let affix = expect_str_method_string_arg(args[1], method_name, 1)?;
+
+    with_str_receiver(args[0], method_name, |value| {
+        if affix.is_empty() {
+            return Ok(args[0]);
+        }
+
+        let stripped = match direction {
+            RemoveAffixDirection::Prefix => value.strip_prefix(&affix),
+            RemoveAffixDirection::Suffix => value.strip_suffix(&affix),
+        };
+        match stripped {
+            Some(rest) => Ok(Value::string(intern(rest))),
+            None => Ok(args[0]),
+        }
+    })
+}
+
+#[inline]
+fn str_rpartition(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", "rpartition", args, 1)?;
+    let separator = expect_str_method_string_arg(args[1], "rpartition", 1)?;
+    if separator.is_empty() {
+        return Err(BuiltinError::ValueError("empty separator".to_string()));
+    }
+
+    with_str_receiver(args[0], "rpartition", |value| {
+        let parts = if let Some(index) = value.rfind(&separator) {
+            (
+                Value::string(intern(&value[..index])),
+                Value::string(intern(&separator)),
+                Value::string(intern(&value[index + separator.len()..])),
+            )
+        } else {
+            (
+                Value::string(intern("")),
+                Value::string(intern("")),
+                Value::string(intern(value)),
+            )
+        };
+        Ok(to_object_value(TupleObject::from_slice(&[
+            parts.0, parts.1, parts.2,
+        ])))
+    })
 }
 
 #[inline]
@@ -2053,9 +3060,9 @@ fn normalize_slice_bounds_with_chars(
     method_name: &'static str,
 ) -> Result<SliceBounds, BuiltinError> {
     let char_len = value.chars().count();
-    let start_char = clamp_slice_index(parse_slice_bound(start, 0, method_name)?, char_len);
+    let start_char = clamp_slice_index(parse_slice_bound(start, 0, "str", method_name)?, char_len);
     let end_char = clamp_slice_index(
-        parse_slice_bound(end, char_len as isize, method_name)?,
+        parse_slice_bound(end, char_len as isize, "str", method_name)?,
         char_len,
     );
     let start_char = start_char.min(end_char);
@@ -2072,6 +3079,7 @@ fn normalize_slice_bounds_with_chars(
 fn parse_slice_bound(
     bound: Option<Value>,
     default: isize,
+    receiver_name: &'static str,
     method_name: &'static str,
 ) -> Result<isize, BuiltinError> {
     let Some(bound) = bound else {
@@ -2080,7 +3088,7 @@ fn parse_slice_bound(
 
     bound.as_int().map(|value| value as isize).ok_or_else(|| {
         BuiltinError::TypeError(format!(
-            "str.{method_name}() slice indices must be integers, not '{}'",
+            "{receiver_name}.{method_name}() slice indices must be integers, not '{}'",
             bound.type_name()
         ))
     })
@@ -2212,6 +3220,45 @@ fn expect_method_string_arg(
 }
 
 #[inline]
+fn bind_split_keyword_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    method_name: &'static str,
+    qualified_name: &'static str,
+) -> Result<(Option<Value>, Option<Value>), BuiltinError> {
+    let mut separator = args.get(1).copied();
+    let mut maxsplit = args.get(2).copied();
+
+    for (name, value) in keywords {
+        match *name {
+            "sep" => {
+                if separator.is_some() {
+                    return Err(BuiltinError::TypeError(format!(
+                        "{method_name}() got multiple values for argument 'sep'"
+                    )));
+                }
+                separator = Some(*value);
+            }
+            "maxsplit" => {
+                if maxsplit.is_some() {
+                    return Err(BuiltinError::TypeError(format!(
+                        "{method_name}() got multiple values for argument 'maxsplit'"
+                    )));
+                }
+                maxsplit = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{qualified_name}() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok((separator, maxsplit))
+}
+
+#[inline]
 fn parse_split_count(
     count: Option<Value>,
     method_name: &'static str,
@@ -2235,6 +3282,32 @@ fn parse_split_count(
     Err(BuiltinError::TypeError(format!(
         "str.{method_name}() argument {position} must be int, not {}",
         count.type_name()
+    )))
+}
+
+#[inline]
+fn parse_keepends_flag(
+    keepends: Option<Value>,
+    method_name: &'static str,
+    position: usize,
+) -> Result<bool, BuiltinError> {
+    let Some(keepends) = keepends else {
+        return Ok(false);
+    };
+
+    if let Some(value) = keepends.as_bool() {
+        return Ok(value);
+    }
+    if let Some(value) = keepends.as_int() {
+        return Ok(value != 0);
+    }
+    if keepends.is_none() {
+        return Ok(false);
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "str.{method_name}() argument {position} must be bool or int, not {}",
+        keepends.type_name()
     )))
 }
 
@@ -2367,6 +3440,37 @@ fn split_with_separator(
     Ok(parts)
 }
 
+fn rsplit_with_separator(
+    value: &str,
+    separator: &str,
+    maxsplit: Option<usize>,
+) -> Result<Vec<Value>, BuiltinError> {
+    if separator.is_empty() {
+        return Err(BuiltinError::ValueError("empty separator".to_string()));
+    }
+
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok(vec![Value::string(intern(value))]);
+    }
+
+    let mut parts = Vec::new();
+    let mut end = value.len();
+    let mut splits = 0usize;
+    while splits < limit {
+        let Some(offset) = value[..end].rfind(separator) else {
+            break;
+        };
+        parts.push(Value::string(intern(&value[offset + separator.len()..end])));
+        end = offset;
+        splits += 1;
+    }
+
+    parts.push(Value::string(intern(&value[..end])));
+    parts.reverse();
+    Ok(parts)
+}
+
 #[inline]
 fn split_on_whitespace(value: &str, maxsplit: Option<usize>) -> Vec<Value> {
     let limit = maxsplit.unwrap_or(usize::MAX);
@@ -2400,6 +3504,145 @@ fn split_on_whitespace(value: &str, maxsplit: Option<usize>) -> Vec<Value> {
     }
 
     parts
+}
+
+fn rsplit_on_whitespace(value: &str, maxsplit: Option<usize>) -> Vec<Value> {
+    let start = value
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
+        .unwrap_or(value.len());
+    let mut end = trim_end_whitespace_index(value, value.len());
+    if start >= end {
+        return Vec::new();
+    }
+
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return vec![Value::string(intern(&value[start..end]))];
+    }
+
+    let mut parts = Vec::new();
+    let mut splits = 0usize;
+    while splits < limit {
+        end = trim_end_whitespace_index(value, end);
+        if end <= start {
+            break;
+        }
+
+        let mut word_start = end;
+        while let Some((index, ch)) = previous_char(value, word_start) {
+            if ch.is_whitespace() {
+                break;
+            }
+            word_start = index;
+        }
+
+        let remainder_end = trim_end_whitespace_index(value, word_start);
+        if remainder_end <= start {
+            break;
+        }
+
+        parts.push(Value::string(intern(&value[word_start..end])));
+        end = remainder_end;
+        splits += 1;
+    }
+
+    parts.push(Value::string(intern(&value[start..end])));
+    parts.reverse();
+    parts
+}
+
+#[inline]
+fn previous_char(value: &str, end: usize) -> Option<(usize, char)> {
+    value[..end].char_indices().next_back()
+}
+
+#[inline]
+fn trim_end_whitespace_index(value: &str, mut end: usize) -> usize {
+    while let Some((index, ch)) = previous_char(value, end) {
+        if !ch.is_whitespace() {
+            break;
+        }
+        end = index;
+    }
+    end
+}
+
+#[inline]
+fn split_lines(value: &str, keepends: bool) -> Vec<Value> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut chars = value.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        let Some(boundary_end) = splitlines_boundary_end(idx, ch, chars.peek().copied()) else {
+            continue;
+        };
+
+        if ch == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            chars.next();
+        }
+
+        let part_end = if keepends { boundary_end } else { idx };
+        parts.push(Value::string(intern(&value[start..part_end])));
+        start = boundary_end;
+    }
+
+    if start < value.len() {
+        parts.push(Value::string(intern(&value[start..])));
+    }
+
+    parts
+}
+
+#[inline]
+fn splitlines_boundary_end(idx: usize, ch: char, next: Option<(usize, char)>) -> Option<usize> {
+    match ch {
+        '\n' | '\u{000b}' | '\u{000c}' | '\u{001c}' | '\u{001d}' | '\u{001e}' | '\u{0085}'
+        | '\u{2028}' | '\u{2029}' => Some(idx + ch.len_utf8()),
+        '\r' => Some(match next {
+            Some((next_idx, '\n')) => next_idx + '\n'.len_utf8(),
+            _ => idx + ch.len_utf8(),
+        }),
+        _ => None,
+    }
+}
+
+#[inline]
+fn expand_tabs(value: &str, tabsize: i64) -> String {
+    let tabsize = tabsize.max(0) as usize;
+    let mut expanded = String::with_capacity(value.len());
+    let mut column = 0usize;
+
+    for ch in value.chars() {
+        match ch {
+            '\t' => {
+                if tabsize == 0 {
+                    continue;
+                }
+
+                let spaces = tabsize - (column % tabsize);
+                for _ in 0..spaces {
+                    expanded.push(' ');
+                }
+                column += spaces;
+            }
+            '\n' | '\r' => {
+                expanded.push(ch);
+                column = 0;
+            }
+            _ => {
+                expanded.push(ch);
+                column += 1;
+            }
+        }
+    }
+
+    expanded
 }
 
 #[inline]
@@ -2533,6 +3776,7 @@ fn expect_pair_from_slice(values: &[Value]) -> Result<(Value, Value), BuiltinErr
 fn set_add(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "add", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "add")?;
+    ensure_hashable(args[1])?;
     set.add(args[1]);
     Ok(Value::none())
 }
@@ -2541,6 +3785,7 @@ fn set_add(args: &[Value]) -> Result<Value, BuiltinError> {
 fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "remove", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "remove")?;
+    ensure_hashable(args[1])?;
     if set.remove(args[1]) {
         Ok(Value::none())
     } else {
@@ -2552,6 +3797,7 @@ fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
 fn set_discard(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "discard", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "discard")?;
+    ensure_hashable(args[1])?;
     set.discard(args[1]);
     Ok(Value::none())
 }
@@ -2590,6 +3836,34 @@ fn set_copy(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn set_result_value(mut set: SetObject, result_type: TypeId) -> Value {
+    set.header.type_id = result_type;
+    to_object_value(set)
+}
+
+#[inline]
+fn hashable_iterable_values_with_vm(
+    vm: &mut VirtualMachine,
+    iterable: Value,
+) -> Result<Vec<Value>, BuiltinError> {
+    let values = collect_iterable_values_with_vm(vm, iterable)?;
+    for value in values.iter().copied() {
+        ensure_hashable(value)?;
+    }
+    Ok(values)
+}
+
+#[inline]
+fn iterable_to_hashable_set_with_vm(
+    vm: &mut VirtualMachine,
+    iterable: Value,
+) -> Result<SetObject, BuiltinError> {
+    Ok(SetObject::from_iter(hashable_iterable_values_with_vm(
+        vm, iterable,
+    )?))
+}
+
+#[inline]
 fn set_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     let set = expect_set_mut_receiver(
         *args
@@ -2600,7 +3874,7 @@ fn set_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     )?;
 
     for iterable in &args[1..] {
-        for value in collect_iterable_values_with_vm(vm, *iterable)? {
+        for value in hashable_iterable_values_with_vm(vm, *iterable)? {
             set.add(value);
         }
     }
@@ -2622,7 +3896,7 @@ fn set_difference_update_with_vm(
     )?;
 
     for iterable in &args[1..] {
-        for value in collect_iterable_values_with_vm(vm, *iterable)? {
+        for value in hashable_iterable_values_with_vm(vm, *iterable)? {
             set.discard(value);
         }
     }
@@ -2644,7 +3918,7 @@ fn set_intersection_update_with_vm(
     )?;
 
     for iterable in &args[1..] {
-        let other = SetObject::from_iter(collect_iterable_values_with_vm(vm, *iterable)?);
+        let other = iterable_to_hashable_set_with_vm(vm, *iterable)?;
         set.intersection_update(&other);
     }
 
@@ -2658,9 +3932,244 @@ fn set_symmetric_difference_update_with_vm(
 ) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "symmetric_difference_update", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "symmetric_difference_update")?;
-    let other = SetObject::from_iter(collect_iterable_values_with_vm(vm, args[1])?);
+    let other = iterable_to_hashable_set_with_vm(vm, args[1])?;
     set.symmetric_difference_update(&other);
     Ok(Value::none())
+}
+
+#[inline]
+fn set_union_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    let receiver = *args.first().ok_or_else(|| {
+        BuiltinError::TypeError(format!("unbound {receiver_name}.{method_name}()"))
+    })?;
+    let mut result = expect_set_receiver(receiver, expected_type, method_name)?.clone();
+    for iterable in &args[1..] {
+        for value in hashable_iterable_values_with_vm(vm, *iterable)? {
+            result.add(value);
+        }
+    }
+    Ok(set_result_value(result, expected_type))
+}
+
+#[inline]
+fn set_intersection_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    let receiver = *args.first().ok_or_else(|| {
+        BuiltinError::TypeError(format!("unbound {receiver_name}.{method_name}()"))
+    })?;
+    let current = expect_set_receiver(receiver, expected_type, method_name)?;
+    if args.len() == 1 {
+        return if expected_type == TypeId::FROZENSET {
+            Ok(receiver)
+        } else {
+            Ok(set_result_value(current.clone(), expected_type))
+        };
+    }
+
+    let mut result = current.clone();
+    for iterable in &args[1..] {
+        let other = iterable_to_hashable_set_with_vm(vm, *iterable)?;
+        result.intersection_update(&other);
+    }
+    Ok(set_result_value(result, expected_type))
+}
+
+#[inline]
+fn set_difference_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    let receiver = *args.first().ok_or_else(|| {
+        BuiltinError::TypeError(format!("unbound {receiver_name}.{method_name}()"))
+    })?;
+    let current = expect_set_receiver(receiver, expected_type, method_name)?;
+    if args.len() == 1 {
+        return if expected_type == TypeId::FROZENSET {
+            Ok(receiver)
+        } else {
+            Ok(set_result_value(current.clone(), expected_type))
+        };
+    }
+
+    let mut result = current.clone();
+    for iterable in &args[1..] {
+        let other = iterable_to_hashable_set_with_vm(vm, *iterable)?;
+        result.difference_update(&other);
+    }
+    Ok(set_result_value(result, expected_type))
+}
+
+#[inline]
+fn set_symmetric_difference_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let set = expect_set_receiver(args[0], expected_type, method_name)?;
+    let other = iterable_to_hashable_set_with_vm(vm, args[1])?;
+    Ok(set_result_value(
+        set.symmetric_difference(&other),
+        expected_type,
+    ))
+}
+
+#[inline]
+fn set_isdisjoint_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let set = expect_set_receiver(args[0], expected_type, method_name)?;
+    let other = iterable_to_hashable_set_with_vm(vm, args[1])?;
+    Ok(Value::bool(set.is_disjoint(&other)))
+}
+
+#[inline]
+fn set_issubset_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let set = expect_set_receiver(args[0], expected_type, method_name)?;
+    let other = iterable_to_hashable_set_with_vm(vm, args[1])?;
+    Ok(Value::bool(set.is_subset(&other)))
+}
+
+#[inline]
+fn set_issuperset_impl(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let set = expect_set_receiver(args[0], expected_type, method_name)?;
+    let other = iterable_to_hashable_set_with_vm(vm, args[1])?;
+    Ok(Value::bool(set.is_superset(&other)))
+}
+
+#[inline]
+fn set_union_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    set_union_impl(vm, args, TypeId::SET, "set", "union")
+}
+
+#[inline]
+fn frozenset_union_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    set_union_impl(vm, args, TypeId::FROZENSET, "frozenset", "union")
+}
+
+#[inline]
+fn set_intersection_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_intersection_impl(vm, args, TypeId::SET, "set", "intersection")
+}
+
+#[inline]
+fn frozenset_intersection_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_intersection_impl(vm, args, TypeId::FROZENSET, "frozenset", "intersection")
+}
+
+#[inline]
+fn set_difference_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    set_difference_impl(vm, args, TypeId::SET, "set", "difference")
+}
+
+#[inline]
+fn frozenset_difference_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_difference_impl(vm, args, TypeId::FROZENSET, "frozenset", "difference")
+}
+
+#[inline]
+fn set_symmetric_difference_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_symmetric_difference_impl(vm, args, TypeId::SET, "set", "symmetric_difference")
+}
+
+#[inline]
+fn frozenset_symmetric_difference_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_symmetric_difference_impl(
+        vm,
+        args,
+        TypeId::FROZENSET,
+        "frozenset",
+        "symmetric_difference",
+    )
+}
+
+#[inline]
+fn set_isdisjoint_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    set_isdisjoint_impl(vm, args, TypeId::SET, "set", "isdisjoint")
+}
+
+#[inline]
+fn frozenset_isdisjoint_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_isdisjoint_impl(vm, args, TypeId::FROZENSET, "frozenset", "isdisjoint")
+}
+
+#[inline]
+fn set_issubset_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    set_issubset_impl(vm, args, TypeId::SET, "set", "issubset")
+}
+
+#[inline]
+fn frozenset_issubset_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_issubset_impl(vm, args, TypeId::FROZENSET, "frozenset", "issubset")
+}
+
+#[inline]
+fn set_issuperset_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    set_issuperset_impl(vm, args, TypeId::SET, "set", "issuperset")
+}
+
+#[inline]
+fn frozenset_issuperset_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    set_issuperset_impl(vm, args, TypeId::FROZENSET, "frozenset", "issuperset")
 }
 
 #[inline]
@@ -2690,6 +4199,15 @@ fn iterator_next(args: &[Value]) -> Result<Value, BuiltinError> {
     iter.next().ok_or(BuiltinError::StopIteration)
 }
 
+fn iterator_length_hint(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("iterator", "__length_hint__", args, 0)?;
+    let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
+    })?;
+    Ok(Value::int(iter.size_hint().unwrap_or(0) as i64)
+        .expect("iterator length hint should fit in tagged int"))
+}
+
 #[inline]
 fn contains_for_set_type(
     args: &[Value],
@@ -2699,6 +4217,7 @@ fn contains_for_set_type(
 ) -> Result<Value, BuiltinError> {
     expect_method_arg_count(receiver_name, method_name, args, 1)?;
     let set = expect_set_receiver(args[0], expected_type, method_name)?;
+    ensure_hashable(args[1])?;
     Ok(Value::bool(set.contains(args[1])))
 }
 
@@ -3033,6 +4552,29 @@ fn expect_list_ref(
     };
 
     Ok(list)
+}
+
+#[inline]
+fn expect_tuple_ref(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static TupleObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'tuple.{method_name}' requires a 'tuple' object but received '{}'",
+            value.type_name()
+        )));
+    };
+
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    let Some(tuple) = tuple_storage_ref_from_ptr(ptr) else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'tuple.{method_name}' requires a 'tuple' object but received '{}'",
+            header.type_id.name()
+        )));
+    };
+
+    Ok(tuple)
 }
 
 #[inline]
@@ -3399,6 +4941,46 @@ fn expect_function_receiver(
     Ok(value)
 }
 
+fn expect_classmethod_receiver(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static ClassMethodDescriptor, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'classmethod.{method_name}' requires a 'classmethod' object but received '{}'",
+            value.type_name()
+        )));
+    };
+    if unsafe { &*(ptr as *const ObjectHeader) }.type_id != TypeId::CLASSMETHOD {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'classmethod.{method_name}' requires a 'classmethod' object but received '{}'",
+            unsafe { &*(ptr as *const ObjectHeader) }.type_id.name()
+        )));
+    }
+
+    Ok(unsafe { &*(ptr as *const ClassMethodDescriptor) })
+}
+
+fn expect_staticmethod_receiver(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static StaticMethodDescriptor, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'staticmethod.{method_name}' requires a 'staticmethod' object but received '{}'",
+            value.type_name()
+        )));
+    };
+    if unsafe { &*(ptr as *const ObjectHeader) }.type_id != TypeId::STATICMETHOD {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'staticmethod.{method_name}' requires a 'staticmethod' object but received '{}'",
+            unsafe { &*(ptr as *const ObjectHeader) }.type_id.name()
+        )));
+    }
+
+    Ok(unsafe { &*(ptr as *const StaticMethodDescriptor) })
+}
+
 fn function_get(args: &[Value]) -> Result<Value, BuiltinError> {
     if !(2..=3).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
@@ -3416,6 +4998,97 @@ fn function_get(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(crate::ops::objects::bind_instance_attribute(
         function, instance,
     ))
+}
+
+fn classmethod_get(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__get__' of 'classmethod' object needs 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let descriptor = expect_classmethod_receiver(args[0], "__get__")?;
+    let instance = args[1];
+    let owner = if args.len() == 3 && !args[2].is_none() {
+        args[2]
+    } else if !instance.is_none() {
+        crate::builtins::builtin_type(&[instance])?
+    } else {
+        return Err(BuiltinError::TypeError(
+            "__get__(None, None) is invalid".to_string(),
+        ));
+    };
+
+    crate::ops::objects::bind_wrapped_classmethod_value(vm, descriptor.function(), owner)
+        .map_err(crate::builtins::runtime_error_to_builtin_error)
+}
+
+fn staticmethod_get(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__get__' of 'staticmethod' object needs 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let descriptor = expect_staticmethod_receiver(args[0], "__get__")?;
+    Ok(descriptor.function())
+}
+
+fn property_get(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__get__' of 'property' object needs 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let descriptor = expect_property_receiver(args[0], "__get__")?;
+    let instance = args[1];
+    if instance.is_none() {
+        return Ok(args[0]);
+    }
+
+    let getter = descriptor
+        .getter()
+        .ok_or_else(|| BuiltinError::AttributeError("property has no getter".to_string()))?;
+    invoke_callable_value(vm, getter, &[instance])
+        .map_err(crate::builtins::runtime_error_to_builtin_error)
+}
+
+fn property_set(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__set__' of 'property' object needs 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let descriptor = expect_property_receiver(args[0], "__set__")?;
+    let setter = descriptor
+        .setter()
+        .ok_or_else(|| BuiltinError::AttributeError("property has no setter".to_string()))?;
+    invoke_callable_value(vm, setter, &[args[1], args[2]])
+        .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+    Ok(Value::none())
+}
+
+fn property_delete(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__delete__' of 'property' object needs 1 argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let descriptor = expect_property_receiver(args[0], "__delete__")?;
+    let deleter = descriptor
+        .deleter()
+        .ok_or_else(|| BuiltinError::AttributeError("property has no deleter".to_string()))?;
+    invoke_callable_value(vm, deleter, &[args[1]])
+        .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+    Ok(Value::none())
 }
 
 #[cfg(test)]
@@ -3438,6 +5111,11 @@ mod tests {
 
     fn boxed_list_value(list: ListObject) -> (Value, *mut ListObject) {
         let ptr = Box::into_raw(Box::new(list));
+        (Value::object_ptr(ptr as *const ()), ptr)
+    }
+
+    fn boxed_tuple_value(tuple: TupleObject) -> (Value, *mut TupleObject) {
+        let ptr = Box::into_raw(Box::new(tuple));
         (Value::object_ptr(ptr as *const ()), ptr)
     }
 
@@ -3465,6 +5143,45 @@ mod tests {
             .expect("string result should be an object");
         let string = unsafe { &*(ptr as *const StringObject) };
         string.as_str().to_string()
+    }
+
+    fn builtin_from_value(value: Value) -> &'static BuiltinFunctionObject {
+        unsafe {
+            &*(value
+                .as_object_ptr()
+                .expect("builtin method should be materialized")
+                as *const BuiltinFunctionObject)
+        }
+    }
+
+    fn property_echo_getter(args: &[Value]) -> Result<Value, BuiltinError> {
+        if args.len() != 1 {
+            return Err(BuiltinError::TypeError(format!(
+                "getter expected 1 argument, got {}",
+                args.len()
+            )));
+        }
+        Ok(args[0])
+    }
+
+    fn property_accepting_setter(args: &[Value]) -> Result<Value, BuiltinError> {
+        if args.len() != 2 {
+            return Err(BuiltinError::TypeError(format!(
+                "setter expected 2 arguments, got {}",
+                args.len()
+            )));
+        }
+        Ok(Value::string(intern("setter return is ignored")))
+    }
+
+    fn property_accepting_deleter(args: &[Value]) -> Result<Value, BuiltinError> {
+        if args.len() != 1 {
+            return Err(BuiltinError::TypeError(format!(
+                "deleter expected 1 argument, got {}",
+                args.len()
+            )));
+        }
+        Ok(Value::string(intern("deleter return is ignored")))
     }
 
     fn byte_values(value: Value) -> Vec<u8> {
@@ -3512,6 +5229,78 @@ mod tests {
         assert!(!pop.is_descriptor);
         assert!(!copy.is_descriptor);
         assert!(!reverse.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_tuple_method_returns_builtin_for_sequence_protocol() {
+        for name in ["__iter__", "__len__", "__getitem__", "count", "index"] {
+            let method =
+                resolve_tuple_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
+    }
+
+    #[test]
+    fn test_tuple_methods_use_native_storage() {
+        let (tuple_value, tuple_ptr) = boxed_tuple_value(TupleObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(1).unwrap(),
+        ]));
+
+        assert_eq!(
+            tuple_len(&[tuple_value])
+                .expect("tuple.__len__ should succeed")
+                .as_int(),
+            Some(3)
+        );
+        assert_eq!(
+            tuple_getitem(&[tuple_value, Value::int(-1).unwrap()])
+                .expect("tuple.__getitem__ should accept negative indices")
+                .as_int(),
+            Some(1)
+        );
+        assert_eq!(
+            tuple_count(&[tuple_value, Value::int(1).unwrap()])
+                .expect("tuple.count should succeed")
+                .as_int(),
+            Some(2)
+        );
+        assert_eq!(
+            tuple_index(&[tuple_value, Value::int(1).unwrap(), Value::int(1).unwrap(),])
+                .expect("tuple.index should honor the start bound")
+                .as_int(),
+            Some(2)
+        );
+
+        let slice_ptr = Box::into_raw(Box::new(SliceObject::new(Some(0), Some(3), Some(2))));
+        let sliced = tuple_getitem(&[tuple_value, Value::object_ptr(slice_ptr as *const ())])
+            .expect("tuple.__getitem__ should accept slice objects");
+        let sliced_ptr = sliced
+            .as_object_ptr()
+            .expect("tuple slice should return a tuple object")
+            as *mut TupleObject;
+        let sliced_tuple = unsafe { &*sliced_ptr };
+        assert_eq!(sliced_tuple.len(), 2);
+        assert_eq!(sliced_tuple.as_slice()[0].as_int(), Some(1));
+        assert_eq!(sliced_tuple.as_slice()[1].as_int(), Some(1));
+
+        let iter_value = tuple_iter(&[tuple_value]).expect("tuple.__iter__ should succeed");
+        let iter = get_iterator_mut(&iter_value).expect("tuple.__iter__ should return iterator");
+        assert_eq!(iter.next().and_then(|value| value.as_int()), Some(1));
+        assert_eq!(iter.next().and_then(|value| value.as_int()), Some(2));
+        assert_eq!(iter.next().and_then(|value| value.as_int()), Some(1));
+        assert!(iter.next().is_none());
+
+        unsafe {
+            drop(Box::from_raw(
+                iter_value.as_object_ptr().unwrap() as *mut IteratorObject
+            ));
+            drop(Box::from_raw(sliced_ptr));
+            drop(Box::from_raw(slice_ptr));
+            drop(Box::from_raw(tuple_ptr));
+        }
     }
 
     #[test]
@@ -3573,6 +5362,66 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(copied_ptr));
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_count_counts_matching_values() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        assert_eq!(
+            list_count(&[list_value, Value::int(1).unwrap()])
+                .expect("list.count should succeed")
+                .as_int(),
+            Some(2)
+        );
+
+        unsafe {
+            drop(Box::from_raw(list_ptr));
+        }
+    }
+
+    #[test]
+    fn test_list_index_honors_optional_bounds() {
+        let (list_value, list_ptr) = boxed_list_value(ListObject::from_slice(&[
+            Value::string(intern("alpha")),
+            Value::string(intern("beta")),
+            Value::string(intern("alpha")),
+            Value::string(intern("gamma")),
+        ]));
+
+        assert_eq!(
+            list_index(&[list_value, Value::string(intern("alpha"))])
+                .expect("list.index should find the first match")
+                .as_int(),
+            Some(0)
+        );
+        assert_eq!(
+            list_index(&[
+                list_value,
+                Value::string(intern("alpha")),
+                Value::int(1).unwrap(),
+            ])
+            .expect("list.index should honor the start bound")
+            .as_int(),
+            Some(2)
+        );
+        let err = list_index(&[
+            list_value,
+            Value::string(intern("alpha")),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+        ])
+        .expect_err("list.index should honor the stop bound");
+        assert_eq!(err.to_string(), "ValueError: list.index(x): x not in list");
+
+        unsafe {
             drop(Box::from_raw(list_ptr));
         }
     }
@@ -3893,6 +5742,7 @@ mod tests {
         let setitem = resolve_dict_method("__setitem__").expect("__setitem__ should resolve");
         let delitem = resolve_dict_method("__delitem__").expect("__delitem__ should resolve");
         let pop = resolve_dict_method("pop").expect("pop should resolve");
+        let popitem = resolve_dict_method("popitem").expect("popitem should resolve");
         let setdefault = resolve_dict_method("setdefault").expect("setdefault should resolve");
         let clear = resolve_dict_method("clear").expect("clear should resolve");
         let update = resolve_dict_method("update").expect("update should resolve");
@@ -3907,6 +5757,7 @@ mod tests {
         assert!(setitem.method.as_object_ptr().is_some());
         assert!(delitem.method.as_object_ptr().is_some());
         assert!(pop.method.as_object_ptr().is_some());
+        assert!(popitem.method.as_object_ptr().is_some());
         assert!(setdefault.method.as_object_ptr().is_some());
         assert!(clear.method.as_object_ptr().is_some());
         assert!(update.method.as_object_ptr().is_some());
@@ -3921,10 +5772,66 @@ mod tests {
         assert!(!setitem.is_descriptor);
         assert!(!delitem.is_descriptor);
         assert!(!pop.is_descriptor);
+        assert!(!popitem.is_descriptor);
         assert!(!setdefault.is_descriptor);
         assert!(!clear.is_descriptor);
         assert!(!update.is_descriptor);
         assert!(!copy.is_descriptor);
+    }
+
+    #[test]
+    fn test_dict_popitem_returns_latest_entry_and_rejects_empty_dict() {
+        let mut dict = DictObject::new();
+        dict.set(Value::string(intern("alpha")), Value::int(1).unwrap());
+        dict.set(Value::string(intern("beta")), Value::int(2).unwrap());
+        let ptr = Box::into_raw(Box::new(dict));
+        let value = Value::object_ptr(ptr as *const ());
+
+        let popped = dict_popitem(&[value]).expect("popitem should succeed");
+        let popped_ptr = popped
+            .as_object_ptr()
+            .expect("popitem should return a tuple") as *mut TupleObject;
+        let tuple = unsafe { &*popped_ptr };
+        assert_eq!(tuple.as_slice()[0], Value::string(intern("beta")));
+        assert_eq!(tuple.as_slice()[1].as_int(), Some(2));
+        assert_eq!(unsafe { &*ptr }.len(), 1);
+
+        let second = dict_popitem(&[value]).expect("second popitem should also succeed");
+        let second_ptr = second
+            .as_object_ptr()
+            .expect("second popitem should return a tuple")
+            as *mut TupleObject;
+        let err = dict_popitem(&[value]).expect_err("empty popitem should fail");
+        assert_eq!(err.to_string(), "KeyError: popitem(): dictionary is empty");
+
+        unsafe {
+            drop(Box::from_raw(second_ptr));
+            drop(Box::from_raw(popped_ptr));
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_dict_methods_reject_unhashable_keys() {
+        let dict = DictObject::new();
+        let dict_ptr = Box::into_raw(Box::new(dict));
+        let dict_value = Value::object_ptr(dict_ptr as *const ());
+        let key = to_object_value(ListObject::from_slice(&[Value::int(1).unwrap()]));
+
+        for err in [
+            dict_contains(&[dict_value, key]).unwrap_err(),
+            dict_get(&[dict_value, key]).unwrap_err(),
+            dict_setitem(&[dict_value, key, Value::int(1).unwrap()]).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("unhashable type: 'list'"));
+        }
+
+        unsafe {
+            drop(Box::from_raw(
+                key.as_object_ptr().unwrap() as *mut ListObject
+            ));
+            drop(Box::from_raw(dict_ptr));
+        }
     }
 
     #[test]
@@ -4091,6 +5998,39 @@ mod tests {
     }
 
     #[test]
+    fn test_object_attribute_mutator_wrappers_use_default_attribute_storage() {
+        let mut vm = VirtualMachine::new();
+        let object = crate::builtins::builtin_object(&[]).expect("object() should succeed");
+        let object_ptr = object
+            .as_object_ptr()
+            .expect("object() should allocate a shaped object");
+
+        object_setattr(
+            &mut vm,
+            &[
+                object,
+                Value::string(intern("token")),
+                Value::int(42).expect("token should fit"),
+            ],
+        )
+        .expect("object.__setattr__ should set default attributes");
+
+        let shaped = unsafe { &*(object_ptr as *const ShapedObject) };
+        assert_eq!(
+            shaped
+                .get_property("token")
+                .expect("token should be stored")
+                .as_int(),
+            Some(42)
+        );
+
+        object_delattr(&mut vm, &[object, Value::string(intern("token"))])
+            .expect("object.__delattr__ should delete default attributes");
+        let shaped = unsafe { &*(object_ptr as *const ShapedObject) };
+        assert!(shaped.get_property("token").is_none());
+    }
+
+    #[test]
     fn test_resolve_type_method_renders_builtin_type_repr() {
         let method = resolve_type_method("__repr__").expect("type.__repr__ should resolve");
         let builtin = unsafe {
@@ -4161,6 +6101,82 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_int_method_exposes_bit_operations() {
+        let bit_length = unsafe {
+            &*(resolve_int_method("bit_length")
+                .expect("bit_length should resolve")
+                .method
+                .as_object_ptr()
+                .expect("bit_length should be allocated")
+                as *const BuiltinFunctionObject)
+        };
+        let bit_count = unsafe {
+            &*(resolve_int_method("bit_count")
+                .expect("bit_count should resolve")
+                .method
+                .as_object_ptr()
+                .expect("bit_count should be allocated")
+                as *const BuiltinFunctionObject)
+        };
+
+        assert_eq!(bit_length.name(), "int.bit_length");
+        assert_eq!(bit_count.name(), "int.bit_count");
+    }
+
+    #[test]
+    fn test_resolve_int_method_exposes_add_wrapper() {
+        let add = unsafe {
+            &*(resolve_int_method("__add__")
+                .expect("__add__ should resolve")
+                .method
+                .as_object_ptr()
+                .expect("__add__ should be allocated")
+                as *const BuiltinFunctionObject)
+        };
+
+        assert_eq!(add.name(), "int.__add__");
+    }
+
+    #[test]
+    fn test_int_add_matches_python_descriptor_contract() {
+        let result = int_add(&[
+            bigint_to_value(num_bigint::BigInt::from(i64::MAX)),
+            Value::int(1).expect("one should fit"),
+        ])
+        .expect("int.__add__ should accept integer operands");
+        assert_eq!(
+            prism_runtime::types::int::value_to_bigint(result),
+            Some(num_bigint::BigInt::from(i64::MAX) + num_bigint::BigInt::from(1_i64))
+        );
+
+        let bool_result = int_add(&[Value::bool(true), Value::int(2).expect("two should fit")])
+            .expect("bool should be accepted as an int receiver");
+        assert_eq!(bool_result.as_int(), Some(3));
+
+        let unsupported = int_add(&[Value::int(1).expect("one should fit"), Value::none()])
+            .expect("unsupported rhs should return NotImplemented");
+        assert_eq!(unsupported, builtin_not_implemented_value());
+
+        let error = int_add(&[Value::none(), Value::int(1).expect("one should fit")])
+            .expect_err("non-int receiver should fail descriptor validation");
+        assert!(matches!(error, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_int_bit_operations_match_python_magnitude_rules() {
+        let bit_length =
+            int_bit_length(&[Value::int(-37).unwrap()]).expect("bit_length should accept ints");
+        assert_eq!(bit_length.as_int(), Some(6));
+
+        let bit_count =
+            int_bit_count(&[Value::int(-37).unwrap()]).expect("bit_count should accept ints");
+        assert_eq!(bit_count.as_int(), Some(3));
+
+        let boolean = int_bit_length(&[Value::bool(true)]).expect("bool should inherit int APIs");
+        assert_eq!(boolean.as_int(), Some(1));
+    }
+
+    #[test]
     fn test_resolve_exception_method_returns_builtin_for_with_traceback() {
         let with_traceback =
             resolve_exception_method("with_traceback").expect("with_traceback should resolve");
@@ -4175,13 +6191,14 @@ mod tests {
 
     #[test]
     fn test_object_rich_comparisons_follow_identity_default() {
+        let mut vm = VirtualMachine::new();
         let same = Value::int(7).unwrap();
         assert_eq!(
             object_eq(&[same, same]).expect("__eq__ should accept two operands"),
             Value::bool(true)
         );
         assert_eq!(
-            object_ne(&[same, same]).expect("__ne__ should accept two operands"),
+            object_ne(&mut vm, &[same, same]).expect("__ne__ should accept two operands"),
             Value::bool(false)
         );
 
@@ -4192,8 +6209,8 @@ mod tests {
             builtin_not_implemented_value()
         );
         assert_eq!(
-            object_ne(&[lhs, rhs]).expect("__ne__ should accept mismatched operands"),
-            builtin_not_implemented_value()
+            object_ne(&mut vm, &[lhs, rhs]).expect("__ne__ should accept mismatched operands"),
+            Value::bool(true)
         );
     }
 
@@ -4212,6 +6229,13 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_str_method_returns_builtin_for_capitalize() {
+        let capitalize = resolve_str_method("capitalize").expect("capitalize should resolve");
+        assert!(capitalize.method.as_object_ptr().is_some());
+        assert!(!capitalize.is_descriptor);
+    }
+
+    #[test]
     fn test_resolve_str_method_returns_builtin_for_replace() {
         let replace = resolve_str_method("replace").expect("replace should resolve");
         assert!(replace.method.as_object_ptr().is_some());
@@ -4219,10 +6243,37 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_str_method_returns_builtin_for_remove_affix_methods() {
+        for name in ["removeprefix", "removesuffix"] {
+            let method =
+                resolve_str_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
+    }
+
+    #[test]
     fn test_resolve_str_method_returns_builtin_for_split() {
         let split = resolve_str_method("split").expect("split should resolve");
         assert!(split.method.as_object_ptr().is_some());
         assert!(!split.is_descriptor);
+        let rsplit = resolve_str_method("rsplit").expect("rsplit should resolve");
+        assert!(rsplit.method.as_object_ptr().is_some());
+        assert!(!rsplit.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_str_method_returns_builtin_for_splitlines() {
+        let splitlines = resolve_str_method("splitlines").expect("splitlines should resolve");
+        assert!(splitlines.method.as_object_ptr().is_some());
+        assert!(!splitlines.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_str_method_returns_builtin_for_expandtabs() {
+        let expandtabs = resolve_str_method("expandtabs").expect("expandtabs should resolve");
+        assert!(expandtabs.method.as_object_ptr().is_some());
+        assert!(!expandtabs.is_descriptor);
     }
 
     #[test]
@@ -4262,10 +6313,13 @@ mod tests {
     fn test_resolve_str_method_returns_builtin_for_startswith_and_endswith() {
         let startswith = resolve_str_method("startswith").expect("startswith should resolve");
         let endswith = resolve_str_method("endswith").expect("endswith should resolve");
+        let rpartition = resolve_str_method("rpartition").expect("rpartition should resolve");
         assert!(startswith.method.as_object_ptr().is_some());
         assert!(endswith.method.as_object_ptr().is_some());
+        assert!(rpartition.method.as_object_ptr().is_some());
         assert!(!startswith.is_descriptor);
         assert!(!endswith.is_descriptor);
+        assert!(!rpartition.is_descriptor);
     }
 
     #[test]
@@ -4309,6 +6363,17 @@ mod tests {
         let already_lower = Value::string(prism_core::intern::intern("path"));
         let unchanged = str_lower(&[already_lower]).expect("lower should preserve lowercase");
         assert_eq!(unchanged, already_lower);
+    }
+
+    #[test]
+    fn test_str_capitalize_uppercases_first_character_and_lowercases_rest() {
+        let result =
+            str_capitalize(&[Value::string(intern("hELLO"))]).expect("capitalize should work");
+        assert_eq!(string_value(result), "Hello");
+
+        let unchanged = str_capitalize(&[Value::string(intern("Hello"))])
+            .expect("capitalize should preserve canonical form");
+        assert_eq!(unchanged, Value::string(intern("Hello")));
     }
 
     #[test]
@@ -4423,6 +6488,86 @@ mod tests {
     }
 
     #[test]
+    fn test_str_remove_affix_methods_match_python_contract() {
+        let without_prefix =
+            str_removeprefix(&[Value::string(intern("spam")), Value::string(intern("sp"))])
+                .expect("removeprefix should remove matching prefix");
+        assert_eq!(string_value(without_prefix), "am");
+
+        let without_suffix =
+            str_removesuffix(&[Value::string(intern("spam")), Value::string(intern("am"))])
+                .expect("removesuffix should remove matching suffix");
+        assert_eq!(string_value(without_suffix), "sp");
+
+        let full_prefix = str_removeprefix(&[
+            Value::string(intern("abcde")),
+            Value::string(intern("abcde")),
+        ])
+        .expect("removeprefix should handle full-string matches");
+        assert_eq!(string_value(full_prefix), "");
+
+        let full_suffix = str_removesuffix(&[
+            Value::string(intern("abcde")),
+            Value::string(intern("abcde")),
+        ])
+        .expect("removesuffix should handle full-string matches");
+        assert_eq!(string_value(full_suffix), "");
+    }
+
+    #[test]
+    fn test_str_remove_affix_reuses_receiver_for_noop_cases() {
+        let receiver = Value::string(intern("spam"));
+
+        let missing_prefix = str_removeprefix(&[receiver, Value::string(intern("python"))])
+            .expect("missing prefix should be a no-op");
+        assert_eq!(missing_prefix, receiver);
+
+        let empty_prefix = str_removeprefix(&[receiver, Value::string(intern(""))])
+            .expect("empty prefix should be a no-op");
+        assert_eq!(empty_prefix, receiver);
+
+        let missing_suffix = str_removesuffix(&[receiver, Value::string(intern("python"))])
+            .expect("missing suffix should be a no-op");
+        assert_eq!(missing_suffix, receiver);
+
+        let empty_suffix = str_removesuffix(&[receiver, Value::string(intern(""))])
+            .expect("empty suffix should be a no-op");
+        assert_eq!(empty_suffix, receiver);
+    }
+
+    #[test]
+    fn test_str_remove_affix_rejects_invalid_arguments() {
+        let missing =
+            str_removeprefix(&[Value::string(intern("hello"))]).expect_err("prefix is required");
+        assert!(
+            missing
+                .to_string()
+                .contains("str.removeprefix() takes exactly 1 argument")
+        );
+
+        let non_string =
+            str_removesuffix(&[Value::string(intern("hello")), Value::int(42).unwrap()])
+                .expect_err("suffix must be a string");
+        assert!(
+            non_string
+                .to_string()
+                .contains("str.removesuffix() argument 1 must be str")
+        );
+
+        let tuple_affix = to_object_value(TupleObject::from_slice(&[
+            Value::string(intern("he")),
+            Value::string(intern("l")),
+        ]));
+        let tuple_err = str_removeprefix(&[Value::string(intern("hello")), tuple_affix])
+            .expect_err("tuple prefixes are not accepted");
+        assert!(
+            tuple_err
+                .to_string()
+                .contains("str.removeprefix() argument 1 must be str")
+        );
+    }
+
+    #[test]
     fn test_str_split_supports_explicit_separator_and_maxsplit() {
         let result = str_split(&[
             Value::string(intern("a::b::c")),
@@ -4435,6 +6580,23 @@ mod tests {
         let list = unsafe { &*(result_ptr as *const ListObject) };
         let values: Vec<String> = list.as_slice().iter().copied().map(string_value).collect();
         assert_eq!(values, vec!["a".to_string(), "b::c".to_string()]);
+    }
+
+    #[test]
+    fn test_str_split_accepts_sep_and_maxsplit_keywords() {
+        let result = str_split_kw(
+            &[Value::string(intern("3.12.0"))],
+            &[
+                ("sep", Value::string(intern("."))),
+                ("maxsplit", Value::int(1).unwrap()),
+            ],
+        )
+        .expect("split keywords should work");
+
+        let result_ptr = result.as_object_ptr().expect("split should return a list");
+        let list = unsafe { &*(result_ptr as *const ListObject) };
+        let values: Vec<String> = list.as_slice().iter().copied().map(string_value).collect();
+        assert_eq!(values, vec!["3".to_string(), "12.0".to_string()]);
     }
 
     #[test]
@@ -4484,6 +6646,224 @@ mod tests {
         let err = str_split(&[Value::string(intern("abc")), Value::string(intern(""))])
             .expect_err("empty separator should fail");
         assert!(err.to_string().contains("empty separator"));
+    }
+
+    #[test]
+    fn test_str_rsplit_supports_explicit_separator_and_maxsplit() {
+        let result = str_rsplit(&[
+            Value::string(intern("os.confstr")),
+            Value::string(intern(".")),
+            Value::int(1).unwrap(),
+        ])
+        .expect("rsplit with separator should work");
+
+        let result_ptr = result.as_object_ptr().expect("rsplit should return a list");
+        let list = unsafe { &*(result_ptr as *const ListObject) };
+        let values: Vec<String> = list.as_slice().iter().copied().map(string_value).collect();
+        assert_eq!(values, vec!["os".to_string(), "confstr".to_string()]);
+    }
+
+    #[test]
+    fn test_str_rsplit_accepts_keywords_and_rejects_duplicates() {
+        let result = str_rsplit_kw(
+            &[Value::string(intern("a.b.c"))],
+            &[
+                ("sep", Value::string(intern("."))),
+                ("maxsplit", Value::int(1).unwrap()),
+            ],
+        )
+        .expect("rsplit keywords should work");
+
+        let result_ptr = result.as_object_ptr().expect("rsplit should return a list");
+        let list = unsafe { &*(result_ptr as *const ListObject) };
+        let values: Vec<String> = list.as_slice().iter().copied().map(string_value).collect();
+        assert_eq!(values, vec!["a.b".to_string(), "c".to_string()]);
+
+        let duplicate = str_split_kw(
+            &[Value::string(intern("a.b")), Value::string(intern("."))],
+            &[("sep", Value::string(intern(",")))],
+        )
+        .expect_err("duplicate sep must be rejected");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("multiple values for argument 'sep'")
+        );
+    }
+
+    #[test]
+    fn test_str_rsplit_preserves_left_whitespace_remainder() {
+        let result = str_rsplit(&[
+            Value::string(intern("  alpha   beta gamma  ")),
+            Value::none(),
+            Value::int(1).unwrap(),
+        ])
+        .expect("rsplit with implicit whitespace should work");
+
+        let result_ptr = result.as_object_ptr().expect("rsplit should return a list");
+        let list = unsafe { &*(result_ptr as *const ListObject) };
+        let values: Vec<String> = list.as_slice().iter().copied().map(string_value).collect();
+        assert_eq!(
+            values,
+            vec!["alpha   beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_str_splitlines_handles_crlf_and_optional_keepends() {
+        let without_keepends = str_splitlines(&[Value::string(intern("alpha\r\nbeta\n"))])
+            .expect("splitlines should work");
+        let without_ptr = without_keepends
+            .as_object_ptr()
+            .expect("splitlines should return a list");
+        let without_list = unsafe { &*(without_ptr as *const ListObject) };
+        let without_values: Vec<String> = without_list
+            .iter()
+            .map(|value| {
+                string_object_from_value(*value)
+                    .unwrap()
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            without_values,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        let with_keepends =
+            str_splitlines(&[Value::string(intern("alpha\r\nbeta\n")), Value::bool(true)])
+                .expect("splitlines keepends should work");
+        let with_ptr = with_keepends
+            .as_object_ptr()
+            .expect("splitlines should return a list");
+        let with_list = unsafe { &*(with_ptr as *const ListObject) };
+        let with_values: Vec<String> = with_list
+            .iter()
+            .map(|value| {
+                string_object_from_value(*value)
+                    .unwrap()
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            with_values,
+            vec!["alpha\r\n".to_string(), "beta\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_str_splitlines_returns_empty_list_for_empty_string() {
+        let result = str_splitlines(&[Value::string(intern(""))]).expect("splitlines should work");
+        let ptr = result
+            .as_object_ptr()
+            .expect("splitlines should return a list");
+        let list = unsafe { &*(ptr as *const ListObject) };
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_str_splitlines_accepts_keepends_keyword_argument() {
+        let splitlines = builtin_from_value(
+            resolve_str_method("splitlines")
+                .expect("splitlines should resolve")
+                .method,
+        );
+        let result = splitlines
+            .call_with_keywords(
+                &[Value::string(intern("a\r\nb"))],
+                &[("keepends", Value::bool(true))],
+            )
+            .expect("splitlines keyword call should succeed");
+        let list = unsafe {
+            &*(result
+                .as_object_ptr()
+                .expect("splitlines should return a list") as *const ListObject)
+        };
+        let values: Vec<String> = list
+            .iter()
+            .map(|value| {
+                string_object_from_value(*value)
+                    .unwrap()
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(values, vec!["a\r\n".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_str_expandtabs_expands_tabs_and_resets_columns_after_newlines() {
+        let result = str_expandtabs(&[Value::string(intern("01\t0123\na\r\tb"))])
+            .expect("expandtabs should work");
+        assert_eq!(string_value(result), "01      0123\na\r        b");
+    }
+
+    #[test]
+    fn test_str_expandtabs_supports_negative_and_boolean_tab_sizes() {
+        let collapsed = str_expandtabs(&[Value::string(intern("a\tb")), Value::int(-1).unwrap()])
+            .expect("negative tabsize should collapse tabs");
+        assert_eq!(string_value(collapsed), "ab");
+
+        let boolean = str_expandtabs(&[Value::string(intern("a\tb")), Value::bool(true)])
+            .expect("bool tabsize should be treated as an integer");
+        assert_eq!(string_value(boolean), "a b");
+    }
+
+    #[test]
+    fn test_str_expandtabs_accepts_tabsize_keyword_argument() {
+        let expandtabs = builtin_from_value(
+            resolve_str_method("expandtabs")
+                .expect("expandtabs should resolve")
+                .method,
+        );
+        let result = expandtabs
+            .call_with_keywords(
+                &[Value::string(intern("a\tb"))],
+                &[("tabsize", Value::int(4).unwrap())],
+            )
+            .expect("expandtabs keyword call should succeed");
+        assert_eq!(string_value(result), "a   b");
+    }
+
+    #[test]
+    fn test_str_expandtabs_reuses_receiver_when_no_tabs_are_present() {
+        let receiver = Value::string(intern("stable"));
+        let result = str_expandtabs(&[receiver]).expect("expandtabs should accept default tabsize");
+        assert_eq!(result, receiver);
+    }
+
+    #[test]
+    fn test_str_rpartition_matches_python_contract() {
+        let value = str_rpartition(&[
+            Value::string(intern("alpha.beta.gamma")),
+            Value::string(intern(".")),
+        ])
+        .expect("rpartition should succeed");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("rpartition should return a tuple") as *mut TupleObject;
+        let tuple = unsafe { &*tuple_ptr };
+        assert_eq!(string_value(tuple.as_slice()[0]), "alpha.beta");
+        assert_eq!(string_value(tuple.as_slice()[1]), ".");
+        assert_eq!(string_value(tuple.as_slice()[2]), "gamma");
+
+        let missing = str_rpartition(&[Value::string(intern("alpha")), Value::string(intern("."))])
+            .expect("rpartition should handle missing separator");
+        let missing_ptr = missing
+            .as_object_ptr()
+            .expect("missing rpartition should return a tuple")
+            as *mut TupleObject;
+        let missing_tuple = unsafe { &*missing_ptr };
+        assert_eq!(string_value(missing_tuple.as_slice()[0]), "");
+        assert_eq!(string_value(missing_tuple.as_slice()[1]), "");
+        assert_eq!(string_value(missing_tuple.as_slice()[2]), "alpha");
+
+        unsafe {
+            drop(Box::from_raw(tuple_ptr));
+            drop(Box::from_raw(missing_ptr));
+        }
     }
 
     #[test]
@@ -5131,6 +7511,13 @@ mod tests {
             "intersection_update",
             "symmetric_difference_update",
             "copy",
+            "union",
+            "intersection",
+            "difference",
+            "symmetric_difference",
+            "isdisjoint",
+            "issubset",
+            "issuperset",
             "__contains__",
         ] {
             let method = resolve_set_method(TypeId::SET, name)
@@ -5145,14 +7532,22 @@ mod tests {
             );
         }
 
-        let frozenset_copy =
-            resolve_set_method(TypeId::FROZENSET, "copy").expect("frozenset.copy should resolve");
-        let frozenset_contains = resolve_set_method(TypeId::FROZENSET, "__contains__")
-            .expect("frozenset membership should resolve");
-        assert!(frozenset_copy.method.as_object_ptr().is_some());
-        assert!(frozenset_contains.method.as_object_ptr().is_some());
-        assert!(!frozenset_copy.is_descriptor);
-        assert!(!frozenset_contains.is_descriptor);
+        for name in [
+            "union",
+            "intersection",
+            "difference",
+            "symmetric_difference",
+            "isdisjoint",
+            "issubset",
+            "issuperset",
+            "copy",
+            "__contains__",
+        ] {
+            let method = resolve_set_method(TypeId::FROZENSET, name)
+                .unwrap_or_else(|| panic!("frozenset.{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
     }
 
     #[test]
@@ -5276,6 +7671,98 @@ mod tests {
     }
 
     #[test]
+    fn test_set_functional_methods_accept_iterables_and_preserve_receiver_type() {
+        let set = SetObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let set_ptr = Box::into_raw(Box::new(set));
+        let set_value = Value::object_ptr(set_ptr as *const ());
+        let mut vm = VirtualMachine::new();
+
+        let union_items = to_object_value(ListObject::from_slice(&[
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+        let union =
+            set_union_with_vm(&mut vm, &[set_value, union_items]).expect("set.union should work");
+        let union_ptr = union
+            .as_object_ptr()
+            .expect("set.union should return a set") as *mut SetObject;
+        assert_eq!(unsafe { &*set_ptr }.len(), 2);
+        assert!(unsafe { &*union_ptr }.contains(Value::int(3).unwrap()));
+
+        let difference_items = to_object_value(TupleObject::from_slice(&[Value::int(2).unwrap()]));
+        let difference = set_difference_with_vm(&mut vm, &[set_value, difference_items])
+            .expect("set.difference should work");
+        let difference_ptr = difference
+            .as_object_ptr()
+            .expect("set.difference should return a set")
+            as *mut SetObject;
+        assert!(unsafe { &*difference_ptr }.contains(Value::int(1).unwrap()));
+        assert!(!unsafe { &*difference_ptr }.contains(Value::int(2).unwrap()));
+
+        let subset_items = to_object_value(ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(9).unwrap(),
+        ]));
+        assert_eq!(
+            set_issubset_with_vm(&mut vm, &[set_value, subset_items]).unwrap(),
+            Value::bool(true)
+        );
+
+        unsafe {
+            drop(Box::from_raw(union_ptr));
+            drop(Box::from_raw(difference_ptr));
+            drop(Box::from_raw(set_ptr));
+        }
+
+        let mut frozen = SetObject::from_slice(&[Value::int(4).unwrap(), Value::int(5).unwrap()]);
+        frozen.header.type_id = TypeId::FROZENSET;
+        let frozen_ptr = Box::into_raw(Box::new(frozen));
+        let frozen_value = Value::object_ptr(frozen_ptr as *const ());
+        let frozen_union_items = to_object_value(ListObject::from_slice(&[Value::int(6).unwrap()]));
+        let frozen_union = frozenset_union_with_vm(&mut vm, &[frozen_value, frozen_union_items])
+            .expect("frozenset.union should work");
+        let frozen_union_ptr = frozen_union
+            .as_object_ptr()
+            .expect("frozenset.union should return a frozenset");
+        assert_eq!(
+            unsafe { &*(frozen_union_ptr as *const ObjectHeader) }.type_id,
+            TypeId::FROZENSET
+        );
+        assert!(
+            unsafe { &*(frozen_union_ptr as *const SetObject) }.contains(Value::int(6).unwrap())
+        );
+
+        unsafe {
+            drop(Box::from_raw(frozen_union_ptr as *mut SetObject));
+            drop(Box::from_raw(frozen_ptr));
+        }
+    }
+
+    #[test]
+    fn test_set_membership_and_mutation_methods_reject_unhashable_values() {
+        let set = SetObject::new();
+        let set_ptr = Box::into_raw(Box::new(set));
+        let set_value = Value::object_ptr(set_ptr as *const ());
+        let key = to_object_value(ListObject::from_slice(&[Value::int(1).unwrap()]));
+
+        for err in [
+            set_add(&[set_value, key]).unwrap_err(),
+            set_contains(&[set_value, key]).unwrap_err(),
+            set_discard(&[set_value, key]).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("unhashable type: 'list'"));
+        }
+
+        unsafe {
+            drop(Box::from_raw(
+                key.as_object_ptr().unwrap() as *mut ListObject
+            ));
+            drop(Box::from_raw(set_ptr));
+        }
+    }
+
+    #[test]
     fn test_set_copy_returns_distinct_set() {
         let set = SetObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
         let ptr = Box::into_raw(Box::new(set));
@@ -5340,6 +7827,16 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_bytes_method_returns_builtin_for_affix_checks() {
+        for name in ["startswith", "endswith"] {
+            let method =
+                resolve_bytes_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
+    }
+
+    #[test]
     fn test_resolve_bytearray_method_returns_builtin_for_copy() {
         let copy = resolve_bytearray_method("copy").expect("bytearray.copy should resolve");
         assert!(copy.method.as_object_ptr().is_some());
@@ -5354,8 +7851,18 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_bytearray_method_returns_builtin_for_affix_checks() {
+        for name in ["startswith", "endswith"] {
+            let method =
+                resolve_bytearray_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(method.method.as_object_ptr().is_some());
+            assert!(!method.is_descriptor);
+        }
+    }
+
+    #[test]
     fn test_resolve_iterator_method_returns_builtin_for_iter_and_next() {
-        for name in ["__iter__", "__next__"] {
+        for name in ["__iter__", "__next__", "__length_hint__"] {
             let method =
                 resolve_iterator_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
             assert!(method.method.as_object_ptr().is_some());
@@ -5431,6 +7938,64 @@ mod tests {
     }
 
     #[test]
+    fn test_bytes_affix_methods_accept_bytes_like_prefixes_and_bounds() {
+        let bytes = BytesObject::from_slice(b"traceback.py");
+        let bytes_ptr = Box::into_raw(Box::new(bytes));
+        let bytes_value = Value::object_ptr(bytes_ptr as *const ());
+
+        let prefix = BytesObject::bytearray_from_slice(b"trace");
+        let prefix_ptr = Box::into_raw(Box::new(prefix));
+        let prefix_value = Value::object_ptr(prefix_ptr as *const ());
+
+        let suffix = BytesObject::from_slice(b".py");
+        let suffix_ptr = Box::into_raw(Box::new(suffix));
+        let suffix_value = Value::object_ptr(suffix_ptr as *const ());
+
+        let prefixes = TupleObject::from_slice(&[prefix_value, suffix_value]);
+        let prefixes_ptr = Box::into_raw(Box::new(prefixes));
+        let prefixes_value = Value::object_ptr(prefixes_ptr as *const ());
+
+        assert_eq!(
+            bytes_startswith(&[bytes_value, prefixes_value]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            bytes_endswith(&[
+                bytes_value,
+                suffix_value,
+                Value::int(0).unwrap(),
+                Value::int(12).unwrap(),
+            ])
+            .unwrap(),
+            Value::bool(true)
+        );
+
+        let short_prefix = BytesObject::from_slice(b"tr");
+        let short_prefix_ptr = Box::into_raw(Box::new(short_prefix));
+        let short_prefix_value = Value::object_ptr(short_prefix_ptr as *const ());
+        assert_eq!(
+            bytearray_startswith(&[prefix_value, short_prefix_value]).unwrap(),
+            Value::bool(true)
+        );
+
+        let error = bytes_startswith(&[bytes_value, Value::int(1).unwrap()])
+            .expect_err("non-bytes affix should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("startswith first arg must be bytes or a tuple of bytes")
+        );
+
+        unsafe {
+            drop(Box::from_raw(short_prefix_ptr));
+            drop(Box::from_raw(prefixes_ptr));
+            drop(Box::from_raw(suffix_ptr));
+            drop(Box::from_raw(prefix_ptr));
+            drop(Box::from_raw(bytes_ptr));
+        }
+    }
+
+    #[test]
     fn test_iterator_iter_and_next_follow_python_protocol() {
         let iter_value = iterator_to_value(IteratorObject::from_values(vec![
             Value::int(1).unwrap(),
@@ -5444,6 +8009,25 @@ mod tests {
             iterator_next(&[iter_value]),
             Err(BuiltinError::StopIteration)
         ));
+    }
+
+    #[test]
+    fn test_iterator_length_hint_reports_remaining_items() {
+        let iter_value = iterator_to_value(IteratorObject::from_values(vec![
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]));
+
+        assert_eq!(
+            iterator_length_hint(&[iter_value]).unwrap().as_int(),
+            Some(3)
+        );
+        assert_eq!(iterator_next(&[iter_value]).unwrap().as_int(), Some(1));
+        assert_eq!(
+            iterator_length_hint(&[iter_value]).unwrap().as_int(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -5527,6 +8111,27 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_regex_pattern_method_returns_builtin_for_findall() {
+        let findall = resolve_regex_pattern_method("findall").expect("findall should resolve");
+        assert!(findall.method.as_object_ptr().is_some());
+        assert!(!findall.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_regex_pattern_method_returns_builtin_for_finditer() {
+        let finditer = resolve_regex_pattern_method("finditer").expect("finditer should resolve");
+        assert!(finditer.method.as_object_ptr().is_some());
+        assert!(!finditer.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_regex_pattern_method_returns_builtin_for_sub() {
+        let sub = resolve_regex_pattern_method("sub").expect("sub should resolve");
+        assert!(sub.method.as_object_ptr().is_some());
+        assert!(!sub.is_descriptor);
+    }
+
+    #[test]
     fn test_resolve_function_method_binds_descriptor_surface() {
         let get = resolve_function_method("__get__").expect("__get__ should resolve");
         assert!(get.method.as_object_ptr().is_some());
@@ -5579,15 +8184,80 @@ mod tests {
 
     #[test]
     fn test_resolve_property_method_returns_builtin_methods() {
+        let get = resolve_property_method("__get__").expect("__get__ should resolve");
+        let set = resolve_property_method("__set__").expect("__set__ should resolve");
+        let delete = resolve_property_method("__delete__").expect("__delete__ should resolve");
         let getter = resolve_property_method("getter").expect("getter should resolve");
         let setter = resolve_property_method("setter").expect("setter should resolve");
         let deleter = resolve_property_method("deleter").expect("deleter should resolve");
+        assert!(get.method.as_object_ptr().is_some());
+        assert!(set.method.as_object_ptr().is_some());
+        assert!(delete.method.as_object_ptr().is_some());
         assert!(getter.method.as_object_ptr().is_some());
         assert!(setter.method.as_object_ptr().is_some());
         assert!(deleter.method.as_object_ptr().is_some());
+        assert!(!get.is_descriptor);
+        assert!(!set.is_descriptor);
+        assert!(!delete.is_descriptor);
         assert!(!getter.is_descriptor);
         assert!(!setter.is_descriptor);
         assert!(!deleter.is_descriptor);
+    }
+
+    #[test]
+    fn test_property_dunder_methods_follow_descriptor_protocol() {
+        let getter_ptr = Box::into_raw(Box::new(BuiltinFunctionObject::new(
+            Arc::from("property_test.getter"),
+            property_echo_getter,
+        )));
+        let setter_ptr = Box::into_raw(Box::new(BuiltinFunctionObject::new(
+            Arc::from("property_test.setter"),
+            property_accepting_setter,
+        )));
+        let deleter_ptr = Box::into_raw(Box::new(BuiltinFunctionObject::new(
+            Arc::from("property_test.deleter"),
+            property_accepting_deleter,
+        )));
+        let getter = Value::object_ptr(getter_ptr as *const ());
+        let setter = Value::object_ptr(setter_ptr as *const ());
+        let deleter = Value::object_ptr(deleter_ptr as *const ());
+        let property_ptr = Box::into_raw(Box::new(PropertyDescriptor::new_full(
+            Some(getter),
+            Some(setter),
+            Some(deleter),
+            None,
+        )));
+        let property_value = Value::object_ptr(property_ptr as *const ());
+        let mut vm = VirtualMachine::new();
+
+        assert_eq!(
+            property_get(&mut vm, &[property_value, Value::none(), Value::none()])
+                .expect("__get__(None, owner) should return the property object"),
+            property_value
+        );
+        let instance = Value::int(99).unwrap();
+        assert_eq!(
+            property_get(&mut vm, &[property_value, instance])
+                .expect("__get__(instance) should invoke fget"),
+            instance
+        );
+        assert!(
+            property_set(&mut vm, &[property_value, instance, Value::int(7).unwrap()])
+                .expect("__set__ should invoke fset")
+                .is_none()
+        );
+        assert!(
+            property_delete(&mut vm, &[property_value, instance])
+                .expect("__delete__ should invoke fdel")
+                .is_none()
+        );
+
+        unsafe {
+            drop(Box::from_raw(property_ptr));
+            drop(Box::from_raw(deleter_ptr));
+            drop(Box::from_raw(setter_ptr));
+            drop(Box::from_raw(getter_ptr));
+        }
     }
 
     #[test]

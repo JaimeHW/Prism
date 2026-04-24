@@ -187,8 +187,18 @@ mod tests {
     use crate::error::RuntimeErrorKind;
     use crate::stdlib::exceptions::ExceptionTypeId;
     use crate::stdlib::generators::LivenessMap;
-    use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register};
+    use prism_code::{
+        CodeFlags, CodeObject, Constant, ExceptionEntry, Instruction, Opcode, Register,
+    };
     use std::sync::Arc;
+
+    fn boxed_constants(constants: Vec<Value>) -> Box<[Constant]> {
+        constants
+            .into_iter()
+            .map(Constant::Value)
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
 
     fn generator_value_for_state(state: GeneratorState) -> Value {
         let code = Arc::new(CodeObject::new("test_send", "<test>"));
@@ -226,7 +236,7 @@ mod tests {
         let mut code = CodeObject::new("runtime_send_generator", "<test>");
         code.flags = CodeFlags::GENERATOR;
         code.register_count = 8;
-        code.constants = vec![Value::int(1).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(1).unwrap()]);
         code.instructions = vec![
             // r2 = 1
             Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
@@ -248,11 +258,10 @@ mod tests {
         let mut code = CodeObject::new("runtime_raise_generator", "<test>");
         code.flags = CodeFlags::GENERATOR;
         code.register_count = 8;
-        code.constants = vec![create_exception(
+        code.constants = boxed_constants(vec![create_exception(
             ExceptionTypeId::TypeError,
             Some(Arc::from("boom from generator")),
-        )]
-        .into_boxed_slice();
+        )]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
             Instruction::op_di(
@@ -273,14 +282,13 @@ mod tests {
         let mut code = CodeObject::new("runtime_handled_raise_generator", "<test>");
         code.flags = CodeFlags::GENERATOR;
         code.register_count = 8;
-        code.constants = vec![
+        code.constants = boxed_constants(vec![
             create_exception(
                 ExceptionTypeId::TypeError,
                 Some(Arc::from("caught in generator")),
             ),
             Value::int(9).unwrap(),
-        ]
-        .into_boxed_slice();
+        ]);
         code.instructions = vec![
             // Raise TypeError from try-range [pc=1, pc=2)
             Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
@@ -315,7 +323,7 @@ mod tests {
         let mut code = CodeObject::new("runtime_return_value_generator", "<test>");
         code.flags = CodeFlags::GENERATOR;
         code.register_count = 8;
-        code.constants = vec![Value::int(42).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(42).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
             Instruction::op_d(Opcode::Return, Register::new(2)),

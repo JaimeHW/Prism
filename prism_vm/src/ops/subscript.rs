@@ -16,7 +16,7 @@ use crate::ops::calls::{
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
-    list_storage_mut_from_ptr, list_storage_ref_from_ptr,
+    list_storage_mut_from_ptr, list_storage_ref_from_ptr, tuple_storage_ref_from_ptr,
 };
 use prism_code::Instruction;
 use prism_core::Value;
@@ -242,11 +242,21 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
-        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+        let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+
+        if has_builtin_sequence_layout && let Some(list) = list_storage_ref_from_ptr(ptr) {
             if let Some(value) = list.get(index) {
                 return Ok(Some(SubscriptResult::Value(value)));
             }
             let len = list.len();
+            return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
+        }
+
+        if has_builtin_sequence_layout && let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            if let Some(value) = tuple.get(index) {
+                return Ok(Some(SubscriptResult::Value(value)));
+            }
+            let len = tuple.len();
             return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
         }
 
@@ -259,14 +269,6 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
                     ))));
                 }
                 let len = bytes.len();
-                return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
-            }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                if let Some(value) = tuple.get(index) {
-                    return Ok(Some(SubscriptResult::Value(value)));
-                }
-                let len = tuple.len();
                 return Err(ControlFlow::Error(RuntimeError::index_error(index, len)));
             }
             TypeId::STR => {
@@ -310,9 +312,16 @@ fn subscr_slice(
     if let Some(ptr) = container.as_object_ptr() {
         let header = unsafe { &*(ptr as *const ObjectHeader) };
 
-        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+        let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+
+        if has_builtin_sequence_layout && let Some(list) = list_storage_ref_from_ptr(ptr) {
             let result = list_slice(list, slice);
             return Ok(Some(SubscriptResult::AllocList(result)));
+        }
+
+        if has_builtin_sequence_layout && let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            let result = tuple_slice(tuple, slice);
+            return Ok(Some(SubscriptResult::AllocTuple(result)));
         }
 
         match header.type_id {
@@ -320,11 +329,6 @@ fn subscr_slice(
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
                 let result = bytes.slice(slice);
                 return Ok(Some(SubscriptResult::AllocBytes(result)));
-            }
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                let result = tuple_slice(tuple, slice);
-                return Ok(Some(SubscriptResult::AllocTuple(result)));
             }
             TypeId::STR => {
                 let string = unsafe { &*(ptr as *const StringObject) };
@@ -727,6 +731,7 @@ mod tests {
     use prism_core::intern::intern;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::mro::ClassId;
+    use prism_runtime::object::shape::Shape;
     use prism_runtime::object::shaped_object::ShapedObject;
     use prism_runtime::object::type_builtins::{
         SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
@@ -760,6 +765,15 @@ mod tests {
         let ptr = Box::into_raw(Box::new(ShapedObject::new_dict_backed(
             class.class_type_id(),
             class.instance_shape().clone(),
+        )));
+        (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn tuple_backed_object_value(items: &[Value]) -> (*mut ShapedObject, Value) {
+        let ptr = Box::into_raw(Box::new(ShapedObject::new_tuple_backed(
+            TypeId::OBJECT,
+            Shape::empty(),
+            TupleObject::from_slice(items),
         )));
         (ptr, Value::object_ptr(ptr as *const ()))
     }
@@ -891,6 +905,53 @@ mod tests {
         assert_eq!(result.get(0).unwrap().as_int(), Some(3));
         assert_eq!(result.get(1).unwrap().as_int(), Some(2));
         assert_eq!(result.get(2).unwrap().as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_tuple_backed_object_integer_subscript() {
+        let (ptr, value) = tuple_backed_object_value(&[
+            Value::int_unchecked(10),
+            Value::int_unchecked(20),
+            Value::int_unchecked(30),
+        ]);
+
+        let result = subscr_integer(value, -1).expect("tuple-backed object should index");
+        match result {
+            Some(SubscriptResult::Value(value)) => assert_eq!(value.as_int(), Some(30)),
+            Some(_) => panic!("expected direct tuple item result"),
+            None => panic!("expected tuple-backed integer fast path"),
+        }
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_tuple_backed_object_slice_subscript() {
+        let (ptr, value) = tuple_backed_object_value(&[
+            Value::int_unchecked(0),
+            Value::int_unchecked(1),
+            Value::int_unchecked(2),
+            Value::int_unchecked(3),
+        ]);
+        let slice = SliceObject::full(1, 4, 2);
+
+        let result = subscr_slice(value, &slice).expect("tuple-backed object should slice");
+        match result {
+            Some(SubscriptResult::AllocTuple(tuple)) => {
+                assert_eq!(
+                    tuple.as_slice(),
+                    &[Value::int_unchecked(1), Value::int_unchecked(3)]
+                );
+            }
+            Some(_) => panic!("expected allocated tuple slice"),
+            None => panic!("expected tuple-backed slice fast path"),
+        }
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
     }
 
     // ==========================================================================

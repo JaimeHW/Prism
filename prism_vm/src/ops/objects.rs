@@ -9,7 +9,8 @@ use crate::builtins::BuiltinFunctionObject;
 use crate::builtins::{ExceptionFlags, ExceptionTypeObject, ExceptionValue};
 use crate::builtins::{
     builtin_bound_type_attribute_value, builtin_bound_type_attribute_value_static,
-    builtin_instance_attribute_value, exception_proxy_class_id_from_ptr,
+    builtin_instance_attribute_value, builtin_type_class_or_static_attribute_value_static,
+    builtin_type_object_attribute_value, exception_proxy_class_id_from_ptr,
     exception_type_attribute_value, heap_type_attribute_value,
 };
 use crate::dispatch::ControlFlow;
@@ -20,11 +21,12 @@ use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::method_cache::method_cache;
 use crate::ops::method_dispatch::resolve_builtin_instance_method;
 use crate::stdlib::collections::deque::DequeObject;
-use prism_code::Instruction;
+use crate::stdlib::exceptions::ExceptionTypeId;
+use prism_code::{Constant, Instruction};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::class::{MethodSlot, PyClassObject};
 use prism_runtime::object::descriptor::{
     BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
 };
@@ -39,6 +41,7 @@ use prism_runtime::object::views::{
 };
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
+use prism_runtime::types::int::bigint_to_value;
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
@@ -92,6 +95,16 @@ pub(crate) fn dict_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut D
 }
 
 #[inline]
+fn dict_storage_ref_from_value(value: Value) -> Option<&'static DictObject> {
+    value.as_object_ptr().and_then(dict_storage_ref_from_ptr)
+}
+
+#[inline]
+fn dict_storage_mut_from_value(value: Value) -> Option<&'static mut DictObject> {
+    value.as_object_ptr().and_then(dict_storage_mut_from_ptr)
+}
+
+#[inline]
 pub(crate) fn list_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static ListObject> {
     prism_runtime::types::list::object_ptr_as_list_ref(ptr)
 }
@@ -99,6 +112,11 @@ pub(crate) fn list_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static ListO
 #[inline]
 pub(crate) fn list_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut ListObject> {
     prism_runtime::types::list::object_ptr_as_list_mut(ptr as *mut ())
+}
+
+#[inline]
+pub(crate) fn tuple_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static TupleObject> {
+    prism_runtime::types::tuple::object_ptr_as_tuple_ref(ptr)
 }
 
 #[inline]
@@ -119,8 +137,13 @@ fn class_object_from_type_ptr(ptr: *const ()) -> Option<&'static PyClassObject> 
 }
 
 #[inline]
+fn lookup_user_class_slot(class: &PyClassObject, name: &InternedString) -> Option<MethodSlot> {
+    class.lookup_method_published(name)
+}
+
+#[inline]
 fn lookup_user_class_attr(class: &PyClassObject, name: &InternedString) -> Option<Value> {
-    class.lookup_method_published(name).map(|slot| slot.value)
+    lookup_user_class_slot(class, name).map(|slot| slot.value)
 }
 
 #[inline]
@@ -138,8 +161,75 @@ pub(crate) fn lookup_class_metaclass_attr(
 
 #[inline]
 fn lookup_instance_class_attr(type_id: TypeId, name: &InternedString) -> Option<Value> {
+    lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
+}
+
+#[inline]
+fn lookup_instance_class_slot(type_id: TypeId, name: &InternedString) -> Option<MethodSlot> {
     let class = global_class(ClassId(type_id.raw()))?;
-    lookup_user_class_attr(class.as_ref(), name)
+    lookup_user_class_slot(class.as_ref(), name)
+}
+
+#[inline]
+fn defining_class_binds_builtin_instance_attributes(defining_class: ClassId) -> bool {
+    defining_class.0 >= TypeId::FIRST_USER_TYPE
+        && global_class(defining_class).is_some_and(|class| class.is_native_heaptype())
+}
+
+#[inline]
+fn bind_user_class_attribute_value(
+    value: Value,
+    defining_class: ClassId,
+    instance: Value,
+) -> Value {
+    let Some(ptr) = value.as_object_ptr() else {
+        return value;
+    };
+    if extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION
+        || !defining_class_binds_builtin_instance_attributes(defining_class)
+    {
+        return bind_instance_attribute(value, instance);
+    }
+
+    let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    if builtin.bound_self().is_some() {
+        value
+    } else {
+        let bound = Box::leak(Box::new(builtin.bind(instance)));
+        Value::object_ptr(bound as *mut BuiltinFunctionObject as *const ())
+    }
+}
+
+#[inline]
+fn bind_user_class_attribute_value_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    defining_class: ClassId,
+    instance: Value,
+) -> Result<Value, RuntimeError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(value);
+    };
+    if extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION
+        || !defining_class_binds_builtin_instance_attributes(defining_class)
+    {
+        return bind_instance_attribute_in_vm(vm, value, instance);
+    }
+
+    let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    if builtin.bound_self().is_some() {
+        Ok(value)
+    } else {
+        let bound = Box::leak(Box::new(builtin.bind(instance)));
+        Ok(Value::object_ptr(
+            bound as *mut BuiltinFunctionObject as *const (),
+        ))
+    }
+}
+
+#[inline]
+fn bind_user_class_slot(slot: MethodSlot, instance: Value) -> Value {
+    bind_user_class_attribute_value(slot.value, slot.defining_class, instance)
 }
 
 fn lookup_builtin_base_instance_attr(
@@ -158,7 +248,7 @@ fn lookup_builtin_base_instance_attr(
 
         let owner = class_id_to_type_id(class_id);
         if let Some(cached) = resolve_builtin_instance_method(owner, name.as_str()) {
-            return Ok(Some(bind_instance_attribute(cached.method, obj)));
+            return Ok(Some(bind_cached_builtin_method(cached.method, obj)));
         }
 
         if let Some(value) = builtin_bound_type_attribute_value_static(owner, obj, name)? {
@@ -191,15 +281,22 @@ fn class_id_to_value(class_id: ClassId) -> Option<Value> {
 }
 
 #[inline]
-fn bind_super_lookup_value(value: Value, super_obj: &SuperObject, name: &InternedString) -> Value {
+fn bind_super_lookup_value(
+    value: Value,
+    defining_class: ClassId,
+    super_obj: &SuperObject,
+    name: &InternedString,
+) -> Value {
     match super_obj.binding() {
         SuperBinding::Unbound => value,
-        SuperBinding::Instance => bind_instance_attribute(value, super_obj.obj()),
+        SuperBinding::Instance => {
+            bind_user_class_attribute_value(value, defining_class, super_obj.obj())
+        }
         SuperBinding::Type => {
             if name.as_str() == "__new__" {
                 resolve_class_attribute(value, super_obj.obj())
             } else {
-                bind_instance_attribute(value, super_obj.obj())
+                bind_user_class_attribute_value(value, defining_class, super_obj.obj())
             }
         }
     }
@@ -210,6 +307,14 @@ fn is_property_descriptor_value(value: Value) -> bool {
     value
         .as_object_ptr()
         .is_some_and(|ptr| extract_type_id(ptr) == TypeId::PROPERTY)
+}
+
+#[inline]
+fn code_constant_to_value(constant: &Constant) -> Value {
+    match constant {
+        Constant::Value(value) => *value,
+        Constant::BigInt(value) => bigint_to_value(value.clone()),
+    }
 }
 
 #[inline]
@@ -312,7 +417,7 @@ pub(crate) fn super_attribute_value_static(
             if super_obj.binding() != SuperBinding::Unbound
                 && let Some(cached) = resolve_builtin_instance_method(owner, name.as_str())
             {
-                return Ok(Some(bind_instance_attribute(
+                return Ok(Some(bind_cached_builtin_method(
                     cached.method,
                     super_obj.obj(),
                 )));
@@ -328,7 +433,9 @@ pub(crate) fn super_attribute_value_static(
         if let Some(class) = global_class(class_id)
             && let Some(value) = class.get_attr(name)
         {
-            return Ok(Some(bind_super_lookup_value(value, super_obj, name)));
+            return Ok(Some(bind_super_lookup_value(
+                value, class_id, super_obj, name,
+            )));
         }
     }
 
@@ -344,7 +451,7 @@ pub(crate) fn super_attribute_exists(super_value: Value, name: &InternedString) 
 }
 
 #[inline]
-fn alloc_heap_value<T>(
+pub(crate) fn alloc_heap_value<T>(
     vm: &mut VirtualMachine,
     object: T,
     context: &'static str,
@@ -418,6 +525,20 @@ pub(crate) fn snapshot_module_dict(module: &crate::import::ModuleObject) -> Dict
     dict
 }
 
+fn module_attribute_value(
+    _vm: &mut VirtualMachine,
+    module: &crate::import::ModuleObject,
+    name: &InternedString,
+) -> Result<Value, RuntimeError> {
+    if name.as_str() == "__dict__" {
+        return Ok(module.dict_value());
+    }
+
+    module
+        .get_attr(name.as_str())
+        .ok_or_else(|| RuntimeError::attribute_error("module", name.as_str()))
+}
+
 pub(crate) fn snapshot_current_globals_dict(vm: &VirtualMachine) -> DictObject {
     if let Some(module) = vm.current_module_cloned() {
         return snapshot_module_dict(module.as_ref());
@@ -483,6 +604,20 @@ fn function_attr_dict_value(
     Ok(Value::object_ptr(dict_ptr as *const ()))
 }
 
+fn function_annotations_value(
+    vm: &mut VirtualMachine,
+    func: &FunctionObject,
+) -> Result<Value, RuntimeError> {
+    let annotations_name = intern("__annotations__");
+    if let Some(value) = func.get_attr(&annotations_name) {
+        return Ok(value);
+    }
+
+    let value = alloc_heap_value(vm, DictObject::new(), "function annotations dict")?;
+    func.set_attr(annotations_name, value);
+    Ok(value)
+}
+
 fn function_module(
     vm: &VirtualMachine,
     func: &FunctionObject,
@@ -501,8 +636,24 @@ fn function_attr_value_in_vm(
     func: &FunctionObject,
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
+    if name.as_str() == "__class__" {
+        return Ok(Some(crate::builtins::builtin_type_object_for_type_id(
+            TypeId::FUNCTION,
+        )));
+    }
+
     if let Some(value) = function_attr_value(func, name) {
         return Ok(Some(value));
+    }
+
+    if name.as_str() == "__get__" {
+        return Ok(
+            crate::ops::method_dispatch::resolve_builtin_instance_method(
+                TypeId::FUNCTION,
+                "__get__",
+            )
+            .map(|cached| bind_cached_builtin_method(cached.method, Value::object_ptr(func_ptr))),
+        );
     }
 
     match name.as_str() {
@@ -513,6 +664,7 @@ fn function_attr_value_in_vm(
                 .map(|module| Value::string(intern(module.name())))
                 .unwrap_or_else(|| Value::string(intern("__main__"))),
         )),
+        "__annotations__" => Ok(Some(function_annotations_value(vm, func)?)),
         "__defaults__" => match func
             .defaults
             .as_ref()
@@ -534,10 +686,12 @@ fn function_attr_value_in_vm(
             "code object view",
         )?)),
         "__globals__" => {
-            let dict = function_module(vm, func)
-                .map(|module| snapshot_module_dict(module.as_ref()))
-                .unwrap_or_else(|| snapshot_current_globals_dict(vm));
-            Ok(Some(alloc_heap_value(vm, dict, "globals dict snapshot")?))
+            if let Some(module) = function_module(vm, func) {
+                Ok(Some(module.dict_value()))
+            } else {
+                let dict = snapshot_current_globals_dict(vm);
+                Ok(Some(alloc_heap_value(vm, dict, "globals dict snapshot")?))
+            }
         }
         "__closure__" => {
             let Some(closure) = vm.lookup_function_closure(func_ptr) else {
@@ -566,8 +720,12 @@ fn method_attr_value_in_vm(
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
     match name.as_str() {
+        "__class__" => Ok(Some(crate::builtins::builtin_type_object_for_type_id(
+            TypeId::METHOD,
+        ))),
         "__self__" => Ok(Some(method.instance())),
         "__func__" | "__wrapped__" => Ok(Some(method.function())),
+        "__get__" => Ok(None),
         _ => {
             let Some(func_ptr) = method.function().as_object_ptr() else {
                 return Ok(None);
@@ -604,6 +762,9 @@ fn code_attr_value_in_vm(
 ) -> Result<Option<Value>, RuntimeError> {
     let code = code_view.code();
     match name.as_str() {
+        "__class__" => Ok(Some(crate::builtins::builtin_type_object_for_type_id(
+            TypeId::CODE,
+        ))),
         "co_name" => Ok(Some(Value::string(intern(code.name.as_ref())))),
         "co_qualname" => Ok(Some(Value::string(intern(code.qualname.as_ref())))),
         "co_filename" => Ok(Some(Value::string(intern(code.filename.as_ref())))),
@@ -627,7 +788,7 @@ fn code_attr_value_in_vm(
         )),
         "co_consts" => Ok(Some(alloc_heap_value(
             vm,
-            TupleObject::from_vec(code.constants.to_vec()),
+            TupleObject::from_vec(code.constants.iter().map(code_constant_to_value).collect()),
             "code constants tuple",
         )?)),
         "co_varnames" => Ok(Some(code_string_tuple_value(
@@ -675,13 +836,37 @@ pub(crate) fn function_attr_value(func: &FunctionObject, name: &InternedString) 
 }
 
 #[inline]
+fn builtin_function_display_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+#[inline]
+pub(crate) fn builtin_function_attr_value(
+    builtin: &BuiltinFunctionObject,
+    name: &InternedString,
+) -> Option<Value> {
+    match name.as_str() {
+        "__name__" => Some(Value::string(intern(builtin_function_display_name(
+            builtin.name(),
+        )))),
+        "__qualname__" => Some(Value::string(intern(builtin.name()))),
+        "__doc__" => Some(Value::none()),
+        "__self__" => Some(builtin.bound_self().unwrap_or_else(Value::none)),
+        _ => None,
+    }
+}
+
+#[inline]
 pub(crate) fn function_attr_exists(func: &FunctionObject, name: &InternedString) -> bool {
     function_attr_value(func, name).is_some()
         || matches!(
             name.as_str(),
             "__doc__"
+                | "__class__"
                 | "__dict__"
+                | "__get__"
                 | "__module__"
+                | "__annotations__"
                 | "__defaults__"
                 | "__code__"
                 | "__globals__"
@@ -761,12 +946,262 @@ pub(crate) fn descriptor_attr_value(value: Value, name: &InternedString) -> Opti
 }
 
 #[inline]
+fn descriptor_wrapped_value(value: Value) -> Option<Value> {
+    let ptr = value.as_object_ptr()?;
+    match extract_type_id(ptr) {
+        TypeId::CLASSMETHOD => {
+            let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            Some(desc.function())
+        }
+        TypeId::STATICMETHOD => {
+            let desc = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            Some(desc.function())
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn descriptor_attr_value_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(value) = descriptor_attr_value(value, name) {
+        return Ok(Some(value));
+    }
+
+    if matches!(name.as_str(), "__get__" | "__set__" | "__delete__") {
+        let Some(ptr) = value.as_object_ptr() else {
+            return Ok(None);
+        };
+        let owner = match extract_type_id(ptr) {
+            TypeId::CLASSMETHOD => TypeId::CLASSMETHOD,
+            TypeId::STATICMETHOD => TypeId::STATICMETHOD,
+            TypeId::PROPERTY => TypeId::PROPERTY,
+            _ => return Ok(None),
+        };
+
+        return Ok(
+            crate::ops::method_dispatch::resolve_builtin_instance_method(owner, name.as_str())
+                .map(|cached| bind_cached_builtin_method(cached.method, value)),
+        );
+    }
+
+    let Some(wrapped) = descriptor_wrapped_value(value) else {
+        return Ok(None);
+    };
+
+    match name.as_str() {
+        "__module__" | "__qualname__" | "__name__" | "__doc__" | "__annotations__" => {
+            get_attribute_value(vm, wrapped, name).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[inline]
+fn classmethod_owner_from_instance(instance: Value) -> Value {
+    crate::builtins::value_type_object(instance)
+}
+
+fn descriptor_special_method_in_vm(
+    vm: &mut VirtualMachine,
+    descriptor: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(ptr) = descriptor.as_object_ptr() else {
+        return Ok(None);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => {
+            let func = unsafe { &*(ptr as *const FunctionObject) };
+            function_attr_value_in_vm(vm, ptr, func, name)
+        }
+        TypeId::METHOD => {
+            let method = unsafe { &*(ptr as *const BoundMethod) };
+            method_attr_value_in_vm(vm, method, name)
+        }
+        TypeId::CLASSMETHOD | TypeId::STATICMETHOD | TypeId::PROPERTY => {
+            descriptor_attr_value_in_vm(vm, descriptor, name)
+        }
+        type_id => {
+            if let Some(method) = builtin_instance_method_attr_value(descriptor, type_id, name) {
+                return Ok(Some(method));
+            }
+
+            if is_user_defined_type(type_id)
+                && let Some(slot) = lookup_instance_class_slot(type_id, name)
+            {
+                return bind_user_class_attribute_value_in_vm(
+                    vm,
+                    slot.value,
+                    slot.defining_class,
+                    descriptor,
+                )
+                .map(Some);
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+fn invoke_descriptor_get_in_vm(
+    vm: &mut VirtualMachine,
+    descriptor: Value,
+    instance: Value,
+    owner: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(getter) = descriptor_special_method_in_vm(vm, descriptor, &intern("__get__"))? else {
+        return Ok(None);
+    };
+
+    crate::ops::calls::invoke_callable_value(vm, getter, &[instance, owner]).map(Some)
+}
+
+fn descriptor_has_special_method_in_vm(
+    vm: &mut VirtualMachine,
+    descriptor: Value,
+    name: &str,
+) -> Result<bool, RuntimeError> {
+    descriptor_special_method_in_vm(vm, descriptor, &intern(name)).map(|value| value.is_some())
+}
+
+fn descriptor_is_data_descriptor_in_vm(
+    vm: &mut VirtualMachine,
+    descriptor: Value,
+) -> Result<bool, RuntimeError> {
+    Ok(
+        descriptor_has_special_method_in_vm(vm, descriptor, "__set__")?
+            || descriptor_has_special_method_in_vm(vm, descriptor, "__delete__")?,
+    )
+}
+
+fn invoke_descriptor_set_in_vm(
+    vm: &mut VirtualMachine,
+    descriptor: Value,
+    instance: Value,
+    value: Value,
+) -> Result<bool, RuntimeError> {
+    let Some(setter) = descriptor_special_method_in_vm(vm, descriptor, &intern("__set__"))? else {
+        return Ok(false);
+    };
+
+    crate::ops::calls::invoke_callable_value(vm, setter, &[instance, value])?;
+    Ok(true)
+}
+
+fn invoke_descriptor_delete_in_vm(
+    vm: &mut VirtualMachine,
+    descriptor: Value,
+    instance: Value,
+) -> Result<bool, RuntimeError> {
+    let Some(deleter) = descriptor_special_method_in_vm(vm, descriptor, &intern("__delete__"))?
+    else {
+        return Ok(false);
+    };
+
+    crate::ops::calls::invoke_callable_value(vm, deleter, &[instance])?;
+    Ok(true)
+}
+
+#[inline]
+fn bind_fallback_callable(value: Value, owner: Value) -> Value {
+    let Some(ptr) = value.as_object_ptr() else {
+        let bound = Box::leak(Box::new(BoundMethod::new(value, owner)));
+        return Value::object_ptr(bound as *mut BoundMethod as *const ());
+    };
+
+    if extract_type_id(ptr) == TypeId::BUILTIN_FUNCTION {
+        return bind_cached_builtin_method(value, owner);
+    }
+
+    let bound = Box::leak(Box::new(BoundMethod::new(value, owner)));
+    Value::object_ptr(bound as *mut BoundMethod as *const ())
+}
+
+pub(crate) fn bind_wrapped_classmethod_value(
+    vm: &mut VirtualMachine,
+    wrapped: Value,
+    owner: Value,
+) -> Result<Value, RuntimeError> {
+    match invoke_descriptor_get_in_vm(vm, wrapped, owner, owner)? {
+        Some(bound) => Ok(bound),
+        None => Ok(bind_fallback_callable(wrapped, owner)),
+    }
+}
+
+#[inline]
+pub(crate) fn resolve_class_attribute_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    owner: Value,
+) -> Result<Value, RuntimeError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(value);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::BUILTIN_FUNCTION => Ok(value),
+        TypeId::CLASSMETHOD => {
+            let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            bind_wrapped_classmethod_value(vm, desc.function(), owner)
+        }
+        TypeId::STATICMETHOD => {
+            let desc = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            Ok(desc.function())
+        }
+        _ => Ok(invoke_descriptor_get_in_vm(vm, value, Value::none(), owner)?.unwrap_or(value)),
+    }
+}
+
+#[inline]
+pub(crate) fn bind_instance_attribute_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    instance: Value,
+) -> Result<Value, RuntimeError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(value);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => {
+            let bound = Box::leak(Box::new(BoundMethod::new(value, instance)));
+            Ok(Value::object_ptr(bound as *mut BoundMethod as *const ()))
+        }
+        TypeId::BUILTIN_FUNCTION => Ok(value),
+        TypeId::CLASSMETHOD => {
+            let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            bind_wrapped_classmethod_value(
+                vm,
+                desc.function(),
+                classmethod_owner_from_instance(instance),
+            )
+        }
+        TypeId::STATICMETHOD => {
+            let desc = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            Ok(desc.function())
+        }
+        _ => Ok(invoke_descriptor_get_in_vm(
+            vm,
+            value,
+            instance,
+            classmethod_owner_from_instance(instance),
+        )?
+        .unwrap_or(value)),
+    }
+}
+
+#[inline]
 pub(crate) fn resolve_class_attribute(value: Value, owner: Value) -> Value {
     let Some(ptr) = value.as_object_ptr() else {
         return value;
     };
 
     match extract_type_id(ptr) {
+        TypeId::BUILTIN_FUNCTION => value,
         TypeId::CLASSMETHOD => {
             let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
             desc.bind_value(owner)
@@ -786,26 +1221,14 @@ pub(crate) fn bind_instance_attribute(value: Value, instance: Value) -> Value {
     };
 
     match extract_type_id(ptr) {
-        TypeId::BUILTIN_FUNCTION => {
-            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
-            let bound = Box::leak(Box::new(builtin.bind(instance)));
-            Value::object_ptr(bound as *mut BuiltinFunctionObject as *const ())
-        }
         TypeId::FUNCTION | TypeId::CLOSURE => {
             let bound = Box::leak(Box::new(BoundMethod::new(value, instance)));
             Value::object_ptr(bound as *mut BoundMethod as *const ())
         }
+        TypeId::BUILTIN_FUNCTION => value,
         TypeId::CLASSMETHOD => {
             let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
-            let owner = if let Some(instance_ptr) = instance.as_object_ptr() {
-                if let Some(class) = global_class(ClassId(extract_type_id(instance_ptr).raw())) {
-                    Value::object_ptr(Arc::as_ptr(&class) as *const ())
-                } else {
-                    instance
-                }
-            } else {
-                instance
-            };
+            let owner = classmethod_owner_from_instance(instance);
             desc.bind_value(owner)
         }
         TypeId::STATICMETHOD => {
@@ -817,13 +1240,27 @@ pub(crate) fn bind_instance_attribute(value: Value, instance: Value) -> Value {
 }
 
 #[inline]
+pub(crate) fn bind_cached_builtin_method(value: Value, instance: Value) -> Value {
+    let Some(ptr) = value.as_object_ptr() else {
+        return value;
+    };
+    if extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION {
+        return bind_instance_attribute(value, instance);
+    }
+
+    let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    let bound = Box::leak(Box::new(builtin.bind(instance)));
+    Value::object_ptr(bound as *mut BuiltinFunctionObject as *const ())
+}
+
+#[inline]
 pub(crate) fn builtin_instance_method_attr_value(
     obj: Value,
     type_id: TypeId,
     name: &InternedString,
 ) -> Option<Value> {
     resolve_builtin_instance_method(type_id, name.as_str())
-        .map(|cached| bind_instance_attribute(cached.method, obj))
+        .map(|cached| bind_cached_builtin_method(cached.method, obj))
 }
 
 #[inline]
@@ -884,20 +1321,18 @@ fn lookup_builtin_primitive_attr(
     for class_id in builtin_class_mro(owner) {
         let builtin_owner = class_id_to_type_id(class_id);
 
-        if let Some(value) = builtin_instance_method_attr_value(obj, builtin_owner, name) {
-            return Ok(Some(value));
-        }
-
         if let Some(value) = builtin_instance_attribute_value(vm, builtin_owner, obj, name)? {
             return Ok(Some(value));
         }
 
-        if let Some(value) = builtin_bound_type_attribute_value_static(builtin_owner, obj, name)? {
-            // `builtin_bound_type_attribute_value_static()` already applies the
-            // descriptor semantics appropriate for type-level attributes such as
-            // `__new__`, `maketrans`, and classmethods. Primitive instance
-            // lookup must not bind those results a second time or we turn
-            // stable type descriptors into fresh bound builtins on every access.
+        if let Some(value) = builtin_instance_method_attr_value(obj, builtin_owner, name) {
+            return Ok(Some(value));
+        }
+
+        let owner_value = crate::builtins::builtin_type_object_for_type_id(builtin_owner);
+        if let Some(value) =
+            builtin_type_class_or_static_attribute_value_static(builtin_owner, owner_value, name)
+        {
             return Ok(Some(value));
         }
     }
@@ -917,6 +1352,28 @@ fn user_defined_attribute_error(type_id: TypeId, name: &InternedString) -> Runti
     RuntimeError::attribute_error(user_defined_instance_type_name(type_id), name.as_str())
 }
 
+fn ensure_user_defined_instance_dict_value(ptr: *const ()) -> Value {
+    let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+    shaped.ensure_instance_dict_value()
+}
+
+fn set_user_defined_instance_dict_value(ptr: *const (), value: Value) -> Result<(), RuntimeError> {
+    if dict_storage_ref_from_value(value).is_none() {
+        return Err(RuntimeError::type_error(
+            "__dict__ must be set to a dictionary",
+        ));
+    }
+
+    let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+    shaped.set_instance_dict_value(value);
+    Ok(())
+}
+
+fn reset_user_defined_instance_dict_value(ptr: *const ()) {
+    let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+    shaped.reset_instance_dict();
+}
+
 fn lookup_user_defined_instance_attribute_default(
     vm: &mut VirtualMachine,
     obj: Value,
@@ -928,18 +1385,41 @@ fn lookup_user_defined_instance_attribute_default(
         return Ok(class_id_to_value(ClassId(type_id.raw())));
     }
 
-    let class_attr = lookup_instance_class_attr(type_id, name);
-    if let Some(descriptor) = class_attr.and_then(property_descriptor_from_value) {
+    let class_slot = lookup_instance_class_slot(type_id, name);
+    if let Some(descriptor) = class_slot
+        .as_ref()
+        .map(|slot| slot.value)
+        .and_then(property_descriptor_from_value)
+    {
         return invoke_property_getter(vm, descriptor, obj).map(Some);
     }
 
+    if let Some(ref slot) = class_slot
+        && descriptor_is_data_descriptor_in_vm(vm, slot.value)?
+    {
+        return bind_user_class_attribute_value_in_vm(vm, slot.value, slot.defining_class, obj)
+            .map(Some);
+    }
+
+    if name.as_str() == "__dict__" {
+        return Ok(Some(ensure_user_defined_instance_dict_value(ptr)));
+    }
+
     let shaped = unsafe { &*(ptr as *const ShapedObject) };
-    if let Some(value) = shaped.get_property_interned(name) {
+    if let Some(dict_value) = shaped.instance_dict_value() {
+        let dict = dict_storage_ref_from_value(dict_value).ok_or_else(|| {
+            RuntimeError::type_error("instance __dict__ storage is not a dictionary")
+        })?;
+        if let Some(value) = dict.get(Value::string(name.clone())) {
+            return Ok(Some(value));
+        }
+    } else if let Some(value) = shaped.get_property_interned(name) {
         return Ok(Some(value));
     }
 
-    if let Some(value) = class_attr {
-        return Ok(Some(bind_instance_attribute(value, obj)));
+    if let Some(slot) = class_slot {
+        return bind_user_class_attribute_value_in_vm(vm, slot.value, slot.defining_class, obj)
+            .map(Some);
     }
 
     if let Some(value) = lookup_builtin_base_instance_attr(obj, type_id, name)? {
@@ -959,16 +1439,17 @@ fn invoke_user_defined_getattr(
         return Ok(None);
     }
 
-    let Some(getattr_value) = lookup_instance_class_attr(type_id, &intern("__getattr__")) else {
+    let Some(getattr_slot) = lookup_instance_class_slot(type_id, &intern("__getattr__")) else {
         return Ok(None);
     };
 
-    crate::ops::calls::invoke_callable_value(
+    let getattr = bind_user_class_attribute_value_in_vm(
         vm,
-        bind_instance_attribute(getattr_value, obj),
-        &[Value::string(name.clone())],
-    )
-    .map(Some)
+        getattr_slot.value,
+        getattr_slot.defining_class,
+        obj,
+    )?;
+    crate::ops::calls::invoke_callable_value(vm, getattr, &[Value::string(name.clone())]).map(Some)
 }
 
 fn lookup_user_defined_instance_attribute(
@@ -978,17 +1459,22 @@ fn lookup_user_defined_instance_attribute(
     type_id: TypeId,
     name: &InternedString,
 ) -> Result<Value, RuntimeError> {
-    if let Some(getattribute_value) =
-        lookup_instance_class_attr(type_id, &intern("__getattribute__"))
+    if let Some(getattribute_slot) =
+        lookup_instance_class_slot(type_id, &intern("__getattribute__"))
     {
-        let getattribute = bind_instance_attribute(getattribute_value, obj);
+        let getattribute = bind_user_class_attribute_value_in_vm(
+            vm,
+            getattribute_slot.value,
+            getattribute_slot.defining_class,
+            obj,
+        )?;
         return match crate::ops::calls::invoke_callable_value(
             vm,
             getattribute,
             &[Value::string(name.clone())],
         ) {
             Ok(value) => Ok(value),
-            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            Err(err) if err.is_attribute_error() => {
                 if let Some(value) = invoke_user_defined_getattr(vm, obj, type_id, name)? {
                     return Ok(value);
                 }
@@ -1006,7 +1492,7 @@ fn lookup_user_defined_instance_attribute(
             }
             Err(user_defined_attribute_error(type_id, name))
         }
-        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+        Err(err) if err.is_attribute_error() => {
             if let Some(value) = invoke_user_defined_getattr(vm, obj, type_id, name)? {
                 return Ok(value);
             }
@@ -1058,14 +1544,24 @@ pub(crate) fn get_attribute_value(
 ) -> Result<Value, RuntimeError> {
     if let Some(ptr) = obj.as_object_ptr() {
         if let Some(module) = vm.import_resolver.module_from_ptr(ptr) {
-            return module
-                .get_attr(name.as_str())
-                .ok_or_else(|| RuntimeError::attribute_error("module", name.as_str()));
+            return module_attribute_value(vm, module.as_ref(), name);
         }
 
         let type_id = extract_type_id(ptr);
+        if type_id == TypeId::MODULE {
+            let module = unsafe { &*(ptr as *const crate::import::ModuleObject) };
+            return module_attribute_value(vm, module, name);
+        }
 
-        if let Some(value) = builtin_instance_method_attr_value(obj, type_id, name) {
+        if type_id != TypeId::EXCEPTION_TYPE
+            && let Some(value) = builtin_instance_attribute_value(vm, type_id, obj, name)?
+        {
+            return Ok(value);
+        }
+
+        if type_id != TypeId::EXCEPTION_TYPE
+            && let Some(value) = builtin_instance_method_attr_value(obj, type_id, name)
+        {
             return Ok(value);
         }
 
@@ -1104,6 +1600,11 @@ pub(crate) fn get_attribute_value(
                 function_attr_value_in_vm(vm, ptr, func, name)?
                     .ok_or_else(|| RuntimeError::attribute_error("function", name.as_str()))
             }
+            TypeId::BUILTIN_FUNCTION => {
+                let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+                builtin_function_attr_value(builtin, name)
+                    .ok_or_else(|| RuntimeError::attribute_error("builtin_function", name.as_str()))
+            }
             TypeId::METHOD => {
                 let method = unsafe { &*(ptr as *const BoundMethod) };
                 method_attr_value_in_vm(vm, method, name)?
@@ -1137,6 +1638,13 @@ pub(crate) fn get_attribute_value(
                         .message()
                         .map(|message| Value::string(intern(message)))
                         .unwrap_or_else(Value::none)),
+                    "errno" if exc.is_subclass_of(ExceptionTypeId::OSError) => {
+                        Ok(exception_arg_or_none(exc, 0))
+                    }
+                    "strerror" if exc.is_subclass_of(ExceptionTypeId::OSError) => {
+                        Ok(exception_arg_or_message(exc, 1))
+                    }
+                    "winerror" if exc.is_subclass_of(ExceptionTypeId::OSError) => Ok(Value::none()),
                     "name" => Ok(exc
                         .import_name()
                         .map(|import_name| Value::string(intern(import_name)))
@@ -1145,6 +1653,25 @@ pub(crate) fn get_attribute_value(
                         .import_path()
                         .map(|import_path| Value::string(intern(import_path)))
                         .unwrap_or_else(Value::none)),
+                    "filename" if exc.is_subclass_of(ExceptionTypeId::OSError) => {
+                        Ok(exception_arg_or_none(exc, 2))
+                    }
+                    "filename2" if exc.is_subclass_of(ExceptionTypeId::OSError) => {
+                        Ok(exception_arg_or_none(exc, 4))
+                    }
+                    "filename" => Ok(exc
+                        .syntax_filename()
+                        .map(|filename| Value::string(intern(filename)))
+                        .unwrap_or_else(Value::none)),
+                    "lineno" => Ok(optional_u32_to_value(exc.syntax_lineno())),
+                    "offset" => Ok(optional_u32_to_value(exc.syntax_offset())),
+                    "text" => Ok(exc
+                        .syntax_text()
+                        .map(|text| Value::string(intern(text)))
+                        .unwrap_or_else(Value::none)),
+                    "end_lineno" => Ok(optional_u32_to_value(exc.syntax_end_lineno())),
+                    "end_offset" => Ok(optional_u32_to_value(exc.syntax_end_offset())),
+                    "print_file_and_line" => Ok(Value::none()),
                     "__traceback__" => Ok(exc.traceback().unwrap_or_else(Value::none)),
                     "__cause__" => Ok(exc
                         .cause
@@ -1215,7 +1742,7 @@ pub(crate) fn get_attribute_value(
                     "f_lasti" => Ok(Value::int(frame.lasti() as i64).unwrap_or_else(Value::none)),
                     "f_globals" => Ok(frame.globals()),
                     "f_locals" => Ok(frame.locals()),
-                    "f_back" => Ok(Value::none()),
+                    "f_back" => Ok(frame.back().unwrap_or_else(Value::none)),
                     _ => Err(RuntimeError::attribute_error("frame", name.as_str())),
                 }
             }
@@ -1233,20 +1760,27 @@ pub(crate) fn get_attribute_value(
             TypeId::TYPE => {
                 if let Some(represented) = crate::builtins::builtin_type_object_type_id(ptr)
                     && let Some(value) =
-                        builtin_bound_type_attribute_value(vm, represented, obj, name)?
+                        builtin_type_object_attribute_value(vm, represented, obj, name)?
                 {
                     return Ok(value);
                 }
 
                 if let Some(class) = class_object_from_type_ptr(ptr) {
+                    let metaclass_attr = lookup_class_metaclass_attr(class, name);
+                    if let Some(value) = metaclass_attr
+                        && descriptor_is_data_descriptor_in_vm(vm, value)?
+                    {
+                        return bind_instance_attribute_in_vm(vm, value, obj);
+                    }
+
                     if let Some(value) =
                         heap_type_attribute_value(vm, ptr as *const PyClassObject, name)?
                     {
                         return Ok(value);
                     }
 
-                    if let Some(value) = lookup_class_metaclass_attr(class, name) {
-                        return Ok(bind_instance_attribute(value, obj));
+                    if let Some(value) = metaclass_attr {
+                        return bind_instance_attribute_in_vm(vm, value, obj);
                     }
                 }
 
@@ -1259,7 +1793,7 @@ pub(crate) fn get_attribute_value(
                 Err(RuntimeError::attribute_error("type", name.as_str()))
             }
             _ => {
-                if let Some(value) = descriptor_attr_value(obj, name) {
+                if let Some(value) = descriptor_attr_value_in_vm(vm, obj, name)? {
                     return Ok(value);
                 }
 
@@ -1284,6 +1818,31 @@ pub(crate) fn get_attribute_value(
     ))
 }
 
+#[inline]
+fn exception_arg_or_none(exception: &ExceptionValue, index: usize) -> Value {
+    exception
+        .args
+        .as_deref()
+        .and_then(|args| args.get(index).copied())
+        .unwrap_or_else(Value::none)
+}
+
+#[inline]
+fn exception_arg_or_message(exception: &ExceptionValue, index: usize) -> Value {
+    if let Some(value) = exception
+        .args
+        .as_deref()
+        .and_then(|args| args.get(index).copied())
+    {
+        return value;
+    }
+
+    exception
+        .message()
+        .map(|message| Value::string(intern(message)))
+        .unwrap_or_else(Value::none)
+}
+
 pub(crate) fn set_attribute_value(
     vm: &mut VirtualMachine,
     obj: Value,
@@ -1297,6 +1856,12 @@ pub(crate) fn set_attribute_value(
         }
 
         let type_id = extract_type_id(ptr);
+        if type_id == TypeId::MODULE {
+            let module = unsafe { &*(ptr as *const crate::import::ModuleObject) };
+            module.set_attr(name.as_str(), value);
+            return Ok(());
+        }
+
         return match type_id {
             TypeId::OBJECT => {
                 let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
@@ -1365,7 +1930,8 @@ pub(crate) fn set_attribute_value(
                 }
 
                 if is_user_defined_type(type_id) {
-                    if let Some(descriptor) = lookup_instance_class_attr(type_id, name)
+                    if let Some(descriptor) = lookup_instance_class_slot(type_id, name)
+                        .map(|slot| slot.value)
                         .filter(|descriptor| is_property_descriptor_value(*descriptor))
                         .and_then(property_descriptor_from_value)
                     {
@@ -1373,8 +1939,28 @@ pub(crate) fn set_attribute_value(
                         return Ok(());
                     }
 
+                    if let Some(descriptor) =
+                        lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
+                        && invoke_descriptor_set_in_vm(vm, descriptor, obj, value)?
+                    {
+                        return Ok(());
+                    }
+
+                    if name.as_str() == "__dict__" {
+                        return set_user_defined_instance_dict_value(ptr, value);
+                    }
+
                     let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+                    let instance_dict = shaped.instance_dict_value();
                     shaped.set_property(name.clone(), value, shape_registry());
+                    if let Some(dict_value) = instance_dict {
+                        let dict = dict_storage_mut_from_value(dict_value).ok_or_else(|| {
+                            RuntimeError::type_error(
+                                "instance __dict__ storage is not a dictionary",
+                            )
+                        })?;
+                        dict.set(Value::string(name.clone()), value);
+                    }
                     return Ok(());
                 }
 
@@ -1408,6 +1994,15 @@ pub(crate) fn delete_attribute_value(
         }
 
         let type_id = extract_type_id(ptr);
+        if type_id == TypeId::MODULE {
+            let module = unsafe { &*(ptr as *const crate::import::ModuleObject) };
+            return if module.del_attr(name.as_str()) {
+                Ok(())
+            } else {
+                Err(RuntimeError::attribute_error("module", name.as_str()))
+            };
+        }
+
         return match type_id {
             TypeId::OBJECT => {
                 let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
@@ -1463,7 +2058,8 @@ pub(crate) fn delete_attribute_value(
                 }
 
                 if is_user_defined_type(type_id) {
-                    if let Some(descriptor) = lookup_instance_class_attr(type_id, name)
+                    if let Some(descriptor) = lookup_instance_class_slot(type_id, name)
+                        .map(|slot| slot.value)
                         .filter(|descriptor| is_property_descriptor_value(*descriptor))
                         .and_then(property_descriptor_from_value)
                     {
@@ -1471,8 +2067,31 @@ pub(crate) fn delete_attribute_value(
                         return Ok(());
                     }
 
+                    if let Some(descriptor) =
+                        lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
+                        && invoke_descriptor_delete_in_vm(vm, descriptor, obj)?
+                    {
+                        return Ok(());
+                    }
+
+                    if name.as_str() == "__dict__" {
+                        reset_user_defined_instance_dict_value(ptr);
+                        return Ok(());
+                    }
+
                     let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
-                    if shaped.delete_property_interned(name) {
+                    if let Some(dict_value) = shaped.instance_dict_value() {
+                        let dict = dict_storage_mut_from_value(dict_value).ok_or_else(|| {
+                            RuntimeError::type_error(
+                                "instance __dict__ storage is not a dictionary",
+                            )
+                        })?;
+                        let removed = dict.remove(Value::string(name.clone())).is_some();
+                        shaped.delete_property_interned(name);
+                        if removed {
+                            return Ok(());
+                        }
+                    } else if shaped.delete_property_interned(name) {
                         return Ok(());
                     }
                 }
@@ -1602,20 +2221,20 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             };
         }
 
-        match type_id {
-            TypeId::TUPLE => {
-                let tuple = unsafe { &*(ptr as *const TupleObject) };
-                if let Some(idx) = key.as_int() {
-                    if let Some(val) = tuple.get(idx) {
-                        frame.set_reg(dst, val);
-                        ControlFlow::Continue
-                    } else {
-                        ControlFlow::Error(RuntimeError::index_error(idx, tuple.len()))
-                    }
+        if let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            return if let Some(idx) = key.as_int() {
+                if let Some(val) = tuple.get(idx) {
+                    frame.set_reg(dst, val);
+                    ControlFlow::Continue
                 } else {
-                    ControlFlow::Error(RuntimeError::type_error("tuple indices must be integers"))
+                    ControlFlow::Error(RuntimeError::index_error(idx, tuple.len()))
                 }
-            }
+            } else {
+                ControlFlow::Error(RuntimeError::type_error("tuple indices must be integers"))
+            };
+        }
+
+        match type_id {
             TypeId::DICT => {
                 let dict = unsafe { &*(ptr as *const DictObject) };
                 if let Some(val) = dict.get(key) {
@@ -1832,7 +2451,7 @@ pub fn len(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let dst = inst.dst().0;
 
     if let Some(string) = prism_runtime::types::string::value_as_string_ref(obj) {
-        let value = Value::int(string.len() as i64).unwrap_or_else(Value::none);
+        let value = Value::int(string.char_count() as i64).unwrap_or_else(Value::none);
         frame.set_reg(dst, value);
         ControlFlow::Continue
     } else if let Some(ptr) = obj.as_object_ptr() {
@@ -1840,15 +2459,13 @@ pub fn len(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
         let len_val = if let Some(list) = list_storage_ref_from_ptr(ptr) {
             list.len() as i64
+        } else if let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            tuple.len() as i64
         } else {
             match type_id {
                 TypeId::DEQUE => {
                     let deque = unsafe { &*(ptr as *const DequeObject) };
                     deque.len() as i64
-                }
-                TypeId::TUPLE => {
-                    let tuple = unsafe { &*(ptr as *const TupleObject) };
-                    tuple.len() as i64
                 }
                 TypeId::DICT => {
                     let dict = unsafe { &*(ptr as *const DictObject) };
@@ -1914,7 +2531,9 @@ mod tests {
     use prism_core::intern::intern;
     use prism_runtime::object::ObjectHeader;
     use prism_runtime::object::class::PyClassObject;
-    use prism_runtime::object::descriptor::{BoundMethod, PropertyDescriptor};
+    use prism_runtime::object::descriptor::{
+        BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
+    };
     use prism_runtime::object::mro::ClassId;
     use prism_runtime::object::shaped_object::ShapedObject;
     use prism_runtime::object::type_builtins::{
@@ -1994,6 +2613,13 @@ mod tests {
         (ptr, Value::object_ptr(ptr as *const ()))
     }
 
+    fn value_as_str(value: Value) -> String {
+        prism_runtime::types::string::value_as_string_ref(value)
+            .expect("value should be a Python string")
+            .as_str()
+            .to_string()
+    }
+
     fn instance_value(class: &Arc<PyClassObject>) -> (*mut ShapedObject, Value) {
         let ptr = Box::into_raw(Box::new(ShapedObject::new(
             class.class_type_id(),
@@ -2042,6 +2668,27 @@ mod tests {
         })
     }
 
+    fn metaclass_property_getter(args: &[Value]) -> Result<Value, crate::builtins::BuiltinError> {
+        if args.len() != 1 {
+            return Err(crate::builtins::BuiltinError::TypeError(format!(
+                "getter expected 1 argument, got {}",
+                args.len()
+            )));
+        }
+        let ptr = args[0].as_object_ptr().ok_or_else(|| {
+            crate::builtins::BuiltinError::TypeError("getter requires class receiver".to_string())
+        })?;
+        if extract_type_id(ptr) != TypeId::TYPE {
+            return Err(crate::builtins::BuiltinError::TypeError(format!(
+                "getter requires class receiver, got {}",
+                extract_type_id(ptr).name()
+            )));
+        }
+
+        let class = unsafe { &*(ptr as *const PyClassObject) };
+        Ok(Value::string(class.name().clone()))
+    }
+
     fn property_storage_setter(args: &[Value]) -> Result<Value, crate::builtins::BuiltinError> {
         if args.len() != 2 {
             return Err(crate::builtins::BuiltinError::TypeError(format!(
@@ -2079,6 +2726,14 @@ mod tests {
         let builtin = Box::new(BuiltinFunctionObject::new(Arc::from(name), func));
         let ptr = Box::into_raw(builtin);
         (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn builtin_first_arg(args: &[Value]) -> Result<Value, crate::builtins::BuiltinError> {
+        Ok(args.first().copied().unwrap_or_else(Value::none))
+    }
+
+    fn builtin_arg_count(args: &[Value]) -> Result<Value, crate::builtins::BuiltinError> {
+        Ok(Value::int(args.len() as i64).expect("argument count should fit in Value::int"))
     }
 
     #[test]
@@ -2158,6 +2813,70 @@ mod tests {
     }
 
     #[test]
+    fn test_get_attribute_value_reads_standalone_module_attributes() {
+        let mut vm = vm_with_names(&[]);
+        let (module_value, module_ptr) = boxed_value(ModuleObject::new("standalone"));
+        let module = unsafe { &*module_ptr };
+        module.set_attr("answer", Value::int(42).unwrap());
+
+        let name = get_attribute_value(&mut vm, module_value, &intern("__name__"))
+            .expect("standalone module __name__ should resolve");
+        assert_eq!(value_as_str(name), "standalone");
+
+        let answer = get_attribute_value(&mut vm, module_value, &intern("answer"))
+            .expect("standalone module dynamic attributes should resolve");
+        assert_eq!(answer.as_int(), Some(42));
+
+        let dict_value = get_attribute_value(&mut vm, module_value, &intern("__dict__"))
+            .expect("standalone module __dict__ should resolve");
+        let dict_ptr = dict_value
+            .as_object_ptr()
+            .expect("__dict__ should be a dict");
+        let dict = unsafe { &*(dict_ptr as *const DictObject) };
+        assert!(dict.get(Value::string(intern("__name__"))).is_some());
+        assert_eq!(
+            dict.get(Value::string(intern("answer")))
+                .and_then(|value| value.as_int()),
+            Some(42)
+        );
+
+        unsafe {
+            drop_boxed(module_ptr);
+        }
+    }
+
+    #[test]
+    fn test_set_and_delete_attribute_value_update_standalone_modules() {
+        let mut vm = vm_with_names(&[]);
+        let (module_value, module_ptr) = boxed_value(ModuleObject::new("standalone"));
+
+        set_attribute_value(
+            &mut vm,
+            module_value,
+            &intern("token"),
+            Value::string(intern("ready")),
+        )
+        .expect("setattr should update standalone modules");
+        let token = get_attribute_value(&mut vm, module_value, &intern("token"))
+            .expect("new module attribute should be readable");
+        assert_eq!(value_as_str(token), "ready");
+
+        delete_attribute_value(&mut vm, module_value, &intern("token"))
+            .expect("delattr should remove standalone module attributes");
+        assert!(matches!(
+            get_attribute_value(&mut vm, module_value, &intern("token")),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::AttributeError { .. },
+                ..
+            })
+        ));
+
+        unsafe {
+            drop_boxed(module_ptr);
+        }
+    }
+
+    #[test]
     fn test_get_attr_reads_class_attributes() {
         let mut vm = vm_with_names(&["field"]);
         let class = PyClassObject::new_simple(intern("Example"));
@@ -2201,6 +2920,41 @@ mod tests {
         );
         assert!(matches!(get_attr(&mut vm, inst), ControlFlow::Continue));
         assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(123));
+    }
+
+    #[test]
+    fn test_get_attr_invokes_metaclass_data_descriptor_before_class_attr() {
+        let (getter_ptr, getter_value) =
+            builtin_function_value("metaclass_property.getter", metaclass_property_getter);
+        let property_ptr = Box::into_raw(Box::new(PropertyDescriptor::new_getter(getter_value)));
+        let property_value = Value::object_ptr(property_ptr as *const ());
+
+        let metaclass = PyClassObject::new_simple(intern("MetaWithProperty"));
+        metaclass.set_attr(intern("managed"), property_value);
+        let metaclass = register_test_class(metaclass);
+
+        let mut class = PyClassObject::new_simple(intern("ManagedByMeta"));
+        class.set_attr(intern("managed"), Value::int(99).unwrap());
+        class.set_metaclass(Value::object_ptr(Arc::as_ptr(&metaclass) as *const ()));
+        let class = register_test_class(class);
+        let class_value = Value::object_ptr(Arc::as_ptr(&class) as *const ());
+
+        let mut vm = vm_with_names(&["managed"]);
+        vm.current_frame_mut().set_reg(1, class_value);
+
+        let inst = Instruction::op_dss(
+            Opcode::GetAttr,
+            Register::new(2),
+            Register::new(1),
+            Register::new(0),
+        );
+        assert!(matches!(get_attr(&mut vm, inst), ControlFlow::Continue));
+        assert_eq!(value_as_str(vm.current_frame().get_reg(2)), "ManagedByMeta");
+
+        unsafe {
+            drop(Box::from_raw(property_ptr));
+            drop(Box::from_raw(getter_ptr));
+        }
     }
 
     #[test]
@@ -2325,6 +3079,16 @@ mod tests {
         let mut vm = vm_with_names(&[]);
         let (func_ptr, func_value) = make_test_function_value("descriptor");
 
+        assert_eq!(
+            get_attribute_value(&mut vm, func_value, &intern("__class__"))
+                .expect("function __class__ should resolve"),
+            crate::builtins::builtin_type_object_for_type_id(TypeId::FUNCTION)
+        );
+        assert!(
+            function_attr_exists(unsafe { &*func_ptr }, &intern("__class__")),
+            "hasattr(function, '__class__') should match direct lookup"
+        );
+
         let method = get_attribute_value(&mut vm, func_value, &intern("__get__"))
             .expect("function objects should expose __get__");
         let method_ptr = method
@@ -2381,6 +3145,11 @@ mod tests {
             get_attribute_value(&mut vm, method_value, &intern("__name__"))
                 .expect("__name__ should resolve"),
             Value::string(intern("metadata_method"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, method_value, &intern("__class__"))
+                .expect("bound method __class__ should resolve"),
+            crate::builtins::builtin_type_object_for_type_id(TypeId::METHOD)
         );
         assert!(
             get_attribute_value(&mut vm, method_value, &intern("__doc__"))
@@ -2462,6 +3231,204 @@ mod tests {
     }
 
     #[test]
+    fn test_user_defined_class_leaves_plain_builtin_attributes_unbound() {
+        let mut vm = vm_with_names(&[]);
+        let (builtin_ptr, builtin_value) = builtin_function_value("count_args", builtin_arg_count);
+
+        let mut class = PyClassObject::new_simple(intern("PlainBuiltinAttr"));
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+        let (instance_ptr, instance_value) = instance_value(&class);
+
+        let helper = get_attribute_value(&mut vm, instance_value, &intern("helper"))
+            .expect("plain builtin class attribute should resolve");
+        let helper_ptr = helper
+            .as_object_ptr()
+            .expect("builtin should be heap allocated");
+        assert_eq!(extract_type_id(helper_ptr), TypeId::BUILTIN_FUNCTION);
+        assert_eq!(helper, builtin_value);
+
+        let builtin = unsafe { &*(helper_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "count_args");
+        assert_eq!(builtin.bound_self(), None);
+        let result = builtin
+            .call(&[Value::int(7).unwrap()])
+            .expect("plain builtin should stay unbound on Python heap classes");
+        assert_eq!(result.as_int(), Some(1));
+
+        unsafe {
+            drop_boxed(instance_ptr);
+            drop_boxed(builtin_ptr);
+        }
+    }
+
+    #[test]
+    fn test_class_objects_leave_plain_builtin_attributes_unbound() {
+        let mut vm = vm_with_names(&[]);
+        let (builtin_ptr, builtin_value) = builtin_function_value("count_args", builtin_arg_count);
+
+        let mut class = PyClassObject::new_simple(intern("PlainBuiltinAttr"));
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+
+        let helper = get_attribute_value(
+            &mut vm,
+            Value::object_ptr(Arc::as_ptr(&class) as *const ()),
+            &intern("helper"),
+        )
+        .expect("plain builtin class attribute should resolve on the class object");
+        let helper_ptr = helper
+            .as_object_ptr()
+            .expect("builtin should be heap allocated");
+        assert_eq!(extract_type_id(helper_ptr), TypeId::BUILTIN_FUNCTION);
+        assert_eq!(helper, builtin_value);
+
+        let builtin = unsafe { &*(helper_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "count_args");
+        assert_eq!(builtin.bound_self(), None);
+        let result = builtin
+            .call(&[Value::int(7).unwrap()])
+            .expect("class lookup should preserve the stored builtin callable");
+        assert_eq!(result.as_int(), Some(1));
+
+        unsafe {
+            drop_boxed(builtin_ptr);
+        }
+    }
+
+    #[test]
+    fn test_native_heaptype_binds_builtin_attributes_on_instances() {
+        let mut vm = vm_with_names(&[]);
+        let (builtin_ptr, builtin_value) = builtin_function_value("count_args", builtin_arg_count);
+
+        let mut class = PyClassObject::new_simple(intern("NativeBuiltinAttr"));
+        class.add_flags(prism_runtime::object::class::ClassFlags::NATIVE_HEAPTYPE);
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+        let (instance_ptr, instance_value) = instance_value(&class);
+
+        let helper = get_attribute_value(&mut vm, instance_value, &intern("helper"))
+            .expect("native heap builtin class attribute should resolve");
+        let helper_ptr = helper
+            .as_object_ptr()
+            .expect("bound builtin should be heap allocated");
+        assert_eq!(extract_type_id(helper_ptr), TypeId::BUILTIN_FUNCTION);
+        assert_ne!(helper, builtin_value);
+
+        let bound = unsafe { &*(helper_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(bound.name(), "count_args");
+        assert_eq!(bound.bound_self(), Some(instance_value));
+        let result = bound
+            .call(&[Value::int(7).unwrap()])
+            .expect("native heap builtin should receive an implicit instance");
+        assert_eq!(result.as_int(), Some(2));
+
+        let builtin = unsafe { &*(builtin_ptr as *const BuiltinFunctionObject) };
+        let result = builtin
+            .call(&[Value::int(7).unwrap()])
+            .expect("class attribute storage should remain unbound");
+        assert_eq!(result.as_int(), Some(1));
+
+        unsafe {
+            drop_boxed(instance_ptr);
+            drop_boxed(builtin_ptr);
+        }
+    }
+
+    #[test]
+    fn test_user_defined_class_preserves_prebound_builtin_attributes_on_instances() {
+        let mut vm = vm_with_names(&[]);
+        let builtin = Box::new(BuiltinFunctionObject::new_bound(
+            Arc::from("first_arg"),
+            builtin_first_arg,
+            Value::int(99).unwrap(),
+        ));
+        let builtin_ptr = Box::into_raw(builtin);
+        let builtin_value = Value::object_ptr(builtin_ptr as *const ());
+
+        let mut class = PyClassObject::new_simple(intern("BoundBuiltinAttr"));
+        class.set_attr(intern("helper"), builtin_value);
+        let class = register_test_class(class);
+        let (instance_ptr, instance_value) = instance_value(&class);
+
+        let helper = get_attribute_value(&mut vm, instance_value, &intern("helper"))
+            .expect("pre-bound builtin class attribute should resolve");
+        assert_eq!(helper, builtin_value);
+
+        let builtin = unsafe { &*(builtin_ptr as *const BuiltinFunctionObject) };
+        let result = builtin
+            .call(&[])
+            .expect("pre-bound builtin should retain its original receiver");
+        assert_eq!(result.as_int(), Some(99));
+
+        unsafe {
+            drop_boxed(instance_ptr);
+            drop_boxed(builtin_ptr);
+        }
+    }
+
+    #[test]
+    fn test_exception_proxy_classes_bind_builtin_attributes_on_instances() {
+        let mut vm = vm_with_names(&[]);
+        let exception_base = crate::builtins::exception_proxy_class(
+            crate::stdlib::exceptions::ExceptionTypeId::Exception,
+        );
+        let exception_base_id = exception_base.class_id();
+        let class = PyClassObject::new(intern("ProxyExceptionChild"), &[exception_base_id], |id| {
+            if id == exception_base_id {
+                Some(exception_base.mro().iter().copied().collect())
+            } else if id.0 < TypeId::FIRST_USER_TYPE {
+                Some(
+                    builtin_class_mro(class_id_to_type_id(id))
+                        .into_iter()
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .expect("exception proxy subclass should build");
+        let class = register_test_class(class);
+        let (instance_ptr, instance_value) = instance_value(&class);
+
+        let method = get_attribute_value(&mut vm, instance_value, &intern("with_traceback"))
+            .expect("exception proxy builtin should resolve");
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("bound builtin method should be heap allocated");
+        assert_eq!(extract_type_id(method_ptr), TypeId::BUILTIN_FUNCTION);
+
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "BaseException.with_traceback");
+        assert_eq!(builtin.bound_self(), Some(instance_value));
+
+        unsafe {
+            drop_boxed(instance_ptr);
+        }
+    }
+
+    #[test]
+    fn test_builtin_exception_type_exposes_unbound_base_exception_str_method() {
+        let mut vm = vm_with_names(&[]);
+        let base_exception = crate::builtins::get_exception_type("BaseException")
+            .expect("BaseException type should exist");
+        let base_exception_value = Value::object_ptr(
+            base_exception as *const crate::builtins::ExceptionTypeObject as *const (),
+        );
+
+        let method = get_attribute_value(&mut vm, base_exception_value, &intern("__str__"))
+            .expect("BaseException.__str__ should resolve");
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("BaseException.__str__ should be heap allocated");
+        assert_eq!(extract_type_id(method_ptr), TypeId::BUILTIN_FUNCTION);
+
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "BaseException.__str__");
+        assert_eq!(builtin.bound_self(), None);
+    }
+
+    #[test]
     fn test_get_attribute_value_binds_python_setitem_on_dict_subclass() {
         let mut vm = vm_with_names(&[]);
         let (func_ptr, func_value) = make_test_function_value("__setitem__");
@@ -2501,8 +3468,141 @@ mod tests {
     }
 
     #[test]
+    fn test_user_defined_instance_dict_is_live_and_authoritative() {
+        let mut vm = vm_with_names(&[]);
+        let class = register_test_class(PyClassObject::new_simple(intern("InstanceDictLive")));
+        let (instance_ptr, instance) = instance_value(&class);
+
+        set_attribute_value(&mut vm, instance, &intern("alpha"), Value::int(1).unwrap())
+            .expect("setting an ordinary instance attribute should succeed");
+        assert_eq!(
+            get_attribute_value(&mut vm, instance, &intern("alpha"))
+                .expect("shape-backed attribute should resolve")
+                .as_int(),
+            Some(1)
+        );
+
+        let dict_value = get_attribute_value(&mut vm, instance, &intern("__dict__"))
+            .expect("user instances should expose __dict__");
+        let dict_ptr = dict_value
+            .as_object_ptr()
+            .expect("__dict__ should be a dict");
+        assert_eq!(extract_type_id(dict_ptr), TypeId::DICT);
+        {
+            let dict = dict_storage_mut_from_ptr(dict_ptr).expect("__dict__ should be mutable");
+            assert_eq!(
+                dict.get(Value::string(intern("alpha")))
+                    .expect("materialized dict should contain shaped attributes")
+                    .as_int(),
+                Some(1)
+            );
+            dict.set(Value::string(intern("alpha")), Value::int(3).unwrap());
+            dict.set(Value::string(intern("beta")), Value::int(2).unwrap());
+        }
+
+        assert_eq!(
+            get_attribute_value(&mut vm, instance, &intern("alpha"))
+                .expect("__dict__ writes should override stale shaped slots")
+                .as_int(),
+            Some(3)
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, instance, &intern("beta"))
+                .expect("__dict__ writes should be visible as attributes")
+                .as_int(),
+            Some(2)
+        );
+
+        set_attribute_value(&mut vm, instance, &intern("gamma"), Value::int(4).unwrap())
+            .expect("setattr should update a materialized __dict__");
+        let dict = dict_storage_ref_from_ptr(dict_ptr).expect("__dict__ should stay valid");
+        assert_eq!(
+            dict.get(Value::string(intern("gamma")))
+                .expect("setattr should mirror into __dict__")
+                .as_int(),
+            Some(4)
+        );
+
+        delete_attribute_value(&mut vm, instance, &intern("alpha"))
+            .expect("delattr should remove attributes from materialized __dict__");
+        assert!(matches!(
+            get_attribute_value(&mut vm, instance, &intern("alpha")),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::AttributeError { .. },
+                ..
+            })
+        ));
+
+        unsafe {
+            drop_boxed(instance_ptr);
+        }
+    }
+
+    #[test]
+    fn test_user_defined_instance_dict_assignment_aliases_external_dict() {
+        let mut vm = vm_with_names(&[]);
+        let class = register_test_class(PyClassObject::new_simple(intern("InstanceDictAlias")));
+        let (instance_ptr, instance) = instance_value(&class);
+        let (external_value, external_ptr) = boxed_value(DictObject::new());
+
+        set_attribute_value(&mut vm, instance, &intern("__dict__"), external_value)
+            .expect("__dict__ assignment should accept dictionaries");
+        unsafe { &mut *external_ptr }
+            .set(Value::string(intern("external")), Value::int(5).unwrap());
+        assert_eq!(
+            get_attribute_value(&mut vm, instance, &intern("external"))
+                .expect("external __dict__ mutations should drive attributes")
+                .as_int(),
+            Some(5)
+        );
+
+        set_attribute_value(
+            &mut vm,
+            instance,
+            &intern("mirrored"),
+            Value::int(6).unwrap(),
+        )
+        .expect("setattr should mirror into an assigned __dict__");
+        assert_eq!(
+            unsafe { &*external_ptr }
+                .get(Value::string(intern("mirrored")))
+                .expect("assigned dict should receive mirrored writes")
+                .as_int(),
+            Some(6)
+        );
+
+        delete_attribute_value(&mut vm, instance, &intern("__dict__"))
+            .expect("deleting __dict__ should reset the instance dictionary");
+        assert!(matches!(
+            get_attribute_value(&mut vm, instance, &intern("external")),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::AttributeError { .. },
+                ..
+            })
+        ));
+        let reset_dict = get_attribute_value(&mut vm, instance, &intern("__dict__"))
+            .expect("__dict__ should rematerialize after deletion");
+        assert_ne!(reset_dict, external_value);
+        assert_eq!(
+            dict_storage_ref_from_value(reset_dict)
+                .expect("reset __dict__ should be a dictionary")
+                .len(),
+            0
+        );
+
+        unsafe {
+            drop_boxed(instance_ptr);
+            drop_boxed(external_ptr);
+        }
+    }
+
+    #[test]
     fn test_get_attribute_value_resolves_object_new_for_none_primitive() {
         let mut vm = vm_with_names(&[]);
+
+        let doc = get_attribute_value(&mut vm, Value::none(), &intern("__doc__"))
+            .expect("None.__doc__ should resolve");
+        assert_eq!(value_as_str(doc), "The type of the None singleton.");
 
         let method = get_attribute_value(&mut vm, Value::none(), &intern("__new__"))
             .expect("None should inherit object.__new__");
@@ -2614,6 +3714,45 @@ mod tests {
     }
 
     #[test]
+    fn test_get_attr_exposes_live_module_dict() {
+        let mut vm = vm_with_names(&[]);
+        let module = Arc::new(ModuleObject::new("errno"));
+        module.set_attr("EINVAL", Value::int(22).unwrap());
+        vm.import_resolver
+            .insert_module("errno", Arc::clone(&module));
+
+        let dict_value = get_attribute_value(
+            &mut vm,
+            Value::object_ptr(Arc::as_ptr(&module) as *const ()),
+            &intern("__dict__"),
+        )
+        .expect("module __dict__ lookup should succeed");
+        let dict = dict_storage_ref_from_ptr(
+            dict_value
+                .as_object_ptr()
+                .expect("module __dict__ should be a dict object"),
+        )
+        .expect("module __dict__ should expose dict storage");
+        assert_eq!(
+            dict.get(Value::string(intern("EINVAL")))
+                .and_then(|value| value.as_int()),
+            Some(22)
+        );
+
+        let dict = dict_storage_mut_from_ptr(
+            dict_value
+                .as_object_ptr()
+                .expect("module __dict__ should remain a dict object"),
+        )
+        .expect("module __dict__ should be mutable");
+        dict.set(Value::string(intern("EPERM")), Value::int(1).unwrap());
+        assert_eq!(
+            module.get_attr("EPERM").and_then(|value| value.as_int()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn test_get_attr_exposes_import_exception_metadata() {
         let mut vm = vm_with_names(&[]);
         let exc = crate::builtins::create_exception_with_import_details(
@@ -2646,6 +3785,118 @@ mod tests {
         let path_value =
             get_attribute_value(&mut vm, exc, &intern("path")).expect("path should be readable");
         assert!(path_value.is_none());
+    }
+
+    #[test]
+    fn test_get_attr_exposes_os_error_metadata_from_args() {
+        let mut vm = vm_with_names(&[]);
+        let exc = crate::builtins::create_exception_with_args(
+            crate::stdlib::exceptions::ExceptionTypeId::FileNotFoundError,
+            None,
+            vec![
+                Value::int(2).unwrap(),
+                Value::string(intern("No such file or directory")),
+                Value::string(intern("missing.txt")),
+                Value::none(),
+                Value::string(intern("target.txt")),
+            ]
+            .into_boxed_slice(),
+        );
+
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("errno")).expect("errno should work"),
+            Value::int(2).unwrap()
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("strerror")).expect("strerror should work"),
+            Value::string(intern("No such file or directory"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("filename")).expect("filename should work"),
+            Value::string(intern("missing.txt"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("filename2")).expect("filename2 should work"),
+            Value::string(intern("target.txt"))
+        );
+        assert!(
+            get_attribute_value(&mut vm, exc, &intern("winerror"))
+                .expect("winerror should work")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_get_attr_exposes_os_error_strerror_from_message_without_args() {
+        let mut vm = vm_with_names(&[]);
+        let exc = crate::builtins::create_exception(
+            crate::stdlib::exceptions::ExceptionTypeId::OSError,
+            Some(Arc::from("operation failed")),
+        );
+
+        assert!(
+            get_attribute_value(&mut vm, exc, &intern("errno"))
+                .expect("errno should work")
+                .is_none()
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("strerror")).expect("strerror should work"),
+            Value::string(intern("operation failed"))
+        );
+        assert!(
+            get_attribute_value(&mut vm, exc, &intern("filename"))
+                .expect("filename should work")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_get_attr_exposes_syntax_exception_metadata() {
+        let mut vm = vm_with_names(&[]);
+        let exc = crate::builtins::create_exception_with_syntax_details(
+            crate::stdlib::exceptions::ExceptionTypeId::SyntaxError,
+            Some(Arc::from("invalid syntax")),
+            crate::builtins::SyntaxErrorDetails::new(
+                Some(Arc::from("sample.py")),
+                Some(4),
+                Some(6),
+                Some(Arc::from("value =\n")),
+                Some(4),
+                Some(7),
+            ),
+        );
+
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("filename")).expect("filename should work"),
+            Value::string(intern("sample.py"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("lineno")).expect("lineno should work"),
+            Value::int(4).unwrap()
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("offset")).expect("offset should work"),
+            Value::int(6).unwrap()
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("text")).expect("text should work"),
+            Value::string(intern("value =\n"))
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("end_lineno"))
+                .expect("end_lineno should work"),
+            Value::int(4).unwrap()
+        );
+        assert_eq!(
+            get_attribute_value(&mut vm, exc, &intern("end_offset"))
+                .expect("end_offset should work"),
+            Value::int(7).unwrap()
+        );
+        assert!(
+            get_attribute_value(&mut vm, exc, &intern("print_file_and_line"))
+                .expect("print_file_and_line should work")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2683,11 +3934,20 @@ mod tests {
         code.names = vec![Arc::from("__warningregistry__")].into_boxed_slice();
         code.freevars = vec![Arc::from("captured")].into_boxed_slice();
         code.cellvars = vec![Arc::from("cell")].into_boxed_slice();
-        code.constants = vec![Value::none(), Value::int(7).unwrap()].into_boxed_slice();
+        code.constants = vec![
+            Constant::Value(Value::none()),
+            Constant::Value(Value::int(7).unwrap()),
+        ]
+        .into_boxed_slice();
 
         let (code_value, code_ptr) = boxed_value(CodeObjectView::new(Arc::new(code)));
         let mut vm = vm_with_frame();
 
+        assert_eq!(
+            get_attribute_value(&mut vm, code_value, &intern("__class__"))
+                .expect("code __class__ should be readable"),
+            crate::builtins::builtin_type_object_for_type_id(TypeId::CODE)
+        );
         assert_eq!(
             get_attribute_value(&mut vm, code_value, &intern("co_filename"))
                 .expect("co_filename should be readable"),
@@ -2853,6 +4113,7 @@ mod tests {
             locals_value,
             19,
             5,
+            None,
         ));
         let mut vm = vm_with_frame();
 
@@ -2877,6 +4138,11 @@ mod tests {
                 .expect("f_lasti should be readable")
                 .as_int(),
             Some(5)
+        );
+        assert!(
+            get_attribute_value(&mut vm, frame_value, &intern("f_back"))
+                .expect("f_back should be readable")
+                .is_none()
         );
 
         unsafe {
@@ -3097,6 +4363,69 @@ mod tests {
             extract_type_id(vm.current_frame().get_reg(2).as_object_ptr().unwrap()),
             TypeId::METHOD_WRAPPER
         );
+    }
+
+    #[test]
+    fn test_get_attr_exposes_function_annotations_dict_and_descriptor_getters() {
+        let (func_ptr, func_value) = make_test_function_value("callable");
+        let classmethod_ptr = Box::into_raw(Box::new(ClassMethodDescriptor::new(func_value)));
+        let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(func_value)));
+        let classmethod_value = Value::object_ptr(classmethod_ptr as *const ());
+        let staticmethod_value = Value::object_ptr(staticmethod_ptr as *const ());
+        let mut vm = vm_with_frame();
+
+        let annotations = get_attribute_value(&mut vm, func_value, &intern("__annotations__"))
+            .expect("function annotations should materialize");
+        let annotations_ptr = annotations
+            .as_object_ptr()
+            .expect("__annotations__ should be a dict");
+        assert_eq!(extract_type_id(annotations_ptr), TypeId::DICT);
+        assert_eq!(
+            get_attribute_value(&mut vm, func_value, &intern("__annotations__"))
+                .expect("function annotations should be stable"),
+            annotations
+        );
+
+        let function_get = get_attribute_value(&mut vm, func_value, &intern("__get__"))
+            .expect("functions should expose __get__");
+        let function_get_ptr = function_get
+            .as_object_ptr()
+            .expect("function.__get__ should be heap allocated");
+        let function_get_builtin = unsafe { &*(function_get_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(function_get_builtin.name(), "function.__get__");
+        assert_eq!(function_get_builtin.bound_self(), Some(func_value));
+
+        let classmethod_get = get_attribute_value(&mut vm, classmethod_value, &intern("__get__"))
+            .expect("classmethod should expose __get__");
+        let classmethod_get_ptr = classmethod_get
+            .as_object_ptr()
+            .expect("classmethod.__get__ should be heap allocated");
+        let classmethod_get_builtin =
+            unsafe { &*(classmethod_get_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(classmethod_get_builtin.name(), "classmethod.__get__");
+        assert_eq!(
+            classmethod_get_builtin.bound_self(),
+            Some(classmethod_value)
+        );
+
+        let staticmethod_get = get_attribute_value(&mut vm, staticmethod_value, &intern("__get__"))
+            .expect("staticmethod should expose __get__");
+        let staticmethod_get_ptr = staticmethod_get
+            .as_object_ptr()
+            .expect("staticmethod.__get__ should be heap allocated");
+        let staticmethod_get_builtin =
+            unsafe { &*(staticmethod_get_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(staticmethod_get_builtin.name(), "staticmethod.__get__");
+        assert_eq!(
+            staticmethod_get_builtin.bound_self(),
+            Some(staticmethod_value)
+        );
+
+        unsafe {
+            drop(Box::from_raw(staticmethod_ptr));
+            drop(Box::from_raw(classmethod_ptr));
+            drop(Box::from_raw(func_ptr));
+        }
     }
 
     #[test]
