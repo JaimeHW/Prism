@@ -15,14 +15,20 @@ use crate::VirtualMachine;
 use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
-use prism_core::intern::interned_by_ptr;
+use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_gc::trace::{Trace, Tracer};
 use prism_runtime::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
 use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::shape::shape_registry;
+use prism_runtime::object::shaped_object::ShapedObject;
+use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
 use std::cell::RefCell;
 use std::mem;
 use std::pin::Pin;
@@ -72,6 +78,9 @@ pub struct ExceptionValue {
     /// Lazily allocated ImportError / ModuleNotFoundError metadata.
     import_details: Option<Box<ImportErrorDetails>>,
 
+    /// Lazily allocated SyntaxError metadata.
+    syntax_details: Option<Box<SyntaxErrorDetails>>,
+
     /// Explicit cause (from `raise X from Y`).
     /// Uses raw pointer to avoid recursive Box issues.
     pub cause: Option<*const ExceptionValue>,
@@ -95,6 +104,60 @@ struct ImportErrorDetails {
     path: Option<Arc<str>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxErrorDetails {
+    pub filename: Option<Arc<str>>,
+    pub lineno: Option<u32>,
+    pub offset: Option<u32>,
+    pub text: Option<Arc<str>>,
+    pub end_lineno: Option<u32>,
+    pub end_offset: Option<u32>,
+}
+
+impl SyntaxErrorDetails {
+    #[inline]
+    #[must_use]
+    pub fn new(
+        filename: Option<Arc<str>>,
+        lineno: Option<u32>,
+        offset: Option<u32>,
+        text: Option<Arc<str>>,
+        end_lineno: Option<u32>,
+        end_offset: Option<u32>,
+    ) -> Self {
+        Self {
+            filename,
+            lineno,
+            offset,
+            text,
+            end_lineno,
+            end_offset,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.filename.is_none()
+            && self.lineno.is_none()
+            && self.offset.is_none()
+            && self.text.is_none()
+            && self.end_lineno.is_none()
+            && self.end_offset.is_none()
+    }
+}
+
+static EXCEPTION_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("BaseException.__new__"), builtin_exception_new)
+});
+static EXCEPTION_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("BaseException.__init__"), builtin_exception_init)
+});
+static EXCEPTION_STR_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("BaseException.__str__"), builtin_exception_str)
+});
+static EXCEPTION_REPR_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("BaseException.__repr__"), builtin_exception_repr)
+});
 static EXCEPTION_WITH_TRACEBACK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("BaseException.with_traceback"),
@@ -102,6 +165,13 @@ static EXCEPTION_WITH_TRACEBACK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLo
     )
 });
 static EXCEPTION_GC_DISPATCH_ONCE: Once = Once::new();
+static EXCEPTION_ARGS_ATTR: LazyLock<InternedString> = LazyLock::new(|| intern("args"));
+static EXCEPTION_TRACEBACK_ATTR: LazyLock<InternedString> =
+    LazyLock::new(|| intern("__traceback__"));
+static EXCEPTION_CAUSE_ATTR: LazyLock<InternedString> = LazyLock::new(|| intern("__cause__"));
+static EXCEPTION_CONTEXT_ATTR: LazyLock<InternedString> = LazyLock::new(|| intern("__context__"));
+static EXCEPTION_SUPPRESS_CONTEXT_ATTR: LazyLock<InternedString> =
+    LazyLock::new(|| intern("__suppress_context__"));
 
 thread_local! {
     static PINNED_EXCEPTION_VALUES: RefCell<Vec<Pin<Box<ExceptionValue>>>> = const {
@@ -174,6 +244,7 @@ impl ExceptionValue {
             message,
             args: None,
             import_details: None,
+            syntax_details: None,
             cause: None,
             context: None,
             traceback: None,
@@ -196,6 +267,7 @@ impl ExceptionValue {
             message,
             args: Some(args),
             import_details: None,
+            syntax_details: None,
             cause: None,
             context: None,
             traceback: None,
@@ -236,6 +308,48 @@ impl ExceptionValue {
             .and_then(|details| details.path.as_deref())
     }
 
+    #[inline]
+    pub fn syntax_filename(&self) -> Option<&str> {
+        self.syntax_details
+            .as_deref()
+            .and_then(|details| details.filename.as_deref())
+    }
+
+    #[inline]
+    pub fn syntax_lineno(&self) -> Option<u32> {
+        self.syntax_details
+            .as_deref()
+            .and_then(|details| details.lineno)
+    }
+
+    #[inline]
+    pub fn syntax_offset(&self) -> Option<u32> {
+        self.syntax_details
+            .as_deref()
+            .and_then(|details| details.offset)
+    }
+
+    #[inline]
+    pub fn syntax_text(&self) -> Option<&str> {
+        self.syntax_details
+            .as_deref()
+            .and_then(|details| details.text.as_deref())
+    }
+
+    #[inline]
+    pub fn syntax_end_lineno(&self) -> Option<u32> {
+        self.syntax_details
+            .as_deref()
+            .and_then(|details| details.end_lineno)
+    }
+
+    #[inline]
+    pub fn syntax_end_offset(&self) -> Option<u32> {
+        self.syntax_details
+            .as_deref()
+            .and_then(|details| details.end_offset)
+    }
+
     /// Render the exception payload using Python's `str(exception)` semantics.
     pub fn display_text(&self) -> String {
         if let Some(args) = self.args.as_deref() {
@@ -274,6 +388,15 @@ impl ExceptionValue {
         }
 
         format!("{}()", self.type_name())
+    }
+
+    /// Replace the Python-visible constructor payload of an existing native
+    /// exception instance.
+    pub fn reinitialize_args(&mut self, args: &[Value]) {
+        self.message = args
+            .first()
+            .and_then(|value| owned_string_value(*value).map(Arc::from));
+        self.args = Some(args.to_vec().into_boxed_slice());
     }
 
     /// Set the cause (from `raise X from Y`).
@@ -342,6 +465,17 @@ impl ExceptionValue {
             }))
         } else {
             None
+        };
+        self
+    }
+
+    /// Attach SyntaxError metadata.
+    #[inline]
+    pub fn with_syntax_details(mut self, details: SyntaxErrorDetails) -> Self {
+        self.syntax_details = if details.is_empty() {
+            None
+        } else {
+            Some(Box::new(details))
         };
         self
     }
@@ -438,6 +572,10 @@ unsafe impl Trace for ExceptionValue {
                 .as_deref()
                 .map_or(0, |_| mem::size_of::<ImportErrorDetails>())
             + self
+                .syntax_details
+                .as_deref()
+                .map_or(0, |_| mem::size_of::<SyntaxErrorDetails>())
+            + self
                 .args
                 .as_deref()
                 .map_or(0, |args| mem::size_of_val(args))
@@ -478,6 +616,7 @@ impl std::fmt::Debug for ExceptionValue {
             .field("message", &self.message)
             .field("import_name", &self.import_name())
             .field("import_path", &self.import_path())
+            .field("syntax_filename", &self.syntax_filename())
             .field("flags", &self.flags)
             .finish()
     }
@@ -519,6 +658,116 @@ fn builtin_method_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
+fn boxed_object_value<T>(object: T) -> Value {
+    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+}
+
+#[inline]
+fn boxed_tuple_value(items: Vec<Value>) -> Value {
+    boxed_object_value(TupleObject::from_vec(items))
+}
+
+#[inline]
+fn boxed_string_value(text: &str) -> Value {
+    boxed_object_value(StringObject::new(text))
+}
+
+fn builtin_exception_new(args: &[Value]) -> Result<Value, BuiltinError> {
+    let Some(class_value) = args.first().copied() else {
+        return Err(BuiltinError::TypeError(
+            "BaseException.__new__(): not enough arguments".to_string(),
+        ));
+    };
+
+    if let Some(ptr) = class_value.as_object_ptr() {
+        if unsafe { (*(ptr as *const ObjectHeader)).type_id } == crate::builtins::EXCEPTION_TYPE_ID
+        {
+            let exc_type = unsafe { &*(ptr as *const crate::builtins::ExceptionTypeObject) };
+            return Ok(ExceptionValue::new(
+                exc_type
+                    .exception_type()
+                    .unwrap_or(ExceptionTypeId::Exception),
+                None,
+            )
+            .into_value());
+        }
+
+        if unsafe { (*(ptr as *const ObjectHeader)).type_id } == TypeId::TYPE
+            && crate::builtins::builtin_type_object_type_id(ptr).is_none()
+        {
+            let class = unsafe { &*(ptr as *const PyClassObject) };
+            if is_heap_exception_class(class) {
+                let instance = crate::builtins::allocate_heap_instance_for_class(class);
+                let value = boxed_object_value(instance);
+                initialize_heap_exception_state(value)?;
+                return Ok(value);
+            }
+        }
+    }
+
+    Err(BuiltinError::TypeError(
+        "BaseException.__new__(X): X is not a subtype of BaseException".to_string(),
+    ))
+}
+
+fn builtin_exception_init(args: &[Value]) -> Result<Value, BuiltinError> {
+    let Some(receiver) = args.first().copied() else {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__init__' of 'BaseException' object needs an argument".to_string(),
+        ));
+    };
+
+    if let Some(exception) = unsafe { ExceptionValue::from_value_mut(receiver) } {
+        exception.reinitialize_args(&args[1..]);
+        return Ok(Value::none());
+    }
+
+    let Some(instance) = heap_exception_instance_mut(receiver) else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__init__' for 'BaseException' objects doesn't apply to a '{}' object",
+            exception_receiver_type_name(receiver)
+        )));
+    };
+
+    set_heap_exception_args(instance, &args[1..]);
+    Ok(Value::none())
+}
+
+fn builtin_exception_str(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "BaseException.__str__() takes exactly 0 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let text = exception_display_text_for_value(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '__str__' for 'BaseException' objects doesn't apply to a '{}' object",
+            exception_receiver_type_name(args[0])
+        ))
+    })?;
+    Ok(boxed_string_value(&text))
+}
+
+fn builtin_exception_repr(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "BaseException.__repr__() takes exactly 0 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let text = exception_repr_text_for_value(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '__repr__' for 'BaseException' objects doesn't apply to a '{}' object",
+            exception_receiver_type_name(args[0])
+        ))
+    })?;
+    Ok(boxed_string_value(&text))
+}
+
+#[inline]
 fn normalize_traceback_value(traceback: Value) -> Result<Option<Value>, &'static str> {
     if traceback.is_none() {
         return Ok(None);
@@ -544,25 +793,212 @@ fn builtin_exception_with_traceback(args: &[Value]) -> Result<Value, BuiltinErro
     }
 
     let receiver = args[0];
-    let Some(exception) = (unsafe { ExceptionValue::from_value_mut(receiver) }) else {
+    if let Some(exception) = unsafe { ExceptionValue::from_value_mut(receiver) } {
+        exception
+            .replace_traceback(args[1])
+            .map_err(|message| BuiltinError::TypeError(message.to_string()))?;
+        return Ok(receiver);
+    }
+
+    let Some(instance) = heap_exception_instance_mut(receiver) else {
         return Err(BuiltinError::TypeError(format!(
             "descriptor 'with_traceback' for 'BaseException' objects doesn't apply to a '{}' object",
-            receiver.type_name()
+            exception_receiver_type_name(receiver)
         )));
     };
 
-    exception
-        .replace_traceback(args[1])
-        .map_err(|message| BuiltinError::TypeError(message.to_string()))?;
+    let traceback = normalize_traceback_value(args[1])
+        .map_err(|message| BuiltinError::TypeError(message.to_string()))?
+        .unwrap_or_else(Value::none);
+    instance.set_property(
+        EXCEPTION_TRACEBACK_ATTR.clone(),
+        traceback,
+        shape_registry(),
+    );
     Ok(receiver)
 }
 
 #[inline]
 pub(crate) fn exception_method_value(name: &str) -> Option<Value> {
     match name {
+        "__new__" => Some(builtin_method_value(&EXCEPTION_NEW_METHOD)),
+        "__init__" => Some(builtin_method_value(&EXCEPTION_INIT_METHOD)),
+        "__str__" => Some(builtin_method_value(&EXCEPTION_STR_METHOD)),
+        "__repr__" => Some(builtin_method_value(&EXCEPTION_REPR_METHOD)),
         "with_traceback" => Some(builtin_method_value(&EXCEPTION_WITH_TRACEBACK_METHOD)),
         _ => None,
     }
+}
+
+pub(crate) fn exception_display_text_for_value(value: Value) -> Option<String> {
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return Some(exception.display_text());
+    }
+
+    let class = heap_exception_class_from_value(value)?;
+    let args = heap_exception_args_value(value);
+    Some(render_exception_display_text(args, class.name().as_str()))
+}
+
+pub(crate) fn exception_repr_text_for_value(value: Value) -> Option<String> {
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return Some(exception.repr_text());
+    }
+
+    let class = heap_exception_class_from_value(value)?;
+    let args = heap_exception_args_value(value);
+    Some(render_exception_repr_text(class.name().as_str(), args))
+}
+
+#[inline]
+fn exception_receiver_type_name(value: Value) -> String {
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return exception.type_name().to_string();
+    }
+
+    if let Some(class) = heap_exception_class_from_value(value) {
+        return class.name().as_str().to_string();
+    }
+
+    value.type_name().to_string()
+}
+
+#[inline]
+fn is_heap_exception_class(class: &PyClassObject) -> bool {
+    class
+        .mro()
+        .iter()
+        .any(|&class_id| crate::builtins::exception_type_id_for_proxy_class_id(class_id).is_some())
+}
+
+#[inline]
+fn heap_exception_class_from_value(value: Value) -> Option<Arc<PyClassObject>> {
+    let ptr = value.as_object_ptr()?;
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return None;
+    }
+
+    let class = global_class(ClassId(type_id.raw()))?;
+    is_heap_exception_class(class.as_ref()).then_some(class)
+}
+
+#[inline]
+fn heap_exception_instance_mut(value: Value) -> Option<&'static mut ShapedObject> {
+    heap_exception_class_from_value(value)?;
+    Some(unsafe { &mut *(value.as_object_ptr()? as *mut ShapedObject) })
+}
+
+#[inline]
+fn heap_exception_instance_ref(value: Value) -> Option<&'static ShapedObject> {
+    heap_exception_class_from_value(value)?;
+    Some(unsafe { &*(value.as_object_ptr()? as *const ShapedObject) })
+}
+
+#[inline]
+fn heap_exception_args_value(value: Value) -> Option<Value> {
+    heap_exception_instance_ref(value).and_then(|instance| {
+        instance
+            .get_property_interned(&EXCEPTION_ARGS_ATTR)
+            .or_else(|| instance.get_property("args"))
+    })
+}
+
+fn initialize_heap_exception_state(value: Value) -> Result<(), BuiltinError> {
+    let Some(instance) = heap_exception_instance_mut(value) else {
+        return Err(BuiltinError::TypeError(
+            "BaseException.__new__() produced a non-exception instance".to_string(),
+        ));
+    };
+
+    set_heap_exception_args(instance, &[]);
+    instance.set_property(
+        EXCEPTION_TRACEBACK_ATTR.clone(),
+        Value::none(),
+        shape_registry(),
+    );
+    instance.set_property(
+        EXCEPTION_CAUSE_ATTR.clone(),
+        Value::none(),
+        shape_registry(),
+    );
+    instance.set_property(
+        EXCEPTION_CONTEXT_ATTR.clone(),
+        Value::none(),
+        shape_registry(),
+    );
+    instance.set_property(
+        EXCEPTION_SUPPRESS_CONTEXT_ATTR.clone(),
+        Value::bool(false),
+        shape_registry(),
+    );
+    Ok(())
+}
+
+#[inline]
+fn set_heap_exception_args(instance: &mut ShapedObject, args: &[Value]) {
+    instance.set_property(
+        EXCEPTION_ARGS_ATTR.clone(),
+        boxed_tuple_value(args.to_vec()),
+        shape_registry(),
+    );
+}
+
+fn render_exception_display_text(args: Option<Value>, fallback_message: &str) -> String {
+    match args {
+        Some(value) => render_exception_display_from_value(value),
+        None => fallback_message.to_string(),
+    }
+}
+
+fn render_exception_display_from_value(value: Value) -> String {
+    if let Some(tuple) = tuple_ref(value) {
+        return match tuple.as_slice() {
+            [] => String::new(),
+            [item] => exception_arg_display_text(*item),
+            items => {
+                let joined = items
+                    .iter()
+                    .map(|item| exception_arg_repr_text(*item))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({joined})")
+            }
+        };
+    }
+
+    exception_arg_display_text(value)
+}
+
+fn render_exception_repr_text(type_name: &str, args: Option<Value>) -> String {
+    match args {
+        Some(value) => render_exception_repr_from_value(type_name, value),
+        None => format!("{type_name}()"),
+    }
+}
+
+fn render_exception_repr_from_value(type_name: &str, value: Value) -> String {
+    if let Some(tuple) = tuple_ref(value) {
+        if tuple.is_empty() {
+            return format!("{type_name}()");
+        }
+
+        let joined = tuple
+            .iter()
+            .map(|item| exception_arg_repr_text(*item))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{type_name}({joined})");
+    }
+
+    format!("{type_name}({})", exception_arg_repr_text(value))
+}
+
+#[inline]
+fn tuple_ref(value: Value) -> Option<&'static TupleObject> {
+    let ptr = value.as_object_ptr()?;
+    (unsafe { (*(ptr as *const ObjectHeader)).type_id } == TypeId::TUPLE)
+        .then(|| unsafe { &*(ptr as *const TupleObject) })
 }
 
 #[inline]
@@ -585,8 +1021,8 @@ fn exception_arg_display_text(value: Value) -> String {
         }
         return float.to_string();
     }
-    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
-        return exception.display_text();
+    if let Some(text) = exception_display_text_for_value(value) {
+        return text;
     }
 
     let Some(ptr) = value.as_object_ptr() else {
@@ -616,8 +1052,8 @@ fn exception_arg_repr_text(value: Value) -> String {
         }
         return float.to_string();
     }
-    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
-        return exception.repr_text();
+    if let Some(text) = exception_repr_text_for_value(value) {
+        return text;
     }
 
     let Some(ptr) = value.as_object_ptr() else {
@@ -705,6 +1141,28 @@ pub fn create_exception_with_import_details_in_vm(
         .into_gc_value(vm)
 }
 
+/// Create a syntax-related exception with detailed source location metadata.
+pub fn create_exception_with_syntax_details(
+    type_id: ExceptionTypeId,
+    message: Option<Arc<str>>,
+    details: SyntaxErrorDetails,
+) -> Value {
+    ExceptionValue::new(type_id, message)
+        .with_syntax_details(details)
+        .into_value()
+}
+
+pub fn create_exception_with_syntax_details_in_vm(
+    vm: &VirtualMachine,
+    type_id: ExceptionTypeId,
+    message: Option<Arc<str>>,
+    details: SyntaxErrorDetails,
+) -> Result<Value, RuntimeError> {
+    ExceptionValue::new(type_id, message)
+        .with_syntax_details(details)
+        .into_gc_value(vm)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -744,6 +1202,28 @@ mod tests {
         .with_import_details(Some(Arc::from("pkg.missing")), None);
         assert_eq!(exc.import_name(), Some("pkg.missing"));
         assert!(exc.import_path().is_none());
+    }
+
+    #[test]
+    fn test_exception_value_syntax_details_round_trip() {
+        let exc = ExceptionValue::new(
+            ExceptionTypeId::SyntaxError,
+            Some(Arc::from("invalid syntax")),
+        )
+        .with_syntax_details(SyntaxErrorDetails::new(
+            Some(Arc::from("demo.py")),
+            Some(3),
+            Some(7),
+            Some(Arc::from("value =\n")),
+            Some(3),
+            Some(8),
+        ));
+        assert_eq!(exc.syntax_filename(), Some("demo.py"));
+        assert_eq!(exc.syntax_lineno(), Some(3));
+        assert_eq!(exc.syntax_offset(), Some(7));
+        assert_eq!(exc.syntax_text(), Some("value =\n"));
+        assert_eq!(exc.syntax_end_lineno(), Some(3));
+        assert_eq!(exc.syntax_end_offset(), Some(8));
     }
 
     #[test]
@@ -1077,6 +1557,31 @@ mod tests {
     }
 
     #[test]
+    fn test_create_exception_with_syntax_details() {
+        let value = create_exception_with_syntax_details(
+            ExceptionTypeId::SyntaxError,
+            Some(Arc::from("expected ':'")),
+            SyntaxErrorDetails::new(
+                Some(Arc::from("sample.py")),
+                Some(5),
+                Some(9),
+                Some(Arc::from("if True\n")),
+                Some(5),
+                Some(10),
+            ),
+        );
+
+        let exc = unsafe { ExceptionValue::from_value(value).unwrap() };
+        assert_eq!(exc.type_id(), ExceptionTypeId::SyntaxError);
+        assert_eq!(exc.syntax_filename(), Some("sample.py"));
+        assert_eq!(exc.syntax_lineno(), Some(5));
+        assert_eq!(exc.syntax_offset(), Some(9));
+        assert_eq!(exc.syntax_text(), Some("if True\n"));
+        assert_eq!(exc.syntax_end_lineno(), Some(5));
+        assert_eq!(exc.syntax_end_offset(), Some(10));
+    }
+
+    #[test]
     fn test_display_text_prefers_single_string_arg() {
         let args = vec![Value::string(prism_core::intern::intern("boom"))].into_boxed_slice();
         let exc = ExceptionValue::with_args(ExceptionTypeId::ValueError, None, args);
@@ -1091,14 +1596,41 @@ mod tests {
     }
 
     #[test]
-    fn test_exception_method_value_exposes_with_traceback_builtin() {
-        let method = exception_method_value("with_traceback")
-            .expect("with_traceback should resolve to a builtin");
-        let ptr = method
-            .as_object_ptr()
-            .expect("with_traceback should be heap allocated");
-        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
-        assert_eq!(builtin.name(), "BaseException.with_traceback");
+    fn test_exception_method_value_exposes_core_base_exception_builtins() {
+        for (name, expected) in [
+            ("__new__", "BaseException.__new__"),
+            ("__init__", "BaseException.__init__"),
+            ("__str__", "BaseException.__str__"),
+            ("__repr__", "BaseException.__repr__"),
+            ("with_traceback", "BaseException.with_traceback"),
+        ] {
+            let method =
+                exception_method_value(name).expect("base exception builtin should resolve");
+            let ptr = method
+                .as_object_ptr()
+                .expect("base exception builtin should be heap allocated");
+            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            assert_eq!(builtin.name(), expected);
+        }
+    }
+
+    #[test]
+    fn test_exception_display_and_repr_helpers_cover_native_exceptions() {
+        let exc = ExceptionValue::with_args(
+            ExceptionTypeId::ValueError,
+            None,
+            vec![Value::string(prism_core::intern::intern("boom"))].into_boxed_slice(),
+        )
+        .into_value();
+
+        assert_eq!(
+            exception_display_text_for_value(exc).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            exception_repr_text_for_value(exc).as_deref(),
+            Some("ValueError('boom')")
+        );
     }
 
     #[test]

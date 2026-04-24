@@ -57,6 +57,7 @@ use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::iter::IteratorObject;
 #[cfg(test)]
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 #[cfg(test)]
@@ -222,19 +223,31 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
         return Ok(IteratorObject::from_string_chars(*value));
     }
 
-    if prism_runtime::types::list::value_as_list_ref(*value).is_some() {
+    let exact_type_id = get_type_id(value);
+    let has_builtin_sequence_layout =
+        exact_type_id.is_some_and(|type_id| type_id.raw() < TypeId::FIRST_USER_TYPE);
+
+    if has_builtin_sequence_layout
+        && prism_runtime::types::list::value_as_list_ref(*value).is_some()
+    {
         return Ok(IteratorObject::from_list(*value));
     }
 
+    if has_builtin_sequence_layout
+        && let Some(tuple) = prism_runtime::types::tuple::value_as_tuple_ref(*value)
+    {
+        return Ok(IteratorObject::from_values(tuple.as_slice().to_vec()));
+    }
+
     // Fast path: Check if already an iterator
-    if let Some(type_id) = get_type_id(value) {
+    if let Some(type_id) = exact_type_id {
         if type_id == TypeId::ITERATOR {
             return Ok(IteratorObject::from_existing_iterator(*value));
         }
     }
 
     // Get TypeId for dispatch
-    let type_id = match get_type_id(value) {
+    let type_id = match exact_type_id {
         Some(tid) => tid,
         None => {
             // Not an object - could be a primitive
@@ -334,6 +347,15 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             .as_object_ptr()
             .ok_or(IterError::InvalidObject)
             .map(|_| IteratorObject::from_bytes(*value)),
+
+        TypeId::MEMORYVIEW => {
+            let view = value_as_memoryview_ref(*value).ok_or(IterError::InvalidObject)?;
+            if view.released() {
+                return Err(IterError::InvalidObject);
+            }
+            let values = view.to_values().ok_or(IterError::InvalidObject)?;
+            Ok(IteratorObject::from_values(values))
+        }
 
         TypeId::GENERATOR => Err(IterError::NotIterable(
             "iter() should receive generators directly".into(),
@@ -612,6 +634,26 @@ mod tests {
         assert!(iter.next().unwrap().is_none());
         assert!(iter.next().unwrap().is_truthy());
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_iter_tuple_backed_object() {
+        let object = ShapedObject::new_tuple_backed(
+            TypeId::OBJECT,
+            Shape::empty(),
+            TupleObject::from_slice(&[Value::int(4).unwrap(), Value::int(9).unwrap()]),
+        );
+        let ptr = Box::into_raw(Box::new(object));
+        let value = Value::object_ptr(ptr as *const ());
+
+        let mut iter = value_to_iterator(&value).expect("tuple-backed object should be iterable");
+        assert_eq!(iter.next().unwrap().as_int(), Some(4));
+        assert_eq!(iter.next().unwrap().as_int(), Some(9));
+        assert!(iter.next().is_none());
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
     }
 
     #[test]

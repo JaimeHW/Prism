@@ -1,6 +1,9 @@
 //! I/O builtins (print, input, open).
 
 use super::BuiltinError;
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::objects::get_attribute_value;
+use crate::truthiness::try_is_truthy;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
@@ -13,6 +16,38 @@ pub fn builtin_print(args: &[Value]) -> Result<Value, BuiltinError> {
     write_print(args, &mut stdout);
     stdout.flush().ok();
     Ok(Value::none())
+}
+
+/// VM-aware builtin print function with keyword argument support.
+pub fn builtin_print_vm_kw(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let options = parse_print_options(vm, keywords)?;
+    let rendered = format_print_output(args, &options.sep, &options.end);
+
+    if let Some(file) = options.file {
+        write_print_to_python_file(vm, file, &rendered)?;
+        if options.flush {
+            flush_python_file(vm, file)?;
+        }
+        return Ok(Value::none());
+    }
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(rendered.as_bytes()).ok();
+    if options.flush {
+        stdout.flush().ok();
+    }
+    Ok(Value::none())
+}
+
+struct PrintOptions {
+    sep: String,
+    end: String,
+    file: Option<Value>,
+    flush: bool,
 }
 
 #[inline]
@@ -41,15 +76,90 @@ fn format_value(value: Value) -> String {
 }
 
 fn write_print<W: Write>(args: &[Value], out: &mut W) {
-    let mut first = true;
-    for arg in args {
-        if !first {
-            write!(out, " ").ok();
+    out.write_all(format_print_output(args, " ", "\n").as_bytes())
+        .ok();
+}
+
+fn format_print_output(args: &[Value], sep: &str, end: &str) -> String {
+    let mut out = String::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            out.push_str(sep);
         }
-        first = false;
-        write!(out, "{}", format_value(*arg)).ok();
+        out.push_str(&format_value(*arg));
     }
-    writeln!(out).ok();
+    out.push_str(end);
+    out
+}
+
+fn parse_print_options(
+    vm: &mut crate::VirtualMachine,
+    keywords: &[(&str, Value)],
+) -> Result<PrintOptions, BuiltinError> {
+    let mut options = PrintOptions {
+        sep: " ".to_string(),
+        end: "\n".to_string(),
+        file: None,
+        flush: false,
+    };
+
+    for &(name, value) in keywords {
+        match name {
+            "sep" => options.sep = parse_print_text_keyword(value, "sep", " ")?,
+            "end" => options.end = parse_print_text_keyword(value, "end", "\n")?,
+            "file" => {
+                options.file = if value.is_none() { None } else { Some(value) };
+            }
+            "flush" => options.flush = try_is_truthy(vm, value).map_err(BuiltinError::Raised)?,
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "print() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn parse_print_text_keyword(
+    value: Value,
+    name: &'static str,
+    default: &'static str,
+) -> Result<String, BuiltinError> {
+    if value.is_none() {
+        return Ok(default.to_string());
+    }
+
+    value_to_string(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "{name} must be None or a string, not {}",
+            value.type_name()
+        ))
+    })
+}
+
+fn write_print_to_python_file(
+    vm: &mut crate::VirtualMachine,
+    file: Value,
+    rendered: &str,
+) -> Result<(), BuiltinError> {
+    let write = get_attribute_value(vm, file, &intern("write")).map_err(BuiltinError::Raised)?;
+    let rendered_value = vm
+        .allocator()
+        .alloc_value(StringObject::from_string(rendered.to_string()))
+        .ok_or_else(|| {
+            BuiltinError::TypeError("out of memory allocating print output".to_string())
+        })?;
+    invoke_callable_value(vm, write, &[rendered_value]).map_err(BuiltinError::Raised)?;
+    Ok(())
+}
+
+fn flush_python_file(vm: &mut crate::VirtualMachine, file: Value) -> Result<(), BuiltinError> {
+    let flush = get_attribute_value(vm, file, &intern("flush")).map_err(BuiltinError::Raised)?;
+    invoke_callable_value(vm, flush, &[]).map_err(BuiltinError::Raised)?;
+    Ok(())
 }
 
 /// Builtin input function.
@@ -290,9 +400,13 @@ fn value_to_string(value: Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::calls::invoke_callable_value;
+    use crate::ops::objects::get_attribute_value;
     use prism_core::intern::{intern, interned_by_ptr};
     use prism_runtime::types::string::StringObject;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn value_to_rust_string(value: Value) -> String {
         if let Some(ptr) = value.as_string_object_ptr() {
@@ -332,6 +446,71 @@ mod tests {
         write_print(&[exc], &mut out);
 
         assert_eq!(String::from_utf8(out).unwrap(), "boom\n");
+    }
+
+    #[test]
+    fn test_format_print_output_supports_custom_sep_and_end() {
+        let rendered = format_print_output(
+            &[Value::string(intern("alpha")), Value::int(7).unwrap()],
+            " :: ",
+            "!",
+        );
+        assert_eq!(rendered, "alpha :: 7!");
+    }
+
+    #[test]
+    fn test_print_vm_kw_rejects_non_string_sep() {
+        let mut vm = crate::VirtualMachine::new();
+        let err = builtin_print_vm_kw(
+            &mut vm,
+            &[Value::string(intern("alpha"))],
+            &[("sep", Value::int(1).unwrap())],
+        )
+        .expect_err("non-string sep should fail");
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(err.to_string().contains("sep must be None or a string"));
+    }
+
+    #[test]
+    fn test_print_vm_kw_writes_to_file_argument() {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let mut vm = crate::VirtualMachine::new();
+        let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "prism_print_builtin_{}_{}_{}.txt",
+            std::process::id(),
+            nanos,
+            unique
+        ));
+        let path_string = path.to_string_lossy().to_string();
+
+        let file = crate::stdlib::io::open_file_stream_object(&path_string, "w", None)
+            .expect("file stream should open");
+        builtin_print_vm_kw(
+            &mut vm,
+            &[Value::string(intern("alpha")), Value::int(7).unwrap()],
+            &[
+                ("sep", Value::string(intern("-"))),
+                ("end", Value::string(intern("!"))),
+                ("file", file),
+                ("flush", Value::bool(true)),
+            ],
+        )
+        .expect("print should write to file");
+
+        let close =
+            get_attribute_value(&mut vm, file, &intern("close")).expect("file.close should exist");
+        invoke_callable_value(&mut vm, close, &[]).expect("file.close should succeed");
+
+        let contents = std::fs::read_to_string(&path).expect("printed file should be readable");
+        assert_eq!(contents, "alpha-7!");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

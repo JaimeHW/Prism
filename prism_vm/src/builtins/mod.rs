@@ -22,7 +22,7 @@ mod types;
 pub use builtin_function::*;
 pub use exception_type::*;
 pub(crate) use exception_type::{
-    exception_proxy_class_id_from_ptr, exception_type_attribute_value,
+    exception_proxy_class, exception_proxy_class_id_from_ptr, exception_type_attribute_value,
     exception_type_id_for_proxy_class_id,
 };
 pub use exception_value::*;
@@ -34,7 +34,7 @@ pub use io::*;
 pub use iter_dispatch::*;
 pub use itertools::*;
 pub use numeric::*;
-pub(crate) use percent_format::percent_format_string;
+pub(crate) use percent_format::{percent_format_bytes, percent_format_string};
 pub use string::*;
 pub(crate) use type_reflection::*;
 pub(crate) use types::builtin_type_object_type_id;
@@ -56,6 +56,7 @@ use std::sync::{Arc, LazyLock};
 /// Takes a slice of arguments and returns a Result.
 /// Using Result allows proper error propagation.
 pub type BuiltinFn = fn(&[Value]) -> Result<Value, BuiltinError>;
+pub type BuiltinKwFn = fn(&[Value], &[(&str, Value)]) -> Result<Value, BuiltinError>;
 pub type VmBuiltinFn = fn(&mut crate::VirtualMachine, &[Value]) -> Result<Value, BuiltinError>;
 pub type VmBuiltinKwFn =
     fn(&mut crate::VirtualMachine, &[Value], &[(&str, Value)]) -> Result<Value, BuiltinError>;
@@ -116,7 +117,8 @@ impl std::fmt::Display for BuiltinError {
 impl std::error::Error for BuiltinError {}
 
 #[inline]
-fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
+pub(crate) fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
+    let is_attribute_error = err.is_attribute_error();
     match err.kind {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
@@ -134,6 +136,9 @@ fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
         RuntimeErrorKind::AttributeError { type_name, attr } => BuiltinError::AttributeError(
             format!("'{}' object has no attribute '{}'", type_name, attr),
         ),
+        RuntimeErrorKind::Exception { message, .. } if is_attribute_error => {
+            BuiltinError::AttributeError(message.to_string())
+        }
         RuntimeErrorKind::KeyError { key } => BuiltinError::KeyError(key.to_string()),
         RuntimeErrorKind::IndexError { index, length } => {
             BuiltinError::IndexError(format!("index {index} out of range for length {length}"))
@@ -161,6 +166,8 @@ pub struct BuiltinRegistry {
     entries: FxHashMap<Arc<str>, Value>,
     /// Function table for direct dispatch.
     functions: FxHashMap<Arc<str>, BuiltinFn>,
+    /// Keyword-aware function table for builtins that do not need VM context.
+    keyword_functions: FxHashMap<Arc<str>, BuiltinKwFn>,
     /// VM-aware function table for builtins that need runtime execution context.
     vm_functions: FxHashMap<Arc<str>, VmBuiltinFn>,
     /// VM-aware function table for builtins that accept keyword arguments.
@@ -195,6 +202,7 @@ impl BuiltinRegistry {
         Self {
             entries: FxHashMap::default(),
             functions: FxHashMap::default(),
+            keyword_functions: FxHashMap::default(),
             vm_functions: FxHashMap::default(),
             vm_keyword_functions: FxHashMap::default(),
         }
@@ -252,7 +260,7 @@ impl BuiltinRegistry {
         // Register execution functions
         registry.register_function_vm("exec", execution::builtin_exec_vm);
         registry.register_function_vm("eval", execution::builtin_eval_vm);
-        registry.register_function("compile", execution::builtin_compile);
+        registry.register_function_kw("compile", execution::builtin_compile_kw);
         registry.register_function("breakpoint", execution::builtin_breakpoint);
 
         // Register iteration functions
@@ -268,7 +276,7 @@ impl BuiltinRegistry {
         registry.register_function_vm("any", itertools::builtin_any_vm);
 
         // Register I/O functions
-        registry.register_function("print", io::builtin_print);
+        registry.register_function_vm_kw("print", io::builtin_print_vm_kw);
         registry.register_function("input", io::builtin_input);
         registry.register_function_vm_kw("open", io::builtin_open_vm_kw);
 
@@ -348,8 +356,8 @@ impl BuiltinRegistry {
             prism_runtime::object::type_obj::TypeId::TYPE,
             types::builtin_type,
         );
-        registry.register_function("isinstance", types::builtin_isinstance);
-        registry.register_function("issubclass", types::builtin_issubclass);
+        registry.register_function_vm("isinstance", types::builtin_isinstance_vm);
+        registry.register_function_vm("issubclass", types::builtin_issubclass_vm);
         registry.register_callable_type(
             "object",
             prism_runtime::object::type_obj::TypeId::OBJECT,
@@ -421,6 +429,17 @@ impl BuiltinRegistry {
         self.entries.insert(name, Value::object_ptr(ptr));
     }
 
+    /// Register a builtin function that accepts keyword arguments.
+    #[inline]
+    pub fn register_function_kw(&mut self, name: impl Into<Arc<str>>, func: BuiltinKwFn) {
+        let name = name.into();
+        self.keyword_functions.insert(name.clone(), func);
+
+        let builtin_obj = Box::new(BuiltinFunctionObject::new_kw(name.clone(), func));
+        let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
+        self.entries.insert(name, Value::object_ptr(ptr));
+    }
+
     /// Register a builtin function that needs VM context at call time.
     #[inline]
     pub fn register_function_vm(&mut self, name: impl Into<Arc<str>>, func: VmBuiltinFn) {
@@ -470,6 +489,12 @@ impl BuiltinRegistry {
         self.functions.get(name).copied()
     }
 
+    /// Get a keyword-aware builtin function by name.
+    #[inline]
+    pub fn get_keyword_function(&self, name: &str) -> Option<BuiltinKwFn> {
+        self.keyword_functions.get(name).copied()
+    }
+
     /// Get a VM-aware builtin function by name.
     #[inline]
     pub fn get_vm_function(&self, name: &str) -> Option<VmBuiltinFn> {
@@ -481,6 +506,8 @@ impl BuiltinRegistry {
     pub fn call(&self, name: &str, args: &[Value]) -> Result<Value, BuiltinError> {
         if let Some(func) = self.functions.get(name) {
             func(args)
+        } else if let Some(func) = self.keyword_functions.get(name) {
+            func(args, &[])
         } else {
             Err(BuiltinError::AttributeError(format!(
                 "builtin function '{}' not found",
@@ -499,6 +526,9 @@ impl BuiltinRegistry {
     ) -> Result<Value, BuiltinError> {
         if let Some(func) = self.functions.get(name) {
             return func(args);
+        }
+        if let Some(func) = self.keyword_functions.get(name) {
+            return func(args, &[]);
         }
         if let Some(func) = self.vm_functions.get(name) {
             return func(vm, args);
@@ -523,6 +553,7 @@ impl BuiltinRegistry {
     #[inline]
     pub fn is_function(&self, name: &str) -> bool {
         self.functions.contains_key(name)
+            || self.keyword_functions.contains_key(name)
             || self.vm_functions.contains_key(name)
             || self.vm_keyword_functions.contains_key(name)
     }
@@ -550,6 +581,7 @@ impl std::fmt::Debug for BuiltinRegistry {
         f.debug_struct("BuiltinRegistry")
             .field("entries", &self.entries.len())
             .field("functions", &self.functions.len())
+            .field("keyword_functions", &self.keyword_functions.len())
             .field("vm_functions", &self.vm_functions.len())
             .finish()
     }
@@ -562,6 +594,7 @@ impl std::fmt::Debug for BuiltinRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::intern;
 
     #[test]
     fn test_builtin_registry() {
@@ -617,7 +650,37 @@ mod tests {
         assert!(registry.is_function("range"));
         assert!(registry.is_function("type"));
         assert!(registry.is_function("getattr"));
+        assert!(registry.is_function("compile"));
         assert!(!registry.is_function("None")); // Not a function
+    }
+
+    #[test]
+    fn test_registry_exposes_keyword_aware_compile_builtin() {
+        let registry = BuiltinRegistry::with_standard_builtins();
+
+        assert!(registry.get_keyword_function("compile").is_some());
+        assert!(
+            registry
+                .get("compile")
+                .and_then(|value| value.as_object_ptr())
+                .is_some()
+        );
+
+        let compiled = registry
+            .call(
+                "compile",
+                &[
+                    Value::string(intern("pass")),
+                    Value::string(intern("<registry>")),
+                    Value::string(intern("exec")),
+                ],
+            )
+            .expect("keyword-aware builtins should still support positional registry calls");
+        let ptr = compiled
+            .as_object_ptr()
+            .expect("compile should return a code object");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::CODE);
     }
 
     #[test]

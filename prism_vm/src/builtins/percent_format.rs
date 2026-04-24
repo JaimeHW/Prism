@@ -8,6 +8,7 @@ use super::BuiltinError;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
@@ -151,6 +152,168 @@ impl PercentSpec {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BytesPercentSpec {
+    mapping_key: Option<String>,
+    alternate: bool,
+    zero_pad: bool,
+    left_adjust: bool,
+    sign_plus: bool,
+    sign_space: bool,
+    width_from_arg: bool,
+    width: Option<usize>,
+    precision_from_arg: bool,
+    precision: Option<usize>,
+    conversion: u8,
+}
+
+impl BytesPercentSpec {
+    fn parse(template: &[u8], start: usize) -> Result<(Self, usize), BuiltinError> {
+        let mut index = start;
+        let mut spec = Self {
+            mapping_key: None,
+            alternate: false,
+            zero_pad: false,
+            left_adjust: false,
+            sign_plus: false,
+            sign_space: false,
+            width_from_arg: false,
+            width: None,
+            precision_from_arg: false,
+            precision: None,
+            conversion: b'\0',
+        };
+
+        if index >= template.len() {
+            return Err(BuiltinError::ValueError("incomplete format".to_string()));
+        }
+
+        if template[index] == b'(' {
+            index += 1;
+            let key_start = index;
+            while index < template.len() && template[index] != b')' {
+                index += 1;
+            }
+            if index >= template.len() {
+                return Err(BuiltinError::ValueError(
+                    "incomplete format key".to_string(),
+                ));
+            }
+            let key = std::str::from_utf8(&template[key_start..index])
+                .map_err(|_| {
+                    BuiltinError::ValueError(
+                        "bytes format keys must be valid ASCII or UTF-8".to_string(),
+                    )
+                })?
+                .to_string();
+            spec.mapping_key = Some(key);
+            index += 1;
+        }
+
+        while index < template.len() {
+            match template[index] {
+                b'#' => spec.alternate = true,
+                b'0' => spec.zero_pad = true,
+                b'-' => spec.left_adjust = true,
+                b'+' => spec.sign_plus = true,
+                b' ' => spec.sign_space = true,
+                _ => break,
+            }
+            index += 1;
+        }
+
+        if index < template.len() && template[index] == b'*' {
+            spec.width_from_arg = true;
+            index += 1;
+        } else {
+            let width_start = index;
+            while index < template.len() && template[index].is_ascii_digit() {
+                index += 1;
+            }
+            if index > width_start {
+                spec.width = Some(parse_ascii_usize(&template[width_start..index], "width")?);
+            }
+        }
+
+        if index < template.len() && template[index] == b'.' {
+            index += 1;
+            if index < template.len() && template[index] == b'*' {
+                spec.precision_from_arg = true;
+                index += 1;
+            } else {
+                let precision_start = index;
+                while index < template.len() && template[index].is_ascii_digit() {
+                    index += 1;
+                }
+                spec.precision = Some(if index == precision_start {
+                    0
+                } else {
+                    parse_ascii_usize(&template[precision_start..index], "precision")?
+                });
+            }
+        }
+
+        while index < template.len() && matches!(template[index], b'h' | b'l' | b'L') {
+            index += 1;
+        }
+
+        if index >= template.len() {
+            return Err(BuiltinError::ValueError("incomplete format".to_string()));
+        }
+
+        let conversion = template[index];
+        if !matches!(
+            conversion,
+            b'b' | b's'
+                | b'r'
+                | b'a'
+                | b'c'
+                | b'd'
+                | b'i'
+                | b'u'
+                | b'o'
+                | b'x'
+                | b'X'
+                | b'e'
+                | b'E'
+                | b'f'
+                | b'F'
+                | b'g'
+                | b'G'
+        ) {
+            return Err(BuiltinError::ValueError(format!(
+                "unsupported format character '{}' (0x{:02x})",
+                conversion as char, conversion
+            )));
+        }
+        spec.conversion = conversion;
+        Ok((spec, index + 1))
+    }
+
+    fn as_text_spec(&self) -> PercentSpec {
+        PercentSpec {
+            mapping_key: None,
+            alternate: self.alternate,
+            zero_pad: self.zero_pad,
+            left_adjust: self.left_adjust,
+            sign_plus: self.sign_plus,
+            sign_space: self.sign_space,
+            width_from_arg: false,
+            width: self.width,
+            precision_from_arg: false,
+            precision: self.precision,
+            conversion: self.conversion as char,
+        }
+    }
+}
+
+fn parse_ascii_usize(bytes: &[u8], name: &'static str) -> Result<usize, BuiltinError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| BuiltinError::ValueError(format!("invalid {name}")))?;
+    text.parse()
+        .map_err(|_| BuiltinError::ValueError(format!("invalid {name}")))
+}
+
 struct PositionalArgs<'a> {
     tuple: Option<&'a [Value]>,
     index: usize,
@@ -276,6 +439,71 @@ pub(crate) fn percent_format_string(
     Ok(string_to_value(rendered))
 }
 
+pub(crate) fn percent_format_bytes(
+    template: &BytesObject,
+    arguments: Value,
+) -> Result<Value, BuiltinError> {
+    let mut rendered = Vec::with_capacity(template.len());
+    let mut positional = PositionalArgs::new(arguments);
+    let bytes = template.as_bytes();
+    let mut literal_start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+
+        rendered.extend_from_slice(&bytes[literal_start..index]);
+        index += 1;
+        if index >= bytes.len() {
+            return Err(BuiltinError::ValueError("incomplete format".to_string()));
+        }
+
+        if bytes[index] == b'%' {
+            rendered.push(b'%');
+            index += 1;
+            literal_start = index;
+            continue;
+        }
+
+        let (mut spec, next_index) = BytesPercentSpec::parse(bytes, index)?;
+        index = next_index;
+
+        if spec.width_from_arg {
+            let width = positional_int_arg(&mut positional)?;
+            if width < 0 {
+                spec.left_adjust = true;
+                spec.width = Some(
+                    usize::try_from(width.unsigned_abs())
+                        .map_err(|_| BuiltinError::OverflowError("width too large".to_string()))?,
+                );
+            } else {
+                spec.width = Some(width as usize);
+            }
+        }
+
+        if spec.precision_from_arg {
+            let precision = positional_int_arg(&mut positional)?;
+            spec.precision = usize::try_from(precision).ok();
+        }
+
+        let value = if let Some(key) = spec.mapping_key.as_deref() {
+            mapping_argument(arguments, key)?
+        } else {
+            positional.next()?
+        };
+
+        rendered.extend_from_slice(&format_bytes_argument(value, &spec)?);
+        literal_start = index;
+    }
+
+    rendered.extend_from_slice(&bytes[literal_start..]);
+    positional.finish()?;
+    Ok(bytes_to_value(rendered, template.header.type_id))
+}
+
 fn mapping_argument(arguments: Value, key: &str) -> Result<Value, BuiltinError> {
     let Some(ptr) = arguments.as_object_ptr() else {
         return Err(BuiltinError::TypeError(
@@ -326,6 +554,43 @@ fn format_argument(value: Value, spec: &PercentSpec) -> Result<String, BuiltinEr
     }
 }
 
+fn format_bytes_argument(value: Value, spec: &BytesPercentSpec) -> Result<Vec<u8>, BuiltinError> {
+    match spec.conversion {
+        b'b' | b's' => Ok(apply_bytes_width(
+            bytes_precision(raw_bytes_argument(value, spec.conversion)?, spec.precision),
+            spec,
+        )),
+        b'r' => Ok(apply_bytes_width(
+            bytes_precision(render_repr(value)?.into_bytes(), spec.precision),
+            spec,
+        )),
+        b'a' => Ok(apply_bytes_width(
+            bytes_precision(render_ascii(value)?.into_bytes(), spec.precision),
+            spec,
+        )),
+        b'c' => format_byte_char(value, spec),
+        b'd' | b'i' | b'u' | b'o' | b'x' | b'X' => {
+            Ok(format_integer(value, &spec.as_text_spec())?.into_bytes())
+        }
+        b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
+            Ok(format_float(value, &spec.as_text_spec())?.into_bytes())
+        }
+        _ => Err(BuiltinError::ValueError("unsupported format".to_string())),
+    }
+}
+
+fn raw_bytes_argument(value: Value, conversion: u8) -> Result<Vec<u8>, BuiltinError> {
+    value_as_bytes_ref(value)
+        .map(BytesObject::to_vec)
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "%{} requires a bytes-like object, or an object that implements __bytes__, not {}",
+                conversion as char,
+                type_name_of(value)
+            ))
+        })
+}
+
 fn render_str(value: Value) -> Result<String, BuiltinError> {
     string_value(super::types::builtin_str(&[value])?)
 }
@@ -370,6 +635,34 @@ fn format_char(value: Value, spec: &PercentSpec) -> Result<String, BuiltinError>
     };
 
     Ok(apply_string_width(rendered, spec))
+}
+
+fn format_byte_char(value: Value, spec: &BytesPercentSpec) -> Result<Vec<u8>, BuiltinError> {
+    let rendered = if let Some(integer) = value.as_int() {
+        byte_code_point(integer)?
+    } else if let Some(boolean) = value.as_bool() {
+        byte_code_point(if boolean { 1 } else { 0 })?
+    } else if let Some(bytes) = value_as_bytes_ref(value) {
+        let data = bytes.as_bytes();
+        if data.len() != 1 {
+            return Err(BuiltinError::TypeError(
+                "%c requires an integer in range(256) or a single byte".to_string(),
+            ));
+        }
+        data[0]
+    } else {
+        return Err(BuiltinError::TypeError(format!(
+            "%c requires an integer in range(256) or a single byte, not {}",
+            type_name_of(value)
+        )));
+    };
+
+    Ok(apply_bytes_width(vec![rendered], spec))
+}
+
+fn byte_code_point(code_point: i64) -> Result<u8, BuiltinError> {
+    u8::try_from(code_point)
+        .map_err(|_| BuiltinError::OverflowError("%c arg not in range(256)".to_string()))
 }
 
 fn code_point_to_string(code_point: i64) -> Result<String, BuiltinError> {
@@ -480,6 +773,13 @@ fn string_precision(text: String, precision: Option<usize>) -> String {
     }
 }
 
+fn bytes_precision(mut bytes: Vec<u8>, precision: Option<usize>) -> Vec<u8> {
+    if let Some(limit) = precision {
+        bytes.truncate(limit);
+    }
+    bytes
+}
+
 fn apply_string_width(text: String, spec: &PercentSpec) -> String {
     let width = spec.width.unwrap_or(0);
     let char_len = text.chars().count();
@@ -493,6 +793,24 @@ fn apply_string_width(text: String, spec: &PercentSpec) -> String {
     } else {
         format!("{padding}{text}")
     }
+}
+
+fn apply_bytes_width(mut bytes: Vec<u8>, spec: &BytesPercentSpec) -> Vec<u8> {
+    let width = spec.width.unwrap_or(0);
+    if width <= bytes.len() {
+        return bytes;
+    }
+
+    let padding_len = width - bytes.len();
+    if spec.left_adjust {
+        bytes.extend(std::iter::repeat_n(b' ', padding_len));
+        return bytes;
+    }
+
+    let mut padded = Vec::with_capacity(width);
+    padded.extend(std::iter::repeat_n(b' ', padding_len));
+    padded.extend_from_slice(&bytes);
+    padded
 }
 
 fn apply_numeric_width(digits: String, negative: bool, prefix: &str, spec: &PercentSpec) -> String {
@@ -533,6 +851,11 @@ fn string_to_value(text: String) -> Value {
     Value::object_ptr(ptr)
 }
 
+fn bytes_to_value(data: Vec<u8>, type_id: TypeId) -> Value {
+    let ptr = Box::into_raw(Box::new(BytesObject::from_vec_with_type(data, type_id))) as *const ();
+    Value::object_ptr(ptr)
+}
+
 fn type_name_of(value: Value) -> &'static str {
     if value.is_none() {
         "NoneType"
@@ -553,10 +876,12 @@ fn type_name_of(value: Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::percent_format_string;
+    use super::{percent_format_bytes, percent_format_string};
     use crate::builtins::BuiltinError;
     use prism_core::Value;
     use prism_core::intern::intern;
+    use prism_runtime::object::type_obj::TypeId;
+    use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
     use prism_runtime::types::dict::DictObject;
     use prism_runtime::types::string::value_as_string_ref;
     use prism_runtime::types::tuple::TupleObject;
@@ -567,6 +892,21 @@ mod tests {
             .expect("result should be a string")
             .as_str()
             .to_string()
+    }
+
+    fn render_bytes(format: &[u8], arguments: Value) -> Vec<u8> {
+        let template = BytesObject::from_slice(format);
+        let value = percent_format_bytes(&template, arguments).expect("format should succeed");
+        let rendered = value_as_bytes_ref(value)
+            .expect("result should be bytes")
+            .as_bytes()
+            .to_vec();
+        unsafe {
+            drop(Box::from_raw(
+                value.as_object_ptr().expect("bytes result should be boxed") as *mut BytesObject,
+            ));
+        }
+        rendered
     }
 
     fn boxed_value<T>(object: T) -> (Value, *mut T) {
@@ -643,5 +983,53 @@ mod tests {
         assert!(matches!(err, BuiltinError::TypeError(_)));
         assert!(err.to_string().contains("not all arguments converted"));
         unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_percent_format_bytes_inserts_raw_byte_arguments() {
+        let (argument, argument_ptr) = boxed_value(BytesObject::from_slice(b"GLIBC_2.9"));
+        assert_eq!(
+            render_bytes(b"[xxx%sxxx]", argument),
+            b"[xxxGLIBC_2.9xxx]".to_vec()
+        );
+        unsafe { drop_boxed(argument_ptr) };
+    }
+
+    #[test]
+    fn test_percent_format_bytes_honors_tuple_width_precision_and_numeric_specs() {
+        let (argument, argument_ptr) = boxed_value(BytesObject::from_slice(b"abcdef"));
+        let tuple = TupleObject::from_slice(&[argument, Value::int(31).unwrap()]);
+        let (tuple_value, tuple_ptr) = boxed_value(tuple);
+        assert_eq!(
+            render_bytes(b"%-5.3s:%#06x", tuple_value),
+            b"abc  :0x001f".to_vec()
+        );
+        unsafe {
+            drop_boxed(tuple_ptr);
+            drop_boxed(argument_ptr);
+        }
+    }
+
+    #[test]
+    fn test_percent_format_bytearray_preserves_receiver_type() {
+        let template = BytesObject::bytearray_from_slice(b"%c:%b");
+        let (argument, argument_ptr) = boxed_value(BytesObject::from_slice(b"z"));
+        let tuple = TupleObject::from_slice(&[Value::int(65).unwrap(), argument]);
+        let (tuple_value, tuple_ptr) = boxed_value(tuple);
+        let result =
+            percent_format_bytes(&template, tuple_value).expect("bytearray format should succeed");
+        assert_eq!(value_as_bytes_ref(result).unwrap().as_bytes(), b"A:z");
+        assert_eq!(
+            value_as_bytes_ref(result).unwrap().header.type_id,
+            TypeId::BYTEARRAY
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                result.as_object_ptr().expect("result should be boxed") as *mut BytesObject,
+            ));
+            drop_boxed(tuple_ptr);
+            drop_boxed(argument_ptr);
+        }
     }
 }

@@ -28,7 +28,8 @@ use prism_core::python_unicode::{
     python_code_point_escape,
 };
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
+use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::string::StringObject;
 
 // =============================================================================
@@ -414,7 +415,22 @@ fn build_byte_sequence(args: &[Value], kind: ByteSequenceKind) -> Result<Value, 
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
                 return Ok(kind.from_data(bytes.to_vec()));
             }
+            TypeId::MEMORYVIEW => {
+                let view = value_as_memoryview_ref(source).ok_or_else(|| {
+                    BuiltinError::TypeError("invalid memoryview object".to_string())
+                })?;
+                if view.released() {
+                    return Err(BuiltinError::ValueError(
+                        "operation forbidden on released memoryview object".to_string(),
+                    ));
+                }
+                return Ok(kind.from_data(view.to_vec()));
+            }
             _ => {}
+        }
+
+        if let Some(bytes) = value_as_bytes_ref(source) {
+            return Ok(kind.from_data(bytes.to_vec()));
         }
     }
 
@@ -482,6 +498,7 @@ enum TextCodecErrorPolicy {
     Strict,
     Ignore,
     Replace,
+    BackslashReplace,
     SurrogateEscape,
     SurrogatePass,
 }
@@ -492,6 +509,7 @@ fn parse_encoding_error_policy(errors: &str) -> Result<TextCodecErrorPolicy, Bui
         "strict" => Ok(TextCodecErrorPolicy::Strict),
         "ignore" => Ok(TextCodecErrorPolicy::Ignore),
         "replace" => Ok(TextCodecErrorPolicy::Replace),
+        "backslashreplace" => Ok(TextCodecErrorPolicy::BackslashReplace),
         "surrogateescape" => Ok(TextCodecErrorPolicy::SurrogateEscape),
         "surrogatepass" => Ok(TextCodecErrorPolicy::SurrogatePass),
         _ => Err(BuiltinError::ValueError(format!(
@@ -509,6 +527,7 @@ fn encode_string(input: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, B
         "utf8" | "utf-8" => encode_utf8(input, policy, "utf-8"),
         "ascii" => encode_ascii(input, policy, "ascii"),
         "latin1" | "latin-1" | "iso-8859-1" => encode_latin1(input, policy, "latin-1"),
+        "raw-unicode-escape" => Ok(encode_raw_unicode_escape(input)),
         _ => Err(BuiltinError::ValueError(format!(
             "unknown encoding: {}",
             encoding
@@ -524,6 +543,7 @@ fn decode_string(input: &[u8], encoding: &str, errors: &str) -> Result<String, B
         "utf8" | "utf-8" => decode_utf8(input, policy, "utf-8"),
         "ascii" => decode_ascii(input, policy, "ascii"),
         "latin1" | "latin-1" | "iso-8859-1" => decode_latin1(input),
+        "raw-unicode-escape" => decode_raw_unicode_escape(input, policy),
         _ => Err(BuiltinError::ValueError(format!(
             "unknown encoding: {}",
             encoding
@@ -556,6 +576,10 @@ fn encode_utf8(
                 TextCodecErrorPolicy::Ignore => continue,
                 TextCodecErrorPolicy::Replace => {
                     out.push(b'?');
+                    continue;
+                }
+                TextCodecErrorPolicy::BackslashReplace => {
+                    append_backslashreplace(code, &mut out);
                     continue;
                 }
                 TextCodecErrorPolicy::SurrogateEscape => {
@@ -605,6 +629,9 @@ fn encode_ascii(
             }
             TextCodecErrorPolicy::Ignore => {}
             TextCodecErrorPolicy::Replace => out.push(b'?'),
+            TextCodecErrorPolicy::BackslashReplace => {
+                append_backslashreplace(code, &mut out);
+            }
             TextCodecErrorPolicy::SurrogateEscape => {
                 if let Some(byte) = surrogateescape_byte(code) {
                     out.push(byte);
@@ -645,6 +672,9 @@ fn encode_latin1(
             }
             TextCodecErrorPolicy::Ignore => {}
             TextCodecErrorPolicy::Replace => out.push(b'?'),
+            TextCodecErrorPolicy::BackslashReplace => {
+                append_backslashreplace(code, &mut out);
+            }
             TextCodecErrorPolicy::SurrogateEscape => {
                 if let Some(byte) = surrogateescape_byte(code) {
                     out.push(byte);
@@ -660,6 +690,132 @@ fn encode_latin1(
         }
     }
     Ok(out)
+}
+
+fn encode_raw_unicode_escape(input: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for ch in input.chars() {
+        let code = logical_python_code_point(ch as u32);
+        match code {
+            0x00..=0xFF => out.push(code as u8),
+            0x0100..=0xFFFF => append_hex_escape(&mut out, b'u', code, 4),
+            _ => append_hex_escape(&mut out, b'U', code, 8),
+        }
+    }
+    out
+}
+
+fn decode_raw_unicode_escape(
+    input: &[u8],
+    policy: TextCodecErrorPolicy,
+) -> Result<String, BuiltinError> {
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0usize;
+
+    while index < input.len() {
+        let byte = input[index];
+        if byte != b'\\' || index + 1 >= input.len() {
+            out.push(byte as char);
+            index += 1;
+            continue;
+        }
+
+        let marker = input[index + 1];
+        let width = match marker {
+            b'u' => 4,
+            b'U' => 8,
+            _ => {
+                out.push(byte as char);
+                index += 1;
+                continue;
+            }
+        };
+
+        let start = index;
+        let digits_start = index + 2;
+        let mut digits = 0usize;
+        let mut code = 0u32;
+        while digits < width && digits_start + digits < input.len() {
+            let Some(nibble) = hex_nibble(input[digits_start + digits]) else {
+                break;
+            };
+            code = (code << 4) | u32::from(nibble);
+            digits += 1;
+        }
+
+        if digits != width {
+            let consumed = 2 + digits;
+            handle_raw_unicode_escape_error(
+                input,
+                start,
+                consumed,
+                policy,
+                &mut out,
+                if marker == b'u' {
+                    "truncated \\uXXXX escape"
+                } else {
+                    "truncated \\UXXXXXXXX escape"
+                },
+            )?;
+            index += consumed;
+            continue;
+        }
+
+        match encode_python_code_point(code) {
+            Some(ch) => {
+                out.push(ch);
+                index += 2 + width;
+            }
+            None => {
+                handle_raw_unicode_escape_error(
+                    input,
+                    start,
+                    2 + width,
+                    policy,
+                    &mut out,
+                    if marker == b'u' {
+                        "\\uxxxx out of range"
+                    } else {
+                        "\\Uxxxxxxxx out of range"
+                    },
+                )?;
+                index += 2 + width;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn handle_raw_unicode_escape_error(
+    input: &[u8],
+    start: usize,
+    consumed: usize,
+    policy: TextCodecErrorPolicy,
+    out: &mut String,
+    reason: &'static str,
+) -> Result<(), BuiltinError> {
+    match policy {
+        TextCodecErrorPolicy::Ignore => Ok(()),
+        TextCodecErrorPolicy::Replace => {
+            out.push('\u{FFFD}');
+            Ok(())
+        }
+        TextCodecErrorPolicy::BackslashReplace => {
+            for &byte in &input[start..start + consumed] {
+                append_backslashreplace_byte(byte, out);
+            }
+            Ok(())
+        }
+        TextCodecErrorPolicy::Strict
+        | TextCodecErrorPolicy::SurrogateEscape
+        | TextCodecErrorPolicy::SurrogatePass => Err(unicode_decode_error(
+            "raw-unicode-escape",
+            input[start],
+            start,
+            reason,
+        )),
+    }
 }
 
 fn decode_ascii(
@@ -685,6 +841,7 @@ fn decode_ascii(
             }
             TextCodecErrorPolicy::Ignore => {}
             TextCodecErrorPolicy::Replace => out.push('\u{FFFD}'),
+            TextCodecErrorPolicy::BackslashReplace => append_backslashreplace_byte(byte, &mut out),
             TextCodecErrorPolicy::SurrogateEscape => {
                 push_python_code_point(&mut out, 0xDC00 + u32::from(byte));
             }
@@ -734,6 +891,10 @@ fn decode_utf8(
                     }
                     TextCodecErrorPolicy::Replace => {
                         out.push('\u{FFFD}');
+                        index += 1;
+                    }
+                    TextCodecErrorPolicy::BackslashReplace => {
+                        append_backslashreplace_byte(offending, &mut out);
                         index += 1;
                     }
                     TextCodecErrorPolicy::SurrogateEscape => {
@@ -890,6 +1051,49 @@ fn append_utf8_code_point(code_point: u32, out: &mut Vec<u8>) {
             out.push(0x80 | ((code_point & 0x3F) as u8));
         }
     }
+}
+
+#[inline]
+fn append_backslashreplace(code_point: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(python_code_point_escape(code_point).as_bytes());
+}
+
+#[inline]
+fn append_hex_escape(out: &mut Vec<u8>, marker: u8, code_point: u32, width: usize) {
+    out.push(b'\\');
+    out.push(marker);
+    for shift in (0..width).rev() {
+        let nibble = ((code_point >> (shift * 4)) & 0xF) as u8;
+        out.push(hex_digit(nibble));
+    }
+}
+
+#[inline]
+fn hex_digit(nibble: u8) -> u8 {
+    match nibble {
+        0..=9 => b'0' + nibble,
+        10..=15 => b'a' + (nibble - 10),
+        _ => unreachable!("nibble should be in range"),
+    }
+}
+
+#[inline]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[inline]
+fn append_backslashreplace_byte(byte: u8, out: &mut String) {
+    out.push('\\');
+    out.push('x');
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0F) as usize] as char);
 }
 
 #[inline]
@@ -1792,6 +1996,83 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(value_to_byte_vec(replace), b"A?");
+    }
+
+    #[test]
+    fn test_bytes_backslashreplace_error_policy() {
+        let ascii = builtin_bytes(&[
+            Value::string(intern("A\u{00e9}")),
+            Value::string(intern("ascii")),
+            Value::string(intern("backslashreplace")),
+        ])
+        .expect("ascii backslashreplace should escape non-ASCII characters");
+        assert_eq!(value_to_byte_vec(ascii), b"A\\xe9");
+
+        let latin1 = builtin_bytes(&[
+            Value::string(intern("\u{20ac}")),
+            Value::string(intern("latin-1")),
+            Value::string(intern("backslashreplace")),
+        ])
+        .expect("latin-1 backslashreplace should escape non-Latin-1 characters");
+        assert_eq!(value_to_byte_vec(latin1), b"\\u20ac");
+    }
+
+    #[test]
+    fn test_decode_bytes_backslashreplace_error_policy() {
+        let ascii =
+            decode_bytes_to_value(&[0x41, 0xFF, 0x42], Some("ascii"), Some("backslashreplace"))
+                .expect("ascii backslashreplace should preserve invalid bytes");
+        assert_eq!(value_to_rust_string(ascii), r"A\xffB");
+
+        let utf8 =
+            decode_bytes_to_value(&[0x41, 0xFF, 0x42], Some("utf-8"), Some("backslashreplace"))
+                .expect("utf-8 backslashreplace should preserve invalid bytes");
+        assert_eq!(value_to_rust_string(utf8), r"A\xffB");
+    }
+
+    #[test]
+    fn test_raw_unicode_escape_codec_roundtrips_python_wire_format() {
+        let input = "A\u{00e9}\u{0100}\u{1d11e}";
+        let encoded = encode_text_to_data(input, Some("raw-unicode-escape"), Some("strict"))
+            .expect("raw-unicode-escape should encode all Python code points");
+        assert_eq!(encoded, b"A\xe9\\u0100\\U0001d11e");
+
+        let decoded = decode_bytes_to_text(&encoded, Some("raw-unicode-escape"), Some("strict"))
+            .expect("raw-unicode-escape should decode its wire format");
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_raw_unicode_escape_codec_preserves_surrogate_code_points() {
+        let surrogate =
+            encode_python_code_point(0xDC80).expect("surrogate should map into carrier range");
+        let encoded = encode_text_to_data(
+            &surrogate.to_string(),
+            Some("raw_unicode_escape"),
+            Some("strict"),
+        )
+        .expect("raw-unicode-escape should encode surrogate code points");
+        assert_eq!(encoded, b"\\udc80");
+
+        let decoded = decode_bytes_to_text(b"\\udc80", Some("raw-unicode-escape"), Some("strict"))
+            .expect("raw-unicode-escape should decode surrogate escapes");
+        assert_eq!(decoded, surrogate.to_string());
+    }
+
+    #[test]
+    fn test_raw_unicode_escape_decode_error_policies() {
+        let replaced =
+            decode_bytes_to_text(b"\\u12zz", Some("raw-unicode-escape"), Some("replace"))
+                .expect("replace should emit a replacement character");
+        assert_eq!(replaced, "\u{FFFD}zz");
+
+        let escaped = decode_bytes_to_text(
+            b"\\u12",
+            Some("raw-unicode-escape"),
+            Some("backslashreplace"),
+        )
+        .expect("backslashreplace should preserve offending bytes");
+        assert_eq!(escaped, r"\x5c\x75\x31\x32");
     }
 
     #[test]
