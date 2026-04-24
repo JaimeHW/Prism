@@ -33,6 +33,17 @@ pub fn format_prism_error(error: &PrismError, source: Option<&str>, filename: &s
     exit_code_for_error(error)
 }
 
+/// Format a VM `RuntimeError` to stderr in CPython-style traceback format.
+pub fn format_runtime_error(
+    error: &prism_vm::RuntimeError,
+    source: Option<&str>,
+    filename: &str,
+) -> ExitCode {
+    let output = format_runtime_error_string(error, source, filename);
+    eprint!("{}", output);
+    exit_code_for_runtime_error(error)
+}
+
 /// Format a `PrismError` into a string (for testing).
 pub fn format_error_string(error: &PrismError, source: Option<&str>, filename: &str) -> String {
     match error {
@@ -72,16 +83,43 @@ pub fn format_error_string(error: &PrismError, source: Option<&str>, filename: &
             }
         }
 
-        // Runtime errors: simple display (traceback would need frame info).
+        // Runtime errors arriving as `PrismError` no longer have structured
+        // traceback data, so avoid printing a fabricated line number.
         _ => {
             format!(
-                "{}\n  File \"{}\", line 1, in <module>\n{}\n",
+                "{}\n  File \"{}\"\n{}\n",
                 diagnostics::render_traceback_header(),
                 filename,
                 error,
             )
         }
     }
+}
+
+/// Format a VM `RuntimeError` into a string (for testing).
+pub fn format_runtime_error_string(
+    error: &prism_vm::RuntimeError,
+    _source: Option<&str>,
+    filename: &str,
+) -> String {
+    let mut output = String::new();
+    output.push_str(diagnostics::render_traceback_header());
+    output.push('\n');
+
+    if error.traceback.is_empty() {
+        output.push_str(&format!("  File \"{}\"\n", filename));
+    } else {
+        for entry in &error.traceback {
+            output.push_str(&format!(
+                "  File \"{}\", line {}, in {}\n",
+                entry.filename, entry.line, entry.func_name
+            ));
+        }
+    }
+
+    output.push_str(&runtime_error_exception_line(error));
+    output.push('\n');
+    output
 }
 
 /// Format a `CompileError` from the compiler crate to stderr.
@@ -177,6 +215,91 @@ fn exit_code_for_error(error: &PrismError) -> ExitCode {
     }
 }
 
+#[inline]
+fn exit_code_for_runtime_error(error: &prism_vm::RuntimeError) -> ExitCode {
+    use prism_vm::RuntimeErrorKind;
+    use prism_vm::stdlib::exceptions::ExceptionTypeId;
+
+    if runtime_error_type_id(error) == Some(ExceptionTypeId::SystemExit) {
+        let payload = runtime_error_payload(error);
+        if let Ok(code) = payload.parse::<u8>() {
+            return ExitCode::from(code);
+        }
+        return ExitCode::from(EXIT_ERROR);
+    }
+
+    match &error.kind {
+        RuntimeErrorKind::InternalError { .. }
+        | RuntimeErrorKind::InvalidOpcode { .. }
+        | RuntimeErrorKind::ControlTransferred => ExitCode::from(EXIT_INTERNAL_ERROR),
+        _ => ExitCode::from(EXIT_ERROR),
+    }
+}
+
+fn runtime_error_type_id(
+    error: &prism_vm::RuntimeError,
+) -> Option<prism_vm::stdlib::exceptions::ExceptionTypeId> {
+    use prism_vm::RuntimeErrorKind;
+    use prism_vm::stdlib::exceptions::ExceptionTypeId;
+
+    if let Some(value) = error.raised_value
+        && let Some(exception) = unsafe { prism_vm::builtins::ExceptionValue::from_value(value) }
+    {
+        return Some(exception.type_id());
+    }
+
+    match &error.kind {
+        RuntimeErrorKind::Exception { type_id, .. } => ExceptionTypeId::from_u8(*type_id as u8),
+        _ => None,
+    }
+}
+
+fn runtime_error_payload(error: &prism_vm::RuntimeError) -> String {
+    use prism_vm::RuntimeErrorKind;
+
+    if let Some(value) = error.raised_value
+        && let Some(exception) = unsafe { prism_vm::builtins::ExceptionValue::from_value(value) }
+    {
+        return exception.display_text();
+    }
+
+    match &error.kind {
+        RuntimeErrorKind::Exception { message, .. } => message.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn runtime_error_exception_line(error: &prism_vm::RuntimeError) -> String {
+    use prism_vm::RuntimeErrorKind;
+
+    if let Some(value) = error.raised_value
+        && let Some(exception) = unsafe { prism_vm::builtins::ExceptionValue::from_value(value) }
+    {
+        let payload = exception.display_text();
+        return if payload.is_empty() {
+            exception.type_name().to_string()
+        } else {
+            format!("{}: {}", exception.type_name(), payload)
+        };
+    }
+
+    match &error.kind {
+        RuntimeErrorKind::Exception { type_id, message } => {
+            let type_name = prism_vm::stdlib::exceptions::ExceptionTypeId::from_u8(*type_id as u8)
+                .map_or(
+                    "Exception",
+                    prism_vm::stdlib::exceptions::ExceptionTypeId::name,
+                );
+            if message.is_empty() {
+                type_name.to_string()
+            } else {
+                format!("{type_name}: {message}")
+            }
+        }
+        _ => error.to_string(),
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -186,6 +309,7 @@ mod tests {
     use super::*;
     use prism_core::error::RuntimeErrorKind;
     use prism_core::span::Span;
+    use prism_vm::TracebackEntry;
 
     // =========================================================================
     // Exit Code Tests
@@ -276,6 +400,7 @@ mod tests {
         assert!(output.contains("Traceback"));
         assert!(output.contains("NameError"));
         assert!(output.contains("undefined_var"));
+        assert!(!output.contains("line 1, in <module>"));
     }
 
     #[test]
@@ -290,6 +415,45 @@ mod tests {
         let err = PrismError::zero_division("division by zero");
         let output = format_error_string(&err, None, "test.py");
         assert!(output.contains("ZeroDivisionError: division by zero"));
+    }
+
+    #[test]
+    fn test_format_runtime_error_string_uses_recorded_traceback_lines() {
+        let mut err = prism_vm::RuntimeError::name_error("missing");
+        err.add_traceback(TracebackEntry {
+            func_name: "wrapper".into(),
+            filename: "bootstrap.py".into(),
+            line: 27,
+        });
+        err.add_traceback(TracebackEntry {
+            func_name: "<module>".into(),
+            filename: "helpers.py".into(),
+            line: 91,
+        });
+
+        let output = format_runtime_error_string(&err, None, "bootstrap.py");
+        assert!(output.contains("File \"bootstrap.py\", line 27, in wrapper"));
+        assert!(output.contains("File \"helpers.py\", line 91, in <module>"));
+        assert!(output.contains("NameError: name 'missing' is not defined"));
+    }
+
+    #[test]
+    fn test_format_runtime_error_string_without_traceback_omits_fake_line_number() {
+        let err = prism_vm::RuntimeError::type_error("bad operand");
+        let output = format_runtime_error_string(&err, None, "test.py");
+        assert!(output.contains("File \"test.py\""));
+        assert!(!output.contains("line 1"));
+        assert!(output.contains("TypeError: bad operand"));
+    }
+
+    #[test]
+    fn test_exit_code_for_runtime_system_exit_numeric() {
+        let err = prism_vm::RuntimeError::exception(
+            prism_vm::stdlib::exceptions::ExceptionTypeId::SystemExit.as_u8() as u16,
+            "42",
+        );
+        let code = exit_code_for_runtime_error(&err);
+        assert_eq!(code, ExitCode::from(42));
     }
 
     // =========================================================================

@@ -649,6 +649,7 @@ fn is_python_env_var(name: &OsString) -> bool {
 fn discover_tests(config: &HarnessConfig) -> Result<Vec<DiscoveredTest>, HarnessError> {
     let mut tests = Vec::new();
     discover_tests_inner(&config.test_dir, "", config.prefix_test_package, &mut tests)?;
+    tests.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(tests)
 }
 
@@ -682,7 +683,7 @@ fn discover_tests_inner(
             format!("{base_mod}.{stem}")
         };
 
-        if split_test_dir_names().contains(stem) && file_type.is_dir() {
+        if split_test_dir_names().contains(fullname.as_str()) && file_type.is_dir() {
             let nested_base = if base_mod.is_empty() {
                 if prefix_test_package {
                     format!("test.{stem}")
@@ -1381,6 +1382,33 @@ mod tests {
                 "test.test_asyncio.test_tasks",
             ]
         );
+    }
+
+    #[test]
+    fn test_discover_tests_uses_cpython_global_sort_order() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("Lib").join("test").join("test_alpha.py"),
+            "",
+        );
+        write_file(
+            &temp
+                .path
+                .join("Lib")
+                .join("test")
+                .join("test_asyncio")
+                .join("test_events.py"),
+            "",
+        );
+
+        let config = make_config(&temp.path);
+        let discovered = discover_tests(&config).expect("discovery should succeed");
+        let names = discovered
+            .into_iter()
+            .map(|test| test.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["test.test_asyncio.test_events", "test_alpha"]);
     }
 
     #[test]
