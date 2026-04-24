@@ -89,6 +89,9 @@ pub enum RuntimeErrorKind {
     ExecutionLimitExceeded { limit: u64 },
     /// Invalid opcode
     InvalidOpcode { opcode: u8 },
+    /// Internal control-flow sentinel used when a nested direct call has
+    /// already transferred execution back into its caller frame.
+    ControlTransferred,
     /// Internal VM error (should not happen)
     InternalError { message: Arc<str> },
     /// Import error
@@ -249,6 +252,11 @@ impl RuntimeError {
     }
 
     #[inline]
+    pub fn control_transferred() -> Self {
+        Self::new(RuntimeErrorKind::ControlTransferred)
+    }
+
+    #[inline]
     pub fn internal(message: impl Into<Arc<str>>) -> Self {
         Self::new(RuntimeErrorKind::InternalError {
             message: message.into(),
@@ -293,6 +301,110 @@ impl RuntimeError {
         let mut err = Self::exception(type_id, message);
         err.raised_value = Some(value);
         err
+    }
+
+    #[inline]
+    pub fn is_control_transferred(&self) -> bool {
+        matches!(self.kind, RuntimeErrorKind::ControlTransferred)
+    }
+
+    #[inline]
+    pub fn is_attribute_error(&self) -> bool {
+        self.kind.is_attribute_error()
+    }
+
+    /// Return the payload text that should populate a Python exception instance.
+    ///
+    /// This intentionally omits the exception type prefix so that
+    /// `str(exc)` and `exc.args` match CPython's `BaseException`
+    /// construction semantics.
+    #[inline]
+    pub fn python_exception_message(&self) -> Option<Arc<str>> {
+        self.kind.python_exception_message()
+    }
+}
+
+impl RuntimeErrorKind {
+    #[inline]
+    pub fn is_attribute_error(&self) -> bool {
+        matches!(self, Self::AttributeError { .. })
+            || matches!(
+                self,
+                Self::Exception { type_id, .. }
+                    if *type_id
+                        == crate::stdlib::exceptions::ExceptionTypeId::AttributeError.as_u8()
+                            as u16
+            )
+    }
+
+    /// Render the Python-visible exception payload without the leading
+    /// exception class name.
+    pub fn python_exception_message(&self) -> Option<Arc<str>> {
+        match self {
+            Self::TypeError { message }
+            | Self::ValueError { message }
+            | Self::ZeroDivisionError { message }
+            | Self::OverflowError { message }
+            | Self::InternalError { message }
+            | Self::Exception { message, .. } => Some(Arc::clone(message)),
+            Self::UnsupportedOperandTypes { op, left, right } => Some(
+                format!(
+                    "unsupported operand type(s) for {}: '{}' and '{}'",
+                    op, left, right
+                )
+                .into(),
+            ),
+            Self::NotCallable { type_name } => {
+                Some(format!("'{}' object is not callable", type_name).into())
+            }
+            Self::NotIterable { type_name } => {
+                Some(format!("'{}' object is not iterable", type_name).into())
+            }
+            Self::NotSubscriptable { type_name } => {
+                Some(format!("'{}' object is not subscriptable", type_name).into())
+            }
+            Self::NameError { name } => Some(format!("name '{}' is not defined", name).into()),
+            Self::AttributeError { type_name, attr } => {
+                Some(format!("'{}' object has no attribute '{}'", type_name, attr).into())
+            }
+            Self::UnboundLocalError { name } => {
+                Some(format!("local variable '{}' referenced before assignment", name).into())
+            }
+            Self::IndexError { index, length } => Some(
+                format!(
+                    "index {} out of range for sequence of length {}",
+                    index, length
+                )
+                .into(),
+            ),
+            Self::KeyError { key } => Some(format!("'{}'", key).into()),
+            Self::StopIteration | Self::GeneratorExit => None,
+            Self::AssertionError { message } => message.clone(),
+            Self::RecursionError { depth } => {
+                Some(format!("maximum recursion depth exceeded ({depth})").into())
+            }
+            Self::ExecutionLimitExceeded { limit } => {
+                Some(format!("execution step limit exceeded ({limit})").into())
+            }
+            Self::InvalidOpcode { opcode } => Some(format!("invalid opcode 0x{opcode:02x}").into()),
+            Self::ControlTransferred => {
+                Some(Arc::from("nested control transferred to caller frame"))
+            }
+            Self::ImportError {
+                module,
+                message,
+                name,
+                missing,
+                ..
+            } => {
+                if *missing {
+                    let missing_name = name.as_deref().unwrap_or(module);
+                    Some(format!("No module named '{}'", missing_name).into())
+                } else {
+                    Some(format!("cannot import '{}': {}", module, message).into())
+                }
+            }
+        }
     }
 }
 
@@ -369,6 +481,12 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeErrorKind::InvalidOpcode { opcode } => {
                 write!(f, "InternalError: invalid opcode 0x{:02x}", opcode)
+            }
+            RuntimeErrorKind::ControlTransferred => {
+                write!(
+                    f,
+                    "InternalError: nested control transferred to caller frame"
+                )
             }
             RuntimeErrorKind::InternalError { message } => {
                 write!(f, "InternalError: {}", message)
@@ -537,6 +655,7 @@ impl From<RuntimeError> for PrismError {
             RuntimeErrorKind::ExecutionLimitExceeded { limit } => {
                 PrismError::internal(format!("execution step limit exceeded ({})", limit))
             }
+            RuntimeErrorKind::ControlTransferred => PrismError::internal("control transferred"),
             RuntimeErrorKind::InvalidOpcode { opcode } => {
                 PrismError::internal(format!("invalid opcode 0x{:02x}", opcode))
             }
@@ -567,6 +686,15 @@ mod tests {
     fn test_zero_division() {
         let err = RuntimeError::zero_division();
         assert!(err.to_string().contains("ZeroDivisionError"));
+    }
+
+    #[test]
+    fn test_python_attribute_error_exception_is_classified_as_attribute_error() {
+        let err = RuntimeError::exception(
+            crate::stdlib::exceptions::ExceptionTypeId::AttributeError.as_u8() as u16,
+            "_mock_methods",
+        );
+        assert!(err.is_attribute_error());
     }
 
     #[test]
@@ -601,6 +729,24 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "RuntimeError: execution step limit exceeded (128)"
+        );
+    }
+
+    #[test]
+    fn test_python_exception_message_omits_type_prefix_for_type_error() {
+        let err = RuntimeError::type_error("instance must not be None");
+        assert_eq!(
+            err.python_exception_message().as_deref(),
+            Some("instance must not be None")
+        );
+    }
+
+    #[test]
+    fn test_python_exception_message_formats_not_callable_without_prefix() {
+        let err = RuntimeError::not_callable("widget");
+        assert_eq!(
+            err.python_exception_message().as_deref(),
+            Some("'widget' object is not callable")
         );
     }
 }

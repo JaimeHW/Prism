@@ -3,7 +3,7 @@
 //! This module centralizes bytecode -> template lowering so sync and async
 //! compilation paths use identical semantics.
 
-use prism_code::{CodeObject, Opcode};
+use prism_code::{CodeObject, Constant, Opcode};
 use prism_jit::tier1::codegen::TemplateInstruction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,7 +659,7 @@ fn load_const_template(
     inst_index: usize,
 ) -> Result<(TemplateInstruction, KnownType), String> {
     let idx = const_idx as usize;
-    let value = code.constants.get(idx).copied().ok_or_else(|| {
+    let value = code.constants.get(idx).ok_or_else(|| {
         format!(
             "invalid constant index {} at instruction {} ({} constants)",
             const_idx,
@@ -668,43 +668,52 @@ fn load_const_template(
         )
     })?;
 
-    if value.is_none() {
-        Ok((
+    match value {
+        Constant::Value(value) if value.is_none() => Ok((
             TemplateInstruction::LoadNone { bc_offset, dst },
             KnownType::None,
-        ))
-    } else if let Some(b) = value.as_bool() {
-        Ok((
-            TemplateInstruction::LoadBool {
-                bc_offset,
-                dst,
-                value: b,
-            },
-            KnownType::Bool,
-        ))
-    } else if let Some(i) = value.as_int() {
-        Ok((
-            TemplateInstruction::LoadInt {
-                bc_offset,
-                dst,
-                value: i,
-            },
-            KnownType::Int,
-        ))
-    } else if let Some(f) = value.as_float() {
-        Ok((
-            TemplateInstruction::LoadFloat {
-                bc_offset,
-                dst,
-                value: f,
-            },
-            KnownType::Float,
-        ))
-    } else {
-        Err(format!(
+        )),
+        Constant::Value(value) if value.as_bool().is_some() => {
+            let b = value.as_bool().expect("guarded by is_some");
+            Ok((
+                TemplateInstruction::LoadBool {
+                    bc_offset,
+                    dst,
+                    value: b,
+                },
+                KnownType::Bool,
+            ))
+        }
+        Constant::Value(value) if value.as_int().is_some() => {
+            let i = value.as_int().expect("guarded by is_some");
+            Ok((
+                TemplateInstruction::LoadInt {
+                    bc_offset,
+                    dst,
+                    value: i,
+                },
+                KnownType::Int,
+            ))
+        }
+        Constant::Value(value) if value.as_float().is_some() => {
+            let f = value.as_float().expect("guarded by is_some");
+            Ok((
+                TemplateInstruction::LoadFloat {
+                    bc_offset,
+                    dst,
+                    value: f,
+                },
+                KnownType::Float,
+            ))
+        }
+        Constant::Value(_) => Err(format!(
             "tier1 lowering unsupported constant type at index {} for bytecode offset {}",
             const_idx, bc_offset
-        ))
+        )),
+        Constant::BigInt(_) => Err(format!(
+            "tier1 lowering unsupported bigint constant at index {} for bytecode offset {}",
+            const_idx, bc_offset
+        )),
     }
 }
 
@@ -755,8 +764,16 @@ fn jump_target(template: &TemplateInstruction) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_code::{Instruction, Register};
+    use prism_code::{Constant, Instruction, Register};
     use prism_core::Value;
+
+    fn boxed_constants(constants: Vec<Value>) -> Box<[Constant]> {
+        constants
+            .into_iter()
+            .map(Constant::Value)
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
 
     #[test]
     fn test_lower_code_to_templates_rejects_invalid_jump_target() {
@@ -796,7 +813,7 @@ mod tests {
     fn test_lower_code_to_templates_rejects_invalid_constant_index() {
         let mut code = CodeObject::new("bad_const_idx", "<test>");
         code.register_count = 1;
-        code.constants = vec![Value::int(1).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(1).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 3),
             Instruction::op_d(Opcode::Return, Register::new(0)),
@@ -811,7 +828,7 @@ mod tests {
     fn test_lower_code_to_templates_accepts_simple_function() {
         let mut code = CodeObject::new("simple", "<test>");
         code.register_count = 1;
-        code.constants = vec![Value::int(7).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(7).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_d(Opcode::Return, Register::new(0)),
@@ -840,13 +857,12 @@ mod tests {
     fn test_lower_code_to_templates_maps_primitive_load_consts() {
         let mut code = CodeObject::new("consts", "<test>");
         code.register_count = 4;
-        code.constants = vec![
+        code.constants = boxed_constants(vec![
             Value::none(),
             Value::bool(true),
             Value::int(7).unwrap(),
             Value::float(3.5),
-        ]
-        .into_boxed_slice();
+        ]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -952,7 +968,7 @@ mod tests {
     fn test_lower_generic_add_int_specializes_to_int_add() {
         let mut code = CodeObject::new("add_int", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::int(10).unwrap(), Value::int(32).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(10).unwrap(), Value::int(32).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -982,7 +998,7 @@ mod tests {
     fn test_lower_generic_add_float_specializes_to_float_add() {
         let mut code = CodeObject::new("add_float", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::float(1.5), Value::float(2.5)].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::float(1.5), Value::float(2.5)]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1012,7 +1028,7 @@ mod tests {
     fn test_lower_generic_add_rejects_mixed_numeric_types() {
         let mut code = CodeObject::new("add_mixed", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::int(1).unwrap(), Value::float(2.0)].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(1).unwrap(), Value::float(2.0)]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1035,7 +1051,7 @@ mod tests {
     fn test_lower_generic_floor_div_int_specializes_to_int_div() {
         let mut code = CodeObject::new("floordiv_int", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::int(9).unwrap(), Value::int(2).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(9).unwrap(), Value::int(2).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1065,7 +1081,7 @@ mod tests {
     fn test_lower_generic_floor_div_float_specializes_to_float_floor_div() {
         let mut code = CodeObject::new("floordiv_float", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::float(9.0), Value::float(2.0)].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::float(9.0), Value::float(2.0)]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1095,7 +1111,7 @@ mod tests {
     fn test_lower_generic_mod_float_specializes_to_float_mod() {
         let mut code = CodeObject::new("mod_float", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::float(9.5), Value::float(2.0)].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::float(9.5), Value::float(2.0)]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1125,7 +1141,7 @@ mod tests {
     fn test_lower_true_div_int_rejected() {
         let mut code = CodeObject::new("truediv_int", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::int(7).unwrap(), Value::int(2).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(7).unwrap(), Value::int(2).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1147,7 +1163,7 @@ mod tests {
     fn test_lower_true_div_float_specializes_to_float_div() {
         let mut code = CodeObject::new("truediv_float", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::float(7.0), Value::float(2.0)].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::float(7.0), Value::float(2.0)]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1177,7 +1193,7 @@ mod tests {
     fn test_lower_generic_gt_float_specializes_to_float_gt() {
         let mut code = CodeObject::new("gt_float", "<test>");
         code.register_count = 3;
-        code.constants = vec![Value::float(3.0), Value::float(2.0)].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::float(3.0), Value::float(2.0)]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
@@ -1207,7 +1223,7 @@ mod tests {
     fn test_lower_move_propagates_known_type() {
         let mut code = CodeObject::new("move_type_prop", "<test>");
         code.register_count = 4;
-        code.constants = vec![Value::int(5).unwrap()].into_boxed_slice();
+        code.constants = boxed_constants(vec![Value::int(5).unwrap()]);
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_ds(Opcode::Move, Register::new(1), Register::new(0)),

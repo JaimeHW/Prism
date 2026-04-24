@@ -5,8 +5,9 @@
 
 use crate::exception::InlineHandlerCache;
 use crate::import::ModuleObject;
-use prism_code::CodeObject;
+use prism_code::{CodeObject, Constant};
 use prism_core::Value;
+use prism_runtime::types::int::bigint_to_value;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -557,7 +558,10 @@ impl Frame {
     /// Get a constant from the constant pool.
     #[inline(always)]
     pub fn get_const(&self, idx: u16) -> Value {
-        unsafe { *self.code.constants.get_unchecked(idx as usize) }
+        match unsafe { self.code.constants.get_unchecked(idx as usize) } {
+            Constant::Value(value) => *value,
+            Constant::BigInt(value) => bigint_to_value(value.clone()),
+        }
     }
 
     /// Get a name from the name table.

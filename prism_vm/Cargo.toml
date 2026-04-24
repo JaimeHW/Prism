@@ -10,6 +10,7 @@ prism_code.workspace = true
 prism_compiler.workspace = true
 prism_parser.workspace = true
 prism_runtime.workspace = true
+prism_stdlib.workspace = true
 prism_gc.workspace = true
 prism_jit.workspace = true
 num-bigint.workspace = true
@@ -20,6 +21,7 @@ parking_lot.workspace = true
 # High-performance collections
 rustc-hash = "2.0"
 smallvec = "1.13"
+getrandom = "0.2"
 
 # Math functions (gamma, erf, etc.)
 libm = "0.2"
@@ -28,10 +30,11 @@ libm = "0.2"
 regex = "1.10"
 # Extended regex with backreferences/lookaround
 fancy-regex = "0.13"
+sha2 = "0.10"
 
 # Platform-specific time APIs
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Console", "Win32_System_Time", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Time", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

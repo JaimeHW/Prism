@@ -6,19 +6,25 @@
 use crate::allocator::GcAllocator;
 use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
-use crate::error::{RuntimeError, VmResult};
+use crate::error::{RuntimeError, RuntimeErrorKind, TracebackEntry, VmResult};
 use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
 use crate::frame::{ClosureEnv, Frame, FramePool, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
-use crate::import::{ImportError, ImportResolver, ModuleObject, resolve_relative_import};
+use crate::import::{
+    ImportError, ImportResolver, ModuleExportError, ModuleObject, resolve_relative_import,
+};
 use crate::inline_cache::InlineCacheStore;
 use crate::jit_context::{JitConfig, JitContext};
 use crate::jit_executor::ExecutionResult;
-use crate::ops::calls::{capture_closure_environment, initialize_closure_cellvars_from_locals};
+use crate::ops::calls::{
+    capture_closure_environment, initialize_closure_cellvars_from_locals, invoke_callable_value,
+};
+use crate::ops::objects::list_storage_ref_from_ptr;
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
 use crate::speculative::SpeculationCache;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
@@ -41,6 +47,19 @@ fn standard_runtime_builtins_and_import_resolver(
     };
 
     (builtins, import_resolver)
+}
+
+#[inline]
+fn module_value(module: &Arc<ModuleObject>) -> Value {
+    Value::object_ptr(Arc::as_ptr(module) as *const ())
+}
+
+fn module_list_attr_is_populated(module: &Arc<ModuleObject>, attr: &str) -> bool {
+    module
+        .get_attr(attr)
+        .and_then(|value| value.as_object_ptr())
+        .and_then(list_storage_ref_from_ptr)
+        .is_some_and(|list| !list.is_empty())
 }
 
 /// Result of driving a generator frame for a single send()/next() step.
@@ -296,20 +315,28 @@ impl VirtualMachine {
         }
     }
 
-    pub fn import_star_into_current_scope(&mut self, module: &ModuleObject) {
+    pub fn import_star_into_current_scope(
+        &mut self,
+        module: &ModuleObject,
+    ) -> Result<(), RuntimeError> {
+        let attrs = module
+            .public_attrs()
+            .map_err(module_export_error_to_runtime_error)?;
+
         if let Some(target_module) = self.current_module_cloned() {
             let is_main = target_module.name() == "__main__";
-            for (name, value) in module.public_attrs() {
+            for (name, value) in attrs {
                 target_module.set_attr(&name, value);
                 if is_main {
                     self.globals.set(Arc::from(name.as_ref()), value);
                 }
             }
         } else {
-            for (name, value) in module.public_attrs() {
+            for (name, value) in attrs {
                 self.globals.set(Arc::from(name.as_ref()), value);
             }
         }
+        Ok(())
     }
 
     pub fn bind_module(&mut self, module: Arc<ModuleObject>) {
@@ -329,6 +356,15 @@ impl VirtualMachine {
         code: Arc<CodeObject>,
         module: Arc<ModuleObject>,
     ) -> PrismResult<Value> {
+        self.execute_in_module_runtime(code, module)
+            .map_err(Into::into)
+    }
+
+    pub fn execute_in_module_runtime(
+        &mut self,
+        code: Arc<CodeObject>,
+        module: Arc<ModuleObject>,
+    ) -> VmResult<Value> {
         if self.frames.is_empty() {
             self.execution_budget.reset_counter();
         }
@@ -392,6 +428,7 @@ impl VirtualMachine {
             ImportError::CircularImport { module }
             | ImportError::LoadError { module, .. }
             | ImportError::ExecutionError { module, .. }
+            | ImportError::StarImportError { module, .. }
             | ImportError::ImportFromError { module, .. } => {
                 RuntimeError::import_error(module, rendered)
             }
@@ -493,21 +530,7 @@ impl VirtualMachine {
                     }
                 }
                 ControlFlow::Exception { type_id, .. } => {
-                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                        self.frames[self.current_frame_idx].ip = handler_entry;
-                    } else {
-                        loop {
-                            if self.frames.len() <= stop_depth {
-                                return Err(self.uncaught_exception_error(type_id));
-                            }
-
-                            self.pop_top_frame_for_unwind();
-                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                                self.frames[self.current_frame_idx].ip = handler_entry;
-                                break;
-                            }
-                        }
-                    }
+                    self.propagate_exception_to_depth(stop_depth, type_id)?;
                 }
                 ControlFlow::Reraise => {
                     let type_id = if let Some(tid) = self.active_exception_type_id {
@@ -524,21 +547,7 @@ impl VirtualMachine {
                         ));
                     }
 
-                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                        self.frames[self.current_frame_idx].ip = handler_entry;
-                    } else {
-                        loop {
-                            if self.frames.len() <= stop_depth {
-                                return Err(self.uncaught_reraised_exception_error(type_id));
-                            }
-
-                            self.pop_top_frame_for_unwind();
-                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                                self.frames[self.current_frame_idx].ip = handler_entry;
-                                break;
-                            }
-                        }
-                    }
+                    self.propagate_reraise_to_depth(stop_depth, type_id)?;
                 }
                 ControlFlow::EnterHandler { handler_pc, .. } => {
                     self.frames[self.current_frame_idx].ip = handler_pc;
@@ -558,22 +567,7 @@ impl VirtualMachine {
                     self.frames[self.current_frame_idx].set_reg(0, send_value);
                 }
                 ControlFlow::Error(err) => {
-                    let type_id = self.materialize_active_exception_from_runtime_error(&err);
-                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                        self.frames[self.current_frame_idx].ip = handler_entry;
-                    } else {
-                        loop {
-                            if self.frames.len() <= stop_depth {
-                                return Err(err);
-                            }
-
-                            self.pop_top_frame_for_unwind();
-                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                                self.frames[self.current_frame_idx].ip = handler_entry;
-                                break;
-                            }
-                        }
-                    }
+                    self.propagate_runtime_error_to_depth(stop_depth, err)?;
                 }
             }
         }
@@ -596,63 +590,17 @@ impl VirtualMachine {
 
     #[inline]
     fn route_nested_exception(&mut self, stop_depth: usize, type_id: u16) -> VmResult<()> {
-        if let Some(handler_entry) = self.find_exception_handler(type_id) {
-            self.frames[self.current_frame_idx].ip = handler_entry;
-            return Ok(());
-        }
-
-        loop {
-            if self.frames.len() <= stop_depth {
-                return Err(self.uncaught_exception_error(type_id));
-            }
-
-            self.pop_top_frame_for_unwind();
-            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                self.frames[self.current_frame_idx].ip = handler_entry;
-                return Ok(());
-            }
-        }
+        self.propagate_exception_to_depth(stop_depth, type_id)
     }
 
     #[inline]
     fn route_nested_reraise(&mut self, stop_depth: usize, type_id: u16) -> VmResult<()> {
-        if let Some(handler_entry) = self.find_exception_handler(type_id) {
-            self.frames[self.current_frame_idx].ip = handler_entry;
-            return Ok(());
-        }
-
-        loop {
-            if self.frames.len() <= stop_depth {
-                return Err(self.uncaught_reraised_exception_error(type_id));
-            }
-
-            self.pop_top_frame_for_unwind();
-            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                self.frames[self.current_frame_idx].ip = handler_entry;
-                return Ok(());
-            }
-        }
+        self.propagate_reraise_to_depth(stop_depth, type_id)
     }
 
     #[inline]
     fn route_nested_runtime_error(&mut self, stop_depth: usize, err: RuntimeError) -> VmResult<()> {
-        let type_id = self.materialize_active_exception_from_runtime_error(&err);
-        if let Some(handler_entry) = self.find_exception_handler(type_id) {
-            self.frames[self.current_frame_idx].ip = handler_entry;
-            return Ok(());
-        }
-
-        loop {
-            if self.frames.len() <= stop_depth {
-                return Err(err);
-            }
-
-            self.pop_top_frame_for_unwind();
-            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                self.frames[self.current_frame_idx].ip = handler_entry;
-                return Ok(());
-            }
-        }
+        self.propagate_runtime_error_to_depth(stop_depth, err)
     }
 
     #[inline]
@@ -676,111 +624,6 @@ impl VirtualMachine {
         }
     }
 
-    pub(crate) fn execute_until_stack_depth_restored(
-        &mut self,
-        stop_depth: usize,
-        return_reg: u8,
-    ) -> VmResult<Value> {
-        if stop_depth == 0 {
-            return Err(RuntimeError::internal(
-                "nested execution requires a caller frame",
-            ));
-        }
-
-        loop {
-            if self.frames.len() == stop_depth {
-                return Ok(self.frames[self.current_frame_idx].get_reg(return_reg));
-            }
-
-            if self.frames.len() < stop_depth {
-                return Err(RuntimeError::internal(
-                    "nested execution unwound below caller frame",
-                ));
-            }
-
-            let inst = {
-                let current_frame_idx = self.current_frame_idx;
-                let frame = &mut self.frames[current_frame_idx];
-
-                if frame.ip as usize >= frame.code.instructions.len() {
-                    match self.pop_frame(Value::none())? {
-                        Some(_) => {
-                            return Err(RuntimeError::internal(
-                                "nested execution unwound to empty frame stack",
-                            ));
-                        }
-                        None => {
-                            if self.frames.len() == stop_depth {
-                                return Ok(self.frames[self.current_frame_idx].get_reg(return_reg));
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                frame.fetch()
-            };
-
-            let control = get_handler(inst.opcode())(self, inst);
-            match control {
-                ControlFlow::Continue => {}
-                ControlFlow::Jump(offset) => {
-                    let frame = &mut self.frames[self.current_frame_idx];
-                    let new_ip = (frame.ip as i32) + (offset as i32);
-                    frame.ip = new_ip.max(0) as u32;
-                }
-                ControlFlow::Call { code, return_reg } => {
-                    self.push_frame(code, return_reg)?;
-                }
-                ControlFlow::Return(value) => match self.pop_frame(value)? {
-                    Some(_) => {
-                        return Err(RuntimeError::internal(
-                            "nested execution unwound to empty frame stack",
-                        ));
-                    }
-                    None => {
-                        if self.frames.len() == stop_depth {
-                            return Ok(self.frames[self.current_frame_idx].get_reg(return_reg));
-                        }
-                    }
-                },
-                ControlFlow::Exception { type_id, .. } => {
-                    self.route_nested_exception(stop_depth, type_id)?;
-                }
-                ControlFlow::Reraise => {
-                    let type_id = if let Some(tid) = self.get_active_exception_type_id() {
-                        tid
-                    } else if let Some(exc_info) = self.exc_info_stack().peek() {
-                        exc_info.type_id()
-                    } else {
-                        return Err(RuntimeError::type_error("No active exception to re-raise"));
-                    };
-
-                    if type_id == 0 {
-                        return Err(RuntimeError::internal(
-                            "Reraise without active exception type",
-                        ));
-                    }
-
-                    self.route_nested_reraise(stop_depth, type_id)?;
-                }
-                ControlFlow::Error(err) => {
-                    self.route_nested_runtime_error(stop_depth, err)?;
-                }
-                ControlFlow::Yield { .. } | ControlFlow::Resume { .. } => {
-                    return Err(RuntimeError::type_error(
-                        "nested execution cannot suspend or yield",
-                    ));
-                }
-                ControlFlow::EnterHandler { .. }
-                | ControlFlow::EnterFinally { .. }
-                | ControlFlow::ExitHandler => {
-                    self.apply_nested_handler_control_flow(control)?;
-                }
-            }
-        }
-    }
-
     pub(crate) fn execute_until_target_frame_returns(
         &mut self,
         stop_depth: usize,
@@ -788,9 +631,9 @@ impl VirtualMachine {
     ) -> VmResult<Value> {
         match self.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)? {
             NestedTargetFrameOutcome::Returned(value) => Ok(value),
-            NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::internal(
-                "nested execution target frame returned without a result",
-            )),
+            NestedTargetFrameOutcome::ControlTransferred => {
+                Err(RuntimeError::control_transferred())
+            }
         }
     }
 
@@ -1155,7 +998,54 @@ impl VirtualMachine {
             return Err(err);
         }
 
+        if name == "importlib" {
+            self.install_importlib_importers(&module)?;
+        }
+
         Ok(module)
+    }
+
+    fn install_importlib_importers(&mut self, importlib: &Arc<ModuleObject>) -> VmResult<()> {
+        let sys_module = self.import_module_with_context("sys", None)?;
+        if module_list_attr_is_populated(&sys_module, "meta_path") {
+            return Ok(());
+        }
+
+        let imp_module = self.import_module_with_context("_imp", None)?;
+        let Some(bootstrap) = self.module_attr_as_imported_module(importlib, "_bootstrap") else {
+            return Ok(());
+        };
+        let Some(bootstrap_external) =
+            self.module_attr_as_imported_module(importlib, "_bootstrap_external")
+        else {
+            return Ok(());
+        };
+
+        let install_core = bootstrap
+            .get_attr("_install")
+            .ok_or_else(|| RuntimeError::attribute_error("module", "_install"))?;
+        invoke_callable_value(
+            self,
+            install_core,
+            &[module_value(&sys_module), module_value(&imp_module)],
+        )?;
+
+        let install_external = bootstrap_external
+            .get_attr("_install")
+            .ok_or_else(|| RuntimeError::attribute_error("module", "_install"))?;
+        invoke_callable_value(self, install_external, &[module_value(&bootstrap)])?;
+
+        Ok(())
+    }
+
+    fn module_attr_as_imported_module(
+        &self,
+        module: &Arc<ModuleObject>,
+        attr: &str,
+    ) -> Option<Arc<ModuleObject>> {
+        let value = module.get_attr(attr)?;
+        let ptr = value.as_object_ptr()?;
+        self.import_resolver.module_from_ptr(ptr)
     }
 
     fn load_non_stdlib_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
@@ -1251,6 +1141,15 @@ impl VirtualMachine {
         self.import_module_with_context(raw_name, current_module.as_ref())
     }
 
+    pub(crate) fn import_from_module(
+        &mut self,
+        module: &Arc<ModuleObject>,
+        name: &str,
+    ) -> VmResult<Value> {
+        let current_module = self.current_module_cloned();
+        self.import_from_module_with_context(module, name, current_module.as_ref())
+    }
+
     pub(crate) fn import_from_with_context(
         &mut self,
         module_spec: &str,
@@ -1258,9 +1157,45 @@ impl VirtualMachine {
         current_module: Option<&Arc<ModuleObject>>,
     ) -> VmResult<Value> {
         let module = self.import_module_with_context(module_spec, current_module)?;
-        self.import_resolver
-            .import_from(&module, name)
-            .map_err(Self::import_error_to_runtime)
+        self.import_from_module_with_context(&module, name, current_module)
+    }
+
+    fn import_from_module_with_context(
+        &mut self,
+        module: &Arc<ModuleObject>,
+        name: &str,
+        current_module: Option<&Arc<ModuleObject>>,
+    ) -> VmResult<Value> {
+        if let Ok(value) = self.import_resolver.import_from(module, name) {
+            return Ok(value);
+        }
+
+        let submodule_name = format!("{}.{}", module.name(), name);
+        match self.import_module_with_context(&submodule_name, current_module) {
+            Ok(submodule) => {
+                let value = Value::object_ptr(Arc::as_ptr(&submodule) as *const ());
+                module.set_attr(name, value);
+                Ok(value)
+            }
+            Err(err) if Self::missing_submodule_matches(&err, &submodule_name) => Err(
+                Self::import_error_to_runtime(ImportError::ImportFromError {
+                    module: Arc::from(module.name()),
+                    name: Arc::from(name),
+                }),
+            ),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn missing_submodule_matches(err: &RuntimeError, expected: &str) -> bool {
+        matches!(
+            &err.kind,
+            RuntimeErrorKind::ImportError {
+                name: Some(name),
+                missing: true,
+                ..
+            } if name.as_ref() == expected
+        )
     }
 
     /// Create a new virtual machine (interpreter only, no JIT).
@@ -1465,12 +1400,17 @@ impl VirtualMachine {
 
     /// Execute a code object and return the result.
     pub fn execute(&mut self, code: Arc<CodeObject>) -> PrismResult<Value> {
-        self.execute_in_module(code, Arc::new(ModuleObject::new("__main__")))
+        self.execute_runtime(code).map_err(Into::into)
+    }
+
+    /// Execute a code object while preserving the original `RuntimeError`.
+    pub fn execute_runtime(&mut self, code: Arc<CodeObject>) -> VmResult<Value> {
+        self.execute_in_module_runtime(code, Arc::new(ModuleObject::new("__main__")))
     }
 
     /// Main dispatch loop.
     #[inline(never)] // Prevent inlining for better branch prediction
-    fn run_loop(&mut self) -> PrismResult<Value> {
+    fn run_loop(&mut self) -> VmResult<Value> {
         loop {
             self.execution_budget.consume_step()?;
 
@@ -1529,30 +1469,7 @@ impl VirtualMachine {
                     // (handler_pc in the ControlFlow is a hint from raise instruction encoding)
                     let _ = hint_pc; // Compiler hint, actual PC comes from exception table
 
-                    // Look up handler in current frame's exception table
-                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                        // Found a matching handler - jump to it
-                        let frame = &mut self.frames[self.current_frame_idx];
-                        frame.ip = handler_entry;
-                    } else {
-                        // No handler in current frame - unwind to caller
-                        loop {
-                            // Pop current frame
-                            if self.frames.len() <= 1 {
-                                // No more frames - return as uncaught exception
-                                return Err(self.uncaught_exception_error(type_id).into());
-                            }
-
-                            self.pop_top_frame_for_unwind();
-
-                            // Try to find handler in caller
-                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                                let frame = &mut self.frames[self.current_frame_idx];
-                                frame.ip = handler_entry;
-                                break;
-                            }
-                        }
-                    }
+                    self.propagate_exception_to_depth(1, type_id)?;
                 }
 
                 ControlFlow::Reraise => {
@@ -1564,38 +1481,16 @@ impl VirtualMachine {
                     } else if let Some(exc_info) = self.exc_info_stack.peek() {
                         exc_info.type_id()
                     } else {
-                        return Err(
-                            RuntimeError::type_error("No active exception to re-raise").into()
-                        );
+                        return Err(RuntimeError::type_error("No active exception to re-raise"));
                     };
 
                     if type_id == 0 {
                         return Err(RuntimeError::internal(
                             "Reraise without active exception type",
-                        )
-                        .into());
+                        ));
                     }
 
-                    // Look for handler (same as Exception flow)
-                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                        let frame = &mut self.frames[self.current_frame_idx];
-                        frame.ip = handler_entry;
-                    } else {
-                        // Unwind and propagate
-                        loop {
-                            if self.frames.len() <= 1 {
-                                return Err(self.uncaught_reraised_exception_error(type_id).into());
-                            }
-
-                            self.pop_top_frame_for_unwind();
-
-                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                                let frame = &mut self.frames[self.current_frame_idx];
-                                frame.ip = handler_entry;
-                                break;
-                            }
-                        }
-                    }
+                    self.propagate_reraise_to_depth(1, type_id)?;
                 }
 
                 ControlFlow::EnterHandler {
@@ -1671,31 +1566,142 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Error(err) => {
-                    let type_id = self.materialize_active_exception_from_runtime_error(&err);
-
-                    // Try to find a handler in current frame
-                    if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                        let frame = &mut self.frames[self.current_frame_idx];
-                        frame.ip = handler_entry;
-                    } else {
-                        // Unwind stack looking for handler
-                        loop {
-                            if self.frames.len() <= 1 {
-                                // No handlers found - propagate the error
-                                return Err(err.into());
-                            }
-
-                            self.pop_top_frame_for_unwind();
-
-                            if let Some(handler_entry) = self.find_exception_handler(type_id) {
-                                let frame = &mut self.frames[self.current_frame_idx];
-                                frame.ip = handler_entry;
-                                break;
-                            }
-                        }
-                    }
+                    self.propagate_runtime_error_to_depth(1, err)?;
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn current_traceback_entry(&self) -> TracebackEntry {
+        let frame = &self.frames[self.current_frame_idx];
+        let pc = frame.ip.saturating_sub(1);
+        let line = frame
+            .code
+            .line_for_pc(pc)
+            .unwrap_or(frame.code.first_lineno);
+        TracebackEntry {
+            func_name: Arc::clone(&frame.code.name),
+            filename: Arc::clone(&frame.code.filename),
+            line,
+        }
+    }
+
+    #[inline]
+    fn prepend_traceback_entry(traceback: &mut Vec<TracebackEntry>, entry: TracebackEntry) {
+        let duplicate = traceback.first().is_some_and(|existing| {
+            existing.line == entry.line
+                && existing.func_name.as_ref() == entry.func_name.as_ref()
+                && existing.filename.as_ref() == entry.filename.as_ref()
+        });
+        if !duplicate {
+            traceback.insert(0, entry);
+        }
+    }
+
+    #[inline]
+    fn prepend_current_traceback_entry(&self, traceback: &mut Vec<TracebackEntry>) {
+        Self::prepend_traceback_entry(traceback, self.current_traceback_entry());
+    }
+
+    #[inline]
+    fn prepend_current_traceback_to_error(&self, err: &mut RuntimeError) {
+        self.prepend_current_traceback_entry(&mut err.traceback);
+    }
+
+    #[inline]
+    fn propagate_exception_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
+        let mut traceback = Vec::with_capacity(
+            self.frames
+                .len()
+                .saturating_sub(min_depth)
+                .saturating_add(1),
+        );
+        self.prepend_current_traceback_entry(&mut traceback);
+
+        loop {
+            if self.frames.len() <= min_depth {
+                let mut err = self.uncaught_exception_error(type_id);
+                err.traceback = traceback;
+                return Err(err);
+            }
+
+            self.pop_top_frame_for_unwind();
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.frames[self.current_frame_idx].ip = handler_entry;
+                return Ok(());
+            }
+
+            self.prepend_current_traceback_entry(&mut traceback);
+        }
+    }
+
+    #[inline]
+    fn propagate_reraise_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
+        let mut traceback = Vec::with_capacity(
+            self.frames
+                .len()
+                .saturating_sub(min_depth)
+                .saturating_add(1),
+        );
+        self.prepend_current_traceback_entry(&mut traceback);
+
+        loop {
+            if self.frames.len() <= min_depth {
+                let mut err = self.uncaught_reraised_exception_error(type_id);
+                err.traceback = traceback;
+                return Err(err);
+            }
+
+            self.pop_top_frame_for_unwind();
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.frames[self.current_frame_idx].ip = handler_entry;
+                return Ok(());
+            }
+
+            self.prepend_current_traceback_entry(&mut traceback);
+        }
+    }
+
+    #[inline]
+    fn propagate_runtime_error_to_depth(
+        &mut self,
+        min_depth: usize,
+        mut err: RuntimeError,
+    ) -> VmResult<()> {
+        if err.is_control_transferred() {
+            return Ok(());
+        }
+
+        let type_id = self.materialize_active_exception_from_runtime_error(&err);
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
+        self.prepend_current_traceback_to_error(&mut err);
+        loop {
+            if self.frames.len() <= min_depth {
+                return Err(err);
+            }
+
+            self.pop_top_frame_for_unwind();
+            if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.frames[self.current_frame_idx].ip = handler_entry;
+                return Ok(());
+            }
+
+            self.prepend_current_traceback_to_error(&mut err);
         }
     }
 
@@ -1745,6 +1751,7 @@ impl VirtualMachine {
                     ExceptionTypeId::ImportError.as_u8() as u16
                 }
             }
+            RuntimeErrorKind::ControlTransferred => ExceptionTypeId::RuntimeError.as_u8() as u16,
             RuntimeErrorKind::InvalidOpcode { .. } => ExceptionTypeId::SystemError.as_u8() as u16,
             RuntimeErrorKind::InternalError { .. } => ExceptionTypeId::RuntimeError.as_u8() as u16,
             RuntimeErrorKind::Exception { type_id, .. } => *type_id,
@@ -1776,11 +1783,7 @@ impl VirtualMachine {
                 path.clone(),
             ),
             _ => {
-                let error_message = err.to_string();
-                crate::builtins::create_exception(
-                    exc_type_id_enum,
-                    Some(Arc::from(error_message.as_str())),
-                )
+                crate::builtins::create_exception(exc_type_id_enum, err.python_exception_message())
             }
         };
         self.set_active_exception_with_type(exc_value, type_id);
@@ -2099,6 +2102,10 @@ impl VirtualMachine {
                         frame.set_reg(0, send_value);
                     }
                     ControlFlow::Error(err) => {
+                        if err.is_control_transferred() {
+                            continue;
+                        }
+
                         let type_id = self.materialize_active_exception_from_runtime_error(&err);
                         if !self.propagate_exception_within_generator_frames(type_id, caller_depth)
                         {
@@ -2420,6 +2427,28 @@ impl VirtualMachine {
     #[inline(always)]
     pub fn current_frame_mut(&mut self) -> &mut Frame {
         &mut self.frames[self.current_frame_idx]
+    }
+
+    /// Resolve an active frame index by caller depth from the current frame.
+    #[inline]
+    pub(crate) fn frame_index_at_depth(&self, depth: usize) -> Option<usize> {
+        let mut frame_index = self.current_frame_idx;
+        let mut remaining = depth;
+
+        while remaining > 0 {
+            let frame = self.frames.get(frame_index)?;
+            frame_index = frame.return_frame? as usize;
+            remaining -= 1;
+        }
+
+        self.frames.get(frame_index).map(|_| frame_index)
+    }
+
+    /// Get an active frame by caller depth from the current frame.
+    #[inline]
+    pub fn frame_at_depth(&self, depth: usize) -> Option<&Frame> {
+        self.frame_index_at_depth(depth)
+            .and_then(|frame_index| self.frames.get(frame_index))
     }
 
     // =========================================================================
@@ -2879,6 +2908,17 @@ impl VirtualMachine {
     #[inline]
     pub fn current_exc_info(&self) -> (Option<u16>, Option<Value>, Option<u32>) {
         self.exc_info_stack.current_exc_info()
+    }
+}
+
+fn module_export_error_to_runtime_error(err: ModuleExportError) -> RuntimeError {
+    match err {
+        ModuleExportError::InvalidAll { message, .. } => RuntimeError::type_error(message),
+        ModuleExportError::NonStringAllItem { .. } => RuntimeError::type_error(err.to_string()),
+        ModuleExportError::MissingAllAttribute { module, name } => RuntimeError::exception(
+            ExceptionTypeId::AttributeError.as_u8() as u16,
+            format!("module '{}' has no attribute '{}'", module, name),
+        ),
     }
 }
 
@@ -3568,6 +3608,53 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_in_module_runtime_reports_name_error_line() {
+        let mut vm = VirtualMachine::new();
+        let err = vm
+            .execute_in_module_runtime(
+                compile_module("x = 1\ny = missing_name\n", "traceback_name_error.py"),
+                Arc::new(ModuleObject::new("__main__")),
+            )
+            .expect_err("execution should raise a NameError");
+
+        assert_eq!(err.traceback.len(), 1);
+        assert_eq!(
+            err.traceback[0].filename.as_ref(),
+            "traceback_name_error.py"
+        );
+        assert_eq!(err.traceback[0].line, 2);
+        assert!(err.to_string().contains("missing_name"));
+    }
+
+    #[test]
+    fn test_execute_in_module_runtime_preserves_nested_traceback_frames() {
+        let mut vm = VirtualMachine::new();
+        let err = vm
+            .execute_in_module_runtime(
+                compile_module(
+                    "def inner():\n    raise ValueError('boom')\ndef outer():\n    inner()\nouter()\n",
+                    "traceback_stack.py",
+                ),
+                Arc::new(ModuleObject::new("__main__")),
+            )
+            .expect_err("execution should raise a ValueError");
+
+        let observed: Vec<_> = err
+            .traceback
+            .iter()
+            .map(|entry| (entry.func_name.as_ref().to_string(), entry.line))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("<module>".to_string(), 5),
+                ("outer".to_string(), 4),
+                ("inner".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
     fn test_import_error_to_runtime_preserves_module_not_found_metadata() {
         let err = VirtualMachine::import_error_to_runtime(ImportError::ModuleNotFound {
             module: Arc::from("pkg.missing"),
@@ -3588,6 +3675,99 @@ mod tests {
         };
         assert_eq!(exc.import_name(), Some("pkg.missing"));
         assert!(exc.import_path().is_none());
+    }
+
+    #[test]
+    fn test_import_from_with_context_loads_source_backed_submodule() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("pkg/__init__.py"), "");
+        write_file(&temp.path.join("pkg/child.py"), "VALUE = 123\n");
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let child_value = vm
+            .import_from_with_context("pkg", "child", None)
+            .expect("from pkg import child should succeed");
+        let child_ptr = child_value
+            .as_object_ptr()
+            .expect("child import should return a module object");
+        let child = vm
+            .import_resolver
+            .module_from_ptr(child_ptr)
+            .expect("returned object should map to a cached module");
+        assert_eq!(child.name(), "pkg.child");
+        assert_eq!(
+            child.get_attr("VALUE").and_then(|value| value.as_int()),
+            Some(123)
+        );
+
+        let package = vm
+            .import_module_named("pkg")
+            .expect("pkg should remain importable");
+        assert_eq!(package.get_attr("child"), Some(child_value));
+    }
+
+    #[test]
+    fn test_star_import_uses_child_module_all_without_leaking_public_names() {
+        let temp = TestTempDir::new();
+        write_file(
+            &temp.path.join("pkg/__init__.py"),
+            "from .child import *\nRESULT = VALUE\n",
+        );
+        write_file(
+            &temp.path.join("pkg/child.py"),
+            "__all__ = ('VALUE',)\nVALUE = 42\nsubprocess = 'should not leak'\n",
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let module = vm
+            .import_module_named("pkg")
+            .expect("package star import should honor child __all__");
+
+        assert_eq!(
+            module.get_attr("RESULT").and_then(|value| value.as_int()),
+            Some(42)
+        );
+        assert!(
+            module.get_attr("subprocess").is_none(),
+            "star import should not import public names omitted from __all__"
+        );
+    }
+
+    #[test]
+    fn test_import_from_with_context_preserves_nested_submodule_failure() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("pkg/__init__.py"), "");
+        write_file(
+            &temp.path.join("pkg/child.py"),
+            "import missing_dependency\nVALUE = 123\n",
+        );
+
+        let mut vm = VirtualMachine::new();
+        vm.import_resolver
+            .add_search_path(Arc::from(temp.path.to_string_lossy().into_owned()));
+
+        let err = vm
+            .import_from_with_context("pkg", "child", None)
+            .expect_err("nested import failure should propagate");
+        match err.kind {
+            RuntimeErrorKind::ImportError {
+                name,
+                missing,
+                module,
+                ..
+            } => {
+                assert!(missing);
+                assert_eq!(name.as_deref(), Some("missing_dependency"));
+                assert_eq!(module.as_ref(), "missing_dependency");
+            }
+            other => panic!("expected missing nested import error, got {other:?}"),
+        }
     }
 
     #[test]

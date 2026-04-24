@@ -8,6 +8,7 @@
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::complex::ComplexObject;
+use prism_runtime::types::int::value_to_i64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ComplexParts {
@@ -18,7 +19,10 @@ pub struct ComplexParts {
 /// Convert a value to its Python integer slot value.
 #[inline(always)]
 pub fn int_like_value(value: Value) -> Option<i64> {
-    value.as_int().or_else(|| value.as_bool().map(i64::from))
+    value
+        .as_bool()
+        .map(i64::from)
+        .or_else(|| value_to_i64(value))
 }
 
 /// Convert a value to its Python real-number slot value.

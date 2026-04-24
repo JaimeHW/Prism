@@ -17,6 +17,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::memoryview::MemoryViewObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
@@ -91,6 +92,7 @@ fn exact_truthiness(value: Value) -> Option<bool> {
         TypeId::DICT => !unsafe { &*(ptr as *const DictObject) }.is_empty(),
         TypeId::SET | TypeId::FROZENSET => !unsafe { &*(ptr as *const SetObject) }.is_empty(),
         TypeId::BYTES | TypeId::BYTEARRAY => !unsafe { &*(ptr as *const BytesObject) }.is_empty(),
+        TypeId::MEMORYVIEW => !unsafe { &*(ptr as *const MemoryViewObject) }.is_empty(),
         TypeId::DEQUE => !unsafe { &*(ptr as *const DequeObject) }.is_empty(),
         TypeId::RANGE => !unsafe { &*(ptr as *const RangeObject) }.is_empty(),
         TypeId::COMPLEX => !unsafe { &*(ptr as *const ComplexObject) }.is_zero(),
