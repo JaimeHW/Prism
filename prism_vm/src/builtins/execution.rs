@@ -16,14 +16,23 @@
 
 use super::BuiltinError;
 use crate::VirtualMachine;
+use crate::builtins::{SyntaxErrorDetails, create_exception_with_syntax_details};
+use crate::error::RuntimeError;
 use crate::import::ModuleObject;
-use crate::ops::objects::{dict_storage_mut_from_ptr, dict_storage_ref_from_ptr};
+use crate::ops::objects::{
+    alloc_heap_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
+    snapshot_frame_locals_dict,
+};
+use crate::python_numeric::int_like_value;
+use prism_compiler::compiler::CompileError;
 use prism_compiler::{Compiler, ModuleNamespaceMode, OptimizationLevel};
-use prism_core::Value;
 use prism_core::intern::intern;
-use prism_parser::parse as parse_module_source;
+use prism_core::{PrismError, Span, Value};
+use prism_parser::ast::{Expr, ExprKind, Module, Stmt, StmtKind};
+use prism_parser::{parse as parse_module_source, parse_expression};
 use prism_runtime::object::class::ClassDict;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::CodeObjectView;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::value_as_string_ref;
@@ -32,6 +41,11 @@ use std::sync::Arc;
 const DYNAMIC_EXEC_FILENAME: &str = "<string>";
 const EVAL_RESULT_NAME: &str = "__prism_eval_result__";
 const DYNAMIC_EXEC_RETURN_REG: u8 = 255;
+
+enum DynamicSource {
+    Text(String),
+    Code(Arc<prism_code::CodeObject>),
+}
 
 // =============================================================================
 // exec() - Execute Python Code
@@ -96,18 +110,32 @@ pub fn builtin_exec(args: &[Value]) -> Result<Value, BuiltinError> {
 /// VM-aware exec implementation.
 pub fn builtin_exec_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     validate_exec_args(args)?;
-    let source = dynamic_source_text(
-        args[0],
-        "exec() arg 1 must be a string, bytes or code object",
-    )?;
     let globals_arg = args.get(1).copied();
     let locals_arg = args.get(2).copied();
-    let code = compile_dynamic_module(
-        &source,
-        DYNAMIC_EXEC_FILENAME,
-        dynamic_module_namespace_mode(globals_arg, locals_arg),
-    )?;
+    let namespace_mode = dynamic_module_namespace_mode(vm, globals_arg, locals_arg);
+    let (code, clears_internal_eval_result) = match dynamic_source(
+        args[0],
+        "exec() arg 1 must be a string, bytes or code object",
+    )? {
+        DynamicSource::Text(source) => (
+            compile_source_for_mode(
+                &source,
+                DYNAMIC_EXEC_FILENAME,
+                CompileMode::Exec,
+                OptimizationLevel::None,
+                namespace_mode,
+            )?,
+            false,
+        ),
+        DynamicSource::Code(code) => {
+            let clears_internal_eval_result = code_contains_internal_eval_result(code.as_ref());
+            (code, clears_internal_eval_result)
+        }
+    };
     let mut execution = execute_dynamic_module(vm, code, globals_arg, locals_arg)?;
+    if clears_internal_eval_result {
+        clear_internal_eval_result(&execution);
+    }
     execution.write_back(None)?;
     Ok(Value::none())
 }
@@ -173,24 +201,36 @@ pub fn builtin_eval(args: &[Value]) -> Result<Value, BuiltinError> {
 /// VM-aware eval implementation.
 pub fn builtin_eval_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     validate_eval_args(args)?;
-    let source = dynamic_source_text(
-        args[0],
-        "eval() arg 1 must be a string, bytes or code object",
-    )?;
-    let wrapped = format!("{EVAL_RESULT_NAME} = ({source})\n");
     let globals_arg = args.get(1).copied();
     let locals_arg = args.get(2).copied();
-    let code = compile_dynamic_module(
-        &wrapped,
-        DYNAMIC_EXEC_FILENAME,
-        dynamic_module_namespace_mode(globals_arg, locals_arg),
-    )?;
+    let namespace_mode = dynamic_module_namespace_mode(vm, globals_arg, locals_arg);
+    let (code, expects_result) = match dynamic_source(
+        args[0],
+        "eval() arg 1 must be a string, bytes or code object",
+    )? {
+        DynamicSource::Text(source) => (
+            compile_source_for_mode(
+                &source,
+                DYNAMIC_EXEC_FILENAME,
+                CompileMode::Eval,
+                OptimizationLevel::None,
+                namespace_mode,
+            )?,
+            true,
+        ),
+        DynamicSource::Code(code) => {
+            let expects_result = code_contains_internal_eval_result(code.as_ref());
+            (code, expects_result)
+        }
+    };
     let mut execution = execute_dynamic_module(vm, code, globals_arg, locals_arg)?;
-    let result = execution
-        .read_name(EVAL_RESULT_NAME)
-        .ok_or_else(|| BuiltinError::SyntaxError("eval() did not produce a result".to_string()))?;
-    execution.delete_name(EVAL_RESULT_NAME);
-    execution.module.del_attr(EVAL_RESULT_NAME);
+    let result = if expects_result {
+        take_internal_eval_result(&execution).ok_or_else(|| {
+            BuiltinError::SyntaxError("eval() did not produce a result".to_string())
+        })?
+    } else {
+        Value::none()
+    };
     execution.write_back(Some(EVAL_RESULT_NAME))?;
     Ok(result)
 }
@@ -235,9 +275,9 @@ fn validate_eval_args(args: &[Value]) -> Result<(), BuiltinError> {
     Ok(())
 }
 
-fn dynamic_source_text(value: Value, error_message: &str) -> Result<String, BuiltinError> {
+fn dynamic_source(value: Value, error_message: &str) -> Result<DynamicSource, BuiltinError> {
     if let Some(string) = value_as_string_ref(value) {
-        return Ok(string.as_str().to_string());
+        return Ok(DynamicSource::Text(string.as_str().to_string()));
     }
 
     let Some(ptr) = value.as_object_ptr() else {
@@ -248,43 +288,251 @@ fn dynamic_source_text(value: Value, error_message: &str) -> Result<String, Buil
         TypeId::BYTES | TypeId::BYTEARRAY => {
             let bytes = unsafe { &*(ptr as *const BytesObject) };
             std::str::from_utf8(bytes.as_bytes())
-                .map(|text| text.to_string())
+                .map(|text| DynamicSource::Text(text.to_string()))
                 .map_err(|_| {
                     BuiltinError::SyntaxError(
                         "source code string cannot contain undecodable bytes".to_string(),
                     )
                 })
         }
+        TypeId::CODE => {
+            let code = unsafe { &*(ptr as *const CodeObjectView) };
+            Ok(DynamicSource::Code(Arc::clone(code.code())))
+        }
         _ => Err(BuiltinError::TypeError(error_message.to_string())),
     }
+}
+
+fn source_text_for_compile(value: Value) -> Result<String, BuiltinError> {
+    match dynamic_source(
+        value,
+        "compile() source must be a string, bytes, or AST object",
+    )? {
+        DynamicSource::Text(source) => Ok(source),
+        DynamicSource::Code(_) => Err(BuiltinError::TypeError(
+            "compile() source must be a string, bytes, or AST object".to_string(),
+        )),
+    }
+}
+
+fn compile_source_for_mode(
+    source: &str,
+    filename: &str,
+    mode: CompileMode,
+    optimize: OptimizationLevel,
+    namespace_mode: ModuleNamespaceMode,
+) -> Result<Arc<prism_code::CodeObject>, BuiltinError> {
+    match mode {
+        CompileMode::Exec | CompileMode::Single => {
+            compile_dynamic_module(source, filename, optimize, namespace_mode)
+        }
+        CompileMode::Eval => compile_dynamic_expression(source, filename, optimize, namespace_mode),
+    }
+}
+
+fn syntax_error_from_prism_error(source: &str, filename: &str, err: PrismError) -> BuiltinError {
+    let (message, span) = match err {
+        PrismError::LexError { message, span } | PrismError::SyntaxError { message, span } => {
+            (message, Some(span))
+        }
+        PrismError::CompileError { message, span } => (message, span),
+        other => return BuiltinError::SyntaxError(other.to_string()),
+    };
+
+    let message: Arc<str> = Arc::from(message);
+    let exception = create_exception_with_syntax_details(
+        crate::stdlib::exceptions::ExceptionTypeId::SyntaxError,
+        Some(message.clone()),
+        syntax_error_details(source, filename, span),
+    );
+    BuiltinError::Raised(RuntimeError::raised_exception(
+        crate::stdlib::exceptions::ExceptionTypeId::SyntaxError.as_u8() as u16,
+        exception,
+        message,
+    ))
+}
+
+fn syntax_error_details(source: &str, filename: &str, span: Option<Span>) -> SyntaxErrorDetails {
+    let Some(span) = span else {
+        return SyntaxErrorDetails::new(Some(Arc::from(filename)), None, None, None, None, None);
+    };
+
+    let (lineno, offset) = span.line_col(source);
+    let end_span = if span.end > span.start {
+        Span::new(span.end - 1, span.end)
+    } else {
+        span
+    };
+    let (end_lineno, end_offset) = end_span.line_col(source);
+
+    SyntaxErrorDetails::new(
+        Some(Arc::from(filename)),
+        u32::try_from(lineno).ok(),
+        u32::try_from(offset).ok(),
+        syntax_error_line_text(source, lineno),
+        u32::try_from(end_lineno).ok(),
+        u32::try_from(end_offset).ok(),
+    )
+}
+
+fn syntax_error_line_text(source: &str, lineno: usize) -> Option<Arc<str>> {
+    if lineno == 0 {
+        return None;
+    }
+
+    source
+        .split_inclusive('\n')
+        .nth(lineno.saturating_sub(1))
+        .or_else(|| source.lines().nth(lineno.saturating_sub(1)))
+        .map(Arc::<str>::from)
+}
+
+fn syntax_error_from_compile_error(
+    source: &str,
+    filename: &str,
+    err: CompileError,
+) -> BuiltinError {
+    let message: Arc<str> = Arc::from(err.message);
+    let lineno = Some(err.line.max(1));
+    let offset = Some(err.column.saturating_add(1));
+    let exception = create_exception_with_syntax_details(
+        crate::stdlib::exceptions::ExceptionTypeId::SyntaxError,
+        Some(message.clone()),
+        SyntaxErrorDetails::new(
+            Some(Arc::from(filename)),
+            lineno,
+            offset,
+            syntax_error_line_text(source, err.line.max(1) as usize),
+            lineno,
+            offset,
+        ),
+    );
+    BuiltinError::Raised(RuntimeError::raised_exception(
+        crate::stdlib::exceptions::ExceptionTypeId::SyntaxError.as_u8() as u16,
+        exception,
+        message,
+    ))
 }
 
 fn compile_dynamic_module(
     source: &str,
     filename: &str,
+    optimize: OptimizationLevel,
     namespace_mode: ModuleNamespaceMode,
 ) -> Result<Arc<prism_code::CodeObject>, BuiltinError> {
-    let parsed =
-        parse_module_source(source).map_err(|err| BuiltinError::SyntaxError(err.to_string()))?;
-    Compiler::compile_module_with_namespace_mode(
-        &parsed,
-        filename,
-        OptimizationLevel::None,
-        namespace_mode,
-    )
-    .map(Arc::new)
-    .map_err(|err| BuiltinError::SyntaxError(err.to_string()))
+    let parsed = parse_module_source(source)
+        .map_err(|err| syntax_error_from_prism_error(source, filename, err))?;
+    Compiler::compile_module_with_namespace_mode(&parsed, filename, optimize, namespace_mode)
+        .map(Arc::new)
+        .map_err(|err| syntax_error_from_compile_error(source, filename, err))
+}
+
+fn compile_dynamic_expression(
+    source: &str,
+    filename: &str,
+    optimize: OptimizationLevel,
+    namespace_mode: ModuleNamespaceMode,
+) -> Result<Arc<prism_code::CodeObject>, BuiltinError> {
+    let expr = parse_expression(source)
+        .map_err(|err| syntax_error_from_prism_error(source, filename, err))?;
+    let span = Span::dummy();
+    let target = Expr::new(ExprKind::Name(EVAL_RESULT_NAME.to_string()), span);
+    let assign = Stmt::new(
+        StmtKind::Assign {
+            targets: vec![target],
+            value: Box::new(expr),
+        },
+        span,
+    );
+    let module = Module::new(vec![assign], span);
+    Compiler::compile_module_with_namespace_mode(&module, filename, optimize, namespace_mode)
+        .map(Arc::new)
+        .map_err(|err| syntax_error_from_compile_error(source, filename, err))
+}
+
+fn code_contains_internal_eval_result(code: &prism_code::CodeObject) -> bool {
+    code.locals
+        .iter()
+        .chain(code.names.iter())
+        .any(|name| name.as_ref() == EVAL_RESULT_NAME)
+}
+
+fn clear_internal_eval_result(execution: &DynamicExecution) {
+    execution.delete_name(EVAL_RESULT_NAME);
+    execution.module.del_attr(EVAL_RESULT_NAME);
+}
+
+fn take_internal_eval_result(execution: &DynamicExecution) -> Option<Value> {
+    let result = execution.read_name(EVAL_RESULT_NAME);
+    if result.is_some() {
+        clear_internal_eval_result(execution);
+    }
+    result
+}
+
+fn compile_filename_arg(value: Value) -> Result<String, BuiltinError> {
+    value_as_string_ref(value)
+        .map(|value| value.as_str().to_string())
+        .ok_or_else(|| BuiltinError::TypeError("compile() arg 2 must be a string".to_string()))
+}
+
+fn compile_mode_arg(value: Value) -> Result<CompileMode, BuiltinError> {
+    let mode = value_as_string_ref(value)
+        .ok_or_else(|| BuiltinError::TypeError("compile() arg 3 must be a string".to_string()))?;
+    CompileMode::from_str(mode.as_str()).ok_or_else(|| {
+        BuiltinError::ValueError("compile() mode must be 'exec', 'eval' or 'single'".to_string())
+    })
+}
+
+fn optional_compile_int_arg(
+    value: Option<Value>,
+    index: usize,
+    label: &str,
+) -> Result<Option<i64>, BuiltinError> {
+    value
+        .map(|value| {
+            int_like_value(value).ok_or_else(|| {
+                BuiltinError::TypeError(format!(
+                    "compile() arg {index} ({label}) must be an integer"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn compile_optimize_arg(value: Option<Value>) -> Result<OptimizationLevel, BuiltinError> {
+    let optimize = optional_compile_int_arg(value, 6, "optimize")?.unwrap_or(-1);
+    match optimize {
+        -1 | 0 => Ok(OptimizationLevel::None),
+        1 => Ok(OptimizationLevel::Basic),
+        2 => Ok(OptimizationLevel::Full),
+        _ => Err(BuiltinError::ValueError(
+            "compile() optimize value must be -1, 0, 1, or 2".to_string(),
+        )),
+    }
+}
+
+fn boxed_code_value(code: Arc<prism_code::CodeObject>) -> Value {
+    Value::object_ptr(Box::into_raw(Box::new(CodeObjectView::new(code))) as *const ())
 }
 
 fn dynamic_module_namespace_mode(
+    vm: &VirtualMachine,
     globals_arg: Option<Value>,
     locals_arg: Option<Value>,
 ) -> ModuleNamespaceMode {
+    let globals_arg = globals_arg.filter(|value| !value.is_none());
+    let locals_arg = locals_arg.filter(|value| !value.is_none());
+
     if uses_dynamic_locals_mapping(locals_arg) {
         return ModuleNamespaceMode::DynamicLocals;
     }
 
     if locals_arg.is_none() && uses_dynamic_locals_mapping(globals_arg) {
+        return ModuleNamespaceMode::DynamicLocals;
+    }
+
+    if globals_arg.is_none() && locals_arg.is_none() && vm.call_depth() > 0 {
         return ModuleNamespaceMode::DynamicLocals;
     }
 
@@ -306,6 +554,30 @@ fn uses_dynamic_locals_mapping(arg: Option<Value>) -> bool {
 enum NamespaceTarget {
     Dict(*mut DictObject),
     Module(Arc<ModuleObject>),
+}
+
+fn default_dynamic_locals_target(
+    vm: &mut VirtualMachine,
+) -> Result<Option<NamespaceTarget>, BuiltinError> {
+    if vm.call_depth() == 0 {
+        return Ok(None);
+    }
+
+    if let Some(mapping) = vm
+        .current_frame()
+        .locals_mapping()
+        .filter(|value| !value.is_none())
+    {
+        return namespace_target_for_value(vm, mapping, "locals").map(Some);
+    }
+
+    let snapshot = snapshot_frame_locals_dict(vm.current_frame());
+    let snapshot_value =
+        alloc_heap_value(vm, snapshot, "dynamic locals snapshot").map_err(BuiltinError::Raised)?;
+    let dict_ptr = snapshot_value
+        .as_object_ptr()
+        .expect("dynamic locals snapshot should allocate a dict");
+    Ok(Some(NamespaceTarget::Dict(dict_ptr as *mut DictObject)))
 }
 
 struct DynamicExecution {
@@ -374,31 +646,12 @@ fn execute_dynamic_module(
     let globals_arg = globals_arg.filter(|value| !value.is_none());
     let locals_arg = locals_arg.filter(|value| !value.is_none());
 
-    if globals_arg.is_none() && locals_arg.is_none() {
+    if globals_arg.is_none() && locals_arg.is_none() && vm.call_depth() == 0 {
         let module = vm
             .current_module_cloned()
             .unwrap_or_else(|| Arc::new(ModuleObject::new("__main__")));
-        if vm.call_depth() == 0 {
-            vm.execute_in_module(code, Arc::clone(&module))
-                .map_err(|err| BuiltinError::Raised(err.into()))?;
-        } else {
-            let stop_depth = vm.call_depth();
-            let saved_return_reg = vm.current_frame().get_reg(DYNAMIC_EXEC_RETURN_REG);
-
-            vm.push_frame_with_module(code, DYNAMIC_EXEC_RETURN_REG, Some(Arc::clone(&module)))
-                .map_err(BuiltinError::Raised)?;
-
-            let nested_result = vm
-                .execute_until_stack_depth_restored(stop_depth, DYNAMIC_EXEC_RETURN_REG)
-                .map_err(BuiltinError::Raised);
-
-            if vm.call_depth() == stop_depth {
-                vm.current_frame_mut()
-                    .set_reg(DYNAMIC_EXEC_RETURN_REG, saved_return_reg);
-            }
-
-            nested_result?;
-        }
+        vm.execute_in_module(code, Arc::clone(&module))
+            .map_err(|err| BuiltinError::Raised(err.into()))?;
         return Ok(DynamicExecution {
             module,
             globals_target: None,
@@ -406,12 +659,23 @@ fn execute_dynamic_module(
         });
     }
 
-    let globals_target = globals_arg
-        .map(|value| namespace_target_for_value(vm, value, "globals"))
-        .transpose()?;
-    let locals_target = locals_arg
-        .map(|value| namespace_target_for_value(vm, value, "locals"))
-        .transpose()?;
+    let globals_target = if let Some(value) = globals_arg {
+        Some(namespace_target_for_value(vm, value, "globals")?)
+    } else if locals_arg.is_none() {
+        Some(NamespaceTarget::Module(
+            vm.current_module_cloned()
+                .unwrap_or_else(|| Arc::new(ModuleObject::new("__main__"))),
+        ))
+    } else {
+        None
+    };
+    let locals_target = if let Some(value) = locals_arg {
+        Some(namespace_target_for_value(vm, value, "locals")?)
+    } else if globals_arg.is_none() {
+        default_dynamic_locals_target(vm)?
+    } else {
+        None
+    };
 
     let module = Arc::new(ModuleObject::new("__dynamic_exec__"));
     if let Some(target) = globals_target.as_ref() {
@@ -623,34 +887,20 @@ pub fn builtin_compile(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let source = &args[0];
-    let _filename = &args[1];
-    let _mode = &args[2];
-
-    // Validate source type
-    if source.is_none() {
-        return Err(BuiltinError::TypeError(
-            "compile() source must be a string, bytes, or AST object".to_string(),
-        ));
-    }
-
-    if source.is_int() || source.is_float() || source.is_bool() {
-        return Err(BuiltinError::TypeError(
-            "compile() source must be a string, bytes, or AST object".to_string(),
-        ));
-    }
-
-    // TODO: Validate filename is a string
-    // TODO: Validate mode is 'exec', 'eval', or 'single'
-    // TODO: Validate optional arguments
-
-    // TODO: Implement actual compilation
-    // 1. Parse the source code
-    // 2. Compile to bytecode
-    // 3. Return a code object
-    Err(BuiltinError::NotImplemented(
-        "compile() requires compiler integration".to_string(),
-    ))
+    let source = source_text_for_compile(args[0])?;
+    let filename = compile_filename_arg(args[1])?;
+    let mode = compile_mode_arg(args[2])?;
+    let _flags = optional_compile_int_arg(args.get(3).copied(), 4, "flags")?;
+    let _dont_inherit = optional_compile_int_arg(args.get(4).copied(), 5, "dont_inherit")?;
+    let optimize = compile_optimize_arg(args.get(5).copied())?;
+    let code = compile_source_for_mode(
+        &source,
+        &filename,
+        mode,
+        optimize,
+        ModuleNamespaceMode::Standard,
+    )?;
+    Ok(boxed_code_value(code))
 }
 
 // =============================================================================
@@ -687,6 +937,10 @@ pub fn builtin_breakpoint(args: &[Value]) -> Result<Value, BuiltinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_code::CodeObject;
+    use prism_runtime::object::ObjectHeader;
+    use prism_runtime::types::TupleObject;
+    use std::sync::Arc;
 
     fn leaked_dict_value() -> (*mut DictObject, Value) {
         let dict_ptr = Box::into_raw(Box::new(DictObject::new()));
@@ -701,6 +955,13 @@ mod tests {
     fn dict_set(dict_ptr: *mut DictObject, name: &str, value: Value) {
         let dict = unsafe { &mut *dict_ptr };
         dict.set(Value::string(intern(name)), value);
+    }
+
+    fn code_view_from_value(value: Value) -> &'static CodeObjectView {
+        let ptr = value.as_object_ptr().expect("expected code object view");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::CODE);
+        unsafe { &*(ptr as *const CodeObjectView) }
     }
 
     // =========================================================================
@@ -942,6 +1203,31 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_vm_defaults_to_current_frame_locals_when_nested() {
+        let mut vm = VirtualMachine::new();
+        let mut code = CodeObject::new("outer", "<test>");
+        code.register_count = 4;
+        code.locals = vec![Arc::from("args")].into_boxed_slice();
+        vm.push_frame(Arc::new(code), 0)
+            .expect("frame push should succeed");
+
+        let args_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
+            Value::int(7).unwrap(),
+            Value::int(42).unwrap(),
+        ])));
+        let args_value = Value::object_ptr(args_ptr as *const ());
+        vm.current_frame_mut().set_reg(0, args_value);
+
+        let result = builtin_eval_vm(&mut vm, &[Value::string(intern("args[1]"))])
+            .expect("nested eval should see the caller's locals");
+
+        assert_eq!(result.as_int(), Some(42));
+        unsafe {
+            drop(Box::from_raw(args_ptr));
+        }
+    }
+
+    #[test]
     fn test_eval_vm_propagates_missing_name_errors_without_panicking() {
         let mut vm = VirtualMachine::new();
 
@@ -1032,6 +1318,113 @@ mod tests {
             Err(BuiltinError::TypeError(_)) => {}
             _ => panic!("Expected TypeError"),
         }
+    }
+
+    #[test]
+    fn test_compile_returns_code_object_for_eval_mode() {
+        let code = builtin_compile(&[
+            Value::string(intern("40 + 2")),
+            Value::string(intern("<test>")),
+            Value::string(intern("eval")),
+        ])
+        .expect("compile should succeed");
+
+        let view = code_view_from_value(code);
+        assert!(code_contains_internal_eval_result(view.code().as_ref()));
+    }
+
+    #[test]
+    fn test_compile_accepts_future_flags_argument() {
+        let code = builtin_compile(&[
+            Value::string(intern("pass")),
+            Value::string(intern("<test>")),
+            Value::string(intern("exec")),
+            Value::int(0x20_000).unwrap(),
+        ])
+        .expect("compile should accept future flags");
+
+        let ptr = code
+            .as_object_ptr()
+            .expect("compile should return a code object");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::CODE);
+    }
+
+    #[test]
+    fn test_compile_syntax_error_preserves_filename_metadata() {
+        let err = builtin_compile(&[
+            Value::string(intern("if True\n    pass\n")),
+            Value::string(intern("demo.py")),
+            Value::string(intern("exec")),
+        ])
+        .expect_err("compile should raise SyntaxError metadata");
+
+        let BuiltinError::Raised(runtime) = err else {
+            panic!("expected raised SyntaxError, got {err:?}");
+        };
+        let raised = runtime
+            .raised_value
+            .expect("raised SyntaxError should preserve exception object");
+        let exc = unsafe {
+            crate::builtins::ExceptionValue::from_value(raised)
+                .expect("raised value should be an exception")
+        };
+        assert_eq!(
+            exc.type_id(),
+            crate::stdlib::exceptions::ExceptionTypeId::SyntaxError
+        );
+        assert_eq!(exc.syntax_filename(), Some("demo.py"));
+        assert_eq!(exc.syntax_lineno(), Some(1));
+        assert!(exc.syntax_offset().is_some());
+        assert_eq!(exc.syntax_text(), Some("if True\n"));
+    }
+
+    #[test]
+    fn test_eval_vm_accepts_compiled_code_object() {
+        let mut vm = VirtualMachine::new();
+        let (globals_ptr, globals) = leaked_dict_value();
+        dict_set(globals_ptr, "x", Value::int(40).unwrap());
+
+        let code = builtin_compile(&[
+            Value::string(intern("x + 2")),
+            Value::string(intern("<test>")),
+            Value::string(intern("eval")),
+        ])
+        .expect("compile should succeed");
+
+        let result = builtin_eval_vm(&mut vm, &[code, globals]).expect("eval should succeed");
+        assert_eq!(result.as_int(), Some(42));
+        assert!(dict_get(globals_ptr, EVAL_RESULT_NAME).is_none());
+    }
+
+    #[test]
+    fn test_eval_vm_returns_none_for_exec_mode_code_object() {
+        let mut vm = VirtualMachine::new();
+        let code = builtin_compile(&[
+            Value::string(intern("x = 1")),
+            Value::string(intern("<test>")),
+            Value::string(intern("exec")),
+        ])
+        .expect("compile should succeed");
+
+        let result = builtin_eval_vm(&mut vm, &[code]).expect("eval should accept code object");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_exec_vm_cleans_internal_binding_from_compiled_eval_code_object() {
+        let mut vm = VirtualMachine::new();
+        let (globals_ptr, globals) = leaked_dict_value();
+
+        let code = builtin_compile(&[
+            Value::string(intern("40 + 2")),
+            Value::string(intern("<test>")),
+            Value::string(intern("eval")),
+        ])
+        .expect("compile should succeed");
+
+        builtin_exec_vm(&mut vm, &[code, globals]).expect("exec should accept code object");
+        assert!(dict_get(globals_ptr, EVAL_RESULT_NAME).is_none());
     }
 
     // =========================================================================

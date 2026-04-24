@@ -1,5 +1,5 @@
 use crate::VirtualMachine;
-use crate::builtins::BuiltinFunctionObject;
+use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use crate::error::RuntimeError;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
@@ -49,6 +49,11 @@ static TYPE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
         super::types::builtin_type_new_with_vm,
     )
 });
+static TYPE_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("type.__init__"), super::types::builtin_type_init)
+});
+static TYPE_PREPARE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("type.__prepare__"), type_prepare));
 static TUPLE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("tuple.__new__"), super::types::builtin_tuple_new)
 });
@@ -82,6 +87,15 @@ static BOOL_FROM_BYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
         super::types::builtin_int_from_bytes,
     )
 });
+static BYTES_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytes.__new__"), super::types::builtin_bytes_new)
+});
+static BYTEARRAY_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("bytearray.__new__"),
+        super::types::builtin_bytearray_new,
+    )
+});
 static LIST_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("list.__new__"), super::types::builtin_list_new)
 });
@@ -95,6 +109,12 @@ static FROZENSET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| 
     BuiltinFunctionObject::new(
         Arc::from("frozenset.__new__"),
         super::types::builtin_frozenset_new,
+    )
+});
+static MODULE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("module.__new__"),
+        super::types::builtin_module_new,
     )
 });
 
@@ -132,6 +152,14 @@ const TYPE_ATTRS: &[AttrSpec] = &[
         kind: ReflectedValueKind::DictProxy,
     },
     NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__init__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+    AttrSpec {
+        name: "__prepare__",
+        kind: ReflectedValueKind::ClassMethodDescriptor,
+    },
 ];
 
 const OBJECT_TYPE_ATTRS: &[AttrSpec] = &[
@@ -190,6 +218,10 @@ const BOOL_TYPE_ATTRS: &[AttrSpec] = &[
     },
 ];
 
+const BYTES_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const BYTEARRAY_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
 const LIST_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
 const TUPLE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
@@ -209,6 +241,8 @@ const DICT_TYPE_ATTRS: &[AttrSpec] = &[
 const SET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
 const FROZENSET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const MODULE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
 const FUNCTION_TYPE_ATTRS: &[AttrSpec] = &[
     AttrSpec {
@@ -241,12 +275,14 @@ const DICT_METHOD_NAMES: &[&str] = &[
     "values",
     "items",
     "pop",
+    "popitem",
     "setdefault",
     "clear",
     "update",
     "copy",
 ];
-const OBJECT_METHOD_NAMES: &[&str] = &["__eq__", "__ne__"];
+const OBJECT_METHOD_NAMES: &[&str] = &["__eq__", "__ne__", "__setattr__", "__delattr__"];
+const INT_METHOD_NAMES: &[&str] = &["__add__", "bit_length", "bit_count", "to_bytes"];
 const STR_METHOD_NAMES: &[&str] = &[
     "upper",
     "replace",
@@ -254,6 +290,7 @@ const STR_METHOD_NAMES: &[&str] = &[
     "isidentifier",
     "startswith",
     "endswith",
+    "rpartition",
 ];
 const SET_METHOD_NAMES: &[&str] = &[
     "add",
@@ -265,15 +302,42 @@ const SET_METHOD_NAMES: &[&str] = &[
     "difference_update",
     "intersection_update",
     "symmetric_difference_update",
+    "union",
+    "intersection",
+    "difference",
+    "symmetric_difference",
+    "isdisjoint",
+    "issubset",
+    "issuperset",
     "copy",
     "__contains__",
 ];
-const FROZENSET_METHOD_NAMES: &[&str] = &["copy", "__contains__"];
+const FROZENSET_METHOD_NAMES: &[&str] = &[
+    "union",
+    "intersection",
+    "difference",
+    "symmetric_difference",
+    "isdisjoint",
+    "issubset",
+    "issuperset",
+    "copy",
+    "__contains__",
+];
 const BYTEARRAY_METHOD_NAMES: &[&str] = &["copy"];
-const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__"];
+const TUPLE_METHOD_NAMES: &[&str] = &["__iter__", "__len__", "__getitem__", "count", "index"];
+const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
 const PROPERTY_METHOD_NAMES: &[&str] = &["getter", "setter", "deleter"];
-const REGEX_PATTERN_METHOD_NAMES: &[&str] = &["match", "search", "fullmatch"];
+const REGEX_PATTERN_METHOD_NAMES: &[&str] = &[
+    "match",
+    "search",
+    "fullmatch",
+    "findall",
+    "finditer",
+    "sub",
+    "subn",
+    "split",
+];
 const REGEX_MATCH_METHOD_NAMES: &[&str] = &["group", "groups", "groupdict", "start", "end", "span"];
 
 #[inline]
@@ -285,11 +349,14 @@ fn builtin_type_attr_specs(type_id: TypeId) -> &'static [AttrSpec] {
         TypeId::FLOAT => FLOAT_TYPE_ATTRS,
         TypeId::STR => STR_TYPE_ATTRS,
         TypeId::BOOL => BOOL_TYPE_ATTRS,
+        TypeId::BYTES => BYTES_TYPE_ATTRS,
+        TypeId::BYTEARRAY => BYTEARRAY_TYPE_ATTRS,
         TypeId::LIST => LIST_TYPE_ATTRS,
         TypeId::TUPLE => TUPLE_TYPE_ATTRS,
         TypeId::DICT => DICT_TYPE_ATTRS,
         TypeId::SET => SET_TYPE_ATTRS,
         TypeId::FROZENSET => FROZENSET_TYPE_ATTRS,
+        TypeId::MODULE => MODULE_TYPE_ATTRS,
         TypeId::FUNCTION => FUNCTION_TYPE_ATTRS,
         _ => &[],
     }
@@ -309,10 +376,12 @@ fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
         TypeId::DEQUE => DEQUE_METHOD_NAMES,
         TypeId::DICT => DICT_METHOD_NAMES,
         TypeId::OBJECT => OBJECT_METHOD_NAMES,
+        TypeId::INT => INT_METHOD_NAMES,
         TypeId::STR => STR_METHOD_NAMES,
         TypeId::SET => SET_METHOD_NAMES,
         TypeId::FROZENSET => FROZENSET_METHOD_NAMES,
         TypeId::BYTEARRAY => BYTEARRAY_METHOD_NAMES,
+        TypeId::TUPLE => TUPLE_METHOD_NAMES,
         TypeId::ITERATOR => ITERATOR_METHOD_NAMES,
         TypeId::GENERATOR => GENERATOR_METHOD_NAMES,
         TypeId::PROPERTY => PROPERTY_METHOD_NAMES,
@@ -428,9 +497,25 @@ fn builtin_type_doc_value(owner: TypeId) -> Value {
     }
 }
 
+const NONE_TYPE_DOC: &str = "The type of the None singleton.";
+
 #[inline]
-fn builtin_type_doc(_owner: TypeId) -> Option<&'static str> {
-    None
+fn builtin_type_doc(owner: TypeId) -> Option<&'static str> {
+    match owner {
+        TypeId::NONE => Some(NONE_TYPE_DOC),
+        _ => None,
+    }
+}
+
+fn type_prepare(args: &[Value], _keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    if args.len() != 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "type.__prepare__() takes 2 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    Ok(leak_object_value(DictObject::new()))
 }
 
 #[inline]
@@ -449,29 +534,36 @@ fn builtin_method_value(method: &'static BuiltinFunctionObject) -> Value {
 pub(crate) fn builtin_type_method_value(owner: TypeId, name: &str) -> Option<Value> {
     crate::ops::method_dispatch::resolve_builtin_instance_method(owner, name)
         .map(|cached| cached.method)
-        .or_else(|| match (owner, name) {
-            (TypeId::TYPE, "__new__") => Some(builtin_method_value(&TYPE_NEW_METHOD)),
-            (TypeId::INT, "__new__") => Some(builtin_method_value(&INT_NEW_METHOD)),
-            (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
-            (TypeId::FLOAT, "__new__") => Some(builtin_method_value(&FLOAT_NEW_METHOD)),
-            (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
-            (TypeId::STR, "maketrans") => Some(builtin_method_value(&STR_MAKETRANS_METHOD)),
-            (TypeId::STR, "__new__") => Some(builtin_method_value(&STR_NEW_METHOD)),
-            (TypeId::BOOL, "__new__") => Some(builtin_method_value(&BOOL_NEW_METHOD)),
-            (TypeId::BOOL, "from_bytes") => Some(builtin_method_value(&BOOL_FROM_BYTES_METHOD)),
-            (TypeId::LIST, "__new__") => Some(builtin_method_value(&LIST_NEW_METHOD)),
-            (TypeId::DICT, "__new__") => Some(builtin_method_value(&DICT_NEW_METHOD)),
-            (TypeId::SET, "__new__") => Some(builtin_method_value(&SET_NEW_METHOD)),
-            (TypeId::FROZENSET, "__new__") => Some(builtin_method_value(&FROZENSET_NEW_METHOD)),
-            (TypeId::OBJECT, "__new__") => Some(builtin_method_value(&OBJECT_NEW_METHOD)),
-            (TypeId::TUPLE, "__new__") => Some(builtin_method_value(&TUPLE_NEW_METHOD)),
-            _ => None,
-        })
+        .or_else(|| builtin_type_static_method_value(owner, name))
+        .or_else(|| builtin_type_class_method_value(owner, name))
+}
+
+#[inline]
+fn builtin_type_static_method_value(owner: TypeId, name: &str) -> Option<Value> {
+    match (owner, name) {
+        (TypeId::TYPE, "__new__") => Some(builtin_method_value(&TYPE_NEW_METHOD)),
+        (TypeId::OBJECT, "__new__") => Some(builtin_method_value(&OBJECT_NEW_METHOD)),
+        (TypeId::INT, "__new__") => Some(builtin_method_value(&INT_NEW_METHOD)),
+        (TypeId::FLOAT, "__new__") => Some(builtin_method_value(&FLOAT_NEW_METHOD)),
+        (TypeId::STR, "__new__") => Some(builtin_method_value(&STR_NEW_METHOD)),
+        (TypeId::STR, "maketrans") => Some(builtin_method_value(&STR_MAKETRANS_METHOD)),
+        (TypeId::BOOL, "__new__") => Some(builtin_method_value(&BOOL_NEW_METHOD)),
+        (TypeId::BYTES, "__new__") => Some(builtin_method_value(&BYTES_NEW_METHOD)),
+        (TypeId::BYTEARRAY, "__new__") => Some(builtin_method_value(&BYTEARRAY_NEW_METHOD)),
+        (TypeId::LIST, "__new__") => Some(builtin_method_value(&LIST_NEW_METHOD)),
+        (TypeId::TUPLE, "__new__") => Some(builtin_method_value(&TUPLE_NEW_METHOD)),
+        (TypeId::DICT, "__new__") => Some(builtin_method_value(&DICT_NEW_METHOD)),
+        (TypeId::SET, "__new__") => Some(builtin_method_value(&SET_NEW_METHOD)),
+        (TypeId::FROZENSET, "__new__") => Some(builtin_method_value(&FROZENSET_NEW_METHOD)),
+        (TypeId::MODULE, "__new__") => Some(builtin_method_value(&MODULE_NEW_METHOD)),
+        _ => None,
+    }
 }
 
 #[inline]
 fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
     match (owner, name) {
+        (TypeId::TYPE, "__prepare__") => Some(builtin_method_value(&TYPE_PREPARE_METHOD)),
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
         (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
@@ -486,6 +578,7 @@ fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
 #[inline]
 fn builtin_type_class_method_value(owner: TypeId, name: &str) -> Option<Value> {
     match (owner, name) {
+        (TypeId::TYPE, "__prepare__") => Some(builtin_method_value(&TYPE_PREPARE_METHOD)),
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
         (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
@@ -505,6 +598,7 @@ pub(crate) fn reflected_descriptor_callable_value(
     match descriptor_type {
         TypeId::WRAPPER_DESCRIPTOR => match (owner, name.as_str()) {
             (TypeId::OBJECT, "__init__") => Some(builtin_method_value(&OBJECT_INIT_METHOD)),
+            (TypeId::TYPE, "__init__") => Some(builtin_method_value(&TYPE_INIT_METHOD)),
             _ => builtin_type_method_value(owner, name.as_str()),
         },
         TypeId::METHOD_DESCRIPTOR => builtin_type_method_value(owner, name.as_str()),
@@ -681,6 +775,41 @@ fn user_type_direct_bases(class: &PyClassObject) -> Vec<ClassId> {
 
 #[inline]
 fn resolve_heap_type_mro_value(
+    vm: &mut VirtualMachine,
+    class: &PyClassObject,
+    name: &InternedString,
+    owner_value: Value,
+    mut resolve_builtin: impl FnMut(&mut VirtualMachine, TypeId) -> Result<Option<Value>, RuntimeError>,
+) -> Result<Option<Value>, RuntimeError> {
+    for &class_id in class.mro() {
+        if class_id == class.class_id() {
+            if let Some(value) = class.get_attr(name) {
+                return crate::ops::objects::resolve_class_attribute_in_vm(vm, value, owner_value)
+                    .map(Some);
+            }
+            continue;
+        }
+
+        if class_id.0 < TypeId::FIRST_USER_TYPE {
+            if let Some(value) = resolve_builtin(vm, class_id_to_type_id(class_id))? {
+                return Ok(Some(value));
+            }
+            continue;
+        }
+
+        if let Some(parent) = global_class(class_id)
+            && let Some(value) = parent.get_attr(name)
+        {
+            return crate::ops::objects::resolve_class_attribute_in_vm(vm, value, owner_value)
+                .map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+#[inline]
+fn resolve_heap_type_mro_value_static(
     class: &PyClassObject,
     name: &InternedString,
     owner_value: Value,
@@ -773,7 +902,7 @@ fn user_type_attribute_value(
                 .get_attr(&intern("__module__"))
                 .unwrap_or_else(|| Value::string(intern("__main__"))),
         )),
-        _ => resolve_heap_type_mro_value(class, name, owner_value, |owner| {
+        _ => resolve_heap_type_mro_value(vm, class, name, owner_value, |vm, owner| {
             builtin_bound_type_attribute_value(vm, owner, owner_value, name)
         }),
     }
@@ -821,7 +950,7 @@ fn user_type_attribute_value_static(
                 .get_attr(&intern("__module__"))
                 .unwrap_or_else(|| Value::string(intern("__main__"))),
         )),
-        _ => resolve_heap_type_mro_value(class, name, owner_value, |owner| {
+        _ => resolve_heap_type_mro_value_static(class, name, owner_value, |owner| {
             builtin_bound_type_attribute_value_static(owner, owner_value, name)
         }),
     }
@@ -971,6 +1100,19 @@ pub(crate) fn builtin_bound_type_attribute_value(
     )))
 }
 
+pub(crate) fn builtin_type_object_attribute_value(
+    vm: &mut VirtualMachine,
+    owner: TypeId,
+    owner_value: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(value) = builtin_type_class_or_static_attribute_value(owner, owner_value, name) {
+        return Ok(Some(value));
+    }
+
+    builtin_type_attribute_value(vm, owner, name)
+}
+
 pub(crate) fn builtin_bound_type_attribute_value_static(
     owner: TypeId,
     owner_value: Value,
@@ -1010,10 +1152,37 @@ pub(crate) fn builtin_bound_type_attribute_value_static(
     )))
 }
 
+pub(crate) fn builtin_type_class_or_static_attribute_value_static(
+    owner: TypeId,
+    owner_value: Value,
+    name: &InternedString,
+) -> Option<Value> {
+    builtin_type_class_or_static_attribute_value(owner, owner_value, name)
+}
+
+fn builtin_type_class_or_static_attribute_value(
+    owner: TypeId,
+    owner_value: Value,
+    name: &InternedString,
+) -> Option<Value> {
+    if let Some(method) = builtin_type_bound_method_value(owner, name.as_str()) {
+        let ptr = method
+            .as_object_ptr()
+            .expect("builtin type method values must be heap-allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let bound = Box::leak(Box::new(builtin.bind(owner_value)));
+        return Some(Value::object_ptr(
+            bound as *mut BuiltinFunctionObject as *const (),
+        ));
+    }
+
+    builtin_type_static_method_value(owner, name.as_str())
+}
+
 #[inline]
 fn bind_builtin_type_method_if_needed(method: Value, owner_value: Value) -> Value {
     if should_bind_builtin_type_callable(owner_value) {
-        crate::ops::objects::bind_instance_attribute(method, owner_value)
+        crate::ops::objects::bind_cached_builtin_method(method, owner_value)
     } else {
         method
     }
@@ -1038,14 +1207,17 @@ fn bind_reflected_descriptor_if_needed(
         return value;
     };
 
-    crate::ops::objects::bind_instance_attribute(target, owner_value)
+    crate::ops::objects::bind_cached_builtin_method(target, owner_value)
 }
 
 #[inline]
 fn should_bind_builtin_type_callable(owner_value: Value) -> bool {
-    owner_value
-        .as_object_ptr()
-        .is_some_and(|ptr| crate::ops::objects::extract_type_id(ptr) != TypeId::TYPE)
+    !owner_value.as_object_ptr().is_some_and(|ptr| {
+        matches!(
+            crate::ops::objects::extract_type_id(ptr),
+            TypeId::TYPE | TypeId::EXCEPTION_TYPE
+        )
+    })
 }
 
 #[inline]
@@ -1195,6 +1367,7 @@ pub(crate) fn builtin_instance_attribute_value(
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
     match (type_id, name.as_str()) {
+        (TypeId::NONE, "__doc__") => Ok(Some(Value::string(intern(NONE_TYPE_DOC)))),
         (TypeId::INT, "real") | (TypeId::INT, "numerator") => Ok(Some(receiver)),
         (TypeId::INT, "imag") => Ok(Some(Value::int(0).expect("zero should fit"))),
         (TypeId::INT, "denominator") => Ok(Some(Value::int(1).expect("one should fit"))),
@@ -1222,7 +1395,8 @@ pub(crate) fn builtin_instance_attribute_value(
 pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedString) -> bool {
     matches!(
         (type_id, name.as_str()),
-        (TypeId::OBJECT, "__str__")
+        (TypeId::NONE, "__doc__")
+            | (TypeId::OBJECT, "__str__")
             | (TypeId::INT, "real" | "imag" | "numerator" | "denominator")
             | (TypeId::BOOL, "real" | "imag" | "numerator" | "denominator")
     )
@@ -1268,6 +1442,14 @@ mod tests {
             TypeId::OBJECT,
             &intern("__init__")
         ));
+        assert!(builtin_type_has_attribute(
+            TypeId::OBJECT,
+            &intern("__setattr__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::OBJECT,
+            &intern("__delattr__")
+        ));
         assert!(builtin_type_has_attribute(TypeId::TYPE, &intern("__new__")));
         assert!(builtin_type_has_attribute(
             TypeId::OBJECT,
@@ -1280,6 +1462,14 @@ mod tests {
         ));
         assert!(builtin_type_has_attribute(TypeId::STR, &intern("__new__")));
         assert!(builtin_type_has_attribute(TypeId::BOOL, &intern("__new__")));
+        assert!(builtin_type_has_attribute(
+            TypeId::BYTES,
+            &intern("__new__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::BYTEARRAY,
+            &intern("__new__")
+        ));
         assert!(builtin_type_has_attribute(TypeId::LIST, &intern("__new__")));
         assert!(builtin_type_has_attribute(
             TypeId::TUPLE,
@@ -1307,6 +1497,15 @@ mod tests {
         ));
         assert!(builtin_type_has_attribute(TypeId::DICT, &intern("pop")));
         assert!(builtin_type_has_attribute(
+            TypeId::INT,
+            &intern("bit_length")
+        ));
+        assert!(builtin_type_has_attribute(TypeId::INT, &intern("__add__")));
+        assert!(builtin_type_has_attribute(
+            TypeId::INT,
+            &intern("bit_count")
+        ));
+        assert!(builtin_type_has_attribute(
             TypeId::FUNCTION,
             &intern("__code__")
         ));
@@ -1319,6 +1518,10 @@ mod tests {
     #[test]
     fn test_builtin_instance_attr_registry_covers_method_wrapper_surface() {
         assert!(builtin_instance_has_attribute(
+            TypeId::NONE,
+            &intern("__doc__")
+        ));
+        assert!(builtin_instance_has_attribute(
             TypeId::OBJECT,
             &intern("__str__")
         ));
@@ -1329,10 +1532,43 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_instance_attribute_value_exposes_none_doc() {
+        let mut vm = VirtualMachine::new();
+        let doc = builtin_instance_attribute_value(
+            &mut vm,
+            TypeId::NONE,
+            Value::none(),
+            &intern("__doc__"),
+        )
+        .expect("None.__doc__ lookup should succeed")
+        .expect("None.__doc__ should exist");
+
+        assert_eq!(doc, Value::string(intern(NONE_TYPE_DOC)));
+    }
+
+    #[test]
     fn test_builtin_mapping_proxy_names_include_iterator_protocol_methods() {
         let names = builtin_mapping_proxy_names(TypeId::ITERATOR);
         assert!(names.contains(&intern("__iter__")));
         assert!(names.contains(&intern("__next__")));
+    }
+
+    #[test]
+    fn test_builtin_mapping_proxy_names_include_tuple_sequence_methods() {
+        let names = builtin_mapping_proxy_names(TypeId::TUPLE);
+        assert!(names.contains(&intern("__iter__")));
+        assert!(names.contains(&intern("__len__")));
+        assert!(names.contains(&intern("__getitem__")));
+        assert!(names.contains(&intern("count")));
+        assert!(names.contains(&intern("index")));
+    }
+
+    #[test]
+    fn test_builtin_mapping_proxy_names_include_int_bit_operations() {
+        let names = builtin_mapping_proxy_names(TypeId::INT);
+        assert!(names.contains(&intern("__add__")));
+        assert!(names.contains(&intern("bit_length")));
+        assert!(names.contains(&intern("bit_count")));
     }
 
     #[test]
@@ -1557,6 +1793,42 @@ mod tests {
     }
 
     #[test]
+    fn test_reflected_descriptor_callable_value_exposes_type_init_builtin() {
+        let value = reflected_descriptor_callable_value(
+            TypeId::WRAPPER_DESCRIPTOR,
+            TypeId::TYPE,
+            &intern("__init__"),
+        )
+        .expect("type.__init__ descriptor should resolve to a callable");
+        let ptr = value
+            .as_object_ptr()
+            .expect("callable should be heap allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "type.__init__");
+        assert!(
+            builtin
+                .call(&[builtin_type_object_for_type_id(TypeId::TYPE)])
+                .expect("type.__init__ should accept an already-initialized type")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_reflected_descriptor_callable_value_exposes_int_add_builtin() {
+        let value = reflected_descriptor_callable_value(
+            TypeId::WRAPPER_DESCRIPTOR,
+            TypeId::INT,
+            &intern("__add__"),
+        )
+        .expect("int.__add__ descriptor should resolve to a callable");
+        let ptr = value
+            .as_object_ptr()
+            .expect("callable should be heap allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "int.__add__");
+    }
+
+    #[test]
     fn test_reflected_descriptor_callable_value_exposes_object_init_subclass_builtin() {
         let value = reflected_descriptor_callable_value(
             TypeId::CLASSMETHOD_DESCRIPTOR,
@@ -1569,6 +1841,60 @@ mod tests {
             .expect("callable should be heap allocated");
         let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
         assert_eq!(builtin.name(), "object.__init_subclass__");
+    }
+
+    #[test]
+    fn test_reflected_descriptor_callable_value_exposes_type_prepare_builtin() {
+        let value = reflected_descriptor_callable_value(
+            TypeId::CLASSMETHOD_DESCRIPTOR,
+            TypeId::TYPE,
+            &intern("__prepare__"),
+        )
+        .expect("type.__prepare__ descriptor should resolve to a callable");
+        let ptr = value
+            .as_object_ptr()
+            .expect("callable should be heap allocated");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "type.__prepare__");
+    }
+
+    #[test]
+    fn test_builtin_bound_type_attribute_value_binds_type_prepare_receiver() {
+        let mut vm = VirtualMachine::new();
+        let type_type = builtin_type_object_for_type_id(TypeId::TYPE);
+        let method = builtin_bound_type_attribute_value(
+            &mut vm,
+            TypeId::TYPE,
+            type_type,
+            &intern("__prepare__"),
+        )
+        .expect("binding should succeed")
+        .expect("bound method should exist");
+
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("bound method should be allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        let bases_ptr = Box::into_raw(Box::new(TupleObject::empty()));
+        let result = builtin
+            .call_with_keywords(
+                &[
+                    Value::string(intern("Prepared")),
+                    Value::object_ptr(bases_ptr as *const ()),
+                ],
+                &[("flag", Value::bool(true))],
+            )
+            .expect("bound type.__prepare__ should be callable");
+        let result_ptr = result.as_object_ptr().expect("result should be a dict");
+        assert_eq!(
+            unsafe { &*(result_ptr as *const prism_runtime::object::ObjectHeader) }.type_id,
+            TypeId::DICT
+        );
+
+        unsafe {
+            drop(Box::from_raw(result_ptr as *mut DictObject));
+            drop(Box::from_raw(bases_ptr));
+        }
     }
 
     #[test]
@@ -1717,6 +2043,54 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_bound_type_attribute_value_static_binds_reflected_object_init_for_instances() {
+        let instance =
+            crate::builtins::builtin_object(&[]).expect("object() should produce an instance");
+        let method = builtin_bound_type_attribute_value_static(
+            TypeId::OBJECT,
+            instance,
+            &intern("__init__"),
+        )
+        .expect("lookup should succeed")
+        .expect("object.__init__ should exist");
+
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("bound method should be heap allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "object.__init__");
+        assert_eq!(builtin.bound_self(), Some(instance));
+        assert!(
+            builtin
+                .call(&[])
+                .expect("bound object.__init__ should execute")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_builtin_bound_type_attribute_value_static_binds_reflected_object_eq_for_primitives() {
+        let receiver = Value::int(7).unwrap();
+        let method =
+            builtin_bound_type_attribute_value_static(TypeId::OBJECT, receiver, &intern("__eq__"))
+                .expect("lookup should succeed")
+                .expect("object.__eq__ should exist");
+
+        let method_ptr = method
+            .as_object_ptr()
+            .expect("bound method should be heap allocated");
+        let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
+        assert_eq!(builtin.name(), "object.__eq__");
+        assert_eq!(builtin.bound_self(), Some(receiver));
+        assert_eq!(
+            builtin
+                .call(&[Value::int(7).unwrap()])
+                .expect("bound object.__eq__ should execute"),
+            Value::bool(true)
+        );
+    }
+
+    #[test]
     fn test_builtin_bound_type_attribute_value_materializes_doc_slot() {
         let mut vm = VirtualMachine::new();
         let type_object = builtin_type_object_for_type_id(TypeId::TYPE);
@@ -1729,6 +2103,33 @@ mod tests {
         .expect("lookup should succeed");
 
         assert_eq!(doc, Some(Value::none()));
+    }
+
+    #[test]
+    fn test_builtin_type_attribute_value_materializes_none_doc_slot() {
+        let mut vm = VirtualMachine::new();
+        let doc = builtin_type_attribute_value(&mut vm, TypeId::NONE, &intern("__doc__"))
+            .expect("type(None).__doc__ lookup should succeed")
+            .expect("type(None).__doc__ should exist");
+
+        assert_eq!(doc, Value::string(intern(NONE_TYPE_DOC)));
+    }
+
+    #[test]
+    fn test_builtin_type_attribute_value_materializes_type_init_descriptor() {
+        let mut vm = VirtualMachine::new();
+        let descriptor = builtin_type_attribute_value(&mut vm, TypeId::TYPE, &intern("__init__"))
+            .expect("type.__init__ lookup should succeed")
+            .expect("type.__init__ should exist");
+        let descriptor_ptr = descriptor
+            .as_object_ptr()
+            .expect("type.__init__ should be heap allocated");
+        let header = unsafe { &*(descriptor_ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::WRAPPER_DESCRIPTOR);
+
+        let view = unsafe { &*(descriptor_ptr as *const DescriptorViewObject) };
+        assert_eq!(view.owner(), TypeId::TYPE);
+        assert_eq!(view.name().as_str(), "__init__");
     }
 
     #[test]
@@ -1781,6 +2182,18 @@ mod tests {
             bases.as_slice()[0],
             builtin_type_object_for_type_id(TypeId::INT)
         );
+    }
+
+    #[test]
+    fn test_builtin_type_has_attribute_reports_type_prepare() {
+        assert!(builtin_type_has_attribute(
+            TypeId::TYPE,
+            &intern("__init__")
+        ));
+        assert!(builtin_type_has_attribute(
+            TypeId::TYPE,
+            &intern("__prepare__")
+        ));
     }
 
     #[test]

@@ -56,7 +56,7 @@ use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::class::{ClassDict, PyClassObject};
+use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::{
     global_class_registry, register_global_class, type_new,
@@ -839,6 +839,10 @@ pub(crate) fn exception_type_attribute_value(
     name: &InternedString,
 ) -> Option<Value> {
     match name.as_str() {
+        "__new__" => super::exception_method_value("__new__"),
+        "__init__" => super::exception_method_value("__init__"),
+        "__str__" => super::exception_method_value("__str__"),
+        "__repr__" => super::exception_method_value("__repr__"),
         "with_traceback" => super::exception_method_value("with_traceback"),
         "__name__" | "__qualname__" => Some(Value::string(intern(exception_type.name()))),
         "__module__" => Some(Value::string(intern("builtins"))),
@@ -870,8 +874,16 @@ fn exception_proxy_base_ids(exception_type_id: ExceptionTypeId) -> Vec<ClassId> 
 fn build_exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClassObject> {
     let bases = exception_proxy_base_ids(exception_type_id);
     let namespace = ClassDict::new();
-    if let Some(with_traceback) = super::exception_method_value("with_traceback") {
-        namespace.set(intern("with_traceback"), with_traceback);
+    for method_name in [
+        "__new__",
+        "__init__",
+        "__str__",
+        "__repr__",
+        "with_traceback",
+    ] {
+        if let Some(method) = super::exception_method_value(method_name) {
+            namespace.set(intern(method_name), method);
+        }
     }
     let name = intern(
         get_exception_type_by_id(exception_type_id as u16)
@@ -880,8 +892,12 @@ fn build_exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClas
     );
     let result = type_new(name, &bases, &namespace, global_class_registry())
         .expect("built-in exception proxy classes should always construct successfully");
-    register_global_class(result.class.clone(), result.bitmap);
-    result.class
+    let mut class =
+        Arc::try_unwrap(result.class).expect("freshly created exception proxy should be unique");
+    class.add_flags(ClassFlags::NATIVE_HEAPTYPE);
+    let class = Arc::new(class);
+    register_global_class(class.clone(), result.bitmap);
+    class
 }
 
 pub(crate) fn exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClassObject> {
@@ -1392,6 +1408,52 @@ mod tests {
             .expect("base should be an exception type object");
         let base = unsafe { &*(base_ptr as *const ExceptionTypeObject) };
         assert_eq!(base.name(), "Exception");
+    }
+
+    #[test]
+    fn test_exception_proxy_classes_expose_base_exception_slots() {
+        let proxy = exception_proxy_class(ExceptionTypeId::Exception);
+
+        for name in [
+            "__new__",
+            "__init__",
+            "__str__",
+            "__repr__",
+            "with_traceback",
+        ] {
+            assert!(
+                proxy.get_attr(&intern(name)).is_some(),
+                "exception proxy should expose {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exception_proxy_classes_are_native_heaptypes() {
+        let proxy = exception_proxy_class(ExceptionTypeId::Exception);
+        assert!(proxy.is_native_heaptype());
+    }
+
+    #[test]
+    fn test_exception_type_attribute_value_exposes_base_exception_methods() {
+        let base = get_exception_type("BaseException").expect("BaseException type should exist");
+
+        for (name, expected) in [
+            ("__new__", "BaseException.__new__"),
+            ("__init__", "BaseException.__init__"),
+            ("__str__", "BaseException.__str__"),
+            ("__repr__", "BaseException.__repr__"),
+            ("with_traceback", "BaseException.with_traceback"),
+        ] {
+            let value = exception_type_attribute_value(base, &intern(name))
+                .unwrap_or_else(|| panic!("{name} should resolve from exception type metadata"));
+            let ptr = value
+                .as_object_ptr()
+                .expect("base exception methods should be heap allocated builtins");
+            let builtin = unsafe { &*(ptr as *const crate::builtins::BuiltinFunctionObject) };
+            assert_eq!(builtin.name(), expected);
+            assert_eq!(builtin.bound_self(), None);
+        }
     }
 
     #[test]

@@ -22,7 +22,7 @@ mod types;
 pub use builtin_function::*;
 pub use exception_type::*;
 pub(crate) use exception_type::{
-    exception_proxy_class_id_from_ptr, exception_type_attribute_value,
+    exception_proxy_class, exception_proxy_class_id_from_ptr, exception_type_attribute_value,
     exception_type_id_for_proxy_class_id,
 };
 pub use exception_value::*;
@@ -34,7 +34,7 @@ pub use io::*;
 pub use iter_dispatch::*;
 pub use itertools::*;
 pub use numeric::*;
-pub(crate) use percent_format::percent_format_string;
+pub(crate) use percent_format::{percent_format_bytes, percent_format_string};
 pub use string::*;
 pub(crate) use type_reflection::*;
 pub(crate) use types::builtin_type_object_type_id;
@@ -116,7 +116,8 @@ impl std::fmt::Display for BuiltinError {
 impl std::error::Error for BuiltinError {}
 
 #[inline]
-fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
+pub(crate) fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
+    let is_attribute_error = err.is_attribute_error();
     match err.kind {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
@@ -134,6 +135,9 @@ fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
         RuntimeErrorKind::AttributeError { type_name, attr } => BuiltinError::AttributeError(
             format!("'{}' object has no attribute '{}'", type_name, attr),
         ),
+        RuntimeErrorKind::Exception { message, .. } if is_attribute_error => {
+            BuiltinError::AttributeError(message.to_string())
+        }
         RuntimeErrorKind::KeyError { key } => BuiltinError::KeyError(key.to_string()),
         RuntimeErrorKind::IndexError { index, length } => {
             BuiltinError::IndexError(format!("index {index} out of range for length {length}"))
@@ -268,7 +272,7 @@ impl BuiltinRegistry {
         registry.register_function_vm("any", itertools::builtin_any_vm);
 
         // Register I/O functions
-        registry.register_function("print", io::builtin_print);
+        registry.register_function_vm_kw("print", io::builtin_print_vm_kw);
         registry.register_function("input", io::builtin_input);
         registry.register_function_vm_kw("open", io::builtin_open_vm_kw);
 
@@ -348,8 +352,8 @@ impl BuiltinRegistry {
             prism_runtime::object::type_obj::TypeId::TYPE,
             types::builtin_type,
         );
-        registry.register_function("isinstance", types::builtin_isinstance);
-        registry.register_function("issubclass", types::builtin_issubclass);
+        registry.register_function_vm("isinstance", types::builtin_isinstance_vm);
+        registry.register_function_vm("issubclass", types::builtin_issubclass_vm);
         registry.register_callable_type(
             "object",
             prism_runtime::object::type_obj::TypeId::OBJECT,

@@ -13,6 +13,7 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
+use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::MappingProxyObject;
 use prism_runtime::types::bytes::BytesObject;
@@ -95,7 +96,7 @@ pub(crate) fn try_len_value(vm: &mut VirtualMachine, value: Value) -> Result<usi
 #[inline]
 fn exact_len(value: Value) -> Result<Option<usize>, RuntimeError> {
     if let Some(string) = value_as_string_ref(value) {
-        return Ok(Some(string.len()));
+        return Ok(Some(string.char_count()));
     }
 
     let Some(ptr) = value.as_object_ptr() else {
@@ -103,12 +104,19 @@ fn exact_len(value: Value) -> Result<Option<usize>, RuntimeError> {
     };
 
     use crate::ops::objects::extract_type_id;
-    if let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr) {
+    let type_id = extract_type_id(ptr);
+    let has_builtin_sequence_layout = type_id.raw() < TypeId::FIRST_USER_TYPE;
+    if has_builtin_sequence_layout
+        && let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr)
+    {
         return Ok(Some(list.len()));
     }
-    let type_id = extract_type_id(ptr);
+    if has_builtin_sequence_layout
+        && let Some(tuple) = crate::ops::objects::tuple_storage_ref_from_ptr(ptr)
+    {
+        return Ok(Some(tuple.len()));
+    }
     match type_id {
-        TypeId::TUPLE => Ok(Some(unsafe { &*(ptr as *const TupleObject) }.len())),
         TypeId::DICT => Ok(Some(unsafe { &*(ptr as *const DictObject) }.len())),
         TypeId::MAPPING_PROXY => {
             let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
@@ -146,12 +154,18 @@ fn type_name_for_exact_len(value: Value) -> &'static str {
         return value_type_name(value);
     };
 
-    if crate::ops::objects::list_storage_ref_from_ptr(ptr).is_some() {
+    let type_id = crate::ops::objects::extract_type_id(ptr);
+    let has_builtin_sequence_layout = type_id.raw() < TypeId::FIRST_USER_TYPE;
+    if has_builtin_sequence_layout && crate::ops::objects::list_storage_ref_from_ptr(ptr).is_some()
+    {
         return "list";
     }
+    if has_builtin_sequence_layout && crate::ops::objects::tuple_storage_ref_from_ptr(ptr).is_some()
+    {
+        return "tuple";
+    }
 
-    match crate::ops::objects::extract_type_id(ptr) {
-        TypeId::TUPLE => "tuple",
+    match type_id {
         TypeId::DICT => "dict",
         TypeId::MAPPING_PROXY => "mappingproxy",
         TypeId::SET => "set",
@@ -1328,6 +1342,10 @@ pub fn builtin_id(args: &[Value]) -> Result<Value, BuiltinError> {
         return Value::int(ptr as i64)
             .ok_or_else(|| BuiltinError::OverflowError("id overflow".to_string()));
     }
+    if let Some(ptr) = obj.as_string_object_ptr() {
+        return Value::int(ptr as i64)
+            .ok_or_else(|| BuiltinError::OverflowError("id overflow".to_string()));
+    }
 
     // For primitives, compute a stable ID based on the actual value
     // Python semantics: identical primitive values may share ID (interning)
@@ -1459,6 +1477,9 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
     if let Some(string) = value_as_string_ref(value) {
         return Ok(quote_python_string(string.as_str()));
     }
+    if let Some(text) = crate::builtins::exception_repr_text_for_value(value) {
+        return Ok(text);
+    }
 
     let ptr = value
         .as_object_ptr()
@@ -1538,10 +1559,19 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
             let complex = unsafe { &*(ptr as *const ComplexObject) };
             Ok(complex.to_string())
         }
-        TypeId::EXCEPTION => {
-            let exception = unsafe { crate::builtins::ExceptionValue::from_value(value) }
-                .ok_or_else(|| BuiltinError::TypeError("invalid exception object".to_string()))?;
-            Ok(exception.repr_text())
+        TypeId::STATICMETHOD => {
+            let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            Ok(format!(
+                "<staticmethod({})>",
+                repr_value(descriptor.function(), depth + 1)?
+            ))
+        }
+        TypeId::CLASSMETHOD => {
+            let descriptor = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            Ok(format!(
+                "<classmethod({})>",
+                repr_value(descriptor.function(), depth + 1)?
+            ))
         }
         _ => Ok(format!(
             "<{} object at 0x{:x}>",
@@ -1636,6 +1666,10 @@ mod tests {
     use prism_core::value::SMALL_INT_MAX;
     use prism_runtime::object::ObjectHeader;
     use prism_runtime::object::class::PyClassObject;
+    use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
+    use prism_runtime::object::shape::Shape;
+    use prism_runtime::object::shaped_object::ShapedObject;
+    use prism_runtime::types::function::FunctionObject;
     use std::sync::Arc;
 
     fn boxed_value<T>(obj: T) -> (Value, *mut T) {
@@ -1666,6 +1700,16 @@ mod tests {
     }
 
     #[test]
+    fn test_len_string_counts_unicode_scalar_values() {
+        let tagged = Value::string(intern("tmpæ"));
+        assert_eq!(builtin_len(&[tagged]).unwrap().as_int(), Some(4));
+
+        let (heap, ptr) = boxed_value(StringObject::new("hé 🦀"));
+        assert_eq!(builtin_len(&[heap]).unwrap().as_int(), Some(4));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
     fn test_len_list_object() {
         let list = ListObject::from_slice(&[
             Value::int(1).unwrap(),
@@ -1689,6 +1733,23 @@ mod tests {
         let (value, ptr) = boxed_value(tuple);
         let result = builtin_len(&[value]).unwrap();
         assert_eq!(result.as_int(), Some(4));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_tuple_backed_object() {
+        let object = ShapedObject::new_tuple_backed(
+            TypeId::OBJECT,
+            Shape::empty(),
+            TupleObject::from_slice(&[
+                Value::int(1).unwrap(),
+                Value::int(2).unwrap(),
+                Value::int(3).unwrap(),
+            ]),
+        );
+        let (value, ptr) = boxed_value(object);
+        let result = builtin_len(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(3));
         unsafe { drop_boxed(ptr) };
     }
 
@@ -2347,6 +2408,36 @@ mod tests {
     }
 
     #[test]
+    fn test_repr_staticmethod_and_classmethod_wrappers() {
+        let function = FunctionObject::new(
+            Arc::new(prism_code::CodeObject::new("demo", "<test>")),
+            Arc::from("demo"),
+            None,
+            None,
+        );
+        let (function_value, function_ptr) = boxed_value(function);
+        let inner_repr = repr_value(function_value, 0).expect("function repr should succeed");
+
+        let (staticmethod_value, staticmethod_ptr) =
+            boxed_value(StaticMethodDescriptor::new(function_value));
+        let staticmethod_repr =
+            tagged_string_value_to_rust_string(builtin_repr(&[staticmethod_value]).unwrap());
+        assert_eq!(staticmethod_repr, format!("<staticmethod({inner_repr})>"));
+
+        let (classmethod_value, classmethod_ptr) =
+            boxed_value(ClassMethodDescriptor::new(function_value));
+        let classmethod_repr =
+            tagged_string_value_to_rust_string(builtin_repr(&[classmethod_value]).unwrap());
+        assert_eq!(classmethod_repr, format!("<classmethod({inner_repr})>"));
+
+        unsafe {
+            drop_boxed(classmethod_ptr);
+            drop_boxed(staticmethod_ptr);
+            drop_boxed(function_ptr);
+        }
+    }
+
+    #[test]
     fn test_ascii_non_ascii_escaping() {
         let tagged = Value::string(intern("hé"));
         let tagged_ascii = tagged_string_value_to_rust_string(builtin_ascii(&[tagged]).unwrap());
@@ -2365,6 +2456,23 @@ mod tests {
 
         let ascii_err = builtin_ascii(&[]);
         assert!(matches!(ascii_err, Err(BuiltinError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_id_distinguishes_interned_string_values() {
+        let platform = Value::string(intern("platform"));
+        let uname_result = Value::string(intern("uname_result"));
+
+        let platform_id = builtin_id(&[platform]).unwrap().as_int().unwrap();
+        let same_platform_id = builtin_id(&[Value::string(intern("platform"))])
+            .unwrap()
+            .as_int()
+            .unwrap();
+        let uname_result_id = builtin_id(&[uname_result]).unwrap().as_int().unwrap();
+
+        assert_ne!(platform_id, 0);
+        assert_eq!(platform_id, same_platform_id);
+        assert_ne!(platform_id, uname_result_id);
     }
 
     #[test]
