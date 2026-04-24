@@ -25,14 +25,17 @@ pub use streams::*;
 
 use super::{Module, ModuleError};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::ops::calls::value_supports_call_protocol;
+use crate::ops::objects::{snapshot_frame_globals_dict, snapshot_frame_locals_dict};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
+use prism_runtime::object::views::FrameViewObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::tuple::TupleObject;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// The sys module providing runtime system configuration.
 pub struct SysModule {
@@ -101,9 +104,18 @@ static EXCEPTHOOK_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.excepthook"), sys_excepthook));
 static EXC_INFO_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("sys.exc_info"), sys_exc_info));
+static EXCEPTION_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("sys.exception"), sys_exception));
+static GETFRAME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("sys._getframe"), sys_getframe));
+static GETTRACE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.gettrace"), sys_gettrace));
+static SETTRACE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.settrace"), sys_settrace));
 static GETWINDOWSVERSION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("sys.getwindowsversion"), sys_getwindowsversion)
 });
+static CURRENT_TRACE_FUNCTION: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(Value::none()));
 
 impl SysModule {
     /// Create a new sys module with default configuration.
@@ -256,6 +268,10 @@ impl Module for SysModule {
             }
 
             "exc_info" => Ok(builtin_value(&EXC_INFO_FUNCTION)),
+            "exception" => Ok(builtin_value(&EXCEPTION_FUNCTION)),
+            "_getframe" => Ok(builtin_value(&GETFRAME_FUNCTION)),
+            "gettrace" => Ok(builtin_value(&GETTRACE_FUNCTION)),
+            "settrace" => Ok(builtin_value(&SETTRACE_FUNCTION)),
             "intern" => Ok(builtin_value(&INTERN_FUNCTION)),
             "getfilesystemencoding" => Ok(builtin_value(&GET_FILESYSTEM_ENCODING_FUNCTION)),
             "getfilesystemencodeerrors" => Ok(builtin_value(&GET_FILESYSTEM_ENCODEERRORS_FUNCTION)),
@@ -274,12 +290,15 @@ impl Module for SysModule {
             "copyright" => Ok(Value::string(intern(COPYRIGHT))),
             "platlibdir" => Ok(Value::string(intern(PLATLIBDIR))),
             "_vpath" if self.platform.is_windows() => Ok(Value::string(intern(VPATH))),
+            "pycache_prefix" => Ok(Value::none()),
+            "dont_write_bytecode" => Ok(Value::bool(false)),
 
             "version_info" => Ok(version_info_tuple()),
             "implementation" => Ok(implementation_info()),
             "float_info" => Ok(float_info_tuple()),
             "int_info" => Ok(int_info_tuple()),
             "hash_info" => Ok(hash_info_tuple()),
+            "_git" => Ok(git_info_tuple()),
 
             "builtin_module_names" => Ok(self.builtin_module_names_value),
             "warnoptions" => Ok(self.warnoptions_value),
@@ -331,6 +350,8 @@ impl Module for SysModule {
             Arc::from("byteorder"),
             Arc::from("copyright"),
             Arc::from("platlibdir"),
+            Arc::from("pycache_prefix"),
+            Arc::from("dont_write_bytecode"),
             Arc::from("builtin_module_names"),
             Arc::from("warnoptions"),
             Arc::from("meta_path"),
@@ -343,6 +364,7 @@ impl Module for SysModule {
             Arc::from("float_info"),
             Arc::from("int_info"),
             Arc::from("hash_info"),
+            Arc::from("_git"),
             Arc::from("stdin"),
             Arc::from("stdout"),
             Arc::from("stderr"),
@@ -357,6 +379,10 @@ impl Module for SysModule {
             Arc::from("path"),
             Arc::from("argv"),
             Arc::from("exc_info"),
+            Arc::from("exception"),
+            Arc::from("_getframe"),
+            Arc::from("gettrace"),
+            Arc::from("settrace"),
             Arc::from("exit"),
             Arc::from("getfilesystemencoding"),
             Arc::from("getfilesystemencodeerrors"),
@@ -419,6 +445,74 @@ fn sys_exc_info(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value,
     ])))
 }
 
+fn sys_exception(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "exception() takes exactly 0 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(crate::ops::exception::build_exc_info(vm).exc_value)
+}
+
+fn sys_getframe(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "_getframe() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let depth = args
+        .first()
+        .copied()
+        .map(parse_frame_depth)
+        .transpose()?
+        .unwrap_or(0);
+    let Some(frame_index) = vm.frame_index_at_depth(depth) else {
+        return Err(BuiltinError::ValueError(
+            "call stack is not deep enough".to_string(),
+        ));
+    };
+
+    Ok(build_frame_view(vm, frame_index).expect("frame index from VM should be valid"))
+}
+
+fn sys_gettrace(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "gettrace() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(*CURRENT_TRACE_FUNCTION
+        .lock()
+        .expect("sys trace hook lock poisoned"))
+}
+
+fn sys_settrace(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "settrace() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let trace = args[0];
+    if !trace.is_none() && !value_supports_call_protocol(trace) {
+        return Err(BuiltinError::TypeError(
+            "settrace() argument must be callable or None".to_string(),
+        ));
+    }
+
+    *CURRENT_TRACE_FUNCTION
+        .lock()
+        .expect("sys trace hook lock poisoned") = trace;
+    Ok(Value::none())
+}
+
 fn sys_intern(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -453,6 +547,58 @@ fn sys_intern(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::string(intern(string.as_str())))
 }
 
+fn parse_frame_depth(value: Value) -> Result<usize, BuiltinError> {
+    let depth = if let Some(index) = value.as_int() {
+        index
+    } else if let Some(boolean) = value.as_bool() {
+        if boolean { 1 } else { 0 }
+    } else {
+        return Err(BuiltinError::TypeError(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value.type_name()
+        )));
+    };
+
+    if depth < 0 {
+        return Err(BuiltinError::ValueError(
+            "call stack is not deep enough".to_string(),
+        ));
+    }
+
+    Ok(depth as usize)
+}
+
+fn build_frame_view(vm: &crate::VirtualMachine, frame_index: usize) -> Option<Value> {
+    let frame = vm.frames.get(frame_index)?;
+    let globals = leak_object_value(snapshot_frame_globals_dict(vm, frame));
+    let locals = leak_object_value(snapshot_frame_locals_dict(frame));
+    let back = frame
+        .return_frame
+        .and_then(|back_index| build_frame_view(vm, back_index as usize));
+    Some(leak_object_value(FrameViewObject::new(
+        Some(Arc::clone(&frame.code)),
+        globals,
+        locals,
+        frame_line_number(frame),
+        frame.ip,
+        back,
+    )))
+}
+
+#[inline]
+fn frame_line_number(frame: &crate::frame::Frame) -> u32 {
+    frame
+        .code
+        .line_for_pc(frame.ip)
+        .or_else(|| {
+            frame
+                .ip
+                .checked_sub(1)
+                .and_then(|pc| frame.code.line_for_pc(pc))
+        })
+        .unwrap_or(frame.code.first_lineno)
+}
+
 #[inline]
 fn leak_object_value<T>(object: T) -> Value {
     let ptr = Box::into_raw(Box::new(object)) as *const ();
@@ -467,6 +613,14 @@ fn empty_list_value() -> Value {
 #[inline]
 fn empty_dict_value() -> Value {
     leak_object_value(DictObject::new())
+}
+
+fn git_info_tuple() -> Value {
+    leak_object_value(TupleObject::from_slice(&[
+        Value::string(intern("Prism")),
+        Value::string(intern("")),
+        Value::string(intern("")),
+    ]))
 }
 
 fn sys_flags_value() -> Value {
@@ -583,10 +737,14 @@ fn sys_getwindowsversion(args: &[Value]) -> Result<Value, BuiltinError> {
 mod tests {
     use super::*;
     use crate::builtins::BuiltinFunctionObject;
+    use crate::builtins::create_exception;
+    use crate::stdlib::exceptions::ExceptionTypeId;
     use prism_core::intern::interned_by_ptr;
     use prism_runtime::object::shaped_object::ShapedObject;
+    use prism_runtime::object::views::FrameViewObject;
     use prism_runtime::types::list::ListObject;
     use prism_runtime::types::tuple::TupleObject;
+    use std::sync::Arc;
 
     // =========================================================================
     // SysModule Creation Tests
@@ -1030,6 +1188,21 @@ mod tests {
     }
 
     #[test]
+    fn test_git_attribute_matches_cpython_metadata_tuple_shape() {
+        let sys = SysModule::new();
+        let value = sys.get_attr("_git").expect("sys._git should exist");
+        let ptr = value
+            .as_object_ptr()
+            .expect("sys._git should be a tuple object");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+
+        assert_eq!(tuple.len(), 3);
+        assert_eq!(tuple.get(0), Some(Value::string(intern("Prism"))));
+        assert_eq!(tuple.get(1), Some(Value::string(intern(""))));
+        assert_eq!(tuple.get(2), Some(Value::string(intern(""))));
+    }
+
+    #[test]
     fn test_implementation_attribute_exposes_namespace_fields() {
         let sys = SysModule::new();
         let value = sys
@@ -1076,6 +1249,24 @@ mod tests {
                 .expect("platlibdir should resolve")
                 .as_ref(),
             PLATLIBDIR
+        );
+    }
+
+    #[test]
+    fn test_import_cache_configuration_matches_cpython_defaults() {
+        let sys = SysModule::new();
+
+        assert!(
+            sys.get_attr("pycache_prefix")
+                .expect("pycache_prefix should exist")
+                .is_none(),
+            "sys.pycache_prefix should default to None"
+        );
+        assert_eq!(
+            sys.get_attr("dont_write_bytecode")
+                .expect("dont_write_bytecode should exist"),
+            Value::bool(false),
+            "sys.dont_write_bytecode should default to False"
         );
     }
 
@@ -1183,8 +1374,17 @@ mod tests {
         let names = sys.dir();
         assert!(names.iter().any(|name| name.as_ref() == "argv"));
         assert!(names.iter().any(|name| name.as_ref() == "path"));
+        assert!(names.iter().any(|name| name.as_ref() == "_getframe"));
+        assert!(names.iter().any(|name| name.as_ref() == "gettrace"));
         assert!(names.iter().any(|name| name.as_ref() == "base_prefix"));
         assert!(names.iter().any(|name| name.as_ref() == "base_exec_prefix"));
+        assert!(names.iter().any(|name| name.as_ref() == "pycache_prefix"));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.as_ref() == "dont_write_bytecode")
+        );
+        assert!(names.iter().any(|name| name.as_ref() == "_git"));
         assert!(
             names
                 .iter()
@@ -1275,6 +1475,243 @@ mod tests {
 
         assert_eq!(tuple.len(), 3);
         assert!(tuple.iter().all(Value::is_none));
+    }
+
+    #[test]
+    fn test_sys_exception_returns_none_without_active_exception() {
+        let sys = SysModule::new();
+        let hook = sys
+            .get_attr("exception")
+            .expect("sys.exception should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys.exception should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let mut vm = crate::VirtualMachine::new();
+
+        let value = builtin
+            .call_with_vm(&mut vm, &[])
+            .expect("sys.exception should accept zero arguments");
+
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_sys_exception_returns_active_exception_value() {
+        let sys = SysModule::new();
+        let hook = sys
+            .get_attr("exception")
+            .expect("sys.exception should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys.exception should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let mut vm = crate::VirtualMachine::new();
+        let active_exception =
+            create_exception(ExceptionTypeId::TypeError, Some(Arc::from("boom")));
+        vm.set_active_exception_with_type(
+            active_exception,
+            ExceptionTypeId::TypeError.as_u8() as u16,
+        );
+
+        let value = builtin
+            .call_with_vm(&mut vm, &[])
+            .expect("sys.exception should return the active exception");
+
+        assert_eq!(value, active_exception);
+    }
+
+    #[test]
+    fn test_sys_getframe_returns_current_frame_and_back_chain() {
+        let sys = SysModule::new();
+        let hook = sys
+            .get_attr("_getframe")
+            .expect("sys._getframe should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys._getframe should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let mut vm = crate::VirtualMachine::new();
+
+        let outer = Arc::new(prism_code::CodeObject::new("outer", "<test>"));
+        let inner = Arc::new(prism_code::CodeObject::new("inner", "<test>"));
+        vm.push_frame(Arc::clone(&outer), 0).unwrap();
+        vm.current_frame_mut().ip = 2;
+        vm.push_frame(Arc::clone(&inner), 0).unwrap();
+        vm.current_frame_mut().ip = 5;
+
+        let value = builtin
+            .call_with_vm(&mut vm, &[])
+            .expect("sys._getframe should return the current frame");
+        let frame_ptr = value
+            .as_object_ptr()
+            .expect("sys._getframe should return a frame object");
+        let frame = unsafe { &*(frame_ptr as *const FrameViewObject) };
+        assert_eq!(
+            frame
+                .code()
+                .expect("frame should keep its code object")
+                .name
+                .as_ref(),
+            "inner"
+        );
+        assert_eq!(frame.lasti(), 5);
+
+        let back = frame.back().expect("current frame should expose a caller");
+        let back_ptr = back
+            .as_object_ptr()
+            .expect("caller frame should be a frame object");
+        let caller = unsafe { &*(back_ptr as *const FrameViewObject) };
+        assert_eq!(
+            caller
+                .code()
+                .expect("caller frame should keep its code object")
+                .name
+                .as_ref(),
+            "outer"
+        );
+        assert_eq!(caller.lasti(), 2);
+        assert_eq!(caller.back(), None);
+    }
+
+    #[test]
+    fn test_sys_getframe_honors_depth_and_validates_arguments() {
+        let sys = SysModule::new();
+        let hook = sys
+            .get_attr("_getframe")
+            .expect("sys._getframe should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys._getframe should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let mut vm = crate::VirtualMachine::new();
+
+        vm.push_frame(Arc::new(prism_code::CodeObject::new("outer", "<test>")), 0)
+            .unwrap();
+        vm.push_frame(Arc::new(prism_code::CodeObject::new("inner", "<test>")), 0)
+            .unwrap();
+
+        let caller = builtin
+            .call_with_vm(&mut vm, &[Value::int(1).unwrap()])
+            .expect("depth=1 should return the caller frame");
+        let caller_ptr = caller
+            .as_object_ptr()
+            .expect("depth=1 should still return a frame object");
+        let caller = unsafe { &*(caller_ptr as *const FrameViewObject) };
+        assert_eq!(
+            caller
+                .code()
+                .expect("caller frame should keep its code object")
+                .name
+                .as_ref(),
+            "outer"
+        );
+
+        let too_deep = builtin
+            .call_with_vm(&mut vm, &[Value::int(2).unwrap()])
+            .expect_err("depth beyond the active stack should fail");
+        assert!(
+            matches!(too_deep, BuiltinError::ValueError(ref message) if message == "call stack is not deep enough")
+        );
+
+        let negative = builtin
+            .call_with_vm(&mut vm, &[Value::int(-1).unwrap()])
+            .expect_err("negative depth should fail");
+        assert!(
+            matches!(negative, BuiltinError::ValueError(ref message) if message == "call stack is not deep enough")
+        );
+
+        let invalid = builtin
+            .call_with_vm(&mut vm, &[Value::float(1.5)])
+            .expect_err("non-integral depth should fail");
+        assert!(
+            matches!(invalid, BuiltinError::TypeError(ref message) if message.contains("cannot be interpreted as an integer"))
+        );
+    }
+
+    #[test]
+    fn test_sys_gettrace_exists_and_defaults_to_none() {
+        *CURRENT_TRACE_FUNCTION
+            .lock()
+            .expect("sys trace hook lock poisoned") = Value::none();
+        let sys = SysModule::new();
+        let hook = sys.get_attr("gettrace").expect("sys.gettrace should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys.gettrace should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+
+        assert!(
+            builtin
+                .call(&[])
+                .expect("gettrace() should succeed")
+                .is_none()
+        );
+
+        let err = builtin
+            .call(&[Value::int(1).unwrap()])
+            .expect_err("gettrace() should reject positional arguments");
+        assert!(
+            matches!(err, BuiltinError::TypeError(ref message) if message == "gettrace() takes no arguments (1 given)")
+        );
+    }
+
+    #[test]
+    fn test_sys_settrace_updates_visible_trace_hook_and_validates_input() {
+        *CURRENT_TRACE_FUNCTION
+            .lock()
+            .expect("sys trace hook lock poisoned") = Value::none();
+        let sys = SysModule::new();
+        let gettrace = unsafe {
+            &*(sys
+                .get_attr("gettrace")
+                .expect("sys.gettrace should exist")
+                .as_object_ptr()
+                .expect("sys.gettrace should be callable")
+                as *const BuiltinFunctionObject)
+        };
+        let settrace = unsafe {
+            &*(sys
+                .get_attr("settrace")
+                .expect("sys.settrace should exist")
+                .as_object_ptr()
+                .expect("sys.settrace should be callable")
+                as *const BuiltinFunctionObject)
+        };
+        let intern = sys.get_attr("intern").expect("sys.intern should exist");
+
+        assert!(
+            settrace
+                .call(&[intern])
+                .expect("settrace should accept callables")
+                .is_none()
+        );
+        assert_eq!(
+            gettrace
+                .call(&[])
+                .expect("gettrace should return current hook"),
+            intern
+        );
+
+        assert!(
+            settrace
+                .call(&[Value::none()])
+                .expect("settrace should accept None")
+                .is_none()
+        );
+        assert!(
+            gettrace
+                .call(&[])
+                .expect("gettrace should return None after reset")
+                .is_none()
+        );
+
+        let err = settrace
+            .call(&[Value::int(1).unwrap()])
+            .expect_err("settrace should reject non-callables");
+        assert!(
+            matches!(err, BuiltinError::TypeError(ref message) if message == "settrace() argument must be callable or None")
+        );
     }
 
     #[test]

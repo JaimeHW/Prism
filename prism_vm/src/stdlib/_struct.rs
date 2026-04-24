@@ -15,8 +15,9 @@ use prism_core::intern::intern;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::int::value_to_bigint;
+use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
@@ -133,6 +134,9 @@ enum Endian {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FormatCode {
     Pad,
+    Char,
+    Bytes,
+    PascalBytes,
     Bool,
     Int8,
     UInt8,
@@ -142,6 +146,9 @@ enum FormatCode {
     UInt32,
     Int64,
     UInt64,
+    NativeSSize,
+    NativeSize,
+    Pointer,
     Float32,
     Float64,
 }
@@ -180,6 +187,9 @@ impl FormatCode {
     fn from_char(ch: char) -> Option<Self> {
         Some(match ch {
             'x' => Self::Pad,
+            'c' => Self::Char,
+            's' => Self::Bytes,
+            'p' => Self::PascalBytes,
             '?' => Self::Bool,
             'b' => Self::Int8,
             'B' => Self::UInt8,
@@ -189,6 +199,9 @@ impl FormatCode {
             'I' | 'L' => Self::UInt32,
             'q' => Self::Int64,
             'Q' => Self::UInt64,
+            'n' => Self::NativeSSize,
+            'N' => Self::NativeSize,
+            'P' => Self::Pointer,
             'f' => Self::Float32,
             'd' => Self::Float64,
             _ => return None,
@@ -200,6 +213,7 @@ impl FormatCode {
         match layout {
             Layout::Native => match self {
                 Self::Pad => 1,
+                Self::Char | Self::Bytes | Self::PascalBytes => 1,
                 Self::Bool => std::mem::size_of::<bool>(),
                 Self::Int8 => std::mem::size_of::<i8>(),
                 Self::UInt8 => std::mem::size_of::<u8>(),
@@ -209,14 +223,26 @@ impl FormatCode {
                 Self::UInt32 => std::mem::size_of::<u32>(),
                 Self::Int64 => std::mem::size_of::<i64>(),
                 Self::UInt64 => std::mem::size_of::<u64>(),
+                Self::NativeSSize => std::mem::size_of::<isize>(),
+                Self::NativeSize => std::mem::size_of::<usize>(),
+                Self::Pointer => std::mem::size_of::<usize>(),
                 Self::Float32 => std::mem::size_of::<f32>(),
                 Self::Float64 => std::mem::size_of::<f64>(),
             },
             Layout::Standard { .. } => match self {
-                Self::Pad | Self::Bool | Self::Int8 | Self::UInt8 => 1,
+                Self::Pad
+                | Self::Char
+                | Self::Bytes
+                | Self::PascalBytes
+                | Self::Bool
+                | Self::Int8
+                | Self::UInt8 => 1,
                 Self::Int16 | Self::UInt16 => 2,
                 Self::Int32 | Self::UInt32 | Self::Float32 => 4,
                 Self::Int64 | Self::UInt64 | Self::Float64 => 8,
+                Self::NativeSSize | Self::NativeSize | Self::Pointer => {
+                    std::mem::size_of::<usize>()
+                }
             },
         }
     }
@@ -228,7 +254,7 @@ impl FormatCode {
         }
 
         match self {
-            Self::Pad => 1,
+            Self::Pad | Self::Char | Self::Bytes | Self::PascalBytes => 1,
             Self::Bool => std::mem::align_of::<bool>(),
             Self::Int8 => std::mem::align_of::<i8>(),
             Self::UInt8 => std::mem::align_of::<u8>(),
@@ -238,6 +264,9 @@ impl FormatCode {
             Self::UInt32 => std::mem::align_of::<u32>(),
             Self::Int64 => std::mem::align_of::<i64>(),
             Self::UInt64 => std::mem::align_of::<u64>(),
+            Self::NativeSSize => std::mem::align_of::<isize>(),
+            Self::NativeSize => std::mem::align_of::<usize>(),
+            Self::Pointer => std::mem::align_of::<usize>(),
             Self::Float32 => std::mem::align_of::<f32>(),
             Self::Float64 => std::mem::align_of::<f64>(),
         }
@@ -252,6 +281,37 @@ impl FormatCode {
         match self {
             Self::Pad => {
                 out.fill(0);
+                Ok(())
+            }
+            Self::Char => {
+                let bytes =
+                    bytes_argument(value, "char format requires a bytes object of length 1")?;
+                if bytes.len() != 1 {
+                    return Err(BuiltinError::ValueError(
+                        "char format requires a bytes object of length 1".to_string(),
+                    ));
+                }
+                out[0] = bytes[0];
+                Ok(())
+            }
+            Self::Bytes => {
+                let bytes =
+                    bytes_or_bytearray_argument(value, "argument for 's' must be a bytes object")?;
+                out.fill(0);
+                let copy_len = bytes.len().min(out.len());
+                out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                Ok(())
+            }
+            Self::PascalBytes => {
+                let bytes =
+                    bytes_or_bytearray_argument(value, "argument for 'p' must be a bytes object")?;
+                out.fill(0);
+                if out.is_empty() {
+                    return Ok(());
+                }
+                let copy_len = bytes.len().min(out.len().saturating_sub(1)).min(255);
+                out[0] = copy_len as u8;
+                out[1..1 + copy_len].copy_from_slice(&bytes[..copy_len]);
                 Ok(())
             }
             Self::Bool => {
@@ -313,6 +373,24 @@ impl FormatCode {
                     .to_u64()
                     .ok_or_else(out_of_range_error)?,
             ),
+            Self::NativeSSize => write_isize(
+                out,
+                integer_argument(value, "pack expected integer")?
+                    .to_isize()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::NativeSize => write_usize(
+                out,
+                integer_argument(value, "pack expected integer")?
+                    .to_usize()
+                    .ok_or_else(out_of_range_error)?,
+            ),
+            Self::Pointer => write_usize(
+                out,
+                integer_argument(value, "pack expected integer")?
+                    .to_usize()
+                    .ok_or_else(out_of_range_error)?,
+            ),
             Self::Float32 => write_f32(out, layout.endianness(), float_argument(value)? as f32),
             Self::Float64 => write_f64(out, layout.endianness(), float_argument(value)?),
         }
@@ -321,6 +399,16 @@ impl FormatCode {
     fn unpack_from_slice(self, layout: Layout, data: &[u8]) -> Result<Value, BuiltinError> {
         Ok(match self {
             Self::Pad => Value::none(),
+            Self::Char => bytes_value(data),
+            Self::Bytes => bytes_value(data),
+            Self::PascalBytes => {
+                if data.is_empty() {
+                    bytes_value(data)
+                } else {
+                    let len = usize::from(data[0]).min(data.len() - 1);
+                    bytes_value(&data[1..1 + len])
+                }
+            }
             Self::Bool => Value::bool(data[0] != 0),
             Self::Int8 => Value::int(i64::from(i8::from_ne_bytes([data[0]]))).unwrap(),
             Self::UInt8 => Value::int(i64::from(data[0])).unwrap(),
@@ -342,6 +430,29 @@ impl FormatCode {
                     } else {
                         prism_runtime::types::int::bigint_to_value(BigInt::from(value))
                     }
+                } else {
+                    prism_runtime::types::int::bigint_to_value(BigInt::from(value))
+                }
+            }
+            Self::NativeSSize => Value::int(read_isize(data) as i64).unwrap_or_else(|| {
+                prism_runtime::types::int::bigint_to_value(BigInt::from(read_isize(data)))
+            }),
+            Self::NativeSize => {
+                let value = read_usize(data);
+                if value <= i64::MAX as usize {
+                    Value::int(value as i64).unwrap_or_else(|| {
+                        prism_runtime::types::int::bigint_to_value(BigInt::from(value))
+                    })
+                } else {
+                    prism_runtime::types::int::bigint_to_value(BigInt::from(value))
+                }
+            }
+            Self::Pointer => {
+                let value = read_usize(data);
+                if value <= i64::MAX as usize {
+                    Value::int(value as i64).unwrap_or_else(|| {
+                        prism_runtime::types::int::bigint_to_value(BigInt::from(value))
+                    })
                 } else {
                     prism_runtime::types::int::bigint_to_value(BigInt::from(value))
                 }
@@ -413,10 +524,7 @@ fn calcsize_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let spec = parse_format_spec(value_to_rust_string(
-        args[0],
-        "calcsize() format must be a str",
-    )?)?;
+    let spec = parse_format_spec(value_to_format_string(args[0], true)?)?;
     Ok(Value::int(spec.size as i64).expect("struct size should fit in i64"))
 }
 
@@ -427,7 +535,7 @@ fn pack_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         ));
     }
 
-    let format = value_to_rust_string(args[0], "pack() format must be a str")?;
+    let format = value_to_format_string(args[0], true)?;
     let buffer = pack_with_format(&format, &args[1..])?;
     Ok(bytes_value(&buffer))
 }
@@ -440,7 +548,7 @@ fn unpack_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let format = value_to_rust_string(args[0], "unpack() format must be a str")?;
+    let format = value_to_format_string(args[0], true)?;
     unpack_tuple_value(
         &format,
         &value_to_bytes_like(args[1], "unpack() buffer must be bytes-like")?,
@@ -455,7 +563,7 @@ fn pack_into_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         ));
     }
 
-    let format = value_to_rust_string(args[0], "pack_into() format must be a str")?;
+    let format = value_to_format_string(args[0], true)?;
     let buffer_ptr =
         writable_bytearray_ptr(args[1], "pack_into() requires a writable bytearray buffer")?;
     let offset = offset_argument(
@@ -486,7 +594,7 @@ fn unpack_from_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let format = value_to_rust_string(args[0], "unpack_from() format must be a str")?;
+    let format = value_to_format_string(args[0], true)?;
     let buffer = value_to_bytes_like(args[1], "unpack_from() buffer must be bytes-like")?;
     let offset = if let Some(offset_value) = args.get(2) {
         offset_argument(
@@ -508,7 +616,7 @@ fn iter_unpack_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let format = value_to_rust_string(args[0], "iter_unpack() format must be a str")?;
+    let format = value_to_format_string(args[0], true)?;
     let spec = parse_format_spec(format.clone())?;
     if spec.size == 0 {
         return Err(BuiltinError::ValueError(
@@ -550,7 +658,7 @@ fn struct_constructor(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let format = value_to_rust_string(args[0], "Struct() format must be a str")?;
+    let format = value_to_format_string(args[0], false)?;
     let spec = parse_format_spec(format.clone())?;
 
     let object = Box::new(ShapedObject::with_empty_shape(
@@ -808,8 +916,40 @@ fn push_fields(
     let code = FormatCode::from_char(code_char).ok_or_else(|| {
         BuiltinError::ValueError(format!("bad char in struct format: '{}'", code_char))
     })?;
+    if matches!(
+        code,
+        FormatCode::Pointer | FormatCode::NativeSSize | FormatCode::NativeSize
+    ) && !matches!(layout, Layout::Native)
+    {
+        return Err(BuiltinError::ValueError(format!(
+            "bad char in struct format: '{}'",
+            code_char
+        )));
+    }
     let size = code.size(layout);
     let alignment = code.alignment(layout);
+
+    if matches!(code, FormatCode::Bytes | FormatCode::PascalBytes) {
+        *offset = align_up(*offset, alignment);
+        let field_size = size
+            .checked_mul(repeat)
+            .ok_or_else(|| BuiltinError::ValueError("total struct size too long".to_string()))?;
+        fields.push(Field {
+            code,
+            offset: *offset,
+            size: field_size,
+        });
+        *offset = (*offset)
+            .checked_add(field_size)
+            .ok_or_else(|| BuiltinError::ValueError("total struct size too long".to_string()))?;
+        *value_count += 1;
+        return Ok(());
+    }
+
+    if repeat == 0 {
+        *offset = align_up(*offset, alignment);
+        return Ok(());
+    }
 
     for _ in 0..repeat {
         *offset = align_up(*offset, alignment);
@@ -818,12 +958,48 @@ fn push_fields(
             offset: *offset,
             size,
         });
-        *offset += size;
+        *offset = (*offset)
+            .checked_add(size)
+            .ok_or_else(|| BuiltinError::ValueError("total struct size too long".to_string()))?;
         if code != FormatCode::Pad {
             *value_count += 1;
         }
     }
     Ok(())
+}
+
+fn value_to_format_string(value: Value, allow_memoryview: bool) -> Result<String, BuiltinError> {
+    if let Some(string) = value_as_string_ref(value) {
+        reject_embedded_nul(string.as_str().as_bytes())?;
+        return Ok(string.as_str().to_string());
+    }
+
+    if let Some(ptr) = value.as_object_ptr()
+        && extract_type_id(ptr) != TypeId::BYTEARRAY
+        && let Some(bytes) = value_as_bytes_ref(value)
+    {
+        let data = bytes.as_bytes();
+        reject_embedded_nul(data)?;
+        return bytes_to_ascii_format(data);
+    }
+
+    if allow_memoryview {
+        if let Some(view) = value_as_memoryview_ref(value) {
+            if view.released() {
+                return Err(BuiltinError::ValueError(
+                    "operation forbidden on released memoryview object".to_string(),
+                ));
+            }
+            let data = view.as_bytes();
+            reject_embedded_nul(data)?;
+            return bytes_to_ascii_format(data);
+        }
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "Struct() argument 1 must be a str or bytes object, not {}",
+        value.type_name()
+    )))
 }
 
 fn value_to_rust_string(value: Value, context: &str) -> Result<String, BuiltinError> {
@@ -835,6 +1011,31 @@ fn value_to_rust_string(value: Value, context: &str) -> Result<String, BuiltinEr
         "{context}, not {}",
         value.type_name()
     )))
+}
+
+fn bytes_to_ascii_format(data: &[u8]) -> Result<String, BuiltinError> {
+    if !data.is_ascii() {
+        let byte = data
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii())
+            .unwrap_or_default();
+        return Err(BuiltinError::ValueError(format!(
+            "bad char in struct format: '{}'",
+            char::from(byte)
+        )));
+    }
+    String::from_utf8(data.to_vec())
+        .map_err(|_| BuiltinError::ValueError("bad char in struct format".to_string()))
+}
+
+fn reject_embedded_nul(data: &[u8]) -> Result<(), BuiltinError> {
+    if data.contains(&0) {
+        return Err(BuiltinError::ValueError(
+            "embedded null character".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn integer_argument(value: Value, context: &str) -> Result<BigInt, BuiltinError> {
@@ -862,6 +1063,22 @@ fn float_argument(value: Value) -> Result<f64, BuiltinError> {
     ))
 }
 
+fn bytes_argument(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
+    let Some(bytes) = value_as_bytes_ref(value) else {
+        return Err(BuiltinError::ValueError(context.to_string()));
+    };
+    if bytes.is_bytearray() {
+        return Err(BuiltinError::ValueError(context.to_string()));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn bytes_or_bytearray_argument(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
+    value_as_bytes_ref(value)
+        .map(BytesObject::to_vec)
+        .ok_or_else(|| BuiltinError::ValueError(context.to_string()))
+}
+
 fn value_to_bytes_like(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
     let Some(ptr) = value.as_object_ptr() else {
         return Err(BuiltinError::TypeError(format!(
@@ -870,8 +1087,21 @@ fn value_to_bytes_like(value: Value, context: &str) -> Result<Vec<u8>, BuiltinEr
         )));
     };
 
+    if let Some(bytes) = value_as_bytes_ref(value) {
+        return Ok(bytes.to_vec());
+    }
+
     match extract_type_id(ptr) {
-        TypeId::BYTES | TypeId::BYTEARRAY => Ok(unsafe { &*(ptr as *const BytesObject) }.to_vec()),
+        TypeId::MEMORYVIEW => {
+            let view = value_as_memoryview_ref(value)
+                .ok_or_else(|| BuiltinError::TypeError("invalid memoryview object".to_string()))?;
+            if view.released() {
+                return Err(BuiltinError::ValueError(
+                    "operation forbidden on released memoryview object".to_string(),
+                ));
+            }
+            Ok(view.to_vec())
+        }
         _ => Err(BuiltinError::TypeError(format!(
             "{context}, not {}",
             value.type_name()
@@ -988,6 +1218,20 @@ fn write_u64(out: &mut [u8], endian: Endian, value: u64) -> Result<(), BuiltinEr
 }
 
 #[inline]
+fn write_isize(out: &mut [u8], value: isize) -> Result<(), BuiltinError> {
+    let bytes = value.to_ne_bytes();
+    out.copy_from_slice(&bytes);
+    Ok(())
+}
+
+#[inline]
+fn write_usize(out: &mut [u8], value: usize) -> Result<(), BuiltinError> {
+    let bytes = value.to_ne_bytes();
+    out.copy_from_slice(&bytes);
+    Ok(())
+}
+
+#[inline]
 fn write_f32(out: &mut [u8], endian: Endian, value: f32) -> Result<(), BuiltinError> {
     write_u32(out, endian, value.to_bits())
 }
@@ -1058,6 +1302,20 @@ fn read_u64(data: &[u8], endian: Endian) -> u64 {
 }
 
 #[inline]
+fn read_isize(data: &[u8]) -> isize {
+    let mut bytes = [0_u8; std::mem::size_of::<isize>()];
+    bytes.copy_from_slice(data);
+    isize::from_ne_bytes(bytes)
+}
+
+#[inline]
+fn read_usize(data: &[u8]) -> usize {
+    let mut bytes = [0_u8; std::mem::size_of::<usize>()];
+    bytes.copy_from_slice(data);
+    usize::from_ne_bytes(bytes)
+}
+
+#[inline]
 fn read_f32(data: &[u8], endian: Endian) -> f32 {
     f32::from_bits(read_u32(data, endian))
 }
@@ -1077,6 +1335,10 @@ mod tests {
         unsafe { &*(ptr as *const BytesObject) }.to_vec()
     }
 
+    fn bytearray_value(data: &[u8]) -> Value {
+        leak_object_value(BytesObject::bytearray_from_slice(data))
+    }
+
     fn tuple_items(value: Value) -> Vec<Value> {
         let ptr = value.as_object_ptr().expect("tuple object");
         unsafe { &*(ptr as *const TupleObject) }.as_slice().to_vec()
@@ -1091,10 +1353,51 @@ mod tests {
             ("<Q", 8),
             ("<i", 4),
             (">d", 8),
+            ("P", std::mem::size_of::<usize>() as i64),
+            ("n", std::mem::size_of::<isize>() as i64),
+            ("N", std::mem::size_of::<usize>() as i64),
         ] {
             let result = calcsize_builtin(&[Value::string(intern(format))]).expect("calcsize");
             assert_eq!(result.as_int(), Some(expected));
         }
+    }
+
+    #[test]
+    fn test_calcsize_accepts_cpython_bytes_formats_and_native_alignment() {
+        let zip_header = calcsize_builtin(&[bytes_value(b"<4s4H2LH")])
+            .expect("zipfile byte format should parse");
+        assert_eq!(zip_header.as_int(), Some(22));
+
+        let aligned = calcsize_builtin(&[Value::string(intern("nP0n"))])
+            .expect("native ssize, pointer, and zero-repeat alignment should parse");
+        let expected = align_up(
+            align_up(std::mem::size_of::<isize>(), std::mem::align_of::<usize>())
+                + std::mem::size_of::<usize>(),
+            std::mem::align_of::<isize>(),
+        );
+        assert_eq!(aligned.as_int(), Some(expected as i64));
+
+        let err = calcsize_builtin(&[Value::string(intern("=n"))])
+            .expect_err("native ssize_t code is only valid in native mode");
+        assert!(err.to_string().contains("bad char in struct format"));
+
+        let nul_err =
+            calcsize_builtin(&[bytes_value(b"\0")]).expect_err("embedded null should fail");
+        assert!(nul_err.to_string().contains("embedded null character"));
+    }
+
+    #[test]
+    fn test_pointer_format_is_native_only() {
+        let value = Value::int(0x1234).unwrap();
+        let packed = pack_builtin(&[Value::string(intern("P")), value]).expect("pack pointer");
+        assert_eq!(bytes_to_vec(packed).len(), std::mem::size_of::<usize>());
+
+        let unpacked = unpack_builtin(&[Value::string(intern("P")), packed]).expect("unpack");
+        assert_eq!(tuple_items(unpacked), vec![value]);
+
+        let err = calcsize_builtin(&[Value::string(intern("<P"))])
+            .expect_err("standard pointer format should be rejected");
+        assert!(err.to_string().contains("bad char in struct format"));
     }
 
     #[test]
@@ -1137,6 +1440,51 @@ mod tests {
     }
 
     #[test]
+    fn test_pack_and_unpack_cover_cpython_bytes_formats() {
+        let packed = pack_builtin(&[
+            Value::string(intern("<4s4H2LH")),
+            bytes_value(b"PK\x05\x06"),
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(4).unwrap(),
+            Value::int(5).unwrap(),
+            Value::int(6).unwrap(),
+            Value::int(7).unwrap(),
+        ])
+        .expect("pack zip header");
+        assert_eq!(bytes_to_vec(packed).len(), 22);
+
+        assert_eq!(
+            bytes_to_vec(pack_builtin(&[Value::string(intern("4s")), bytes_value(b"xy")]).unwrap()),
+            b"xy\0\0"
+        );
+        assert_eq!(
+            bytes_to_vec(
+                pack_builtin(&[Value::string(intern("3s")), bytes_value(b"wxyz")]).unwrap()
+            ),
+            b"wxy"
+        );
+        assert_eq!(
+            bytes_to_vec(
+                pack_builtin(&[Value::string(intern("3p")), bytearray_value(b"abcd")]).unwrap()
+            ),
+            b"\x02ab"
+        );
+        assert_eq!(
+            bytes_to_vec(pack_builtin(&[Value::string(intern("c")), bytes_value(b"z")]).unwrap()),
+            b"z"
+        );
+
+        let unpacked = unpack_builtin(&[Value::string(intern("2s3pc")), bytes_value(b"ab\x02cdZ")])
+            .expect("unpack string formats");
+        let items = tuple_items(unpacked);
+        assert_eq!(bytes_to_vec(items[0]), b"ab");
+        assert_eq!(bytes_to_vec(items[1]), b"cd");
+        assert_eq!(bytes_to_vec(items[2]), b"Z");
+    }
+
+    #[test]
     fn test_pack_into_unpack_from_and_iter_unpack_work_with_offsets() {
         let target = leak_object_value(BytesObject::repeat_with_type(0, 10, TypeId::BYTEARRAY));
         pack_into_builtin(&[
@@ -1173,7 +1521,7 @@ mod tests {
 
     #[test]
     fn test_struct_constructor_binds_format_and_methods() {
-        let receiver = struct_constructor(&[Value::string(intern("<I"))]).expect("Struct()");
+        let receiver = struct_constructor(&[bytes_value(b"<I")]).expect("Struct()");
         let ptr = receiver.as_object_ptr().expect("struct helper object");
         let shaped = unsafe { &*(ptr as *const ShapedObject) };
         let format = shaped.get_property("format").expect("format");

@@ -279,14 +279,14 @@ impl Engine for FancyEngine {
             .captures(text)
             .ok()
             .flatten()
-            .map(|caps| Match::from_fancy_captures(&caps, text))
+            .map(|caps| Match::from_fancy_captures_with_regex(&caps, text, &self.regex))
     }
 
     fn find_all(&self, text: &str) -> Vec<Match> {
         self.regex
             .captures_iter(text)
             .filter_map(|r| r.ok())
-            .map(|caps| Match::from_fancy_captures(&caps, text))
+            .map(|caps| Match::from_fancy_captures_with_regex(&caps, text, &self.regex))
             .collect()
     }
 
@@ -294,7 +294,11 @@ impl Engine for FancyEngine {
         self.regex.captures(text).ok().flatten().and_then(|caps| {
             if let Some(m) = caps.get(0) {
                 if m.start() == 0 {
-                    return Some(Match::from_fancy_captures(&caps, text));
+                    return Some(Match::from_fancy_captures_with_regex(
+                        &caps,
+                        text,
+                        &self.regex,
+                    ));
                 }
             }
             None
@@ -364,13 +368,14 @@ impl Engine for FancyEngine {
 
     #[inline]
     fn captures_len(&self) -> usize {
-        // fancy-regex doesn't expose this directly, parse from pattern
-        count_capture_groups(&self.pattern)
+        self.regex.captures_len()
     }
 
     fn group_names(&self) -> Vec<Option<String>> {
-        // fancy-regex doesn't expose names directly
-        Vec::new()
+        self.regex
+            .capture_names()
+            .map(|name| name.map(|name| name.to_string()))
+            .collect()
     }
 }
 
@@ -423,6 +428,7 @@ pub(crate) fn prepare_pattern_for_backend(
 pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
     let mut normalized = String::with_capacity(pattern.len());
     let mut in_class = false;
+    let mut class_item_count = 0usize;
     let mut offset = 0;
 
     while offset < pattern.len() {
@@ -432,26 +438,20 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
             .expect("slice should begin on a character boundary");
         match ch {
             '\\' => {
-                normalized.push('\\');
-                offset += ch.len_utf8();
-                if offset >= pattern.len() {
-                    break;
-                }
-
-                let next = pattern[offset..]
-                    .chars()
-                    .next()
-                    .expect("slice should begin on a character boundary");
-                if !in_class && next == 'Z' {
-                    normalized.push('z');
-                } else {
-                    normalized.push(next);
-                }
-                offset += next.len_utf8();
+                let (translated, consumed) = normalize_escape_sequence(pattern, offset, in_class)?;
+                normalized.push_str(&translated);
+                offset += consumed;
             }
             '[' if !in_class => {
                 in_class = true;
+                class_item_count = 0;
                 normalized.push(ch);
+                offset += ch.len_utf8();
+            }
+            '[' if in_class => {
+                normalized.push('\\');
+                normalized.push('[');
+                class_item_count += 1;
                 offset += ch.len_utf8();
             }
             '{' if !in_class => {
@@ -465,8 +465,14 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
                 }
             }
             ']' if in_class => {
-                in_class = false;
-                normalized.push(ch);
+                if class_item_count == 0 {
+                    normalized.push('\\');
+                    normalized.push(']');
+                    class_item_count += 1;
+                } else {
+                    in_class = false;
+                    normalized.push(ch);
+                }
                 offset += ch.len_utf8();
             }
             '}' if !in_class => {
@@ -475,6 +481,11 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
                 offset += ch.len_utf8();
             }
             '(' if !in_class => {
+                if pattern[offset..].starts_with("(?>") {
+                    normalized.push_str("(?:");
+                    offset += 3;
+                    continue;
+                }
                 if let Some((translated, consumed)) =
                     translate_inline_flag_group(&pattern[offset..], pattern)?
                 {
@@ -487,12 +498,133 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
             }
             _ => {
                 normalized.push(ch);
+                if in_class {
+                    class_item_count += 1;
+                }
                 offset += ch.len_utf8();
             }
         }
     }
 
     Ok(normalized)
+}
+
+fn normalize_escape_sequence(
+    pattern: &str,
+    offset: usize,
+    in_class: bool,
+) -> EngineResult<(String, usize)> {
+    let bytes = pattern.as_bytes();
+    debug_assert_eq!(bytes[offset], b'\\');
+
+    if offset + 1 >= bytes.len() {
+        return Ok(("\\".to_string(), 1));
+    }
+
+    if let Some((value, consumed)) = parse_python_octal_escape(bytes, offset, in_class)? {
+        return Ok((format!(r"\x{{{:x}}}", value), consumed));
+    }
+
+    let next = pattern[offset + 1..]
+        .chars()
+        .next()
+        .expect("slice should begin on a character boundary");
+    let mut translated = String::with_capacity(1 + next.len_utf8());
+    translated.push('\\');
+    if !in_class && next == 'Z' {
+        translated.push('z');
+    } else {
+        translated.push(next);
+    }
+
+    Ok((translated, 1 + next.len_utf8()))
+}
+
+fn parse_python_octal_escape(
+    bytes: &[u8],
+    offset: usize,
+    in_class: bool,
+) -> EngineResult<Option<(u32, usize)>> {
+    let first_index = offset + 1;
+    if first_index >= bytes.len() || !is_ascii_octal_digit(bytes[first_index]) {
+        return Ok(None);
+    }
+
+    let first = bytes[first_index];
+    let mut digits = [0u8; 3];
+    let digit_count = if in_class || first == b'0' {
+        let mut count = 1usize;
+        digits[0] = first;
+        while count < 3 {
+            let next_index = first_index + count;
+            if next_index >= bytes.len() || !is_ascii_octal_digit(bytes[next_index]) {
+                break;
+            }
+            digits[count] = bytes[next_index];
+            count += 1;
+        }
+        count
+    } else if first_index + 2 < bytes.len()
+        && is_ascii_octal_digit(bytes[first_index + 1])
+        && is_ascii_octal_digit(bytes[first_index + 2])
+    {
+        digits[0] = first;
+        digits[1] = bytes[first_index + 1];
+        digits[2] = bytes[first_index + 2];
+        3
+    } else {
+        return Ok(None);
+    };
+
+    let value = digits[..digit_count]
+        .iter()
+        .fold(0u32, |acc, digit| (acc << 3) + u32::from(digit - b'0'));
+    if value > 0o377 {
+        let escape =
+            std::str::from_utf8(&bytes[offset..first_index + digit_count]).unwrap_or("\\???");
+        return Err(RegexError {
+            kind: RegexErrorKind::Syntax,
+            message: format!("octal escape value {escape} outside of range 0-0o377"),
+            pattern: None,
+            position: Some(offset),
+        });
+    }
+
+    Ok(Some((value, 1 + digit_count)))
+}
+
+fn python_octal_escape_len(bytes: &[u8], offset: usize, in_class: bool) -> Option<usize> {
+    let first_index = offset + 1;
+    if first_index >= bytes.len() || !is_ascii_octal_digit(bytes[first_index]) {
+        return None;
+    }
+
+    let first = bytes[first_index];
+    if in_class || first == b'0' {
+        let mut count = 1usize;
+        while count < 3 {
+            let next_index = first_index + count;
+            if next_index >= bytes.len() || !is_ascii_octal_digit(bytes[next_index]) {
+                break;
+            }
+            count += 1;
+        }
+        return Some(1 + count);
+    }
+
+    if first_index + 2 < bytes.len()
+        && is_ascii_octal_digit(bytes[first_index + 1])
+        && is_ascii_octal_digit(bytes[first_index + 2])
+    {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn is_ascii_octal_digit(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'7')
 }
 
 fn normalize_brace_sequence(input: &str) -> Option<(String, usize)> {
@@ -659,42 +791,79 @@ fn translate_inline_flag_spec(
 
 /// Check if pattern requires fancy-regex features.
 pub fn requires_fancy_engine(pattern: &str) -> bool {
-    // Check for backreferences: \1, \2, etc.
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                // Backreference
-                if next.is_ascii_digit() && next != '0' {
-                    return true;
-                }
+    let bytes = pattern.as_bytes();
+    let mut in_class = false;
+    let mut class_item_count = 0usize;
+    let mut offset = 0usize;
+
+    while offset < pattern.len() {
+        let ch = pattern[offset..]
+            .chars()
+            .next()
+            .expect("slice should begin on a character boundary");
+
+        if ch == '\\' {
+            if let Some(consumed) = python_octal_escape_len(bytes, offset, in_class) {
+                offset += consumed;
+                continue;
+            }
+
+            let next_index = offset + 1;
+            if !in_class
+                && next_index < pattern.len()
+                && bytes[next_index].is_ascii_digit()
+                && bytes[next_index] != b'0'
+            {
+                return true;
+            }
+
+            offset += 1;
+            if offset < pattern.len() {
+                let escaped = pattern[offset..]
+                    .chars()
+                    .next()
+                    .expect("slice should begin on a character boundary");
+                offset += escaped.len_utf8();
+            }
+            if in_class {
+                class_item_count += 1;
+            }
+            continue;
+        }
+
+        if ch == '[' && !in_class {
+            in_class = true;
+            class_item_count = 0;
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if ch == ']' && in_class {
+            if class_item_count == 0 {
+                class_item_count += 1;
+            } else {
+                in_class = false;
+            }
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if !in_class && ch == '(' {
+            let suffix = &pattern[offset..];
+            if suffix.starts_with("(?=")
+                || suffix.starts_with("(?!")
+                || suffix.starts_with("(?<=")
+                || suffix.starts_with("(?<!")
+                || suffix.starts_with("(?P=")
+            {
+                return true;
             }
         }
-        // Lookahead/lookbehind
-        if c == '(' {
-            if let Some(&next) = chars.peek() {
-                if next == '?' {
-                    chars.next();
-                    if let Some(&after) = chars.peek() {
-                        // (?= positive lookahead
-                        // (?! negative lookahead
-                        // (?<= positive lookbehind
-                        // (?<! negative lookbehind
-                        if after == '=' || after == '!' {
-                            return true;
-                        }
-                        if after == '<' {
-                            chars.next();
-                            if let Some(&lookbehind) = chars.peek() {
-                                if lookbehind == '=' || lookbehind == '!' {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+
+        if in_class {
+            class_item_count += 1;
         }
+        offset += ch.len_utf8();
     }
     false
 }
@@ -822,7 +991,30 @@ mod tests {
     #[test]
     fn test_requires_fancy_backreference() {
         assert!(requires_fancy_engine(r"(.)\1"));
+        assert!(requires_fancy_engine(r#"(?P<quote>['"])(?P=quote)"#));
+        assert!(!requires_fancy_engine(r"\111"));
+        assert!(!requires_fancy_engine(r"[\041-\176]+:$"));
+        assert!(!requires_fancy_engine(r"\\1"));
         assert!(!requires_fancy_engine(r"\d+"));
+    }
+
+    #[test]
+    fn test_python_named_backreference_uses_fancy_engine() {
+        let engine = compile_pattern(
+            r#"^(?P<name>\w+)=(?P<quote>["']?)(?P<value>.*)(?P=quote)$"#,
+            RegexFlags::default(),
+        )
+        .expect("named Python backreference should compile");
+        assert_eq!(engine.kind(), EngineKind::Fancy);
+        let matched = engine.match_start("NAME=\"Prism\"").expect("match");
+        assert_eq!(
+            matched.group(matched.group_index("name").expect("name group")),
+            Some("NAME")
+        );
+        assert_eq!(
+            matched.group(matched.group_index("value").expect("value group")),
+            Some("Prism")
+        );
     }
 
     #[test]
@@ -870,6 +1062,15 @@ mod tests {
     }
 
     #[test]
+    fn test_fancy_engine_reports_named_group_metadata() {
+        let engine = compile_pattern(r"(?P<word>foo)(?!bar)", RegexFlags::default()).unwrap();
+        assert_eq!(engine.kind(), EngineKind::Fancy);
+        let group_names = engine.group_names();
+        assert_eq!(group_names.len(), 2);
+        assert_eq!(group_names[1].as_deref(), Some("word"));
+    }
+
+    #[test]
     fn test_normalize_python_pattern_converts_end_of_string_anchor() {
         assert_eq!(normalize_python_pattern(r"foo\Z").unwrap(), r"foo\z");
     }
@@ -901,6 +1102,41 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_python_pattern_escapes_literal_open_bracket_inside_class() {
+        assert_eq!(normalize_python_pattern(r"([*?[])").unwrap(), r"([*?\[])");
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_translates_octal_escapes() {
+        assert_eq!(
+            normalize_python_pattern(r"[\041-\176]+:$").unwrap(),
+            r"[\x{21}-\x{7e}]+:$"
+        );
+        assert_eq!(
+            normalize_python_pattern(r"\0\01\018").unwrap(),
+            r"\x{0}\x{1}\x{1}8"
+        );
+        assert_eq!(normalize_python_pattern(r"\111").unwrap(), r"\x{49}");
+    }
+
+    #[test]
+    fn test_normalize_python_pattern_rejects_out_of_range_octal_escapes() {
+        let outside_class = normalize_python_pattern(r"\567").unwrap_err();
+        assert_eq!(
+            outside_class.message,
+            r"octal escape value \567 outside of range 0-0o377"
+        );
+        assert_eq!(outside_class.position, Some(0));
+
+        let inside_class = normalize_python_pattern(r"[\567]").unwrap_err();
+        assert_eq!(
+            inside_class.message,
+            r"octal escape value \567 outside of range 0-0o377"
+        );
+        assert_eq!(inside_class.position, Some(1));
+    }
+
+    #[test]
     fn test_prepare_pattern_for_backend_applies_ascii_and_verbose_flags() {
         let prepared = prepare_pattern_for_backend(
             r"\$(?:(?P<named>(?a:[_a-z][_a-z0-9]*)))",
@@ -909,6 +1145,13 @@ mod tests {
         .unwrap();
         assert!(prepared.starts_with("(?ix)"));
         assert!(prepared.contains(r"(?-u:[_a-z][_a-z0-9]*)"));
+    }
+
+    #[test]
+    fn test_prepare_pattern_for_backend_normalizes_atomic_groups() {
+        let prepared = prepare_pattern_for_backend(r"(?s:(?>.*?a).*)\Z", RegexFlags::default())
+            .expect("atomic groups should normalize for backend regex engines");
+        assert_eq!(prepared, r"(?s:(?:.*?a).*)\z");
     }
 
     #[test]
@@ -933,5 +1176,22 @@ mod tests {
             StandardEngine::compile(r"foo\Z", RegexFlags::default()).expect(r"\Z should compile");
         assert!(engine.is_match("foo"));
         assert!(!engine.is_match("foo\n"));
+    }
+
+    #[test]
+    fn test_standard_engine_accepts_glob_magic_character_class_pattern() {
+        let engine = StandardEngine::compile(r"([*?[])", RegexFlags::default())
+            .expect("glob's magic-check pattern should compile");
+        assert!(engine.is_match("["));
+        assert!(engine.is_match("*"));
+        assert!(engine.is_match("?"));
+    }
+
+    #[test]
+    fn test_standard_engine_accepts_cpython_email_header_character_range() {
+        let engine = StandardEngine::compile(r"[\041-\176]+:$", RegexFlags::default())
+            .expect("email.header's printable ASCII range should compile");
+        assert!(engine.is_match("Subject:"));
+        assert!(!engine.is_match("Subject"));
     }
 }

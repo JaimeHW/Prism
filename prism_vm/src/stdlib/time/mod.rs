@@ -35,12 +35,15 @@ pub use struct_time::StructTime;
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::python_numeric::{float_like_value, int_like_value};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -73,6 +76,23 @@ static THREAD_TIME_NS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
 });
 static SLEEP_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.sleep"), sleep_builtin));
+static GMTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.gmtime"), gmtime_builtin));
+static LOCALTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.localtime"), localtime_builtin));
+static MKTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.mktime"), mktime_builtin));
+static STRFTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.strftime"), strftime_builtin));
+static STRPTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.strptime"), strptime_builtin));
+static ASCTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.asctime"), asctime_builtin));
+static CTIME_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("time.ctime"), ctime_builtin));
+static STRUCT_TIME_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("time.struct_time"), struct_time_builtin)
+});
 static GET_CLOCK_INFO_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("time.get_clock_info"), get_clock_info_builtin)
 });
@@ -188,12 +208,15 @@ impl Module for TimeModule {
             "thread_time" => Ok(builtin_value(&THREAD_TIME_FUNCTION)),
             "thread_time_ns" => Ok(builtin_value(&THREAD_TIME_NS_FUNCTION)),
             "sleep" => Ok(builtin_value(&SLEEP_FUNCTION)),
+            "gmtime" => Ok(builtin_value(&GMTIME_FUNCTION)),
+            "localtime" => Ok(builtin_value(&LOCALTIME_FUNCTION)),
+            "mktime" => Ok(builtin_value(&MKTIME_FUNCTION)),
+            "strftime" => Ok(builtin_value(&STRFTIME_FUNCTION)),
+            "strptime" => Ok(builtin_value(&STRPTIME_FUNCTION)),
+            "asctime" => Ok(builtin_value(&ASCTIME_FUNCTION)),
+            "ctime" => Ok(builtin_value(&CTIME_FUNCTION)),
+            "struct_time" => Ok(builtin_value(&STRUCT_TIME_FUNCTION)),
             "get_clock_info" => Ok(builtin_value(&GET_CLOCK_INFO_FUNCTION)),
-            "gmtime" | "localtime" | "mktime" | "strftime" | "strptime" | "asctime" | "ctime"
-            | "struct_time" => Err(ModuleError::AttributeError(format!(
-                "time.{} is not yet callable as an object",
-                name
-            ))),
 
             // Timezone info - integer constants
             "timezone" => Ok(Value::int_unchecked(get_timezone_offset())),
@@ -204,10 +227,7 @@ impl Module for TimeModule {
                 0
             })),
 
-            // tzname requires tuple/string - not yet supported
-            "tzname" => Err(ModuleError::AttributeError(
-                "time.tzname is not yet accessible (tuple support pending)".to_string(),
-            )),
+            "tzname" => Ok(tzname_value()),
 
             // Clock constants
             "CLOCK_REALTIME" => Ok(Value::int_unchecked(ClockId::Realtime as i64)),
@@ -347,6 +367,33 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
+fn leak_object_value<T>(object: T) -> Value {
+    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+}
+
+#[inline]
+fn tuple_value(values: &[Value]) -> Value {
+    leak_object_value(TupleObject::from_slice(values))
+}
+
+#[inline]
+fn struct_time_value(value: StructTime) -> Value {
+    let fields = value
+        .to_array()
+        .map(|item| Value::int_unchecked(item as i64));
+    tuple_value(&fields)
+}
+
+#[inline]
+fn tzname_value() -> Value {
+    let (standard, daylight) = get_tzname();
+    tuple_value(&[
+        Value::string(intern(&standard)),
+        Value::string(intern(&daylight)),
+    ])
+}
+
+#[inline]
 fn expect_no_args(args: &[Value], fn_name: &str) -> Result<(), BuiltinError> {
     if args.is_empty() {
         Ok(())
@@ -466,6 +513,119 @@ fn sleep_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::none())
 }
 
+fn gmtime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    Ok(struct_time_value(gmtime(parse_optional_seconds_arg(
+        args, "gmtime",
+    )?)))
+}
+
+fn localtime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    Ok(struct_time_value(localtime(parse_optional_seconds_arg(
+        args,
+        "localtime",
+    )?)))
+}
+
+fn mktime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "mktime() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::float(mktime(&struct_time_from_value(
+        args[0], "mktime",
+    )?)))
+}
+
+fn strftime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "strftime() takes 1 or 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let format = value_to_string(args[0], "format")?;
+    let when = args
+        .get(1)
+        .copied()
+        .map(|value| struct_time_from_value(value, "strftime"))
+        .transpose()?;
+    Ok(Value::string(intern(
+        &strftime_fn(&format, when.as_ref())
+            .map_err(|err| BuiltinError::ValueError(err.to_string()))?,
+    )))
+}
+
+fn strptime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "strptime() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let string = value_to_string(args[0], "time string")?;
+    let format = value_to_string(args[1], "format")?;
+    Ok(struct_time_value(strptime_fn(&string, &format).map_err(
+        |err| BuiltinError::ValueError(err.to_string()),
+    )?))
+}
+
+fn asctime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "asctime() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let when = args
+        .first()
+        .copied()
+        .filter(|value| !value.is_none())
+        .map(|value| struct_time_from_value(value, "asctime"))
+        .transpose()?;
+    Ok(Value::string(intern(&asctime(when.as_ref()).map_err(
+        |err| BuiltinError::ValueError(err.to_string()),
+    )?)))
+}
+
+fn ctime_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "ctime() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let when = args
+        .first()
+        .copied()
+        .filter(|value| !value.is_none())
+        .map(|value| seconds_from_value(value, "ctime"))
+        .transpose()?;
+    Ok(Value::string(intern(&ctime(when).map_err(|err| {
+        BuiltinError::ValueError(err.to_string())
+    })?)))
+}
+
+fn struct_time_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "struct_time() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(struct_time_value(struct_time_from_value(
+        args[0],
+        "struct_time",
+    )?))
+}
+
 fn get_clock_info_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -491,4 +651,164 @@ fn get_clock_info_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         registry,
     );
     Ok(Value::object_ptr(Box::into_raw(object) as *const ()))
+}
+
+fn parse_optional_seconds_arg(args: &[Value], fn_name: &str) -> Result<Option<f64>, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{fn_name}() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    args.first()
+        .copied()
+        .filter(|value| !value.is_none())
+        .map(|value| seconds_from_value(value, fn_name))
+        .transpose()
+}
+
+fn seconds_from_value(value: Value, fn_name: &str) -> Result<f64, BuiltinError> {
+    let seconds = float_like_value(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!("{fn_name}() argument must be int or float"))
+    })?;
+    if !seconds.is_finite() {
+        return Err(BuiltinError::ValueError(format!(
+            "{fn_name}() argument must be finite"
+        )));
+    }
+    Ok(seconds)
+}
+
+fn struct_time_from_value(value: Value, fn_name: &str) -> Result<StructTime, BuiltinError> {
+    let items = sequence_items(value, fn_name)?;
+    if items.len() != 9 {
+        return Err(BuiltinError::TypeError(format!(
+            "{fn_name}() argument must be a 9-item sequence"
+        )));
+    }
+
+    let mut fields = [0i64; 9];
+    for (index, item) in items.into_iter().enumerate() {
+        fields[index] = int_like_value(item).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{fn_name}() argument must be a sequence of integers"
+            ))
+        })?;
+    }
+
+    StructTime::from_tuple(&fields)
+        .ok_or_else(|| BuiltinError::ValueError(format!("{fn_name}() argument out of range")))
+}
+
+fn sequence_items(value: Value, fn_name: &str) -> Result<Vec<Value>, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "{fn_name}() argument must be a tuple or list"
+        )));
+    };
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::TUPLE => Ok(unsafe { &*(ptr as *const TupleObject) }.as_slice().to_vec()),
+        TypeId::LIST => Ok(unsafe { &*(ptr as *const ListObject) }.as_slice().to_vec()),
+        _ => Err(BuiltinError::TypeError(format!(
+            "{fn_name}() argument must be a tuple or list"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod builtin_api_tests {
+    use super::*;
+
+    fn builtin_from_value(value: Value) -> &'static BuiltinFunctionObject {
+        let ptr = value
+            .as_object_ptr()
+            .expect("expected builtin function object");
+        unsafe { &*(ptr as *const BuiltinFunctionObject) }
+    }
+
+    fn tuple_from_value(value: Value) -> &'static TupleObject {
+        let ptr = value.as_object_ptr().expect("expected tuple object");
+        unsafe { &*(ptr as *const TupleObject) }
+    }
+
+    #[test]
+    fn test_time_module_exposes_callable_conversion_helpers() {
+        let module = TimeModule::new();
+        assert!(module.get_attr("gmtime").unwrap().as_object_ptr().is_some());
+        assert!(
+            module
+                .get_attr("localtime")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+        assert!(
+            module
+                .get_attr("strftime")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+        assert!(
+            module
+                .get_attr("asctime")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_gmtime_builtin_returns_nine_item_tuple() {
+        let module = TimeModule::new();
+        let gmtime = builtin_from_value(module.get_attr("gmtime").unwrap());
+        let result = gmtime
+            .call(&[Value::int(0).unwrap()])
+            .expect("gmtime should succeed");
+        let tuple = tuple_from_value(result);
+        assert_eq!(tuple.len(), 9);
+        assert_eq!(tuple.as_slice()[0].as_int(), Some(1970));
+        assert_eq!(tuple.as_slice()[1].as_int(), Some(1));
+        assert_eq!(tuple.as_slice()[2].as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_asctime_and_mktime_accept_sequence_arguments() {
+        let module = TimeModule::new();
+        let asctime = builtin_from_value(module.get_attr("asctime").unwrap());
+        let mktime = builtin_from_value(module.get_attr("mktime").unwrap());
+        let tuple = tuple_value(&[
+            Value::int(1973).unwrap(),
+            Value::int(9).unwrap(),
+            Value::int(16).unwrap(),
+            Value::int(1).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(52).unwrap(),
+            Value::int(0).unwrap(),
+            Value::int(259).unwrap(),
+            Value::int(-1).unwrap(),
+        ]);
+
+        let rendered = asctime.call(&[tuple]).expect("asctime should succeed");
+        let rendered_ptr = rendered
+            .as_string_object_ptr()
+            .expect("asctime should return a string");
+        let rendered_text =
+            interned_by_ptr(rendered_ptr as *const u8).expect("asctime result should be interned");
+        let text = rendered_text.as_str();
+        assert!(text.contains("1973"));
+
+        let timestamp = mktime.call(&[tuple]).expect("mktime should succeed");
+        assert!(timestamp.as_float().is_some());
+    }
+
+    #[test]
+    fn test_time_module_exposes_tzname_tuple() {
+        let module = TimeModule::new();
+        let value = module.get_attr("tzname").expect("tzname should exist");
+        let tuple = tuple_from_value(value);
+        assert_eq!(tuple.len(), 2);
+    }
 }

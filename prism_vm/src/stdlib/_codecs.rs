@@ -47,6 +47,18 @@ static UTF8_ENCODE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_codecs.utf_8_encode"), utf_8_encode));
 static UTF8_DECODE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_codecs.utf_8_decode"), utf_8_decode));
+static RAW_UNICODE_ESCAPE_ENCODE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_codecs.raw_unicode_escape_encode"),
+        raw_unicode_escape_encode,
+    )
+});
+static RAW_UNICODE_ESCAPE_DECODE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("_codecs.raw_unicode_escape_decode"),
+        raw_unicode_escape_decode,
+    )
+});
 
 static STRICT_ERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_codecs.strict_errors"), builtin_strict_errors)
@@ -96,6 +108,8 @@ static UTF8_CODEC_INFO: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_codec_info(CodecKind::Utf8));
 static UTF8_SIG_CODEC_INFO: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_codec_info(CodecKind::Utf8Sig));
+static RAW_UNICODE_ESCAPE_CODEC_INFO: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_codec_info(CodecKind::RawUnicodeEscape));
 
 static ASCII_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_encode(CodecKind::Ascii));
@@ -113,6 +127,10 @@ static UTF8_SIG_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_encode(CodecKind::Utf8Sig));
 static UTF8_SIG_CODEC_DECODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_decode(CodecKind::Utf8Sig));
+static RAW_UNICODE_ESCAPE_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| codec_method_encode(CodecKind::RawUnicodeEscape));
+static RAW_UNICODE_ESCAPE_CODEC_DECODE: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| codec_method_decode(CodecKind::RawUnicodeEscape));
 
 static REGISTRY: LazyLock<RwLock<CodecRegistry>> =
     LazyLock::new(|| RwLock::new(CodecRegistry::new()));
@@ -123,6 +141,7 @@ enum CodecKind {
     Latin1,
     Utf8,
     Utf8Sig,
+    RawUnicodeEscape,
 }
 
 impl CodecKind {
@@ -132,6 +151,7 @@ impl CodecKind {
             Self::Latin1 => "latin-1",
             Self::Utf8 => "utf-8",
             Self::Utf8Sig => "utf-8-sig",
+            Self::RawUnicodeEscape => "raw-unicode-escape",
         }
     }
 
@@ -141,6 +161,7 @@ impl CodecKind {
             Self::Latin1 => "latin_1_codec_info",
             Self::Utf8 => "utf_8_codec_info",
             Self::Utf8Sig => "utf_8_sig_codec_info",
+            Self::RawUnicodeEscape => "raw_unicode_escape_codec_info",
         }
     }
 
@@ -150,6 +171,7 @@ impl CodecKind {
             Self::Latin1 => &*LATIN1_CODEC_INFO,
             Self::Utf8 => &*UTF8_CODEC_INFO,
             Self::Utf8Sig => &*UTF8_SIG_CODEC_INFO,
+            Self::RawUnicodeEscape => &*RAW_UNICODE_ESCAPE_CODEC_INFO,
         };
         Value::object_ptr(Arc::as_ptr(class) as *const ())
     }
@@ -160,6 +182,7 @@ impl CodecKind {
             Self::Latin1 => &LATIN1_CODEC_ENCODE,
             Self::Utf8 => &UTF8_CODEC_ENCODE,
             Self::Utf8Sig => &UTF8_SIG_CODEC_ENCODE,
+            Self::RawUnicodeEscape => &RAW_UNICODE_ESCAPE_CODEC_ENCODE,
         }
     }
 
@@ -169,6 +192,7 @@ impl CodecKind {
             Self::Latin1 => &LATIN1_CODEC_DECODE,
             Self::Utf8 => &UTF8_CODEC_DECODE,
             Self::Utf8Sig => &UTF8_SIG_CODEC_DECODE,
+            Self::RawUnicodeEscape => &RAW_UNICODE_ESCAPE_CODEC_DECODE,
         }
     }
 }
@@ -233,6 +257,8 @@ impl CodecsModule {
                 Arc::from("latin_1_decode"),
                 Arc::from("utf_8_encode"),
                 Arc::from("utf_8_decode"),
+                Arc::from("raw_unicode_escape_encode"),
+                Arc::from("raw_unicode_escape_decode"),
             ],
             all_value: export_names_value(),
         }
@@ -265,6 +291,8 @@ impl Module for CodecsModule {
             "latin_1_decode" => Ok(builtin_value(&LATIN1_DECODE_FUNCTION)),
             "utf_8_encode" => Ok(builtin_value(&UTF8_ENCODE_FUNCTION)),
             "utf_8_decode" => Ok(builtin_value(&UTF8_DECODE_FUNCTION)),
+            "raw_unicode_escape_encode" => Ok(builtin_value(&RAW_UNICODE_ESCAPE_ENCODE_FUNCTION)),
+            "raw_unicode_escape_decode" => Ok(builtin_value(&RAW_UNICODE_ESCAPE_DECODE_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module '_codecs' has no attribute '{}'",
                 name
@@ -303,6 +331,8 @@ fn export_names_value() -> Value {
             "latin_1_decode",
             "utf_8_encode",
             "utf_8_decode",
+            "raw_unicode_escape_encode",
+            "raw_unicode_escape_decode",
         ]
         .into_iter()
         .map(|name| Value::string(intern(name)))
@@ -472,6 +502,22 @@ fn utf_8_decode(args: &[Value]) -> Result<Value, BuiltinError> {
     builtin_tuple_decode(args, CodecKind::Utf8, "utf_8_decode")
 }
 
+fn raw_unicode_escape_encode(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_tuple_encode(
+        args,
+        CodecKind::RawUnicodeEscape,
+        "raw_unicode_escape_encode",
+    )
+}
+
+fn raw_unicode_escape_decode(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_tuple_decode(
+        args,
+        CodecKind::RawUnicodeEscape,
+        "raw_unicode_escape_decode",
+    )
+}
+
 fn builtin_codec_method_encode(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -632,6 +678,7 @@ fn codec_kind_for_label(label: &str) -> Option<CodecKind> {
         "latin1" | "latin-1" | "iso-8859-1" => Some(CodecKind::Latin1),
         "utf8" | "utf-8" => Some(CodecKind::Utf8),
         "utf-8-sig" | "utf8-sig" => Some(CodecKind::Utf8Sig),
+        "raw-unicode-escape" | "rawunicodeescape" => Some(CodecKind::RawUnicodeEscape),
         _ => None,
     }
 }
@@ -740,6 +787,12 @@ fn encode_with_kind(input: &str, kind: CodecKind, errors: &str) -> Result<Vec<u8
             out.extend_from_slice(&payload);
             Ok(out)
         }
+        CodecKind::RawUnicodeEscape => encode_text_to_data(
+            input,
+            Some("raw-unicode-escape"),
+            Some(normalized_errors.as_str()),
+        )
+        .map_err(remap_unknown_error_handler),
     }
 }
 
@@ -767,13 +820,20 @@ fn decode_with_kind(input: &[u8], kind: CodecKind, errors: &str) -> Result<Strin
             decode_bytes_to_text(payload, Some("utf-8"), Some(normalized_errors.as_str()))
                 .map_err(remap_unknown_error_handler)
         }
+        CodecKind::RawUnicodeEscape => decode_bytes_to_text(
+            input,
+            Some("raw-unicode-escape"),
+            Some(normalized_errors.as_str()),
+        )
+        .map_err(remap_unknown_error_handler),
     }
 }
 
 fn validate_error_policy(errors: &str) -> Result<String, BuiltinError> {
     let normalized = errors.to_ascii_lowercase();
     match normalized.as_str() {
-        "strict" | "ignore" | "replace" | "surrogateescape" | "surrogatepass" => Ok(normalized),
+        "strict" | "ignore" | "replace" | "backslashreplace" | "surrogateescape"
+        | "surrogatepass" => Ok(normalized),
         _ => Err(BuiltinError::KeyError(format!(
             "unknown error handler name '{}'",
             errors
@@ -811,6 +871,13 @@ mod tests {
                 .as_object_ptr()
                 .is_some()
         );
+        assert!(
+            module
+                .get_attr("raw_unicode_escape_encode")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
     }
 
     #[test]
@@ -820,6 +887,11 @@ mod tests {
         assert!(
             lookup
                 .call_with_vm(&mut vm, &[Value::string(intern("utf-8"))])
+                .is_ok()
+        );
+        assert!(
+            lookup
+                .call_with_vm(&mut vm, &[Value::string(intern("raw-unicode-escape"))])
                 .is_ok()
         );
         let err = lookup
@@ -856,7 +928,7 @@ mod tests {
         let lookup_error =
             builtin_from_value(CodecsModule::new().get_attr("lookup_error").unwrap());
 
-        for handler_name in ["surrogateescape", "surrogatepass"] {
+        for handler_name in ["surrogateescape", "surrogatepass", "backslashreplace"] {
             let value = lookup_error
                 .call(&[Value::string(intern(handler_name))])
                 .expect("built-in surrogate handler should resolve");
@@ -909,6 +981,48 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_unicode_escape_encode_decode_returns_codec_tuples() {
+        let encoded = builtin_from_value(
+            CodecsModule::new()
+                .get_attr("raw_unicode_escape_encode")
+                .unwrap(),
+        )
+        .call(&[Value::string(intern("\u{0100}"))])
+        .expect("raw_unicode_escape_encode should succeed");
+        let encoded_ptr = encoded.as_object_ptr().expect("tuple should be object");
+        let encoded_tuple = unsafe { &*(encoded_ptr as *const TupleObject) };
+        let bytes_ptr = encoded_tuple
+            .get(0)
+            .unwrap()
+            .as_object_ptr()
+            .expect("bytes should be object");
+        let bytes = unsafe { &*(bytes_ptr as *const BytesObject) };
+        assert_eq!(bytes.as_bytes(), b"\\u0100");
+        assert_eq!(encoded_tuple.get(1).unwrap().as_int(), Some(1));
+
+        let decoded = builtin_from_value(
+            CodecsModule::new()
+                .get_attr("raw_unicode_escape_decode")
+                .unwrap(),
+        )
+        .call(&[leak_object_value(BytesObject::from_vec_with_type(
+            b"\\u0100".to_vec(),
+            TypeId::BYTES,
+        ))])
+        .expect("raw_unicode_escape_decode should succeed");
+        let decoded_ptr = decoded.as_object_ptr().expect("tuple should be object");
+        let decoded_tuple = unsafe { &*(decoded_ptr as *const TupleObject) };
+        let text_ptr = decoded_tuple
+            .get(0)
+            .unwrap()
+            .as_object_ptr()
+            .expect("decoded text should be object");
+        let text = unsafe { &*(text_ptr as *const StringObject) };
+        assert_eq!(text.as_str(), "\u{0100}");
+        assert_eq!(decoded_tuple.get(1).unwrap().as_int(), Some(6));
+    }
+
+    #[test]
     fn test_utf8_decode_supports_surrogateescape() {
         let value = builtin_from_value(CodecsModule::new().get_attr("utf_8_decode").unwrap())
             .call(&[
@@ -931,5 +1045,30 @@ mod tests {
         let escaped = encode_python_code_point(0xDCFF).expect("surrogate carrier should encode");
         assert_eq!(decoded.as_str(), format!("A{escaped}B"));
         assert_eq!(tuple.get(1).unwrap().as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_utf8_decode_supports_backslashreplace() {
+        let value = builtin_from_value(CodecsModule::new().get_attr("utf_8_decode").unwrap())
+            .call(&[
+                leak_object_value(BytesObject::from_vec_with_type(
+                    vec![0x41, 0xFF, 0x42],
+                    TypeId::BYTES,
+                )),
+                Value::string(intern("backslashreplace")),
+            ])
+            .expect("utf_8_decode should accept backslashreplace");
+
+        let ptr = value.as_object_ptr().expect("tuple should be object");
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        assert_eq!(tuple.get(1).unwrap().as_int(), Some(3));
+
+        let string_ptr = tuple
+            .get(0)
+            .unwrap()
+            .as_object_ptr()
+            .expect("decoded text should be object");
+        let decoded = unsafe { &*(string_ptr as *const StringObject) };
+        assert_eq!(decoded.as_str(), r"A\xffB");
     }
 }

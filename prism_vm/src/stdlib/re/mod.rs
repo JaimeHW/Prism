@@ -45,11 +45,13 @@ pub use functions::*;
 pub use match_obj::Match;
 pub use pattern::CompiledPattern;
 pub use python_api::{
-    RegexMatchObject, RegexPatternObject, builtin_compile, builtin_escape, builtin_fullmatch,
-    builtin_match, builtin_match_end, builtin_match_group, builtin_match_groupdict,
-    builtin_match_groups, builtin_match_span, builtin_match_start, builtin_pattern_fullmatch,
-    builtin_pattern_match, builtin_pattern_search, builtin_purge, builtin_search, match_attr_value,
-    pattern_attr_value,
+    RegexMatchObject, RegexPatternObject, builtin_compile, builtin_escape, builtin_findall,
+    builtin_finditer, builtin_fullmatch, builtin_match, builtin_match_end, builtin_match_group,
+    builtin_match_groupdict, builtin_match_groups, builtin_match_span, builtin_match_start,
+    builtin_pattern_findall, builtin_pattern_finditer, builtin_pattern_fullmatch,
+    builtin_pattern_match, builtin_pattern_search, builtin_pattern_split, builtin_pattern_sub,
+    builtin_pattern_subn, builtin_purge, builtin_search, builtin_split, builtin_sub, builtin_subn,
+    match_attr_value, pattern_attr_value,
 };
 
 use super::{Module, ModuleError, ModuleResult};
@@ -99,18 +101,22 @@ impl ReModule {
             // Flags
             Arc::from("IGNORECASE"),
             Arc::from("I"),
+            Arc::from("TEMPLATE"),
+            Arc::from("T"),
             Arc::from("MULTILINE"),
             Arc::from("M"),
             Arc::from("DOTALL"),
             Arc::from("S"),
             Arc::from("VERBOSE"),
             Arc::from("X"),
+            Arc::from("DEBUG"),
             Arc::from("ASCII"),
             Arc::from("A"),
             Arc::from("UNICODE"),
             Arc::from("U"),
             Arc::from("LOCALE"),
             Arc::from("L"),
+            Arc::from("NOFLAG"),
             // Types
             Arc::from("Pattern"),
             Arc::from("Match"),
@@ -136,6 +142,16 @@ static SEARCH_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.search"), builtin_search));
 static FULLMATCH_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.fullmatch"), builtin_fullmatch));
+static FINDALL_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.findall"), builtin_findall));
+static FINDITER_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.finditer"), builtin_finditer));
+static SUB_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.sub"), builtin_sub));
+static SUBN_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.subn"), builtin_subn));
+static SPLIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.split"), builtin_split));
 static ESCAPE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("re.escape"), builtin_escape));
 static PURGE_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -157,17 +173,22 @@ impl Module for ReModule {
             "match" => Ok(builtin_value(&MATCH_FUNCTION)),
             "search" => Ok(builtin_value(&SEARCH_FUNCTION)),
             "fullmatch" => Ok(builtin_value(&FULLMATCH_FUNCTION)),
+            "findall" => Ok(builtin_value(&FINDALL_FUNCTION)),
+            "finditer" => Ok(builtin_value(&FINDITER_FUNCTION)),
+            "sub" => Ok(builtin_value(&SUB_FUNCTION)),
+            "subn" => Ok(builtin_value(&SUBN_FUNCTION)),
+            "split" => Ok(builtin_value(&SPLIT_FUNCTION)),
             "escape" => Ok(builtin_value(&ESCAPE_FUNCTION)),
             "purge" => Ok(builtin_value(&PURGE_FUNCTION)),
-            "findall" | "finditer" | "sub" | "subn" | "split" => Err(ModuleError::AttributeError(
-                format!("re.{} is not yet callable as an object", name),
-            )),
 
             // Flag constants
+            "NOFLAG" => Ok(Value::int_unchecked(0)),
             "IGNORECASE" | "I" => Ok(Value::int_unchecked(RegexFlags::IGNORECASE as i64)),
+            "TEMPLATE" | "T" => Ok(Value::int_unchecked(RegexFlags::TEMPLATE as i64)),
             "MULTILINE" | "M" => Ok(Value::int_unchecked(RegexFlags::MULTILINE as i64)),
             "DOTALL" | "S" => Ok(Value::int_unchecked(RegexFlags::DOTALL as i64)),
             "VERBOSE" | "X" => Ok(Value::int_unchecked(RegexFlags::VERBOSE as i64)),
+            "DEBUG" => Ok(Value::int_unchecked(RegexFlags::DEBUG as i64)),
             "ASCII" | "A" => Ok(Value::int_unchecked(RegexFlags::ASCII as i64)),
             "UNICODE" | "U" => Ok(Value::int_unchecked(RegexFlags::UNICODE as i64)),
             "LOCALE" | "L" => Ok(Value::int_unchecked(RegexFlags::LOCALE as i64)),
@@ -218,5 +239,22 @@ mod module_tests {
         );
         assert!(module.get_attr("Match").unwrap().as_object_ptr().is_some());
         assert!(module.get_attr("error").unwrap().as_object_ptr().is_some());
+        assert!(
+            module
+                .get_attr("findall")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+        assert!(
+            module
+                .get_attr("finditer")
+                .unwrap()
+                .as_object_ptr()
+                .is_some()
+        );
+        assert!(module.get_attr("sub").unwrap().as_object_ptr().is_some());
+        assert!(module.get_attr("subn").unwrap().as_object_ptr().is_some());
+        assert!(module.get_attr("split").unwrap().as_object_ptr().is_some());
     }
 }

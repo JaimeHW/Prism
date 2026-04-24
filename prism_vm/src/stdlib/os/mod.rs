@@ -31,8 +31,24 @@ pub use file::*;
 pub use process::*;
 
 use super::{Module, ModuleError};
+use crate::VirtualMachine;
+use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::resolve_special_method;
+use crate::ops::objects::extract_type_id;
+use crate::stdlib::secure_random::urandom_value_from_args;
 use prism_core::Value;
-use std::sync::Arc;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::value_as_bytes_ref;
+use prism_runtime::types::string::value_as_string_ref;
+use std::sync::{Arc, LazyLock};
+
+static OS_URANDOM_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.urandom"), os_urandom));
+static OS_FSPATH_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("os.fspath"), os_fspath));
 
 /// The os module providing operating system interface.
 pub struct OsModule {
@@ -91,9 +107,11 @@ impl Module for OsModule {
             | "unlink" | "rename" | "replace" | "stat" | "lstat" | "listdir" | "scandir"
             | "walk" | "fwalk" | "getenv" | "putenv" | "unsetenv" | "getpid" | "getppid"
             | "kill" | "system" | "popen" | "access" | "chmod" | "chown" | "link" | "symlink"
-            | "readlink" | "urandom" => {
+            | "readlink" => {
                 Ok(Value::none()) // Placeholder for callable
             }
+            "urandom" => Ok(builtin_value(&OS_URANDOM_FUNCTION)),
+            "fspath" => Ok(builtin_value(&OS_FSPATH_FUNCTION)),
 
             // Submodule
             "path" => Ok(Value::none()), // TODO: Return os.path module
@@ -167,6 +185,7 @@ impl Module for OsModule {
             Arc::from("unsetenv"),
             // Misc
             Arc::from("urandom"),
+            Arc::from("fspath"),
             // Flags
             Arc::from("O_RDONLY"),
             Arc::from("O_WRONLY"),
@@ -179,6 +198,93 @@ impl Module for OsModule {
     }
 }
 
+#[inline]
+fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
+    Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+fn os_urandom(args: &[Value]) -> Result<Value, BuiltinError> {
+    urandom_value_from_args(args, "urandom")
+}
+
+pub(crate) fn os_fspath(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "fspath() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let path = args[0];
+    if is_path_protocol_result(path) {
+        return Ok(path);
+    }
+
+    let target = match resolve_special_method(path, "__fspath__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => {
+            return Err(BuiltinError::TypeError(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                python_type_name(path)
+            )));
+        }
+        Err(err) => return Err(BuiltinError::Raised(err)),
+    };
+
+    let result = match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(BuiltinError::Raised)?;
+
+    if is_path_protocol_result(result) {
+        Ok(result)
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "expected {}.__fspath__() to return str or bytes, not {}",
+            python_type_name(path),
+            python_type_name(result)
+        )))
+    }
+}
+
+#[inline]
+fn is_path_protocol_result(value: Value) -> bool {
+    value_as_string_ref(value).is_some()
+        || value_as_bytes_ref(value).is_some_and(|bytes| bytes.header.type_id == TypeId::BYTES)
+}
+
+fn python_type_name(value: Value) -> String {
+    if value.is_none() {
+        return "NoneType".to_string();
+    }
+    if value.as_bool().is_some() {
+        return "bool".to_string();
+    }
+    if value.as_int().is_some() {
+        return "int".to_string();
+    }
+    if value.as_float().is_some() {
+        return "float".to_string();
+    }
+    if value.is_string() {
+        return "str".to_string();
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return "object".to_string();
+    };
+
+    let type_id = extract_type_id(ptr);
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && let Some(class) = global_class(ClassId(type_id.raw()))
+    {
+        return class.name().as_str().to_string();
+    }
+
+    type_id.name().to_string()
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -186,6 +292,8 @@ impl Module for OsModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VirtualMachine;
+    use prism_runtime::types::bytes::BytesObject;
 
     // =========================================================================
     // Module Creation Tests
@@ -295,6 +403,68 @@ mod tests {
         assert!(environ.is_none());
     }
 
+    #[test]
+    fn test_urandom_returns_callable_builtin() {
+        let os = OsModule::new();
+        assert!(os.get_attr("urandom").unwrap().as_object_ptr().is_some());
+    }
+
+    #[test]
+    fn test_fspath_returns_callable_builtin() {
+        let os = OsModule::new();
+        assert!(os.get_attr("fspath").unwrap().as_object_ptr().is_some());
+    }
+
+    #[test]
+    fn test_os_urandom_returns_requested_number_of_bytes() {
+        let result = os_urandom(&[Value::int(24).expect("length should fit")])
+            .expect("os.urandom should succeed");
+        let ptr = result
+            .as_object_ptr()
+            .expect("os.urandom should return a bytes object");
+        let bytes = unsafe { &*(ptr as *const BytesObject) };
+        assert_eq!(bytes.len(), 24);
+    }
+
+    #[test]
+    fn test_os_fspath_returns_str_and_bytes_unchanged() {
+        let mut vm = VirtualMachine::new();
+        let string = Value::string(prism_core::intern::intern("path"));
+        assert_eq!(
+            os_fspath(&mut vm, &[string]).expect("str path should be accepted"),
+            string
+        );
+
+        let bytes_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"path")));
+        let bytes = Value::object_ptr(bytes_ptr as *const ());
+        assert_eq!(
+            os_fspath(&mut vm, &[bytes]).expect("bytes path should be accepted"),
+            bytes
+        );
+
+        unsafe {
+            drop(Box::from_raw(bytes_ptr));
+        }
+    }
+
+    #[test]
+    fn test_os_fspath_rejects_bytearray_and_non_path_values() {
+        let mut vm = VirtualMachine::new();
+        let bytearray_ptr = Box::into_raw(Box::new(BytesObject::bytearray_from_slice(b"path")));
+        let bytearray = Value::object_ptr(bytearray_ptr as *const ());
+        let bytearray_err = os_fspath(&mut vm, &[bytearray])
+            .expect_err("bytearray is not an accepted path protocol result");
+        assert!(matches!(bytearray_err, BuiltinError::TypeError(_)));
+
+        let int_err = os_fspath(&mut vm, &[Value::int(7).expect("int should fit")])
+            .expect_err("non-path object should be rejected");
+        assert!(matches!(int_err, BuiltinError::TypeError(_)));
+
+        unsafe {
+            drop(Box::from_raw(bytearray_ptr));
+        }
+    }
+
     // =========================================================================
     // Error Handling Tests
     // =========================================================================
@@ -351,6 +521,13 @@ mod tests {
         assert!(attrs.contains(&Arc::from("O_RDONLY")));
         assert!(attrs.contains(&Arc::from("O_WRONLY")));
         assert!(attrs.contains(&Arc::from("O_RDWR")));
+    }
+
+    #[test]
+    fn test_dir_contains_fspath() {
+        let os = OsModule::new();
+        let attrs = os.dir();
+        assert!(attrs.contains(&Arc::from("fspath")));
     }
 
     #[test]

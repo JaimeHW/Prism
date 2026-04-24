@@ -7,7 +7,10 @@
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinError, BuiltinFunctionObject, ExceptionValue, get_exception_type};
+use crate::builtins::{
+    BuiltinError, BuiltinFunctionObject, ExceptionValue, exception_proxy_class,
+    exception_proxy_class_id_from_ptr, get_exception_type,
+};
 use crate::error::RuntimeError;
 use crate::import::ModuleObject;
 use crate::ops::calls::invoke_callable_value;
@@ -19,6 +22,9 @@ use crate::truthiness::try_is_truthy;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class_bitmap;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
@@ -120,7 +126,7 @@ pub(crate) fn emit_bool_invert_deprecation_warning(
     let context = WarningContext::capture(vm)?;
     emit_warning(
         vm,
-        ExceptionTypeId::DeprecationWarning,
+        builtin_warning_category(ExceptionTypeId::DeprecationWarning)?,
         BOOL_INVERT_DEPRECATION_MESSAGE,
         &context,
     )
@@ -136,7 +142,10 @@ fn warn(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> 
     let message = warning_message_text(args[0]).map_err(BuiltinError::TypeError)?;
     let category = warning_category_from_value(args.get(1).copied())
         .map_err(BuiltinError::TypeError)?
-        .unwrap_or(ExceptionTypeId::UserWarning);
+        .unwrap_or_else(|| {
+            builtin_warning_category(ExceptionTypeId::UserWarning)
+                .expect("UserWarning must be a valid warning category")
+        });
     let context = WarningContext::capture(vm).map_err(BuiltinError::Raised)?;
     emit_warning(vm, category, &message, &context).map_err(BuiltinError::Raised)?;
     Ok(Value::none())
@@ -152,7 +161,10 @@ fn warn_explicit(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
     let message = warning_message_text(args[0]).map_err(BuiltinError::TypeError)?;
     let category = warning_category_from_value(args.get(1).copied())
         .map_err(BuiltinError::TypeError)?
-        .unwrap_or(ExceptionTypeId::UserWarning);
+        .unwrap_or_else(|| {
+            builtin_warning_category(ExceptionTypeId::UserWarning)
+                .expect("UserWarning must be a valid warning category")
+        });
     let filename = value_to_string(args[2], "warn_explicit() arg 3 must be str")
         .map_err(BuiltinError::TypeError)?;
     let lineno = value_to_i64(args[3], "warn_explicit() arg 4 must be int")
@@ -222,7 +234,7 @@ impl WarningContext {
 
 fn emit_warning(
     vm: &mut VirtualMachine,
-    category: ExceptionTypeId,
+    category: WarningCategory,
     message: &str,
     context: &WarningContext,
 ) -> Result<(), RuntimeError> {
@@ -232,14 +244,13 @@ fn emit_warning(
     };
 
     let text_value = Value::string(intern(message));
-    let category_value = category_value(category)?;
-    let warning_instance = crate::builtins::create_exception(category, Some(Arc::from(message)));
+    let warning_instance = instantiate_warning_instance(vm, category, message)?;
 
     let action = resolve_warning_action(
         vm,
         &warnings,
         text_value,
-        category_value,
+        category,
         &context.module_name,
         context.lineno,
         context.registry,
@@ -248,13 +259,11 @@ fn emit_warning(
     match action.as_str() {
         "ignore" => return Ok(()),
         "error" => {
-            let exc = RuntimeError::new(crate::error::RuntimeErrorKind::Exception {
-                type_id: category as u16,
-                message: Arc::from(message),
-            });
-            let mut exc = exc;
-            exc.raised_value = Some(warning_instance);
-            return Err(exc);
+            return Err(RuntimeError::raised_exception(
+                category.exception_type_id_for_raise(),
+                warning_instance,
+                Arc::from(message),
+            ));
         }
         "once" => {
             let Some(onceregistry_ptr) = warnings
@@ -265,7 +274,7 @@ fn emit_warning(
             };
             let once_key = alloc_tuple_value(
                 vm,
-                &[text_value, category_value],
+                &[text_value, category.value],
                 "warning once registry key",
             )?;
             let onceregistry = unsafe { &mut *onceregistry_ptr };
@@ -285,7 +294,7 @@ fn emit_warning(
                     registry,
                     &[
                         text_value,
-                        category_value,
+                        category.value,
                         Value::int(context.lineno as i64).unwrap(),
                     ],
                 )?;
@@ -296,7 +305,7 @@ fn emit_warning(
                     registry,
                     &[
                         text_value,
-                        category_value,
+                        category.value,
                         Value::int(context.lineno as i64).unwrap(),
                     ],
                 )?;
@@ -304,7 +313,7 @@ fn emit_warning(
                     vm,
                     &[
                         text_value,
-                        category_value,
+                        category.value,
                         Value::int(0).expect("zero should fit in tagged int"),
                     ],
                     "warning module registry key",
@@ -323,7 +332,7 @@ fn emit_warning(
         vm,
         &warnings,
         warning_instance,
-        category_value,
+        category.value,
         &context.filename,
         context.lineno,
     )?;
@@ -338,7 +347,7 @@ fn resolve_warning_action(
     vm: &mut VirtualMachine,
     warnings: &Arc<ModuleObject>,
     text: Value,
-    category: Value,
+    category: WarningCategory,
     module_name: &str,
     lineno: u32,
     registry: Option<*mut DictObject>,
@@ -347,7 +356,7 @@ fn resolve_warning_action(
         refresh_warning_registry(registry);
         let key = alloc_tuple_value(
             vm,
-            &[text, category, Value::int(lineno as i64).unwrap()],
+            &[text, category.value, Value::int(lineno as i64).unwrap()],
             "warning registry key",
         )?;
         if unsafe { &mut *registry }.get(key).is_some() {
@@ -377,7 +386,7 @@ fn match_filter(
     vm: &mut VirtualMachine,
     item: Value,
     text: Value,
-    category: Value,
+    category: WarningCategory,
     module_name: &str,
     lineno: u32,
 ) -> Result<Option<String>, RuntimeError> {
@@ -432,24 +441,31 @@ fn filter_pattern_matches(
     try_is_truthy(vm, matched)
 }
 
-fn warning_category_matches(actual: Value, expected: Value) -> Result<bool, RuntimeError> {
-    let Some(actual_ptr) = actual.as_object_ptr() else {
+fn warning_category_matches(
+    actual: WarningCategory,
+    expected: Value,
+) -> Result<bool, RuntimeError> {
+    let Some(expected_class_id) = warning_category_class_id(expected) else {
         return Ok(false);
     };
-    let Some(expected_ptr) = expected.as_object_ptr() else {
-        return Ok(false);
-    };
-    let actual_header = unsafe { &*(actual_ptr as *const ObjectHeader) };
-    let expected_header = unsafe { &*(expected_ptr as *const ObjectHeader) };
-    if actual_header.type_id != crate::builtins::EXCEPTION_TYPE_ID
-        || expected_header.type_id != crate::builtins::EXCEPTION_TYPE_ID
-    {
-        return Ok(false);
+    Ok(global_class_bitmap(actual.class_id)
+        .map(|bitmap| bitmap.is_subclass_of(TypeId::from_raw(expected_class_id.0)))
+        .unwrap_or(actual.class_id == expected_class_id))
+}
+
+fn instantiate_warning_instance(
+    vm: &mut VirtualMachine,
+    category: WarningCategory,
+    message: &str,
+) -> Result<Value, RuntimeError> {
+    if let Some(kind) = category.exception_type_id {
+        return Ok(crate::builtins::create_exception(
+            kind,
+            Some(Arc::from(message)),
+        ));
     }
 
-    let actual = unsafe { &*(actual_ptr as *const crate::builtins::ExceptionTypeObject) };
-    let expected = unsafe { &*(expected_ptr as *const crate::builtins::ExceptionTypeObject) };
-    Ok(actual.is_subclass_of(expected.exception_type_id))
+    invoke_callable_value(vm, category.value, &[Value::string(intern(message))])
 }
 
 fn instantiate_warning_message(
@@ -539,25 +555,84 @@ fn category_value(category: ExceptionTypeId) -> Result<Value, RuntimeError> {
     ))
 }
 
-fn warning_category_from_value(value: Option<Value>) -> Result<Option<ExceptionTypeId>, String> {
+#[derive(Clone, Copy, Debug)]
+struct WarningCategory {
+    value: Value,
+    class_id: ClassId,
+    exception_type_id: Option<ExceptionTypeId>,
+}
+
+impl WarningCategory {
+    #[inline]
+    fn exception_type_id_for_raise(self) -> u16 {
+        self.exception_type_id.unwrap_or(ExceptionTypeId::Warning) as u16
+    }
+}
+
+fn builtin_warning_category(category: ExceptionTypeId) -> Result<WarningCategory, RuntimeError> {
+    let value = category_value(category)?;
+    let class_id = warning_category_class_id(value).ok_or_else(|| {
+        RuntimeError::internal(format!(
+            "{} did not publish an exception proxy class",
+            category.name()
+        ))
+    })?;
+    Ok(WarningCategory {
+        value,
+        class_id,
+        exception_type_id: Some(category),
+    })
+}
+
+fn warning_category_from_value(value: Option<Value>) -> Result<Option<WarningCategory>, String> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(None);
     };
-    let Some(ptr) = value.as_object_ptr() else {
+
+    let Some(class_id) = warning_category_class_id(value) else {
         return Err("warning category must be a Warning subclass".to_string());
     };
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != crate::builtins::EXCEPTION_TYPE_ID {
+    if !is_warning_category_class_id(class_id) {
         return Err("warning category must be a Warning subclass".to_string());
     }
 
-    let exception_type = unsafe { &*(ptr as *const crate::builtins::ExceptionTypeObject) };
-    let kind = ExceptionTypeId::from_u8(exception_type.exception_type_id as u8)
-        .ok_or_else(|| "warning category must be a Warning subclass".to_string())?;
-    if !kind.is_subclass_of(ExceptionTypeId::Warning) {
-        return Err("warning category must be a Warning subclass".to_string());
+    Ok(Some(WarningCategory {
+        value,
+        class_id,
+        exception_type_id: warning_category_exception_type_id(value),
+    }))
+}
+
+fn warning_category_exception_type_id(value: Value) -> Option<ExceptionTypeId> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != crate::builtins::EXCEPTION_TYPE_ID {
+        return None;
     }
-    Ok(Some(kind))
+
+    let exception_type = unsafe { &*(ptr as *const crate::builtins::ExceptionTypeObject) };
+    ExceptionTypeId::from_u8(exception_type.exception_type_id as u8)
+}
+
+fn warning_category_class_id(value: Value) -> Option<ClassId> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id == crate::builtins::EXCEPTION_TYPE_ID {
+        return exception_proxy_class_id_from_ptr(ptr);
+    }
+    if header.type_id == TypeId::TYPE && crate::builtins::builtin_type_object_type_id(ptr).is_none()
+    {
+        let class = unsafe { &*(ptr as *const PyClassObject) };
+        return Some(class.class_id());
+    }
+    None
+}
+
+fn is_warning_category_class_id(class_id: ClassId) -> bool {
+    let warning_id = exception_proxy_class(ExceptionTypeId::Warning).class_id();
+    global_class_bitmap(class_id)
+        .map(|bitmap| bitmap.is_subclass_of(TypeId::from_raw(warning_id.0)))
+        .unwrap_or(class_id == warning_id)
 }
 
 fn warning_message_text(value: Value) -> Result<String, String> {
@@ -648,5 +723,52 @@ mod tests {
             let header = unsafe { &*(ptr as *const ObjectHeader) };
             assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
         }
+    }
+
+    #[test]
+    fn test_warning_category_accepts_supplemental_heap_warning_classes() {
+        let resource_warning = crate::builtins::supplemental_exception_class("ResourceWarning")
+            .expect("ResourceWarning supplemental class should exist");
+        let value =
+            Value::object_ptr(resource_warning.as_ref() as *const PyClassObject as *const ());
+
+        let category = warning_category_from_value(Some(value))
+            .expect("ResourceWarning should be a valid category")
+            .expect("category should be present");
+
+        assert_eq!(category.value, value);
+        assert_eq!(category.class_id, resource_warning.class_id());
+        assert_eq!(category.exception_type_id, None);
+        assert!(is_warning_category_class_id(category.class_id));
+    }
+
+    #[test]
+    fn test_warning_category_matches_builtin_and_heap_category_hierarchy() {
+        let resource_warning = crate::builtins::supplemental_exception_class("ResourceWarning")
+            .expect("ResourceWarning supplemental class should exist");
+        let resource_value =
+            Value::object_ptr(resource_warning.as_ref() as *const PyClassObject as *const ());
+        let category = warning_category_from_value(Some(resource_value))
+            .expect("ResourceWarning should be a valid category")
+            .expect("category should be present");
+
+        let warning_value = category_value(ExceptionTypeId::Warning).expect("Warning exists");
+        let runtime_warning_value =
+            category_value(ExceptionTypeId::RuntimeWarning).expect("RuntimeWarning exists");
+
+        assert!(warning_category_matches(category, warning_value).unwrap());
+        assert!(warning_category_matches(category, resource_value).unwrap());
+        assert!(!warning_category_matches(category, runtime_warning_value).unwrap());
+    }
+
+    #[test]
+    fn test_warning_category_rejects_non_warning_heap_classes() {
+        let plain_class = PyClassObject::new_simple(intern("PlainCategory"));
+        let value = Value::object_ptr(&plain_class as *const PyClassObject as *const ());
+
+        let error = warning_category_from_value(Some(value))
+            .expect_err("plain heap classes are not warning categories");
+
+        assert_eq!(error, "warning category must be a Warning subclass");
     }
 }

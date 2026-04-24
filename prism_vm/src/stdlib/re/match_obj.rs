@@ -116,7 +116,6 @@ impl Match {
         let groups: Vec<Option<Range<usize>>> =
             caps.iter().map(|m| m.map(|m| m.start()..m.end())).collect();
 
-        // Named groups not directly accessible in fancy-regex
         let named_groups = FxHashMap::default();
 
         Self {
@@ -125,6 +124,21 @@ impl Match {
             groups,
             named_groups,
         }
+    }
+
+    /// Create from `fancy_regex::Captures` with regex for named groups.
+    pub fn from_fancy_captures_with_regex(
+        caps: &fancy_regex::Captures,
+        text: &str,
+        regex: &fancy_regex::Regex,
+    ) -> Self {
+        let mut match_value = Self::from_fancy_captures(caps, text);
+        for (i, name_opt) in regex.capture_names().enumerate() {
+            if let Some(name) = name_opt {
+                match_value.named_groups.insert(Arc::from(name), i);
+            }
+        }
+        match_value
     }
 
     // =========================================================================
@@ -144,6 +158,12 @@ impl Match {
         self.groups
             .get(n)
             .and_then(|opt| opt.as_ref().map(|span| &self.string[span.clone()]))
+    }
+
+    /// Resolve a named capture group to its numeric index.
+    #[inline]
+    pub fn group_index(&self, name: &str) -> Option<usize> {
+        self.named_groups.get(name).copied()
     }
 
     /// Return all groups except group 0 as a tuple (Vec).
@@ -225,6 +245,18 @@ impl Match {
     #[inline]
     pub fn string(&self) -> &str {
         &self.string
+    }
+
+    /// Rebase this match from a sliced substring back onto the original string.
+    pub fn with_offset(mut self, text: &str, offset: usize) -> Self {
+        self.string = Arc::from(text);
+        self.full_span = (self.full_span.start + offset)..(self.full_span.end + offset);
+        for group in &mut self.groups {
+            if let Some(span) = group {
+                *span = (span.start + offset)..(span.end + offset);
+            }
+        }
+        self
     }
 
     /// Return the number of groups (including group 0).
