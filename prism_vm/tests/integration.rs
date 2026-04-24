@@ -15,6 +15,7 @@ use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use prism_vm::VirtualMachine;
 use prism_vm::import::ModuleObject;
+use prism_vm::stdlib::re::RegexFlags;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -184,6 +185,115 @@ fn test_integer_multiplication() {
 }
 
 #[test]
+fn test_constructor_exception_after_successful_instance_is_not_masked_by_stale_return_register() {
+    let result = execute(
+        r#"
+class Example:
+    def __init__(self, ok):
+        if ok:
+            self.value = 1
+        else:
+            raise ValueError("boom")
+
+first = Example(True)
+assert first.value == 1
+
+try:
+    Example(False)
+except ValueError as exc:
+    assert exc.args == ("boom",)
+else:
+    raise AssertionError("expected ValueError")
+
+third = Example(True)
+assert third.value == 1
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_nonreflexive_values_preserve_identity_inside_builtin_containers() {
+    let result = execute_with_cpython_lib(
+        r#"
+from collections import deque
+from test.support import NEVER_EQ
+
+values = float('nan'), 1, None, 'abc', NEVER_EQ
+constructors = list, tuple, dict.fromkeys, set, frozenset, deque
+
+for constructor in constructors:
+    container = constructor(values)
+    for elem in container:
+        assert elem in container
+    assert container == constructor(values)
+    assert container == container
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_main_module_exposes_doc_binding_without_a_docstring() {
+    let result = execute(
+        r#"
+assert __doc__ is None
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_imported_source_module_exposes_doc_binding_without_a_docstring() {
+    let temp_dir = unique_temp_dir("module_doc_binding");
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    fs::write(temp_dir.join("docless_mod.py"), "VALUE = __doc__\n")
+        .expect("failed to write temp module");
+
+    let result = execute_with_search_paths(
+        r#"
+import docless_mod
+
+assert docless_mod.VALUE is None
+"#,
+        &[temp_dir.as_path()],
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_native_chainmap_supports_unittest_style_ordered_subtest_params() {
+    let result = execute_with_cpython_lib(
+        r#"
+from collections import ChainMap
+
+class _OrderedChainMap(ChainMap):
+    def __iter__(self):
+        d = {}
+        for mapping in reversed(self.maps):
+            d.update(dict.fromkeys(mapping))
+        return iter(d)
+
+params = _OrderedChainMap({'scope': 'x'})
+assert list(params.items()) == [('scope', 'x')]
+
+child = params.new_child({'phase': 'y'})
+assert list(child.items()) == [('scope', 'x'), ('phase', 'y')]
+assert child['scope'] == 'x'
+assert child['phase'] == 'y'
+assert list(child.parents.items()) == [('scope', 'x')]
+
+created = ChainMap.fromkeys(['alpha', 'beta'], 5)
+assert list(created.items()) == [('alpha', 5), ('beta', 5)]
+"#,
+    );
+
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_compound_arithmetic() {
     let result = execute("2 + 3 * 4");
     assert!(result.is_ok(), "Failed: {:?}", result);
@@ -301,6 +411,46 @@ assert pickle.dumps(True, protocol=1) == b"I01\n."
 assert pickle.dumps(False, protocol=1) == b"I00\n."
 assert pickle.dumps(True, protocol=2) == b"\x80\x02\x88."
 assert pickle.dumps(False, protocol=2) == b"\x80\x02\x89."
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_platform_uname_pickle_round_trips_all_protocols_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import pickle
+import platform
+
+original = platform.uname()
+for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+    restored = pickle.loads(pickle.dumps(original, proto))
+    assert restored == original
+    assert tuple(restored) == tuple(original)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_platform_win32_ver_uses_native_windows_version_and_registry_data() {
+    let result = execute_with_cpython_lib(
+        r#"
+import os
+import platform
+import sys
+
+release, version, csd, ptype = platform.win32_ver('a', 'b', 'c', 'd')
+if sys.platform == 'win32':
+    assert release != 'a'
+    assert version and all(part.isdigit() for part in version.split('.'))
+    assert not csd or csd.startswith('SP')
+    assert not ptype or 'Multiprocessor' in ptype or 'Uniprocessor' in ptype
+    count = os.cpu_count()
+    assert count is None or count >= 1
+else:
+    assert (release, version, csd, ptype) == ('a', 'b', 'c', 'd')
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
@@ -1062,6 +1212,33 @@ assert getattr(Child, "__dict__")["token"] == 7
 }
 
 #[test]
+fn test_class_body_loads_later_method_names_from_globals_until_assigned() {
+    let result = execute(
+        r#"
+class date:
+    __slots__ = ("date_slot",)
+
+class time:
+    __slots__ = ("time_slot",)
+
+class datetime(date):
+    __slots__ = date.__slots__ + time.__slots__
+
+    def date(self):
+        return "method-date"
+
+    def time(self):
+        return "method-time"
+
+assert datetime.__slots__ == ("date_slot", "time_slot")
+assert datetime.date(None) == "method-date"
+assert datetime.time(None) == "method-time"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_builtin_type_reflection_exposes_mro_and_mappingproxy_membership_to_python() {
     let result = execute(
         r#"
@@ -1070,6 +1247,21 @@ assert getattr(bool, "__mro__")[1] is int
 assert getattr(bool, "__mro__")[2] is object
 assert "fromkeys" in dict.__dict__
 assert dict.__dict__["fromkeys"] is not None
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_builtin_container_instances_expose_class_attribute_to_python() {
+    let result = execute(
+        r#"
+assert [].__class__ is list
+assert {}.__class__ is dict
+assert ().__class__ is tuple
+assert {1}.__class__ is set
+assert b"abc".__class__ is bytes
+assert bytearray(b"abc").__class__ is bytearray
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
@@ -1449,11 +1641,151 @@ assert point.y == 2
 }
 
 #[test]
+fn test_namedtuple_subclass_custom_new_does_not_reinitialize_tuple_payload() {
+    let result = execute_with_cpython_lib(
+        r#"
+from collections import namedtuple
+
+Base = namedtuple("Base", "nid shortname longname oid")
+
+class ASN1Object(Base):
+    __slots__ = ()
+
+    def __new__(cls, oid):
+        return Base.__new__(cls, 129, "serverAuth", "TLS Web Server Authentication", oid)
+
+value = ASN1Object("1.3.6.1.5.5.7.3.1")
+assert value.nid == 129
+assert value.shortname == "serverAuth"
+assert value.longname == "TLS Web Server Authentication"
+assert value.oid == "1.3.6.1.5.5.7.3.1"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_copy_uses_user_reduce_via_object_reduce_ex_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import copy
+
+def factory():
+    return "ok"
+
+class Reducible:
+    def __reduce__(self):
+        return (factory, ())
+
+assert copy.copy(Reducible()) == "ok"
+assert copy.deepcopy(Reducible()) == "ok"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_dis_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import dis
+
+assert dis._Instruction.opname.__doc__ == "Human readable name for operation"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_import_functools_with_cpython_stdlib() {
     let result = execute_with_cpython_lib(
         r#"
 import functools
 "#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_cpython_base64_uses_native_binascii() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import base64
+import binascii
+from array import array
+from io import BytesIO
+
+assert binascii.hexlify(b"\xb9\x01\xef") == b"b901ef"
+assert binascii.hexlify(array("B", b"\x01\x02\xef")) == b"0102ef"
+assert b"==payload==\n".rstrip(b"=\n") == b"==payload"
+assert bytearray(b"\tdata\n").strip() == bytearray(b"data")
+assert b"abca".translate(bytes.maketrans(b"a", b"z")) == b"zbcz"
+assert b"abc".translate(None, b"b") == b"ac"
+assert bytes.maketrans(array("B", b"+/"), array("B", b"-_"))[ord("+")] == ord("-")
+assert base64.b64encode(b"hello") == b"aGVsbG8="
+assert base64.b64decode(b"aGVsbG8=") == b"hello"
+assert base64.b16encode(array("B", b"\x01\x02\xef")) == b"0102EF"
+outfp = BytesIO()
+base64.decode(BytesIO(b"d3d3LnB5dGhvbi5vcmc="), outfp)
+assert outfp.getvalue() == b"www.python.org"
+try:
+    base64.decodebytes(memoryview(b"1234").cast("B", (2, 2)))
+    raise AssertionError("multidimensional memoryview should be rejected")
+except TypeError:
+    pass
+"#,
+        200_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_memoryview_cast_preserves_shape_metadata() {
+    let source = r#"
+view = memoryview(b"1234").cast("B", (2, 2))
+assert view.ndim == 2
+assert view.shape == (2, 2)
+assert view.strides == (2, 1)
+assert memoryview(view).ndim == 2
+assert memoryview(view).shape == (2, 2)
+"#;
+
+    execute(source).unwrap();
+}
+
+#[test]
+fn test_named_expression_in_while_condition_assigns_loop_value() {
+    let source = r#"
+calls = 0
+seen = []
+
+def read():
+    global calls
+    calls = calls + 1
+    if calls == 1:
+        return b"payload"
+    return b""
+
+while line := read():
+    seen.append(line)
+
+assert seen == [b"payload"]
+assert line == b""
+assert calls == 2
+"#;
+
+    execute(source).unwrap();
+}
+
+#[test]
+fn test_cpython_http_server_imports_with_native_http_stack() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+from http.server import HTTPServer
+
+assert HTTPServer.__name__ == "HTTPServer"
+"#,
+        12_000_000,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
@@ -2693,6 +3025,46 @@ RESULT = re.escape("a+b")
 }
 
 #[test]
+fn test_cpython_re_compile_uses_native_sre_bridge() {
+    let result = execute_with_cpython_lib(
+        r#"
+import re
+
+pattern = re.compile(r"(?P<word>ab)+", re.I)
+match = pattern.match("ABab")
+assert match is not None
+assert match.group("word") == "ab"
+assert pattern.groupindex["word"] == 1
+RESULT = pattern.flags
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+    assert_eq!(
+        result.expect("pattern flags should be returned").as_int(),
+        Some(RegexFlags::IGNORECASE as i64 | RegexFlags::UNICODE as i64)
+    );
+}
+
+#[test]
+fn test_direct_sre_compile_supports_cpython_parser_output() {
+    let result = execute_with_cpython_lib(
+        r#"
+from re import _compiler
+
+pattern = _compiler.compile(r"(?P<word>ab)+", 0)
+match = pattern.match("abab")
+assert match is not None
+RESULT = match.group("word")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+    assert!(value_is_python_string(
+        result.expect("_sre bridge should return a working pattern"),
+        "ab"
+    ));
+}
+
+#[test]
 fn test_import_tokenize_with_cpython_stdlib() {
     let result = execute_with_cpython_lib(
         r#"
@@ -3684,6 +4056,23 @@ assert copy_metadata(*args, **kwargs) is wrapper
 }
 
 #[test]
+fn test_call_ex_starargs_expands_generator_iterable() {
+    let result = execute(
+        r#"
+def values():
+    yield 1
+    yield 2
+
+def collect(*items):
+    return items
+
+assert collect(*values()) == (1, 2)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_functools_wraps_decorator_with_cpython_stdlib() {
     let result = execute_with_cpython_lib(
         r#"
@@ -3879,6 +4268,26 @@ assert second() == "second"
 }
 
 #[test]
+fn test_comprehension_reads_explicit_global_without_creating_cell() {
+    let result = execute(
+        r#"
+seed = [10]
+cache = None
+
+def build():
+    global cache, seed
+    if cache is None:
+        cache = [x + seed[0] for x in range(2)]
+    return cache[0]
+
+assert build() == 10
+assert build() == 10
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_functools_wraps_closures_keep_distinct_wrapped_functions() {
     let result = execute(
         r#"
@@ -3950,6 +4359,48 @@ fn test_import_os_with_cpython_stdlib() {
     let result = execute_with_cpython_lib(
         r#"
 import os
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_os_fspath_uses_pathlike_protocol_with_cpython_stdlib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import os
+
+assert os.fspath("alpha") == "alpha"
+assert os.fspath(b"alpha") == b"alpha"
+
+class PathLike:
+    def __fspath__(self):
+        return "beta"
+
+assert os.fspath(PathLike()) == "beta"
+
+class BadReturn:
+    def __fspath__(self):
+        return 123
+
+try:
+    os.fspath(BadReturn())
+except TypeError as exc:
+    assert "__fspath__" in str(exc)
+else:
+    raise AssertionError("expected TypeError for invalid __fspath__ result")
+
+class InstanceOnly:
+    pass
+
+instance = InstanceOnly()
+instance.__fspath__ = lambda: "ignored"
+try:
+    os.fspath(instance)
+except TypeError:
+    pass
+else:
+    raise AssertionError("instance __fspath__ must not satisfy the path protocol")
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
@@ -4134,6 +4585,57 @@ assert not keyword.iskeyword("prism_runtime")
 }
 
 #[test]
+fn test_plain_builtin_class_attributes_remain_unbound() {
+    let result = execute(
+        r#"
+class Probe:
+    helper = len
+
+assert Probe().helper("abc") == 3
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_random_module_binds_native_heaptype_methods() {
+    let result = execute(
+        r#"
+import _random
+
+rng = _random.Random()
+seed = rng.seed
+assert seed.__self__ is rng
+seed(123)
+assert rng.getstate() == 123
+seed()
+assert isinstance(rng.getstate(), int)
+assert isinstance(rng.random(), float)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_random_stdlib_subclass_inherits_bound_native_methods() {
+    let result = execute_with_cpython_lib(
+        r#"
+import random
+
+rng = random.Random()
+seed = rng.seed
+assert seed.__self__ is rng
+seed(123)
+assert isinstance(rng.getstate(), tuple)
+assert rng.getstate()[1] == 123
+seed()
+assert isinstance(rng.random(), float)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_import_sysconfig_supports_dict_union_operators() {
     let result = execute_with_cpython_lib(
         r#"
@@ -4186,6 +4688,40 @@ result = keyword.iskeyword("while")
 }
 
 #[test]
+fn test_test_support_package_exposes_path_and_import_helper_with_cpython_lib() {
+    let result = execute_with_cpython_lib(
+        r#"
+import test.support as support
+from test.support import import_helper, warnings_helper
+
+assert hasattr(support, "__path__")
+assert import_helper is not None
+assert warnings_helper is not None
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_winreg_with_cpython_lib_bootstrap_surface() {
+    if !cfg!(windows) {
+        return;
+    }
+
+    let result = execute_with_cpython_lib(
+        r#"
+import winreg
+
+assert winreg.HKEY_CURRENT_USER >= 0
+assert winreg.HKEY_LOCAL_MACHINE >= 0
+assert callable(winreg.OpenKey)
+assert callable(winreg.QueryValue)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_import_textwrap_with_cpython_lib() {
     let result = execute_with_cpython_lib(
         r#"
@@ -4214,8 +4750,11 @@ fn test_import_unittest_with_cpython_lib() {
     let result = execute_with_cpython_lib_and_step_limit(
         r#"
 import unittest
+
+loader = unittest.TestLoader()
+assert loader.__class__.__name__ == "TestLoader"
 "#,
-        120_000,
+        200_000,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
@@ -4246,6 +4785,492 @@ assert buffer.writable()
 assert buffer.readable()
 assert buffer.seekable()
 "#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_io_memory_buffers_are_subclassable_from_python() {
+    let result = execute(
+        r#"
+from io import BytesIO, StringIO
+
+class TextBuffer(StringIO):
+    pass
+
+class BinaryBuffer(BytesIO):
+    pass
+
+text = TextBuffer("seed")
+text.seek(4)
+assert text.write("!")
+assert text.getvalue() == "seed!"
+
+binary = BinaryBuffer(b"seed")
+binary.seek(4)
+assert binary.write(b"!")
+assert binary.getvalue() == b"seed!"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_super_binds_builtin_object_init_from_base_class() {
+    let result = execute(
+        r#"
+class Base:
+    pass
+
+class Derived(Base):
+    def __init__(self):
+        super(Derived, self).__init__()
+        self.ready = True
+
+instance = Derived()
+assert instance.ready is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_import_doctest_with_cpython_lib() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+
+assert doctest._newline_convert("a\r\nb\rc\n") == "a\nb\nc\n"
+"#,
+        200_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bound_builtin_callbacks_stored_on_classes_remain_unbound() {
+    let result = execute(
+        r#"
+import re
+
+class Parser:
+    matcher = re.compile(r"^a+$").match
+
+parser = Parser()
+assert Parser.matcher("aaa") is not None
+assert parser.matcher("aaa") is not None
+assert parser.matcher("bbb") is None
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_finder_handles_named_group_stdlib_parsing() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+import test.test_listcomps as module
+
+finder = doctest.DocTestFinder()
+tests = finder.find(module)
+assert len(tests) >= 1
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_decimal_bootstrap_uses_contextvars_for_localcontext() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import decimal
+
+base = decimal.getcontext().prec
+with decimal.localcontext() as ctx:
+    ctx.prec = base + 2
+    assert decimal.getcontext().prec == base + 2
+
+assert decimal.getcontext().prec == base
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_large_i64_literals_survive_compile_and_execute() {
+    let result = execute(
+        r#"
+value = 2305843009213693952
+assert value == 2305843009213693952
+assert value - 1 == 2305843009213693951
+assert value + 1 == 2305843009213693953
+assert -value == -2305843009213693952
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bigint_literals_survive_compile_and_execute() {
+    let result = execute(
+        r#"
+value = 1267650600228229401496703205376
+assert value == 1267650600228229401496703205376
+assert value - 1 == 1267650600228229401496703205375
+assert value + 1 == 1267650600228229401496703205377
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_sys_hash_info_modulus_supports_bigint_arithmetic() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import sys
+
+assert sys.hash_info.modulus - 2 == 2305843009213693949
+assert sys.hash_info.modulus + 1 == 2305843009213693952
+assert -sys.hash_info.modulus == -2305843009213693951
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_parser_blank_or_comment_callback_uses_regex_receiver() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+
+parser = doctest.DocTestParser()
+assert parser._IS_BLANK_OR_COMMENT("   # comment") is not None
+assert parser._IS_BLANK_OR_COMMENT("   ") is not None
+assert parser._IS_BLANK_OR_COMMENT("value") is None
+"#,
+        200_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_class_bodies_seed_module_and_qualname_metadata() {
+    let result = execute(
+        r#"
+class Outer:
+    seen_module = __module__
+    seen_qualname = __qualname__
+
+    class Inner:
+        seen_module = __module__
+        seen_qualname = __qualname__
+
+def factory():
+    class Local:
+        seen_module = __module__
+        seen_qualname = __qualname__
+    return Local
+
+Local = factory()
+
+assert Outer.__module__ == "__main__"
+assert Outer.__qualname__ == "Outer"
+assert Outer.seen_module == "__main__"
+assert Outer.seen_qualname == "Outer"
+
+assert Outer.Inner.__module__ == "__main__"
+assert Outer.Inner.__qualname__ == "Outer.Inner"
+assert Outer.Inner.seen_module == "__main__"
+assert Outer.Inner.seen_qualname == "Outer.Inner"
+
+assert Local.__module__ == "__main__"
+assert Local.__qualname__ == "factory.<locals>.Local"
+assert Local.seen_module == "__main__"
+assert Local.seen_qualname == "factory.<locals>.Local"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_finder_reads_cpython_source_lines_as_text() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import inspect
+import linecache
+import re
+import test.test_listcomps as module
+
+source_file = inspect.getsourcefile(module.ListComprehensionTest)
+if not isinstance(source_file, str):
+    raise AssertionError(f"source_file={source_file!r} type={type(source_file).__name__}")
+
+source_lines = linecache.getlines(source_file, module.__dict__)
+if not isinstance(source_lines, list):
+    raise AssertionError(f"source_lines_type={type(source_lines).__name__}")
+if len(source_lines) <= 100:
+    raise AssertionError(f"source_lines_len={len(source_lines)}")
+line_types = [type(line).__name__ for line in source_lines[:10]]
+if not all(isinstance(line, str) for line in source_lines[:10]):
+    raise AssertionError(f"source_line_types={line_types!r}")
+
+pat = re.compile(r'(^|.*:)\s*\w*("|\')')
+for line in source_lines[:50]:
+    pat.match(line)
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_finder_computes_lineno_for_cpython_class() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+import inspect
+import linecache
+import test.test_listcomps as module
+
+finder = doctest.DocTestFinder()
+source_file = inspect.getsourcefile(module.ListComprehensionTest)
+source_lines = linecache.getlines(source_file, module.__dict__)
+
+class_lineno = finder._find_lineno(module.ListComprehensionTest, source_lines)
+if class_lineno is not None:
+    raise AssertionError(f"class_lineno={class_lineno!r}")
+
+load_tests_lineno = finder._find_lineno(module.load_tests, source_lines)
+if not isinstance(load_tests_lineno, int):
+    raise AssertionError(
+        f"load_tests_lineno={load_tests_lineno!r} type={type(load_tests_lineno).__name__}"
+    )
+if load_tests_lineno < 0:
+    raise AssertionError(f"load_tests_lineno={load_tests_lineno}")
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_finder_extracts_known_test_listcomps_members() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+import inspect
+import linecache
+import test.test_listcomps as module
+
+finder = doctest.DocTestFinder()
+source_file = inspect.getsourcefile(module)
+source_lines = linecache.getlines(source_file, module.__dict__)
+globs = module.__dict__.copy()
+
+targets = [
+    ("module", module),
+    ("ListComprehensionTest", module.ListComprehensionTest),
+    ("load_tests", module.load_tests),
+    ("doctests", module.__test__["doctests"]),
+]
+
+for label, obj in targets:
+    try:
+        finder._get_test(obj, label, module, globs, source_lines)
+    except Exception as exc:
+        raise AssertionError(f"{label}: {type(exc).__name__}: {exc}")
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_parser_named_groups_produce_text_segments() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+import test.test_listcomps as module
+
+doc = module.__test__["doctests"]
+match = next(doctest.DocTestParser._EXAMPLE_RE.finditer(doc))
+
+source = match.group("source")
+want = match.group("want")
+if not isinstance(source, str):
+    raise AssertionError(f"source_type={type(source).__name__}")
+if not isinstance(want, str):
+    raise AssertionError(f"want_type={type(want).__name__}")
+
+source_lines = source.split("\n")
+want_lines = want.split("\n")
+if not all(isinstance(line, str) for line in source_lines):
+    raise AssertionError(f"source_line_types={[type(line).__name__ for line in source_lines]!r}")
+if not all(isinstance(line, str) for line in want_lines):
+    raise AssertionError(f"want_line_types={[type(line).__name__ for line in want_lines]!r}")
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_parser_parses_each_stdlib_listcomps_example() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+import test.test_listcomps as module
+
+parser = doctest.DocTestParser()
+doc = module.__test__["doctests"]
+lineno = 0
+
+for match in doctest.DocTestParser._EXAMPLE_RE.finditer(doc):
+    try:
+        parser._parse_example(match, "test.test_listcomps.__test__.doctests", lineno)
+    except Exception as exc:
+        raise AssertionError(f"lineno={lineno}: {type(exc).__name__}: {exc}")
+    lineno += doc.count("\n", match.start(), match.end())
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_doctest_parser_replays_known_failing_example_steps() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import doctest
+import re
+import test.test_listcomps as module
+
+doc = module.__test__["doctests"]
+lineno = 0
+target = None
+
+for match in doctest.DocTestParser._EXAMPLE_RE.finditer(doc):
+    if lineno == 21:
+        target = match
+        break
+    lineno += doc.count("\n", match.start(), match.end())
+
+assert target is not None
+
+indent_text = target.group("indent")
+source = target.group("source")
+want = target.group("want")
+
+if not isinstance(indent_text, str):
+    raise AssertionError(f"indent_type={type(indent_text).__name__}")
+if not isinstance(source, str):
+    raise AssertionError(f"source_type={type(source).__name__}")
+if not isinstance(want, str):
+    raise AssertionError(f"want_type={type(want).__name__}")
+
+indent = len(indent_text)
+source_lines = source.split("\n")
+want_lines = want.split("\n")
+if not all(isinstance(line, str) for line in source_lines):
+    raise AssertionError(f"source_line_types={[type(line).__name__ for line in source_lines]!r}")
+if not all(isinstance(line, str) for line in want_lines):
+    raise AssertionError(f"want_line_types={[type(line).__name__ for line in want_lines]!r}")
+
+try:
+    re.match(r" *$", want_lines[-1])
+except Exception as exc:
+    raise AssertionError(f"module_re_match: {type(exc).__name__}: {exc}")
+
+stripped_source_lines = [line[indent + 4:] for line in source_lines]
+stripped_want_lines = [line[indent:] for line in want_lines]
+if not all(isinstance(line, str) for line in stripped_source_lines):
+    raise AssertionError(
+        f"stripped_source_line_types={[type(line).__name__ for line in stripped_source_lines]!r}"
+    )
+if not all(isinstance(line, str) for line in stripped_want_lines):
+    raise AssertionError(
+        f"stripped_want_line_types={[type(line).__name__ for line in stripped_want_lines]!r}"
+    )
+
+stripped_source = "\n".join(stripped_source_lines)
+stripped_want = "\n".join(stripped_want_lines)
+if not isinstance(stripped_source, str):
+    raise AssertionError(f"stripped_source_type={type(stripped_source).__name__}")
+if not isinstance(stripped_want, str):
+    raise AssertionError(f"stripped_want_type={type(stripped_want).__name__}")
+
+try:
+    doctest.DocTestParser._EXCEPTION_RE.match(stripped_want)
+except Exception as exc:
+    raise AssertionError(f"exception_re_match: {type(exc).__name__}: {exc}")
+
+try:
+    option_matches = list(doctest.DocTestParser._OPTION_DIRECTIVE_RE.finditer(stripped_source))
+except Exception as exc:
+    raise AssertionError(f"option_finditer: {type(exc).__name__}: {exc}")
+
+if option_matches:
+    try:
+        parser = doctest.DocTestParser()
+        parser._IS_BLANK_OR_COMMENT(stripped_source)
+    except Exception as exc:
+        raise AssertionError(f"blank_or_comment: {type(exc).__name__}: {exc}")
+
+parser = doctest.DocTestParser()
+try:
+    parser._check_prompt_blank(source_lines, indent, "test", lineno)
+    parser._check_prefix(source_lines[1:], " " * indent + ".", "test", lineno)
+    parser._check_prefix(want_lines, " " * indent, "test", lineno + len(source_lines))
+except Exception as exc:
+    raise AssertionError(f"parser_checks: {type(exc).__name__}: {exc}")
+
+try:
+    parser._parse_example(target, "test.test_listcomps.__test__.doctests", lineno)
+except Exception as exc:
+    raise AssertionError(f"parse_example: {type(exc).__name__}: {exc}")
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_inspect_bootstrap_reports_source_metadata_for_cpython_test_modules() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import inspect
+import test.test_listcomps as module
+
+assert inspect.ismodule(module)
+assert inspect.getmodule(module) is module
+assert inspect.isclass(module.ListComprehensionTest)
+assert inspect.isfunction(module.load_tests)
+assert inspect.getmodule(module.ListComprehensionTest) is module
+assert inspect.getmodule(module.load_tests) is module
+assert inspect.getfile(module).endswith("test_listcomps.py")
+assert inspect.getsourcefile(module.ListComprehensionTest).endswith("test_listcomps.py")
+assert inspect.getsourcefile(module.load_tests).endswith("test_listcomps.py")
+"#,
+        300_000,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_unittest_loader_handles_doctest_load_tests_modules() {
+    let result = execute_with_cpython_lib_and_step_limit(
+        r#"
+import unittest
+import test.test_listcomps as module
+
+suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+assert suite.countTestCases() >= 1
+"#,
+        300_000,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
@@ -4551,6 +5576,79 @@ assert bool.from_bytes([0, 1], byteorder="big") is True
 }
 
 #[test]
+fn test_int_from_bytes_consumes_lazy_python_iterables_with_vm_context() {
+    let result = execute(
+        r#"
+assert int.from_bytes(map(int, ["1", "2", "3", "4"]), "big") == 16909060
+assert bool.from_bytes(map(int, ["0"]), "big") is False
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_int_constructor_uses_python_numeric_conversion_protocols() {
+    let result = execute(
+        r#"
+class IntLike:
+    def __int__(self):
+        return 3221225985
+
+class IndexLike:
+    def __index__(self):
+        return 33
+
+class TruncatedIndex:
+    def __index__(self):
+        return 44
+
+class TruncLike:
+    def __trunc__(self):
+        return TruncatedIndex()
+
+assert int(IntLike()) == 3221225985
+assert int(IndexLike()) == 33
+assert int(TruncLike()) == 44
+assert int("ff", base=16) == 255
+assert int(memoryview(b"123")) == 123
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_int_constructor_rejects_invalid_numeric_protocol_results() {
+    let result = execute(
+        r#"
+class BadInt:
+    def __int__(self):
+        return "not an int"
+
+class BadIndex:
+    def __index__(self):
+        return "not an int"
+
+class BadTrunc:
+    def __trunc__(self):
+        return object()
+
+for cls, expected in [
+    (BadInt, "__int__ returned non-int"),
+    (BadIndex, "__index__ returned non-int"),
+    (BadTrunc, "__trunc__ returned non-Integral"),
+]:
+    try:
+        int(cls())
+    except TypeError as exc:
+        assert expected in str(exc), str(exc)
+    else:
+        raise AssertionError(expected)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_bool_real_and_imag_project_to_int_values() {
     let result = execute(
         r#"
@@ -4732,6 +5830,428 @@ result = 0
 for i in range(3):
     for j in range(3):
         result = result + 1
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_user_defined_descriptors_bind_on_class_and_instance_access() {
+    let result = execute(
+        r#"
+class Descriptor:
+    def __init__(self, label):
+        self.label = label
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return ('class', owner.__name__, self.label)
+        return ('instance', owner.__name__, self.label)
+
+class Example:
+    value = Descriptor('token')
+
+assert Example.value == ('class', 'Example', 'token')
+assert Example().value == ('instance', 'Example', 'token')
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_user_defined_data_descriptors_support_get_set_and_delete() {
+    let result = execute(
+        r#"
+events = []
+
+class Descriptor:
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        events.append(('get', owner.__name__))
+        return 'managed'
+
+    def __set__(self, instance, value):
+        events.append(('set', value))
+
+    def __delete__(self, instance):
+        events.append(('delete', type(instance).__name__))
+
+class Example:
+    value = Descriptor()
+
+example = Example()
+example.value = 10
+assert example.value == 'managed'
+del example.value
+assert events == [('set', 10), ('get', 'Example'), ('delete', 'Example')]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_wrapped_descriptor_inside_classmethod_matches_cpython() {
+    let result = execute(
+        r#"
+class BoundWrapper:
+    def __init__(self, wrapped):
+        self.__wrapped__ = wrapped
+
+    def __call__(self, *args, **kwargs):
+        return self.__wrapped__(*args, **kwargs)
+
+class Wrapper:
+    def __init__(self, wrapped):
+        self.__wrapped__ = wrapped
+
+    def __get__(self, instance, owner):
+        bound_function = self.__wrapped__.__get__(instance, owner)
+        return BoundWrapper(bound_function)
+
+def decorator(wrapped):
+    return Wrapper(wrapped)
+
+class Example:
+    @decorator
+    @classmethod
+    def inner(cls):
+        return 'spam'
+
+    @classmethod
+    @decorator
+    def outer(cls):
+        return 'eggs'
+
+assert Example.inner() == 'spam'
+assert Example.outer() == 'eggs'
+assert Example().inner() == 'spam'
+assert Example().outer() == 'eggs'
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_bound_function_inside_classmethod_matches_cpython() {
+    let result = execute(
+        r#"
+class A:
+    def foo(self, cls):
+        return 'spam'
+
+class B:
+    bar = classmethod(A().foo)
+
+assert B.bar() == 'spam'
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_eval_defaults_to_current_frame_locals_for_varargs_and_kwargs() {
+    let result = execute(
+        r#"
+def outer():
+    def check(*args, **kwds):
+        return (
+            eval("args[1] is not None", None, None),
+            eval("kwds['token']", None, None),
+        )
+
+    return check(1, 2, token=3)
+
+assert outer() == (True, 3)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_eval_compiled_code_object_uses_current_frame_locals_with_explicit_none_namespaces() {
+    let result = execute(
+        r#"
+expr = compile("args[1] is not None", "<probe>", "eval")
+
+def check(*args, **kwds):
+    return eval(expr, None, None)
+
+assert check(1, 2, token=3) is True
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_types_method_type_matches_cpython_binding_contract() {
+    let result = execute_with_cpython_lib(
+        r#"
+from types import MethodType
+
+class C:
+    def f(self, value):
+        return (self, value)
+
+obj = C()
+bound = MethodType(C.f, obj)
+
+assert bound.__self__ is obj
+assert bound.__func__ is C.f
+assert bound(7) == (obj, 7)
+
+try:
+    MethodType(C.f, None)
+except TypeError as exc:
+    assert str(exc) == "instance must not be None"
+else:
+    raise AssertionError("MethodType should reject None instance")
+
+try:
+    MethodType(42, obj)
+except TypeError as exc:
+    assert str(exc) == "first argument must be callable"
+else:
+    raise AssertionError("MethodType should reject non-callable receiver")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_types_method_type_preserves_raw_exception_payloads() {
+    let result = execute_with_cpython_lib(
+        r#"
+from types import MethodType
+
+class C:
+    def f(self):
+        return self
+
+obj = C()
+
+try:
+    MethodType(C.f, None)
+except TypeError as exc:
+    assert str(exc) == "instance must not be None"
+    assert exc.args == ("instance must not be None",)
+else:
+    raise AssertionError("MethodType(None) should raise TypeError")
+
+try:
+    MethodType(42, obj)
+except TypeError as exc:
+    assert str(exc) == "first argument must be callable"
+    assert exc.args == ("first argument must be callable",)
+else:
+    raise AssertionError("MethodType(noncallable) should raise TypeError")
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_types_method_type_wraps_callable_instances() {
+    let result = execute_with_cpython_lib(
+        r#"
+from types import MethodType
+
+class Callable:
+    def __call__(self, owner, value):
+        return (owner, value)
+
+callable_obj = Callable()
+owner = object()
+bound = MethodType(callable_obj, owner)
+
+assert bound.__self__ is owner
+assert bound.__func__ is callable_obj
+assert bound(9) == (owner, 9)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_heap_exception_subclass_can_call_base_exception_init_explicitly() {
+    let result = execute(
+        r#"
+class DbcheckError(Exception):
+    def __init__(self, exprstr, func, args, kwds):
+        Exception.__init__(
+            self,
+            "dbcheck %r failed (func=%s args=%s kwds=%s)" % (exprstr, func, args, kwds),
+        )
+
+err = DbcheckError("x", "f", (1, None), {})
+
+assert err.args == ("dbcheck 'x' failed (func=f args=(1, None) kwds={})",)
+assert str(err) == "dbcheck 'x' failed (func=f args=(1, None) kwds={})"
+assert repr(err) == "DbcheckError('dbcheck \\'x\\' failed (func=f args=(1, None) kwds={})')"
+assert BaseException.__str__(err) == str(err)
+assert BaseException.__repr__(err) == repr(err)
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_base_exception_class_surface_exposes_unbound_base_methods() {
+    let result = execute(
+        r#"
+str_method = BaseException.__str__
+repr_method = BaseException.__repr__
+
+assert str_method.__qualname__ == "BaseException.__str__"
+assert str_method.__self__ is None
+assert repr_method.__qualname__ == "BaseException.__repr__"
+assert repr_method.__self__ is None
+
+err = Exception("boom")
+assert str_method(err) == "boom"
+assert repr_method(err) == "Exception('boom')"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_heap_exception_subclass_new_initializes_empty_base_state() {
+    let result = execute(
+        r#"
+class CustomError(Exception):
+    def __init__(self, marker):
+        self.marker = marker
+
+err = CustomError(7)
+
+assert err.marker == 7
+assert err.args == ()
+assert str(err) == ""
+assert repr(err) == "CustomError()"
+assert err.__traceback__ is None
+assert err.__cause__ is None
+assert err.__context__ is None
+assert err.__suppress_context__ is False
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_heap_exception_subclass_with_traceback_round_trips() {
+    let result = execute(
+        r#"
+class CustomError(Exception):
+    pass
+
+try:
+    raise ValueError("boom")
+except ValueError as exc:
+    tb = exc.__traceback__
+
+err = CustomError("payload").with_traceback(tb)
+
+assert err.args == ("payload",)
+assert err.__traceback__ is tb
+assert str(err) == "payload"
+assert repr(err) == "CustomError('payload')"
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_wrapped_classmethod_inside_classmethod_matches_cpython() {
+    let result = execute_with_cpython_lib(
+        r#"
+from types import MethodType
+
+class MyClassMethod1:
+    def __init__(self, func):
+        self.func = func
+
+    def __call__(self, cls):
+        if hasattr(self.func, '__get__'):
+            return self.func.__get__(cls, cls)()
+        return self.func(cls)
+
+    def __get__(self, instance, owner=None):
+        if owner is None:
+            owner = type(instance)
+        return MethodType(self, owner)
+
+class MyClassMethod2:
+    def __init__(self, func):
+        if isinstance(func, classmethod):
+            func = func.__func__
+        self.func = func
+
+    def __call__(self, cls):
+        return self.func(cls)
+
+    def __get__(self, instance, owner=None):
+        if owner is None:
+            owner = type(instance)
+        return MethodType(self, owner)
+
+for myclassmethod in [MyClassMethod1, MyClassMethod2]:
+    class A:
+        @myclassmethod
+        def f1(cls):
+            return cls
+
+        @classmethod
+        @myclassmethod
+        def f2(cls):
+            return cls
+
+        @myclassmethod
+        @classmethod
+        def f3(cls):
+            return cls
+
+        @classmethod
+        @classmethod
+        def f4(cls):
+            return cls
+
+        @myclassmethod
+        @MyClassMethod1
+        def f5(cls):
+            return cls
+
+        @myclassmethod
+        @MyClassMethod2
+        def f6(cls):
+            return cls
+
+    assert A.f1() is A
+    assert A.f2() is A
+    assert A.f3() is A
+    assert A.f4() is A
+    assert A.f5() is A
+    assert A.f6() is A
+
+    a = A()
+    assert a.f1() is A
+    assert a.f2() is A
+    assert a.f3() is A
+    assert a.f4() is A
+    assert a.f5() is A
+    assert a.f6() is A
+
+    def f(cls):
+        return cls
+
+    assert myclassmethod(f).__get__(a)() is A
+    assert myclassmethod(f).__get__(a, A)() is A
+    assert myclassmethod(f).__get__(A, A)() is A
+    assert myclassmethod(f).__get__(A)() is type(A)
+    assert classmethod(f).__get__(a)() is A
+    assert classmethod(f).__get__(a, A)() is A
+    assert classmethod(f).__get__(A, A)() is A
+    assert classmethod(f).__get__(A)() is type(A)
 "#,
     );
     assert!(result.is_ok(), "Failed: {:?}", result);

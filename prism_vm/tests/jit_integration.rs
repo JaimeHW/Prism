@@ -1,9 +1,17 @@
 use prism_code::{
-    CodeFlags, CodeObject, ExceptionEntry, Instruction, LineTableEntry, Opcode, Register,
+    CodeFlags, CodeObject, Constant, ExceptionEntry, Instruction, LineTableEntry, Opcode, Register,
 };
 use prism_core::Value;
 use prism_vm::{JitConfig, JitContext, VirtualMachine};
 use std::sync::Arc;
+
+fn boxed_constants(constants: Vec<Value>) -> Box<[Constant]> {
+    constants
+        .into_iter()
+        .map(Constant::Value)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 // Helper to create a simple code object that returns a constant
 fn create_return_const_code(const_val: Value) -> Arc<CodeObject> {
@@ -24,7 +32,7 @@ fn create_return_const_code(const_val: Value) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -138,7 +146,7 @@ fn create_loop_code() -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),

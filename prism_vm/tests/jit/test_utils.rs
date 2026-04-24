@@ -1,6 +1,6 @@
 //! Shared test utilities for JIT integration tests.
 
-use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Constant, ExceptionEntry, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -20,7 +20,11 @@ pub fn create_code_object(
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: constants
+            .into_iter()
+            .map(Constant::Value)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),

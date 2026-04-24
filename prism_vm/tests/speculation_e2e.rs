@@ -3,7 +3,7 @@
 //! Tests the complete speculation pipeline from bytecode through interpreter
 //! to speculative execution. Focuses on correctness of operations.
 
-use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Constant, ExceptionEntry, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
@@ -11,6 +11,14 @@ use std::sync::Arc;
 // =============================================================================
 // Test Helpers
 // =============================================================================
+
+fn boxed_constants(constants: Vec<Value>) -> Box<[Constant]> {
+    constants
+        .into_iter()
+        .map(Constant::Value)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 /// Create a code object for integer addition: a + b
 fn create_int_add_code(a: i64, b: i64) -> Arc<CodeObject> {
@@ -30,7 +38,7 @@ fn create_int_add_code(a: i64, b: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -63,7 +71,7 @@ fn create_float_add_code(a: f64, b: f64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -96,7 +104,7 @@ fn create_lt_code(a: i64, b: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -129,7 +137,7 @@ fn create_mul_code(a: i64, b: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -213,7 +221,7 @@ fn create_hot_loop_code(n: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -525,7 +533,7 @@ fn test_e2e_nested_loops() {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: boxed_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
