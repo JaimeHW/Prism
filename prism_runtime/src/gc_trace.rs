@@ -37,6 +37,7 @@ use crate::types::function::{ClosureEnv, FunctionObject};
 use crate::types::int::IntObject;
 use crate::types::iter::IteratorObject;
 use crate::types::list::ListObject;
+use crate::types::memoryview::MemoryViewObject;
 use crate::types::range::RangeObject;
 use crate::types::set::SetObject;
 use crate::types::string::StringObject;
@@ -89,6 +90,19 @@ unsafe impl Trace for BytesObject {
 
     fn size_of(&self) -> usize {
         std::mem::size_of::<Self>() + self.len()
+    }
+}
+
+/// Safety: MemoryViewObject stores one Prism Value reference (`source`) plus
+/// Rust-owned byte storage.
+unsafe impl Trace for MemoryViewObject {
+    #[inline]
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        self.source().trace(tracer);
+    }
+
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>() + self.nbytes()
     }
 }
 

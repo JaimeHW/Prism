@@ -4,10 +4,34 @@
 //! `bytearray` values. Both are represented by the same storage layout and
 //! distinguished by `header.type_id`.
 
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::slice::SliceObject;
+use prism_core::Value;
 use std::fmt;
+
+/// Error raised when bytearray slice assignment cannot be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ByteSliceAssignError {
+    /// The receiver is immutable `bytes`, not mutable `bytearray`.
+    Immutable,
+    /// Extended slice assignment must preserve the selected slice length.
+    ExtendedSliceSizeMismatch { expected: usize, actual: usize },
+}
+
+impl fmt::Display for ByteSliceAssignError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Immutable => write!(f, "bytes object does not support item assignment"),
+            Self::ExtendedSliceSizeMismatch { expected, actual } => write!(
+                f,
+                "attempt to assign bytes of size {} to extended slice of size {}",
+                actual, expected
+            ),
+        }
+    }
+}
 
 /// Shared object backing for `bytes` and `bytearray`.
 ///
@@ -126,6 +150,18 @@ impl BytesObject {
         true
     }
 
+    /// Append a byte slice for mutable instances.
+    ///
+    /// Returns false for immutable `bytes`.
+    #[inline]
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+        self.data.extend_from_slice(bytes);
+        true
+    }
+
     /// Set one byte by index for mutable instances.
     ///
     /// Returns false for immutable `bytes` or out-of-bounds index.
@@ -139,6 +175,42 @@ impl BytesObject {
         };
         self.data[idx] = byte;
         true
+    }
+
+    /// Replace the selected slice with replacement bytes.
+    ///
+    /// Contiguous slices may grow or shrink the bytearray. Extended slices
+    /// mirror CPython sequence semantics and therefore require an exact-length
+    /// replacement.
+    pub fn assign_slice(
+        &mut self,
+        slice: &SliceObject,
+        replacement: &[u8],
+    ) -> Result<(), ByteSliceAssignError> {
+        if !self.is_bytearray() {
+            return Err(ByteSliceAssignError::Immutable);
+        }
+
+        let indices = slice.indices(self.data.len());
+        if indices.step == 1 {
+            let end = indices.stop.max(indices.start);
+            self.data
+                .splice(indices.start..end, replacement.iter().copied());
+            return Ok(());
+        }
+
+        if replacement.len() != indices.length {
+            return Err(ByteSliceAssignError::ExtendedSliceSizeMismatch {
+                expected: indices.length,
+                actual: replacement.len(),
+            });
+        }
+
+        for (index, byte) in indices.iter().zip(replacement.iter().copied()) {
+            self.data[index] = byte;
+        }
+
+        Ok(())
     }
 
     /// Clone bytes into a new vector.
@@ -231,9 +303,37 @@ impl PyObject for BytesObject {
     }
 }
 
+/// Borrow native byte-sequence storage from exact `bytes`/`bytearray` values
+/// and heap subclasses backed by native byte storage.
+#[inline]
+pub fn value_as_bytes_ref(value: Value) -> Option<&'static BytesObject> {
+    let ptr = value.as_object_ptr()?;
+    object_ptr_as_bytes_ref(ptr)
+}
+
+/// Borrow native byte-sequence storage from an object pointer.
+#[inline]
+pub fn object_ptr_as_bytes_ref(ptr: *const ()) -> Option<&'static BytesObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::BYTES | TypeId::BYTEARRAY => Some(unsafe { &*(ptr as *const BytesObject) }),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+            (&*(ptr as *const ShapedObject)).bytes_backing()
+        },
+        _ => None,
+    }
+}
+
+/// Clone the native byte-sequence payload from exact objects or subclasses.
+#[inline]
+pub fn clone_bytes_value(value: Value) -> Option<BytesObject> {
+    value_as_bytes_ref(value).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::shape::Shape;
 
     #[test]
     fn test_new_bytes_empty() {
@@ -381,6 +481,20 @@ mod tests {
     }
 
     #[test]
+    fn test_extend_immutable_bytes_rejected() {
+        let mut bytes = BytesObject::from_slice(&[1, 2, 3]);
+        assert!(!bytes.extend_from_slice(&[4, 5]));
+        assert_eq!(bytes.as_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_extend_mutable_bytearray() {
+        let mut bytearray = BytesObject::bytearray_from_slice(&[1, 2]);
+        assert!(bytearray.extend_from_slice(&[3, 4]));
+        assert_eq!(bytearray.as_bytes(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
     fn test_set_immutable_bytes_rejected() {
         let mut bytes = BytesObject::from_slice(&[1, 2, 3]);
         assert!(!bytes.set(0, 9));
@@ -404,6 +518,40 @@ mod tests {
     }
 
     #[test]
+    fn test_assign_bytearray_contiguous_slice_can_resize() {
+        let mut bytearray = BytesObject::bytearray_from_slice(b"abcdef");
+        bytearray
+            .assign_slice(&SliceObject::start_stop(2, 4), b"XYZ")
+            .expect("contiguous bytearray slice assignment should resize");
+        assert_eq!(bytearray.as_bytes(), b"abXYZef");
+
+        bytearray
+            .assign_slice(&SliceObject::new(Some(-5), None, None), b"12345")
+            .expect("negative slice bounds should be normalized");
+        assert_eq!(bytearray.as_bytes(), b"ab12345");
+    }
+
+    #[test]
+    fn test_assign_bytearray_extended_slice_requires_matching_length() {
+        let mut bytearray = BytesObject::bytearray_from_slice(b"abcdef");
+        bytearray
+            .assign_slice(&SliceObject::full(0, 6, 2), b"XYZ")
+            .expect("matching extended slice assignment should succeed");
+        assert_eq!(bytearray.as_bytes(), b"XbYdZf");
+
+        let err = bytearray
+            .assign_slice(&SliceObject::full(0, 6, 2), b"12")
+            .expect_err("extended bytearray slice size mismatch should fail");
+        assert_eq!(
+            err,
+            ByteSliceAssignError::ExtendedSliceSizeMismatch {
+                expected: 3,
+                actual: 2
+            }
+        );
+    }
+
+    #[test]
     fn test_clone_preserves_type_and_contents() {
         let original = BytesObject::bytearray_from_slice(&[1, 2, 3]);
         let cloned = original.clone();
@@ -416,5 +564,28 @@ mod tests {
         let bytes = BytesObject::from_slice(&[1, 2, 3]);
         let dbg = format!("{:?}", bytes);
         assert!(dbg.contains("bytes"));
+    }
+
+    #[test]
+    fn test_value_as_bytes_ref_reads_heap_subclass_native_storage() {
+        let object = ShapedObject::new_bytes_backed(
+            TypeId::from_raw(TypeId::FIRST_USER_TYPE + 50),
+            Shape::empty(),
+            BytesObject::from_slice(b"payload"),
+        );
+        let value = Value::object_ptr(Box::into_raw(Box::new(object)) as *const ());
+
+        assert_eq!(
+            value_as_bytes_ref(value)
+                .expect("bytes backing should be visible")
+                .as_bytes(),
+            b"payload"
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                value.as_object_ptr().unwrap() as *mut ShapedObject
+            ));
+        }
     }
 }

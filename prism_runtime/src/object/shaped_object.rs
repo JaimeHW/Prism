@@ -22,9 +22,12 @@
 use super::shape::{MAX_INLINE_SLOTS, PropertyFlags, Shape, ShapeId};
 use super::{ObjectHeader, PyObject};
 use crate::object::type_obj::TypeId;
+use crate::types::bytes::BytesObject;
 use crate::types::dict::DictObject;
 use crate::types::list::ListObject;
 use crate::types::string::StringObject;
+use crate::types::tuple::TupleObject;
+use num_bigint::BigInt;
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
@@ -217,6 +220,14 @@ pub struct ShapedObject {
     /// Lazily allocated only when needed.
     overflow: Option<Box<OverflowStorage>>,
 
+    /// Python-visible instance dictionary for heap instances.
+    ///
+    /// The shaped slots above remain the cold-start fast path for normal
+    /// attribute access. Once `obj.__dict__` is materialized or explicitly
+    /// assigned, this mapping becomes the authoritative Python attribute
+    /// dictionary and the VM mirrors normal writes into it.
+    instance_dict: Option<InstanceDictStorage>,
+
     /// Optional native dict storage for heap subclasses of `dict`.
     ///
     /// This keeps Python-visible mapping state separate from instance
@@ -231,11 +242,37 @@ pub struct ShapedObject {
     /// keeping user-defined instance attributes in the shaped-object storage.
     list_backing: Option<Box<ListObject>>,
 
+    /// Optional native tuple storage for tuple-like heap objects.
+    ///
+    /// This supports CPython struct-sequence style objects that expose named
+    /// fields while still participating in the immutable tuple protocol.
+    tuple_backing: Option<Box<TupleObject>>,
+
     /// Optional native string storage for heap subclasses of `str`.
     ///
     /// This preserves native string semantics while keeping heap instance
     /// attributes in the shaped-object storage.
     string_backing: Option<Box<StringObject>>,
+
+    /// Optional native bytes storage for heap subclasses of `bytes` and
+    /// `bytearray`.
+    ///
+    /// This preserves byte-sequence semantics while keeping heap instance
+    /// attributes in the shaped-object storage.
+    bytes_backing: Option<Box<BytesObject>>,
+
+    /// Optional native integer storage for heap subclasses of `int`.
+    ///
+    /// The payload is arbitrary precision, matching Python's visible `int`
+    /// semantics while preserving user-defined instance attributes in the
+    /// shaped-object storage.
+    int_backing: Option<Box<BigInt>>,
+}
+
+#[derive(Debug)]
+enum InstanceDictStorage {
+    Owned(Box<DictObject>),
+    External(Value),
 }
 
 impl ShapedObject {
@@ -247,9 +284,13 @@ impl ShapedObject {
             shape: empty_shape,
             inline_slots: InlineSlots::new(),
             overflow: None,
+            instance_dict: None,
             dict_backing: None,
             list_backing: None,
+            tuple_backing: None,
             string_backing: None,
+            bytes_backing: None,
+            int_backing: None,
         }
     }
 
@@ -269,6 +310,14 @@ impl ShapedObject {
         object
     }
 
+    /// Create a new ShapedObject with native tuple storage.
+    #[inline]
+    pub fn new_tuple_backed(type_id: TypeId, empty_shape: Arc<Shape>, tuple: TupleObject) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.tuple_backing = Some(Box::new(tuple));
+        object
+    }
+
     /// Create a new ShapedObject with native string storage.
     #[inline]
     pub fn new_string_backed(
@@ -278,6 +327,22 @@ impl ShapedObject {
     ) -> Self {
         let mut object = Self::new(type_id, empty_shape);
         object.string_backing = Some(Box::new(string));
+        object
+    }
+
+    /// Create a new ShapedObject with native bytes storage.
+    #[inline]
+    pub fn new_bytes_backed(type_id: TypeId, empty_shape: Arc<Shape>, bytes: BytesObject) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.bytes_backing = Some(Box::new(bytes));
+        object
+    }
+
+    /// Create a new ShapedObject with native integer storage.
+    #[inline]
+    pub fn new_int_backed(type_id: TypeId, empty_shape: Arc<Shape>, integer: BigInt) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.int_backing = Some(Box::new(integer));
         object
     }
 
@@ -305,6 +370,53 @@ impl ShapedObject {
         self.dict_backing.as_deref_mut()
     }
 
+    /// Check whether a Python-visible instance dictionary has been materialized.
+    #[inline]
+    pub fn has_instance_dict(&self) -> bool {
+        self.instance_dict.is_some()
+    }
+
+    /// Return the current Python-visible instance dictionary value.
+    #[inline]
+    pub fn instance_dict_value(&self) -> Option<Value> {
+        self.instance_dict.as_ref().map(InstanceDictStorage::value)
+    }
+
+    /// Materialize and return the Python-visible instance dictionary.
+    ///
+    /// Existing shaped properties are copied into the dictionary exactly once.
+    /// After materialization, the VM treats the dictionary as authoritative and
+    /// mirrors normal attribute writes into both representations.
+    pub fn ensure_instance_dict_value(&mut self) -> Value {
+        if self.instance_dict.is_none() {
+            let mut dict = DictObject::with_capacity(self.property_count());
+            for (name, value) in self.iter_properties() {
+                dict.set(Value::string(name), value);
+            }
+            self.instance_dict = Some(InstanceDictStorage::Owned(Box::new(dict)));
+        }
+
+        self.instance_dict_value()
+            .expect("instance dict should be initialized")
+    }
+
+    /// Replace the Python-visible instance dictionary with an externally owned mapping.
+    #[inline]
+    pub fn set_instance_dict_value(&mut self, value: Value) {
+        if self.instance_dict_value() == Some(value) {
+            return;
+        }
+        self.instance_dict = Some(InstanceDictStorage::External(value));
+    }
+
+    /// Reset the Python-visible instance dictionary to a fresh empty dict.
+    #[inline]
+    pub fn reset_instance_dict(&mut self) -> Value {
+        self.instance_dict = Some(InstanceDictStorage::Owned(Box::new(DictObject::new())));
+        self.instance_dict_value()
+            .expect("instance dict should be initialized")
+    }
+
     /// Check whether this heap instance carries native list storage.
     #[inline]
     pub fn has_list_backing(&self) -> bool {
@@ -323,6 +435,24 @@ impl ShapedObject {
         self.list_backing.as_deref_mut()
     }
 
+    /// Check whether this heap instance carries native tuple storage.
+    #[inline]
+    pub fn has_tuple_backing(&self) -> bool {
+        self.tuple_backing.is_some()
+    }
+
+    /// Borrow the native tuple storage for tuple-like heap objects.
+    #[inline]
+    pub fn tuple_backing(&self) -> Option<&TupleObject> {
+        self.tuple_backing.as_deref()
+    }
+
+    /// Replace the native tuple storage for tuple-like heap objects.
+    #[inline]
+    pub fn set_tuple_backing(&mut self, tuple: TupleObject) {
+        self.tuple_backing = Some(Box::new(tuple));
+    }
+
     /// Check whether this heap instance carries native string storage.
     #[inline]
     pub fn has_string_backing(&self) -> bool {
@@ -339,6 +469,38 @@ impl ShapedObject {
     #[inline]
     pub fn string_backing_mut(&mut self) -> Option<&mut StringObject> {
         self.string_backing.as_deref_mut()
+    }
+
+    /// Check whether this heap instance carries native bytes storage.
+    #[inline]
+    pub fn has_bytes_backing(&self) -> bool {
+        self.bytes_backing.is_some()
+    }
+
+    /// Borrow the native bytes storage for heap subclasses of `bytes` and
+    /// `bytearray`.
+    #[inline]
+    pub fn bytes_backing(&self) -> Option<&BytesObject> {
+        self.bytes_backing.as_deref()
+    }
+
+    /// Mutably borrow the native bytes storage for heap subclasses of `bytes`
+    /// and `bytearray`.
+    #[inline]
+    pub fn bytes_backing_mut(&mut self) -> Option<&mut BytesObject> {
+        self.bytes_backing.as_deref_mut()
+    }
+
+    /// Check whether this heap instance carries native integer storage.
+    #[inline]
+    pub fn has_int_backing(&self) -> bool {
+        self.int_backing.is_some()
+    }
+
+    /// Borrow the native integer storage for heap subclasses of `int`.
+    #[inline]
+    pub fn int_backing(&self) -> Option<&BigInt> {
+        self.int_backing.as_deref()
     }
 
     /// Get the current shape.
@@ -643,6 +805,16 @@ impl PyObject for ShapedObject {
     }
 }
 
+impl InstanceDictStorage {
+    #[inline]
+    fn value(&self) -> Value {
+        match self {
+            Self::Owned(dict) => Value::object_ptr(&**dict as *const DictObject as *const ()),
+            Self::External(value) => *value,
+        }
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -651,6 +823,7 @@ impl PyObject for ShapedObject {
 mod tests {
     use super::*;
     use crate::object::shape::ShapeRegistry;
+    use num_bigint::BigInt;
 
     fn intern(s: &str) -> InternedString {
         prism_core::intern::intern(s)
@@ -721,6 +894,44 @@ mod tests {
     }
 
     #[test]
+    fn test_instance_dict_materializes_shape_properties_and_is_stable() {
+        let registry = ShapeRegistry::new();
+        let mut object = ShapedObject::new(TypeId::from_raw(612), registry.empty_shape());
+        object.set_property(intern("alpha"), val(11), &registry);
+        object.set_property(intern("beta"), val(22), &registry);
+
+        assert!(!object.has_instance_dict());
+        let dict_value = object.ensure_instance_dict_value();
+        assert!(object.has_instance_dict());
+        assert_eq!(object.ensure_instance_dict_value(), dict_value);
+
+        let dict_ptr = dict_value
+            .as_object_ptr()
+            .expect("instance dict should be an object");
+        let dict = unsafe { &*(dict_ptr as *const DictObject) };
+        assert_eq!(dict.get(Value::string(intern("alpha"))), Some(val(11)));
+        assert_eq!(dict.get(Value::string(intern("beta"))), Some(val(22)));
+    }
+
+    #[test]
+    fn test_instance_dict_can_alias_external_mapping() {
+        let mut object = ShapedObject::new(TypeId::from_raw(613), Shape::empty());
+        let mut dict = Box::new(DictObject::new());
+        dict.set(Value::string(intern("external")), val(33));
+        let dict_ptr = Box::into_raw(dict);
+        let dict_value = Value::object_ptr(dict_ptr as *const ());
+
+        object.set_instance_dict_value(dict_value);
+        assert_eq!(object.instance_dict_value(), Some(dict_value));
+        assert_eq!(
+            unsafe { &*dict_ptr }.get(Value::string(intern("external"))),
+            Some(val(33))
+        );
+
+        unsafe { drop(Box::from_raw(dict_ptr)) };
+    }
+
+    #[test]
     fn test_new_list_backed_allocates_native_sequence_storage() {
         let mut object = ShapedObject::new_list_backed(TypeId::from_raw(513), Shape::empty());
         assert!(object.has_list_backing());
@@ -741,6 +952,26 @@ mod tests {
     }
 
     #[test]
+    fn test_new_tuple_backed_preserves_native_tuple_storage() {
+        let mut object = ShapedObject::new_tuple_backed(
+            TypeId::OBJECT,
+            Shape::empty(),
+            TupleObject::from_slice(&[val(3), val(5)]),
+        );
+
+        assert!(object.has_tuple_backing());
+        let tuple = object.tuple_backing().expect("tuple backing should exist");
+        assert_eq!(tuple.len(), 2);
+        assert_eq!(tuple.get(0), Some(val(3)));
+        assert_eq!(tuple.get(1), Some(val(5)));
+
+        object.set_tuple_backing(TupleObject::from_slice(&[val(8)]));
+        let tuple = object.tuple_backing().expect("tuple backing should exist");
+        assert_eq!(tuple.len(), 1);
+        assert_eq!(tuple.get(0), Some(val(8)));
+    }
+
+    #[test]
     fn test_new_string_backed_preserves_native_string_storage() {
         let object = ShapedObject::new_string_backed(
             TypeId::from_raw(514),
@@ -754,6 +985,37 @@ mod tests {
                 .expect("string backing should exist")
                 .as_str(),
             "value"
+        );
+    }
+
+    #[test]
+    fn test_new_bytes_backed_preserves_native_byte_storage() {
+        let object = ShapedObject::new_bytes_backed(
+            TypeId::from_raw(515),
+            Shape::empty(),
+            BytesObject::from_slice(b"value"),
+        );
+
+        assert!(object.has_bytes_backing());
+        assert_eq!(
+            object
+                .bytes_backing()
+                .expect("bytes backing should exist")
+                .as_bytes(),
+            b"value"
+        );
+    }
+
+    #[test]
+    fn test_new_int_backed_preserves_native_integer_storage() {
+        let integer = BigInt::from(1_u8) << 90_u32;
+        let object =
+            ShapedObject::new_int_backed(TypeId::from_raw(515), Shape::empty(), integer.clone());
+
+        assert!(object.has_int_backing());
+        assert_eq!(
+            object.int_backing().expect("integer backing should exist"),
+            &integer
         );
     }
 

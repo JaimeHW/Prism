@@ -499,9 +499,8 @@ pub fn builtin_type_bitmap(type_id: TypeId) -> SubclassBitmap {
 
 /// Convert a class identifier into the corresponding runtime type id.
 ///
-/// Heap classes reuse their allocated type id directly. Builtin base classes
-/// do the same, except for `object`, which is represented in MROs via the
-/// sentinel [`ClassId::OBJECT`].
+/// Heap classes reuse their allocated type id directly. Builtin class ids
+/// mirror their [`TypeId`] values, including [`ClassId::OBJECT`].
 #[inline]
 pub fn class_id_to_type_id(class_id: ClassId) -> TypeId {
     if class_id == ClassId::OBJECT {
@@ -1432,10 +1431,22 @@ mod tests {
     #[test]
     fn test_class_id_to_type_id_maps_object_sentinel() {
         assert_eq!(class_id_to_type_id(ClassId::OBJECT), TypeId::OBJECT);
+        assert_eq!(
+            class_id_to_type_id(ClassId(TypeId::NONE.raw())),
+            TypeId::NONE
+        );
         assert_eq!(class_id_to_type_id(ClassId(TypeId::INT.raw())), TypeId::INT);
         assert_eq!(
             class_id_to_type_id(ClassId(TypeId::FIRST_USER_TYPE)),
             TypeId::from_raw(TypeId::FIRST_USER_TYPE)
+        );
+    }
+
+    #[test]
+    fn test_builtin_none_mro_preserves_none_type() {
+        assert_eq!(
+            builtin_class_mro(TypeId::NONE),
+            vec![ClassId(TypeId::NONE.raw()), ClassId::OBJECT]
         );
     }
 

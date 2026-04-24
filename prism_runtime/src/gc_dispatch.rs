@@ -40,6 +40,7 @@ use crate::types::function::FunctionObject;
 use crate::types::int::IntObject;
 use crate::types::iter::IteratorObject;
 use crate::types::list::ListObject;
+use crate::types::memoryview::MemoryViewObject;
 use crate::types::range::RangeObject;
 use crate::types::set::SetObject;
 use crate::types::string::StringObject;
@@ -193,6 +194,15 @@ fn init_dispatch_table() -> DispatchTable {
             trace: trace_bytes,
             size: size_bytes,
             finalize: finalize_bytes,
+        },
+    );
+
+    table.register(
+        TypeId::MEMORYVIEW,
+        DispatchEntry {
+            trace: trace_memoryview,
+            size: size_memoryview,
+            finalize: finalize_memoryview,
         },
     );
 
@@ -526,6 +536,27 @@ unsafe fn size_bytes(ptr: *const ()) -> usize {
 unsafe fn finalize_bytes(ptr: *mut ()) {
     // SAFETY: Caller guarantees ptr points to valid BytesObject
     unsafe { std::ptr::drop_in_place(ptr as *mut BytesObject) };
+}
+
+// =============================================================================
+// MemoryViewObject Dispatch
+// =============================================================================
+
+unsafe fn trace_memoryview(ptr: *const (), tracer: &mut dyn Tracer) {
+    // SAFETY: Caller guarantees ptr points to valid MemoryViewObject
+    let obj = unsafe { &*(ptr as *const MemoryViewObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_memoryview(ptr: *const ()) -> usize {
+    // SAFETY: Caller guarantees ptr points to valid MemoryViewObject
+    let obj = unsafe { &*(ptr as *const MemoryViewObject) };
+    std::mem::size_of::<MemoryViewObject>() + obj.nbytes()
+}
+
+unsafe fn finalize_memoryview(ptr: *mut ()) {
+    // SAFETY: Caller guarantees ptr points to valid MemoryViewObject
+    unsafe { std::ptr::drop_in_place(ptr as *mut MemoryViewObject) };
 }
 
 // =============================================================================
