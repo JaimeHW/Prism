@@ -3,8 +3,10 @@
 //! The `FunctionBuilder` provides a high-level API for constructing bytecode
 //! with automatic register allocation and label resolution.
 
-use super::code_object::{CodeFlags, CodeObject, ExceptionEntry, LineTableEntry};
+use super::code_object::{CodeFlags, CodeObject, Constant, ExceptionEntry, LineTableEntry};
 use super::instruction::{ConstIndex, Instruction, LocalSlot, Opcode, Register};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,7 +105,7 @@ pub struct FunctionBuilder {
     instructions: Vec<Instruction>,
 
     /// Constant pool.
-    constants: Vec<Value>,
+    constants: Vec<Constant>,
     /// Constant deduplication map.
     constant_map: HashMap<ConstantKey, ConstIndex>,
 
@@ -160,6 +162,7 @@ enum ConstantKey {
     None,
     Bool(bool),
     Int(i64),
+    BigInt(BigInt),
     /// Float bits for exact comparison.
     Float(u64),
     String(Arc<str>),
@@ -411,20 +414,43 @@ impl FunctionBuilder {
                 return idx;
             }
             let idx = ConstIndex::new(self.constants.len() as u16);
-            self.constants.push(value);
+            self.constants.push(Constant::Value(value));
             self.constant_map.insert(key, idx);
             idx
         } else {
             // No deduplication for complex types
             let idx = ConstIndex::new(self.constants.len() as u16);
-            self.constants.push(value);
+            self.constants.push(Constant::Value(value));
             idx
         }
     }
 
     /// Add an integer constant.
     pub fn add_int(&mut self, value: i64) -> ConstIndex {
-        self.add_constant(Value::int(value).unwrap_or_else(|| Value::none()))
+        match Value::int(value) {
+            Some(value) => self.add_constant(value),
+            None => self.add_bigint(BigInt::from(value)),
+        }
+    }
+
+    /// Add an arbitrary-precision integer constant.
+    pub fn add_bigint(&mut self, value: BigInt) -> ConstIndex {
+        if let Some(i) = value
+            .to_i64()
+            .filter(|candidate| Value::int(*candidate).is_some())
+        {
+            return self.add_int(i);
+        }
+
+        let key = ConstantKey::BigInt(value.clone());
+        if let Some(&idx) = self.constant_map.get(&key) {
+            return idx;
+        }
+
+        let idx = ConstIndex::new(self.constants.len() as u16);
+        self.constants.push(Constant::BigInt(value));
+        self.constant_map.insert(key, idx);
+        idx
     }
 
     /// Add a float constant.
@@ -465,7 +491,7 @@ impl FunctionBuilder {
         let value = Value::string(interned);
 
         let idx = ConstIndex::new(self.constants.len() as u16);
-        self.constants.push(value);
+        self.constants.push(Constant::Value(value));
         self.constant_map.insert(key, idx);
         idx
     }
@@ -481,7 +507,8 @@ impl FunctionBuilder {
         // At runtime, the VM will interpret this as a code object reference
         let code_ptr = Arc::into_raw(Arc::clone(&code)) as *const ();
         let idx = ConstIndex::new(self.constants.len() as u16);
-        self.constants.push(Value::object_ptr(code_ptr));
+        self.constants
+            .push(Constant::Value(Value::object_ptr(code_ptr)));
 
         // Store Arc in nested_code_objects for test accessibility
         self.nested_code_objects.push(code);
@@ -1054,7 +1081,8 @@ impl FunctionBuilder {
         let tuple = KwNamesTuple::new(names);
         let tuple_ptr = Box::into_raw(Box::new(tuple)) as *const ();
         let idx = ConstIndex::new(self.constants.len() as u16);
-        self.constants.push(Value::object_ptr(tuple_ptr));
+        self.constants
+            .push(Constant::Value(Value::object_ptr(tuple_ptr)));
         self.constant_map.insert(key, idx);
         idx.0
     }
@@ -1955,9 +1983,10 @@ mod tests {
         let code = builder.finish();
         assert_eq!(code.constants.len(), 1);
 
-        // The constant should be a string value
-        let val = code.constants[0];
-        assert!(val.is_string());
+        assert!(matches!(
+            &code.constants[0],
+            Constant::Value(value) if value.is_string()
+        ));
     }
 
     #[test]
@@ -1990,6 +2019,38 @@ mod tests {
 
         let code = builder.finish();
         assert_eq!(code.constants.len(), 2);
+    }
+
+    #[test]
+    fn test_add_int_promotes_wide_i64_to_heap_backed_constant() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let value = 2_305_843_009_213_693_952_i64;
+        let idx = builder.add_int(value);
+        let code = builder.finish();
+
+        assert_eq!(idx.0, 0);
+        assert!(matches!(
+            &code.constants[0],
+            Constant::BigInt(constant) if constant == &BigInt::from(value)
+        ));
+    }
+
+    #[test]
+    fn test_add_bigint_deduplicates_large_constants() {
+        let mut builder = FunctionBuilder::new("test");
+        let value = BigInt::from(1_u8) << 100_u32;
+
+        let first = builder.add_bigint(value.clone());
+        let second = builder.add_bigint(value.clone());
+        let code = builder.finish();
+
+        assert_eq!(first.0, second.0);
+        assert_eq!(code.constants.len(), 1);
+        assert!(matches!(
+            &code.constants[0],
+            Constant::BigInt(constant) if constant == &value
+        ));
     }
 
     #[test]

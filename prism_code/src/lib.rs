@@ -11,5 +11,7 @@ pub mod code_object;
 pub mod instruction;
 
 pub use builder::{FunctionBuilder, KwNamesTuple, Label};
-pub use code_object::{CodeFlags, CodeObject, ExceptionEntry, LineTableEntry, disassemble};
+pub use code_object::{
+    CodeFlags, CodeObject, Constant, ExceptionEntry, LineTableEntry, disassemble,
+};
 pub use instruction::{ConstIndex, Instruction, InstructionFormat, LocalSlot, Opcode, Register};
