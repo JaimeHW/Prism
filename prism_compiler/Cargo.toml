@@ -8,4 +8,5 @@ edition.workspace = true
 prism_core.workspace = true
 prism_code.workspace = true
 prism_parser.workspace = true
+num-bigint.workspace = true
 smallvec.workspace = true

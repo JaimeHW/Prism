@@ -34,7 +34,7 @@
 //! 4. Assign closure slots to free variables (matching the enclosing cell slots)
 //! 5. Handle nonlocal declarations specially (explicit capture request)
 
-use super::symbol::{Scope, ScopeKind, SymbolFlags};
+use super::symbol::{Scope, ScopeKind, Symbol, SymbolFlags};
 use std::sync::Arc;
 
 /// Closure analyzer that computes cell/freevar relationships.
@@ -105,7 +105,7 @@ impl ClosureAnalyzer {
             local_names: scope
                 .symbols
                 .iter()
-                .filter(|(_, sym)| sym.flags.contains(SymbolFlags::DEF))
+                .filter(|(_, sym)| is_closure_local_definition(sym))
                 .map(|(name, _)| name.clone())
                 .collect(),
         };
@@ -253,7 +253,7 @@ impl ClosureAnalyzer {
         for child in &scope.children {
             for freevar in child.freevars() {
                 // Skip if this is actually a global reference (marked by previous analysis)
-                if !freevar.flags.contains(SymbolFlags::GLOBAL_IMPLICIT) {
+                if is_closure_capture_reference(freevar) {
                     child_freevars.insert(freevar.name.clone());
                 }
             }
@@ -277,6 +277,9 @@ impl ClosureAnalyzer {
                 if sym.flags.contains(SymbolFlags::DEF)
                     && !sym.flags.contains(SymbolFlags::CELL)
                     && scope.kind != ScopeKind::Module
+                    && !sym.flags.contains(SymbolFlags::GLOBAL_EXPLICIT)
+                    && !sym.flags.contains(SymbolFlags::GLOBAL_IMPLICIT)
+                    && !sym.flags.contains(SymbolFlags::NONLOCAL)
                 {
                     // We define it - mark as cell
                     sym.flags |= SymbolFlags::CELL;
@@ -328,6 +331,20 @@ impl Default for ClosureAnalyzer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[inline]
+fn is_closure_local_definition(symbol: &Symbol) -> bool {
+    symbol.flags.contains(SymbolFlags::DEF)
+        && !symbol.flags.contains(SymbolFlags::GLOBAL_EXPLICIT)
+        && !symbol.flags.contains(SymbolFlags::GLOBAL_IMPLICIT)
+        && !symbol.flags.contains(SymbolFlags::NONLOCAL)
+}
+
+#[inline]
+fn is_closure_capture_reference(symbol: &Symbol) -> bool {
+    !symbol.flags.contains(SymbolFlags::GLOBAL_EXPLICIT)
+        && !symbol.flags.contains(SymbolFlags::GLOBAL_IMPLICIT)
 }
 
 /// Information about a scope for closure resolution.
@@ -771,6 +788,34 @@ def outer():
                 .unwrap()
                 .flags
                 .contains(SymbolFlags::CELL)
+        );
+    }
+
+    #[test]
+    fn test_explicit_global_used_by_comprehension_is_not_cellvar() {
+        let source = r#"
+seed = [10]
+
+def outer():
+    global seed
+    return [x + seed[0] for x in range(2)]
+"#;
+        let table = analyze(source);
+
+        let outer_scope = &table.root.children[0];
+        let seed = outer_scope.lookup("seed").unwrap();
+        assert!(seed.flags.contains(SymbolFlags::GLOBAL_EXPLICIT));
+        assert!(
+            !seed.flags.contains(SymbolFlags::CELL),
+            "explicit global must not become a cellvar"
+        );
+
+        let comp_scope = &outer_scope.children[0];
+        let seed = comp_scope.lookup("seed").unwrap();
+        assert!(seed.flags.contains(SymbolFlags::GLOBAL_IMPLICIT));
+        assert!(
+            !seed.flags.contains(SymbolFlags::FREE),
+            "comprehension should load explicit outer globals as globals"
         );
     }
 

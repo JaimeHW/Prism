@@ -5,7 +5,10 @@
 
 use super::code_object::{CodeFlags, CodeObject, ExceptionEntry, LineTableEntry};
 use super::instruction::{ConstIndex, Instruction, LocalSlot, Opcode, Register};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use prism_core::Value;
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -160,6 +163,7 @@ enum ConstantKey {
     None,
     Bool(bool),
     Int(i64),
+    BigInt(BigInt),
     /// Float bits for exact comparison.
     Float(u64),
     String(Arc<str>),
@@ -176,6 +180,12 @@ impl ConstantKey {
             Some(ConstantKey::Bool(b))
         } else if let Some(i) = value.as_int() {
             Some(ConstantKey::Int(i))
+        } else if let Some(bigint) = value_to_bigint(*value) {
+            if let Some(i) = bigint.to_i64() {
+                Some(ConstantKey::Int(i))
+            } else {
+                Some(ConstantKey::BigInt(bigint))
+            }
         } else if let Some(f) = value.as_float() {
             Some(ConstantKey::Float(f.to_bits()))
         } else {
@@ -424,7 +434,27 @@ impl FunctionBuilder {
 
     /// Add an integer constant.
     pub fn add_int(&mut self, value: i64) -> ConstIndex {
-        self.add_constant(Value::int(value).unwrap_or_else(|| Value::none()))
+        match Value::int(value) {
+            Some(value) => self.add_constant(value),
+            None => self.add_constant(bigint_to_value(BigInt::from(value))),
+        }
+    }
+
+    /// Add an arbitrary-precision integer constant.
+    pub fn add_bigint(&mut self, value: BigInt) -> ConstIndex {
+        if let Some(i) = value.to_i64() {
+            return self.add_int(i);
+        }
+
+        let key = ConstantKey::BigInt(value.clone());
+        if let Some(&idx) = self.constant_map.get(&key) {
+            return idx;
+        }
+
+        let idx = ConstIndex::new(self.constants.len() as u16);
+        self.constants.push(bigint_to_value(value));
+        self.constant_map.insert(key, idx);
+        idx
     }
 
     /// Add a float constant.
@@ -1366,6 +1396,7 @@ impl FunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_runtime::types::int::value_to_bigint;
 
     #[test]
     fn test_simple_function() {
@@ -1990,6 +2021,32 @@ mod tests {
 
         let code = builder.finish();
         assert_eq!(code.constants.len(), 2);
+    }
+
+    #[test]
+    fn test_add_int_promotes_wide_i64_to_heap_backed_constant() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let value = 2_305_843_009_213_693_952_i64;
+        let idx = builder.add_int(value);
+        let code = builder.finish();
+
+        assert_eq!(idx.0, 0);
+        assert_eq!(value_to_bigint(code.constants[0]), Some(BigInt::from(value)));
+    }
+
+    #[test]
+    fn test_add_bigint_deduplicates_large_constants() {
+        let mut builder = FunctionBuilder::new("test");
+        let value = BigInt::from(1_u8) << 100_u32;
+
+        let first = builder.add_bigint(value.clone());
+        let second = builder.add_bigint(value.clone());
+        let code = builder.finish();
+
+        assert_eq!(first.0, second.0);
+        assert_eq!(code.constants.len(), 1);
+        assert_eq!(value_to_bigint(code.constants[0]), Some(value));
     }
 
     #[test]
