@@ -179,19 +179,29 @@ impl<'a> BytecodeTranslator<'a> {
                     )
                 })?;
 
-                let node = if let Some(i) = val.as_int() {
-                    self.builder.const_int(i)
-                } else if let Some(f) = val.as_float() {
-                    self.builder.const_float(f)
-                } else if let Some(b) = val.as_bool() {
-                    self.builder.const_bool(b)
-                } else if val.is_none() {
-                    self.builder.const_none()
-                } else {
-                    return Err(format!(
-                        "unsupported constant type at index {} for instruction offset {}",
-                        const_idx, offset
-                    ));
+                let node = match val {
+                    Constant::Value(val) => {
+                        if let Some(i) = val.as_int() {
+                            self.builder.const_int(i)
+                        } else if let Some(f) = val.as_float() {
+                            self.builder.const_float(f)
+                        } else if let Some(b) = val.as_bool() {
+                            self.builder.const_bool(b)
+                        } else if val.is_none() {
+                            self.builder.const_none()
+                        } else {
+                            return Err(format!(
+                                "unsupported constant type at index {} for instruction offset {}",
+                                const_idx, offset
+                            ));
+                        }
+                    }
+                    Constant::BigInt(_) => {
+                        return Err(format!(
+                            "unsupported bigint constant at index {} for instruction offset {}",
+                            const_idx, offset
+                        ));
+                    }
                 };
                 self.set_register(inst.dst(), node);
             }
@@ -888,3 +898,4 @@ mod tests {
         assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::Shr)));
     }
 }
+use prism_code::Constant;
