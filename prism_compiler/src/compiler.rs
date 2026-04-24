@@ -12,6 +12,7 @@ use crate::bytecode::{
 use crate::function_compiler::{VarLocation, VariableEmitter};
 use crate::scope::{ClosureAnalyzer, ScopeAnalyzer, ScopeKind, SymbolFlags, SymbolTable};
 
+use num_bigint::BigInt;
 use prism_parser::ast::{
     AugOp, BinOp, BoolOp, CmpOp, ExceptHandler, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
 };
@@ -277,6 +278,13 @@ impl Compiler {
             }
         }
 
+        if use_dynamic_module_locals {
+            if let Some(slot) = self.builder.lookup_local(name) {
+                return VarLocation::Local(slot.0);
+            }
+            return VarLocation::Local(self.builder.define_local(name).0);
+        }
+
         if !in_module_scope || use_dynamic_module_locals {
             if let Some(slot) = self.builder.lookup_local(name) {
                 return VarLocation::Local(slot.0);
@@ -294,6 +302,57 @@ impl Compiler {
             scope = &scope.children[child_idx];
         }
         scope
+    }
+
+    fn qualified_name_for_nested_definition(&self, name: &str) -> Arc<str> {
+        if self.scope_path.is_empty() {
+            return Arc::from(name);
+        }
+
+        let mut scope = &self.symbol_table.root;
+        let mut qualname = String::new();
+
+        for &child_idx in &self.scope_path {
+            scope = &scope.children[child_idx];
+            if scope.kind == ScopeKind::Module {
+                continue;
+            }
+
+            if !qualname.is_empty() {
+                qualname.push('.');
+            }
+            qualname.push_str(scope.name.as_ref());
+
+            if matches!(
+                scope.kind,
+                ScopeKind::Function | ScopeKind::Lambda | ScopeKind::Comprehension
+            ) {
+                qualname.push_str(".<locals>");
+            }
+        }
+
+        if !qualname.is_empty() {
+            qualname.push('.');
+        }
+        qualname.push_str(name);
+        Arc::from(qualname)
+    }
+
+    fn emit_implicit_class_metadata_bindings(&mut self, qualname: &str) {
+        let module_slot = self.builder.define_local("__module__");
+        let qualname_slot = self.builder.define_local("__qualname__");
+
+        let module_reg = self.builder.alloc_register();
+        let module_name_idx = self.builder.add_name("__name__");
+        self.builder.emit_load_global(module_reg, module_name_idx);
+        self.builder.emit_store_local(module_slot, module_reg);
+        self.builder.free_register(module_reg);
+
+        let qualname_reg = self.builder.alloc_register();
+        let qualname_idx = self.builder.add_string(qualname);
+        self.builder.emit_load_const(qualname_reg, qualname_idx);
+        self.builder.emit_store_local(qualname_slot, qualname_reg);
+        self.builder.free_register(qualname_reg);
     }
 
     fn ordered_cellvar_names(scope: &crate::scope::Scope) -> Vec<Arc<str>> {
@@ -349,6 +408,7 @@ impl Compiler {
             }
 
             StmtKind::AugAssign { target, op, value } => {
+                self.validate_augassign_target(target)?;
                 let left_reg = self.compile_expr(target)?;
                 let right_reg = self.compile_expr(value)?;
                 let result_reg = self.builder.alloc_register();
@@ -587,8 +647,7 @@ impl Compiler {
                     anext_reg,
                     anext_reg,
                 ));
-                self.builder
-                    .emit(Instruction::op_ds(Opcode::YieldFrom, anext_reg, anext_reg));
+                self.emit_yield_from(anext_reg, anext_reg);
 
                 // Step 4: Check for StopAsyncIteration
                 // EndAsyncFor checks if the awaited result indicates StopAsyncIteration
@@ -711,9 +770,10 @@ impl Compiler {
                     };
 
                 // Create a new FunctionBuilder for the class body
+                let class_qualname = self.qualified_name_for_nested_definition(name.as_ref());
                 let mut class_builder = FunctionBuilder::new(name.clone());
                 class_builder.set_filename(self.builder.get_filename());
-                class_builder.set_qualname(name.clone());
+                class_builder.set_qualname(Arc::clone(&class_qualname));
                 class_builder.add_flag(CodeFlags::CLASS);
 
                 // Check if any method uses zero-arg super() and inject __class__ cell
@@ -741,6 +801,10 @@ impl Compiler {
                 if let Some(scope_idx) = class_scope_idx {
                     self.enter_child_scope(scope_idx);
                 }
+
+                // CPython seeds every class body namespace with __module__ and
+                // __qualname__ before user statements execute.
+                self.emit_implicit_class_metadata_bindings(class_qualname.as_ref());
 
                 // Compile class body statements (method definitions, class variables, etc.)
                 for (index, stmt) in body.iter().enumerate() {
@@ -1137,6 +1201,34 @@ impl Compiler {
         Ok(reg)
     }
 
+    fn parse_bigint_literal(literal: &str) -> Option<BigInt> {
+        let (radix, digits) = if let Some(rest) = literal
+            .strip_prefix("0x")
+            .or_else(|| literal.strip_prefix("0X"))
+        {
+            (16, rest)
+        } else if let Some(rest) = literal
+            .strip_prefix("0o")
+            .or_else(|| literal.strip_prefix("0O"))
+        {
+            (8, rest)
+        } else if let Some(rest) = literal
+            .strip_prefix("0b")
+            .or_else(|| literal.strip_prefix("0B"))
+        {
+            (2, rest)
+        } else {
+            (10, literal)
+        };
+
+        let normalized: String = digits.chars().filter(|c| *c != '_').collect();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        BigInt::parse_bytes(normalized.as_bytes(), radix)
+    }
+
     fn compile_large_dict_literal_into(
         &mut self,
         dst: Register,
@@ -1173,6 +1265,16 @@ impl Compiler {
         match &expr.kind {
             ExprKind::Int(n) => {
                 let idx = self.builder.add_int(*n);
+                self.builder.emit_load_const(reg, idx);
+            }
+
+            ExprKind::BigInt(literal) => {
+                let value = Self::parse_bigint_literal(literal).ok_or_else(|| CompileError {
+                    message: format!("invalid integer literal: {literal}"),
+                    line: expr.span.start,
+                    column: 0,
+                })?;
+                let idx = self.builder.add_bigint(value);
                 self.builder.emit_load_const(reg, idx);
             }
 
@@ -1764,8 +1866,7 @@ impl Compiler {
                 // Step 3: YieldFrom - Delegate to the awaitable until completion
                 // This suspends the coroutine and returns control to the event loop
                 // The result ends up in reg when the awaitable completes
-                self.builder
-                    .emit(Instruction::op_ds(Opcode::YieldFrom, reg, reg));
+                self.emit_yield_from(reg, reg);
             }
 
             ExprKind::Yield(value) => {
@@ -1808,8 +1909,7 @@ impl Compiler {
                 let iter_reg = self.compile_expr(value)?;
 
                 // YieldFrom: dst = result, src = iterator
-                self.builder
-                    .emit(Instruction::op_ds(Opcode::YieldFrom, reg, iter_reg));
+                self.emit_yield_from(reg, iter_reg);
                 self.builder.free_register(iter_reg);
             }
 
@@ -2279,6 +2379,17 @@ impl Compiler {
         Ok(())
     }
 
+    fn validate_augassign_target(&self, target: &Expr) -> CompileResult<()> {
+        match &target.kind {
+            ExprKind::Tuple(_) | ExprKind::List(_) => Err(CompileError {
+                message: "illegal expression for augmented assignment".to_string(),
+                line: target.span.start,
+                column: 0,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     fn compile_delete_target(&mut self, target: &Expr) -> CompileResult<()> {
         match &target.kind {
             ExprKind::Name(name) => {
@@ -2382,6 +2493,22 @@ impl Compiler {
                 .builder
                 .emit(Instruction::op_dss(Opcode::NotIn, dst, left, right)),
         }
+    }
+
+    fn emit_yield_from(&mut self, dst: Register, iterable_reg: Register) {
+        if dst == iterable_reg {
+            let source_reg = self.builder.alloc_register();
+            self.builder.emit_move(source_reg, iterable_reg);
+            self.builder.emit_load_none(dst);
+            self.builder
+                .emit(Instruction::op_ds(Opcode::YieldFrom, dst, source_reg));
+            self.builder.free_register(source_reg);
+            return;
+        }
+
+        self.builder.emit_load_none(dst);
+        self.builder
+            .emit(Instruction::op_ds(Opcode::YieldFrom, dst, iterable_reg));
     }
 
     // =========================================================================
@@ -3141,8 +3268,7 @@ impl Compiler {
             aenter_awaitable_reg,
         ));
         self.builder.free_register(aenter_awaitable_reg);
-        self.builder
-            .emit(Instruction::op_ds(Opcode::YieldFrom, value_reg, value_reg));
+        self.emit_yield_from(value_reg, value_reg);
 
         // Step 6: If there's an as-clause, bind the value
         if let Some(optional_vars) = &item.optional_vars {
@@ -3188,11 +3314,7 @@ impl Compiler {
             aexit_awaitable_reg,
         ));
         self.builder.free_register(aexit_awaitable_reg);
-        self.builder.emit(Instruction::op_ds(
-            Opcode::YieldFrom,
-            aexit_result_reg,
-            aexit_result_reg,
-        ));
+        self.emit_yield_from(aexit_result_reg, aexit_result_reg);
         self.builder.free_register(aexit_result_reg);
 
         // Jump to end (skip exception path)
@@ -3244,11 +3366,7 @@ impl Compiler {
             suppress_awaitable_reg,
         ));
         self.builder.free_register(suppress_awaitable_reg);
-        self.builder.emit(Instruction::op_ds(
-            Opcode::YieldFrom,
-            suppress_reg,
-            suppress_reg,
-        ));
+        self.emit_yield_from(suppress_reg, suppress_reg);
 
         // Pop exception info
         self.builder.emit(Instruction::op(Opcode::PopExcInfo));
@@ -4200,31 +4318,14 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
-        let _ = self.next_comprehension_scope("<comprehension>");
-
-        // For now, compile comprehension inline for simplicity
-        // Full implementation would create a nested scope
-
-        // Create the result list in a fresh register so nested call blocks can
-        // reserve their own contiguous layouts without aliasing the live list.
-        //
-        // We intentionally preserve the existing free-register pool here. Call
-        // lowering already allocates fresh contiguous blocks when needed, so
-        // discarding reusable registers only increases pressure and can exhaust
-        // the 8-bit virtual register space on large stdlib functions such as
-        // CPython's `functools._c3_mro`.
-        let list_reg = self.builder.alloc_register_block(1);
-
-        self.builder.emit_build_list(list_reg, list_reg, 0);
-
-        // Compile generators (nested loops)
-        self.compile_comprehension_generators(elt, generators, list_reg, ComprehensionKind::List)?;
-
-        // Move result to destination
-        self.builder.emit_move(dst, list_reg);
-        self.builder.free_register(list_reg);
-
-        Ok(dst)
+        self.compile_sequence_comprehension(
+            "<listcomp>",
+            "<comprehension>",
+            elt,
+            generators,
+            dst,
+            ComprehensionKind::List,
+        )
     }
 
     /// Compile a set comprehension.
@@ -4234,21 +4335,14 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
-        let _ = self.next_comprehension_scope("<comprehension>");
-
-        // Create empty set
-        let set_reg = self.builder.alloc_register();
-        self.builder
-            .emit(Instruction::op_d(Opcode::BuildSet, set_reg));
-
-        // Compile generators
-        self.compile_comprehension_generators(elt, generators, set_reg, ComprehensionKind::Set)?;
-
-        // Move result to destination
-        self.builder.emit_move(dst, set_reg);
-        self.builder.free_register(set_reg);
-
-        Ok(dst)
+        self.compile_sequence_comprehension(
+            "<setcomp>",
+            "<comprehension>",
+            elt,
+            generators,
+            dst,
+            ComprehensionKind::Set,
+        )
     }
 
     /// Compile a dict comprehension.
@@ -4259,19 +4353,177 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
-        let _ = self.next_comprehension_scope("<dictcomp>");
+        let comp_scope_idx = self.next_comprehension_scope("<dictcomp>");
+        let (cellvars, freevars, locals) = self.comprehension_scope_layout(comp_scope_idx);
+        let captures_freevars = !freevars.is_empty();
 
-        // Create empty dict
+        let mut comp_builder = FunctionBuilder::new("<dictcomp>");
+        comp_builder.set_filename(&*self.filename);
+        comp_builder.set_arg_count(1);
+        comp_builder.define_local(".0");
+        for name in locals {
+            comp_builder.define_local(name);
+        }
+        Self::configure_closure_layout(&mut comp_builder, cellvars, freevars);
+
+        let parent_builder = std::mem::replace(&mut self.builder, comp_builder);
+        if let Some(scope_idx) = comp_scope_idx {
+            self.enter_child_scope(scope_idx);
+        }
+
+        let iter_reg = self.builder.alloc_register();
+        self.builder
+            .emit_load_local(iter_reg, crate::bytecode::LocalSlot::new(0));
+
         let dict_reg = self.builder.alloc_register();
         self.builder
             .emit(Instruction::op_d(Opcode::BuildDict, dict_reg));
-
-        // Compile generators with key-value pair
-        self.compile_dict_comprehension_generators(key, value, generators, dict_reg)?;
-
-        // Move result to destination
-        self.builder.emit_move(dst, dict_reg);
+        self.compile_dict_comprehension_generators(key, value, generators, dict_reg, 0, iter_reg)?;
+        self.builder.emit_return(dict_reg);
         self.builder.free_register(dict_reg);
+        self.builder.free_register(iter_reg);
+
+        if comp_scope_idx.is_some() {
+            self.exit_child_scope();
+        }
+
+        let comp_builder = std::mem::replace(&mut self.builder, parent_builder);
+        let comp_code = comp_builder.finish();
+        self.emit_comprehension_call(comp_code, captures_freevars, &generators[0].iter, dst)
+    }
+
+    fn compile_sequence_comprehension(
+        &mut self,
+        code_name: &'static str,
+        scope_name: &'static str,
+        elt: &Expr,
+        generators: &[prism_parser::ast::Comprehension],
+        dst: Register,
+        kind: ComprehensionKind,
+    ) -> CompileResult<Register> {
+        let comp_scope_idx = self.next_comprehension_scope(scope_name);
+        let (cellvars, freevars, locals) = self.comprehension_scope_layout(comp_scope_idx);
+        let captures_freevars = !freevars.is_empty();
+
+        let mut comp_builder = FunctionBuilder::new(code_name);
+        comp_builder.set_filename(&*self.filename);
+        comp_builder.set_arg_count(1);
+        comp_builder.define_local(".0");
+        for name in locals {
+            comp_builder.define_local(name);
+        }
+        Self::configure_closure_layout(&mut comp_builder, cellvars, freevars);
+
+        let parent_builder = std::mem::replace(&mut self.builder, comp_builder);
+        if let Some(scope_idx) = comp_scope_idx {
+            self.enter_child_scope(scope_idx);
+        }
+
+        let iter_reg = self.builder.alloc_register();
+        self.builder
+            .emit_load_local(iter_reg, crate::bytecode::LocalSlot::new(0));
+
+        let result_reg = self.builder.alloc_register();
+        match kind {
+            ComprehensionKind::List => self.builder.emit_build_list(result_reg, result_reg, 0),
+            ComprehensionKind::Set => self
+                .builder
+                .emit(Instruction::op_d(Opcode::BuildSet, result_reg)),
+        }
+        self.compile_comprehension_generators(elt, generators, result_reg, kind, 0, iter_reg)?;
+        self.builder.emit_return(result_reg);
+        self.builder.free_register(result_reg);
+        self.builder.free_register(iter_reg);
+
+        if comp_scope_idx.is_some() {
+            self.exit_child_scope();
+        }
+
+        let comp_builder = std::mem::replace(&mut self.builder, parent_builder);
+        let comp_code = comp_builder.finish();
+        self.emit_comprehension_call(comp_code, captures_freevars, &generators[0].iter, dst)
+    }
+
+    fn comprehension_scope_layout(
+        &self,
+        scope_idx: Option<usize>,
+    ) -> (Vec<Arc<str>>, Vec<Arc<str>>, Vec<Arc<str>>) {
+        if let Some(scope_idx) = scope_idx {
+            let scope = &self.current_scope().children[scope_idx];
+            let cellvars = Self::ordered_cellvar_names(scope);
+            let freevars = Self::ordered_freevar_names(scope);
+            let mut locals = scope
+                .locals()
+                .map(|sym| Arc::from(sym.name.as_ref()))
+                .collect::<Vec<Arc<str>>>();
+            locals.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            (cellvars, freevars, locals)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+    }
+
+    fn configure_closure_layout(
+        builder: &mut FunctionBuilder,
+        cellvars: Vec<Arc<str>>,
+        freevars: Vec<Arc<str>>,
+    ) {
+        let has_cellvars = !cellvars.is_empty();
+        let captures_freevars = !freevars.is_empty();
+
+        for name in cellvars {
+            builder.add_cellvar(name);
+        }
+        for name in freevars {
+            builder.add_freevar(name);
+        }
+
+        if has_cellvars {
+            builder.add_flags(CodeFlags::HAS_CELLVARS);
+        }
+        if captures_freevars {
+            builder.add_flags(CodeFlags::HAS_FREEVARS);
+        }
+    }
+
+    fn emit_comprehension_call(
+        &mut self,
+        comp_code: CodeObject,
+        captures_freevars: bool,
+        first_iter_expr: &Expr,
+        dst: Register,
+    ) -> CompileResult<Register> {
+        let code_idx = self.builder.add_code_object(Arc::new(comp_code));
+        let mut func_reg = self.builder.alloc_register();
+        self.builder.emit(Instruction::op_di(
+            if captures_freevars {
+                Opcode::MakeClosure
+            } else {
+                Opcode::MakeFunction
+            },
+            func_reg,
+            code_idx,
+        ));
+
+        let call_block = self.builder.alloc_register_block(2);
+        if func_reg.0 >= call_block.0 && func_reg.0 < call_block.0 + 2 {
+            let safe_reg = self.builder.alloc_register();
+            self.builder.emit_move(safe_reg, func_reg);
+            self.builder.free_register(func_reg);
+            func_reg = safe_reg;
+        }
+
+        let first_iter = self.compile_expr(first_iter_expr)?;
+        let arg_reg = Register::new(call_block.0 + 1);
+        self.builder.emit_get_iter(arg_reg, first_iter);
+        self.builder.free_register(first_iter);
+
+        self.builder.emit_call(call_block, func_reg, 1);
+        if call_block != dst {
+            self.builder.emit_move(dst, call_block);
+        }
+        self.builder.free_register(func_reg);
+        self.builder.free_register_block(call_block, 2);
 
         Ok(dst)
     }
@@ -4401,6 +4653,8 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         result_reg: Register,
         kind: ComprehensionKind,
+        depth: usize,
+        first_iter_reg: Register,
     ) -> CompileResult<()> {
         if generators.is_empty() {
             // Base case: compute element and add to collection
@@ -4432,30 +4686,36 @@ impl Compiler {
         let comp_gen = &generators[0];
         let rest = &generators[1..];
 
-        // Compile iterator
-        let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
         let loop_regs = self.builder.alloc_register_block(2);
         let iter_reg = loop_regs;
         let item_reg = Register::new(loop_regs.0 + 1);
 
-        // Get iterator (sync or async)
-        if comp_gen.is_async {
-            if !self.in_async_context {
-                return Err(CompileError {
-                    message: "asynchronous comprehension outside of an async function".to_string(),
-                    line: 0,
-                    column: 0,
-                });
-            }
-            self.builder.emit(Instruction::op_ds(
-                Opcode::GetAIter,
-                iter_reg,
-                iter_expr_reg,
-            ));
+        if depth == 0 {
+            self.builder.emit_move(iter_reg, first_iter_reg);
         } else {
-            self.builder.emit_get_iter(iter_reg, iter_expr_reg);
+            // Compile iterator
+            let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
+
+            // Get iterator (sync or async)
+            if comp_gen.is_async {
+                if !self.in_async_context {
+                    return Err(CompileError {
+                        message: "asynchronous comprehension outside of an async function"
+                            .to_string(),
+                        line: 0,
+                        column: 0,
+                    });
+                }
+                self.builder.emit(Instruction::op_ds(
+                    Opcode::GetAIter,
+                    iter_reg,
+                    iter_expr_reg,
+                ));
+            } else {
+                self.builder.emit_get_iter(iter_reg, iter_expr_reg);
+            }
+            self.builder.free_register(iter_expr_reg);
         }
-        self.builder.free_register(iter_expr_reg);
 
         // Create loop labels
         let loop_start = self.builder.create_label();
@@ -4470,8 +4730,7 @@ impl Compiler {
             // await the result
             self.builder
                 .emit(Instruction::op_ds(Opcode::GetAwaitable, item_reg, item_reg));
-            self.builder
-                .emit(Instruction::op_ds(Opcode::YieldFrom, item_reg, item_reg));
+            self.emit_yield_from(item_reg, item_reg);
         } else {
             self.builder.emit_for_iter(item_reg, loop_end);
         }
@@ -4487,7 +4746,14 @@ impl Compiler {
         }
 
         // Recurse for nested generators or emit element
-        self.compile_comprehension_generators(elt, rest, result_reg, kind)?;
+        self.compile_comprehension_generators(
+            elt,
+            rest,
+            result_reg,
+            kind,
+            depth + 1,
+            Register::new(0),
+        )?;
 
         // Jump back to loop start
         self.builder.emit_jump(loop_start);
@@ -4506,6 +4772,8 @@ impl Compiler {
         value: &Expr,
         generators: &[prism_parser::ast::Comprehension],
         result_reg: Register,
+        depth: usize,
+        first_iter_reg: Register,
     ) -> CompileResult<()> {
         if generators.is_empty() {
             // Base case: compute key-value and add to dict
@@ -4520,29 +4788,35 @@ impl Compiler {
         let comp_gen = &generators[0];
         let rest = &generators[1..];
 
-        // Compile iterator
-        let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
         let loop_regs = self.builder.alloc_register_block(2);
         let iter_reg = loop_regs;
         let item_reg = Register::new(loop_regs.0 + 1);
 
-        if comp_gen.is_async {
-            if !self.in_async_context {
-                return Err(CompileError {
-                    message: "asynchronous comprehension outside of an async function".to_string(),
-                    line: 0,
-                    column: 0,
-                });
-            }
-            self.builder.emit(Instruction::op_ds(
-                Opcode::GetAIter,
-                iter_reg,
-                iter_expr_reg,
-            ));
+        if depth == 0 {
+            self.builder.emit_move(iter_reg, first_iter_reg);
         } else {
-            self.builder.emit_get_iter(iter_reg, iter_expr_reg);
+            // Compile iterator
+            let iter_expr_reg = self.compile_expr(&comp_gen.iter)?;
+
+            if comp_gen.is_async {
+                if !self.in_async_context {
+                    return Err(CompileError {
+                        message: "asynchronous comprehension outside of an async function"
+                            .to_string(),
+                        line: 0,
+                        column: 0,
+                    });
+                }
+                self.builder.emit(Instruction::op_ds(
+                    Opcode::GetAIter,
+                    iter_reg,
+                    iter_expr_reg,
+                ));
+            } else {
+                self.builder.emit_get_iter(iter_reg, iter_expr_reg);
+            }
+            self.builder.free_register(iter_expr_reg);
         }
-        self.builder.free_register(iter_expr_reg);
 
         // Create loop labels
         let loop_start = self.builder.create_label();
@@ -4556,8 +4830,7 @@ impl Compiler {
                 .emit(Instruction::op_ds(Opcode::GetANext, item_reg, iter_reg));
             self.builder
                 .emit(Instruction::op_ds(Opcode::GetAwaitable, item_reg, item_reg));
-            self.builder
-                .emit(Instruction::op_ds(Opcode::YieldFrom, item_reg, item_reg));
+            self.emit_yield_from(item_reg, item_reg);
         } else {
             self.builder.emit_for_iter(item_reg, loop_end);
         }
@@ -4573,7 +4846,14 @@ impl Compiler {
         }
 
         // Recurse for nested generators
-        self.compile_dict_comprehension_generators(key, value, rest, result_reg)?;
+        self.compile_dict_comprehension_generators(
+            key,
+            value,
+            rest,
+            result_reg,
+            depth + 1,
+            Register::new(0),
+        )?;
 
         // Jump back to loop start
         self.builder.emit_jump(loop_start);
@@ -4664,6 +4944,8 @@ enum ComprehensionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_bigint::BigInt;
+    use prism_code::Constant;
 
     fn compile(source: &str) -> CodeObject {
         let module = prism_parser::parse(source).expect("parse error");
@@ -4714,6 +4996,31 @@ mod tests {
     fn try_compile(source: &str) -> Result<CodeObject, CompileError> {
         let module = prism_parser::parse(source).expect("parse error");
         Compiler::compile_module(&module, "<test>")
+    }
+
+    #[test]
+    fn test_compile_wide_i64_literal_emits_integer_constant() {
+        let code = compile("value = 2305843009213693952");
+
+        assert!(code.constants.iter().any(|value| {
+            matches!(
+                value,
+                Constant::BigInt(constant)
+                    if constant == &BigInt::from(2_305_843_009_213_693_952_i64)
+            )
+        }));
+    }
+
+    #[test]
+    fn test_compile_bigint_literal_emits_arbitrary_precision_constant() {
+        let expected = BigInt::from(1_u8) << 100_u32;
+        let code = compile("value = 1267650600228229401496703205376");
+
+        assert!(
+            code.constants
+                .iter()
+                .any(|value| matches!(value, Constant::BigInt(constant) if constant == &expected))
+        );
     }
 
     #[test]
@@ -5487,11 +5794,13 @@ class Child(Base1, Base2):
         let code_const = code
             .constants
             .get(code_idx)
-            .copied()
             .expect("BUILD_CLASS code index must be in constant pool");
-        let code_ptr = code_const
-            .as_object_ptr()
-            .expect("BUILD_CLASS constant must be a code object pointer");
+        let code_ptr = match code_const {
+            Constant::Value(value) => value
+                .as_object_ptr()
+                .expect("BUILD_CLASS constant must be a code object pointer"),
+            Constant::BigInt(_) => panic!("BUILD_CLASS constant must not be a bigint"),
+        };
 
         let nested = code
             .nested_code_objects
@@ -5564,7 +5873,10 @@ class Child(Base, answer=42):
         let names_ptr = code
             .constants
             .get(kwnames_idx as usize)
-            .and_then(|value| value.as_object_ptr())
+            .and_then(|value| match value {
+                Constant::Value(value) => value.as_object_ptr(),
+                Constant::BigInt(_) => None,
+            })
             .expect("class keyword metadata should point at keyword names");
         let names = unsafe { &*(names_ptr as *const crate::bytecode::KwNamesTuple) };
         assert_eq!(names.get(0).map(|name| name.as_ref()), Some("answer"));
@@ -6471,5 +6783,15 @@ def safe_divide(a, b):
 "#,
         );
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_augassign_rejects_unpacking_targets() {
+        let err = try_compile("x, b += 3").expect_err("tuple augassign target should fail");
+        assert!(
+            err.message
+                .contains("illegal expression for augmented assignment"),
+            "unexpected compile error: {err:?}"
+        );
     }
 }
