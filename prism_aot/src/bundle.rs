@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use prism_code::KwNamesTuple;
-use prism_code::{CodeObject, Opcode};
+use prism_code::{CodeObject, Constant, Opcode};
 use prism_core::Value;
 use prism_core::intern::interned_by_ptr;
 
@@ -18,6 +18,7 @@ const CONSTANT_FLOAT_BITS: u8 = 3;
 const CONSTANT_STRING: u8 = 4;
 const CONSTANT_NESTED_CODE: u8 = 5;
 const CONSTANT_KW_NAMES: u8 = 6;
+const CONSTANT_BIGINT: u8 = 7;
 
 /// Serialized frozen module bundle for downstream native link steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +119,8 @@ pub enum ConstantImage {
     NestedCode(u32),
     /// Keyword names tuple used by `CallKw`.
     KwNamesTuple(Vec<String>),
+    /// Arbitrary-precision integer literal encoded in base 10.
+    BigInt(String),
 }
 
 /// Serialized line table entry.
@@ -281,12 +284,12 @@ impl CodeImage {
             .constants
             .iter()
             .enumerate()
-            .map(|(index, value)| {
-                ConstantImage::from_value(
+            .map(|(index, constant)| {
+                ConstantImage::from_constant(
                     module_name,
                     &code.qualname,
                     index,
-                    *value,
+                    constant,
                     &nested_code_indices,
                     &kw_name_indices,
                 )
@@ -342,7 +345,28 @@ impl CodeImage {
 }
 
 impl ConstantImage {
-    fn from_value(
+    fn from_constant(
+        module_name: &str,
+        code_name: &str,
+        constant_index: usize,
+        constant: &Constant,
+        nested_code_indices: &HashMap<usize, u32>,
+        kw_name_indices: &BTreeSet<usize>,
+    ) -> Result<Self, AotError> {
+        match constant {
+            Constant::Value(value) => Self::from_materialized_value(
+                module_name,
+                code_name,
+                constant_index,
+                *value,
+                nested_code_indices,
+                kw_name_indices,
+            ),
+            Constant::BigInt(value) => Ok(Self::BigInt(value.to_string())),
+        }
+    }
+
+    fn from_materialized_value(
         module_name: &str,
         code_name: &str,
         constant_index: usize,
@@ -577,6 +601,10 @@ impl BundleWriter {
                     self.write_string(name)?;
                 }
             }
+            ConstantImage::BigInt(value) => {
+                self.write_u8(CONSTANT_BIGINT);
+                self.write_string(value)?;
+            }
         }
         Ok(())
     }
@@ -783,6 +811,7 @@ impl<'a> BundleReader<'a> {
                 let names = self.read_vec(|reader| reader.read_string())?;
                 Ok(ConstantImage::KwNamesTuple(names))
             }
+            CONSTANT_BIGINT => Ok(ConstantImage::BigInt(self.read_string()?)),
             tag => Err(AotError::InvalidArtifact {
                 message: format!("invalid constant tag in frozen bundle: {}", tag),
             }),
@@ -951,5 +980,35 @@ mod tests {
         let decoded =
             FrozenModuleBundle::read_from_path(&output_path).expect("bundle should read back");
         assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn test_bundle_roundtrip_preserves_bigint_constants() {
+        let temp = TestTempDir::new();
+        let main_path = temp.path.join("main.py");
+        let literal = "12345678901234567890123456789012345678901234567890";
+        write_file(&main_path, &format!("VALUE = {literal}\n"));
+
+        let plan = planner_for(&temp.path)
+            .plan(BuildEntry::Script(main_path))
+            .expect("plan should succeed");
+        let bundle = FrozenModuleBundle::from_build_plan(&plan).expect("bundle build should work");
+        let decoded =
+            FrozenModuleBundle::from_bytes(&bundle.to_bytes().expect("bundle bytes should exist"))
+                .expect("bundle should round-trip");
+
+        let main_module = decoded
+            .modules
+            .iter()
+            .find(|module| module.name == "__main__")
+            .expect("main module should exist");
+        let code = main_module
+            .code
+            .as_ref()
+            .expect("source module should have code");
+
+        assert!(code.constants.iter().any(|constant| {
+            matches!(constant, ConstantImage::BigInt(value) if value == literal)
+        }));
     }
 }

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use num_bigint::BigInt;
 use prism_code::{
-    CodeFlags, CodeObject, ExceptionEntry, Instruction, KwNamesTuple, LineTableEntry,
+    CodeFlags, CodeObject, Constant, ExceptionEntry, Instruction, KwNamesTuple, LineTableEntry,
 };
 use prism_core::Value;
 use prism_core::intern::intern;
@@ -114,14 +115,14 @@ impl CodeImage {
             .iter()
             .enumerate()
             .map(|(index, constant)| {
-                constant
-                    .to_value(&nested_code_objects)
-                    .map_err(|err| AotError::InvalidArtifact {
+                constant.to_constant(&nested_code_objects).map_err(|err| {
+                    AotError::InvalidArtifact {
                         message: format!(
                             "failed to decode constant {} for '{}': {}",
                             index, self.qualname, err
                         ),
-                    })
+                    }
+                })
             })
             .collect::<Result<Vec<_>, AotError>>()?;
 
@@ -183,20 +184,18 @@ impl CodeImage {
 }
 
 impl ConstantImage {
-    fn to_value(&self, nested_code_objects: &[Arc<CodeObject>]) -> Result<Value, AotError> {
+    fn to_constant(&self, nested_code_objects: &[Arc<CodeObject>]) -> Result<Constant, AotError> {
         match self {
-            ConstantImage::None => Ok(Value::none()),
-            ConstantImage::Bool(value) => Ok(Value::bool(*value)),
-            ConstantImage::Int(value) => {
-                Value::int(*value).ok_or_else(|| AotError::InvalidArtifact {
-                    message: format!(
-                        "integer constant {} does not fit Prism immediate format",
-                        value
-                    ),
-                })
+            ConstantImage::None => Ok(Constant::Value(Value::none())),
+            ConstantImage::Bool(value) => Ok(Constant::Value(Value::bool(*value))),
+            ConstantImage::Int(value) => Ok(match Value::int(*value) {
+                Some(value) => Constant::Value(value),
+                None => Constant::BigInt(BigInt::from(*value)),
+            }),
+            ConstantImage::FloatBits(bits) => {
+                Ok(Constant::Value(Value::float(f64::from_bits(*bits))))
             }
-            ConstantImage::FloatBits(bits) => Ok(Value::float(f64::from_bits(*bits))),
-            ConstantImage::String(value) => Ok(Value::string(intern(value))),
+            ConstantImage::String(value) => Ok(Constant::Value(Value::string(intern(value)))),
             ConstantImage::NestedCode(index) => {
                 let code = nested_code_objects.get(*index as usize).ok_or_else(|| {
                     AotError::InvalidArtifact {
@@ -206,7 +205,9 @@ impl ConstantImage {
                         ),
                     }
                 })?;
-                Ok(Value::object_ptr(Arc::as_ptr(code) as *const ()))
+                Ok(Constant::Value(Value::object_ptr(
+                    Arc::as_ptr(code) as *const ()
+                )))
             }
             ConstantImage::KwNamesTuple(names) => {
                 let tuple = KwNamesTuple::new(
@@ -216,7 +217,15 @@ impl ConstantImage {
                         .collect(),
                 );
                 let tuple_ptr = Box::into_raw(Box::new(tuple)) as *const ();
-                Ok(Value::object_ptr(tuple_ptr))
+                Ok(Constant::Value(Value::object_ptr(tuple_ptr)))
+            }
+            ConstantImage::BigInt(value) => {
+                let parsed = BigInt::parse_bytes(value.as_bytes(), 10).ok_or_else(|| {
+                    AotError::InvalidArtifact {
+                        message: format!("invalid bigint constant '{}'", value),
+                    }
+                })?;
+                Ok(Constant::BigInt(parsed))
             }
         }
     }
@@ -311,8 +320,16 @@ mod tests {
             code.nested_code_objects.len(),
             image.nested_code_objects.len()
         );
-        assert!(code.constants.iter().any(|value| value.is_string()));
-        assert!(code.constants.iter().any(|value| value.is_object()));
+        assert!(
+            code.constants
+                .iter()
+                .any(|constant| matches!(constant, Constant::Value(value) if value.is_string()))
+        );
+        assert!(
+            code.constants
+                .iter()
+                .any(|constant| matches!(constant, Constant::Value(value) if value.is_object()))
+        );
     }
 
     #[test]
@@ -375,5 +392,38 @@ mod tests {
             .to_code_object()
             .expect_err("invalid nested code reference should fail");
         assert!(err.to_string().contains("nested code"));
+    }
+
+    #[test]
+    fn test_code_image_decodes_bigint_constants() {
+        let image = CodeImage {
+            name: "mod".to_string(),
+            qualname: "<module>".to_string(),
+            filename: "<frozen>".to_string(),
+            first_lineno: 1,
+            instructions: Vec::new(),
+            constants: vec![ConstantImage::BigInt(
+                "12345678901234567890123456789012345678901234567890".to_string(),
+            )],
+            locals: Vec::new(),
+            names: Vec::new(),
+            freevars: Vec::new(),
+            cellvars: Vec::new(),
+            arg_count: 0,
+            posonlyarg_count: 0,
+            kwonlyarg_count: 0,
+            register_count: 0,
+            flags: CodeFlags::MODULE.bits(),
+            line_table: Vec::new(),
+            exception_table: Vec::new(),
+            nested_code_objects: Vec::new(),
+        };
+
+        let code = image
+            .to_code_object()
+            .expect("bigint constants should decode");
+        assert!(code.constants.iter().any(|constant| {
+            matches!(constant, Constant::BigInt(value) if value == &BigInt::parse_bytes(b"12345678901234567890123456789012345678901234567890", 10).expect("valid bigint"))
+        }));
     }
 }
