@@ -41,8 +41,8 @@
 use crate::barrier::satb_buffer::SatbQueue;
 use crate::collector::mark_bitmap::AtomicMarkBitmap;
 use crossbeam_deque::{Injector, Stealer, Worker};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // =============================================================================
 // MarkPtr — Send-safe raw pointer wrapper

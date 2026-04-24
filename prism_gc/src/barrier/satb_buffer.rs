@@ -39,8 +39,8 @@
 //! - **Buffer**: stack-allocated array, fixed capacity → no allocation on push
 //! - **Flush**: amortized over `BUFFER_CAPACITY` stores
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // =============================================================================
 // Constants

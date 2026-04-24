@@ -15,10 +15,10 @@ pub use large_object_space::LargeObjectSpace;
 pub use nursery::Nursery;
 pub use old_space::OldSpace;
 
+use crate::Generation;
 use crate::barrier::RememberedSet;
 use crate::config::GcConfig;
 use crate::stats::GcStats;
-use crate::Generation;
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};

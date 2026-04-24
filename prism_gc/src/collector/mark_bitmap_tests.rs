@@ -38,7 +38,7 @@ fn test_bitmap_coverage() {
 #[test]
 fn test_bitmap_memory_usage() {
     let bm = AtomicMarkBitmap::new(0, 1024 * 1024); // 1MB
-                                                    // 1MB / 8 bytes = 131072 granules → 131072 / 64 = 2048 words → 16KB
+    // 1MB / 8 bytes = 131072 granules → 131072 / 64 = 2048 words → 16KB
     assert_eq!(bm.memory_usage(), 2048 * 8);
 }
 
