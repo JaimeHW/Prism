@@ -23,8 +23,12 @@ const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_contextvars",
     "_imp",
     "_io",
+    "_overlapped",
     "_random",
     "_sha2",
+    "_socket",
+    "_ssl",
+    "_sre",
     "_string",
     "_struct",
     "_thread",
@@ -32,6 +36,7 @@ const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_winapi",
     "_warnings",
     "_weakref",
+    "array",
     "builtins",
     "atexit",
     "gc",
@@ -39,6 +44,7 @@ const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
     "itertools",
     "marshal",
     "math",
+    "select",
     "signal",
     "sys",
     "time",
@@ -53,8 +59,12 @@ const WINDOWS_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_contextvars",
     "_imp",
     "_io",
+    "_overlapped",
     "_random",
     "_sha2",
+    "_socket",
+    "_ssl",
+    "_sre",
     "_string",
     "_struct",
     "_thread",
@@ -62,6 +72,7 @@ const WINDOWS_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_winapi",
     "_warnings",
     "_weakref",
+    "array",
     "builtins",
     "atexit",
     "gc",
@@ -69,7 +80,9 @@ const WINDOWS_BUILTIN_MODULE_NAMES: &[&str] = &[
     "itertools",
     "marshal",
     "math",
+    "msvcrt",
     "nt",
+    "select",
     "signal",
     "sys",
     "time",
@@ -86,12 +99,16 @@ const POSIX_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_io",
     "_random",
     "_sha2",
+    "_socket",
+    "_ssl",
+    "_sre",
     "_string",
     "_struct",
     "_thread",
     "_tokenize",
     "_warnings",
     "_weakref",
+    "array",
     "builtins",
     "atexit",
     "gc",
@@ -100,6 +117,7 @@ const POSIX_BUILTIN_MODULE_NAMES: &[&str] = &[
     "marshal",
     "math",
     "posix",
+    "select",
     "signal",
     "sys",
     "time",
@@ -127,14 +145,18 @@ pub fn is_builtin_module_name(name: &str) -> bool {
 pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
     match name {
         "builtins" | "_abc" | "_ast" | "_codecs" | "_contextvars" | "_imp" | "_random"
-        | "_sha2" | "_io" | "_string" | "_struct" | "_thread" | "_tokenize" | "_warnings"
-        | "_weakref" | "atexit" | "math" | "errno" | "gc" | "sys" | "time" | "typing"
-        | "signal" | "weakref" | "re" | "collections" | "fnmatch" | "inspect" | "itertools"
-        | "io" | "marshal" => Some(StdlibResolutionPolicy::PreferNative),
+        | "_sha2" | "_socket" | "_ssl" | "_sre" | "_io" | "_string" | "_struct" | "_thread"
+        | "_tokenize" | "_warnings" | "_weakref" | "array" | "atexit" | "math" | "errno" | "gc"
+        | "sys" | "time" | "typing" | "signal" | "select" | "weakref" | "re" | "collections"
+        | "fnmatch" | "inspect" | "itertools" | "io" | "marshal" => {
+            Some(StdlibResolutionPolicy::PreferNative)
+        }
         "os" | "os.path" | "json" | "functools" => {
             Some(StdlibResolutionPolicy::PreferSourceWhenAvailable)
         }
-        "_winapi" | "nt" | "winreg" if cfg!(windows) => Some(StdlibResolutionPolicy::PreferNative),
+        "_overlapped" | "_winapi" | "msvcrt" | "nt" | "winreg" if cfg!(windows) => {
+            Some(StdlibResolutionPolicy::PreferNative)
+        }
         _ => None,
     }
 }
@@ -159,15 +181,23 @@ mod tests {
     fn test_builtin_module_names_match_platform_surface() {
         assert!(is_builtin_module_name("_imp"));
         assert!(is_builtin_module_name("_io"));
+        assert!(is_builtin_module_name("_socket"));
+        assert!(is_builtin_module_name("_ssl"));
+        assert!(is_builtin_module_name("_sre"));
+        assert!(is_builtin_module_name("array"));
         assert!(is_builtin_module_name("builtins"));
+        assert!(is_builtin_module_name("select"));
         assert!(is_builtin_module_name("sys"));
 
         if cfg!(windows) {
+            assert!(is_builtin_module_name("_overlapped"));
             assert!(is_builtin_module_name("_winapi"));
+            assert!(is_builtin_module_name("msvcrt"));
             assert!(is_builtin_module_name("winreg"));
             assert!(is_builtin_module_name("nt"));
         } else if cfg!(unix) {
             assert!(is_builtin_module_name("posix"));
+            assert!(!is_builtin_module_name("_overlapped"));
             assert!(!is_builtin_module_name("_winapi"));
         }
     }
@@ -187,7 +217,23 @@ mod tests {
             Some(StdlibResolutionPolicy::PreferNative)
         );
         assert_eq!(
+            native_module_policy("array"),
+            Some(StdlibResolutionPolicy::PreferNative)
+        );
+        assert_eq!(
             native_module_policy("math"),
+            Some(StdlibResolutionPolicy::PreferNative)
+        );
+        assert_eq!(
+            native_module_policy("select"),
+            Some(StdlibResolutionPolicy::PreferNative)
+        );
+        assert_eq!(
+            native_module_policy("_socket"),
+            Some(StdlibResolutionPolicy::PreferNative)
+        );
+        assert_eq!(
+            native_module_policy("_sre"),
             Some(StdlibResolutionPolicy::PreferNative)
         );
     }
@@ -195,11 +241,15 @@ mod tests {
     #[test]
     fn test_platform_specific_native_modules_are_gated() {
         if cfg!(windows) {
+            assert!(is_native_stdlib_module("_overlapped"));
             assert!(is_native_stdlib_module("_winapi"));
+            assert!(is_native_stdlib_module("msvcrt"));
             assert!(is_native_stdlib_module("winreg"));
             assert!(is_native_stdlib_module("nt"));
         } else {
+            assert!(!is_native_stdlib_module("_overlapped"));
             assert!(!is_native_stdlib_module("_winapi"));
+            assert!(!is_native_stdlib_module("msvcrt"));
             assert!(!is_native_stdlib_module("winreg"));
             assert!(!is_native_stdlib_module("nt"));
         }
