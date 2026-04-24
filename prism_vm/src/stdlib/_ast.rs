@@ -137,7 +137,7 @@ fn build_root_class(name: &str) -> Arc<PyClassObject> {
     class.set_attr(intern("__module__"), Value::string(intern("_ast")));
     class.set_attr(intern("_fields"), empty_tuple_value());
     class.set_attr(intern("_attributes"), empty_tuple_value());
-    class.add_flags(ClassFlags::INITIALIZED);
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
     register_native_type(class)
 }
 
@@ -173,7 +173,7 @@ fn build_subclass(name: &str, base: &Arc<PyClassObject>, fields: &[&str]) -> Arc
     class.set_attr(intern("__module__"), Value::string(intern("_ast")));
     class.set_attr(intern("_fields"), tuple_of_names(fields));
     class.set_attr(intern("_attributes"), empty_tuple_value());
-    class.add_flags(ClassFlags::INITIALIZED);
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
     register_native_type(class)
 }
 

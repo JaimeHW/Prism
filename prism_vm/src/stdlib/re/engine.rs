@@ -279,14 +279,14 @@ impl Engine for FancyEngine {
             .captures(text)
             .ok()
             .flatten()
-            .map(|caps| Match::from_fancy_captures(&caps, text))
+            .map(|caps| Match::from_fancy_captures_with_regex(&caps, text, &self.regex))
     }
 
     fn find_all(&self, text: &str) -> Vec<Match> {
         self.regex
             .captures_iter(text)
             .filter_map(|r| r.ok())
-            .map(|caps| Match::from_fancy_captures(&caps, text))
+            .map(|caps| Match::from_fancy_captures_with_regex(&caps, text, &self.regex))
             .collect()
     }
 
@@ -294,7 +294,11 @@ impl Engine for FancyEngine {
         self.regex.captures(text).ok().flatten().and_then(|caps| {
             if let Some(m) = caps.get(0) {
                 if m.start() == 0 {
-                    return Some(Match::from_fancy_captures(&caps, text));
+                    return Some(Match::from_fancy_captures_with_regex(
+                        &caps,
+                        text,
+                        &self.regex,
+                    ));
                 }
             }
             None
@@ -364,13 +368,14 @@ impl Engine for FancyEngine {
 
     #[inline]
     fn captures_len(&self) -> usize {
-        // fancy-regex doesn't expose this directly, parse from pattern
-        count_capture_groups(&self.pattern)
+        self.regex.captures_len()
     }
 
     fn group_names(&self) -> Vec<Option<String>> {
-        // fancy-regex doesn't expose names directly
-        Vec::new()
+        self.regex
+            .capture_names()
+            .map(|name| name.map(|name| name.to_string()))
+            .collect()
     }
 }
 
@@ -423,6 +428,7 @@ pub(crate) fn prepare_pattern_for_backend(
 pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
     let mut normalized = String::with_capacity(pattern.len());
     let mut in_class = false;
+    let mut class_item_count = 0usize;
     let mut offset = 0;
 
     while offset < pattern.len() {
@@ -451,7 +457,14 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
             }
             '[' if !in_class => {
                 in_class = true;
+                class_item_count = 0;
                 normalized.push(ch);
+                offset += ch.len_utf8();
+            }
+            '[' if in_class => {
+                normalized.push('\\');
+                normalized.push('[');
+                class_item_count += 1;
                 offset += ch.len_utf8();
             }
             '{' if !in_class => {
@@ -465,8 +478,14 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
                 }
             }
             ']' if in_class => {
-                in_class = false;
-                normalized.push(ch);
+                if class_item_count == 0 {
+                    normalized.push('\\');
+                    normalized.push(']');
+                    class_item_count += 1;
+                } else {
+                    in_class = false;
+                    normalized.push(ch);
+                }
                 offset += ch.len_utf8();
             }
             '}' if !in_class => {
@@ -475,6 +494,11 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
                 offset += ch.len_utf8();
             }
             '(' if !in_class => {
+                if pattern[offset..].starts_with("(?>") {
+                    normalized.push_str("(?:");
+                    offset += 3;
+                    continue;
+                }
                 if let Some((translated, consumed)) =
                     translate_inline_flag_group(&pattern[offset..], pattern)?
                 {
@@ -487,6 +511,9 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
             }
             _ => {
                 normalized.push(ch);
+                if in_class {
+                    class_item_count += 1;
+                }
                 offset += ch.len_utf8();
             }
         }
@@ -690,6 +717,11 @@ pub fn requires_fancy_engine(pattern: &str) -> bool {
                                     return true;
                                 }
                             }
+                        } else if after == 'P' {
+                            chars.next();
+                            if matches!(chars.peek(), Some('=')) {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -822,7 +854,27 @@ mod tests {
     #[test]
     fn test_requires_fancy_backreference() {
         assert!(requires_fancy_engine(r"(.)\1"));
+        assert!(requires_fancy_engine(r#"(?P<quote>['"])(?P=quote)"#));
         assert!(!requires_fancy_engine(r"\d+"));
+    }
+
+    #[test]
+    fn test_python_named_backreference_uses_fancy_engine() {
+        let engine = compile_pattern(
+            r#"^(?P<name>\w+)=(?P<quote>["']?)(?P<value>.*)(?P=quote)$"#,
+            RegexFlags::default(),
+        )
+        .expect("named Python backreference should compile");
+        assert_eq!(engine.kind(), EngineKind::Fancy);
+        let matched = engine.match_start("NAME=\"Prism\"").expect("match");
+        assert_eq!(
+            matched.group(matched.group_index("name").expect("name group")),
+            Some("NAME")
+        );
+        assert_eq!(
+            matched.group(matched.group_index("value").expect("value group")),
+            Some("Prism")
+        );
     }
 
     #[test]
@@ -870,6 +922,15 @@ mod tests {
     }
 
     #[test]
+    fn test_fancy_engine_reports_named_group_metadata() {
+        let engine = compile_pattern(r"(?P<word>foo)(?!bar)", RegexFlags::default()).unwrap();
+        assert_eq!(engine.kind(), EngineKind::Fancy);
+        let group_names = engine.group_names();
+        assert_eq!(group_names.len(), 2);
+        assert_eq!(group_names[1].as_deref(), Some("word"));
+    }
+
+    #[test]
     fn test_normalize_python_pattern_converts_end_of_string_anchor() {
         assert_eq!(normalize_python_pattern(r"foo\Z").unwrap(), r"foo\z");
     }
@@ -901,6 +962,11 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_python_pattern_escapes_literal_open_bracket_inside_class() {
+        assert_eq!(normalize_python_pattern(r"([*?[])").unwrap(), r"([*?\[])");
+    }
+
+    #[test]
     fn test_prepare_pattern_for_backend_applies_ascii_and_verbose_flags() {
         let prepared = prepare_pattern_for_backend(
             r"\$(?:(?P<named>(?a:[_a-z][_a-z0-9]*)))",
@@ -909,6 +975,13 @@ mod tests {
         .unwrap();
         assert!(prepared.starts_with("(?ix)"));
         assert!(prepared.contains(r"(?-u:[_a-z][_a-z0-9]*)"));
+    }
+
+    #[test]
+    fn test_prepare_pattern_for_backend_normalizes_atomic_groups() {
+        let prepared = prepare_pattern_for_backend(r"(?s:(?>.*?a).*)\Z", RegexFlags::default())
+            .expect("atomic groups should normalize for backend regex engines");
+        assert_eq!(prepared, r"(?s:(?:.*?a).*)\z");
     }
 
     #[test]
@@ -933,5 +1006,14 @@ mod tests {
             StandardEngine::compile(r"foo\Z", RegexFlags::default()).expect(r"\Z should compile");
         assert!(engine.is_match("foo"));
         assert!(!engine.is_match("foo\n"));
+    }
+
+    #[test]
+    fn test_standard_engine_accepts_glob_magic_character_class_pattern() {
+        let engine = StandardEngine::compile(r"([*?[])", RegexFlags::default())
+            .expect("glob's magic-check pattern should compile");
+        assert!(engine.is_match("["));
+        assert!(engine.is_match("*"));
+        assert!(engine.is_match("?"));
     }
 }

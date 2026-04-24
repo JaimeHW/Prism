@@ -8,6 +8,8 @@
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::stdlib::os::{O_APPEND, O_BINARY, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
+use crate::stdlib::secure_random::urandom_value_from_args;
 use num_bigint::BigInt;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
@@ -26,12 +28,15 @@ use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use std::fs::Metadata;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 static NT_OPEN_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.open"), nt_open));
+static NT_CLOSE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.close"), nt_close));
 static NT_STAT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.stat"), nt_stat));
 static NT_LSTAT_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -67,6 +72,12 @@ static NT_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt._exit"), nt_exit));
 static NT_ACCESS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.access"), nt_access));
+static NT_URANDOM_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.urandom"), nt_urandom));
+static NT_PUTENV_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.putenv"), nt_putenv));
+static NT_UNSETENV_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.unsetenv"), nt_unsetenv));
 static NT_STAT_RESULT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_stat_result_class);
 
 const STAT_RESULT_MATCH_ARGS: [&str; 7] = [
@@ -109,6 +120,7 @@ impl NtModule {
                 Arc::from("__all__"),
                 Arc::from("access"),
                 Arc::from("open"),
+                Arc::from("close"),
                 Arc::from("stat"),
                 Arc::from("lstat"),
                 Arc::from("listdir"),
@@ -128,9 +140,20 @@ impl NtModule {
                 Arc::from("environ"),
                 Arc::from("_have_functions"),
                 Arc::from("_exit"),
+                Arc::from("urandom"),
+                Arc::from("putenv"),
+                Arc::from("unsetenv"),
                 Arc::from("SEEK_SET"),
                 Arc::from("SEEK_CUR"),
                 Arc::from("SEEK_END"),
+                Arc::from("O_RDONLY"),
+                Arc::from("O_WRONLY"),
+                Arc::from("O_RDWR"),
+                Arc::from("O_APPEND"),
+                Arc::from("O_CREAT"),
+                Arc::from("O_TRUNC"),
+                Arc::from("O_EXCL"),
+                Arc::from("O_BINARY"),
                 Arc::from("F_OK"),
                 Arc::from("R_OK"),
                 Arc::from("W_OK"),
@@ -159,6 +182,7 @@ impl Module for NtModule {
             "__all__" => Ok(self.all_value),
             "access" => Ok(builtin_value(&NT_ACCESS_FUNCTION)),
             "open" => Ok(builtin_value(&NT_OPEN_FUNCTION)),
+            "close" => Ok(builtin_value(&NT_CLOSE_FUNCTION)),
             "stat" => Ok(builtin_value(&NT_STAT_FUNCTION)),
             "lstat" => Ok(builtin_value(&NT_LSTAT_FUNCTION)),
             "listdir" => Ok(builtin_value(&NT_LISTDIR_FUNCTION)),
@@ -178,9 +202,20 @@ impl Module for NtModule {
             "environ" => Ok(self.environ_value),
             "_have_functions" => Ok(self.have_functions_value),
             "_exit" => Ok(builtin_value(&NT_EXIT_FUNCTION)),
+            "urandom" => Ok(builtin_value(&NT_URANDOM_FUNCTION)),
+            "putenv" => Ok(builtin_value(&NT_PUTENV_FUNCTION)),
+            "unsetenv" => Ok(builtin_value(&NT_UNSETENV_FUNCTION)),
             "SEEK_SET" => Ok(Value::int(0).expect("SEEK_SET fits in i64")),
             "SEEK_CUR" => Ok(Value::int(1).expect("SEEK_CUR fits in i64")),
             "SEEK_END" => Ok(Value::int(2).expect("SEEK_END fits in i64")),
+            "O_RDONLY" => Ok(Value::int(O_RDONLY as i64).expect("O_RDONLY fits in i64")),
+            "O_WRONLY" => Ok(Value::int(O_WRONLY as i64).expect("O_WRONLY fits in i64")),
+            "O_RDWR" => Ok(Value::int(O_RDWR as i64).expect("O_RDWR fits in i64")),
+            "O_APPEND" => Ok(Value::int(O_APPEND as i64).expect("O_APPEND fits in i64")),
+            "O_CREAT" => Ok(Value::int(O_CREAT as i64).expect("O_CREAT fits in i64")),
+            "O_TRUNC" => Ok(Value::int(O_TRUNC as i64).expect("O_TRUNC fits in i64")),
+            "O_EXCL" => Ok(Value::int(O_EXCL as i64).expect("O_EXCL fits in i64")),
+            "O_BINARY" => Ok(Value::int(O_BINARY as i64).expect("O_BINARY fits in i64")),
             "F_OK" => Ok(Value::int(0).expect("F_OK fits in i64")),
             "R_OK" => Ok(Value::int(4).expect("R_OK fits in i64")),
             "W_OK" => Ok(Value::int(2).expect("W_OK fits in i64")),
@@ -212,6 +247,7 @@ fn export_names_value() -> Value {
     let names = [
         "access",
         "open",
+        "close",
         "stat",
         "lstat",
         "listdir",
@@ -229,9 +265,20 @@ fn export_names_value() -> Value {
         "stat_result",
         "terminal_size",
         "environ",
+        "urandom",
+        "putenv",
+        "unsetenv",
         "SEEK_SET",
         "SEEK_CUR",
         "SEEK_END",
+        "O_RDONLY",
+        "O_WRONLY",
+        "O_RDWR",
+        "O_APPEND",
+        "O_CREAT",
+        "O_TRUNC",
+        "O_EXCL",
+        "O_BINARY",
         "F_OK",
         "R_OK",
         "W_OK",
@@ -643,8 +690,163 @@ fn not_implemented(function_name: &str, _args: &[Value]) -> Result<Value, Builti
     )))
 }
 
+fn integer_arg(value: Value, fn_name: &str, parameter: &str) -> Result<i64, BuiltinError> {
+    value
+        .as_int()
+        .or_else(|| value.as_bool().map(i64::from))
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{fn_name}() {parameter} must be an integer, not {}",
+                value.type_name()
+            ))
+        })
+}
+
+fn configure_open_options(flags: i64, mode: i64) -> Result<OpenOptions, BuiltinError> {
+    let flags = u32::try_from(flags).map_err(|_| {
+        BuiltinError::OverflowError("open() flags out of range for platform integer".to_string())
+    })?;
+    let mode = u32::try_from(mode).map_err(|_| {
+        BuiltinError::OverflowError("open() mode out of range for platform integer".to_string())
+    })?;
+
+    let mut options = OpenOptions::new();
+    match flags & 0x3 {
+        O_RDONLY => {
+            options.read(true);
+        }
+        O_WRONLY => {
+            options.write(true);
+        }
+        O_RDWR => {
+            options.read(true).write(true);
+        }
+        _ => {
+            return Err(BuiltinError::ValueError(
+                "open() invalid access mode in flags".to_string(),
+            ));
+        }
+    }
+
+    if flags & O_APPEND != 0 {
+        options.append(true).write(true);
+    }
+    if flags & O_TRUNC != 0 {
+        options.truncate(true).write(true);
+    }
+    if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+        options.create_new(true);
+    } else if flags & O_CREAT != 0 {
+        options.create(true);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+
+    let _ = mode;
+    Ok(options)
+}
+
+#[cfg(windows)]
+#[link(name = "ucrt")]
+unsafe extern "C" {
+    #[link_name = "_open_osfhandle"]
+    fn crt_open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+    #[link_name = "_close"]
+    fn crt_close(fd: i32) -> i32;
+}
+
+#[cfg(windows)]
+fn file_to_fd(file: std::fs::File, flags: i64) -> Result<i32, std::io::Error> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let handle = file.into_raw_handle();
+    let fd = unsafe { crt_open_osfhandle(handle as isize, flags as i32) };
+    if fd == -1 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(error);
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn file_to_fd(file: std::fs::File, _flags: i64) -> Result<i32, std::io::Error> {
+    use std::os::fd::IntoRawFd;
+    Ok(file.into_raw_fd())
+}
+
+fn close_fd(fd: i32) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        if unsafe { crt_close(fd) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        if unsafe { libc::close(fd) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 fn nt_open(args: &[Value]) -> Result<Value, BuiltinError> {
-    not_implemented("nt.open()", args)
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "open() takes 2 or 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let path = path_from_value(args[0], "open", "path")?;
+    let flags = integer_arg(args[1], "open", "flags")?;
+    let mode = args
+        .get(2)
+        .map(|value| integer_arg(*value, "open", "mode"))
+        .transpose()?
+        .unwrap_or(0o777);
+
+    let file = configure_open_options(flags, mode)?
+        .open(&path)
+        .map_err(|err| {
+            BuiltinError::OSError(format!("open() failed for '{}': {}", path.display(), err))
+        })?;
+    let fd = file_to_fd(file, flags).map_err(|err| {
+        BuiltinError::OSError(format!(
+            "open() failed to create file descriptor for '{}': {}",
+            path.display(),
+            err
+        ))
+    })?;
+
+    Ok(Value::int(i64::from(fd)).expect("file descriptor should fit in Prism int"))
+}
+
+fn nt_close(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "close() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let fd = i32::try_from(integer_arg(args[0], "close", "fd")?)
+        .map_err(|_| BuiltinError::OverflowError("close() file descriptor out of range".into()))?;
+    close_fd(fd).map_err(|err| BuiltinError::OSError(format!("close() failed for {fd}: {err}")))?;
+    Ok(Value::none())
 }
 
 fn nt_access(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -739,6 +941,77 @@ fn nt_getpid(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     Ok(Value::int(std::process::id() as i64).expect("process id fits in i64"))
+}
+
+fn nt_urandom(args: &[Value]) -> Result<Value, BuiltinError> {
+    urandom_value_from_args(args, "urandom")
+}
+
+fn validate_env_key(key: &str, fn_name: &str) -> Result<(), BuiltinError> {
+    if key.is_empty() {
+        return Err(BuiltinError::ValueError(format!(
+            "{fn_name}() environment variable name cannot be empty"
+        )));
+    }
+    if key.contains('=') {
+        return Err(BuiltinError::ValueError(format!(
+            "{fn_name}() environment variable name cannot contain '='"
+        )));
+    }
+    if key.contains('\0') {
+        return Err(BuiltinError::ValueError(format!(
+            "{fn_name}() embedded null character in environment variable name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_env_value(value: &str, fn_name: &str) -> Result<(), BuiltinError> {
+    if value.contains('\0') {
+        return Err(BuiltinError::ValueError(format!(
+            "{fn_name}() embedded null character in environment variable value"
+        )));
+    }
+    Ok(())
+}
+
+fn nt_putenv(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "putenv() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let key = value_to_string(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("putenv() key must be str".to_string()))?;
+    let value = value_to_string(args[1])
+        .ok_or_else(|| BuiltinError::TypeError("putenv() value must be str".to_string()))?;
+    validate_env_key(&key, "putenv")?;
+    validate_env_value(&value, "putenv")?;
+
+    unsafe {
+        std::env::set_var(key, value);
+    }
+    Ok(Value::none())
+}
+
+fn nt_unsetenv(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "unsetenv() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let key = value_to_string(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("unsetenv() key must be str".to_string()))?;
+    validate_env_key(&key, "unsetenv")?;
+
+    unsafe {
+        std::env::remove_var(key);
+    }
+    Ok(Value::none())
 }
 
 fn remove_impl(args: &[Value], fn_name: &str) -> Result<Value, BuiltinError> {
@@ -948,6 +1221,7 @@ mod tests {
         assert!(module.get_attr("__all__").is_ok());
         assert!(module.get_attr("access").is_ok());
         assert!(module.get_attr("open").is_ok());
+        assert!(module.get_attr("close").is_ok());
         assert!(module.get_attr("stat").is_ok());
         assert!(module.get_attr("lstat").is_ok());
         assert!(module.get_attr("listdir").is_ok());
@@ -967,6 +1241,17 @@ mod tests {
         assert!(module.get_attr("environ").is_ok());
         assert!(module.get_attr("_have_functions").is_ok());
         assert!(module.get_attr("_exit").is_ok());
+        assert!(module.get_attr("urandom").is_ok());
+        assert!(module.get_attr("putenv").is_ok());
+        assert!(module.get_attr("unsetenv").is_ok());
+        assert!(module.get_attr("O_RDONLY").is_ok());
+        assert!(module.get_attr("O_WRONLY").is_ok());
+        assert!(module.get_attr("O_RDWR").is_ok());
+        assert!(module.get_attr("O_APPEND").is_ok());
+        assert!(module.get_attr("O_CREAT").is_ok());
+        assert!(module.get_attr("O_TRUNC").is_ok());
+        assert!(module.get_attr("O_EXCL").is_ok());
+        assert!(module.get_attr("O_BINARY").is_ok());
         assert!(module.get_attr("F_OK").is_ok());
         assert!(module.get_attr("R_OK").is_ok());
         assert!(module.get_attr("W_OK").is_ok());
@@ -986,6 +1271,26 @@ mod tests {
             tuple
                 .iter()
                 .any(|value| value == &Value::string(intern("open")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("close")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("O_RDONLY")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("O_CREAT")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("O_BINARY")))
         );
         assert!(
             tuple
@@ -1031,6 +1336,56 @@ mod tests {
             tuple
                 .iter()
                 .any(|value| value == &Value::string(intern("environ")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("urandom")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("putenv")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("unsetenv")))
+        );
+    }
+
+    #[test]
+    fn test_nt_putenv_and_unsetenv_update_process_environment() {
+        let key = format!(
+            "PRISM_NT_PUTENV_TEST_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+
+        unsafe {
+            std::env::remove_var(&key);
+        }
+
+        let result = nt_putenv(&[
+            Value::string(intern(&key)),
+            Value::string(intern("configured")),
+        ])
+        .expect("putenv should accept a valid key and value");
+        assert!(result.is_none());
+        assert_eq!(
+            std::env::var(&key).expect("putenv should set process environment"),
+            "configured"
+        );
+
+        let result = nt_unsetenv(&[Value::string(intern(&key))])
+            .expect("unsetenv should accept a valid key");
+        assert!(result.is_none());
+        assert!(
+            std::env::var_os(&key).is_none(),
+            "unsetenv should remove process environment entry"
         );
     }
 
@@ -1162,6 +1517,18 @@ mod tests {
     }
 
     #[test]
+    fn test_nt_urandom_returns_requested_number_of_bytes() {
+        let result = nt_urandom(&[Value::int(32).expect("length should fit")])
+            .expect("nt.urandom should succeed");
+        let ptr = result
+            .as_object_ptr()
+            .expect("nt.urandom should return a bytes object");
+        let bytes = unsafe { &*(ptr as *const BytesObject) };
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes.header.type_id, TypeId::BYTES);
+    }
+
+    #[test]
     fn test_nt_terminal_size_constructor_builds_named_record() {
         let value = nt_terminal_size(&[leak_object_value(TupleObject::from_vec(vec![
             Value::int(120).expect("columns should fit"),
@@ -1206,6 +1573,64 @@ mod tests {
     fn test_nt_getpid_returns_process_identifier() {
         let result = nt_getpid(&[]).expect("nt.getpid should succeed");
         assert_eq!(result.as_int(), Some(std::process::id() as i64));
+    }
+
+    #[test]
+    fn test_nt_open_returns_closeable_file_descriptor_for_existing_file() {
+        let path = unique_temp_path("open_existing");
+        fs::write(&path, b"ready").expect("fixture file should be written");
+
+        let fd = nt_open(&[
+            Value::string(intern(path.to_str().expect("temp path should be utf-8"))),
+            Value::int((O_RDONLY | O_BINARY) as i64).expect("flags should fit"),
+        ])
+        .expect("nt.open should open existing files")
+        .as_int()
+        .expect("nt.open should return an integer fd");
+        assert!(fd >= 0);
+
+        nt_close(&[Value::int(fd).expect("fd should fit")]).expect("nt.close should close fd");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_nt_open_create_truncate_and_exclusive_flags() {
+        let path = unique_temp_path("open_create");
+        let path_value = Value::string(intern(path.to_str().expect("temp path should be utf-8")));
+        let create_flags = (O_WRONLY | O_CREAT | O_TRUNC | O_BINARY) as i64;
+
+        let fd = nt_open(&[
+            path_value,
+            Value::int(create_flags).expect("flags should fit"),
+            Value::int(0o600).expect("mode should fit"),
+        ])
+        .expect("nt.open should create files")
+        .as_int()
+        .expect("nt.open should return an integer fd");
+        nt_close(&[Value::int(fd).expect("fd should fit")]).expect("nt.close should close fd");
+        assert!(path.exists());
+
+        let err = nt_open(&[
+            path_value,
+            Value::int((O_WRONLY | O_CREAT | O_EXCL | O_BINARY) as i64).expect("flags should fit"),
+        ])
+        .expect_err("exclusive create should fail for an existing file");
+        assert!(matches!(err, BuiltinError::OSError(_)));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_nt_open_validates_arguments() {
+        let err = nt_open(&[Value::none()]).expect_err("nt.open should validate arity");
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+
+        let err = nt_open(&[
+            Value::string(intern("ignored")),
+            Value::string(intern("bad flags")),
+        ])
+        .expect_err("nt.open should validate flags");
+        assert!(matches!(err, BuiltinError::TypeError(_)));
     }
 
     #[test]

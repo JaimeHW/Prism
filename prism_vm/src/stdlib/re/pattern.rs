@@ -96,14 +96,7 @@ impl CompiledPattern {
 
     /// Try to match pattern at start of string from position.
     pub fn match_at(&self, text: &str, pos: usize) -> Option<Match> {
-        if pos > text.len() {
-            return None;
-        }
-        let substr = &text[pos..];
-        self.engine.match_start(substr).map(|mut m| {
-            // Adjust spans for the offset
-            m
-        })
+        self.match_range(text, pos, None)
     }
 
     /// Search for pattern anywhere in string.
@@ -116,23 +109,53 @@ impl CompiledPattern {
 
     /// Search from a specific position.
     pub fn search_at(&self, text: &str, pos: usize) -> Option<Match> {
-        if pos > text.len() {
-            return None;
-        }
-        let substr = &text[pos..];
-        self.engine.find(substr)
+        self.search_range(text, pos, None)
     }
 
     /// Match entire string against pattern.
     pub fn fullmatch(&self, text: &str) -> Option<Match> {
-        let m = self.engine.match_start(text)?;
-        if m.end() == text.len() { Some(m) } else { None }
+        self.fullmatch_range(text, 0, None)
+    }
+
+    /// Match at the beginning of the bounded string range.
+    pub fn match_range(&self, text: &str, pos: usize, endpos: Option<usize>) -> Option<Match> {
+        let (substr, offset) = bounded_text_range(text, pos, endpos)?;
+        self.engine
+            .match_start(substr)
+            .map(|m| m.with_offset(text, offset))
+    }
+
+    /// Search within a bounded string range.
+    pub fn search_range(&self, text: &str, pos: usize, endpos: Option<usize>) -> Option<Match> {
+        let (substr, offset) = bounded_text_range(text, pos, endpos)?;
+        self.engine
+            .find(substr)
+            .map(|m| m.with_offset(text, offset))
+    }
+
+    /// Fullmatch within a bounded string range.
+    pub fn fullmatch_range(&self, text: &str, pos: usize, endpos: Option<usize>) -> Option<Match> {
+        let (substr, offset) = bounded_text_range(text, pos, endpos)?;
+        let m = self.engine.match_start(substr)?;
+        (m.end() == substr.len()).then(|| m.with_offset(text, offset))
     }
 
     /// Find all non-overlapping matches.
     #[inline]
     pub fn findall(&self, text: &str) -> Vec<Match> {
         self.engine.find_all(text)
+    }
+
+    /// Find all matches within a bounded string range.
+    pub fn findall_range(&self, text: &str, pos: usize, endpos: Option<usize>) -> Vec<Match> {
+        let Some((substr, offset)) = bounded_text_range(text, pos, endpos) else {
+            return Vec::new();
+        };
+        self.engine
+            .find_all(substr)
+            .into_iter()
+            .map(|m| m.with_offset(text, offset))
+            .collect()
     }
 
     /// Find all matches as strings (matching Python behavior).
@@ -167,6 +190,16 @@ impl CompiledPattern {
     /// Return iterator over all matches.
     pub fn finditer<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Match> + 'a {
         self.engine.find_all(text).into_iter()
+    }
+
+    /// Return an iterator over matches within a bounded string range.
+    pub fn finditer_range<'a>(
+        &'a self,
+        text: &'a str,
+        pos: usize,
+        endpos: Option<usize>,
+    ) -> impl Iterator<Item = Match> + 'a {
+        self.findall_range(text, pos, endpos).into_iter()
     }
 
     // =========================================================================
@@ -246,6 +279,16 @@ impl std::fmt::Display for CompiledPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "re.compile({:?}, {})", self.pattern, self.flags)
     }
+}
+
+fn bounded_text_range(text: &str, pos: usize, endpos: Option<usize>) -> Option<(&str, usize)> {
+    let text_len = text.len();
+    let pos = pos.min(text_len);
+    let end = endpos.unwrap_or(text_len).min(text_len);
+    if pos > end || !text.is_char_boundary(pos) || !text.is_char_boundary(end) {
+        return None;
+    }
+    Some((&text[pos..end], pos))
 }
 
 // =============================================================================

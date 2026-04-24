@@ -31,8 +31,13 @@ pub use file::*;
 pub use process::*;
 
 use super::{Module, ModuleError};
+use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::stdlib::secure_random::urandom_value_from_args;
 use prism_core::Value;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+static OS_URANDOM_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.urandom"), os_urandom));
 
 /// The os module providing operating system interface.
 pub struct OsModule {
@@ -91,9 +96,10 @@ impl Module for OsModule {
             | "unlink" | "rename" | "replace" | "stat" | "lstat" | "listdir" | "scandir"
             | "walk" | "fwalk" | "getenv" | "putenv" | "unsetenv" | "getpid" | "getppid"
             | "kill" | "system" | "popen" | "access" | "chmod" | "chown" | "link" | "symlink"
-            | "readlink" | "urandom" => {
+            | "readlink" => {
                 Ok(Value::none()) // Placeholder for callable
             }
+            "urandom" => Ok(builtin_value(&OS_URANDOM_FUNCTION)),
 
             // Submodule
             "path" => Ok(Value::none()), // TODO: Return os.path module
@@ -179,6 +185,15 @@ impl Module for OsModule {
     }
 }
 
+#[inline]
+fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
+    Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+fn os_urandom(args: &[Value]) -> Result<Value, BuiltinError> {
+    urandom_value_from_args(args, "urandom")
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -186,6 +201,7 @@ impl Module for OsModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_runtime::types::bytes::BytesObject;
 
     // =========================================================================
     // Module Creation Tests
@@ -293,6 +309,23 @@ mod tests {
         let os = OsModule::new();
         let environ = os.get_attr("environ").unwrap();
         assert!(environ.is_none());
+    }
+
+    #[test]
+    fn test_urandom_returns_callable_builtin() {
+        let os = OsModule::new();
+        assert!(os.get_attr("urandom").unwrap().as_object_ptr().is_some());
+    }
+
+    #[test]
+    fn test_os_urandom_returns_requested_number_of_bytes() {
+        let result = os_urandom(&[Value::int(24).expect("length should fit")])
+            .expect("os.urandom should succeed");
+        let ptr = result
+            .as_object_ptr()
+            .expect("os.urandom should return a bytes object");
+        let bytes = unsafe { &*(ptr as *const BytesObject) };
+        assert_eq!(bytes.len(), 24);
     }
 
     // =========================================================================

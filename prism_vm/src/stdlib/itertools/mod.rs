@@ -38,6 +38,7 @@ pub use terminating::{
 };
 
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::ops::iteration::ensure_iterator_value;
 use crate::stdlib::{Module, ModuleResult};
 use prism_core::Value;
 use prism_core::intern::intern;
@@ -79,7 +80,8 @@ itertools_stub!(
     "itertools.accumulate",
     "accumulate"
 );
-itertools_stub!(CHAIN_FUNCTION, builtin_chain, "itertools.chain", "chain");
+static CHAIN_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("itertools.chain"), builtin_chain));
 itertools_stub!(
     COMPRESS_FUNCTION,
     builtin_compress,
@@ -291,6 +293,17 @@ fn builtin_count(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(iterator_value(iter))
 }
 
+fn builtin_chain(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    let mut iterators = Vec::with_capacity(args.len());
+    for iterable in args {
+        let iterator_value = ensure_iterator_value(vm, *iterable)
+            .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+        iterators.push(IteratorObject::from_existing_iterator(iterator_value));
+    }
+
+    Ok(iterator_value(IteratorObject::chain(iterators)))
+}
+
 fn builtin_islice(args: &[Value]) -> Result<Value, BuiltinError> {
     if !(2..=4).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
@@ -357,7 +370,9 @@ fn builtin_permutations(args: &[Value]) -> Result<Value, BuiltinError> {
 #[cfg(test)]
 mod mod_tests {
     use super::*;
+    use crate::VirtualMachine;
     use crate::builtins::get_iterator_mut;
+    use crate::ops::iteration::{IterStep, next_step};
     use prism_core::intern::intern;
 
     #[test]
@@ -397,6 +412,43 @@ mod mod_tests {
     fn test_module_unknown_attr() {
         let m = ItertoolsModule::new();
         assert!(m.get_attr("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_builtin_chain_lazily_yields_each_iterable_in_order() {
+        let left = TupleObject::from_slice(&[Value::int_unchecked(1), Value::int_unchecked(2)]);
+        let right = TupleObject::from_slice(&[Value::int_unchecked(3)]);
+        let left_ptr = Box::leak(Box::new(left)) as *mut TupleObject as *const ();
+        let right_ptr = Box::leak(Box::new(right)) as *mut TupleObject as *const ();
+        let mut vm = VirtualMachine::new();
+
+        let iter_value = builtin_chain(
+            &mut vm,
+            &[Value::object_ptr(left_ptr), Value::object_ptr(right_ptr)],
+        )
+        .expect("chain() should accept iterable arguments");
+
+        let mut values = Vec::new();
+        loop {
+            match next_step(&mut vm, iter_value).expect("chain iterator should advance") {
+                IterStep::Yielded(value) => {
+                    values.push(value.as_int().expect("chain should yield ints"))
+                }
+                IterStep::Exhausted => break,
+            }
+        }
+
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_builtin_chain_without_args_returns_empty_iterator() {
+        let mut vm = VirtualMachine::new();
+        let iter_value = builtin_chain(&mut vm, &[]).expect("chain() should allow no args");
+        let iter = get_iterator_mut(&iter_value).expect("chain() should return an iterator");
+
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
     }
 
     #[test]

@@ -754,7 +754,9 @@ impl PartialEq for Deque {
         if self.len != other.len {
             return false;
         }
-        self.iter().zip(other.iter()).all(|(a, b)| a == b)
+        self.iter()
+            .zip(other.iter())
+            .all(|(a, b)| a.raw_bits() == b.raw_bits() || a == b)
     }
 }
 
@@ -1458,6 +1460,17 @@ mod deque_tests {
         d2.append(Value::int_unchecked(2));
 
         assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn test_equality_with_identical_nan_values() {
+        let nan = Value::float(f64::NAN);
+        let mut d1 = Deque::new();
+        let mut d2 = Deque::new();
+        d1.append(nan);
+        d2.append(nan);
+
+        assert_eq!(d1, d2);
     }
 
     // =========================================================================

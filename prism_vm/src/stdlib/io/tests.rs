@@ -1037,7 +1037,48 @@ mod file_mode_tests {
 
 mod io_module_tests {
     use super::*;
+    use crate::VirtualMachine;
     use crate::builtins::builtin_issubclass;
+    use crate::error::RuntimeErrorKind;
+    use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
+    use crate::ops::objects::get_attribute_value;
+    use crate::stdlib::nt::NtModule;
+    use prism_core::Value;
+    use prism_core::intern::intern;
+    use prism_runtime::object::ObjectHeader;
+    use prism_runtime::object::type_obj::TypeId;
+    use prism_runtime::types::bytes::BytesObject;
+    use prism_runtime::types::list::ListObject;
+    use prism_runtime::types::string::{StringObject, value_as_string_ref};
+    use prism_runtime::types::tuple::TupleObject;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "prism_io_{prefix}_{}_{}",
+            std::process::id(),
+            nonce
+        ))
+    }
+
+    fn temp_path_value(path: &std::path::Path) -> Value {
+        Value::string(intern(
+            path.to_str()
+                .expect("temp file path should be valid unicode"),
+        ))
+    }
+
+    fn assert_builtin_function(value: Value, context: &str) {
+        let ptr = value.as_object_ptr().expect(context);
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
+    }
 
     #[test]
     fn test_module_name() {
@@ -1067,14 +1108,420 @@ mod io_module_tests {
     }
 
     #[test]
-    fn test_stringio_attribute_is_callable() {
+    fn test_stringio_attribute_is_class() {
         let module = IoModule::new();
         let value = module
             .get_attr("StringIO")
             .expect("io.StringIO should be exposed");
         let ptr = value
             .as_object_ptr()
-            .expect("io.StringIO should be a builtin function");
+            .expect("io.StringIO should be a class object");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(
+            header.type_id,
+            prism_runtime::object::type_obj::TypeId::TYPE
+        );
+    }
+
+    #[test]
+    fn test_bytesio_attribute_is_class() {
+        let module = IoModule::new();
+        let value = module
+            .get_attr("BytesIO")
+            .expect("io.BytesIO should be exposed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("io.BytesIO should be a class object");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(
+            header.type_id,
+            prism_runtime::object::type_obj::TypeId::TYPE
+        );
+    }
+
+    #[test]
+    fn test_textiowrapper_attribute_is_class() {
+        let module = IoModule::new();
+        let value = module
+            .get_attr("TextIOWrapper")
+            .expect("io.TextIOWrapper should be exposed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("io.TextIOWrapper should be a class object");
+        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+        assert_eq!(
+            header.type_id,
+            prism_runtime::object::type_obj::TypeId::TYPE
+        );
+    }
+
+    #[test]
+    fn test_open_and_file_aliases_are_callable_on_public_and_private_modules() {
+        for module in [IoModule::new(), IoModule::with_name("_io")] {
+            for name in [
+                "open",
+                "FileIO",
+                "BufferedReader",
+                "BufferedWriter",
+                "BufferedRandom",
+            ] {
+                let value = module
+                    .get_attr(name)
+                    .unwrap_or_else(|_| panic!("{}.{} should be exposed", module.name(), name));
+                assert_builtin_function(value, "I/O open aliases should be builtin callables");
+            }
+        }
+    }
+
+    #[test]
+    fn test_open_reads_text_path_with_default_encoding() {
+        let path = unique_temp_path("open_text");
+        fs::write(&path, b"alpha\nbeta\n").expect("fixture file should be written");
+
+        let module = IoModule::new();
+        let open = module.get_attr("open").expect("io.open should be exposed");
+        let mut vm = VirtualMachine::new();
+        let stream = invoke_callable_value(&mut vm, open, &[temp_path_value(&path)])
+            .expect("io.open(path) should create a text stream");
+        let read = get_attribute_value(&mut vm, stream, &intern("read"))
+            .expect("text stream should expose read");
+        let rendered = invoke_callable_value(&mut vm, read, &[]).expect("read() should succeed");
+        assert_eq!(
+            value_as_string_ref(rendered)
+                .expect("text mode read() should return str")
+                .as_str(),
+            "alpha\nbeta\n"
+        );
+
+        let close = get_attribute_value(&mut vm, stream, &intern("close"))
+            .expect("text stream should expose close");
+        invoke_callable_value(&mut vm, close, &[]).expect("close() should succeed");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_open_reads_binary_path_as_bytes() {
+        let path = unique_temp_path("open_binary");
+        fs::write(&path, b"alpha\0beta").expect("fixture file should be written");
+
+        let module = IoModule::new();
+        let open = module.get_attr("open").expect("io.open should be exposed");
+        let mut vm = VirtualMachine::new();
+        let stream = invoke_callable_value(
+            &mut vm,
+            open,
+            &[temp_path_value(&path), Value::string(intern("rb"))],
+        )
+        .expect("io.open(path, 'rb') should create a binary stream");
+        let read = get_attribute_value(&mut vm, stream, &intern("read"))
+            .expect("binary stream should expose read");
+        let rendered = invoke_callable_value(&mut vm, read, &[]).expect("read() should succeed");
+        let ptr = rendered
+            .as_object_ptr()
+            .expect("binary mode read() should return bytes");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BYTES);
+        assert_eq!(
+            unsafe { &*(ptr as *const BytesObject) }.as_bytes(),
+            b"alpha\0beta"
+        );
+
+        let close = get_attribute_value(&mut vm, stream, &intern("close"))
+            .expect("binary stream should expose close");
+        invoke_callable_value(&mut vm, close, &[]).expect("close() should succeed");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_open_reads_nt_file_descriptor_as_bytes_and_closes_it() {
+        let path = unique_temp_path("open_fd");
+        fs::write(&path, b"descriptor payload").expect("fixture file should be written");
+
+        let io_module = IoModule::new();
+        let open = io_module
+            .get_attr("open")
+            .expect("io.open should be exposed");
+        let nt_module = NtModule::new();
+        let nt_open = nt_module
+            .get_attr("open")
+            .expect("nt.open should be exposed");
+        let flags = nt_module
+            .get_attr("O_RDONLY")
+            .expect("nt.O_RDONLY should exist")
+            .as_int()
+            .expect("nt.O_RDONLY should be an integer")
+            | nt_module
+                .get_attr("O_BINARY")
+                .expect("nt.O_BINARY should exist")
+                .as_int()
+                .expect("nt.O_BINARY should be an integer");
+
+        let mut vm = VirtualMachine::new();
+        let fd = invoke_callable_value(
+            &mut vm,
+            nt_open,
+            &[
+                temp_path_value(&path),
+                Value::int(flags).expect("flags should fit"),
+            ],
+        )
+        .expect("nt.open should create a file descriptor");
+        let stream = invoke_callable_value(&mut vm, open, &[fd, Value::string(intern("rb"))])
+            .expect("io.open(fd, 'rb') should create a binary stream");
+
+        let fileno = get_attribute_value(&mut vm, stream, &intern("fileno"))
+            .expect("descriptor stream should expose fileno");
+        let rendered_fd =
+            invoke_callable_value(&mut vm, fileno, &[]).expect("fileno() should succeed");
+        assert_eq!(rendered_fd.as_int(), fd.as_int());
+
+        let read = get_attribute_value(&mut vm, stream, &intern("read"))
+            .expect("descriptor stream should expose read");
+        let rendered = invoke_callable_value(&mut vm, read, &[]).expect("read() should succeed");
+        let ptr = rendered
+            .as_object_ptr()
+            .expect("descriptor read() should return bytes");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BYTES);
+        assert_eq!(
+            unsafe { &*(ptr as *const BytesObject) }.as_bytes(),
+            b"descriptor payload"
+        );
+
+        let close = get_attribute_value(&mut vm, stream, &intern("close"))
+            .expect("descriptor stream should expose close");
+        invoke_callable_value(&mut vm, close, &[]).expect("close() should succeed");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_open_rejects_invalid_path_options_before_host_open() {
+        let path = unique_temp_path("open_invalid");
+        let module = IoModule::new();
+        let open = module.get_attr("open").expect("io.open should be exposed");
+        let mut vm = VirtualMachine::new();
+
+        let err = invoke_callable_value_with_keywords(
+            &mut vm,
+            open,
+            &[temp_path_value(&path)],
+            &[("closefd", Value::bool(false))],
+        )
+        .expect_err("closefd=False with a path should be rejected");
+        assert!(matches!(err.kind, RuntimeErrorKind::ValueError { .. }));
+
+        let err = invoke_callable_value_with_keywords(
+            &mut vm,
+            open,
+            &[temp_path_value(&path), Value::string(intern("rb"))],
+            &[("encoding", Value::string(intern("utf-8")))],
+        )
+        .expect_err("binary mode with encoding should be rejected");
+        assert!(matches!(err.kind, RuntimeErrorKind::ValueError { .. }));
+
+        let err = invoke_callable_value_with_keywords(
+            &mut vm,
+            open,
+            &[temp_path_value(&path), Value::string(intern("r"))],
+            &[("mode", Value::string(intern("rb")))],
+        )
+        .expect_err("duplicate mode should be rejected");
+        assert!(matches!(err.kind, RuntimeErrorKind::TypeError { .. }));
+    }
+
+    #[test]
+    fn test_stringio_class_call_uses_heap_type_instantiation_and_keywords() {
+        let module = IoModule::new();
+        let string_io = module
+            .get_attr("StringIO")
+            .expect("io.StringIO should be exposed");
+        let mut vm = VirtualMachine::new();
+        let buffer = invoke_callable_value_with_keywords(
+            &mut vm,
+            string_io,
+            &[],
+            &[
+                ("initial_value", Value::string(intern("seed"))),
+                ("newline", Value::string(intern(""))),
+            ],
+        )
+        .expect("StringIO should accept keyword initialization");
+
+        let getvalue = get_attribute_value(&mut vm, buffer, &intern("getvalue"))
+            .expect("StringIO instance should expose getvalue");
+        let rendered =
+            invoke_callable_value(&mut vm, getvalue, &[]).expect("getvalue() should succeed");
+        assert_eq!(
+            value_as_string_ref(rendered)
+                .expect("StringIO.getvalue() should return str")
+                .as_str(),
+            "seed"
+        );
+    }
+
+    #[test]
+    fn test_bytesio_class_call_uses_heap_type_instantiation_and_keywords() {
+        let module = IoModule::new();
+        let bytes_io = module
+            .get_attr("BytesIO")
+            .expect("io.BytesIO should be exposed");
+        let mut vm = VirtualMachine::new();
+        let payload = Value::object_ptr(
+            Box::into_raw(Box::new(BytesObject::from_slice(b"seed"))) as *const ()
+        );
+        let buffer = invoke_callable_value_with_keywords(
+            &mut vm,
+            bytes_io,
+            &[],
+            &[("initial_bytes", payload)],
+        )
+        .expect("BytesIO should accept keyword initialization");
+
+        let getvalue = get_attribute_value(&mut vm, buffer, &intern("getvalue"))
+            .expect("BytesIO instance should expose getvalue");
+        let rendered =
+            invoke_callable_value(&mut vm, getvalue, &[]).expect("getvalue() should succeed");
+        let ptr = rendered
+            .as_object_ptr()
+            .expect("BytesIO.getvalue() should allocate bytes");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::BYTES);
+        assert_eq!(unsafe { &*(ptr as *const BytesObject) }.as_bytes(), b"seed");
+    }
+
+    #[test]
+    fn test_textiowrapper_class_wraps_binary_file_stream_with_keywords() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let temp_path = std::env::temp_dir().join(format!(
+            "prism_text_wrapper_{}_{}.txt",
+            std::process::id(),
+            nonce
+        ));
+        fs::write(&temp_path, b"alpha\nbeta\n").expect("temp file should be written");
+
+        let module = IoModule::new();
+        let text_wrapper = module
+            .get_attr("TextIOWrapper")
+            .expect("io.TextIOWrapper should be exposed");
+        let raw_stream = open_file_stream_object(
+            temp_path
+                .to_str()
+                .expect("temp file path should be valid unicode"),
+            "rb",
+            None,
+        )
+        .expect("binary file stream should open");
+        let mut vm = VirtualMachine::new();
+        let wrapper = invoke_callable_value_with_keywords(
+            &mut vm,
+            text_wrapper,
+            &[raw_stream],
+            &[
+                ("encoding", Value::string(intern("utf-8"))),
+                ("line_buffering", Value::bool(true)),
+            ],
+        )
+        .expect("TextIOWrapper should accept keyword initialization");
+
+        let encoding = get_attribute_value(&mut vm, wrapper, &intern("encoding"))
+            .expect("TextIOWrapper instance should expose encoding");
+        assert_eq!(
+            value_as_string_ref(encoding)
+                .expect("encoding should be a string")
+                .as_str(),
+            "utf-8"
+        );
+
+        let read = get_attribute_value(&mut vm, wrapper, &intern("read"))
+            .expect("TextIOWrapper instance should expose read");
+        let rendered = invoke_callable_value(&mut vm, read, &[]).expect("read() should succeed");
+        assert_eq!(
+            value_as_string_ref(rendered)
+                .expect("TextIOWrapper.read() should return text")
+                .as_str(),
+            "alpha\nbeta\n"
+        );
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_textiowrapper_readlines_returns_text_list_and_honors_hint() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let temp_path = std::env::temp_dir().join(format!(
+            "prism_text_wrapper_lines_{}_{}.txt",
+            std::process::id(),
+            nonce
+        ));
+        fs::write(&temp_path, b"alpha\nbeta\ngamma\n").expect("temp file should be written");
+
+        let module = IoModule::new();
+        let text_wrapper = module
+            .get_attr("TextIOWrapper")
+            .expect("io.TextIOWrapper should be exposed");
+        let raw_stream = open_file_stream_object(
+            temp_path
+                .to_str()
+                .expect("temp file path should be valid unicode"),
+            "rb",
+            None,
+        )
+        .expect("binary file stream should open");
+        let mut vm = VirtualMachine::new();
+        let wrapper = invoke_callable_value_with_keywords(
+            &mut vm,
+            text_wrapper,
+            &[raw_stream],
+            &[("encoding", Value::string(intern("utf-8")))],
+        )
+        .expect("TextIOWrapper should accept keyword initialization");
+
+        let readlines = get_attribute_value(&mut vm, wrapper, &intern("readlines"))
+            .expect("TextIOWrapper instance should expose readlines");
+        let rendered = invoke_callable_value(&mut vm, readlines, &[Value::int(6).unwrap()])
+            .expect("readlines() should succeed");
+        let ptr = rendered
+            .as_object_ptr()
+            .expect("readlines() should allocate a list");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::LIST);
+        let list = unsafe { &*(ptr as *const ListObject) };
+        assert_eq!(list.len(), 1, "size hint should stop after the first line");
+        assert_eq!(
+            value_as_string_ref(list.get(0).expect("first line should exist"))
+                .expect("first readlines() entry should be a string")
+                .as_str(),
+            "alpha\n"
+        );
+
+        let read = get_attribute_value(&mut vm, wrapper, &intern("read"))
+            .expect("TextIOWrapper instance should expose read");
+        let rendered = invoke_callable_value(&mut vm, read, &[]).expect("read() should succeed");
+        assert_eq!(
+            value_as_string_ref(rendered)
+                .expect("read() after readlines() should return text")
+                .as_str(),
+            "beta\ngamma\n"
+        );
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_incremental_newline_decoder_attribute_is_callable() {
+        let module = IoModule::new();
+        let value = module
+            .get_attr("IncrementalNewlineDecoder")
+            .expect("io.IncrementalNewlineDecoder should be exposed");
+        let ptr = value
+            .as_object_ptr()
+            .expect("io.IncrementalNewlineDecoder should be callable");
         let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
         assert_eq!(
             header.type_id,
@@ -1083,19 +1530,45 @@ mod io_module_tests {
     }
 
     #[test]
-    fn test_bytesio_attribute_is_callable() {
+    fn test_incremental_newline_decoder_normalizes_universal_newlines() {
         let module = IoModule::new();
-        let value = module
-            .get_attr("BytesIO")
-            .expect("io.BytesIO should be exposed");
-        let ptr = value
-            .as_object_ptr()
-            .expect("io.BytesIO should be a builtin function");
-        let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
-        assert_eq!(
-            header.type_id,
-            prism_runtime::object::type_obj::TypeId::BUILTIN_FUNCTION
+        let constructor = module
+            .get_attr("IncrementalNewlineDecoder")
+            .expect("IncrementalNewlineDecoder should be exposed");
+        let mut vm = VirtualMachine::new();
+        let decoder =
+            invoke_callable_value(&mut vm, constructor, &[Value::none(), Value::bool(true)])
+                .expect("constructor should succeed");
+        let decode = get_attribute_value(&mut vm, decoder, &intern("decode"))
+            .expect("decode method should exist");
+        let input = Value::object_ptr(
+            Box::into_raw(Box::new(StringObject::new("a\r\nb\rc\n"))) as *const ()
         );
+        let output = invoke_callable_value(&mut vm, decode, &[input, Value::bool(true)])
+            .expect("decode should succeed");
+        let output = value_as_string_ref(output).expect("decode should return str");
+        assert_eq!(output.as_str(), "a\nb\nc\n");
+
+        let newlines = get_attribute_value(&mut vm, decoder, &intern("newlines"))
+            .expect("newlines should exist");
+        let ptr = newlines
+            .as_object_ptr()
+            .expect("newlines should be a tuple");
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.type_id, TypeId::TUPLE);
+
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        let rendered: Vec<String> = tuple
+            .as_slice()
+            .iter()
+            .map(|item| {
+                value_as_string_ref(*item)
+                    .expect("newline entry should be str")
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(rendered, vec!["\r", "\n", "\r\n"]);
     }
 
     #[test]
@@ -1141,6 +1614,11 @@ mod io_module_tests {
         let text = module
             .get_attr("TextIOBase")
             .expect("TextIOBase should exist");
+        let string_io = module.get_attr("StringIO").expect("StringIO should exist");
+        let bytes_io = module.get_attr("BytesIO").expect("BytesIO should exist");
+        let text_wrapper = module
+            .get_attr("TextIOWrapper")
+            .expect("TextIOWrapper should exist");
 
         assert_eq!(
             builtin_issubclass(&[buffered, io_base]).unwrap().as_bool(),
@@ -1152,6 +1630,18 @@ mod io_module_tests {
         );
         assert_eq!(
             builtin_issubclass(&[text, io_base]).unwrap().as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            builtin_issubclass(&[string_io, text]).unwrap().as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            builtin_issubclass(&[text_wrapper, text]).unwrap().as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            builtin_issubclass(&[bytes_io, buffered]).unwrap().as_bool(),
             Some(true)
         );
     }

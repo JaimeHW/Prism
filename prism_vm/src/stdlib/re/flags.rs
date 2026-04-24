@@ -16,26 +16,32 @@ impl RegexFlags {
     /// No flags set.
     pub const NONE: u32 = 0;
 
+    /// Template mode (deprecated, preserved for CPython compatibility).
+    pub const TEMPLATE: u32 = 1 << 0;
+
     /// Case-insensitive matching (re.I, re.IGNORECASE).
-    pub const IGNORECASE: u32 = 1 << 0;
+    pub const IGNORECASE: u32 = 1 << 1;
+
+    /// Locale-dependent matching (re.L, re.LOCALE).
+    pub const LOCALE: u32 = 1 << 2;
 
     /// Multi-line mode: ^ and $ match at line boundaries (re.M, re.MULTILINE).
-    pub const MULTILINE: u32 = 1 << 1;
+    pub const MULTILINE: u32 = 1 << 3;
 
     /// Dot matches newline (re.S, re.DOTALL).
-    pub const DOTALL: u32 = 1 << 2;
-
-    /// Verbose mode: whitespace and comments ignored (re.X, re.VERBOSE).
-    pub const VERBOSE: u32 = 1 << 3;
-
-    /// ASCII-only matching for \w, \b, \s, \d (re.A, re.ASCII).
-    pub const ASCII: u32 = 1 << 4;
+    pub const DOTALL: u32 = 1 << 4;
 
     /// Unicode matching (default in Python 3) (re.U, re.UNICODE).
     pub const UNICODE: u32 = 1 << 5;
 
-    /// Locale-dependent matching (re.L, re.LOCALE).
-    pub const LOCALE: u32 = 1 << 6;
+    /// Verbose mode: whitespace and comments ignored (re.X, re.VERBOSE).
+    pub const VERBOSE: u32 = 1 << 6;
+
+    /// Debug compilation mode (accepted for compatibility).
+    pub const DEBUG: u32 = 1 << 7;
+
+    /// ASCII-only matching for \w, \b, \s, \d (re.A, re.ASCII).
+    pub const ASCII: u32 = 1 << 8;
 
     /// Create new flags from raw value.
     #[inline]
@@ -85,6 +91,18 @@ impl RegexFlags {
         self.contains(Self::ASCII)
     }
 
+    /// Check if debug mode is enabled.
+    #[inline]
+    pub const fn is_debug(&self) -> bool {
+        self.contains(Self::DEBUG)
+    }
+
+    /// Check if template mode is enabled.
+    #[inline]
+    pub const fn is_template(&self) -> bool {
+        self.contains(Self::TEMPLATE)
+    }
+
     /// Combine flags.
     #[inline]
     pub const fn union(self, other: Self) -> Self {
@@ -124,6 +142,18 @@ impl fmt::Display for RegexFlags {
         if self.is_ascii() {
             parts.push("ASCII");
         }
+        if self.contains(Self::UNICODE) {
+            parts.push("UNICODE");
+        }
+        if self.contains(Self::LOCALE) {
+            parts.push("LOCALE");
+        }
+        if self.is_debug() {
+            parts.push("DEBUG");
+        }
+        if self.is_template() {
+            parts.push("TEMPLATE");
+        }
         if parts.is_empty() {
             write!(f, "0")
         } else {
@@ -142,11 +172,15 @@ mod tests {
 
     #[test]
     fn test_flag_constants() {
-        assert_eq!(RegexFlags::IGNORECASE, 1);
-        assert_eq!(RegexFlags::MULTILINE, 2);
-        assert_eq!(RegexFlags::DOTALL, 4);
-        assert_eq!(RegexFlags::VERBOSE, 8);
-        assert_eq!(RegexFlags::ASCII, 16);
+        assert_eq!(RegexFlags::TEMPLATE, 1);
+        assert_eq!(RegexFlags::IGNORECASE, 2);
+        assert_eq!(RegexFlags::LOCALE, 4);
+        assert_eq!(RegexFlags::MULTILINE, 8);
+        assert_eq!(RegexFlags::DOTALL, 16);
+        assert_eq!(RegexFlags::UNICODE, 32);
+        assert_eq!(RegexFlags::VERBOSE, 64);
+        assert_eq!(RegexFlags::DEBUG, 128);
+        assert_eq!(RegexFlags::ASCII, 256);
     }
 
     #[test]

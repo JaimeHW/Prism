@@ -146,7 +146,7 @@ fn export_names_value() -> Value {
 fn build_placeholder_type(name: &str) -> Arc<PyClassObject> {
     let mut class = PyClassObject::new_simple(intern(name));
     class.set_attr(intern("__module__"), Value::string(intern("_weakref")));
-    class.add_flags(ClassFlags::INITIALIZED);
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
     register_native_type(class)
 }
 
@@ -156,7 +156,12 @@ fn build_reference_type(name: &str) -> Arc<PyClassObject> {
     class.set_attr(intern("__new__"), builtin_value(&REF_NEW_FUNCTION));
     class.set_attr(intern("__init__"), builtin_value(&REF_INIT_FUNCTION));
     class.set_attr(intern("__call__"), builtin_value(&REF_CALL_FUNCTION));
-    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::HAS_NEW | ClassFlags::HAS_INIT);
+    class.add_flags(
+        ClassFlags::INITIALIZED
+            | ClassFlags::HAS_NEW
+            | ClassFlags::HAS_INIT
+            | ClassFlags::NATIVE_HEAPTYPE,
+    );
     register_native_type(class)
 }
 

@@ -142,6 +142,7 @@ enum FormatCode {
     UInt32,
     Int64,
     UInt64,
+    Pointer,
     Float32,
     Float64,
 }
@@ -189,6 +190,7 @@ impl FormatCode {
             'I' | 'L' => Self::UInt32,
             'q' => Self::Int64,
             'Q' => Self::UInt64,
+            'P' => Self::Pointer,
             'f' => Self::Float32,
             'd' => Self::Float64,
             _ => return None,
@@ -209,6 +211,7 @@ impl FormatCode {
                 Self::UInt32 => std::mem::size_of::<u32>(),
                 Self::Int64 => std::mem::size_of::<i64>(),
                 Self::UInt64 => std::mem::size_of::<u64>(),
+                Self::Pointer => std::mem::size_of::<usize>(),
                 Self::Float32 => std::mem::size_of::<f32>(),
                 Self::Float64 => std::mem::size_of::<f64>(),
             },
@@ -217,6 +220,7 @@ impl FormatCode {
                 Self::Int16 | Self::UInt16 => 2,
                 Self::Int32 | Self::UInt32 | Self::Float32 => 4,
                 Self::Int64 | Self::UInt64 | Self::Float64 => 8,
+                Self::Pointer => std::mem::size_of::<usize>(),
             },
         }
     }
@@ -238,6 +242,7 @@ impl FormatCode {
             Self::UInt32 => std::mem::align_of::<u32>(),
             Self::Int64 => std::mem::align_of::<i64>(),
             Self::UInt64 => std::mem::align_of::<u64>(),
+            Self::Pointer => std::mem::align_of::<usize>(),
             Self::Float32 => std::mem::align_of::<f32>(),
             Self::Float64 => std::mem::align_of::<f64>(),
         }
@@ -313,6 +318,12 @@ impl FormatCode {
                     .to_u64()
                     .ok_or_else(out_of_range_error)?,
             ),
+            Self::Pointer => write_usize(
+                out,
+                integer_argument(value, "pack expected integer")?
+                    .to_usize()
+                    .ok_or_else(out_of_range_error)?,
+            ),
             Self::Float32 => write_f32(out, layout.endianness(), float_argument(value)? as f32),
             Self::Float64 => write_f64(out, layout.endianness(), float_argument(value)?),
         }
@@ -342,6 +353,16 @@ impl FormatCode {
                     } else {
                         prism_runtime::types::int::bigint_to_value(BigInt::from(value))
                     }
+                } else {
+                    prism_runtime::types::int::bigint_to_value(BigInt::from(value))
+                }
+            }
+            Self::Pointer => {
+                let value = read_usize(data);
+                if value <= i64::MAX as usize {
+                    Value::int(value as i64).unwrap_or_else(|| {
+                        prism_runtime::types::int::bigint_to_value(BigInt::from(value))
+                    })
                 } else {
                     prism_runtime::types::int::bigint_to_value(BigInt::from(value))
                 }
@@ -808,6 +829,12 @@ fn push_fields(
     let code = FormatCode::from_char(code_char).ok_or_else(|| {
         BuiltinError::ValueError(format!("bad char in struct format: '{}'", code_char))
     })?;
+    if matches!(code, FormatCode::Pointer) && !matches!(layout, Layout::Native) {
+        return Err(BuiltinError::ValueError(format!(
+            "bad char in struct format: '{}'",
+            code_char
+        )));
+    }
     let size = code.size(layout);
     let alignment = code.alignment(layout);
 
@@ -988,6 +1015,13 @@ fn write_u64(out: &mut [u8], endian: Endian, value: u64) -> Result<(), BuiltinEr
 }
 
 #[inline]
+fn write_usize(out: &mut [u8], value: usize) -> Result<(), BuiltinError> {
+    let bytes = value.to_ne_bytes();
+    out.copy_from_slice(&bytes);
+    Ok(())
+}
+
+#[inline]
 fn write_f32(out: &mut [u8], endian: Endian, value: f32) -> Result<(), BuiltinError> {
     write_u32(out, endian, value.to_bits())
 }
@@ -1058,6 +1092,13 @@ fn read_u64(data: &[u8], endian: Endian) -> u64 {
 }
 
 #[inline]
+fn read_usize(data: &[u8]) -> usize {
+    let mut bytes = [0_u8; std::mem::size_of::<usize>()];
+    bytes.copy_from_slice(data);
+    usize::from_ne_bytes(bytes)
+}
+
+#[inline]
 fn read_f32(data: &[u8], endian: Endian) -> f32 {
     f32::from_bits(read_u32(data, endian))
 }
@@ -1091,10 +1132,25 @@ mod tests {
             ("<Q", 8),
             ("<i", 4),
             (">d", 8),
+            ("P", std::mem::size_of::<usize>() as i64),
         ] {
             let result = calcsize_builtin(&[Value::string(intern(format))]).expect("calcsize");
             assert_eq!(result.as_int(), Some(expected));
         }
+    }
+
+    #[test]
+    fn test_pointer_format_is_native_only() {
+        let value = Value::int(0x1234).unwrap();
+        let packed = pack_builtin(&[Value::string(intern("P")), value]).expect("pack pointer");
+        assert_eq!(bytes_to_vec(packed).len(), std::mem::size_of::<usize>());
+
+        let unpacked = unpack_builtin(&[Value::string(intern("P")), packed]).expect("unpack");
+        assert_eq!(tuple_items(unpacked), vec![value]);
+
+        let err = calcsize_builtin(&[Value::string(intern("<P"))])
+            .expect_err("standard pointer format should be rejected");
+        assert!(err.to_string().contains("bad char in struct format"));
     }
 
     #[test]

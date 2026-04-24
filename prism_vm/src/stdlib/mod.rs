@@ -16,7 +16,14 @@
 pub mod _abc;
 pub mod _ast;
 pub mod _codecs;
+pub mod _contextvars;
 pub mod _imp;
+pub mod _overlapped;
+pub mod _random;
+pub mod _sha2;
+pub mod _socket;
+pub mod _sre;
+pub mod _ssl;
 pub mod _string;
 pub mod _struct;
 pub mod _thread;
@@ -24,11 +31,14 @@ pub mod _tokenize;
 pub mod _warnings;
 pub mod _weakref;
 pub mod _winapi;
+pub mod array;
+pub mod atexit;
 pub mod collections;
 pub mod errno;
 pub mod exceptions;
 pub mod fnmatch;
 pub mod functools;
+pub mod gc;
 pub mod generators;
 pub mod inspect;
 pub mod io;
@@ -36,91 +46,24 @@ pub mod itertools;
 pub mod json;
 pub mod marshal;
 pub mod math;
+pub mod msvcrt;
 pub mod nt;
 pub mod os;
 pub mod python_builtins;
 pub mod re;
+pub(crate) mod secure_random;
+pub mod select;
 pub mod signal;
 pub mod sys;
 pub mod time;
+pub mod typing;
 pub mod weakref;
+pub mod winreg;
 
 use crate::builtins::BuiltinRegistry;
 use prism_core::Value;
+pub use prism_stdlib::StdlibResolutionPolicy;
 use std::sync::Arc;
-
-const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
-    "_abc",
-    "_ast",
-    "_codecs",
-    "_imp",
-    "_io",
-    "_string",
-    "_struct",
-    "_thread",
-    "_tokenize",
-    "_winapi",
-    "_warnings",
-    "_weakref",
-    "builtins",
-    "io",
-    "itertools",
-    "marshal",
-    "math",
-    "signal",
-    "sys",
-    "time",
-    "weakref",
-];
-
-const WINDOWS_BUILTIN_MODULE_NAMES: &[&str] = &[
-    "_abc",
-    "_ast",
-    "_codecs",
-    "_imp",
-    "_io",
-    "_string",
-    "_struct",
-    "_thread",
-    "_tokenize",
-    "_winapi",
-    "_warnings",
-    "_weakref",
-    "builtins",
-    "io",
-    "itertools",
-    "marshal",
-    "math",
-    "nt",
-    "signal",
-    "sys",
-    "time",
-    "weakref",
-];
-
-const POSIX_BUILTIN_MODULE_NAMES: &[&str] = &[
-    "_abc",
-    "_ast",
-    "_codecs",
-    "_imp",
-    "_io",
-    "_string",
-    "_struct",
-    "_thread",
-    "_tokenize",
-    "_warnings",
-    "_weakref",
-    "builtins",
-    "io",
-    "itertools",
-    "marshal",
-    "math",
-    "posix",
-    "signal",
-    "sys",
-    "time",
-    "weakref",
-];
 
 /// Result type for module attribute lookup.
 pub type ModuleResult = Result<Value, ModuleError>;
@@ -134,15 +77,6 @@ pub type ModuleResult = Result<Value, ModuleError>;
 /// When a CPython source tree is available on `sys.path`, the fallback modules
 /// should defer to the source implementation for correctness. Native-preferred
 /// modules remain authoritative regardless of filesystem contents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StdlibResolutionPolicy {
-    /// Always load Prism's native module implementation.
-    PreferNative,
-    /// Use a source module/package when available and fall back to the native
-    /// implementation only when source is unavailable.
-    PreferSourceWhenAvailable,
-}
-
 /// Errors that can occur during module operations.
 #[derive(Debug, Clone)]
 pub enum ModuleError {
@@ -191,19 +125,13 @@ pub trait Module {
 
 /// Returns the builtin modules exposed through importlib's builtin importer.
 pub(crate) fn builtin_module_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        WINDOWS_BUILTIN_MODULE_NAMES
-    } else if cfg!(unix) {
-        POSIX_BUILTIN_MODULE_NAMES
-    } else {
-        COMMON_BUILTIN_MODULE_NAMES
-    }
+    prism_stdlib::builtin_module_names()
 }
 
 /// Returns whether a module should be treated as a builtin module for
 /// importlib bootstrap purposes.
 pub(crate) fn is_builtin_module_name(name: &str) -> bool {
-    builtin_module_names().contains(&name)
+    prism_stdlib::is_builtin_module_name(name)
 }
 
 /// Registry of all stdlib modules.
@@ -279,9 +207,51 @@ impl StdlibRegistry {
 
         Self::insert_module(
             &mut modules,
+            "_contextvars",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_contextvars::ContextVarsModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "_imp",
             StdlibResolutionPolicy::PreferNative,
             Box::new(_imp::ImpModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_random",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_random::RandomModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_sha2",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_sha2::Sha2Module::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_socket",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_socket::SocketModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_ssl",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_ssl::SslModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_sre",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_sre::SreModule::new()),
         );
 
         Self::insert_module(
@@ -315,9 +285,30 @@ impl StdlibRegistry {
         if cfg!(windows) {
             Self::insert_module(
                 &mut modules,
+                "_overlapped",
+                StdlibResolutionPolicy::PreferNative,
+                Box::new(_overlapped::OverlappedModule::new()),
+            );
+
+            Self::insert_module(
+                &mut modules,
                 "_winapi",
                 StdlibResolutionPolicy::PreferNative,
                 Box::new(_winapi::WinApiModule::new()),
+            );
+
+            Self::insert_module(
+                &mut modules,
+                "msvcrt",
+                StdlibResolutionPolicy::PreferNative,
+                Box::new(msvcrt::MsvcrtModule::new()),
+            );
+
+            Self::insert_module(
+                &mut modules,
+                "winreg",
+                StdlibResolutionPolicy::PreferNative,
+                Box::new(winreg::WinregModule::new()),
             );
         }
 
@@ -342,6 +333,13 @@ impl StdlibRegistry {
             Box::new(_warnings::WarningsModule::new()),
         );
 
+        Self::insert_module(
+            &mut modules,
+            "array",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(array::ArrayModule::new()),
+        );
+
         // Register math module
         Self::insert_module(
             &mut modules,
@@ -359,9 +357,23 @@ impl StdlibRegistry {
 
         Self::insert_module(
             &mut modules,
+            "atexit",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(atexit::AtexitModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "errno",
             StdlibResolutionPolicy::PreferNative,
             Box::new(errno::ErrnoModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "gc",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(gc::GcModule::new()),
         );
 
         if cfg!(windows) {
@@ -410,6 +422,13 @@ impl StdlibRegistry {
 
         Self::insert_module(
             &mut modules,
+            "typing",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(typing::TypingModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "signal",
             StdlibResolutionPolicy::PreferNative,
             Box::new(signal::SignalModule::new()),
@@ -420,6 +439,13 @@ impl StdlibRegistry {
             "weakref",
             StdlibResolutionPolicy::PreferNative,
             Box::new(weakref::WeakrefModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "select",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(select::SelectModule::new()),
         );
 
         // Register pure-Python stdlib fallbacks.
@@ -535,16 +561,28 @@ mod tests {
         let registry = StdlibRegistry::new();
         assert!(registry.contains("math"));
         assert!(registry.contains("errno"));
+        assert!(registry.contains("gc"));
         assert!(registry.contains("builtins"));
         assert!(registry.contains("signal"));
+        assert!(registry.contains("select"));
         assert!(registry.contains("_codecs"));
+        assert!(registry.contains("_contextvars"));
         assert!(registry.contains("_imp"));
+        assert!(registry.contains("_random"));
+        assert!(registry.contains("_sha2"));
+        assert!(registry.contains("_socket"));
+        assert!(registry.contains("_ssl"));
+        assert!(registry.contains("_sre"));
         assert!(registry.contains("_tokenize"));
         assert!(registry.contains("_weakref"));
         assert!(registry.contains("_warnings"));
         assert!(registry.contains("weakref"));
+        assert!(registry.contains("array"));
         if cfg!(windows) {
+            assert!(registry.contains("_overlapped"));
+            assert!(registry.contains("msvcrt"));
             assert!(registry.contains("nt"));
+            assert!(registry.contains("winreg"));
         }
     }
 
@@ -592,22 +630,43 @@ mod tests {
         assert!(!registry.prefers_source_when_available("sys"));
         assert!(!registry.prefers_source_when_available("math"));
         assert!(!registry.prefers_source_when_available("signal"));
+        assert!(!registry.prefers_source_when_available("select"));
         assert!(!registry.prefers_source_when_available("_codecs"));
         assert!(!registry.prefers_source_when_available("_imp"));
+        assert!(!registry.prefers_source_when_available("_random"));
+        assert!(!registry.prefers_source_when_available("_sha2"));
+        assert!(!registry.prefers_source_when_available("_socket"));
+        assert!(!registry.prefers_source_when_available("_sre"));
         assert!(!registry.prefers_source_when_available("_tokenize"));
         assert!(!registry.prefers_source_when_available("_weakref"));
         assert!(!registry.prefers_source_when_available("_warnings"));
         assert!(!registry.prefers_source_when_available("weakref"));
+        if cfg!(windows) {
+            assert!(!registry.prefers_source_when_available("_overlapped"));
+        }
     }
 
     #[test]
     fn test_builtin_module_name_registry_contains_importlib_bootstrap_modules() {
+        assert!(is_builtin_module_name("_contextvars"));
         assert!(is_builtin_module_name("_imp"));
         assert!(is_builtin_module_name("_io"));
+        assert!(is_builtin_module_name("_random"));
+        assert!(is_builtin_module_name("_sha2"));
+        assert!(is_builtin_module_name("_socket"));
+        assert!(is_builtin_module_name("_ssl"));
+        assert!(is_builtin_module_name("_sre"));
         assert!(is_builtin_module_name("_thread"));
-        assert!(is_builtin_module_name("_winapi"));
         assert!(is_builtin_module_name("_weakref"));
         assert!(is_builtin_module_name("_warnings"));
+        assert!(is_builtin_module_name("array"));
+        assert!(is_builtin_module_name("select"));
+        if cfg!(windows) {
+            assert!(is_builtin_module_name("_overlapped"));
+            assert!(is_builtin_module_name("_winapi"));
+            assert!(is_builtin_module_name("msvcrt"));
+            assert!(is_builtin_module_name("winreg"));
+        }
         assert!(!is_builtin_module_name("re"));
     }
 }
