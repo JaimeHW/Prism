@@ -92,7 +92,7 @@ pub mod import;
 pub use allocator::{AllocResult, GcAllocator, HeapAllocExt};
 pub use builtins::{BuiltinError, BuiltinFn, BuiltinRegistry};
 pub use dispatch::ControlFlow;
-pub use error::{RuntimeError, RuntimeErrorKind, VmResult};
+pub use error::{RuntimeError, RuntimeErrorKind, TracebackEntry, VmResult};
 pub use frame::{ClosureEnv, Frame, MAX_RECURSION_DEPTH};
 pub use gc_integration::{ManagedHeap, RootProvider, SafePoint, StackRoots};
 pub use globals::GlobalScope;

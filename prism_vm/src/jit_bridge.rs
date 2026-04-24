@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_compile_tier2_rejects_unsupported_generic_arithmetic() {
-        use prism_code::{Instruction, Opcode, Register};
+        use prism_code::{Constant, Instruction, Opcode, Register};
         use prism_core::Value;
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
@@ -717,7 +717,11 @@ mod tests {
             Instruction::op_d(Opcode::Return, Register::new(2)),
         ]
         .into_boxed_slice();
-        code.constants = vec![Value::int(10).unwrap(), Value::int(20).unwrap()].into_boxed_slice();
+        code.constants = vec![Value::int(10).unwrap(), Value::int(20).unwrap()]
+            .into_iter()
+            .map(Constant::Value)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let code = Arc::new(code);
 
         let err = bridge

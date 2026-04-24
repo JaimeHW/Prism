@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_handle_tier_up_tier2_failure_is_not_retried_for_same_code() {
-        use prism_code::{Instruction, Opcode, Register};
+        use prism_code::{Constant, Instruction, Opcode, Register};
         use prism_core::Value;
 
         let mut ctx = JitContext::for_testing();
@@ -632,7 +632,11 @@ mod tests {
             Instruction::op_d(Opcode::Return, Register::new(2)),
         ]
         .into_boxed_slice();
-        code.constants = vec![Value::int(1).unwrap(), Value::int(2).unwrap()].into_boxed_slice();
+        code.constants = vec![Value::int(1).unwrap(), Value::int(2).unwrap()]
+            .into_iter()
+            .map(Constant::Value)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let code = Arc::new(code);
 
         assert!(!ctx.handle_tier_up(&code, TierUpDecision::Tier2));
