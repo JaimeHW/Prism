@@ -125,7 +125,7 @@ fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine, config: &
 
     // Execute.
     let main_module = repl_main_module(vm);
-    match vm.execute_in_module(code, main_module) {
+    match vm.execute_in_module_runtime(code, main_module) {
         Ok(result) => {
             // Display non-None results (matching CPython REPL behavior).
             if !result.is_none() {
@@ -133,7 +133,10 @@ fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine, config: &
             }
         }
         Err(e) => {
-            eprintln!("{}", e);
+            eprint!(
+                "{}",
+                crate::error::format_runtime_error_string(&e, Some(source), "<stdin>")
+            );
         }
     }
 }

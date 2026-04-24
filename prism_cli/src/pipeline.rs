@@ -220,9 +220,9 @@ fn execute_source_entry(
         Some(Arc::clone(&main_module.package_name)),
     ));
 
-    match vm.execute_in_module(code, main_module) {
+    match vm.execute_in_module_runtime(code, main_module) {
         Ok(_) => ExitCode::from(error::EXIT_SUCCESS),
-        Err(e) => error::format_prism_error(&e, Some(source), filename_for_errors.as_ref()),
+        Err(e) => error::format_runtime_error(&e, Some(source), filename_for_errors.as_ref()),
     }
 }
 
@@ -1149,6 +1149,16 @@ assert f(2)(4) == 6\n",
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
         let code = run_string(
             "class Example:\n    pass\n\nobj = Example()\nobj._value = 7\nassert getattr(obj, '_value', None) == 7\n",
+            &config,
+        );
+        assert_eq!(code, ExitCode::from(0));
+    }
+
+    #[test]
+    fn test_run_string_preserves_base_exception_class_surface_methods() {
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        let code = run_string(
+            "m = BaseException.__str__\nassert m.__qualname__ == 'BaseException.__str__'\nassert m.__self__ is None\nassert m(Exception('boom')) == 'boom'\n",
             &config,
         );
         assert_eq!(code, ExitCode::from(0));
