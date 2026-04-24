@@ -29,6 +29,8 @@ pub struct Parser<'src> {
     previous: Token,
     /// Whether we've hit an error.
     had_error: bool,
+    /// First parse error encountered while recovering.
+    first_error: Option<PrismError>,
     /// Whether we're in panic mode (error recovery).
     panic_mode: bool,
 }
@@ -43,6 +45,7 @@ impl<'src> Parser<'src> {
             current: first_token.clone(),
             previous: first_token,
             had_error: false,
+            first_error: None,
             panic_mode: false,
         }
     }
@@ -57,17 +60,21 @@ impl<'src> Parser<'src> {
 
         // Parse statements until EOF
         while !self.check(TokenKind::Eof) {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
+            match StmtParser::parse_statement_sequence(self) {
+                Ok(stmts) => body.extend(stmts),
                 Err(e) => {
                     self.had_error = true;
-                    self.synchronize();
-                    if self.check(TokenKind::Eof) {
-                        return Err(e);
+                    if self.first_error.is_none() {
+                        self.first_error = Some(e);
                     }
+                    self.synchronize();
                 }
             }
             self.skip_newlines();
+        }
+
+        if let Some(err) = self.first_error.take() {
+            return Err(err);
         }
 
         let end = self.current.span.end;

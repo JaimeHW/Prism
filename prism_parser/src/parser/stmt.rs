@@ -14,6 +14,31 @@ use prism_core::{PrismResult, Span};
 pub struct StmtParser;
 
 impl StmtParser {
+    fn decorator_can_start_expression(kind: &TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Int(_)
+                | TokenKind::BigInt(_)
+                | TokenKind::Float(_)
+                | TokenKind::Complex(_)
+                | TokenKind::String(_)
+                | TokenKind::FString(_)
+                | TokenKind::Bytes(_)
+                | TokenKind::Ident(_)
+                | TokenKind::Minus
+                | TokenKind::Plus
+                | TokenKind::Tilde
+                | TokenKind::LeftParen
+                | TokenKind::LeftBracket
+                | TokenKind::LeftBrace
+                | TokenKind::Star
+                | TokenKind::Ellipsis
+                | TokenKind::Keyword(
+                    KW::True | KW::False | KW::None | KW::Not | KW::Await | KW::Lambda | KW::Yield
+                )
+        )
+    }
+
     /// Parse a statement.
     pub fn parse(parser: &mut Parser<'_>) -> PrismResult<Stmt> {
         let start = parser.start_span();
@@ -44,6 +69,34 @@ impl StmtParser {
 
         // Simple statement
         Self::parse_simple_statement(parser, start)
+    }
+
+    /// Parse one logical statement line, expanding semicolon-separated simple
+    /// statements into distinct AST nodes.
+    pub fn parse_statement_sequence(parser: &mut Parser<'_>) -> PrismResult<Vec<Stmt>> {
+        if Self::looks_like_match_statement(parser) {
+            return Ok(vec![Self::parse_match(parser, parser.start_span())?]);
+        }
+
+        if let TokenKind::Keyword(kw) = &parser.current().kind {
+            match kw {
+                KW::If
+                | KW::While
+                | KW::For
+                | KW::Try
+                | KW::With
+                | KW::Def
+                | KW::Class
+                | KW::Async => return Ok(vec![Self::parse(parser)?]),
+                _ => {}
+            }
+        }
+
+        if parser.check(TokenKind::At) {
+            return Ok(vec![Self::parse(parser)?]);
+        }
+
+        Self::parse_simple_statement_sequence(parser)
     }
 
     /// Parse a simple statement.
@@ -81,6 +134,27 @@ impl StmtParser {
         // Consume trailing newline if present
         parser.match_token(TokenKind::Newline);
         Ok(stmt)
+    }
+
+    /// Parse one or more simple statements separated by semicolons.
+    fn parse_simple_statement_sequence(parser: &mut Parser<'_>) -> PrismResult<Vec<Stmt>> {
+        let mut stmts = Vec::new();
+
+        loop {
+            let stmt_start = parser.start_span();
+            stmts.push(Self::parse_simple_statement(parser, stmt_start)?);
+
+            if !parser.match_token(TokenKind::Semicolon) {
+                break;
+            }
+
+            if parser.check(TokenKind::Newline) || parser.check(TokenKind::Eof) {
+                break;
+            }
+        }
+
+        parser.match_token(TokenKind::Newline);
+        Ok(stmts)
     }
 
     // =========================================================================
@@ -1406,9 +1480,16 @@ impl StmtParser {
         let mut decorators = Vec::new();
 
         while parser.match_token(TokenKind::At) {
-            let decorator = ExprParser::parse(parser, Precedence::Lowest)?;
+            if !Self::decorator_can_start_expression(&parser.current().kind) {
+                return Err(parser.error_at_current("expected decorator expression"));
+            }
+
+            let decorator = ExprParser::parse(parser, Precedence::NamedExpr)?;
+            if !parser.check(TokenKind::Newline) {
+                return Err(parser.error_at_current("expected newline after decorator"));
+            }
             decorators.push(decorator);
-            parser.expect(TokenKind::Newline, "expected newline after decorator")?;
+            parser.advance();
         }
 
         // Parse the decorated definition
@@ -1501,7 +1582,7 @@ impl StmtParser {
             if parser.check(TokenKind::Dedent) || parser.check(TokenKind::Eof) {
                 break;
             }
-            stmts.push(Self::parse(parser)?);
+            stmts.extend(Self::parse_statement_sequence(parser)?);
         }
 
         parser.expect(TokenKind::Dedent, "expected dedent")?;
@@ -1855,6 +1936,40 @@ mod tests {
     }
 
     #[test]
+    fn test_decorator_rejects_bare_tuple_and_assignment_forms() {
+        for source in [
+            "@x,\ndef f(): pass",
+            "@x, y\ndef f(): pass",
+            "@x = y\ndef f(): pass",
+        ] {
+            assert!(
+                parse(source).is_err(),
+                "decorator form should be rejected: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decorator_rejects_statement_keywords() {
+        for source in ["@pass\ndef f(): pass", "@import sys\ndef f(): pass"] {
+            assert!(
+                parse(source).is_err(),
+                "statement-like decorator should be rejected: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decorator_accepts_parenthesized_tuple_and_named_expression() {
+        for source in ["@(x, y)\ndef f(): pass", "@(x := y)\ndef f(): pass"] {
+            assert!(
+                parse(source).is_ok(),
+                "valid decorator expression should parse: {source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_try() {
         let module = parse("try:\n    pass\nexcept:\n    pass").expect("parse failed");
         assert!(matches!(module.body[0].kind, StmtKind::Try { .. }));
@@ -1874,6 +1989,26 @@ mod tests {
         };
         assert_eq!(body.len(), 2);
         assert!(matches!(body[0].kind, StmtKind::Pass));
+        assert!(matches!(body[1].kind, StmtKind::Assign { .. }));
+    }
+
+    #[test]
+    fn test_top_level_semicolon_separates_simple_statements() {
+        let module = parse("x = 1; y = 2; z = 3").expect("parse failed");
+        assert_eq!(module.body.len(), 3);
+        assert!(matches!(module.body[0].kind, StmtKind::Assign { .. }));
+        assert!(matches!(module.body[1].kind, StmtKind::Assign { .. }));
+        assert!(matches!(module.body[2].kind, StmtKind::Assign { .. }));
+    }
+
+    #[test]
+    fn test_indented_block_semicolon_separates_simple_statements() {
+        let module = parse("if True:\n    x = 1; y = 2\n").expect("parse failed");
+        let StmtKind::If { body, .. } = &module.body[0].kind else {
+            panic!("expected If");
+        };
+        assert_eq!(body.len(), 2);
+        assert!(matches!(body[0].kind, StmtKind::Assign { .. }));
         assert!(matches!(body[1].kind, StmtKind::Assign { .. }));
     }
 }
