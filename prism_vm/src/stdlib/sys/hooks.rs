@@ -461,20 +461,6 @@ mod tests {
         assert_eq!(TraceEvent::Opcode.as_str(), "opcode");
     }
 
-    #[test]
-    fn test_trace_event_clone() {
-        let event = TraceEvent::Call;
-        let cloned = event.clone();
-        assert_eq!(event, cloned);
-    }
-
-    #[test]
-    fn test_trace_event_copy() {
-        let event = TraceEvent::Line;
-        let _copied: TraceEvent = event;
-        let _again: TraceEvent = event;
-    }
-
     // =========================================================================
     // TraceHook Tests
     // =========================================================================

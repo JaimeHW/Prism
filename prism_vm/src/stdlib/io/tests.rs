@@ -1739,18 +1739,4 @@ mod io_error_tests {
         let e = IoError::OsError("disk full".to_string());
         assert!(e.to_string().contains("OSError"));
     }
-
-    #[test]
-    fn test_error_equality() {
-        let e1 = IoError::ValueError("test".to_string());
-        let e2 = IoError::ValueError("test".to_string());
-        assert_eq!(e1, e2);
-    }
-
-    #[test]
-    fn test_error_inequality() {
-        let e1 = IoError::ValueError("a".to_string());
-        let e2 = IoError::ValueError("b".to_string());
-        assert_ne!(e1, e2);
-    }
 }

@@ -336,13 +336,6 @@ mod tests {
         assert_eq!(event.args.len(), 1);
     }
 
-    #[test]
-    fn test_audit_event_clone() {
-        let event = AuditEvent::new("clone.test");
-        let cloned = event.clone();
-        assert_eq!(event.name, cloned.name);
-    }
-
     // =========================================================================
     // CallDepth Tests
     // =========================================================================

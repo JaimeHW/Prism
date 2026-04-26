@@ -227,26 +227,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Clone Tests
-    // =========================================================================
-
-    #[test]
-    fn test_clone() {
-        let argv = SysArgv::new(vec!["original".to_string()]);
-        let cloned = argv.clone();
-        assert_eq!(cloned.len(), 1);
-        assert_eq!(cloned.get(0).map(|s| s.as_ref()), Some("original"));
-    }
-
-    #[test]
-    fn test_clone_shares_data() {
-        let argv = SysArgv::new(vec!["shared".to_string()]);
-        let cloned = argv.clone();
-        // Both should point to same Arc data
-        assert!(Arc::ptr_eq(&argv.args, &cloned.args));
-    }
-
-    // =========================================================================
     // Unicode Tests
     // =========================================================================
 

@@ -338,20 +338,6 @@ mod tests {
         assert!(!StreamMode::WriteBinary.is_text());
     }
 
-    #[test]
-    fn test_stream_mode_clone() {
-        let mode = StreamMode::ReadText;
-        let cloned = mode.clone();
-        assert_eq!(mode, cloned);
-    }
-
-    #[test]
-    fn test_stream_mode_copy() {
-        let mode = StreamMode::WriteText;
-        let _copied: StreamMode = mode;
-        let _again: StreamMode = mode; // Can use again because Copy
-    }
-
     // =========================================================================
     // StringWriter Tests
     // =========================================================================

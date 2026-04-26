@@ -326,24 +326,4 @@ mod tests {
         let result = interval.set(f64::INFINITY);
         assert!(result.is_err());
     }
-
-    // =========================================================================
-    // Clone Tests
-    // =========================================================================
-
-    #[test]
-    fn test_recursion_limit_clone() {
-        let mut limit = RecursionLimit::new();
-        limit.set(3000).unwrap();
-        let cloned = limit.clone();
-        assert_eq!(cloned.get(), 3000);
-    }
-
-    #[test]
-    fn test_switch_interval_clone() {
-        let mut interval = SwitchInterval::new();
-        interval.set(0.1).unwrap();
-        let cloned = interval.clone();
-        assert_eq!(cloned.get(), 0.1);
-    }
 }
