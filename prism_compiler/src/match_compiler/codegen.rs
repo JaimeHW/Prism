@@ -25,6 +25,15 @@ use crate::compiler::{CompileError, CompileResult};
 use prism_parser::ast::Expr;
 use std::collections::HashMap;
 
+#[inline]
+fn unsupported_match_codegen(message: impl Into<String>) -> CompileError {
+    CompileError {
+        message: message.into(),
+        line: 0,
+        column: 0,
+    }
+}
+
 // =============================================================================
 // Subject Cache
 // =============================================================================
@@ -404,8 +413,8 @@ fn emit_leaf(
     guard: Option<&Expr>,
     _action: usize,
     fallback: Option<&DecisionTree>,
-    fail_label: Label,
-    end_label: Label,
+    _fail_label: Label,
+    _end_label: Label,
 ) -> CompileResult<()> {
     // Store bindings to locals
     for binding in bindings {
@@ -416,24 +425,11 @@ fn emit_leaf(
         builder.emit_store_local(slot, value_reg);
     }
 
-    // Handle guard expression
-    if let Some(_guard_expr) = guard {
-        if let Some(fallback_tree) = fallback {
-            // Create label for guard failure
-            let guard_fail = builder.create_label();
-
-            // Compile guard expression - for now, emit a placeholder
-            // The actual guard compilation will be done by the compiler
-            // which has access to compile_expr
-            // TODO: Pass guard compilation closure or integrate with compiler
-
-            // If guard fails, go to fallback
-            builder.bind_label(guard_fail);
-            emit_tree_node(builder, fallback_tree, cache, fail_label, end_label)?;
-        } else {
-            // No fallback, guard failure means match failure
-            // TODO: Compile guard and jump to fail_label on failure
-        }
+    if guard.is_some() {
+        let _ = fallback;
+        return Err(unsupported_match_codegen(
+            "unsupported guarded match leaf: decision-tree lowering requires expression codegen",
+        ));
     }
 
     // Match succeeded - body will be compiled separately by the caller
@@ -577,13 +573,10 @@ fn emit_constructor_test(
         }
 
         Constructor::Class { cls: _ } => {
-            // Use MatchClass opcode for isinstance check
-            // Need to compile the class expression first
-            // For now, emit a placeholder
-            let cls_reg = builder.alloc_register();
-            // TODO: Compile cls expression
-            emit_match_class(builder, result, value, cls_reg);
-            builder.free_register(cls_reg);
+            let _ = (builder, result, value);
+            return Err(unsupported_match_codegen(
+                "unsupported class pattern constructor: decision-tree lowering requires class expression codegen",
+            ));
         }
     }
 
@@ -624,40 +617,18 @@ fn load_literal_value(
 
 /// Emit a type check node.
 fn emit_type_check(
-    builder: &mut FunctionBuilder,
-    cache: &mut SubjectCache,
-    access: &AccessPath,
+    _builder: &mut FunctionBuilder,
+    _cache: &mut SubjectCache,
+    _access: &AccessPath,
     _cls: &Expr,
-    success: &DecisionTree,
-    failure: &DecisionTree,
-    fail_label: Label,
-    end_label: Label,
+    _success: &DecisionTree,
+    _failure: &DecisionTree,
+    _fail_label: Label,
+    _end_label: Label,
 ) -> CompileResult<()> {
-    let value_reg = cache.get_or_load(builder, access)?;
-
-    // Compile class expression
-    let cls_reg = builder.alloc_register();
-    // TODO: Compile cls expression - requires access to compiler
-
-    // Emit MatchClass opcode
-    let result_reg = builder.alloc_register();
-    emit_match_class(builder, result_reg, value_reg, cls_reg);
-    builder.free_register(cls_reg);
-
-    // Create failure label
-    let type_fail = builder.create_label();
-    builder.emit_jump_if_false(result_reg, type_fail);
-    builder.free_register(result_reg);
-
-    // Emit success subtree
-    emit_tree_node(builder, success, cache, fail_label, end_label)?;
-    builder.emit_jump(end_label);
-
-    // Emit failure subtree
-    builder.bind_label(type_fail);
-    emit_tree_node(builder, failure, cache, fail_label, end_label)?;
-
-    Ok(())
+    Err(unsupported_match_codegen(
+        "unsupported class pattern type check: decision-tree lowering requires class expression codegen",
+    ))
 }
 
 /// Emit a sequence check node.
@@ -843,7 +814,13 @@ fn emit_get_match_args(builder: &mut FunctionBuilder, dst: Register, subject: Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::Span;
+    use prism_parser::ast::ExprKind;
     use std::sync::Arc;
+
+    fn test_expr(kind: ExprKind) -> Expr {
+        Expr::new(kind, Span::dummy())
+    }
 
     #[test]
     fn test_subject_cache_new() {
@@ -984,6 +961,62 @@ mod tests {
             .expect_err("bytes literals must not be lowered as placeholder strings");
 
         assert!(err.message.contains("unsupported pattern bytes literal"));
+    }
+
+    #[test]
+    fn test_guarded_leaf_rejects_placeholder_lowering() {
+        let mut builder = FunctionBuilder::new("test");
+        let end_label = builder.create_label();
+        let fail_label = builder.create_label();
+        let subject = builder.alloc_register();
+        let tree = DecisionTree::Leaf {
+            bindings: Vec::new(),
+            guard: Some(test_expr(ExprKind::Bool(true))),
+            action: 0,
+            fallback: Some(Box::new(DecisionTree::Fail)),
+        };
+
+        let err = emit_tree(&mut builder, &tree, subject, fail_label, end_label)
+            .expect_err("guarded leaves need real guard expression lowering");
+
+        assert!(err.message.contains("unsupported guarded match leaf"));
+    }
+
+    #[test]
+    fn test_class_constructor_rejects_placeholder_lowering() {
+        let mut builder = FunctionBuilder::new("test");
+        let result = builder.alloc_register();
+        let value = builder.alloc_register();
+        let ctor = Constructor::Class {
+            cls: Box::new(test_expr(ExprKind::Name("C".to_string()))),
+        };
+
+        let err = emit_constructor_test(&mut builder, result, value, &ctor)
+            .expect_err("class constructors need real class expression lowering");
+
+        assert!(
+            err.message
+                .contains("unsupported class pattern constructor")
+        );
+    }
+
+    #[test]
+    fn test_type_check_rejects_placeholder_lowering() {
+        let mut builder = FunctionBuilder::new("test");
+        let end_label = builder.create_label();
+        let fail_label = builder.create_label();
+        let subject = builder.alloc_register();
+        let tree = DecisionTree::TypeCheck {
+            access: AccessPath::Root,
+            cls: Box::new(test_expr(ExprKind::Name("C".to_string()))),
+            success: Box::new(DecisionTree::Fail),
+            failure: Box::new(DecisionTree::Fail),
+        };
+
+        let err = emit_tree(&mut builder, &tree, subject, fail_label, end_label)
+            .expect_err("type checks need real class expression lowering");
+
+        assert!(err.message.contains("unsupported class pattern type check"));
     }
 
     #[test]
