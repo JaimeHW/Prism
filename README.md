@@ -173,7 +173,7 @@ The import system also supports frozen source modules so the AOT pipeline can bu
 
 ### Prerequisites
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94+ (edition 2024)
 - x86-64 target support
 - Optional: a CPython 3.12 source checkout for `prism-test`
 
@@ -185,6 +185,19 @@ cargo build --workspace --release
 cargo test --workspace
 cargo bench --workspace
 ```
+
+## Engineering Docs
+
+- [Architecture](docs/ARCHITECTURE.md) - crate ownership, layering, public API
+  policy, and current refactor targets
+- [Performance Engineering](docs/PERFORMANCE.md) - hot-path, allocation, JIT,
+  GC, and benchmarking standards
+- [Testing Strategy](docs/TESTING.md) - local checks, CI contract, compatibility
+  tests, and benchmark expectations
+- [Unsafe Code Policy](docs/UNSAFE.md) - required invariants for GC, value
+  representation, JIT, and platform code
+- [Contributing](CONTRIBUTING.md) - commit style, review expectations, and
+  pre-PR checks
 
 ---
 
