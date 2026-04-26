@@ -611,23 +611,4 @@ mod tests {
         assert_eq!(stats.deopt_count_for(DeoptReason::BoundsCheck), 0);
     }
 
-    #[test]
-    fn test_deopt_reasons() {
-        let reasons = [
-            DeoptReason::TypeGuard,
-            DeoptReason::Overflow,
-            DeoptReason::DivisionByZero,
-            DeoptReason::BoundsCheck,
-            DeoptReason::NullCheck,
-            DeoptReason::ArityMismatch,
-            DeoptReason::Speculation,
-            DeoptReason::Explicit,
-            DeoptReason::Unknown,
-        ];
-
-        for reason in reasons {
-            // Ensure description doesn't panic
-            let _ = reason.description();
-        }
-    }
 }

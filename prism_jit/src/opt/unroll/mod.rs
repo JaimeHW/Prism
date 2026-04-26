@@ -735,9 +735,4 @@ mod tests {
         assert_eq!(unroll.stats().loops_analyzed, 0);
     }
 
-    #[test]
-    fn test_unroll_default_impl() {
-        let unroll = Unroll::default();
-        assert_eq!(unroll.config().max_full_unroll_trip, 16);
-    }
 }

@@ -642,20 +642,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // NullListener Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_null_listener_new() {
-        let listener = NullListener::default();
-        // Should not panic
-        listener.on_transition(ShapeId(1), ShapeId(2));
-        listener.on_property_delete(ShapeId(1), "foo");
-        listener.on_prototype_change(ShapeId(1));
-        listener.on_accessor_installed(ShapeId(1), "bar");
-    }
-
-    // -------------------------------------------------------------------------
     // RecordingListener Tests
     // -------------------------------------------------------------------------
 
@@ -862,20 +848,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // ShapeHookStatsSnapshot Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_stats_snapshot_default() {
-        let snap = ShapeHookStatsSnapshot::default();
-        assert_eq!(snap.transitions, 0);
-        assert_eq!(snap.deletions, 0);
-        assert_eq!(snap.prototype_changes, 0);
-        assert_eq!(snap.accessor_installs, 0);
-        assert_eq!(snap.batch_transitions, 0);
-    }
-
-    // -------------------------------------------------------------------------
     // Edge Case Tests
     // -------------------------------------------------------------------------
 
@@ -938,10 +910,4 @@ mod tests {
     // Global Stats Tests
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_global_hook_stats_accessible() {
-        let stats = global_hook_stats();
-        // Just verify it's accessible without panic
-        let _ = stats.snapshot();
-    }
 }

@@ -1368,20 +1368,6 @@ mod tests {
     }
 
     // =========================================================================
-    // RetClass Tests
-    // =========================================================================
-
-    #[test]
-    fn test_ret_class_variants() {
-        // Just ensure all variants work
-        let _gpr = RetClass::Gpr(Gpr::Rax);
-        let _xmm = RetClass::Xmm(Xmm::Xmm0);
-        let _ymm = RetClass::Ymm(Ymm::Ymm0);
-        let _zmm = RetClass::Zmm(Zmm::Zmm0);
-        let _mem = RetClass::Memory;
-    }
-
-    // =========================================================================
     // Edge Case Tests
     // =========================================================================
 

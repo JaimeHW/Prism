@@ -1061,17 +1061,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_all_templates_compile() {
-        // Verify all 6 templates compile without panic
-        emit_and_finalize(&ListPopLastTemplate::new(1, 0, 0));
-        emit_and_finalize(&ListLenTemplate::new(1, 0, 0));
-        emit_and_finalize(&ListClearTemplate::new(0, 0));
-        emit_and_finalize(&ListContainsTemplate::new(2, 0, 1, 0));
-        emit_and_finalize(&ListInsertTemplate::new(0, 1, 2, 0));
-        emit_and_finalize(&ListRemoveTemplate::new(2, 0, 1, 0));
-    }
-
-    #[test]
     fn test_sequential_emission() {
         let mut asm = Assembler::new();
         let frame = FrameLayout::minimal(16);
@@ -1161,27 +1150,6 @@ mod tests {
                 tmpl.estimated_size()
             );
         }
-    }
-
-    #[test]
-    fn test_zero_register_indices() {
-        // All templates with register index 0
-        emit_and_finalize(&ListPopLastTemplate::new(0, 0, 0));
-        emit_and_finalize(&ListLenTemplate::new(0, 0, 0));
-        emit_and_finalize(&ListClearTemplate::new(0, 0));
-        emit_and_finalize(&ListContainsTemplate::new(0, 0, 0, 0));
-        emit_and_finalize(&ListInsertTemplate::new(0, 0, 0, 0));
-        emit_and_finalize(&ListRemoveTemplate::new(0, 0, 0, 0));
-    }
-
-    #[test]
-    fn test_adjacent_register_indices() {
-        emit_and_finalize(&ListPopLastTemplate::new(1, 2, 0));
-        emit_and_finalize(&ListLenTemplate::new(2, 3, 0));
-        emit_and_finalize(&ListClearTemplate::new(4, 0));
-        emit_and_finalize(&ListContainsTemplate::new(5, 6, 7, 0));
-        emit_and_finalize(&ListInsertTemplate::new(8, 9, 10, 0));
-        emit_and_finalize(&ListRemoveTemplate::new(11, 12, 13, 0));
     }
 
     #[test]

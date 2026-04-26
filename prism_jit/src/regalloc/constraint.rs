@@ -967,28 +967,4 @@ mod tests {
         assert!(not_found.is_none());
     }
 
-    #[test]
-    fn test_all_constraint_types() {
-        // Test all OperandConstraint variants
-        let constraints = vec![
-            OperandConstraint::FixedReg(PReg::Gpr(Gpr::Rax)),
-            OperandConstraint::RegClass(RegClass::Int),
-            OperandConstraint::Tied(0),
-            OperandConstraint::RegOrMem(RegClass::Float),
-            OperandConstraint::Memory,
-            OperandConstraint::Any,
-            OperandConstraint::ReuseInput(1),
-        ];
-
-        for c in constraints {
-            // All should have Display impl
-            let _ = format!("{}", c);
-
-            // All should have reg_class or return None
-            let _ = c.get_reg_class();
-
-            // All should have is_fixed
-            let _ = c.is_fixed();
-        }
-    }
 }

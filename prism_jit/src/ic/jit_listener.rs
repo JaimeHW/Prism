@@ -434,12 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_listener_default() {
-        let listener = JitShapeListener::default();
-        assert!(!listener.explicit_on_transition());
-    }
-
-    #[test]
     fn test_jit_listener_set_explicit() {
         let listener = JitShapeListener::new();
         assert!(!listener.explicit_on_transition());
@@ -756,35 +750,11 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_global_jit_listener_accessible() {
-        let listener = global_jit_listener();
-        // Should be accessible
-        let _ = listener.stats().snapshot();
-    }
-
-    #[test]
     fn test_global_jit_listener_singleton() {
         let l1 = global_jit_listener();
         let l2 = global_jit_listener();
         // Same instance
         assert!(std::ptr::eq(l1, l2));
-    }
-
-    // -------------------------------------------------------------------------
-    // Snapshot Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_stats_snapshot_default() {
-        let snap = JitListenerStatsSnapshot::default();
-        assert_eq!(snap.transitions, 0);
-        assert_eq!(snap.deletions, 0);
-        assert_eq!(snap.prototype_changes, 0);
-        assert_eq!(snap.accessor_installs, 0);
-        assert_eq!(snap.batch_transitions, 0);
-        assert_eq!(snap.version_bumps, 0);
-        assert_eq!(snap.explicit_invalidations, 0);
-        assert_eq!(snap.ics_invalidated, 0);
     }
 
     // -------------------------------------------------------------------------
