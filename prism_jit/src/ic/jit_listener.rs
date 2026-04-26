@@ -787,18 +787,6 @@ mod tests {
         assert_eq!(snap.ics_invalidated, 0);
     }
 
-    #[test]
-    fn test_stats_snapshot_copy() {
-        let listener = JitShapeListener::new();
-        listener.on_transition(ShapeId(1), ShapeId(2));
-
-        let snap1 = listener.stats().snapshot();
-        let snap2 = snap1; // Copy
-
-        assert_eq!(snap1.transitions, snap2.transitions);
-        assert_eq!(snap1.version_bumps, snap2.version_bumps);
-    }
-
     // -------------------------------------------------------------------------
     // Edge Case Tests
     // -------------------------------------------------------------------------

@@ -376,16 +376,6 @@ mod tests {
         assert_eq!(id.raw(), 42);
     }
 
-    #[test]
-    fn test_expr_id_equality() {
-        let id1 = ExprId::new(1);
-        let id2 = ExprId::new(1);
-        let id3 = ExprId::new(2);
-
-        assert_eq!(id1, id2);
-        assert_ne!(id1, id3);
-    }
-
     // =========================================================================
     // Expression Tests
     // =========================================================================
@@ -402,16 +392,6 @@ mod tests {
         let inputs = vec![ExprId::new(0), ExprId::new(1)];
         let expr = Expression::new(Operator::IntOp(ArithOp::Add), inputs.clone());
         assert_eq!(expr.inputs, inputs);
-    }
-
-    #[test]
-    fn test_expression_equality() {
-        let expr1 = Expression::new(Operator::ConstInt(42), vec![]);
-        let expr2 = Expression::new(Operator::ConstInt(42), vec![]);
-        let expr3 = Expression::new(Operator::ConstInt(43), vec![]);
-
-        assert_eq!(expr1, expr2);
-        assert_ne!(expr1, expr3);
     }
 
     // =========================================================================

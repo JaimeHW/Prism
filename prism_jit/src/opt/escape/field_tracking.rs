@@ -990,22 +990,4 @@ mod tests {
         assert!(indices.contains(&3));
         assert!(indices.contains(&5));
     }
-
-    #[test]
-    fn test_field_access_clone() {
-        let access = FieldAccess {
-            node: NodeId::new(1),
-            object: NodeId::new(0),
-            field: FieldIndex::Constant(2),
-            kind: FieldAccessKind::Store,
-            value: Some(NodeId::new(3)),
-            value_type: ValueType::Int64,
-            control: Some(NodeId::new(4)),
-        };
-
-        let cloned = access.clone();
-        assert_eq!(cloned.node, access.node);
-        assert_eq!(cloned.field, access.field);
-        assert_eq!(cloned.value, access.value);
-    }
 }

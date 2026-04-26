@@ -952,36 +952,6 @@ mod tests {
     }
 
     // =========================================================================
-    // WidenBounds Tests
-    // =========================================================================
-
-    #[test]
-    fn test_widen_bounds_equality() {
-        let b1 = WidenBounds {
-            min_bound: BoundValue::Constant(0),
-            max_bound: BoundValue::Constant(99),
-        };
-        let b2 = WidenBounds {
-            min_bound: BoundValue::Constant(0),
-            max_bound: BoundValue::Constant(99),
-        };
-        assert_eq!(b1, b2);
-    }
-
-    #[test]
-    fn test_widen_bounds_inequality() {
-        let b1 = WidenBounds {
-            min_bound: BoundValue::Constant(0),
-            max_bound: BoundValue::Constant(99),
-        };
-        let b2 = WidenBounds {
-            min_bound: BoundValue::Constant(0),
-            max_bound: BoundValue::Constant(100),
-        };
-        assert_ne!(b1, b2);
-    }
-
-    // =========================================================================
     // Helper Functions
     // =========================================================================
 

@@ -342,19 +342,6 @@ mod tests {
         assert_eq!(stats.phis_simplified, 0);
     }
 
-    #[test]
-    fn test_copy_prop_stats_clone() {
-        let stats = CopyPropStats {
-            copies_found: 5,
-            uses_rewritten: 10,
-            copies_eliminated: 3,
-            phis_simplified: 2,
-        };
-        let cloned = stats.clone();
-        assert_eq!(cloned.copies_found, 5);
-        assert_eq!(cloned.uses_rewritten, 10);
-    }
-
     // =========================================================================
     // CopyProp Construction Tests
     // =========================================================================

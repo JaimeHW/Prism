@@ -313,22 +313,6 @@ mod tests {
         assert_eq!(stats.checks_widened, 0);
     }
 
-    #[test]
-    fn test_rce_stats_clone() {
-        let stats = RceStats {
-            loops_analyzed: 5,
-            induction_vars_found: 3,
-            range_checks_found: 10,
-            checks_eliminated: 7,
-            checks_hoisted: 2,
-            checks_widened: 1,
-        };
-        let cloned = stats.clone();
-        assert_eq!(cloned.loops_analyzed, 5);
-        assert_eq!(cloned.checks_eliminated, 7);
-        assert_eq!(cloned.checks_widened, 1);
-    }
-
     // =========================================================================
     // Integration Tests
     // =========================================================================

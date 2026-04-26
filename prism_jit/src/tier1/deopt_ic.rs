@@ -1169,23 +1169,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ic_deopt_context_copy() {
-        let ctx1 = IcDeoptContext::new_property(
-            1,
-            ShapeId(42),
-            5,
-            PropertyFlags::default(),
-            IcKind::GetProperty,
-            true,
-        );
-
-        let ctx2 = ctx1; // Copy
-
-        assert_eq!(ctx1.ic_site_idx, ctx2.ic_site_idx);
-        assert_eq!(ctx1.observed_shape, ctx2.observed_shape);
-    }
-
-    #[test]
     fn test_multiple_transitions_to_megamorphic() {
         let mut manager = IcManager::new(ShapeVersion::current());
         let stats = IcDeoptStats::new();

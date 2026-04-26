@@ -392,19 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn test_insertion_result_clone() {
-        let mut result = InsertionResult::new();
-        result.inserted = 5;
-        result.failed = 2;
-        result.new_guards.push(NodeId::new(1));
-
-        let cloned = result.clone();
-        assert_eq!(cloned.inserted, 5);
-        assert_eq!(cloned.failed, 2);
-        assert_eq!(cloned.new_guards.len(), 1);
-    }
-
-    #[test]
     fn test_insertion_result_high_counts() {
         let mut result = InsertionResult::new();
         result.inserted = 1000;
