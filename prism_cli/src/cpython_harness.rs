@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
@@ -19,18 +19,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_WORKDIR_COMPONENT_LEN: usize = 80;
 const BOOTSTRAP_SCRIPT_NAME: &str = "bootstrap.py";
-const SPLIT_TEST_DIRS: &[&str] = &[
-    "test_asyncio",
-    "test_concurrent_futures",
-    "test_doctests",
-    "test_future_stmt",
-    "test_gdb",
-    "test_inspect",
-    "test_multiprocessing_fork",
-    "test_multiprocessing_forkserver",
-    "test_multiprocessing_spawn",
-    "test_pydoc",
-];
+const TESTS_DIR_NAME: &str = "tests";
+const CPYTHON_TEST_PACKAGE: &str = "test";
+const LIBREGRTTEST_FINDTESTS: &str = "libregrtest/findtests.py";
+const SPLIT_TEST_DIRS_NAME: &str = "SPLITTESTDIRS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerMode {
@@ -66,7 +58,7 @@ pub struct PrismCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliArgs {
-    pub cpython_root: PathBuf,
+    pub cpython_root: Option<PathBuf>,
     pub prism_executable: Option<PathBuf>,
     pub prism_args: Vec<String>,
     pub lib_dir: Option<PathBuf>,
@@ -86,7 +78,7 @@ pub struct CliArgs {
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
-            cpython_root: PathBuf::new(),
+            cpython_root: None,
             prism_executable: None,
             prism_args: Vec::new(),
             lib_dir: None,
@@ -251,27 +243,22 @@ enum ChildOutcome {
     TimedOut,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestLayout {
+    lib_dir: PathBuf,
+    test_dir: PathBuf,
+    search_root: PathBuf,
+    prefix_test_package: bool,
+}
+
 impl HarnessConfig {
     pub fn from_cli(args: &CliArgs) -> Result<Self, HarnessError> {
-        let cpython_root = canonicalize_existing_dir(&args.cpython_root, "CPython root")?;
-        let lib_dir = args
-            .lib_dir
-            .clone()
-            .unwrap_or_else(|| cpython_root.join("Lib"));
-        let lib_dir = canonicalize_existing_dir(&lib_dir, "CPython Lib directory")?;
-
-        let test_dir = args
-            .test_dir
-            .clone()
-            .unwrap_or_else(|| lib_dir.join("test"));
-        let test_dir = canonicalize_existing_dir(&test_dir, "CPython test directory")?;
-
-        let prefix_test_package = test_dir == lib_dir.join("test");
-        let search_root = if prefix_test_package {
-            lib_dir.clone()
-        } else {
-            test_dir.clone()
-        };
+        let TestLayout {
+            lib_dir,
+            test_dir,
+            search_root,
+            prefix_test_package,
+        } = resolve_test_layout(args)?;
 
         let prism_command = PrismCommand {
             executable: args
@@ -281,7 +268,7 @@ impl HarnessConfig {
             prefix_args: args.prism_args.clone(),
         };
 
-        if !prism_command.executable.is_file() {
+        if !args.list_tests && !prism_command.executable.is_file() {
             return Err(HarnessError::InvalidConfiguration(format!(
                 "Prism executable does not exist: {}",
                 prism_command.executable.display()
@@ -392,7 +379,7 @@ pub fn parse_cli_action(raw_args: &[String]) -> Result<CliAction, HarnessError> 
             "-V" | "--version" => return Ok(CliAction::Version),
             "--cpython-root" => {
                 index += 1;
-                parsed.cpython_root = required_path_value(raw_args, index, "--cpython-root")?;
+                parsed.cpython_root = Some(required_path_value(raw_args, index, "--cpython-root")?);
             }
             "--lib-dir" => {
                 index += 1;
@@ -450,27 +437,21 @@ pub fn parse_cli_action(raw_args: &[String]) -> Result<CliAction, HarnessError> 
         index += 1;
     }
 
-    if parsed.cpython_root.as_os_str().is_empty() {
-        return Err(HarnessError::Argument(
-            "missing required option --cpython-root <path>".to_string(),
-        ));
-    }
-
     Ok(CliAction::Run(parsed))
 }
 
 pub fn help_text() -> String {
     format!(
         "\
-usage: prism-test --cpython-root <path> [options] [test_name ...]
+usage: prism-test [options] [test_name ...]
 
 Run Prism against the CPython regression test corpus using CPython-style
 test discovery and Prism subprocess isolation.
 
 options:
-  --cpython-root <path>  Path to the CPython source checkout
-  --lib-dir <path>       Override the stdlib root (defaults to <root>/Lib)
-  --testdir <path>       Override the regression test directory
+  --cpython-root <path>  Optional CPython source checkout (uses <root>/Lib/test)
+  --lib-dir <path>       Override the CPython import root (defaults to vendored tests/{})
+  --testdir <path>       Override the regression test package directory
   --prism <path>         Path to the Prism executable (defaults to sibling prism binary)
   --prism-arg <arg>      Extra argument passed to the Prism executable
   --runner <mode>        One of: import, suite, test-main (default: suite)
@@ -483,7 +464,8 @@ options:
   -v, --verbose          Print captured output for passing tests
   -q, --quiet            Suppress per-test success lines
   -h, --help             Show this help message
-  -V, --version          Print Prism test harness version"
+  -V, --version          Print Prism test harness version",
+        vendored_cpython_dir_name()
     )
 }
 
@@ -646,9 +628,185 @@ fn is_python_env_var(name: &OsString) -> bool {
     name.to_string_lossy().starts_with("PYTHON")
 }
 
+fn resolve_test_layout(args: &CliArgs) -> Result<TestLayout, HarnessError> {
+    let configured_lib_dir = match (&args.lib_dir, &args.cpython_root) {
+        (Some(lib_dir), _) => canonicalize_existing_dir(lib_dir, "CPython import root")?,
+        (None, Some(cpython_root)) => {
+            let cpython_root = canonicalize_existing_dir(cpython_root, "CPython root")?;
+            canonicalize_existing_dir(&cpython_root.join("Lib"), "CPython Lib directory")?
+        }
+        (None, None) => find_vendored_cpython_root()?,
+    };
+
+    let test_dir = match &args.test_dir {
+        Some(test_dir) => canonicalize_existing_dir(test_dir, "CPython test directory")?,
+        None => canonicalize_existing_dir(
+            &configured_lib_dir.join(CPYTHON_TEST_PACKAGE),
+            "CPython test directory",
+        )?,
+    };
+
+    validate_cpython_test_package(&test_dir)?;
+
+    let prefix_test_package = test_dir
+        .file_name()
+        .is_some_and(|name| name == OsStr::new(CPYTHON_TEST_PACKAGE));
+    let search_root = if prefix_test_package {
+        test_dir
+            .parent()
+            .ok_or_else(|| {
+                HarnessError::InvalidConfiguration(format!(
+                    "CPython test package has no parent import root: {}",
+                    test_dir.display()
+                ))
+            })?
+            .to_path_buf()
+    } else if args.test_dir.is_some() && args.lib_dir.is_none() && args.cpython_root.is_none() {
+        test_dir.clone()
+    } else {
+        configured_lib_dir.clone()
+    };
+    let search_root = canonicalize_existing_dir(&search_root, "CPython import root")?;
+
+    Ok(TestLayout {
+        lib_dir: search_root.clone(),
+        test_dir,
+        search_root,
+        prefix_test_package,
+    })
+}
+
+fn validate_cpython_test_package(test_dir: &Path) -> Result<(), HarnessError> {
+    if !test_dir.join("__init__.py").is_file() || !test_dir.join("support").is_dir() {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "CPython regression tests must be a test package with support helpers: {}",
+            test_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn find_vendored_cpython_root() -> Result<PathBuf, HarnessError> {
+    let version_dir = vendored_cpython_dir_name();
+    for start in default_search_starts() {
+        for ancestor in start.ancestors() {
+            let candidate = ancestor.join(TESTS_DIR_NAME).join(&version_dir);
+            if candidate
+                .join(CPYTHON_TEST_PACKAGE)
+                .join("__init__.py")
+                .is_file()
+            {
+                return canonicalize_existing_dir(&candidate, "vendored CPython test root");
+            }
+        }
+    }
+
+    Err(HarnessError::InvalidConfiguration(format!(
+        "could not find vendored CPython regression tests at {}/{}/{}",
+        TESTS_DIR_NAME, version_dir, CPYTHON_TEST_PACKAGE
+    )))
+}
+
+fn vendored_cpython_dir_name() -> String {
+    format!(
+        "cpython_{}.{}",
+        prism_core::PYTHON_VERSION.0,
+        prism_core::PYTHON_VERSION.1
+    )
+}
+
+fn default_search_starts() -> Vec<PathBuf> {
+    let mut starts = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        push_unique_path(&mut starts, current_dir);
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            push_unique_path(&mut starts, parent.to_path_buf());
+        }
+    }
+    starts
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| existing == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn load_split_test_dirs(test_dir: &Path) -> Result<BTreeSet<String>, HarnessError> {
+    let findtests_path = test_dir.join(LIBREGRTTEST_FINDTESTS);
+    match fs::read_to_string(&findtests_path) {
+        Ok(source) => Ok(parse_split_test_dirs(&source)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(source) => Err(HarnessError::io(
+            "failed to read CPython findtests.py",
+            source,
+        )),
+    }
+}
+
+fn parse_split_test_dirs(source: &str) -> BTreeSet<String> {
+    let mut split_test_dirs = BTreeSet::new();
+    let mut in_split_set = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !in_split_set {
+            in_split_set = trimmed.starts_with(SPLIT_TEST_DIRS_NAME) && trimmed.contains('{');
+            if !in_split_set {
+                continue;
+            }
+        }
+
+        collect_python_string_literals(trimmed, &mut split_test_dirs);
+
+        if trimmed.contains('}') {
+            break;
+        }
+    }
+
+    split_test_dirs
+}
+
+fn collect_python_string_literals(line: &str, output: &mut BTreeSet<String>) {
+    let mut chars = line.char_indices();
+    while let Some((start_index, ch)) = chars.next() {
+        if ch != '"' && ch != '\'' {
+            continue;
+        }
+
+        let quote = ch;
+        let content_start = start_index + quote.len_utf8();
+        let mut escaped = false;
+        for (end_index, current) in line[content_start..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if current == '\\' {
+                escaped = true;
+                continue;
+            }
+            if current == quote {
+                let content_end = content_start + end_index;
+                output.insert(line[content_start..content_end].to_string());
+                break;
+            }
+        }
+    }
+}
+
 fn discover_tests(config: &HarnessConfig) -> Result<Vec<DiscoveredTest>, HarnessError> {
     let mut tests = Vec::new();
-    discover_tests_inner(&config.test_dir, "", config.prefix_test_package, &mut tests)?;
+    let split_test_dirs = load_split_test_dirs(&config.test_dir)?;
+    discover_tests_inner(
+        &config.test_dir,
+        "",
+        config.prefix_test_package,
+        &split_test_dirs,
+        &mut tests,
+    )?;
     tests.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(tests)
 }
@@ -657,6 +815,7 @@ fn discover_tests_inner(
     directory: &Path,
     base_mod: &str,
     prefix_test_package: bool,
+    split_test_dirs: &BTreeSet<String>,
     discovered: &mut Vec<DiscoveredTest>,
 ) -> Result<(), HarnessError> {
     let mut entries = fs::read_dir(directory)
@@ -683,21 +842,29 @@ fn discover_tests_inner(
             format!("{base_mod}.{stem}")
         };
 
-        if split_test_dir_names().contains(fullname.as_str()) && file_type.is_dir() {
+        if split_test_dirs.contains(&fullname) && file_type.is_dir() {
             let nested_base = if base_mod.is_empty() {
                 if prefix_test_package {
-                    format!("test.{stem}")
+                    format!("{CPYTHON_TEST_PACKAGE}.{stem}")
                 } else {
                     stem.to_string()
                 }
             } else {
                 fullname
             };
-            discover_tests_inner(&path, &nested_base, prefix_test_package, discovered)?;
+            discover_tests_inner(
+                &path,
+                &nested_base,
+                prefix_test_package,
+                split_test_dirs,
+                discovered,
+            )?;
             continue;
         }
 
-        if extension == Some("py") || (extension.is_none() && file_type.is_dir()) {
+        if extension == Some("py")
+            || (extension.is_none() && file_type.is_dir() && path.join("__init__.py").is_file())
+        {
             let module = resolve_module_name(&fullname, prefix_test_package);
             discovered.push(DiscoveredTest {
                 name: fullname,
@@ -732,12 +899,10 @@ fn select_tests(
 
     if let Some(start_name) = start {
         let start_name = strip_py_suffix(start_name);
-        let Some(start_index) = selected.iter().position(|test| {
-            test.name == start_name
-                || test.module == start_name
-                || test.name.starts_with(&(start_name.clone() + "."))
-                || test.module.starts_with(&(start_name.clone() + "."))
-        }) else {
+        let Some(start_index) = selected
+            .iter()
+            .position(|test| test_matches_selector(test, &start_name))
+        else {
             return Err(HarnessError::UnknownTest(format!(
                 "start test not found in selection: {start_name}"
             )));
@@ -756,27 +921,16 @@ fn expand_requested_test(
 
     let exact = discovered
         .iter()
-        .filter(|test| test.name == requested || test.module == requested)
+        .filter(|test| test_matches_exact_selector(test, &requested))
         .cloned()
         .collect::<Vec<_>>();
     if !exact.is_empty() {
         return Ok(exact);
     }
 
-    let prefixed = if requested.starts_with("test.") {
-        requested.clone()
-    } else {
-        format!("test.{requested}")
-    };
-
     let expanded = discovered
         .iter()
-        .filter(|test| {
-            test.name.starts_with(&(requested.clone() + "."))
-                || test.module.starts_with(&(requested.clone() + "."))
-                || test.name.starts_with(&(prefixed.clone() + "."))
-                || test.module.starts_with(&(prefixed.clone() + "."))
-        })
+        .filter(|test| test_matches_prefix_selector(test, &requested))
         .cloned()
         .collect::<Vec<_>>();
     if !expanded.is_empty() {
@@ -786,6 +940,32 @@ fn expand_requested_test(
     Err(HarnessError::UnknownTest(format!(
         "requested test not found: {requested}"
     )))
+}
+
+fn test_matches_selector(test: &DiscoveredTest, selector: &str) -> bool {
+    test_matches_exact_selector(test, selector) || test_matches_prefix_selector(test, selector)
+}
+
+fn test_matches_exact_selector(test: &DiscoveredTest, selector: &str) -> bool {
+    test.name == selector
+        || test.module == selector
+        || (!selector.starts_with("test.")
+            && (test.name == format!("{CPYTHON_TEST_PACKAGE}.{selector}")
+                || test.module == format!("{CPYTHON_TEST_PACKAGE}.{selector}")))
+}
+
+fn test_matches_prefix_selector(test: &DiscoveredTest, selector: &str) -> bool {
+    let selector_prefix = format!("{selector}.");
+    if test.name.starts_with(&selector_prefix) || test.module.starts_with(&selector_prefix) {
+        return true;
+    }
+
+    if selector.starts_with("test.") {
+        return false;
+    }
+
+    let package_prefix = format!("{CPYTHON_TEST_PACKAGE}.{selector}.");
+    test.name.starts_with(&package_prefix) || test.module.starts_with(&package_prefix)
 }
 
 fn render_bootstrap_script(module_name: &str, runner: RunnerMode, verbose: bool) -> String {
@@ -1072,11 +1252,6 @@ fn strip_py_suffix(name: &str) -> String {
     }
 }
 
-fn split_test_dir_names() -> &'static BTreeSet<&'static str> {
-    static INIT: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| SPLIT_TEST_DIRS.iter().copied().collect())
-}
-
 fn default_work_root() -> PathBuf {
     let mut path = std::env::temp_dir();
     let stamp = SystemTime::now()
@@ -1124,4 +1299,156 @@ fn recreate_directory(path: &Path) -> Result<(), HarnessError> {
     }
     fs::create_dir_all(path)
         .map_err(|source| HarnessError::io("failed to create per-test work directory", source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_does_not_require_external_cpython_root() {
+        let args = vec!["--list-tests".to_string()];
+        let action = parse_cli_action(&args).expect("parse prism-test args");
+
+        let CliAction::Run(parsed) = action else {
+            panic!("expected run action");
+        };
+        assert!(parsed.cpython_root.is_none());
+        assert!(parsed.list_tests);
+    }
+
+    #[test]
+    fn config_finds_vendored_cpython_tests_by_default() {
+        let args = CliArgs {
+            prism_executable: Some(std::env::current_exe().expect("current test executable")),
+            ..CliArgs::default()
+        };
+        let config = HarnessConfig::from_cli(&args).expect("resolve vendored CPython tests");
+
+        assert!(
+            config
+                .search_root
+                .ends_with(Path::new(TESTS_DIR_NAME).join(vendored_cpython_dir_name()))
+        );
+        assert_eq!(
+            config.test_dir.file_name(),
+            Some(OsStr::new(CPYTHON_TEST_PACKAGE))
+        );
+        assert!(config.prefix_test_package);
+    }
+
+    #[test]
+    fn discovery_follows_cpython_top_level_test_packages() {
+        let root = unique_temp_dir("prism-cpython-harness-discovery");
+        let test_dir = root.join(CPYTHON_TEST_PACKAGE);
+        fs::create_dir_all(test_dir.join("support")).expect("create support package");
+        fs::create_dir_all(test_dir.join("test_pkg")).expect("create test package");
+        fs::write(test_dir.join("__init__.py"), "").expect("write package marker");
+        fs::write(test_dir.join("support").join("__init__.py"), "").expect("write support marker");
+        fs::write(test_dir.join("test_alpha.py"), "").expect("write module test");
+        fs::write(test_dir.join("test_pkg").join("__init__.py"), "").expect("write package test");
+        fs::write(test_dir.join("test_pkg").join("test_nested.py"), "").expect("write nested test");
+
+        let config = HarnessConfig {
+            prism_command: PrismCommand {
+                executable: PathBuf::from("unused"),
+                prefix_args: Vec::new(),
+            },
+            lib_dir: root.clone(),
+            test_dir,
+            search_root: root.clone(),
+            work_root: root.join("work"),
+            prefix_test_package: true,
+            runner: RunnerMode::Suite,
+            timeout: None,
+            fail_fast: false,
+            verbose: false,
+            quiet: true,
+            json_report: None,
+        };
+
+        let tests = discover_tests(&config).expect("discover tests");
+        let names = tests
+            .iter()
+            .map(|test| test.name.as_str())
+            .collect::<Vec<_>>();
+        let modules = tests
+            .iter()
+            .map(|test| test.module.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["test_alpha", "test_pkg"]);
+        assert_eq!(modules, vec!["test.test_alpha", "test.test_pkg"]);
+
+        fs::remove_dir_all(root).expect("remove temp discovery tree");
+    }
+
+    #[test]
+    fn discovery_reads_cpython_split_dirs_from_vendored_findtests() {
+        let root = unique_temp_dir("prism-cpython-harness-split-discovery");
+        let test_dir = root.join(CPYTHON_TEST_PACKAGE);
+        let package_dir = test_dir.join("test_pkg");
+        fs::create_dir_all(test_dir.join("support")).expect("create support package");
+        fs::create_dir_all(test_dir.join("libregrtest")).expect("create libregrtest package");
+        fs::create_dir_all(&package_dir).expect("create split package");
+        fs::write(test_dir.join("__init__.py"), "").expect("write package marker");
+        fs::write(test_dir.join("support").join("__init__.py"), "").expect("write support marker");
+        fs::write(
+            test_dir.join("libregrtest").join("findtests.py"),
+            "SPLITTESTDIRS: set[str] = {\n    \"test_pkg\",\n}\n",
+        )
+        .expect("write split discovery source");
+        fs::write(package_dir.join("__init__.py"), "").expect("write split package marker");
+        fs::write(package_dir.join("test_nested.py"), "").expect("write nested test");
+
+        let config = HarnessConfig {
+            prism_command: PrismCommand {
+                executable: PathBuf::from("unused"),
+                prefix_args: Vec::new(),
+            },
+            lib_dir: root.clone(),
+            test_dir,
+            search_root: root.clone(),
+            work_root: root.join("work"),
+            prefix_test_package: true,
+            runner: RunnerMode::Suite,
+            timeout: None,
+            fail_fast: false,
+            verbose: false,
+            quiet: true,
+            json_report: None,
+        };
+
+        let tests = discover_tests(&config).expect("discover split package tests");
+
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].name, "test.test_pkg.test_nested");
+        assert_eq!(tests[0].module, "test.test_pkg.test_nested");
+
+        let selected = select_tests(&tests, &[String::from("test_pkg")], Some("test_pkg"))
+            .expect("select split package tests using shorthand selector");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "test.test_pkg.test_nested");
+
+        fs::remove_dir_all(root).expect("remove temp split discovery tree");
+    }
+
+    #[test]
+    fn list_only_config_does_not_require_prism_executable() {
+        let args = CliArgs {
+            list_tests: true,
+            prism_executable: Some(PathBuf::from("missing-prism-executable")),
+            ..CliArgs::default()
+        };
+
+        HarnessConfig::from_cli(&args).expect("resolve list-only config");
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{stamp}", std::process::id()))
+    }
 }
