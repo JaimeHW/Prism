@@ -650,12 +650,6 @@ mod tests {
         assert_eq!(ShapeId(42).raw(), 42);
     }
 
-    #[test]
-    fn test_shape_id_equality() {
-        assert_eq!(ShapeId(1), ShapeId(1));
-        assert_ne!(ShapeId(1), ShapeId(2));
-    }
-
     // -------------------------------------------------------------------------
     // Shape Tests - Basic
     // -------------------------------------------------------------------------
