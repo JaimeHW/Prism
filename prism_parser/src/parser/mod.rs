@@ -409,34 +409,78 @@ impl<'src> Parser<'src> {
         self.panic_mode = false;
 
         while !self.check(TokenKind::Eof) {
-            // Stop at newlines (end of statement)
-            if self.previous.kind == TokenKind::Newline {
+            if self.previous.kind == TokenKind::Newline && self.current_can_start_statement() {
                 return;
             }
 
-            // Stop at statement-starting keywords
-            if let TokenKind::Keyword(kw) = &self.current.kind {
-                match kw {
-                    Keyword::Class
-                    | Keyword::Def
-                    | Keyword::For
-                    | Keyword::If
-                    | Keyword::While
-                    | Keyword::Return
-                    | Keyword::Import
-                    | Keyword::From
-                    | Keyword::Try
-                    | Keyword::With => return,
-                    _ => {}
-                }
-            }
-
-            if self.check_identifier_value("match") || self.check_identifier_value("type") {
+            if self.current_can_start_compound_statement() {
                 return;
             }
 
             self.advance();
         }
+    }
+
+    #[inline]
+    fn current_can_start_statement(&self) -> bool {
+        self.current_can_start_compound_statement()
+            || matches!(
+                &self.current.kind,
+                TokenKind::Int(_)
+                    | TokenKind::BigInt(_)
+                    | TokenKind::Float(_)
+                    | TokenKind::Complex(_)
+                    | TokenKind::String(_)
+                    | TokenKind::FString(_)
+                    | TokenKind::Bytes(_)
+                    | TokenKind::Ident(_)
+                    | TokenKind::Minus
+                    | TokenKind::Plus
+                    | TokenKind::Tilde
+                    | TokenKind::LeftParen
+                    | TokenKind::LeftBracket
+                    | TokenKind::LeftBrace
+                    | TokenKind::Star
+                    | TokenKind::Ellipsis
+                    | TokenKind::At
+                    | TokenKind::Keyword(
+                        Keyword::Assert
+                            | Keyword::Await
+                            | Keyword::Break
+                            | Keyword::Continue
+                            | Keyword::Del
+                            | Keyword::False
+                            | Keyword::Global
+                            | Keyword::Import
+                            | Keyword::Lambda
+                            | Keyword::None
+                            | Keyword::Nonlocal
+                            | Keyword::Not
+                            | Keyword::Pass
+                            | Keyword::Raise
+                            | Keyword::Return
+                            | Keyword::True
+                            | Keyword::Yield
+                    )
+            )
+    }
+
+    #[inline]
+    fn current_can_start_compound_statement(&self) -> bool {
+        matches!(
+            &self.current.kind,
+            TokenKind::Keyword(
+                Keyword::Class
+                    | Keyword::Def
+                    | Keyword::For
+                    | Keyword::If
+                    | Keyword::Try
+                    | Keyword::While
+                    | Keyword::With
+                    | Keyword::Async
+            )
+        ) || self.check_identifier_value("match")
+            || self.check_identifier_value("type")
     }
 }
 
@@ -973,5 +1017,23 @@ mod tests {
     fn test_precedence_next() {
         assert_eq!(Precedence::Additive.next(), Precedence::Multiplicative);
         assert_eq!(Precedence::Primary.next(), Precedence::Primary);
+    }
+
+    #[test]
+    fn test_missing_compound_colon_reports_syntax_error() {
+        let err = parse("if True\n    pass\n").expect_err("missing colon should fail");
+        assert!(
+            err.to_string().contains("expected ':'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_recovery_skips_orphaned_indent_after_syntax_error() {
+        let err = parse("if True\n    pass\nx = 1\n").expect_err("missing colon should fail");
+        assert!(
+            err.to_string().contains("expected ':'"),
+            "unexpected error: {err}"
+        );
     }
 }
