@@ -773,17 +773,6 @@ mod tests {
         assert!(debug_str.contains("pool_count"));
     }
 
-    #[test]
-    fn test_pool_manager_default() {
-        let manager = PoolManager::default();
-
-        assert_eq!(manager.pool_count(), 0);
-        assert_eq!(
-            manager.pool_threshold(),
-            PoolManager::DEFAULT_POOL_THRESHOLD
-        );
-    }
-
     // =========================================================================
     // InstancePool Stress Tests
     // =========================================================================

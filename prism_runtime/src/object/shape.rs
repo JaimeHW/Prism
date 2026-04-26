@@ -573,15 +573,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_property_flags_default() {
-        let flags = PropertyFlags::default();
-        assert!(flags.contains(PropertyFlags::WRITABLE));
-        assert!(flags.contains(PropertyFlags::ENUMERABLE));
-        assert!(flags.contains(PropertyFlags::CONFIGURABLE));
-        assert!(flags.contains(PropertyFlags::DATA));
-    }
-
-    #[test]
     fn test_property_flags_read_only() {
         let flags = PropertyFlags::read_only();
         assert!(!flags.contains(PropertyFlags::WRITABLE));

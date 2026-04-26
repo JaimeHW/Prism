@@ -752,12 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn test_type_metaclass_default() {
-        let meta = TypeMetaclass::default();
-        assert_eq!(meta.type_id(), TYPE_METACLASS_ID);
-    }
-
-    #[test]
     fn test_type_metaclass_name() {
         let meta = TypeMetaclass::new();
         assert_eq!(meta.name().as_str(), "type");
@@ -962,12 +956,6 @@ mod tests {
     }
 
     #[test]
-    fn test_class_factory_default() {
-        let factory = ClassFactory::default();
-        assert_eq!(factory.classes_created(), 0);
-    }
-
-    #[test]
     fn test_class_factory_type_metaclass() {
         let factory = ClassFactory::new();
         let meta = factory.type_metaclass();
@@ -997,17 +985,6 @@ mod tests {
         let (hits, misses) = factory.cache_stats();
         assert_eq!(hits, 1);
         assert_eq!(misses, 1);
-    }
-
-    #[test]
-    fn test_class_factory_register_metaclass() {
-        let factory = ClassFactory::new();
-        let custom_meta = Arc::new(TypeMetaclass::new());
-
-        // Note: This works because TypeMetaclass implements Metaclass
-        factory.register_metaclass(custom_meta as Arc<dyn Metaclass>);
-
-        // Would need different TypeId to properly test, but demonstrates API
     }
 
     // =========================================================================

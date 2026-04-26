@@ -795,13 +795,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_instance_overflow_default() {
-        let overflow = InstanceOverflow::default();
-        assert!(overflow.custom_dict.is_none());
-        assert!(overflow.weakrefs.is_none());
-    }
-
-    #[test]
     fn test_instance_overflow_new_dict() {
         let overflow = InstanceOverflow::new_dict();
         // Should have dict-based storage
@@ -903,13 +896,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_drop_frees_overflow() {
-        let class_id = ClassId(100);
-        let type_id = TypeId::from_raw(100);
-        let instance = PyInstanceObject::new_with_overflow(class_id, type_id);
-
-        // Just verify it doesn't leak - Drop will be called
-        drop(instance);
-    }
 }

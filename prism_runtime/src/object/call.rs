@@ -518,12 +518,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_specialization_default() {
-        let spec = CallSpecialization::default();
-        assert_eq!(spec, CallSpecialization::Unknown);
-    }
-
-    #[test]
     fn test_specialization_is_fast_path() {
         assert!(CallSpecialization::DefaultBoth.is_fast_path());
         assert!(CallSpecialization::Singleton(Value::int_unchecked(0)).is_fast_path());

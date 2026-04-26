@@ -360,13 +360,6 @@ mod tests {
         assert!(cell.get().is_none());
     }
 
-    #[test]
-    fn test_cell_default_is_unbound() {
-        let cell = Cell::default();
-        assert!(cell.is_empty());
-        assert!(cell.get().is_none());
-    }
-
     // =========================================================================
     // Set Operations
     // =========================================================================

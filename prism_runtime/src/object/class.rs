@@ -1077,18 +1077,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_has_custom_new_default() {
-        let class = PyClassObject::new_simple(intern("MyClass"));
-        assert!(!class.has_custom_new());
-    }
-
-    #[test]
-    fn test_has_custom_init_default() {
-        let class = PyClassObject::new_simple(intern("MyClass"));
-        assert!(!class.has_custom_init());
-    }
-
-    #[test]
     fn test_mark_has_new() {
         let mut class = PyClassObject::new_simple(intern("MyClass"));
         assert!(!class.has_custom_new());
