@@ -110,6 +110,21 @@ fn expr_kind_name(kind: &ExprKind) -> &'static str {
     }
 }
 
+fn pattern_kind_name(kind: &prism_parser::ast::PatternKind) -> &'static str {
+    use prism_parser::ast::PatternKind;
+
+    match kind {
+        PatternKind::MatchValue(_) => "MatchValue",
+        PatternKind::MatchSingleton(_) => "MatchSingleton",
+        PatternKind::MatchSequence(_) => "MatchSequence",
+        PatternKind::MatchMapping { .. } => "MatchMapping",
+        PatternKind::MatchClass { .. } => "MatchClass",
+        PatternKind::MatchStar(_) => "MatchStar",
+        PatternKind::MatchAs { .. } => "MatchAs",
+        PatternKind::MatchOr(_) => "MatchOr",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SourceLineMap {
     line_starts: Arc<[u32]>,
@@ -232,6 +247,8 @@ struct FinallyContext {
     return_label: Label,
     /// Register that carries the pending return value into `return_label`.
     return_value_reg: Register,
+    /// True once a return statement has targeted `return_label`.
+    return_used: bool,
     /// Break/continue continuations that need this finally body before jumping.
     jump_continuations: SmallVec<[FinallyJumpContinuation; 4]>,
 }
@@ -478,10 +495,12 @@ impl Compiler {
 
     /// Emit a return, routing it through active finally blocks when needed.
     fn emit_return_value(&mut self, value_reg: Register) {
-        if let Some(finally_ctx) = self.finally_stack.last() {
-            self.builder
-                .emit_move(finally_ctx.return_value_reg, value_reg);
-            self.builder.emit_jump(finally_ctx.return_label);
+        if let Some(finally_ctx) = self.finally_stack.last_mut() {
+            finally_ctx.return_used = true;
+            let return_value_reg = finally_ctx.return_value_reg;
+            let return_label = finally_ctx.return_label;
+            self.builder.emit_move(return_value_reg, value_reg);
+            self.builder.emit_jump(return_label);
         } else {
             self.builder.emit_return(value_reg);
         }
@@ -489,9 +508,12 @@ impl Compiler {
 
     /// Emit `return None`, routing it through active finally blocks when needed.
     fn emit_return_none_value(&mut self) {
-        if let Some(finally_ctx) = self.finally_stack.last() {
-            self.builder.emit_load_none(finally_ctx.return_value_reg);
-            self.builder.emit_jump(finally_ctx.return_label);
+        if let Some(finally_ctx) = self.finally_stack.last_mut() {
+            finally_ctx.return_used = true;
+            let return_value_reg = finally_ctx.return_value_reg;
+            let return_label = finally_ctx.return_label;
+            self.builder.emit_load_none(return_value_reg);
+            self.builder.emit_jump(return_label);
         } else {
             self.builder.emit_return_none();
         }
@@ -548,6 +570,43 @@ impl Compiler {
         self.builder
             .emit_call_method(exit_result_reg, exit_method_reg, 3);
         self.builder.free_register(exit_result_reg);
+    }
+
+    /// Emit an awaited non-exceptional async context-manager exit call.
+    fn emit_async_context_exit_none(&mut self, aexit_method_reg: Register) {
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(aexit_method_reg.0 + 2),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(aexit_method_reg.0 + 3),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(aexit_method_reg.0 + 4),
+        ));
+
+        let aexit_awaitable_reg = self.builder.alloc_register();
+        self.builder
+            .emit_call_method(aexit_awaitable_reg, aexit_method_reg, 3);
+
+        let aexit_result_reg = self.builder.alloc_register();
+        self.builder.emit(Instruction::op_ds(
+            Opcode::GetAwaitable,
+            aexit_result_reg,
+            aexit_awaitable_reg,
+        ));
+        self.builder.free_register(aexit_awaitable_reg);
+        self.emit_yield_from(aexit_result_reg, aexit_result_reg);
+        self.builder.free_register(aexit_result_reg);
+    }
+
+    /// Emit the concrete class load used for context-manager exception exits.
+    #[inline]
+    fn emit_exception_type_attr(&mut self, dst: Register, exception: Register) {
+        let class_name_idx = self.builder.add_name("__class__");
+        self.builder.emit_get_attr(dst, exception, class_name_idx);
     }
 
     /// Resolve a variable name to its location.
@@ -1616,6 +1675,22 @@ impl Compiler {
                 expr_kind_name(&expr.kind)
             ),
             line: self.line_for_span(expr.span),
+            column: 0,
+        }
+    }
+
+    #[inline]
+    fn unsupported_pattern_error(
+        &self,
+        pattern: &prism_parser::ast::Pattern,
+        reason: &'static str,
+    ) -> CompileError {
+        CompileError {
+            message: format!(
+                "unsupported pattern {}: {reason}",
+                pattern_kind_name(&pattern.kind)
+            ),
+            line: self.line_for_span(pattern.span),
             column: 0,
         }
     }
@@ -3304,6 +3379,7 @@ impl Compiler {
             self.finally_stack.push(FinallyContext {
                 return_label,
                 return_value_reg,
+                return_used: false,
                 jump_continuations: SmallVec::new(),
             });
         }
@@ -3539,9 +3615,13 @@ impl Compiler {
         }
 
         if let Some(cleanup_context) = cleanup_context {
-            self.builder.bind_label(cleanup_context.return_label);
-            self.compile_finally_cleanup_body(finalbody)?;
-            self.emit_return_value(cleanup_context.return_value_reg);
+            if cleanup_context.return_used {
+                self.builder.bind_label(cleanup_context.return_label);
+                self.compile_finally_cleanup_body(finalbody)?;
+                self.emit_return_value(cleanup_context.return_value_reg);
+            } else {
+                self.builder.free_register(cleanup_context.return_value_reg);
+            }
 
             for continuation in cleanup_context.jump_continuations {
                 self.builder.bind_label(continuation.cleanup_label);
@@ -3666,6 +3746,7 @@ impl Compiler {
         self.finally_stack.push(FinallyContext {
             return_label,
             return_value_reg,
+            return_used: false,
             jump_continuations: SmallVec::new(),
         });
 
@@ -3701,7 +3782,7 @@ impl Compiler {
         // __exit__(exc_type, exc, tb) compatibility with unittest/assertRaises.
         self.builder
             .emit(Instruction::op_d(Opcode::LoadException, exc_val_reg));
-        self.emit_named_call_from_regs("type", &[exc_val_reg], exc_type_reg)?;
+        self.emit_exception_type_attr(exc_type_reg, exc_val_reg);
         self.builder
             .emit(Instruction::op_d(Opcode::LoadNone, exc_tb_reg));
 
@@ -3744,9 +3825,13 @@ impl Compiler {
         self.builder.emit(Instruction::op(Opcode::ClearException));
         self.builder.emit_jump(end_label);
 
-        self.builder.bind_label(cleanup_context.return_label);
-        self.emit_context_exit_none(exit_method_reg);
-        self.emit_return_value(cleanup_context.return_value_reg);
+        if cleanup_context.return_used {
+            self.builder.bind_label(cleanup_context.return_label);
+            self.emit_context_exit_none(exit_method_reg);
+            self.emit_return_value(cleanup_context.return_value_reg);
+        } else {
+            self.builder.free_register(cleanup_context.return_value_reg);
+        }
 
         for continuation in cleanup_context.jump_continuations {
             self.builder.bind_label(continuation.cleanup_label);
@@ -3865,42 +3950,26 @@ impl Compiler {
         let try_start_pc = self.builder.current_pc();
         let cleanup_label = self.builder.create_label();
         let end_label = self.builder.create_label();
+        let return_label = self.builder.create_label();
+        let return_value_reg = self.builder.alloc_register();
+        self.finally_stack.push(FinallyContext {
+            return_label,
+            return_value_reg,
+            return_used: false,
+            jump_continuations: SmallVec::new(),
+        });
 
         // Step 8: Compile nested items and body
         self.compile_async_with_items(items, body, depth + 1)?;
 
         // Step 9: Normal exit path
         let try_end_pc = self.builder.current_pc();
+        let cleanup_context = self
+            .finally_stack
+            .pop()
+            .expect("async with statement should have an active cleanup context");
 
-        // Load three None values for __aexit__(None, None, None)
-        self.builder.emit(Instruction::op_d(
-            Opcode::LoadNone,
-            Register::new(aexit_method_reg.0 + 2),
-        ));
-        self.builder.emit(Instruction::op_d(
-            Opcode::LoadNone,
-            Register::new(aexit_method_reg.0 + 3),
-        ));
-        self.builder.emit(Instruction::op_d(
-            Opcode::LoadNone,
-            Register::new(aexit_method_reg.0 + 4),
-        ));
-
-        // Call __aexit__(None, None, None)
-        let aexit_awaitable_reg = self.builder.alloc_register();
-        self.builder
-            .emit_call_method(aexit_awaitable_reg, aexit_method_reg, 3);
-
-        // Await the __aexit__ result
-        let aexit_result_reg = self.builder.alloc_register();
-        self.builder.emit(Instruction::op_ds(
-            Opcode::GetAwaitable,
-            aexit_result_reg,
-            aexit_awaitable_reg,
-        ));
-        self.builder.free_register(aexit_awaitable_reg);
-        self.emit_yield_from(aexit_result_reg, aexit_result_reg);
-        self.builder.free_register(aexit_result_reg);
+        self.emit_async_context_exit_none(aexit_method_reg);
 
         // Jump to end (skip exception path)
         self.builder.emit_jump(end_label);
@@ -3919,7 +3988,7 @@ impl Compiler {
 
         self.builder
             .emit(Instruction::op_d(Opcode::LoadException, exc_val_reg));
-        self.emit_named_call_from_regs("type", &[exc_val_reg], exc_type_reg)?;
+        self.emit_exception_type_attr(exc_type_reg, exc_val_reg);
         self.builder
             .emit(Instruction::op_d(Opcode::LoadNone, exc_tb_reg));
 
@@ -3970,6 +4039,24 @@ impl Compiler {
 
         self.builder.bind_label(suppress_label);
         self.builder.emit(Instruction::op(Opcode::ClearException));
+        self.builder.emit_jump(end_label);
+
+        if cleanup_context.return_used {
+            self.builder.bind_label(cleanup_context.return_label);
+            self.emit_async_context_exit_none(aexit_method_reg);
+            self.emit_return_value(cleanup_context.return_value_reg);
+        } else {
+            self.builder.free_register(cleanup_context.return_value_reg);
+        }
+
+        for continuation in cleanup_context.jump_continuations {
+            self.builder.bind_label(continuation.cleanup_label);
+            self.emit_async_context_exit_none(aexit_method_reg);
+            self.emit_jump_through_finally_until(
+                continuation.target_label,
+                continuation.preserve_finally_depth,
+            );
+        }
 
         // Step 11: End label
         self.builder.bind_label(end_label);
@@ -4100,6 +4187,16 @@ impl Compiler {
             }
 
             PatternKind::MatchSequence(patterns) => {
+                if patterns
+                    .iter()
+                    .any(|sub_pattern| matches!(sub_pattern.kind, PatternKind::MatchStar(_)))
+                {
+                    return Err(self.unsupported_pattern_error(
+                        pattern,
+                        "sequence star patterns require variable-length slicing and rest binding semantics",
+                    ));
+                }
+
                 // Sequence pattern: [a, b, c]
                 // First check if subject is a sequence type using MatchSequence opcode
                 let is_seq_reg = self.builder.alloc_register();
@@ -4144,93 +4241,25 @@ impl Compiler {
                 }
             }
 
-            PatternKind::MatchMapping {
-                keys,
-                patterns,
-                rest,
-            } => {
-                // Mapping pattern: {"key": value, ...}
-                // First check if subject is a mapping type using MatchMapping opcode
-                let is_map_reg = self.builder.alloc_register();
-                crate::match_compiler::emit_match_mapping(
-                    &mut self.builder,
-                    is_map_reg,
-                    subject_reg,
-                );
-                self.builder.emit_jump_if_false(is_map_reg, fail_label);
-                self.builder.free_register(is_map_reg);
-
-                // TODO: MatchKeys requires consecutive register allocation for key tuple.
-                // For now, skip emitting MatchKeys and just check keys via GetItem.
-                // The MatchMapping type check ensures we have a mapping type.
-
-                // Match each key-value pair
-                for (key, sub_pattern) in keys.iter().zip(patterns.iter()) {
-                    let key_reg = self.compile_expr(key)?;
-                    let value_reg = self.builder.alloc_register();
-                    self.builder.emit_get_item(value_reg, subject_reg, key_reg);
-                    self.compile_pattern_match(sub_pattern, value_reg, fail_label)?;
-                    self.builder.free_register(value_reg);
-                    self.builder.free_register(key_reg);
-                }
-
-                // Handle rest binding if present
-                // TODO: CopyDictWithoutKeys requires consecutive register allocation for key tuple.
-                // For now, skip emitting CopyDictWithoutKeys - rest binding requires runtime support.
-                if rest.is_some() {
-                    // Future: emit CopyDictWithoutKeys opcode here
-                }
+            PatternKind::MatchMapping { .. } => {
+                return Err(self.unsupported_pattern_error(
+                    pattern,
+                    "mapping patterns require missing-key failure, duplicate-key validation, rest-copy allocation, and full mapping protocol semantics",
+                ));
             }
 
-            PatternKind::MatchClass {
-                cls,
-                patterns,
-                kwd_attrs,
-                kwd_patterns,
-            } => {
-                // Class pattern: ClassName(x, y, attr=z)
-                // First get the class object and check isinstance
-                let cls_reg = self.compile_expr(cls)?;
-
-                // Use MatchClass opcode to check isinstance and get match result
-                let match_result_reg = self.builder.alloc_register();
-                crate::match_compiler::emit_match_class(
-                    &mut self.builder,
-                    match_result_reg,
-                    subject_reg,
-                    cls_reg,
-                );
-                self.builder
-                    .emit_jump_if_false(match_result_reg, fail_label);
-                self.builder.free_register(match_result_reg);
-                self.builder.free_register(cls_reg);
-
-                // Match positional patterns via __match_args__
-                for (idx, sub_pattern) in patterns.iter().enumerate() {
-                    // For now, just use index - proper implementation needs __match_args__
-                    let idx_const = self.builder.add_int(idx as i64);
-                    let idx_reg = self.builder.alloc_register();
-                    self.builder.emit_load_const(idx_reg, idx_const);
-                    let elem_reg = self.builder.alloc_register();
-                    self.builder.emit_get_item(elem_reg, subject_reg, idx_reg);
-                    self.compile_pattern_match(sub_pattern, elem_reg, fail_label)?;
-                    self.builder.free_register(elem_reg);
-                    self.builder.free_register(idx_reg);
-                }
-
-                // Match keyword patterns via attributes
-                for (attr_name, sub_pattern) in kwd_attrs.iter().zip(kwd_patterns.iter()) {
-                    let attr_idx = self.builder.add_name(Arc::from(attr_name.as_ref()));
-                    let attr_reg = self.builder.alloc_register();
-                    self.builder.emit_get_attr(attr_reg, subject_reg, attr_idx);
-                    self.compile_pattern_match(sub_pattern, attr_reg, fail_label)?;
-                    self.builder.free_register(attr_reg);
-                }
+            PatternKind::MatchClass { .. } => {
+                return Err(self.unsupported_pattern_error(
+                    pattern,
+                    "class patterns require CPython-compatible isinstance, __match_args__, and descriptor-aware attribute matching",
+                ));
             }
 
             PatternKind::MatchStar(_name) => {
-                // Star pattern: *rest - captures remaining elements
-                // This is only valid inside sequence patterns (handled there)
+                return Err(self.unsupported_pattern_error(
+                    pattern,
+                    "star patterns are only valid inside fully implemented sequence patterns",
+                ));
             }
 
             PatternKind::MatchAs { pattern, name } => {
@@ -6539,7 +6568,7 @@ class Child(Base1, Base2):
     }
 
     #[test]
-    fn test_compile_build_class_moves_bases_into_contiguous_result_block() {
+    fn test_compile_build_class_compiles_bases_into_contiguous_result_block() {
         let code = compile(
             r#"
 class Child(Base1, Base2):
@@ -6555,20 +6584,17 @@ class Child(Base1, Base2):
             .expect("expected BUILD_CLASS instruction");
         let result_reg = build_class.dst().0;
 
-        let moved_base_regs: Vec<u8> = code.instructions[..build_index]
-            .iter()
-            .filter(|inst| inst.opcode() == Opcode::Move as u8)
-            .map(|inst| inst.dst().0)
-            .filter(|dst| *dst == result_reg + 1 || *dst == result_reg + 2)
-            .collect();
-
         assert!(
-            moved_base_regs.contains(&(result_reg + 1)),
-            "expected first base to be moved into BUILD_CLASS base slot"
+            code.instructions[..build_index].iter().any(|inst| {
+                inst.opcode() == Opcode::LoadGlobal as u8 && inst.dst().0 == result_reg + 1
+            }),
+            "expected first base to be compiled into BUILD_CLASS base slot"
         );
         assert!(
-            moved_base_regs.contains(&(result_reg + 2)),
-            "expected second base to be moved into BUILD_CLASS base slot"
+            code.instructions[..build_index].iter().any(|inst| {
+                inst.opcode() == Opcode::LoadGlobal as u8 && inst.dst().0 == result_reg + 2
+            }),
+            "expected second base to be compiled into BUILD_CLASS base slot"
         );
     }
 

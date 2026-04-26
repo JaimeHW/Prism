@@ -3,7 +3,7 @@
 //! Converts AST patterns to a flattened representation optimized for
 //! decision tree construction and matrix operations.
 
-use crate::compiler::CompileResult;
+use crate::compiler::{CompileError, CompileResult};
 use prism_parser::ast::{Expr, ExprKind, Pattern, PatternKind, Singleton};
 use std::sync::Arc;
 
@@ -265,14 +265,14 @@ fn flatten_value_pattern(expr: &Expr) -> CompileResult<FlatPattern> {
         ExprKind::Bytes(b) => Ok(FlatPattern::Literal(LiteralValue::Bytes(Arc::from(
             b.as_slice(),
         )))),
-        // For complex expressions (attribute access, etc.),
-        // we need runtime evaluation - store the expression
-        _ => {
-            // This handles patterns like `Color.RED`
-            Ok(FlatPattern::Literal(LiteralValue::String(Arc::from(
-                format!("{:?}", expr.kind),
-            ))))
-        }
+        _ => Err(CompileError {
+            message: format!(
+                "unsupported pattern value expression for decision-tree lowering: {:?}",
+                expr.kind
+            ),
+            line: 0,
+            column: 0,
+        }),
     }
 }
 
@@ -404,7 +404,14 @@ fn expr_to_literal_value(expr: &Expr) -> CompileResult<LiteralValue> {
         ExprKind::Float(f) => Ok(LiteralValue::Float(*f)),
         ExprKind::String(s) => Ok(LiteralValue::String(Arc::from(s.value.as_str()))),
         ExprKind::Bytes(b) => Ok(LiteralValue::Bytes(Arc::from(b.as_slice()))),
-        _ => Ok(LiteralValue::String(Arc::from(format!("{:?}", expr.kind)))),
+        _ => Err(CompileError {
+            message: format!(
+                "unsupported mapping-pattern key expression for decision-tree lowering: {:?}",
+                expr.kind
+            ),
+            line: 0,
+            column: 0,
+        }),
     }
 }
 
@@ -469,6 +476,19 @@ mod tests {
         let pat = make_pattern(PatternKind::MatchValue(Box::new(expr)));
         let (flat, _) = flatten(&pat).unwrap();
         assert!(matches!(flat, FlatPattern::Literal(LiteralValue::Int(42))));
+    }
+
+    #[test]
+    fn test_flatten_runtime_value_pattern_rejects_debug_string_placeholder() {
+        let expr = Expr::new(ExprKind::Name("Color.RED".to_string()), Span::new(0, 0));
+        let pat = make_pattern(PatternKind::MatchValue(Box::new(expr)));
+        let err = flatten(&pat).expect_err("runtime value patterns need explicit lowering");
+
+        assert!(
+            err.message
+                .contains("unsupported pattern value expression for decision-tree lowering"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

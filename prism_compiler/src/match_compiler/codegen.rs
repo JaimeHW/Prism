@@ -21,7 +21,7 @@ use super::decision_tree::{DecisionTree, SwitchCase};
 use super::matrix::Constructor;
 use super::pattern::{AccessPath, Binding, LiteralKey, LiteralValue};
 use crate::bytecode::{FunctionBuilder, Instruction, Label, Opcode, Register};
-use crate::compiler::CompileResult;
+use crate::compiler::{CompileError, CompileResult};
 use prism_parser::ast::Expr;
 use std::collections::HashMap;
 
@@ -206,10 +206,11 @@ impl SubjectCache {
                 builder.emit_load_const(reg, idx);
             }
             LiteralKey::Bytes(_b) => {
-                // Bytes constants are rarely used as mapping keys
-                // For now, create an empty string constant as placeholder
-                let idx = builder.add_string("");
-                builder.emit_load_const(reg, idx);
+                return Err(CompileError {
+                    message: "unsupported pattern bytes key: decision-tree lowering needs native bytes constants".to_string(),
+                    line: 0,
+                    column: 0,
+                });
             }
         }
 
@@ -610,10 +611,11 @@ fn load_literal_value(
             builder.emit_load_const(reg, idx);
         }
         LiteralValue::Bytes(_b) => {
-            // Bytes constants are rarely used as literal patterns
-            // For now, create an empty string constant as placeholder
-            let idx = builder.add_string("");
-            builder.emit_load_const(reg, idx);
+            return Err(CompileError {
+                message: "unsupported pattern bytes literal: decision-tree lowering needs native bytes constants".to_string(),
+                line: 0,
+                column: 0,
+            });
         }
     }
 
@@ -973,6 +975,15 @@ mod tests {
         assert_eq!(code.instructions.len(), 1);
         assert_eq!(code.instructions[0].opcode(), Opcode::LoadConst as u8);
         assert_eq!(code.instructions[0].dst(), reg);
+    }
+
+    #[test]
+    fn test_load_literal_bytes_rejects_placeholder_lowering() {
+        let mut builder = FunctionBuilder::new("test");
+        let err = load_literal_value(&mut builder, &LiteralValue::Bytes(Arc::from(&b"key"[..])))
+            .expect_err("bytes literals must not be lowered as placeholder strings");
+
+        assert!(err.message.contains("unsupported pattern bytes literal"));
     }
 
     #[test]

@@ -44,6 +44,18 @@ fn assert_compiles(source: &str) {
     let _ = compile(source);
 }
 
+/// Helper to assert that incomplete pattern forms fail loudly instead of
+/// producing bytecode with placeholder semantics.
+fn assert_rejects_unsupported_pattern(source: &str, pattern_name: &str) {
+    let module = parse(source).expect("Failed to parse");
+    let err = Compiler::compile_module(&module, "test.py")
+        .expect_err("unsupported pattern should be rejected");
+    assert!(
+        err.message.contains("unsupported pattern") && err.message.contains(pattern_name),
+        "unexpected compile error: {err:?}"
+    );
+}
+
 /// Helper to find opcode count in compiled code.
 fn count_opcodes(code: &prism_compiler::CodeObject, opcode: Opcode) -> usize {
     code.instructions
@@ -281,7 +293,7 @@ match data:
     case {"key": [x, y] as pair}:
         result = (pair, x, y)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -322,7 +334,7 @@ match data:
     case {"name": name, "age": age}:
         result = (name, age)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 // ============================================================================
@@ -381,7 +393,7 @@ match items:
     case [first, *middle, last]:
         result = (first, middle, last)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchSequence");
 }
 
 #[test]
@@ -391,7 +403,7 @@ match items:
     case [*rest, last]:
         result = (rest, last)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchSequence");
 }
 
 #[test]
@@ -401,7 +413,7 @@ match items:
     case [first, *rest]:
         result = (first, rest)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchSequence");
 }
 
 #[test]
@@ -411,7 +423,7 @@ match items:
     case [first, *_, last]:
         result = (first, last)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchSequence");
 }
 
 #[test]
@@ -473,8 +485,7 @@ match data:
     case {}:
         result = "empty dict"
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::MatchMapping) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -484,9 +495,7 @@ match data:
     case {"key": value}:
         result = value
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::MatchMapping) when codegen is wired
-    // TODO: assert_has_opcode(&code, Opcode::MatchKeys) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -496,7 +505,7 @@ match data:
     case {"name": name, "age": age, "city": city}:
         result = (name, age, city)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -508,7 +517,7 @@ match config:
     case {"debug": False}:
         result = "production mode"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -518,8 +527,7 @@ match data:
     case {"required": value, **rest}:
         result = (value, rest)
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::CopyDictWithoutKeys) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -529,7 +537,7 @@ match data:
     case {"key": value, **_}:
         result = value
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -539,7 +547,7 @@ match data:
     case {"outer": {"inner": value}}:
         result = value
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -549,7 +557,7 @@ match data:
     case {"items": [first, *rest]}:
         result = (first, rest)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -559,7 +567,7 @@ match data:
     case {0: zero, 1: one}:
         result = (zero, one)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -569,7 +577,7 @@ match data:
     case {"str": s, 1: one, True: t}:
         result = (s, one, t)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -581,7 +589,7 @@ match data:
     case {"required": req}:
         result = (req, None)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -591,7 +599,7 @@ match config:
     case {"database": {"host": host, "port": port}, "cache": {"enabled": True}}:
         result = (host, port)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 // ============================================================================
@@ -605,8 +613,7 @@ match obj:
     case Point():
         result = "is a point"
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::MatchClass) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -616,7 +623,7 @@ match point:
     case Point(x, y):
         result = x + y
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -626,7 +633,7 @@ match point:
     case Point(x=x, y=y):
         result = (x, y)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -636,7 +643,7 @@ match rect:
     case Rectangle(x, y, width=w, height=h):
         result = (x, y, w, h)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -650,7 +657,7 @@ match point:
     case Point(x, 0):
         result = "on x-axis"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -664,7 +671,7 @@ match value:
     case list():
         result = "list"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -674,7 +681,7 @@ match shape:
     case Circle(Point(x, y), radius):
         result = (x, y, radius)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -684,7 +691,7 @@ match point:
     case Point(x, y) if x > 0 and y > 0:
         result = "first quadrant"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -698,7 +705,7 @@ match event:
     case WindowResize(w, h):
         result = ("resize", w, h)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -712,7 +719,7 @@ match animal:
     case Animal(name=name):
         result = ("animal", name)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -724,7 +731,7 @@ match obj:
     case Circle(_, r):
         result = ("circle", r)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -736,7 +743,7 @@ match obj:
     case shapes.Circle(center, radius):
         result = (center, radius)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 // ============================================================================
@@ -806,7 +813,7 @@ match data:
     case {"type": "a" | "b"} | {"kind": "c" | "d"}:
         result = "matched"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -831,7 +838,7 @@ match event:
     case {"key": k} | {"char": k}:
         result = ("input", k)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 // ============================================================================
@@ -876,7 +883,7 @@ match items:
     case []:
         result = "no items"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchSequence");
 }
 
 #[test]
@@ -888,7 +895,7 @@ match data:
     case {"value": v}:
         result = "default"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -926,7 +933,7 @@ match s:
     case str() as text if text.endswith(".py"):
         result = "python file"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -964,7 +971,7 @@ match data:
     case {"level1": {"level2": {"level3": [x, y, z]}}}:
         result = (x, y, z)
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -1024,7 +1031,7 @@ def process(data):
         case _:
             return 0
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -1089,7 +1096,7 @@ match response:
     case _:
         result = "unknown"
 "#;
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 // ============================================================================
@@ -1114,8 +1121,7 @@ match data:
     case {"key": value}:
         result = value
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::MatchMapping) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -1125,8 +1131,7 @@ match obj:
     case Point(x, y):
         result = (x, y)
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::MatchClass) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchClass");
 }
 
 #[test]
@@ -1136,8 +1141,7 @@ match data:
     case {"k": v, **rest}:
         result = rest
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::CopyDictWithoutKeys) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]
@@ -1147,8 +1151,7 @@ match data:
     case {"a": x, "b": y}:
         result = (x, y)
 "#;
-    // TODO: assert_has_opcode(&code, Opcode::MatchKeys) when codegen is wired
-    assert_compiles(source);
+    assert_rejects_unsupported_pattern(source, "MatchMapping");
 }
 
 #[test]

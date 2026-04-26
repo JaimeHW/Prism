@@ -373,17 +373,21 @@ with mgr:
 }
 
 #[test]
-fn test_with_emits_call() {
+fn test_with_emits_call_method_without_generic_call() {
     let source = r#"
 with mgr:
     pass
 "#;
     let code = compile(source);
 
-    // Should emit Call for __enter__() and __exit__(...)
+    // Context-manager protocol calls use the LoadMethod/CallMethod fast path.
     assert!(
-        has_opcode(&code, Opcode::Call),
-        "With should emit Call opcodes for method invocations"
+        count_opcodes(&code, Opcode::CallMethod) >= 3,
+        "With should emit CallMethod for __enter__ and both __exit__ paths"
+    );
+    assert!(
+        !has_opcode(&code, Opcode::Call),
+        "With should not emit generic Call opcodes for context-manager protocol calls"
     );
 }
 
@@ -461,6 +465,67 @@ async def func():
         await y.process(data)
 "#;
     assert_compiles(source);
+}
+
+#[test]
+fn test_async_with_return_awaits_aexit_cleanup_path() {
+    let source = r#"
+async def func():
+    async with mgr:
+        return 42
+"#;
+    let code = compile(source);
+    let async_fn = code
+        .nested_code_objects
+        .first()
+        .expect("expected nested async function");
+
+    assert_eq!(
+        count_opcodes(async_fn, Opcode::CallMethod),
+        4,
+        "async with return should call __aenter__, normal __aexit__, exception __aexit__, and return-cleanup __aexit__"
+    );
+    assert_eq!(
+        count_opcodes(async_fn, Opcode::GetAwaitable),
+        4,
+        "async with return should await __aenter__ and every emitted __aexit__ cleanup path"
+    );
+    assert_eq!(
+        count_opcodes(async_fn, Opcode::YieldFrom),
+        4,
+        "async with return should suspend on __aenter__ and every emitted __aexit__ cleanup path"
+    );
+}
+
+#[test]
+fn test_async_with_loop_escape_awaits_aexit_cleanup_path() {
+    let source = r#"
+async def func():
+    while flag:
+        async with mgr:
+            break
+"#;
+    let code = compile(source);
+    let async_fn = code
+        .nested_code_objects
+        .first()
+        .expect("expected nested async function");
+
+    assert_eq!(
+        count_opcodes(async_fn, Opcode::CallMethod),
+        4,
+        "break escaping async with should route through an awaited __aexit__ cleanup path"
+    );
+    assert_eq!(
+        count_opcodes(async_fn, Opcode::GetAwaitable),
+        4,
+        "break escaping async with should await __aexit__ before jumping to the loop target"
+    );
+    assert_eq!(
+        count_opcodes(async_fn, Opcode::YieldFrom),
+        4,
+        "break escaping async with should suspend until __aexit__ completes"
+    );
 }
 
 // ============================================================================
