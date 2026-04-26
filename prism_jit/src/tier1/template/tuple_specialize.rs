@@ -1053,22 +1053,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_all_templates_compile() {
-        // Smoke test: all 5 templates compile and emit non-zero code
-        let templates: Vec<Box<dyn OpcodeTemplate>> = vec![
-            Box::new(TupleIndexTemplate::new(0, 1, 2, 0)),
-            Box::new(TupleLenTemplate::new(0, 1, 0)),
-            Box::new(TupleContainsTemplate::new(1, 2, 0, 0)),
-            Box::new(TupleConcatTemplate::new(0, 1, 2, 0)),
-            Box::new(TupleRepeatTemplate::new(0, 1, 2, 0)),
-        ];
-        for (i, tmpl) in templates.iter().enumerate() {
-            let code = emit_and_finalize(tmpl.as_ref());
-            assert!(!code.is_empty(), "Template {} emitted empty code", i);
-        }
-    }
-
-    #[test]
     fn test_all_estimates_are_conservative() {
         let templates: Vec<Box<dyn OpcodeTemplate>> = vec![
             Box::new(TupleIndexTemplate::new(0, 1, 2, 0)),

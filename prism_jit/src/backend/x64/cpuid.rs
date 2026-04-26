@@ -754,36 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn test_bmi_usually_with_avx2() {
-        let features = CpuFeatures::detect();
-
-        // On most modern CPUs, AVX2 comes with BMI1/BMI2
-        // (though this isn't strictly required)
-        if features.has_avx2() {
-            // Most Haswell+ CPUs have BMI
-            // This is informational, not a hard requirement
-            let _ = features.has_bmi1();
-            let _ = features.has_bmi2();
-        }
-    }
-
-    #[test]
     fn test_cpu_level_from_features() {
         // Test with baseline
         let baseline = CpuFeatures::baseline();
         assert_eq!(CpuLevel::from_features(&baseline), CpuLevel::Baseline);
-    }
-
-    #[test]
-    fn test_model_family_stepping() {
-        let features = CpuFeatures::detect();
-
-        // Should have reasonable values
-        let _family = features.family();
-        let _model = features.model();
-        let _stepping = features.stepping();
-
-        // All values are valid (0 is possible for virtual CPUs)
     }
 
     #[test]

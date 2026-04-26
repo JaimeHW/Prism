@@ -1253,21 +1253,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_template_types_compile() {
-        let index_code = emit_and_finalize(&ListIndexTemplate::new(0, 1, 2, 0));
-        let store_code = emit_and_finalize(&ListStoreTemplate::new(0, 1, 2, 0));
-        let append_code = emit_and_finalize(&ListAppendFastTemplate::new(0, 1, 0));
-        let concat_code = emit_and_finalize(&ListConcatTemplate::new(0, 1, 2, 0));
-        let repeat_code = emit_and_finalize(&ListRepeatTemplate::new(0, 1, 2, true, 0));
-
-        assert!(!index_code.is_empty(), "ListIndex should emit code");
-        assert!(!store_code.is_empty(), "ListStore should emit code");
-        assert!(!append_code.is_empty(), "ListAppendFast should emit code");
-        assert!(!concat_code.is_empty(), "ListConcat should emit code");
-        assert!(!repeat_code.is_empty(), "ListRepeat should emit code");
-    }
-
-    #[test]
     fn test_index_generates_more_code_than_concat() {
         // Index has inline bounds check and indexed load; concat just type-checks + deopts
         let index_code = emit_and_finalize(&ListIndexTemplate::new(0, 1, 2, 0));

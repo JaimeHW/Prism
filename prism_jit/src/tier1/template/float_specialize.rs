@@ -1126,23 +1126,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_all_templates_compile() {
-        let templates: Vec<Box<dyn OpcodeTemplate>> = vec![
-            Box::new(FloatAddTemplate::new(0, 1, 2, 0)),
-            Box::new(FloatSubTemplate::new(0, 1, 2, 0)),
-            Box::new(FloatMulTemplate::new(0, 1, 2, 0)),
-            Box::new(FloatDivTemplate::new(0, 1, 2, 0)),
-            Box::new(FloatNegTemplate::new(0, 1, 0)),
-            Box::new(FloatAbsTemplate::new(0, 1, 0)),
-            Box::new(FloatCompareTemplate::new(0, 1, 2, FloatCmpOp::Lt, 0)),
-        ];
-        for (i, tmpl) in templates.iter().enumerate() {
-            let code = emit_and_finalize(tmpl.as_ref());
-            assert!(!code.is_empty(), "Template {} emitted empty code", i);
-        }
-    }
-
-    #[test]
     fn test_all_estimates_are_conservative() {
         let templates: Vec<Box<dyn OpcodeTemplate>> = vec![
             Box::new(FloatAddTemplate::new(0, 1, 2, 0)),

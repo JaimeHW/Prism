@@ -534,21 +534,6 @@ fn test_ic_state_from_u8() {
     assert_eq!(IcState::from_u8(255), IcState::Megamorphic);
 }
 
-// =============================================================================
-// Performance Characteristics Tests
-// =============================================================================
-
-/// Test: Version check is O(1).
-#[test]
-fn test_version_check_performance() {
-    // Just verify the pattern - actual perf testing needs benchmarks
-    for _ in 0..10000 {
-        let v = ShapeVersion::current();
-        let _ = v.is_stale();
-        let _ = v.is_current();
-    }
-}
-
 /// Test: Multiple invalidators are independent.
 #[test]
 fn test_multiple_invalidators_independent() {
