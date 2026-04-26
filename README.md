@@ -186,21 +186,6 @@ cargo test --workspace
 cargo bench --workspace
 ```
 
-## Engineering Docs
-
-- [Architecture](docs/ARCHITECTURE.md) - crate ownership, layering, public API
-  policy, and current refactor targets
-- [Performance Engineering](docs/PERFORMANCE.md) - hot-path, allocation, JIT,
-  GC, and benchmarking standards
-- [Testing Strategy](docs/TESTING.md) - local checks, release checks, compatibility
-  tests, and benchmark expectations
-- [Unsafe Code Policy](docs/UNSAFE.md) - required invariants for GC, value
-  representation, JIT, and platform code
-- [Contributing](CONTRIBUTING.md) - commit style, review expectations, and
-  pre-PR checks
-
----
-
 ## Project Status
 
 Prism is under active development. The runtime is architecturally broad, from parser through JIT, and it already runs meaningful end-to-end Python programs. Compatibility work continues across the standard library and CPython edge-case behavior.

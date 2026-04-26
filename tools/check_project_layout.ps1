@@ -4,21 +4,8 @@ $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 
 $requiredFiles = @(
     ".cargo/config.toml",
-    "CONTRIBUTING.md",
-    "docs/ARCHITECTURE.md",
-    "docs/PERFORMANCE.md",
-    "docs/TESTING.md",
-    "docs/UNSAFE.md",
     "rust-toolchain.toml",
     "rustfmt.toml"
-)
-
-$docLinks = @(
-    "docs/ARCHITECTURE.md",
-    "docs/PERFORMANCE.md",
-    "docs/TESTING.md",
-    "docs/UNSAFE.md",
-    "CONTRIBUTING.md"
 )
 
 $maxNewRustFileLines = 3000
@@ -38,14 +25,6 @@ $errors = New-Object System.Collections.Generic.List[string]
 foreach ($relative in $requiredFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf)) {
         $errors.Add("missing required project file: $relative")
-    }
-}
-
-$readmePath = Join-Path $root "README.md"
-$readme = Get-Content -LiteralPath $readmePath -Raw
-foreach ($relative in $docLinks) {
-    if (-not $readme.Contains($relative)) {
-        $errors.Add("README.md does not link to $relative")
     }
 }
 
