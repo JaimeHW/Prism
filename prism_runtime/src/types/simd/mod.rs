@@ -36,7 +36,6 @@ pub mod search;
 pub mod validation;
 pub mod whitespace;
 
-
 use std::sync::OnceLock;
 
 // =============================================================================

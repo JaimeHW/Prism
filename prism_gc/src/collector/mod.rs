@@ -35,7 +35,6 @@ mod major;
 pub mod mark_bitmap;
 mod minor;
 
-
 pub use concurrent_major::{
     ConcurrentGcPhase, ConcurrentMajorCollector, ConcurrentMajorConfig, ConcurrentMajorResult,
 };

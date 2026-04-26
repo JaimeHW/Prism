@@ -29,7 +29,6 @@ pub mod partial;
 pub mod reduce;
 pub mod wraps;
 
-
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use std::sync::Arc;

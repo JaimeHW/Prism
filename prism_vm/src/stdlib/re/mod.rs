@@ -35,7 +35,6 @@ mod match_obj;
 mod pattern;
 mod python_api;
 
-
 pub use cache::PatternCache;
 pub use engine::{Engine, EngineKind};
 pub use flags::RegexFlags;

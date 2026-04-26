@@ -24,7 +24,6 @@ pub mod infinite;
 pub mod recipes;
 pub mod terminating;
 
-
 // Re-export all public types for convenience
 pub use combinatoric::{Combinations, CombinationsWithReplacement, Permutations, Product};
 pub use grouping::{Batched, GroupBy, Pairwise, Triplewise};

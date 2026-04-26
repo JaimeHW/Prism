@@ -25,7 +25,6 @@ mod format;
 mod functions;
 mod struct_time;
 
-
 pub use clock::{Clock, ClockId, ClockInfo, ClockKind};
 pub use format::{strftime, strptime};
 pub use functions::*;

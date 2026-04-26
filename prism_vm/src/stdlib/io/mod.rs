@@ -12,7 +12,6 @@ pub mod open_fn;
 mod python_streams;
 pub mod string_io;
 
-
 pub use bytes_io::BytesIO;
 pub use open_fn::{DEFAULT_BUFFER_SIZE, FileMode, SEEK_CUR, SEEK_END, SEEK_SET};
 pub use string_io::{IoError, StringIO};

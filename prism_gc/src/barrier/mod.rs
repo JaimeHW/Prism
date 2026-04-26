@@ -12,7 +12,6 @@ mod card_table;
 mod remembered_set;
 pub mod satb_buffer;
 
-
 pub use card_table::CardTable;
 pub use remembered_set::{RememberedEntry, RememberedSet};
 pub use satb_buffer::{

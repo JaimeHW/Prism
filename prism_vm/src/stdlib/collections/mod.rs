@@ -38,7 +38,6 @@ pub mod defaultdict;
 pub mod deque;
 pub mod ordereddict;
 
-
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, get_iterator_mut, value_to_iterator};

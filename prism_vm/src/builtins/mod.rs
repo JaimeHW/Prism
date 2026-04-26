@@ -19,7 +19,6 @@ mod string;
 mod type_reflection;
 mod types;
 
-
 pub use builtin_function::*;
 pub use exception_type::*;
 pub(crate) use exception_type::{

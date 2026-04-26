@@ -37,7 +37,6 @@ mod mega_ic;
 mod poly_ic;
 mod property_ic;
 
-
 pub use call_ic::{CallIc, CallIcData, CallIcState};
 pub use hooks::{
     CountingListener, NullListener, RecordedEvent, RecordingListener, ShapeHookStats,

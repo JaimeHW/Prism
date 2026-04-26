@@ -20,7 +20,6 @@
 mod decode;
 mod encode;
 
-
 pub use decode::{JsonDecodeError, loads};
 pub use encode::{JsonEncodeError, dumps};
 
