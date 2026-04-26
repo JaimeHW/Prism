@@ -8,7 +8,7 @@
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
-use crate::ops::comparison::{compare_order_result, contains_value};
+use crate::ops::comparison::{compare_order_result, contains_value, eq_result, ne_result};
 use crate::ops::protocols::RichCompareOp;
 use crate::truthiness::try_is_truthy;
 use prism_core::Value;
@@ -25,12 +25,24 @@ static CONTAINS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 });
 static LT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.lt"), operator_lt));
+static LE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.le"), operator_le));
+static EQ_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.eq"), operator_eq));
+static NE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.ne"), operator_ne));
+static GT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.gt"), operator_gt));
+static GE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.ge"), operator_ge));
 static IS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_"), operator_is));
 static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
 
-const EXPORTS: &[&str] = &["contains", "is_", "is_not", "lt", "not_", "truth"];
+const EXPORTS: &[&str] = &[
+    "contains", "eq", "ge", "gt", "is_", "is_not", "le", "lt", "ne", "not_", "truth",
+];
 
 /// Native `operator` module descriptor.
 #[derive(Debug, Clone)]
@@ -71,7 +83,12 @@ impl Module for OperatorModule {
             "truth" => Ok(builtin_value(&TRUTH_FUNCTION)),
             "not_" => Ok(builtin_value(&NOT_FUNCTION)),
             "contains" => Ok(builtin_value(&CONTAINS_FUNCTION)),
+            "eq" => Ok(builtin_value(&EQ_FUNCTION)),
+            "ne" => Ok(builtin_value(&NE_FUNCTION)),
             "lt" => Ok(builtin_value(&LT_FUNCTION)),
+            "le" => Ok(builtin_value(&LE_FUNCTION)),
+            "gt" => Ok(builtin_value(&GT_FUNCTION)),
+            "ge" => Ok(builtin_value(&GE_FUNCTION)),
             "is_" => Ok(builtin_value(&IS_FUNCTION)),
             "is_not" => Ok(builtin_value(&IS_NOT_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
@@ -136,6 +153,41 @@ fn operator_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
 fn operator_lt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("lt", args, 2)?;
     compare_order_result(vm, args[0], args[1], RichCompareOp::Lt)
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn operator_le(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("le", args, 2)?;
+    compare_order_result(vm, args[0], args[1], RichCompareOp::Le)
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn operator_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("eq", args, 2)?;
+    eq_result(vm, args[0], args[1])
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn operator_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("ne", args, 2)?;
+    ne_result(vm, args[0], args[1])
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn operator_gt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("gt", args, 2)?;
+    compare_order_result(vm, args[0], args[1], RichCompareOp::Gt)
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn operator_ge(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("ge", args, 2)?;
+    compare_order_result(vm, args[0], args[1], RichCompareOp::Ge)
         .map(Value::bool)
         .map_err(BuiltinError::Raised)
 }

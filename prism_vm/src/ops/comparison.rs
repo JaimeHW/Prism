@@ -409,7 +409,7 @@ pub(crate) fn builtin_eq_fallback(a: Value, b: Value) -> Option<bool> {
 }
 
 #[inline]
-fn eq_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, RuntimeError> {
+pub(crate) fn eq_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, RuntimeError> {
     if let Some(ordering) = compare_numeric_values(a, b) {
         return Ok(ordering.is_eq());
     }
@@ -434,7 +434,7 @@ fn eq_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, Runtim
 }
 
 #[inline]
-fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, RuntimeError> {
+pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, RuntimeError> {
     if let Some(ordering) = compare_numeric_values(a, b) {
         return Ok(!ordering.is_eq());
     }

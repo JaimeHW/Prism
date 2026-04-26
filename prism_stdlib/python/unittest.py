@@ -81,6 +81,14 @@ class _AssertWarnsContext:
         return False
 
 
+class _SubTestContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class TestCase:
     failureException = AssertionError
 
@@ -161,7 +169,14 @@ class TestCase:
         if not first == second:
             self.fail(msg or (repr(first) + " != " + repr(second)))
 
+    def assertNotEqual(self, first, second, msg=None):
+        if first == second:
+            self.fail(msg or (repr(first) + " == " + repr(second)))
+
     def assertListEqual(self, first, second, msg=None):
+        self.assertEqual(first, second, msg)
+
+    def assertSequenceEqual(self, first, second, msg=None):
         self.assertEqual(first, second, msg)
 
     def assertIs(self, first, second, msg=None):
@@ -188,6 +203,10 @@ class TestCase:
         if member not in container:
             self.fail(msg or (repr(member) + " not found"))
 
+    def assertNotIn(self, member, container, msg=None):
+        if member in container:
+            self.fail(msg or (repr(member) + " unexpectedly found"))
+
     def assertRaises(self, expected_exception, callable_obj=None, *args):
         context = _AssertRaisesContext(expected_exception, self)
         if callable_obj is None:
@@ -206,6 +225,9 @@ class TestCase:
 
     def assertWarns(self, expected_warning):
         return _AssertWarnsContext(expected_warning, self)
+
+    def subTest(self, msg=None, **params):
+        return _SubTestContext()
 
 
 class TestSuite:
