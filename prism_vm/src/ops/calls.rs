@@ -340,7 +340,7 @@ fn alloc_heap_value<T>(
     _context: &'static str,
 ) -> Result<Value, RuntimeError>
 where
-    T: prism_runtime::Trace,
+    T: prism_runtime::Trace + 'static,
 {
     Ok(alloc_value_in_current_heap_or_box(object))
 }

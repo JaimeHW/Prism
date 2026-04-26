@@ -131,12 +131,11 @@ impl MajorCollector {
             }
         }
 
-        // Phase 4: Sweep - free unmarked objects
-
-        // Sweep old space
-        let (old_freed, old_objects) = heap.old_space_mut().sweep();
-        result.bytes_freed += old_freed;
-        result.objects_freed += old_objects;
+        // Phase 4: Sweep precisely tracked spaces.
+        //
+        // Old-space blocks do not yet have per-object mark metadata wired into
+        // this collector. Sweeping them by block live_count would reclaim live
+        // objects, so old space remains pinned until exact object marks exist.
 
         // Sweep large object space
         let (los_freed, los_objects) = heap.large_objects().sweep();
@@ -170,10 +169,6 @@ impl MajorCollector {
         while let Some(_obj_ptr) = self.worklist.pop_front() {
             result.objects_marked += 1;
         }
-
-        let (old_freed, old_objects) = heap.old_space_mut().sweep();
-        result.bytes_freed += old_freed;
-        result.objects_freed += old_objects;
 
         let (los_freed, los_objects) = heap.large_objects().sweep();
         result.bytes_freed += los_freed;

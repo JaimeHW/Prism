@@ -902,7 +902,7 @@ fn list_value(items: Vec<Value>) -> Value {
     leak_object_value(ListObject::from_iter(items))
 }
 
-fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+fn leak_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
     crate::alloc_managed_value(object)
 }
 

@@ -37,8 +37,14 @@ impl LargeObjectSpace {
 
     /// Allocate a large object.
     pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
-        // Allocate from system allocator
         let layout = std::alloc::Layout::from_size_align(size, 8).ok()?;
+        self.alloc_layout(layout)
+    }
+
+    /// Allocate a large object with an explicit layout.
+    pub fn alloc_layout(&self, layout: std::alloc::Layout) -> Option<NonNull<u8>> {
+        let size = layout.size().max(8);
+        let layout = std::alloc::Layout::from_size_align(size, layout.align()).ok()?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
 
         if ptr.is_null() {
@@ -54,13 +60,13 @@ impl LargeObjectSpace {
             addr,
             LargeObject {
                 ptr,
-                size,
+                size: layout.size(),
                 marked: false,
             },
         );
 
         self.allocated
-            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
 
         Some(ptr)
     }
@@ -68,7 +74,10 @@ impl LargeObjectSpace {
     /// Check if a pointer is a large object.
     pub fn contains(&self, ptr: *const ()) -> bool {
         let objects = self.objects.lock();
-        objects.contains_key(&(ptr as usize))
+        let addr = ptr as usize;
+        objects.values().any(|obj| {
+            addr >= obj.ptr.as_ptr() as usize && addr < obj.ptr.as_ptr() as usize + obj.size
+        })
     }
 
     /// Get the size of a large object.

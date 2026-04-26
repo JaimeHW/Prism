@@ -2067,7 +2067,7 @@ fn split_result_to_value(
     alloc_value(vm, ListObject::from_iter(items), "regex split list")
 }
 
-fn alloc_value<T: Trace>(
+fn alloc_value<T: Trace + 'static>(
     _vm: &mut VirtualMachine,
     value: T,
     _context: &'static str,
@@ -2086,7 +2086,7 @@ fn alloc_tenured_value<T: Trace>(
         .ok_or_else(|| BuiltinError::TypeError(format!("out of memory allocating {context}")))
 }
 
-fn alloc_runtime_value<T: Trace>(
+fn alloc_runtime_value<T: Trace + 'static>(
     _vm: &mut VirtualMachine,
     value: T,
     _context: &'static str,

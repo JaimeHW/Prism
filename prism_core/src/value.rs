@@ -174,7 +174,7 @@ impl Value {
     #[must_use]
     pub fn object_ptr(ptr: *const ()) -> Self {
         let ptr_bits = ptr as usize as u64;
-        debug_assert!(
+        assert!(
             ptr_bits & !PAYLOAD_MASK == 0,
             "Pointer too large for NaN-boxing"
         );
@@ -190,7 +190,7 @@ impl Value {
         // The interner owns the canonical Arc<str>, so the string data pointer
         // stays stable for the lifetime of the program.
         let ptr = s.as_str().as_ptr() as usize as u64;
-        debug_assert!(ptr & !PAYLOAD_MASK == 0, "Pointer too large for NaN-boxing");
+        assert!(ptr & !PAYLOAD_MASK == 0, "Pointer too large for NaN-boxing");
         Self {
             bits: QNAN | (TAG_STRING << TAG_SHIFT) | (ptr & PAYLOAD_MASK),
         }
@@ -1034,6 +1034,13 @@ mod tests {
         unsafe {
             drop(Box::from_raw(ptr as *mut u64));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "Pointer too large for NaN-boxing")]
+    fn test_object_pointer_rejects_non_canonical_payload() {
+        let ptr = ((PAYLOAD_MASK + 1) as usize) as *const ();
+        let _ = Value::object_ptr(ptr);
     }
 
     #[test]

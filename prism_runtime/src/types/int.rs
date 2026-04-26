@@ -5,15 +5,13 @@
 //! [`num_bigint::BigInt`]. This mirrors CPython's single visible `int` type
 //! while preserving the fast small-int representation.
 
-use crate::allocation_context::try_alloc_value_in_current_heap;
+use crate::allocation_context::alloc_value_in_current_heap_or_box;
 use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
-use crate::pinned_store::PinnedObjectStore;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
-use std::sync::LazyLock;
 
 /// Heap-backed arbitrary-precision Python integer.
 #[repr(C)]
@@ -49,9 +47,6 @@ impl PyObject for IntObject {
         &mut self.header
     }
 }
-
-static PINNED_INT_OBJECTS: LazyLock<PinnedObjectStore<IntObject>> =
-    LazyLock::new(PinnedObjectStore::default);
 
 /// Return the heap-backed integer object if `value` is a promoted `int`.
 #[inline]
@@ -129,19 +124,18 @@ pub fn bigint_to_value(value: BigInt) -> Value {
         }
     }
 
-    let object = match try_alloc_value_in_current_heap(IntObject::new(value)) {
-        Ok(value) => return value,
-        Err(object) => object,
-    };
-    Value::object_ptr(PINNED_INT_OBJECTS.alloc(object) as *const ())
+    alloc_value_in_current_heap_or_box(IntObject::new(value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocation_context::{RuntimeHeapBinding, current_heap_binding_depth};
+    use crate::allocation_context::{
+        RuntimeHeapBinding, current_heap_binding_depth, standalone_allocation_count,
+    };
     use prism_gc::config::GcConfig;
     use prism_gc::heap::GcHeap;
+    use std::alloc::Layout;
 
     #[test]
     fn test_bigint_to_value_keeps_small_ints_inline() {
@@ -173,32 +167,34 @@ mod tests {
         let heap = GcHeap::new(GcConfig::default());
         let _binding = RuntimeHeapBinding::register(&heap);
 
-        let baseline = PINNED_INT_OBJECTS.len();
+        let baseline = standalone_allocation_count();
         let big = BigInt::from(1_u8) << 100_u32;
         let value = bigint_to_value(big.clone());
 
-        assert_eq!(PINNED_INT_OBJECTS.len(), baseline);
+        assert_eq!(standalone_allocation_count(), baseline);
+        assert!(heap.contains(value.as_object_ptr().expect("bigint should allocate")));
         let obj = value_as_heap_int(value).expect("bound heap should allocate managed int");
         assert_eq!(obj.value(), &big);
     }
 
     #[test]
-    fn test_bigint_to_value_falls_back_after_bound_heap_exhaustion() {
+    fn test_bigint_to_value_uses_tenured_after_nursery_exhaustion() {
         let heap = GcHeap::new(GcConfig {
             nursery_size: 64 * 1024,
             minor_gc_trigger: 64 * 1024,
+            large_object_threshold: 128 * 1024,
             ..GcConfig::default()
         });
-        let _binding = RuntimeHeapBinding::register(&heap);
+        heap.alloc_layout(Layout::from_size_align(64 * 1024 - 8, 8).unwrap())
+            .expect("nursery filler allocation should succeed");
 
-        while crate::allocation_context::alloc_value_in_current_heap(
-            crate::types::dict::DictObject::new(),
-        )
-        .is_some()
-        {}
+        let _binding = RuntimeHeapBinding::register(&heap);
+        let baseline = standalone_allocation_count();
 
         let big = BigInt::from(1_u8) << 100_u32;
         let value = bigint_to_value(big.clone());
+        assert_eq!(standalone_allocation_count(), baseline);
+        assert!(heap.contains(value.as_object_ptr().expect("bigint should allocate")));
         let obj = value_as_heap_int(value).expect("large integer should survive exhaustion");
         assert_eq!(obj.value(), &big);
     }

@@ -702,7 +702,7 @@ fn builtin_method_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn boxed_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+fn boxed_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
     crate::alloc_managed_value(object)
 }
 

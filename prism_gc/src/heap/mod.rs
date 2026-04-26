@@ -20,6 +20,7 @@ use crate::barrier::RememberedSet;
 use crate::config::GcConfig;
 use crate::stats::GcStats;
 
+use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -108,9 +109,44 @@ impl GcHeap {
         None
     }
 
+    /// Allocate memory for an object with an explicit Rust layout.
+    ///
+    /// The size-only allocator is kept for raw heap users, but typed runtime
+    /// allocation must preserve alignments greater than the GC's natural
+    /// word-size alignment to avoid undefined behavior for SIMD and other
+    /// over-aligned objects.
+    #[inline]
+    pub fn alloc_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+        let size = layout.size().max(8);
+        let align = layout.align().max(8);
+
+        if align <= 8 {
+            return self.alloc(size);
+        }
+
+        let padded_size = size.checked_add(align - 1)?;
+        if padded_size >= self.config.large_object_threshold {
+            return self.alloc_large_layout(layout);
+        }
+
+        let raw = self.alloc(padded_size)?;
+        align_non_null(raw, align)
+    }
+
     /// Allocate in the large object space.
     fn alloc_large(&self, size: usize) -> Option<NonNull<u8>> {
         let ptr = self.large_objects.alloc(size)?;
+        self.stats.record_allocation(size);
+        self.stats
+            .large_object_usage
+            .fetch_add(size as u64, Ordering::Relaxed);
+        Some(ptr)
+    }
+
+    /// Allocate in the large object space with an explicit layout.
+    fn alloc_large_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+        let size = layout.size().max(8);
+        let ptr = self.large_objects.alloc_layout(layout)?;
         self.stats.record_allocation(size);
         self.stats
             .large_object_usage
@@ -126,6 +162,21 @@ impl GcHeap {
         let ptr = self.old_space.alloc(aligned_size)?;
         self.stats.record_promotion(aligned_size);
         Some(ptr)
+    }
+
+    /// Allocate directly in the old generation with an explicit Rust layout.
+    pub fn alloc_tenured_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+        let size = layout.size().max(8);
+        let align = layout.align().max(8);
+
+        if align <= 8 {
+            return self.alloc_tenured(size);
+        }
+
+        let padded_size = size.checked_add(align - 1)?;
+        let raw = self.old_space.alloc(padded_size)?;
+        self.stats.record_promotion(padded_size);
+        align_non_null(raw, align)
     }
 
     // =========================================================================
@@ -273,6 +324,12 @@ pub fn align_ptr_up(ptr: *mut u8, align: usize) -> *mut u8 {
     let addr = ptr as usize;
     let aligned = align_up(addr, align);
     aligned as *mut u8
+}
+
+#[inline]
+fn align_non_null(ptr: NonNull<u8>, align: usize) -> Option<NonNull<u8>> {
+    debug_assert!(align.is_power_of_two());
+    NonNull::new(align_ptr_up(ptr.as_ptr(), align))
 }
 
 #[cfg(test)]

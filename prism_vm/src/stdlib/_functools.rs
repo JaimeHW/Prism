@@ -198,7 +198,7 @@ fn tuple_ref(value: Value, context: &'static str) -> Result<&'static TupleObject
         .ok_or_else(|| BuiltinError::TypeError(format!("{context} must be a tuple")))
 }
 
-fn alloc_value<T: prism_runtime::Trace>(
+fn alloc_value<T: prism_runtime::Trace + 'static>(
     vm: &mut VirtualMachine,
     object: T,
     context: &'static str,

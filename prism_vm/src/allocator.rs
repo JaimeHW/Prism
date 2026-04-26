@@ -111,11 +111,8 @@ impl<'h> GcAllocator<'h> {
     /// - Inlined for zero call overhead on hot paths
     #[inline]
     pub fn alloc<T: Trace>(&self, value: T) -> Option<*mut T> {
-        let layout = Layout::new::<T>();
-        let size = layout.size().max(8); // Minimum 8-byte allocation
-
         // Allocate raw memory from heap
-        let ptr = self.heap.alloc(size)?;
+        let ptr = self.heap.alloc_layout(Layout::new::<T>())?;
 
         // Initialize the object in-place
         let typed_ptr = ptr.as_ptr() as *mut T;

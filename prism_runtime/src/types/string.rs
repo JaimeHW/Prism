@@ -8,11 +8,10 @@
 //! - **UTF-8 Native**: All strings are valid UTF-8
 //! - **Static Empty String**: Zero-allocation access via `empty_string()`
 
-use crate::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
+use crate::allocation_context::alloc_value_in_current_heap_or_box;
 use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{HASH_NOT_COMPUTED, ObjectHeader, PyObject};
-use crate::pinned_store::PinnedObjectStore;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use std::borrow::Cow;
@@ -43,8 +42,6 @@ const EMPTY_INLINE: InlineString = InlineString {
 /// Returns a reference to a pre-allocated empty StringObject.
 /// Used for zero-allocation empty string operations like `str * 0`.
 static STATIC_EMPTY_STRING: LazyLock<StringObject> = LazyLock::new(StringObject::empty);
-static PINNED_STRING_OBJECTS: LazyLock<PinnedObjectStore<StringObject>> =
-    LazyLock::new(PinnedObjectStore::default);
 
 /// Get a reference to the static empty string (zero allocation).
 ///
@@ -62,11 +59,7 @@ pub fn empty_string() -> &'static StringObject {
 
 #[inline(always)]
 fn boxed_string_value(string: StringObject) -> Value {
-    if has_current_heap_binding() {
-        alloc_value_in_current_heap(string).expect("bound heap should satisfy string allocation")
-    } else {
-        Value::object_ptr(PINNED_STRING_OBJECTS.alloc(string) as *const ())
-    }
+    alloc_value_in_current_heap_or_box(string)
 }
 
 // =============================================================================
@@ -939,7 +932,9 @@ impl<'a> From<Cow<'a, str>> for StringObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocation_context::{RuntimeHeapBinding, current_heap_binding_depth};
+    use crate::allocation_context::{
+        RuntimeHeapBinding, current_heap_binding_depth, standalone_allocation_count,
+    };
     use prism_gc::config::GcConfig;
     use prism_gc::heap::GcHeap;
 
@@ -1052,17 +1047,18 @@ mod tests {
         let heap = GcHeap::new(GcConfig::default());
         let _binding = RuntimeHeapBinding::register(&heap);
 
-        let baseline = PINNED_STRING_OBJECTS.len();
+        let baseline = standalone_allocation_count();
         let result = concat_string_values(
             Value::string(intern("managed")),
             Value::string(intern(" heap")),
         )
         .expect("concat should allocate");
 
-        assert_eq!(PINNED_STRING_OBJECTS.len(), baseline);
+        assert_eq!(standalone_allocation_count(), baseline);
         let ptr = result
             .as_object_ptr()
             .expect("managed concat should produce heap-backed string");
+        assert!(heap.contains(ptr));
         let string = unsafe { &*(ptr as *const StringObject) };
         assert_eq!(string.as_str(), "managed heap");
     }

@@ -548,7 +548,7 @@ where
 }
 
 #[inline]
-fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+fn leak_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
     crate::alloc_managed_value(object)
 }
 
