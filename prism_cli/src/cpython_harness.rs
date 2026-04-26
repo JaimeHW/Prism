@@ -16,7 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_SUITE_TIMEOUT_SECS: u64 = 60 * 60;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const MAX_WORKDIR_COMPONENT_LEN: usize = 80;
 const BOOTSTRAP_SCRIPT_NAME: &str = "bootstrap.py";
 const TESTS_DIR_NAME: &str = "tests";
@@ -65,7 +67,8 @@ pub struct CliArgs {
     pub test_dir: Option<PathBuf>,
     pub tests: Vec<String>,
     pub runner: RunnerMode,
-    pub timeout: Option<Duration>,
+    pub timeout: Duration,
+    pub suite_timeout: Duration,
     pub start: Option<String>,
     pub list_tests: bool,
     pub fail_fast: bool,
@@ -85,7 +88,8 @@ impl Default for CliArgs {
             test_dir: None,
             tests: Vec::new(),
             runner: RunnerMode::Suite,
-            timeout: Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            suite_timeout: Duration::from_secs(DEFAULT_SUITE_TIMEOUT_SECS),
             start: None,
             list_tests: false,
             fail_fast: false,
@@ -113,7 +117,8 @@ pub struct HarnessConfig {
     pub work_root: PathBuf,
     pub prefix_test_package: bool,
     pub runner: RunnerMode,
-    pub timeout: Option<Duration>,
+    pub timeout: Duration,
+    pub suite_timeout: Duration,
     pub fail_fast: bool,
     pub verbose: bool,
     pub quiet: bool,
@@ -163,7 +168,10 @@ pub struct SuiteReport {
     pub passed: usize,
     pub failed: usize,
     pub timed_out: usize,
+    pub executed: usize,
     pub duration_ms: u128,
+    pub aborted: bool,
+    pub abort_reason: Option<String>,
     pub listed_only: bool,
     pub tests: Vec<String>,
     pub results: Vec<TestResult>,
@@ -171,7 +179,7 @@ pub struct SuiteReport {
 
 impl SuiteReport {
     pub fn exit_code(&self) -> u8 {
-        if self.listed_only || (self.failed == 0 && self.timed_out == 0) {
+        if self.listed_only || (!self.aborted && self.failed == 0 && self.timed_out == 0) {
             0
         } else {
             1
@@ -286,6 +294,7 @@ impl HarnessConfig {
             prefix_test_package,
             runner: args.runner,
             timeout: args.timeout,
+            suite_timeout: args.suite_timeout,
             fail_fast: args.fail_fast,
             verbose: args.verbose,
             quiet: args.quiet,
@@ -411,7 +420,12 @@ pub fn parse_cli_action(raw_args: &[String]) -> Result<CliAction, HarnessError> 
             "--timeout" => {
                 index += 1;
                 let value = required_string_value(raw_args, index, "--timeout")?;
-                parsed.timeout = parse_timeout(&value)?;
+                parsed.timeout = parse_positive_duration(&value, "--timeout")?;
+            }
+            "--suite-timeout" => {
+                index += 1;
+                let value = required_string_value(raw_args, index, "--suite-timeout")?;
+                parsed.suite_timeout = parse_positive_duration(&value, "--suite-timeout")?;
             }
             "--start" | "-S" => {
                 index += 1;
@@ -455,7 +469,8 @@ options:
   --prism <path>         Path to the Prism executable (defaults to sibling prism binary)
   --prism-arg <arg>      Extra argument passed to the Prism executable
   --runner <mode>        One of: import, suite, test-main (default: suite)
-  --timeout <secs>       Per-test timeout in seconds (0 disables timeouts, default: {DEFAULT_TIMEOUT_SECS})
+  --timeout <secs>       Per-test timeout in seconds, must be > 0 (default: {DEFAULT_TIMEOUT_SECS})
+  --suite-timeout <secs> Whole-suite timeout in seconds, must be > 0 (default: {DEFAULT_SUITE_TIMEOUT_SECS})
   --start <test>         Start execution at the named discovered test
   --list-tests           Print the discovered test names without executing them
   --fail-fast            Stop after the first failing or timed-out test
@@ -498,7 +513,10 @@ pub fn execute_cli_with_executor<E: TestExecutor>(
             passed: 0,
             failed: 0,
             timed_out: 0,
+            executed: 0,
             duration_ms: 0,
+            aborted: false,
+            abort_reason: None,
             listed_only: true,
             tests: plan.tests.into_iter().map(|test| test.name).collect(),
             results: Vec::new(),
@@ -567,9 +585,25 @@ impl Harness {
         let mut passed = 0usize;
         let mut failed = 0usize;
         let mut timed_out = 0usize;
+        let mut abort_reason = None;
 
         for (index, test) in plan.tests.iter().enumerate() {
-            let result = executor.run(test, &self.config)?;
+            let Some(timeout) = test_timeout_for_suite_budget(
+                started,
+                self.config.timeout,
+                self.config.suite_timeout,
+            ) else {
+                abort_reason = Some(format!(
+                    "suite timeout of {}s reached after {} executed tests",
+                    self.config.suite_timeout.as_secs(),
+                    results.len()
+                ));
+                break;
+            };
+
+            let mut run_config = self.config.clone();
+            run_config.timeout = timeout;
+            let result = executor.run(test, &run_config)?;
             match result.status {
                 TestStatus::Passed => passed += 1,
                 TestStatus::Failed => failed += 1,
@@ -588,6 +622,8 @@ impl Harness {
                 break;
             }
         }
+        let aborted = abort_reason.is_some();
+        let executed = results.len();
 
         Ok(SuiteReport {
             runner: self.config.runner.as_str().to_string(),
@@ -596,7 +632,10 @@ impl Harness {
             passed,
             failed,
             timed_out,
+            executed,
             duration_ms: started.elapsed().as_millis(),
+            aborted,
+            abort_reason,
             listed_only: false,
             tests: selected_names,
             results,
@@ -610,6 +649,19 @@ pub fn default_prism_executable() -> PathBuf {
         current.with_file_name("prism.exe")
     } else {
         current.with_file_name("prism")
+    }
+}
+
+fn test_timeout_for_suite_budget(
+    suite_started: Instant,
+    per_test_timeout: Duration,
+    suite_timeout: Duration,
+) -> Option<Duration> {
+    let elapsed = suite_started.elapsed();
+    if elapsed >= suite_timeout {
+        None
+    } else {
+        Some(per_test_timeout.min(suite_timeout - elapsed))
     }
 }
 
@@ -1001,29 +1053,22 @@ fn describe_command(
 
 fn wait_for_child(
     child: &mut std::process::Child,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<ChildOutcome, HarnessError> {
-    match timeout {
-        None => child
-            .wait()
-            .map(ChildOutcome::Completed)
-            .map_err(|source| HarnessError::io("failed to wait for Prism test process", source)),
-        Some(timeout) => {
-            let start = Instant::now();
-            loop {
-                if let Some(status) = child.try_wait().map_err(|source| {
-                    HarnessError::io("failed to poll Prism test process", source)
-                })? {
-                    return Ok(ChildOutcome::Completed(status));
-                }
-                if start.elapsed() >= timeout {
-                    terminate_child_process(child)?;
-                    let _ = child.wait();
-                    return Ok(ChildOutcome::TimedOut);
-                }
-                thread::sleep(WAIT_POLL_INTERVAL);
-            }
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| HarnessError::io("failed to poll Prism test process", source))?
+        {
+            return Ok(ChildOutcome::Completed(status));
         }
+        if start.elapsed() >= timeout {
+            terminate_child_process(child)?;
+            wait_for_child_exit(child, TERMINATION_GRACE_PERIOD)?;
+            return Ok(ChildOutcome::TimedOut);
+        }
+        thread::sleep(WAIT_POLL_INTERVAL);
     }
 }
 
@@ -1039,13 +1084,13 @@ fn terminate_child_process(child: &mut std::process::Child) -> Result<(), Harnes
     #[cfg(windows)]
     {
         let pid = child.id().to_string();
-        match Command::new("taskkill")
+        let mut taskkill = Command::new("taskkill");
+        taskkill
             .args(["/T", "/F", "/PID", pid.as_str()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
+            .stderr(Stdio::null());
+        match wait_for_terminator(&mut taskkill, TERMINATION_GRACE_PERIOD) {
             Ok(status) if status.success() => return Ok(()),
             Ok(_) | Err(_) => {
                 if child
@@ -1064,6 +1109,54 @@ fn terminate_child_process(child: &mut std::process::Child) -> Result<(), Harnes
     child
         .kill()
         .map_err(|source| HarnessError::io("failed to terminate timed out test", source))
+}
+
+#[cfg(windows)]
+fn wait_for_terminator(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, HarnessError> {
+    let mut child = command
+        .spawn()
+        .map_err(|source| HarnessError::io("failed to spawn process terminator", source))?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| HarnessError::io("failed to poll process terminator", source))?
+        {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "process terminator exceeded {}s timeout",
+                timeout.as_secs()
+            )));
+        }
+        thread::sleep(WAIT_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<(), HarnessError> {
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|source| HarnessError::io("failed to poll terminated test process", source))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Ok(());
+        }
+        thread::sleep(WAIT_POLL_INTERVAL);
+    }
 }
 
 fn read_optional_text(path: &Path) -> Result<String, HarnessError> {
@@ -1147,13 +1240,18 @@ fn print_summary(report: &SuiteReport, quiet: bool) {
         println!();
     }
     println!(
-        "Selected: {}  Passed: {}  Failed: {}  Timed out: {}  Duration: {:.2}s",
+        "Selected: {}  Executed: {}  Passed: {}  Failed: {}  Timed out: {}  Duration: {:.2}s",
         report.selected,
+        report.executed,
         report.passed,
         report.failed,
         report.timed_out,
         report.duration_ms as f64 / 1000.0
     );
+
+    if let Some(reason) = &report.abort_reason {
+        println!("Aborted: {reason}");
+    }
 
     if report.failed > 0 || report.timed_out > 0 {
         println!("Failures:");
@@ -1204,17 +1302,18 @@ fn required_path_value(
     required_string_value(raw_args, index, option).map(PathBuf::from)
 }
 
-fn parse_timeout(value: &str) -> Result<Option<Duration>, HarnessError> {
+fn parse_positive_duration(value: &str, option: &'static str) -> Result<Duration, HarnessError> {
     let seconds = value.parse::<u64>().map_err(|_| {
         HarnessError::Argument(format!(
-            "invalid timeout '{value}', expected a non-negative integer number of seconds"
+            "invalid {option} value '{value}', expected a positive integer number of seconds"
         ))
     })?;
     if seconds == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(Duration::from_secs(seconds)))
+        return Err(HarnessError::Argument(format!(
+            "{option} must be greater than zero seconds"
+        )));
     }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn canonicalize_existing_dir(path: &Path, label: &'static str) -> Result<PathBuf, HarnessError> {
@@ -1318,6 +1417,39 @@ mod tests {
     }
 
     #[test]
+    fn timeout_options_reject_unbounded_zero() {
+        let per_test = parse_cli_action(&["--timeout".to_string(), "0".to_string()])
+            .expect_err("zero per-test timeout should be rejected");
+        assert!(per_test.to_string().contains("greater than zero"));
+
+        let suite = parse_cli_action(&["--suite-timeout".to_string(), "0".to_string()])
+            .expect_err("zero suite timeout should be rejected");
+        assert!(suite.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn suite_budget_caps_effective_test_timeout() {
+        let timeout = test_timeout_for_suite_budget(
+            Instant::now(),
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .expect("fresh suite should have remaining budget");
+
+        assert!(timeout <= Duration::from_secs(5));
+        assert!(timeout > Duration::ZERO);
+
+        assert_eq!(
+            test_timeout_for_suite_budget(
+                Instant::now() - Duration::from_secs(2),
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn config_finds_vendored_cpython_tests_by_default() {
         let args = CliArgs {
             prism_executable: Some(std::env::current_exe().expect("current test executable")),
@@ -1360,7 +1492,8 @@ mod tests {
             work_root: root.join("work"),
             prefix_test_package: true,
             runner: RunnerMode::Suite,
-            timeout: None,
+            timeout: Duration::from_secs(1),
+            suite_timeout: Duration::from_secs(60),
             fail_fast: false,
             verbose: false,
             quiet: true,
@@ -1412,7 +1545,8 @@ mod tests {
             work_root: root.join("work"),
             prefix_test_package: true,
             runner: RunnerMode::Suite,
-            timeout: None,
+            timeout: Duration::from_secs(1),
+            suite_timeout: Duration::from_secs(60),
             fail_fast: false,
             verbose: false,
             quiet: true,
