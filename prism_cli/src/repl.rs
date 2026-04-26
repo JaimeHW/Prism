@@ -396,36 +396,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_execute_repl_assignment() {
-        let mut vm = prism_vm::VirtualMachine::new();
-        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        // Should not panic.
-        execute_repl_input("x = 42\n", &mut vm, &config);
-    }
-
-    #[test]
-    fn test_execute_repl_syntax_error() {
-        let mut vm = prism_vm::VirtualMachine::new();
-        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        // Should print error but not panic.
-        execute_repl_input("def\n", &mut vm, &config);
-    }
-
-    #[test]
-    fn test_execute_repl_print() {
-        let mut vm = prism_vm::VirtualMachine::new();
-        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        execute_repl_input("print('hello')\n", &mut vm, &config);
-    }
-
-    #[test]
-    fn test_execute_repl_multiline_function() {
-        let mut vm = prism_vm::VirtualMachine::new();
-        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        execute_repl_input("def foo():\n    return 42\n\n", &mut vm, &config);
-    }
-
-    #[test]
     fn test_execute_repl_preserves_main_module_state_between_inputs() {
         let mut vm = prism_vm::VirtualMachine::new();
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());

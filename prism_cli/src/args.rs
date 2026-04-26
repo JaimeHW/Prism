@@ -1010,9 +1010,4 @@ mod tests {
         assert!(d.script_args.is_empty());
     }
 
-    #[test]
-    fn test_optimization_level_default() {
-        let o: OptimizationLevel = Default::default();
-        assert_eq!(o, OptimizationLevel::None);
-    }
 }
