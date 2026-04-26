@@ -14,7 +14,6 @@ $knownLargeRustFiles = @{
     "prism_jit/src/tier1/lower.rs" = $true
     "prism_vm/src/builtins/types.rs" = $true
     "prism_vm/src/ops/calls.rs" = $true
-    "prism_vm/src/ops/method_dispatch/builtin_methods.rs" = $true
     "prism_vm/src/ops/objects.rs" = $true
     "prism_vm/src/vm.rs" = $true
     "prism_vm/tests/integration.rs" = $true
