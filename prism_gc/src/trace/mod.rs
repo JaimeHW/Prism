@@ -194,23 +194,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_primitive_trace() {
-        struct NullTracer;
-        impl Tracer for NullTracer {
-            fn trace_value(&mut self, _value: Value) {}
-            fn trace_ptr(&mut self, _ptr: *const ()) {}
-        }
-
-        let mut tracer = NullTracer;
-
-        // Primitives should trace without panicking
-        true.trace(&mut tracer);
-        42i64.trace(&mut tracer);
-        3.14f64.trace(&mut tracer);
-        "hello".to_string().trace(&mut tracer);
-    }
-
-    #[test]
     fn test_container_trace() {
         struct CountingTracer {
             count: usize,

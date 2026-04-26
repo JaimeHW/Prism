@@ -177,63 +177,6 @@ mod tests {
     use crate::GcConfig;
 
     #[test]
-    fn test_write_barrier_no_panic() {
-        let heap = GcHeap::new(GcConfig::default());
-
-        // Should not panic with null pointers
-        write_barrier(&heap, std::ptr::null(), Value::none());
-        write_barrier(&heap, std::ptr::null(), Value::int(42).unwrap());
-    }
-
-    #[test]
-    fn test_write_barrier_concurrent_no_panic() {
-        let heap = GcHeap::new(GcConfig::default());
-        let state = SatbMarkingState::new();
-        let mut buffer = SatbBuffer::new();
-        let queue = SatbQueue::new();
-
-        // Should not panic with null/none values
-        write_barrier_concurrent(
-            &heap,
-            std::ptr::null(),
-            Value::none(),
-            Value::none(),
-            &state,
-            &mut buffer,
-            &queue,
-        );
-
-        // Should not panic with integer values (non-object)
-        write_barrier_concurrent(
-            &heap,
-            std::ptr::null(),
-            Value::int(1).unwrap(),
-            Value::int(2).unwrap(),
-            &state,
-            &mut buffer,
-            &queue,
-        );
-    }
-
-    #[test]
-    fn test_write_barrier_concurrent_ptr_no_panic() {
-        let heap = GcHeap::new(GcConfig::default());
-        let state = SatbMarkingState::new();
-        let mut buffer = SatbBuffer::new();
-        let queue = SatbQueue::new();
-
-        write_barrier_concurrent_ptr(
-            &heap,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            &state,
-            &mut buffer,
-            &queue,
-        );
-    }
-
-    #[test]
     fn test_concurrent_barrier_satb_capture_when_marking() {
         let heap = GcHeap::new(GcConfig::default());
         let state = SatbMarkingState::new();

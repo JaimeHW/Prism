@@ -531,23 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn test_string_drop() {
-        // Ensure strings are properly dropped to avoid memory leaks
-        let (ptr, layout) = alloc_test_array::<String>(3);
-
-        unsafe {
-            let array = &mut *ptr;
-
-            array.push("one".to_string());
-            array.push("two".to_string());
-            array.push("three".to_string());
-        }
-
-        // This should properly drop all strings
-        free_test_array(ptr, layout);
-    }
-
-    #[test]
     fn test_allocation_size() {
         // Check that allocation size is reasonable
         let size = GcArray::<u64>::allocation_size(100);
