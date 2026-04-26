@@ -337,26 +337,6 @@ mod tests {
     use crate::scope::{ScopeKind, SymbolFlags};
 
     // =========================================================================
-    // VarLocation Tests
-    // =========================================================================
-
-    #[test]
-    fn test_var_location_equality() {
-        assert_eq!(VarLocation::Local(0), VarLocation::Local(0));
-        assert_ne!(VarLocation::Local(0), VarLocation::Local(1));
-        assert_ne!(VarLocation::Local(0), VarLocation::Closure(0));
-        assert_ne!(VarLocation::Local(0), VarLocation::Global);
-        assert_eq!(VarLocation::Global, VarLocation::Global);
-    }
-
-    #[test]
-    fn test_var_location_debug_format() {
-        assert!(format!("{:?}", VarLocation::Local(42)).contains("42"));
-        assert!(format!("{:?}", VarLocation::Closure(7)).contains("7"));
-        assert!(format!("{:?}", VarLocation::Global).contains("Global"));
-    }
-
-    // =========================================================================
     // ScopeRef Tests
     // =========================================================================
 

@@ -7019,37 +7019,6 @@ del box.value
     }
 
     #[test]
-    fn debug_nested_if_elif_probe_disassembly() {
-        let code = compile(
-            r#"
-events = []
-
-def probe(key):
-    if False:
-        events.append("private")
-    elif True:
-        if False:
-            events.append("reserved")
-        if key == "x":
-            events.append("inner")
-        elif key == "y":
-            events.append("ignore")
-    elif key == "x":
-        events.append("duplicate")
-    else:
-        events.append("else")
-"#,
-        );
-
-        let nested = code
-            .nested_code_objects
-            .iter()
-            .find(|nested| nested.name.as_ref() == "probe")
-            .expect("expected nested probe code object");
-        println!("{}", crate::bytecode::disassemble(nested));
-    }
-
-    #[test]
     fn test_compile_class_with_single_base() {
         // Simple inheritance
         let code = compile(

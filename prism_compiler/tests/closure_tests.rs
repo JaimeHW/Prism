@@ -3,7 +3,7 @@
 //! These tests verify that the compiler correctly emits closure-aware bytecode
 //! for various closure patterns, from simple captures to complex multi-level closures.
 
-use prism_compiler::{Compiler, Opcode, VarLocation};
+use prism_compiler::{Compiler, Opcode};
 use prism_parser::parse;
 
 // =============================================================================
@@ -87,7 +87,6 @@ def func():
     // Just verify the module compiles correctly
     assert!(!code.instructions.is_empty());
 }
-
 #[test]
 fn test_function_parameter_access() {
     let code = compile(
@@ -96,7 +95,6 @@ def add(a, b):
     return a + b
 "#,
     );
-
     assert!(!code.instructions.is_empty());
 }
 
@@ -137,7 +135,6 @@ def make_counter():
 
     assert!(!code.instructions.is_empty());
 }
-
 #[test]
 fn test_multiple_closures_same_variable() {
     // Multiple inner functions capture the same variable
@@ -442,25 +439,4 @@ def register_callback(callback):
     );
 
     assert!(!code.instructions.is_empty());
-}
-
-// =============================================================================
-// VarLocation Resolution Tests
-// =============================================================================
-
-#[test]
-fn test_var_location_types() {
-    // Verify VarLocation enum variants work correctly
-    let local = VarLocation::Local(0);
-    let closure = VarLocation::Closure(1);
-    let global = VarLocation::Global;
-
-    assert_ne!(local, closure);
-    assert_ne!(local, global);
-    assert_ne!(closure, global);
-
-    // Same values should be equal
-    assert_eq!(VarLocation::Local(5), VarLocation::Local(5));
-    assert_eq!(VarLocation::Closure(3), VarLocation::Closure(3));
-    assert_eq!(VarLocation::Global, VarLocation::Global);
 }
