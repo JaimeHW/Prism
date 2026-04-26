@@ -9,9 +9,7 @@ $requiredFiles = @(
 )
 
 $maxNewRustFileLines = 3000
-$knownLargeRustFiles = @{
-    "prism_jit/src/tier1/lower.rs" = $true
-}
+$knownLargeRustFiles = @{}
 
 $errors = New-Object System.Collections.Generic.List[string]
 
