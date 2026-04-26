@@ -47,65 +47,62 @@
 #![allow(clippy::new_without_default)]
 
 // Core modules
-pub mod allocator;
-pub mod aot_abi;
-pub mod error;
-pub mod frame;
-pub mod gc_integration;
-pub mod globals;
-pub mod vm;
+#[cfg(test)]
+mod allocation_policy_tests;
+mod allocator;
+mod aot_abi;
+mod error;
+mod frame;
+mod gc_integration;
+mod globals;
+mod vm;
+
+// Public facade modules
+pub mod exceptions;
+pub mod imports;
 
 // Execution infrastructure
-pub mod builtins;
-pub mod dispatch;
-pub mod ic_manager;
-pub mod inline_cache;
-pub mod osr_trigger;
-pub mod profiler;
-pub mod python_numeric;
-pub mod speculative;
+mod builtins;
+mod dispatch;
+mod ic_manager;
+mod inline_cache;
+mod osr_trigger;
+mod profiler;
+mod python_numeric;
+mod source;
+mod speculative;
 mod threading_runtime;
-pub mod truthiness;
-pub mod type_feedback;
+mod truthiness;
+mod type_feedback;
 
 // JIT integration
-pub mod compilation_queue;
-pub mod deopt;
-pub mod jit_bridge;
-pub mod jit_context;
-pub mod jit_dispatch;
-pub mod jit_executor;
+mod compilation_queue;
+mod deopt;
+mod jit_bridge;
+mod jit_context;
+mod jit_dispatch;
+mod jit_executor;
 mod tier1_lowering;
 
 // Opcode handlers (organized by category)
-pub mod ops;
+mod ops;
 
 // Exception and generator runtime
-pub mod exception;
+mod exception;
 
 // Standard library modules
-pub mod stdlib;
+mod stdlib;
 
 // Import system
-pub mod import;
+mod import;
 
 // Re-exports
-pub use allocator::{AllocResult, GcAllocator, HeapAllocExt};
-pub use builtins::{BuiltinError, BuiltinFn, BuiltinRegistry};
-pub use dispatch::ControlFlow;
 pub use error::{RuntimeError, RuntimeErrorKind, TracebackEntry, VmResult};
-pub use frame::{ClosureEnv, Frame, MAX_RECURSION_DEPTH};
-pub use gc_integration::{ManagedHeap, RootProvider, SafePoint, StackRoots};
-pub use globals::GlobalScope;
-pub use ic_manager::{ICAccessResult, ICClassification, ICEntry, ICManager, ICSiteId, ICStats};
-pub use inline_cache::{CallIC, InlineCacheStore, MonoIC, PolyIC};
-pub use jit_bridge::{BridgeConfig, JitBridge};
-pub use jit_context::{JitConfig, JitContext, JitStats, ProcessedResult};
-pub use jit_dispatch::{DispatchResult, DispatchStats};
-pub use jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
-pub use osr_trigger::{LoopInfo, OsrDecision, OsrTrigger};
+pub use exceptions::{ExceptionTypeId, RuntimeException, exception_type_id, runtime_exception};
+pub use imports::{FrozenModuleSource, ModuleObject};
+pub use jit_context::{JitConfig, JitStats};
 pub(crate) use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box as alloc_managed_value;
-pub use profiler::{CodeId, Profiler, TierUpDecision};
+pub use source::SourceOptimization;
 pub use vm::VirtualMachine;
 
 /// Convenience function to create and run a VM.

@@ -20,7 +20,6 @@ impl VirtualMachine {
         self.resume_generator(generator, GeneratorResumeMode::Throw { exception, type_id })
     }
 
-
     fn resume_generator(
         &mut self,
         generator: &mut GeneratorObject,

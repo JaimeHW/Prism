@@ -989,7 +989,6 @@ mod file_mode_tests {
         let mode = FileMode::parse("w+").unwrap();
         assert_eq!(format!("{}", mode), "wt+");
     }
-
 }
 
 // =============================================================================

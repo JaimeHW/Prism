@@ -44,7 +44,10 @@ pub fn builtin_int_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     Err(builtin_int_unsupported_argument(arg))
 }
 
-pub(super) fn builtin_int_kw(positional: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+pub(super) fn builtin_int_kw(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
     let args = collect_builtin_int_keyword_args(positional, keywords)?;
     builtin_int(&args)
 }

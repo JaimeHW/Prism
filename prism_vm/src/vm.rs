@@ -24,6 +24,7 @@ use crate::ops::calls::{
 };
 use crate::ops::objects::list_storage_ref_from_ptr;
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
+use crate::source::SourceOptimization;
 use crate::speculative::SpeculationCache;
 use crate::stdlib::_codecs::{SharedCodecRegistry, new_shared_codec_registry};
 use crate::stdlib::_thread::{SharedThreadGroup, new_thread_group};
@@ -32,7 +33,7 @@ use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
 use prism_code::{CodeObject, Instruction, LineTableEntry, Opcode};
-use prism_compiler::{OptimizationLevel, compile_source_code};
+use prism_compiler::compile_source_code;
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
 use prism_runtime::allocation_context::{RuntimeHeapBinding, alloc_value_in_current_heap_or_box};
@@ -235,23 +236,23 @@ impl ExecutionBudget {
 /// - GC-managed heap for object allocation
 pub struct VirtualMachine {
     /// Frame stack (limited by MAX_RECURSION_DEPTH).
-    pub frames: Vec<Frame>,
+    pub(crate) frames: Vec<Frame>,
     /// Reusable frame storage for ordinary calls and JIT entry trampolines.
     frame_pool: FramePool,
     /// Current frame index (frames.len() - 1).
     current_frame_idx: usize,
     /// Global scope.
-    pub globals: GlobalScope,
+    pub(crate) globals: GlobalScope,
     /// Builtin functions and values.
-    pub builtins: BuiltinRegistry,
+    pub(crate) builtins: BuiltinRegistry,
     /// Inline cache storage.
-    pub inline_caches: InlineCacheStore,
+    pub(crate) inline_caches: InlineCacheStore,
     /// Execution profiler.
-    pub profiler: Profiler,
+    pub(crate) profiler: Profiler,
     /// IC Manager for centralized type profiling.
-    pub ic_manager: ICManager,
+    pub(crate) ic_manager: ICManager,
     /// Speculation cache for O(1) fast-path lookup.
-    pub speculation_cache: SpeculationCache,
+    pub(crate) speculation_cache: SpeculationCache,
     /// JIT context (None when JIT is disabled).
     jit: Option<JitContext>,
     /// Temporary storage for JIT return value when root frame executes via JIT.
@@ -285,11 +286,11 @@ pub struct VirtualMachine {
     /// Stack of entered except handlers for nested bare-raise semantics.
     active_except_handlers: Vec<ActiveExceptHandler>,
     /// Import resolver for module imports.
-    pub import_resolver: ImportResolver,
+    pub(crate) import_resolver: ImportResolver,
     /// CPython-style import tracing verbosity (`-v`, `-vv`, ...).
     import_verbosity: u32,
     /// Optimization level used when compiling imported source modules.
-    compiler_optimization: OptimizationLevel,
+    compiler_optimization: SourceOptimization,
     /// Deterministic interpreter execution budget.
     execution_budget: ExecutionBudget,
     /// Most recent runtime error reported by a native AOT helper call.
@@ -332,15 +333,15 @@ impl VirtualMachine {
             .and_then(|frame| frame.module.as_ref())
     }
 
-    pub fn current_module(&self) -> Option<&ModuleObject> {
+    pub(crate) fn current_module(&self) -> Option<&ModuleObject> {
         self.current_module_ref().map(Arc::as_ref)
     }
 
-    pub fn current_module_cloned(&self) -> Option<Arc<ModuleObject>> {
+    pub(crate) fn current_module_cloned(&self) -> Option<Arc<ModuleObject>> {
         self.current_module_ref().cloned()
     }
 
-    pub fn module_from_globals_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
+    pub(crate) fn module_from_globals_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
         if ptr.is_null() {
             None
         } else if let Some(module) = self.import_resolver.module_from_ptr(ptr) {
@@ -371,7 +372,7 @@ impl VirtualMachine {
         None
     }
 
-    pub fn module_scope_value(&self, name: &Arc<str>) -> Option<Value> {
+    pub(crate) fn module_scope_value(&self, name: &Arc<str>) -> Option<Value> {
         if let Some(module) = self.current_module() {
             self.module_scope_value_for_module(module, name)
         } else {
@@ -391,7 +392,7 @@ impl VirtualMachine {
         }
     }
 
-    pub fn set_module_scope_value(&mut self, name: Arc<str>, value: Value) {
+    pub(crate) fn set_module_scope_value(&mut self, name: Arc<str>, value: Value) {
         if let Some(module) = self.current_module_cloned() {
             self.set_module_scope_value_for_module(&module, &name, value);
         } else {
@@ -399,7 +400,7 @@ impl VirtualMachine {
         }
     }
 
-    pub fn delete_module_scope_value(&mut self, name: &str) -> Option<Value> {
+    pub(crate) fn delete_module_scope_value(&mut self, name: &str) -> Option<Value> {
         if let Some(module) = self.current_module_cloned() {
             let removed = module.get_attr(name);
             let existed = module.del_attr(name);
@@ -412,7 +413,7 @@ impl VirtualMachine {
         }
     }
 
-    pub fn import_star_into_current_scope(
+    pub(crate) fn import_star_into_current_scope(
         &mut self,
         module: &ModuleObject,
     ) -> Result<(), RuntimeError> {
@@ -528,8 +529,38 @@ impl VirtualMachine {
     }
 
     #[inline]
-    pub fn set_compiler_optimization(&mut self, level: OptimizationLevel) {
+    pub fn set_source_optimization(&mut self, level: SourceOptimization) {
         self.compiler_optimization = level;
+    }
+
+    #[inline]
+    pub fn builtin_value(&self, name: &str) -> Option<Value> {
+        self.builtins.get(name)
+    }
+
+    pub fn reset_imports_with_sys_args(&mut self, args: Vec<String>) {
+        self.import_resolver =
+            ImportResolver::with_sys_args_and_builtins(args, self.builtins.clone());
+    }
+
+    #[inline]
+    pub fn add_import_search_path(&self, path: impl Into<Arc<str>>) {
+        self.import_resolver.add_search_path(path.into());
+    }
+
+    #[inline]
+    pub fn insert_frozen_module(&self, name: &str, module: FrozenModuleSource) {
+        self.import_resolver.insert_frozen_module(name, module);
+    }
+
+    #[inline]
+    pub fn cached_module(&self, name: &str) -> Option<Arc<ModuleObject>> {
+        self.import_resolver.get_cached(name)
+    }
+
+    #[inline]
+    pub fn imported_module_from_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
+        self.import_resolver.module_from_ptr(ptr)
     }
 
     pub(crate) fn record_aot_error(&mut self, err: RuntimeError) {
@@ -540,7 +571,7 @@ impl VirtualMachine {
         self.last_aot_error = None;
     }
 
-    pub fn take_last_aot_error(&mut self) -> Option<RuntimeError> {
+    pub(crate) fn take_last_aot_error(&mut self) -> Option<RuntimeError> {
         self.last_aot_error.take()
     }
 
@@ -611,7 +642,7 @@ impl VirtualMachine {
         source: &str,
         filename: &str,
     ) -> VmResult<Arc<CodeObject>> {
-        compile_source_code(source, filename, self.compiler_optimization)
+        compile_source_code(source, filename, self.compiler_optimization.to_compiler())
             .map_err(|err| RuntimeError::import_error(module_name, Arc::from(err.to_string())))
     }
 
@@ -1445,7 +1476,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver,
             import_verbosity: 0,
-            compiler_optimization: OptimizationLevel::None,
+            compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
@@ -1516,7 +1547,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver,
             import_verbosity: 0,
-            compiler_optimization: OptimizationLevel::None,
+            compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
@@ -1595,7 +1626,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver,
             import_verbosity: 0,
-            compiler_optimization: OptimizationLevel::None,
+            compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
@@ -1643,14 +1674,14 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver,
             import_verbosity: 0,
-            compiler_optimization: OptimizationLevel::None,
+            compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
     }
 
     /// Create with pre-populated globals.
-    pub fn with_globals(globals: GlobalScope) -> Self {
+    pub(crate) fn with_globals(globals: GlobalScope) -> Self {
         let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
         let thread_group = new_thread_group();
         let heap = new_shared_managed_heap();
@@ -1686,7 +1717,7 @@ impl VirtualMachine {
             active_except_handlers: Vec::new(),
             import_resolver,
             import_verbosity: 0,
-            compiler_optimization: OptimizationLevel::None,
+            compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
             last_aot_error: None,
         }
@@ -2384,11 +2415,11 @@ impl VirtualMachine {
     /// 3. On JIT return, propagate value to caller
     /// 4. On deopt, create frame and resume interpreter
     /// 5. On miss, fall through to interpreter
-    pub fn push_frame(&mut self, code: Arc<CodeObject>, return_reg: u8) -> VmResult<()> {
+    pub(crate) fn push_frame(&mut self, code: Arc<CodeObject>, return_reg: u8) -> VmResult<()> {
         self.push_frame_internal(code, return_reg, None, self.current_module_cloned(), true)
     }
 
-    pub fn push_frame_with_module(
+    pub(crate) fn push_frame_with_module(
         &mut self,
         code: Arc<CodeObject>,
         return_reg: u8,
@@ -2403,7 +2434,7 @@ impl VirtualMachine {
     /// populated, the call path should invoke
     /// [`Self::dispatch_prepared_current_frame_via_jit`] before falling back to
     /// the interpreter loop.
-    pub fn push_frame_with_closure(
+    pub(crate) fn push_frame_with_closure(
         &mut self,
         code: Arc<CodeObject>,
         return_reg: u8,
@@ -2417,7 +2448,7 @@ impl VirtualMachine {
         )
     }
 
-    pub fn push_frame_with_closure_and_module(
+    pub(crate) fn push_frame_with_closure_and_module(
         &mut self,
         code: Arc<CodeObject>,
         return_reg: u8,
@@ -2691,7 +2722,7 @@ impl VirtualMachine {
 
     /// Pop the current frame and return to caller.
     /// Returns Some(value) if this was the last frame, None otherwise.
-    pub fn pop_frame(&mut self, return_value: Value) -> VmResult<Option<Value>> {
+    pub(crate) fn pop_frame(&mut self, return_value: Value) -> VmResult<Option<Value>> {
         let top_idx = self.frames.len() - 1;
         self.handler_stack.pop_frame_handlers(top_idx as u32);
         self.discard_except_handlers_for_frame(top_idx as u32);
@@ -2715,13 +2746,13 @@ impl VirtualMachine {
 
     /// Get reference to current frame.
     #[inline(always)]
-    pub fn current_frame(&self) -> &Frame {
+    pub(crate) fn current_frame(&self) -> &Frame {
         &self.frames[self.current_frame_idx]
     }
 
     /// Get mutable reference to current frame.
     #[inline(always)]
-    pub fn current_frame_mut(&mut self) -> &mut Frame {
+    pub(crate) fn current_frame_mut(&mut self) -> &mut Frame {
         &mut self.frames[self.current_frame_idx]
     }
 
@@ -2742,7 +2773,7 @@ impl VirtualMachine {
 
     /// Get an active frame by caller depth from the current frame.
     #[inline]
-    pub fn frame_at_depth(&self, depth: usize) -> Option<&Frame> {
+    pub(crate) fn frame_at_depth(&self, depth: usize) -> Option<&Frame> {
         self.frame_index_at_depth(depth)
             .and_then(|frame_index| self.frames.get(frame_index))
     }
@@ -2753,18 +2784,18 @@ impl VirtualMachine {
 
     /// Get the current call depth.
     #[inline]
-    pub fn call_depth(&self) -> usize {
+    pub(crate) fn call_depth(&self) -> usize {
         self.frames.len()
     }
 
     /// Check if VM is idle (no frames).
     #[inline]
-    pub fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         self.frames.is_empty()
     }
 
     /// Reset VM state for reuse.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.recycle_all_frames();
         self.set_current_frame_idx(0);
         self.globals = GlobalScope::new();
@@ -2778,7 +2809,7 @@ impl VirtualMachine {
     }
 
     /// Clear only the frame stack (keep globals).
-    pub fn clear_frames(&mut self) {
+    pub(crate) fn clear_frames(&mut self) {
         self.recycle_all_frames();
         self.set_current_frame_idx(0);
         self.handler_stack.clear();
@@ -2798,7 +2829,7 @@ impl VirtualMachine {
     /// Use this to query heap statistics, check collection thresholds,
     /// or read heap configuration.
     #[inline]
-    pub fn heap(&self) -> MutexGuard<'_, ManagedHeap> {
+    pub(crate) fn heap(&self) -> MutexGuard<'_, ManagedHeap> {
         self.heap.lock().expect("managed heap lock poisoned")
     }
 
@@ -2809,7 +2840,7 @@ impl VirtualMachine {
     /// - Updating root sets
     /// - Modifying heap configuration
     #[inline]
-    pub fn heap_mut(&self) -> MutexGuard<'_, ManagedHeap> {
+    pub(crate) fn heap_mut(&self) -> MutexGuard<'_, ManagedHeap> {
         self.heap.lock().expect("managed heap lock poisoned")
     }
 
@@ -2831,7 +2862,7 @@ impl VirtualMachine {
     /// This method is `#[inline]` and creates a zero-cost wrapper.
     /// The allocator itself is stack-allocated and holds only a reference.
     #[inline]
-    pub fn allocator(&self) -> GcAllocator<'_> {
+    pub(crate) fn allocator(&self) -> GcAllocator<'_> {
         let heap_ptr = {
             let heap = self.heap.lock().expect("managed heap lock poisoned");
             heap.heap() as *const _
@@ -2849,14 +2880,14 @@ impl VirtualMachine {
 
     /// Get the current frame's ID for exception handler tracking.
     #[inline]
-    pub fn current_frame_id(&self) -> u32 {
+    pub(crate) fn current_frame_id(&self) -> u32 {
         self.current_frame_idx as u32
     }
 
     /// Set the active exception being propagated.
     /// Uses generic Exception type (4) - prefer set_active_exception_with_type for proper matching.
     #[inline]
-    pub fn set_active_exception(&mut self, exc: Value) {
+    pub(crate) fn set_active_exception(&mut self, exc: Value) {
         self.active_exception = Some(exc);
         self.active_exception_type_id = Some(4); // Generic Exception type
         self.exc_state = ExceptionState::Propagating;
@@ -2865,7 +2896,7 @@ impl VirtualMachine {
     /// Set the active exception with a specific type ID.
     /// This enables proper exception type matching in except handlers.
     #[inline]
-    pub fn set_active_exception_with_type(&mut self, exc: Value, type_id: u16) {
+    pub(crate) fn set_active_exception_with_type(&mut self, exc: Value, type_id: u16) {
         self.active_exception = Some(exc);
         self.active_exception_type_id = Some(type_id);
         self.exc_state = ExceptionState::Propagating;
@@ -2873,7 +2904,7 @@ impl VirtualMachine {
 
     /// Get the active exception if any.
     #[inline]
-    pub fn get_active_exception(&self) -> Option<&Value> {
+    pub(crate) fn get_active_exception(&self) -> Option<&Value> {
         if self.has_active_exception() {
             self.active_exception.as_ref()
         } else {
@@ -2883,7 +2914,7 @@ impl VirtualMachine {
 
     /// Check if there's an active exception.
     #[inline]
-    pub fn has_active_exception(&self) -> bool {
+    pub(crate) fn has_active_exception(&self) -> bool {
         self.exc_state.has_exception()
             && self.active_exception.is_some()
             && self
@@ -2893,7 +2924,7 @@ impl VirtualMachine {
 
     /// Clear the active exception.
     #[inline]
-    pub fn clear_active_exception(&mut self) {
+    pub(crate) fn clear_active_exception(&mut self) {
         self.active_exception = None;
         self.active_exception_type_id = None;
     }
@@ -2903,7 +2934,7 @@ impl VirtualMachine {
     /// Returns the exception type ID for fast matching, or None if no
     /// active exception exists.
     #[inline]
-    pub fn get_active_exception_type_id(&self) -> Option<u16> {
+    pub(crate) fn get_active_exception_type_id(&self) -> Option<u16> {
         self.active_exception_type_id
     }
 
@@ -2943,7 +2974,7 @@ impl VirtualMachine {
 
     /// Enter an `except` handler and preserve its exception for nested handlers.
     #[inline]
-    pub fn enter_except_handler(&mut self) -> bool {
+    pub(crate) fn enter_except_handler(&mut self) -> bool {
         let Some(value) = self.active_exception else {
             return false;
         };
@@ -2962,7 +2993,7 @@ impl VirtualMachine {
 
     /// Exit the current `except` handler normally.
     #[inline]
-    pub fn exit_except_handler(&mut self) -> bool {
+    pub(crate) fn exit_except_handler(&mut self) -> bool {
         if self.active_except_handlers.pop().is_none() {
             return false;
         }
@@ -2973,7 +3004,7 @@ impl VirtualMachine {
 
     /// Abort the current `except` handler while preserving the new propagating exception.
     #[inline]
-    pub fn abort_except_handler(&mut self) -> bool {
+    pub(crate) fn abort_except_handler(&mut self) -> bool {
         if self.active_except_handlers.pop().is_none() {
             return false;
         }
@@ -2990,13 +3021,13 @@ impl VirtualMachine {
     ///
     /// Returns false if the stack is full.
     #[inline]
-    pub fn push_exception_handler(&mut self, frame: crate::exception::HandlerFrame) -> bool {
+    pub(crate) fn push_exception_handler(&mut self, frame: crate::exception::HandlerFrame) -> bool {
         self.handler_stack.push(frame)
     }
 
     /// Pop an exception handler from the handler stack.
     #[inline]
-    pub fn pop_exception_handler(&mut self) -> Option<crate::exception::HandlerFrame> {
+    pub(crate) fn pop_exception_handler(&mut self) -> Option<crate::exception::HandlerFrame> {
         self.handler_stack.pop()
     }
 
@@ -3006,7 +3037,7 @@ impl VirtualMachine {
     /// body executes. Note: We can't rely on exc_state == Finally because
     /// PopExcInfo may have changed it during the finally execution.
     #[inline]
-    pub fn should_reraise_after_finally(&self) -> bool {
+    pub(crate) fn should_reraise_after_finally(&self) -> bool {
         self.exc_state == ExceptionState::Propagating
             && self.active_exception_type_id.is_some()
             && self.active_exception_type_id != Some(0)
@@ -3014,19 +3045,19 @@ impl VirtualMachine {
 
     /// Clear the reraise flag after handling.
     #[inline]
-    pub fn clear_reraise_flag(&mut self) {
+    pub(crate) fn clear_reraise_flag(&mut self) {
         // Transition state - exception will be preserved for reraise
     }
 
     /// Clear exception state (after successful handling).
     #[inline]
-    pub fn clear_exception_state(&mut self) {
+    pub(crate) fn clear_exception_state(&mut self) {
         self.exc_state = ExceptionState::Normal;
     }
 
     /// Finish a finally cleanup that did not need to reraise.
     #[inline]
-    pub fn finish_finally_without_reraise(&mut self) {
+    pub(crate) fn finish_finally_without_reraise(&mut self) {
         match self.exc_state {
             ExceptionState::Handling | ExceptionState::Finally => {}
             ExceptionState::Normal | ExceptionState::Propagating | ExceptionState::Unhandled => {
@@ -3038,19 +3069,19 @@ impl VirtualMachine {
 
     /// Get the current exception state.
     #[inline]
-    pub fn exception_state(&self) -> ExceptionState {
+    pub(crate) fn exception_state(&self) -> ExceptionState {
         self.exc_state
     }
 
     /// Set the exception state directly.
     #[inline]
-    pub fn set_exception_state(&mut self, state: ExceptionState) {
+    pub(crate) fn set_exception_state(&mut self, state: ExceptionState) {
         self.exc_state = state;
     }
 
     /// Cache a handler lookup result for fast path.
     #[inline]
-    pub fn cache_handler(&mut self, pc: u32, handler_idx: u16) {
+    pub(crate) fn cache_handler(&mut self, pc: u32, handler_idx: u16) {
         self.frames[self.current_frame_idx]
             .handler_cache
             .record(pc, handler_idx);
@@ -3058,7 +3089,7 @@ impl VirtualMachine {
 
     /// Look up a cached handler for a PC.
     #[inline]
-    pub fn lookup_cached_handler(&mut self, pc: u32) -> Option<u16> {
+    pub(crate) fn lookup_cached_handler(&mut self, pc: u32) -> Option<u16> {
         self.frames[self.current_frame_idx]
             .handler_cache
             .try_get(pc)
@@ -3066,7 +3097,7 @@ impl VirtualMachine {
 
     /// Get the handler stack depth.
     #[inline]
-    pub fn handler_stack_depth(&self) -> usize {
+    pub(crate) fn handler_stack_depth(&self) -> usize {
         self.handler_stack.len()
     }
 
@@ -3086,7 +3117,7 @@ impl VirtualMachine {
     /// We prefer the most specific covering range so nested handlers work even
     /// when entries are emitted in source order rather than sorted order.
     #[inline]
-    pub fn find_exception_handler(&mut self, _type_id: u16) -> Option<u32> {
+    pub(crate) fn find_exception_handler(&mut self, _type_id: u16) -> Option<u32> {
         if self.frames.is_empty() {
             return None;
         }
@@ -3153,20 +3184,20 @@ impl VirtualMachine {
 
     /// Get a reference to the exception info stack.
     #[inline]
-    pub fn exc_info_stack(&self) -> &ExcInfoStack {
+    pub(crate) fn exc_info_stack(&self) -> &ExcInfoStack {
         &self.exc_info_stack
     }
 
     /// Get a mutable reference to the exception info stack.
     #[inline]
-    pub fn exc_info_stack_mut(&mut self) -> &mut ExcInfoStack {
+    pub(crate) fn exc_info_stack_mut(&mut self) -> &mut ExcInfoStack {
         &mut self.exc_info_stack
     }
 
     /// Push current exception info onto the stack.
     /// Returns false if stack is full.
     #[inline]
-    pub fn push_exc_info(&mut self) -> bool {
+    pub(crate) fn push_exc_info(&mut self) -> bool {
         use crate::exception::{EntryFlags, ExcInfoEntry};
 
         let has_active_exception = self.has_active_exception();
@@ -3191,7 +3222,7 @@ impl VirtualMachine {
 
     /// Pop exception info from the stack and restore it as active.
     #[inline]
-    pub fn pop_exc_info(&mut self) -> bool {
+    pub(crate) fn pop_exc_info(&mut self) -> bool {
         use crate::exception::EntryFlags;
 
         if let Some(entry) = self.exc_info_stack.pop() {
@@ -3218,13 +3249,13 @@ impl VirtualMachine {
 
     /// Check if there's exception info on the stack.
     #[inline]
-    pub fn has_exc_info(&self) -> bool {
+    pub(crate) fn has_exc_info(&self) -> bool {
         !self.exc_info_stack.is_empty() || self.has_active_exception()
     }
 
     /// Get current exception info as (type_id, value, traceback_id).
     #[inline]
-    pub fn current_exc_info(&self) -> (Option<u16>, Option<Value>, Option<u32>) {
+    pub(crate) fn current_exc_info(&self) -> (Option<u16>, Option<Value>, Option<u32>) {
         self.exc_info_stack.current_exc_info()
     }
 }

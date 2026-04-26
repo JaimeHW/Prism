@@ -1,0 +1,433 @@
+use super::*;
+use crate::builtins::builtin_type;
+use prism_core::intern::intern;
+use prism_runtime::object::class::PyClassObject;
+
+// =========================================================================
+// Unit Tests for Helper Functions
+// =========================================================================
+
+#[test]
+fn test_class_object_has_type_id() {
+    use prism_runtime::object::PyObject;
+    use prism_runtime::object::type_obj::TypeId;
+
+    // Create a class object and verify its header has TYPE type_id via the trait
+    let class = PyClassObject::new_simple(intern("TestClass"));
+
+    // Use the PyObject trait to get the type_id (this is the safe way)
+    assert_eq!(
+        class.header().type_id,
+        TypeId::TYPE,
+        "PyClassObject header should have TypeId::TYPE"
+    );
+}
+
+#[test]
+fn test_class_id_extraction_direct() {
+    // Create a class and verify we can get its class_id through the object
+    let class = PyClassObject::new_simple(intern("DirectTestClass"));
+    let expected_id = class.class_id();
+    let class = Arc::new(class);
+    let class_ptr = Arc::as_ptr(&class) as *const PyClassObject;
+
+    // Directly read from the object
+    let class_ref = unsafe { &*class_ptr };
+    assert_eq!(class_ref.class_id(), expected_id);
+}
+
+#[test]
+fn test_extract_class_id_returns_none_for_non_objects() {
+    // Non-object values should return None
+    assert_eq!(extract_class_id(Value::none()), None);
+    assert_eq!(extract_class_id(Value::bool(true)), None);
+    assert_eq!(extract_class_id(Value::int_unchecked(42)), None);
+}
+
+#[test]
+fn test_extract_class_id_supports_builtin_type_objects() {
+    let int_type =
+        builtin_type(&[Value::int(0).unwrap()]).expect("type(int_instance) should succeed");
+
+    assert_eq!(extract_class_id(int_type), Some(ClassId(TypeId::INT.raw())));
+}
+
+#[test]
+fn test_extract_string_name_tagged() {
+    let name = extract_string_name(Value::string(intern("TaggedClass")));
+    assert_eq!(name.unwrap().as_ref(), "TaggedClass");
+}
+
+#[test]
+fn test_extract_string_name_heap_string() {
+    let ptr = Box::into_raw(Box::new(StringObject::new("HeapClass")));
+    let value = Value::object_ptr(ptr as *const ());
+    let name = extract_string_name(value);
+    assert_eq!(name.unwrap().as_ref(), "HeapClass");
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[test]
+fn test_extract_string_name_invalid_returns_none() {
+    let name = extract_string_name(Value::none());
+    assert!(name.is_none());
+}
+
+#[test]
+fn test_extract_class_name_from_code_const() {
+    let code = Arc::new(CodeObject::new("ExtractedClass", "<test>"));
+    let raw = Arc::into_raw(Arc::clone(&code)) as *const ();
+    let code_const = Value::object_ptr(raw);
+
+    let name = extract_class_name_from_code_const(code_const, &[Arc::clone(&code)]);
+    assert_eq!(name.unwrap().as_ref(), "ExtractedClass");
+
+    unsafe {
+        let _ = Arc::from_raw(raw as *const CodeObject);
+    }
+}
+
+#[test]
+fn test_extract_class_name_from_code_const_returns_none_when_pointer_not_nested() {
+    let code = Arc::new(CodeObject::new("UnlistedClass", "<test>"));
+    let raw = Arc::into_raw(Arc::clone(&code)) as *const ();
+    let code_const = Value::object_ptr(raw);
+
+    let name = extract_class_name_from_code_const(code_const, &[]);
+    assert!(name.is_none());
+
+    unsafe {
+        let _ = Arc::from_raw(raw as *const CodeObject);
+    }
+}
+
+// =========================================================================
+// Class Creation Tests
+// =========================================================================
+
+#[test]
+fn test_simple_class_creation() {
+    let class = PyClassObject::new_simple(intern("SimpleClass"));
+    assert_eq!(class.name().as_ref(), "SimpleClass");
+    assert!(class.bases().is_empty());
+    assert_eq!(class.mro().len(), 2); // [SimpleClass, object]
+}
+
+#[test]
+fn test_class_with_single_base() {
+    // Create parent class
+    let parent = Arc::new(PyClassObject::new_simple(intern("Parent")));
+    let parent_id = parent.class_id();
+    let parent_mro = parent.mro().to_vec();
+
+    // Create child with parent as base
+    let child = PyClassObject::new(intern("Child"), &[parent_id], |id| {
+        if id == parent_id {
+            Some(parent_mro.clone().into())
+        } else {
+            None
+        }
+    });
+
+    assert!(child.is_ok());
+    let child = child.unwrap();
+    assert_eq!(child.bases().len(), 1);
+    assert!(child.bases().contains(&parent_id));
+}
+
+#[test]
+fn test_class_type_id_uniqueness() {
+    let class1 = PyClassObject::new_simple(intern("Class1"));
+    let class2 = PyClassObject::new_simple(intern("Class2"));
+
+    assert_ne!(class1.class_type_id(), class2.class_type_id());
+    assert_ne!(class1.class_id(), class2.class_id());
+}
+
+#[test]
+fn test_class_dict_operations() {
+    let namespace = ClassDict::new();
+
+    // Initially empty
+    assert!(namespace.is_empty());
+
+    // Add attribute
+    let attr_name = intern("my_method");
+    namespace.set(attr_name.clone(), Value::int_unchecked(42));
+
+    // Check attribute
+    assert!(!namespace.is_empty());
+    assert!(namespace.contains(&attr_name));
+    assert_eq!(namespace.get(&attr_name), Some(Value::int_unchecked(42)));
+
+    // Delete attribute
+    let deleted = namespace.delete(&attr_name);
+    assert_eq!(deleted, Some(Value::int_unchecked(42)));
+    assert!(namespace.is_empty());
+}
+
+#[test]
+fn test_class_dict_multiple_attributes() {
+    let namespace = ClassDict::new();
+
+    // Add multiple attributes
+    for i in 0..10 {
+        let name = intern(&format!("attr_{}", i));
+        namespace.set(name, Value::int_unchecked(i as i64));
+    }
+
+    assert_eq!(namespace.len(), 10);
+
+    // Verify all attributes
+    for i in 0..10 {
+        let name = intern(&format!("attr_{}", i));
+        assert!(namespace.contains(&name));
+        assert_eq!(namespace.get(&name), Some(Value::int_unchecked(i as i64)));
+    }
+}
+
+#[test]
+fn test_class_inherits_from_object() {
+    let class = PyClassObject::new_simple(intern("Derived"));
+
+    // MRO should end with object (ClassId::OBJECT)
+    let mro = class.mro();
+    assert_eq!(mro.len(), 2);
+    assert_eq!(mro[0], class.class_id()); // Self first
+    assert_eq!(mro[1], ClassId::OBJECT); // Object last
+}
+
+#[test]
+fn test_class_attribute_setting() {
+    let class = PyClassObject::new_simple(intern("AttrTest"));
+
+    // Set some attributes
+    class.set_attr(intern("x"), Value::int_unchecked(10));
+    class.set_attr(intern("y"), Value::int_unchecked(20));
+
+    // Verify
+    assert!(class.has_attr(&intern("x")));
+    assert!(class.has_attr(&intern("y")));
+    assert_eq!(class.get_attr(&intern("x")), Some(Value::int_unchecked(10)));
+    assert_eq!(class.get_attr(&intern("y")), Some(Value::int_unchecked(20)));
+}
+
+#[test]
+fn test_class_flags_modification() {
+    let mut class = PyClassObject::new_simple(intern("FlagsModTest"));
+
+    // Modify flags
+    class.mark_initialized();
+    class.mark_final();
+    class.mark_has_init();
+
+    assert!(class.is_initialized());
+    assert!(class.is_final());
+    assert!(class.has_custom_init());
+}
+
+#[test]
+fn test_class_slots_definition() {
+    let mut class = PyClassObject::new_simple(intern("SlottedClass"));
+
+    // Define __slots__
+    let slots = vec![intern("x"), intern("y"), intern("z")];
+    class.set_slots(slots);
+
+    assert!(class.has_slots());
+    assert_eq!(class.slot_names().unwrap().len(), 3);
+}
+
+#[test]
+fn test_instantiation_hint_no_slots() {
+    let class = PyClassObject::new_simple(intern("NoSlots"));
+
+    // Without __init__, hint is DefaultInit
+    use prism_runtime::object::class::InstantiationHint;
+    assert_eq!(class.instantiation_hint(), InstantiationHint::DefaultInit);
+}
+
+#[test]
+fn test_instantiation_hint_with_init() {
+    let mut class = PyClassObject::new_simple(intern("WithInit"));
+    class.mark_has_init();
+
+    use prism_runtime::object::class::InstantiationHint;
+    assert_eq!(class.instantiation_hint(), InstantiationHint::Generic);
+}
+
+#[test]
+fn test_instantiation_hint_inline_slots() {
+    let mut class = PyClassObject::new_simple(intern("InlineSlots"));
+    class.set_slots(vec![intern("x"), intern("y")]); // 2 slots, fits inline
+
+    use prism_runtime::object::class::InstantiationHint;
+    assert_eq!(class.instantiation_hint(), InstantiationHint::InlineSlots);
+}
+
+#[test]
+fn test_instantiation_hint_fixed_slots() {
+    let mut class = PyClassObject::new_simple(intern("FixedSlots"));
+    // More than 4 slots - needs fixed allocation
+    class.set_slots(vec![
+        intern("a"),
+        intern("b"),
+        intern("c"),
+        intern("d"),
+        intern("e"),
+        intern("f"),
+    ]);
+
+    use prism_runtime::object::class::InstantiationHint;
+    assert_eq!(class.instantiation_hint(), InstantiationHint::FixedSlots);
+}
+
+// =========================================================================
+// Multiple Inheritance Tests
+// =========================================================================
+
+#[test]
+fn test_diamond_inheritance_mro() {
+    use std::collections::HashMap;
+
+    // Diamond: D(B, C) where B(A) and C(A)
+    // Create A
+    let a = Arc::new(PyClassObject::new_simple(intern("A")));
+    let a_id = a.class_id();
+    let a_mro = a.mro().to_vec();
+
+    let mut registry: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+    registry.insert(a_id, a_mro.clone());
+
+    // Create B(A)
+    let b = Arc::new(
+        PyClassObject::new(intern("B"), &[a_id], |id| {
+            registry.get(&id).cloned().map(|v| v.into())
+        })
+        .unwrap(),
+    );
+    let b_id = b.class_id();
+    let b_mro = b.mro().to_vec();
+    registry.insert(b_id, b_mro.clone());
+
+    // Create C(A)
+    let c = Arc::new(
+        PyClassObject::new(intern("C"), &[a_id], |id| {
+            registry.get(&id).cloned().map(|v| v.into())
+        })
+        .unwrap(),
+    );
+    let c_id = c.class_id();
+    let c_mro = c.mro().to_vec();
+    registry.insert(c_id, c_mro.clone());
+
+    // Create D(B, C)
+    let d = PyClassObject::new(intern("D"), &[b_id, c_id], |id| {
+        registry.get(&id).cloned().map(|v| v.into())
+    })
+    .unwrap();
+
+    // D's MRO should be [D, B, C, A, object]
+    let d_mro = d.mro();
+    assert_eq!(d_mro.len(), 5);
+    assert_eq!(d_mro[0], d.class_id()); // D
+    assert_eq!(d_mro[1], b_id); // B
+    assert_eq!(d_mro[2], c_id); // C
+    assert_eq!(d_mro[3], a_id); // A
+    assert_eq!(d_mro[4], ClassId::OBJECT); // object
+}
+
+// =========================================================================
+// Class Value Conversion Tests
+// =========================================================================
+
+#[test]
+fn test_class_to_value_roundtrip() {
+    let original = PyClassObject::new_simple(intern("Roundtrip"));
+    let original_id = original.class_type_id();
+    let original_name = original.name().clone();
+
+    // Convert to Arc and then to Value
+    let class = Arc::new(original);
+    let class_ptr = Arc::into_raw(class) as *const ();
+    let class_val = Value::object_ptr(class_ptr);
+
+    // Should be able to check it's an object
+    assert!(class_val.as_object_ptr().is_some());
+
+    // Extract and verify
+    let extracted_ptr = class_val.as_object_ptr().unwrap();
+    let extracted_class = unsafe { &*(extracted_ptr as *const PyClassObject) };
+
+    assert_eq!(extracted_class.class_type_id(), original_id);
+    assert_eq!(extracted_class.name(), &original_name);
+
+    // Clean up
+    unsafe { Arc::from_raw(extracted_ptr as *const PyClassObject) };
+}
+
+// =========================================================================
+// Thread Safety Tests
+// =========================================================================
+
+#[test]
+fn test_class_dict_concurrent_access() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let namespace = Arc::new(ClassDict::new());
+
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let ns = namespace.clone();
+            thread::spawn(move || {
+                // Each thread sets its own attribute
+                let name = intern(&format!("thread_attr_{}", i));
+                ns.set(name.clone(), Value::int_unchecked(i as i64));
+
+                // Verify it was set
+                assert!(ns.contains(&name));
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // All 4 attributes should exist
+    assert_eq!(namespace.len(), 4);
+}
+
+#[test]
+fn test_class_object_concurrent_reads() {
+    use std::sync::Arc;
+    use std::thread;
+
+    // Create class with some attributes
+    let class = PyClassObject::new_simple(intern("ConcurrentRead"));
+    class.set_attr(intern("x"), Value::int_unchecked(100));
+    class.set_attr(intern("y"), Value::int_unchecked(200));
+    let class = Arc::new(class);
+
+    // Multiple threads reading simultaneously
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let c = class.clone();
+            thread::spawn(move || {
+                for _ in 0..100 {
+                    let x = c.get_attr(&intern("x"));
+                    let y = c.get_attr(&intern("y"));
+                    assert_eq!(x, Some(Value::int_unchecked(100)));
+                    assert_eq!(y, Some(Value::int_unchecked(200)));
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}

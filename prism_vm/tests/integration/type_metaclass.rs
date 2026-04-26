@@ -495,7 +495,7 @@ RESULT = pattern.flags
     assert!(result.is_ok(), "Failed: {:?}", result);
     assert_eq!(
         result.expect("pattern flags should be returned").as_int(),
-        Some(RegexFlags::IGNORECASE as i64 | RegexFlags::UNICODE as i64)
+        Some(RE_IGNORECASE | RE_UNICODE)
     );
 }
 
@@ -1277,4 +1277,3 @@ assert p() == 1
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
-

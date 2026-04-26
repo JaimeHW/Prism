@@ -1177,4 +1177,3 @@ CHECK_FILTERED_EVENT_COUNT = Example.filtered_event_count
         Some(4)
     );
 }
-

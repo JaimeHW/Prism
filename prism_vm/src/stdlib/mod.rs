@@ -185,126 +185,84 @@ impl StdlibRegistry {
         Self::insert_module(
             &mut modules,
             "builtins",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(python_builtins::BuiltinsModule::new(builtins)),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "_abc",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(_abc::AbcModule::new()),
-        );
+        Self::insert_module(&mut modules, "_abc", Box::new(_abc::AbcModule::new()));
 
-        Self::insert_module(
-            &mut modules,
-            "_ast",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(_ast::AstModule::new()),
-        );
+        Self::insert_module(&mut modules, "_ast", Box::new(_ast::AstModule::new()));
 
         Self::insert_module(
             &mut modules,
             "_codecs",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_codecs::CodecsModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_contextvars",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_contextvars::ContextVarsModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_functools",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_functools::FunctoolsNativeModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "_imp",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(_imp::ImpModule::new()),
-        );
+        Self::insert_module(&mut modules, "_imp", Box::new(_imp::ImpModule::new()));
 
         Self::insert_module(
             &mut modules,
             "_random",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_random::RandomModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "_sha2",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(_sha2::Sha2Module::new()),
-        );
+        Self::insert_module(&mut modules, "_sha2", Box::new(_sha2::Sha2Module::new()));
 
         Self::insert_module(
             &mut modules,
             "_socket",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_socket::SocketModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "_ssl",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(_ssl::SslModule::new()),
-        );
+        Self::insert_module(&mut modules, "_ssl", Box::new(_ssl::SslModule::new()));
 
-        Self::insert_module(
-            &mut modules,
-            "_sre",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(_sre::SreModule::new()),
-        );
+        Self::insert_module(&mut modules, "_sre", Box::new(_sre::SreModule::new()));
 
         Self::insert_module(
             &mut modules,
             "_io",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(io::IoModule::with_name("_io")),
         );
 
         Self::insert_module(
             &mut modules,
             "_string",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_string::StringModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_struct",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_struct::StructModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_thread",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_thread::ThreadModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_testcapi",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_testcapi::TestCapiModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_tracemalloc",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_tracemalloc::TraceMallocModule::new()),
         );
 
@@ -312,28 +270,24 @@ impl StdlibRegistry {
             Self::insert_module(
                 &mut modules,
                 "_overlapped",
-                StdlibResolutionPolicy::PreferNative,
                 Box::new(_overlapped::OverlappedModule::new()),
             );
 
             Self::insert_module(
                 &mut modules,
                 "_winapi",
-                StdlibResolutionPolicy::PreferNative,
                 Box::new(_winapi::WinApiModule::new()),
             );
 
             Self::insert_module(
                 &mut modules,
                 "msvcrt",
-                StdlibResolutionPolicy::PreferNative,
                 Box::new(msvcrt::MsvcrtModule::new()),
             );
 
             Self::insert_module(
                 &mut modules,
                 "winreg",
-                StdlibResolutionPolicy::PreferNative,
                 Box::new(winreg::WinregModule::new()),
             );
         }
@@ -341,101 +295,63 @@ impl StdlibRegistry {
         Self::insert_module(
             &mut modules,
             "_tokenize",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_tokenize::TokenizeModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_weakref",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_weakref::WeakRefModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "_warnings",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(_warnings::WarningsModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "array",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(array::ArrayModule::new()),
-        );
+        Self::insert_module(&mut modules, "array", Box::new(array::ArrayModule::new()));
 
         Self::insert_module(
             &mut modules,
             "binascii",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(binascii::BinasciiModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "ctypes",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(ctypes::CtypesModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "marshal",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(marshal::MarshalModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "math",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(math::MathModule::new()),
-        );
+        Self::insert_module(&mut modules, "math", Box::new(math::MathModule::new()));
 
         Self::insert_module(
             &mut modules,
             "atexit",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(atexit::AtexitModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "errno",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(errno::ErrnoModule::new()),
-        );
+        Self::insert_module(&mut modules, "errno", Box::new(errno::ErrnoModule::new()));
 
-        Self::insert_module(
-            &mut modules,
-            "gc",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(gc::GcModule::new()),
-        );
+        Self::insert_module(&mut modules, "gc", Box::new(gc::GcModule::new()));
 
         if cfg!(windows) {
-            Self::insert_module(
-                &mut modules,
-                "nt",
-                StdlibResolutionPolicy::PreferNative,
-                Box::new(nt::NtModule::new()),
-            );
+            Self::insert_module(&mut modules, "nt", Box::new(nt::NtModule::new()));
         }
 
         // Register os module family as native fallbacks. When a CPython stdlib
         // tree is available, the Python source modules are more correct.
-        Self::insert_module(
-            &mut modules,
-            "os",
-            StdlibResolutionPolicy::PreferSourceWhenAvailable,
-            Box::new(os::OsModule::new()),
-        );
+        Self::insert_module(&mut modules, "os", Box::new(os::OsModule::new()));
         Self::insert_module(
             &mut modules,
             "os.path",
-            StdlibResolutionPolicy::PreferSourceWhenAvailable,
             Box::new(os::path::OsPathModule::new()),
         );
 
@@ -444,63 +360,39 @@ impl StdlibRegistry {
             Some(args) => sys::SysModule::with_args(args),
             None => sys::SysModule::new(),
         };
-        Self::insert_module(
-            &mut modules,
-            "sys",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(sys_module),
-        );
+        Self::insert_module(&mut modules, "sys", Box::new(sys_module));
 
         // Register time module
-        Self::insert_module(
-            &mut modules,
-            "time",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(time::TimeModule::new()),
-        );
+        Self::insert_module(&mut modules, "time", Box::new(time::TimeModule::new()));
 
         Self::insert_module(
             &mut modules,
             "typing",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(typing::TypingModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "signal",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(signal::SignalModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "weakref",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(weakref::WeakrefModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "select",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(select::SelectModule::new()),
         );
 
         // Register pure-Python stdlib fallbacks.
-        Self::insert_module(
-            &mut modules,
-            "re",
-            StdlibResolutionPolicy::PreferSourceWhenAvailable,
-            Box::new(re::ReModule::new()),
-        );
+        Self::insert_module(&mut modules, "re", Box::new(re::ReModule::new()));
 
-        Self::insert_module(
-            &mut modules,
-            "json",
-            StdlibResolutionPolicy::PreferSourceWhenAvailable,
-            Box::new(json::JsonModule::new()),
-        );
+        Self::insert_module(&mut modules, "json", Box::new(json::JsonModule::new()));
 
         // Prefer Prism's native collections module for now. The CPython
         // source implementation currently depends on runtime features such as
@@ -510,44 +402,34 @@ impl StdlibRegistry {
         Self::insert_module(
             &mut modules,
             "collections",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(collections::CollectionsModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "functools",
-            StdlibResolutionPolicy::PreferSourceWhenAvailable,
             Box::new(functools::FunctoolsModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "fnmatch",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(fnmatch::FnmatchModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "inspect",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(inspect::InspectModule::new()),
         );
 
         Self::insert_module(
             &mut modules,
             "itertools",
-            StdlibResolutionPolicy::PreferNative,
             Box::new(itertools::ItertoolsModule::new()),
         );
 
-        Self::insert_module(
-            &mut modules,
-            "io",
-            StdlibResolutionPolicy::PreferNative,
-            Box::new(io::IoModule::new()),
-        );
+        Self::insert_module(&mut modules, "io", Box::new(io::IoModule::new()));
 
         Self { modules }
     }
@@ -555,9 +437,10 @@ impl StdlibRegistry {
     fn insert_module(
         modules: &mut std::collections::HashMap<Arc<str>, RegisteredModule>,
         name: &'static str,
-        policy: StdlibResolutionPolicy,
         module: Box<dyn Module + Send + Sync>,
     ) {
+        let policy = prism_stdlib::native_module_policy(name)
+            .unwrap_or_else(|| panic!("native stdlib module `{name}` is missing metadata"));
         modules.insert(Arc::from(name), RegisteredModule { module, policy });
     }
 
@@ -592,124 +475,4 @@ impl Default for StdlibRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_registry_creation() {
-        let registry = StdlibRegistry::new();
-        assert!(registry.contains("math"));
-        assert!(registry.contains("errno"));
-        assert!(registry.contains("gc"));
-        assert!(registry.contains("ctypes"));
-        assert!(registry.contains("builtins"));
-        assert!(registry.contains("signal"));
-        assert!(registry.contains("select"));
-        assert!(registry.contains("_codecs"));
-        assert!(registry.contains("_contextvars"));
-        assert!(registry.contains("_functools"));
-        assert!(registry.contains("_imp"));
-        assert!(registry.contains("_random"));
-        assert!(registry.contains("_sha2"));
-        assert!(registry.contains("_socket"));
-        assert!(registry.contains("_ssl"));
-        assert!(registry.contains("_sre"));
-        assert!(registry.contains("_tokenize"));
-        assert!(registry.contains("_weakref"));
-        assert!(registry.contains("_warnings"));
-        assert!(registry.contains("weakref"));
-        assert!(registry.contains("array"));
-        if cfg!(windows) {
-            assert!(registry.contains("_overlapped"));
-            assert!(registry.contains("msvcrt"));
-            assert!(registry.contains("nt"));
-            assert!(registry.contains("winreg"));
-        }
-    }
-
-    #[test]
-    fn test_registry_get_math() {
-        let registry = StdlibRegistry::new();
-        let math = registry.get("math");
-        assert!(math.is_some());
-        assert_eq!(math.unwrap().name(), "math");
-    }
-
-    #[test]
-    fn test_registry_unknown_module() {
-        let registry = StdlibRegistry::new();
-        assert!(!registry.contains("nonexistent"));
-        assert!(registry.get("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_list_modules() {
-        let registry = StdlibRegistry::new();
-        let modules = registry.list_modules();
-        assert!(modules.contains(&"math"));
-        assert!(modules.contains(&"builtins"));
-    }
-
-    #[test]
-    fn test_registry_get_builtins() {
-        let registry = StdlibRegistry::new();
-        let builtins = registry
-            .get("builtins")
-            .expect("builtins module should be registered");
-
-        assert_eq!(builtins.name(), "builtins");
-        assert!(builtins.get_attr("open").is_ok());
-    }
-
-    #[test]
-    fn test_registry_marks_fallback_source_preferred_modules() {
-        let registry = StdlibRegistry::new();
-
-        assert!(registry.prefers_source_when_available("re"));
-        assert!(!registry.prefers_source_when_available("collections"));
-        assert!(registry.prefers_source_when_available("os"));
-        assert!(!registry.prefers_source_when_available("sys"));
-        assert!(!registry.prefers_source_when_available("math"));
-        assert!(!registry.prefers_source_when_available("signal"));
-        assert!(!registry.prefers_source_when_available("select"));
-        assert!(!registry.prefers_source_when_available("_codecs"));
-        assert!(!registry.prefers_source_when_available("_imp"));
-        assert!(!registry.prefers_source_when_available("_functools"));
-        assert!(!registry.prefers_source_when_available("_random"));
-        assert!(!registry.prefers_source_when_available("_sha2"));
-        assert!(!registry.prefers_source_when_available("_socket"));
-        assert!(!registry.prefers_source_when_available("_sre"));
-        assert!(!registry.prefers_source_when_available("_tokenize"));
-        assert!(!registry.prefers_source_when_available("_weakref"));
-        assert!(!registry.prefers_source_when_available("_warnings"));
-        assert!(!registry.prefers_source_when_available("weakref"));
-        if cfg!(windows) {
-            assert!(!registry.prefers_source_when_available("_overlapped"));
-        }
-    }
-
-    #[test]
-    fn test_builtin_module_name_registry_contains_importlib_bootstrap_modules() {
-        assert!(is_builtin_module_name("_contextvars"));
-        assert!(is_builtin_module_name("_functools"));
-        assert!(is_builtin_module_name("_imp"));
-        assert!(is_builtin_module_name("_io"));
-        assert!(is_builtin_module_name("_random"));
-        assert!(is_builtin_module_name("_sha2"));
-        assert!(is_builtin_module_name("_socket"));
-        assert!(is_builtin_module_name("_ssl"));
-        assert!(is_builtin_module_name("_sre"));
-        assert!(is_builtin_module_name("_thread"));
-        assert!(is_builtin_module_name("_weakref"));
-        assert!(is_builtin_module_name("_warnings"));
-        assert!(is_builtin_module_name("array"));
-        assert!(is_builtin_module_name("select"));
-        if cfg!(windows) {
-            assert!(is_builtin_module_name("_overlapped"));
-            assert!(is_builtin_module_name("_winapi"));
-            assert!(is_builtin_module_name("msvcrt"));
-            assert!(is_builtin_module_name("winreg"));
-        }
-        assert!(!is_builtin_module_name("re"));
-    }
-}
+mod tests;

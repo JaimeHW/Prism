@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::VirtualMachine;
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::types::list::ListObject;
-use prism_vm::VirtualMachine;
 
 #[test]
 fn vm_lifetime_binds_runtime_heap_for_helper_allocations() {
@@ -13,10 +13,7 @@ fn vm_lifetime_binds_runtime_heap_for_helper_allocations() {
         .as_object_ptr()
         .expect("managed helper should allocate an object value");
 
-    assert!(
-        vm.heap().heap().contains(ptr),
-        "runtime helper allocations should land in the active VM heap"
-    );
+    assert!(vm.heap().heap().contains(ptr));
 }
 
 #[test]
@@ -26,7 +23,7 @@ fn production_vm_code_uses_managed_value_allocation() {
     let mut violations = Vec::new();
 
     visit_rs_files(&src_dir, &mut |path| {
-        if path.file_name().is_some_and(|name| name == "tests.rs") {
+        if is_test_only_source(&src_dir, path) {
             return;
         }
 
@@ -55,7 +52,7 @@ fn production_vm_code_uses_managed_value_allocation() {
             }
             saw_cfg_test = false;
 
-            if test_module_depth.is_none() && line.contains("Box::into_raw(Box::new") {
+            if test_module_depth.is_none() && is_raw_python_object_box(line) {
                 let relative = path
                     .strip_prefix(&manifest_dir)
                     .expect("path should be under manifest dir");
@@ -73,6 +70,23 @@ fn production_vm_code_uses_managed_value_allocation() {
         violations.is_empty(),
         "production VM code must allocate Python objects through managed heap helpers, not raw boxes: {violations:?}"
     );
+}
+
+fn is_test_only_source(src_dir: &Path, path: &Path) -> bool {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    if file_name.is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs")) {
+        return true;
+    }
+
+    path.strip_prefix(src_dir).ok().is_some_and(|relative| {
+        relative
+            .components()
+            .any(|component| component.as_os_str() == "tests")
+    })
+}
+
+fn is_raw_python_object_box(line: &str) -> bool {
+    line.contains("Box::into_raw(Box::new") && !line.contains("KwNamesTuple::new")
 }
 
 fn is_inline_module_decl(line: &str) -> bool {

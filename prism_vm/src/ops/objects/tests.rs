@@ -163,9 +163,9 @@ fn property_storage_getter(args: &[Value]) -> Result<Value, crate::builtins::Bui
         crate::builtins::BuiltinError::TypeError("getter requires object receiver".to_string())
     })?;
     let shaped = unsafe { &*(ptr as *const ShapedObject) };
-    shaped.get_property("_value").ok_or_else(|| {
-        crate::builtins::BuiltinError::AttributeError("_value missing".to_string())
-    })
+    shaped
+        .get_property("_value")
+        .ok_or_else(|| crate::builtins::BuiltinError::AttributeError("_value missing".to_string()))
 }
 
 fn metaclass_property_getter(args: &[Value]) -> Result<Value, crate::builtins::BuiltinError> {
@@ -572,8 +572,7 @@ fn test_get_attr_binds_builtin_list_methods_as_builtin_functions() {
 #[test]
 fn test_get_attr_binds_builtin_frozenset_contains_method() {
     let mut vm = vm_with_names(&["__contains__"]);
-    let mut frozenset =
-        SetObject::from_slice(&[Value::int(3).unwrap(), Value::int(5).unwrap()]);
+    let mut frozenset = SetObject::from_slice(&[Value::int(3).unwrap(), Value::int(5).unwrap()]);
     frozenset.header.type_id = TypeId::FROZENSET;
     let (frozenset_value, frozenset_ptr) = boxed_value(frozenset);
     vm.current_frame_mut().set_reg(1, frozenset_value);
@@ -1138,8 +1137,7 @@ fn test_user_defined_instance_dict_assignment_aliases_external_dict() {
 
     set_attribute_value(&mut vm, instance, &intern("__dict__"), external_value)
         .expect("__dict__ assignment should accept dictionaries");
-    unsafe { &mut *external_ptr }
-        .set(Value::string(intern("external")), Value::int(5).unwrap());
+    unsafe { &mut *external_ptr }.set(Value::string(intern("external")), Value::int(5).unwrap());
     assert_eq!(
         get_attribute_value(&mut vm, instance, &intern("external"))
             .expect("external __dict__ mutations should drive attributes")
@@ -1489,13 +1487,11 @@ fn test_get_attr_exposes_syntax_exception_metadata() {
         Value::string(intern("value =\n"))
     );
     assert_eq!(
-        get_attribute_value(&mut vm, exc, &intern("end_lineno"))
-            .expect("end_lineno should work"),
+        get_attribute_value(&mut vm, exc, &intern("end_lineno")).expect("end_lineno should work"),
         Value::int(4).unwrap()
     );
     assert_eq!(
-        get_attribute_value(&mut vm, exc, &intern("end_offset"))
-            .expect("end_offset should work"),
+        get_attribute_value(&mut vm, exc, &intern("end_offset")).expect("end_offset should work"),
         Value::int(7).unwrap()
     );
     assert!(
@@ -1789,8 +1785,7 @@ fn test_frame_code_view_allocates_after_full_nursery() {
 
 #[test]
 fn test_set_attr_allows_traceback_next_truncation() {
-    let (next_value, next_ptr) =
-        boxed_value(TracebackViewObject::new(Value::none(), None, 20, 0));
+    let (next_value, next_ptr) = boxed_value(TracebackViewObject::new(Value::none(), None, 20, 0));
     let (traceback_value, traceback_ptr) = boxed_value(TracebackViewObject::new(
         Value::none(),
         Some(next_value),
@@ -2176,16 +2171,8 @@ fn test_get_attr_invokes_property_data_descriptor_before_instance_attr() {
     let class = register_test_class(class);
     let (instance_ptr, instance_value) = instance_value(&class);
     unsafe {
-        (*instance_ptr).set_property(
-            intern("_value"),
-            Value::int(41).unwrap(),
-            shape_registry(),
-        );
-        (*instance_ptr).set_property(
-            intern("managed"),
-            Value::int(99).unwrap(),
-            shape_registry(),
-        );
+        (*instance_ptr).set_property(intern("_value"), Value::int(41).unwrap(), shape_registry());
+        (*instance_ptr).set_property(intern("managed"), Value::int(99).unwrap(), shape_registry());
     }
 
     let mut vm = vm_with_names(&["managed"]);
@@ -2274,11 +2261,7 @@ fn test_del_attr_invokes_property_deleter_on_user_instance() {
     let class = register_test_class(class);
     let (instance_ptr, instance_value) = instance_value(&class);
     unsafe {
-        (*instance_ptr).set_property(
-            intern("_value"),
-            Value::int(11).unwrap(),
-            shape_registry(),
-        );
+        (*instance_ptr).set_property(intern("_value"), Value::int(11).unwrap(), shape_registry());
     }
 
     let mut vm = vm_with_names(&["managed"]);

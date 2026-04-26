@@ -681,8 +681,7 @@ import keyword
         .as_object_ptr()
         .expect("keyword binding should be an object pointer");
     let keyword_module = vm
-        .import_resolver
-        .module_from_ptr(keyword_ptr)
+        .imported_module_from_ptr(keyword_ptr)
         .expect("keyword binding should point at a registered module");
     assert_eq!(keyword_module.name(), "keyword");
 }
@@ -705,8 +704,7 @@ import keyword
         .as_object_ptr()
         .expect("keyword binding should be an object pointer");
     let keyword_module = vm
-        .import_resolver
-        .module_from_ptr(keyword_ptr)
+        .imported_module_from_ptr(keyword_ptr)
         .expect("keyword binding should point at a registered module");
 
     let iskeyword = keyword_module
@@ -1202,4 +1200,3 @@ for line in source_lines[:50]:
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
-

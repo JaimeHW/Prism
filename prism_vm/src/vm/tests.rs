@@ -164,8 +164,7 @@ fn catch_all_entry(start_pc: u32, end_pc: u32, handler_pc: u32) -> ExceptionEntr
 }
 
 fn compile_module(source: &str, filename: &str) -> Arc<CodeObject> {
-    compile_source_code(source, filename, OptimizationLevel::Basic)
-        .expect("source should compile")
+    compile_source_code(source, filename, OptimizationLevel::Basic).expect("source should compile")
 }
 
 fn compile_source_module_for_test(source: &str, filename: &str) -> Arc<CodeObject> {
@@ -268,8 +267,8 @@ fn test_imported_source_module_can_read_sys_prefix_family() {
             .as_string_object_ptr()
             .expect("prefix entry should be an interned string")
             as *const u8;
-        let resolved = prism_core::intern::interned_by_ptr(string_ptr)
-            .expect("prefix entry should resolve");
+        let resolved =
+            prism_core::intern::interned_by_ptr(string_ptr).expect("prefix entry should resolve");
         assert!(
             !resolved.as_ref().is_empty(),
             "prefix entry should not be empty"
@@ -311,8 +310,7 @@ fn test_imported_source_module_can_use_builtin_warning_categories() {
 
     let name_ptr = tuple.as_slice()[0]
         .as_string_object_ptr()
-        .expect("first tuple entry should be an interned string")
-        as *const u8;
+        .expect("first tuple entry should be an interned string") as *const u8;
     let resolved = prism_core::intern::interned_by_ptr(name_ptr)
         .expect("warning category name should resolve");
     assert_eq!(resolved.as_ref(), "BytesWarning");
@@ -418,8 +416,8 @@ fn test_imported_source_module_inherits_metaclass_prepare_dict_subclasses() {
     let base_ptr = tuple.as_slice()[0]
         .as_string_object_ptr()
         .expect("base marker should be an interned string") as *const u8;
-    let base = prism_core::intern::interned_by_ptr(base_ptr)
-        .expect("base marker string should resolve");
+    let base =
+        prism_core::intern::interned_by_ptr(base_ptr).expect("base marker string should resolve");
     assert_eq!(base.as_ref(), "ok");
     assert_eq!(tuple.as_slice()[1].as_int(), Some(42));
 }
@@ -509,8 +507,7 @@ fn test_builtin_type_new_with_vm_preserves_class_result_after_handled_set_name_e
         .expect("descriptor callback should publish marker attribute");
     let marker_ptr = marker
         .as_string_object_ptr()
-        .expect("marker should be stored as an interned string")
-        as *const u8;
+        .expect("marker should be stored as an interned string") as *const u8;
     let marker_text =
         prism_core::intern::interned_by_ptr(marker_ptr).expect("marker should resolve");
     assert_eq!(
@@ -601,8 +598,7 @@ fn test_imported_source_module_can_use_str_replace() {
         let ptr = tuple
             .get(i64::try_from(index).expect("tuple index should fit into i64"))
             .and_then(|entry| entry.as_string_object_ptr())
-            .expect("tuple entry should be an interned string")
-            as *const u8;
+            .expect("tuple entry should be an interned string") as *const u8;
         prism_core::intern::interned_by_ptr(ptr)
             .expect("tuple entry should resolve")
             .as_ref()
@@ -935,14 +931,12 @@ fn test_handled_runtime_error_attaches_python_traceback_to_exc_info() {
         TypeId::TRACEBACK
     );
 
-    let line =
-        crate::ops::objects::get_attribute_value(&mut vm, traceback, &intern("tb_lineno"))
-            .expect("tb_lineno should be readable");
+    let line = crate::ops::objects::get_attribute_value(&mut vm, traceback, &intern("tb_lineno"))
+        .expect("tb_lineno should be readable");
     assert_eq!(line.as_int(), Some(3));
 
-    let frame =
-        crate::ops::objects::get_attribute_value(&mut vm, traceback, &intern("tb_frame"))
-            .expect("tb_frame should be readable");
+    let frame = crate::ops::objects::get_attribute_value(&mut vm, traceback, &intern("tb_frame"))
+        .expect("tb_frame should be readable");
     let code = crate::ops::objects::get_attribute_value(&mut vm, frame, &intern("f_code"))
         .expect("f_code should be readable");
     let name = crate::ops::objects::get_attribute_value(&mut vm, code, &intern("co_name"))
@@ -971,9 +965,8 @@ fn test_traceback_for_caller_handler_includes_call_site_and_inner_raise() {
             .expect("outer tb_lineno should be readable");
     assert_eq!(outer_line.as_int(), Some(6));
 
-    let inner_tb =
-        crate::ops::objects::get_attribute_value(&mut vm, outer_tb, &intern("tb_next"))
-            .expect("tb_next should be readable");
+    let inner_tb = crate::ops::objects::get_attribute_value(&mut vm, outer_tb, &intern("tb_next"))
+        .expect("tb_next should be readable");
     let inner_line =
         crate::ops::objects::get_attribute_value(&mut vm, inner_tb, &intern("tb_lineno"))
             .expect("inner tb_lineno should be readable");

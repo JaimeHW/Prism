@@ -14,12 +14,14 @@ use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use prism_vm::VirtualMachine;
-use prism_vm::import::ModuleObject;
-use prism_vm::stdlib::re::RegexFlags;
+use prism_vm::imports::ModuleObject;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const RE_IGNORECASE: i64 = 2;
+const RE_UNICODE: i64 = 32;
 
 /// Helper to run Python source code and return result.
 fn execute(source: &str) -> Result<Value, String> {
@@ -46,7 +48,7 @@ fn execute_with_search_paths_and_step_limit(
     let mut vm = VirtualMachine::new();
     for path in search_paths {
         let path = Arc::<str>::from(path.to_string_lossy().into_owned());
-        vm.import_resolver.add_search_path(path);
+        vm.add_import_search_path(path);
     }
     vm.set_execution_step_limit(step_limit);
     let main = Arc::new(ModuleObject::new("__main__"));
@@ -79,7 +81,6 @@ fn execute_with_cpython_lib_and_step_limit(source: &str, step_limit: u64) -> Res
     execute_with_search_paths_and_step_limit(source, &[lib_dir.as_path()], Some(step_limit))
 }
 
-
 fn execute_in_main_module_with_search_paths(
     source: &str,
     search_paths: &[&Path],
@@ -91,7 +92,7 @@ fn execute_in_main_module_with_search_paths(
     let mut vm = VirtualMachine::new();
     for path in search_paths {
         let path = Arc::<str>::from(path.to_string_lossy().into_owned());
-        vm.import_resolver.add_search_path(path);
+        vm.add_import_search_path(path);
     }
 
     let main = Arc::new(ModuleObject::new("__main__"));
@@ -145,17 +146,17 @@ fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("prism_{label}_{}_{}", std::process::id(), nonce))
 }
 
-#[path = "integration/runtime_threads.rs"]
-mod runtime_threads;
+#[path = "integration/doctest_io.rs"]
+mod doctest_io;
 #[path = "integration/language_core.rs"]
 mod language_core;
+#[path = "integration/primitives_and_protocols.rs"]
+mod primitives_and_protocols;
+#[path = "integration/runtime_threads.rs"]
+mod runtime_threads;
+#[path = "integration/stdlib_bootstrap.rs"]
+mod stdlib_bootstrap;
 #[path = "integration/stdlib_imports.rs"]
 mod stdlib_imports;
 #[path = "integration/type_metaclass.rs"]
 mod type_metaclass;
-#[path = "integration/stdlib_bootstrap.rs"]
-mod stdlib_bootstrap;
-#[path = "integration/doctest_io.rs"]
-mod doctest_io;
-#[path = "integration/primitives_and_protocols.rs"]
-mod primitives_and_protocols;

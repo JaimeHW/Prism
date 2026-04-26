@@ -759,7 +759,6 @@ mod error_tests {
         let result = compile(r"(abc", 0);
         assert!(result.is_err());
     }
-
 }
 
 // =============================================================================
@@ -1039,5 +1038,4 @@ mod performance_tests {
         let matches = findall_default(pattern, &text).unwrap();
         assert!(!matches.is_empty());
     }
-
 }

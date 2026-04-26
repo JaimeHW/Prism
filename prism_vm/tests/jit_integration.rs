@@ -2,7 +2,7 @@ use prism_code::{
     CodeFlags, CodeObject, Constant, ExceptionEntry, Instruction, LineTableEntry, Opcode, Register,
 };
 use prism_core::Value;
-use prism_vm::{JitConfig, JitContext, VirtualMachine};
+use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
 
 fn boxed_constants(constants: Vec<Value>) -> Box<[Constant]> {

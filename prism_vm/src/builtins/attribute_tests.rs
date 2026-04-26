@@ -14,15 +14,15 @@ use prism_core::Value;
 
 mod builtin_tests {
     use super::*;
+    use crate::builtins::BuiltinFunctionObject;
+    use crate::builtins::{
+        BuiltinError, builtin_delattr, builtin_getattr, builtin_hasattr, builtin_setattr,
+    };
     use prism_core::intern::intern;
     use prism_runtime::object::shape::shape_registry;
     use prism_runtime::object::shaped_object::ShapedObject;
     use prism_runtime::types::iter::IteratorObject;
     use prism_runtime::types::string::StringObject;
-    use prism_vm::builtins::BuiltinFunctionObject;
-    use prism_vm::builtins::{
-        BuiltinError, builtin_delattr, builtin_getattr, builtin_hasattr, builtin_setattr,
-    };
 
     fn new_object_value() -> (Value, *mut ShapedObject) {
         let object = ShapedObject::with_empty_shape(shape_registry().empty_shape());

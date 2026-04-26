@@ -83,13 +83,11 @@ fn heap_class(
 ) {
     let (bases_value, bases_ptr) = boxed_value(TupleObject::empty());
     let (namespace_value, namespace_ptr) = boxed_value(DictObject::new());
-    let class_value =
-        builtin_type(&[Value::string(intern(name)), bases_value, namespace_value])
-            .expect("type() should build a heap class");
+    let class_value = builtin_type(&[Value::string(intern(name)), bases_value, namespace_value])
+        .expect("type() should build a heap class");
     let class_ptr = class_value
         .as_object_ptr()
-        .expect("heap class should be object-backed")
-        as *const PyClassObject;
+        .expect("heap class should be object-backed") as *const PyClassObject;
     (
         class_value,
         class_ptr,
@@ -118,8 +116,7 @@ fn heap_class_with_metaclass(
     .expect("type.__new__ should build a heap class");
     let class_ptr = class_value
         .as_object_ptr()
-        .expect("heap class should be object-backed")
-        as *const PyClassObject;
+        .expect("heap class should be object-backed") as *const PyClassObject;
     (
         class_value,
         class_ptr,
@@ -246,8 +243,7 @@ fn test_int_from_bytes_and_bytearray_default_base() {
     let bytes_result = builtin_int(&[bytes_value]).unwrap();
     assert_eq!(bytes_result.as_int(), Some(1));
 
-    let (bytearray_value, bytearray_ptr) =
-        boxed_value(BytesObject::bytearray_from_slice(b"255"));
+    let (bytearray_value, bytearray_ptr) = boxed_value(BytesObject::bytearray_from_slice(b"255"));
     let bytearray_result = builtin_int(&[bytearray_value]).unwrap();
     assert_eq!(bytearray_result.as_int(), Some(255));
 
@@ -259,8 +255,7 @@ fn test_int_from_bytes_and_bytearray_default_base() {
 
 #[test]
 fn test_int_with_explicit_base_parses_prefixed_text() {
-    let value =
-        builtin_int(&[Value::string(intern("0x_FF")), Value::int(16).unwrap()]).unwrap();
+    let value = builtin_int(&[Value::string(intern("0x_FF")), Value::int(16).unwrap()]).unwrap();
     assert_eq!(value.as_int(), Some(255));
 
     let (bytes_value, bytes_ptr) = boxed_value(BytesObject::from_slice(b"0b_1010"));
@@ -278,9 +273,8 @@ fn test_int_to_bytes_defaults_and_zero_length() {
         .expect("0.to_bytes() should use CPython defaults");
     assert_eq!(value_to_bytes(default_bytes), vec![0]);
 
-    let empty_bytes =
-        builtin_int_to_bytes(&[Value::int(0).unwrap(), Value::int(0).unwrap()], &[])
-            .expect("0.to_bytes(0) should succeed");
+    let empty_bytes = builtin_int_to_bytes(&[Value::int(0).unwrap(), Value::int(0).unwrap()], &[])
+        .expect("0.to_bytes(0) should succeed");
     assert_eq!(value_to_bytes(empty_bytes), Vec::<u8>::new());
 }
 
@@ -467,9 +461,8 @@ fn test_str_decode_form_validates_argument_types_and_source_kind() {
             .contains("str() argument 'errors' must be str, not int")
     );
 
-    let decoding_str =
-        builtin_str(&[Value::string(intern("x")), Value::string(intern("utf-8"))])
-            .expect_err("decoding a string should fail");
+    let decoding_str = builtin_str(&[Value::string(intern("x")), Value::string(intern("utf-8"))])
+        .expect_err("decoding a string should fail");
     assert!(
         decoding_str
             .to_string()
@@ -903,8 +896,7 @@ fn test_module_new_exposed_on_type_object_builds_module_objects() {
     let module_new_ptr = module_new
         .as_object_ptr()
         .expect("module.__new__ should be a builtin function object");
-    let builtin =
-        unsafe { &*(module_new_ptr as *const crate::builtins::BuiltinFunctionObject) };
+    let builtin = unsafe { &*(module_new_ptr as *const crate::builtins::BuiltinFunctionObject) };
 
     let result = builtin
         .call(&[module_type, Value::string(intern("via_new"))])
@@ -1010,8 +1002,7 @@ fn test_builtin_float_getformat_rejects_invalid_arguments() {
     assert!(matches!(invalid_kind, BuiltinError::ValueError(_)));
     assert!(invalid_kind.to_string().contains("'double' or 'float'"));
 
-    let invalid_type =
-        builtin_float_getformat(&[float_type, Value::int(1).unwrap()]).unwrap_err();
+    let invalid_type = builtin_float_getformat(&[float_type, Value::int(1).unwrap()]).unwrap_err();
     assert!(matches!(invalid_type, BuiltinError::TypeError(_)));
 
     let missing_arg = builtin_float_getformat(&[float_type]).unwrap_err();
@@ -1237,9 +1228,8 @@ fn test_object_init_subclass_accepts_single_class_receiver() {
 #[test]
 fn test_object_init_subclass_rejects_keyword_arguments() {
     let object_type = builtin_type_object_for_type_id(TypeId::OBJECT);
-    let err =
-        builtin_object_init_subclass(&[object_type], &[("token", Value::int(1).unwrap())])
-            .unwrap_err();
+    let err = builtin_object_init_subclass(&[object_type], &[("token", Value::int(1).unwrap())])
+        .unwrap_err();
     assert!(matches!(err, BuiltinError::TypeError(_)));
     assert!(
         err.to_string()
@@ -1301,8 +1291,8 @@ fn test_mappingproxy_type_wraps_dict_arguments() {
 
 #[test]
 fn test_mappingproxy_type_rejects_non_mappings() {
-    let err = builtin_mappingproxy(&[Value::int(3).unwrap()])
-        .expect_err("mappingproxy(int) should fail");
+    let err =
+        builtin_mappingproxy(&[Value::int(3).unwrap()]).expect_err("mappingproxy(int) should fail");
     match err {
         BuiltinError::TypeError(message) => {
             assert!(message.contains("must be a mapping"));
@@ -1397,8 +1387,8 @@ fn test_set_and_frozenset_reject_unhashable_elements() {
     let set_err = builtin_set(&[outer_value]).expect_err("set should reject unhashable items");
     assert!(set_err.to_string().contains("unhashable type: 'list'"));
 
-    let frozen_err = builtin_frozenset(&[outer_value])
-        .expect_err("frozenset should reject unhashable items");
+    let frozen_err =
+        builtin_frozenset(&[outer_value]).expect_err("frozenset should reject unhashable items");
     assert!(frozen_err.to_string().contains("unhashable type: 'list'"));
 
     unsafe {
@@ -1497,8 +1487,7 @@ fn test_dict_fromkeys_reuses_requested_value_for_each_key() {
         Value::int(4).unwrap(),
     ]));
 
-    let result =
-        builtin_dict_fromkeys(&[dict_type, keys_value, Value::int(99).unwrap()]).unwrap();
+    let result = builtin_dict_fromkeys(&[dict_type, keys_value, Value::int(99).unwrap()]).unwrap();
     let result_ptr = result.as_object_ptr().unwrap();
     let dict = unsafe { &*(result_ptr as *const DictObject) };
 
@@ -1852,8 +1841,7 @@ fn test_type_builtin_returns_heap_class_for_heap_instances() {
 
 #[test]
 fn test_type_builtin_three_arg_form_validates_inputs() {
-    let err =
-        builtin_type(&[Value::int(1).unwrap(), Value::none(), Value::none()]).unwrap_err();
+    let err = builtin_type(&[Value::int(1).unwrap(), Value::none(), Value::none()]).unwrap_err();
     assert!(matches!(err, BuiltinError::TypeError(_)));
     assert!(err.to_string().contains("argument 1"));
 
@@ -1863,8 +1851,7 @@ fn test_type_builtin_three_arg_form_validates_inputs() {
     assert!(err.to_string().contains("argument 2"));
 
     let (bases_value, bases_ptr) = boxed_value(TupleObject::empty());
-    let err =
-        builtin_type(&[Value::string(intern("C")), bases_value, Value::none()]).unwrap_err();
+    let err = builtin_type(&[Value::string(intern("C")), bases_value, Value::none()]).unwrap_err();
     assert!(matches!(err, BuiltinError::TypeError(_)));
     assert!(err.to_string().contains("argument 3"));
 
@@ -1925,8 +1912,7 @@ fn test_isinstance_tuple_of_types() {
 
 #[test]
 fn test_isinstance_invalid_type_spec_error() {
-    let err =
-        builtin_isinstance(&[Value::int(1).unwrap(), Value::int(2).unwrap()]).unwrap_err();
+    let err = builtin_isinstance(&[Value::int(1).unwrap(), Value::int(2).unwrap()]).unwrap_err();
     assert!(matches!(err, BuiltinError::TypeError(_)));
     assert!(err.to_string().contains("arg 2 must be a type"));
 }
@@ -1935,8 +1921,7 @@ fn test_isinstance_invalid_type_spec_error() {
 fn test_isinstance_uses_heap_metaclass_for_class_objects() {
     let type_type = crate::builtins::builtin_type_object_for_type_id(TypeId::TYPE);
 
-    let (metaclass_bases, metaclass_bases_ptr) =
-        boxed_value(TupleObject::from_slice(&[type_type]));
+    let (metaclass_bases, metaclass_bases_ptr) = boxed_value(TupleObject::from_slice(&[type_type]));
     let (metaclass_namespace, metaclass_namespace_ptr) = boxed_value(DictObject::new());
     let metaclass = builtin_type(&[
         Value::string(intern("MetaEnumType")),
@@ -2049,10 +2034,9 @@ fn test_issubclass_arg_validation() {
 
 #[test]
 fn test_issubclass_accepts_exception_type_values_without_heap_class_casts() {
-    let value_error = crate::builtins::exception_type_value_for_id(
-        ExceptionTypeId::ValueError.as_u8() as u16,
-    )
-    .expect("ValueError type should exist");
+    let value_error =
+        crate::builtins::exception_type_value_for_id(ExceptionTypeId::ValueError.as_u8() as u16)
+            .expect("ValueError type should exist");
     let exception =
         crate::builtins::exception_type_value_for_id(ExceptionTypeId::Exception.as_u8() as u16)
             .expect("Exception type should exist");

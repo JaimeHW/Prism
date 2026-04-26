@@ -9,7 +9,7 @@ fn test_vm_builtins_are_initialized() {
     let vm = VirtualMachine::new();
 
     // Verify len builtin exists and is an object_ptr
-    let len_val = vm.builtins.get("len").expect("len should exist");
+    let len_val = vm.builtin_value("len").expect("len should exist");
     assert!(
         len_val.as_object_ptr().is_some(),
         "len should be object_ptr, got: bits = {:#x}",
@@ -17,7 +17,7 @@ fn test_vm_builtins_are_initialized() {
     );
 
     // Verify range builtin
-    let range_val = vm.builtins.get("range").expect("range should exist");
+    let range_val = vm.builtin_value("range").expect("range should exist");
     assert!(
         range_val.as_object_ptr().is_some(),
         "range should be object_ptr"
@@ -1257,4 +1257,3 @@ assert AsyncGenerator.__subclasshook__(AsyncGenerator) is True
     );
     assert!(result.is_ok(), "Failed: {:?}", result);
 }
-

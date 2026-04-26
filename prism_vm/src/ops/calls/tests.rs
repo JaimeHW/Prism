@@ -194,12 +194,7 @@ fn test_restore_direct_call_caller_state_only_restores_scratch_register() {
     vm.current_frame_mut().set_reg(7, Value::int(42).unwrap());
 
     let stop_depth = vm.call_depth();
-    restore_direct_call_caller_state(
-        &mut vm,
-        stop_depth,
-        saved_register,
-        saved_exception_context,
-    );
+    restore_direct_call_caller_state(&mut vm, stop_depth, saved_register, saved_exception_context);
 
     assert_eq!(vm.current_frame().get_reg(7).as_int(), Some(42));
     assert_eq!(
@@ -230,12 +225,7 @@ fn test_restore_direct_call_caller_state_preserves_written_scratch_register_stat
     vm.current_frame_mut().set_reg(8, Value::int(22).unwrap());
 
     let stop_depth = vm.call_depth();
-    restore_direct_call_caller_state(
-        &mut vm,
-        stop_depth,
-        saved_register,
-        saved_exception_context,
-    );
+    restore_direct_call_caller_state(&mut vm, stop_depth, saved_register, saved_exception_context);
 
     assert_eq!(
         vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG).as_int(),
@@ -344,9 +334,9 @@ fn test_staticmethod_values_are_callable() {
         Arc::from("test.staticmethod_identity"),
         staticmethod_identity,
     )));
-    let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(
-        Value::object_ptr(builtin_ptr as *const ()),
-    )));
+    let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(Value::object_ptr(
+        builtin_ptr as *const (),
+    ))));
     let staticmethod_value = Value::object_ptr(staticmethod_ptr as *const ());
     let mut vm = VirtualMachine::new();
 
@@ -381,12 +371,10 @@ fn test_staticmethod_values_are_callable() {
 #[test]
 fn test_invoke_callable_value_executes_reflected_wrapper_descriptor() {
     let mut vm = VirtualMachine::new();
-    let descriptor = crate::builtins::builtin_type_attribute_value_static(
-        TypeId::OBJECT,
-        &intern("__init__"),
-    )
-    .expect("lookup should succeed")
-    .expect("object.__init__ descriptor should exist");
+    let descriptor =
+        crate::builtins::builtin_type_attribute_value_static(TypeId::OBJECT, &intern("__init__"))
+            .expect("lookup should succeed")
+            .expect("object.__init__ descriptor should exist");
     let instance = crate::builtins::builtin_object(&[]).expect("object() should succeed");
 
     let result = invoke_callable_value(&mut vm, descriptor, &[instance])
@@ -475,11 +463,10 @@ fn test_invoke_callable_value_instantiates_heap_class_with_inherited_object_new(
 #[test]
 fn test_invoke_callable_value_instantiates_int_subclass_with_native_new() {
     let mut vm = VirtualMachine::new();
-    let class =
-        PyClassObject::new(intern("IntSubclass"), &[ClassId(TypeId::INT.raw())], |id| {
-            Some(builtin_class_mro(class_id_to_type_id(id)).into())
-        })
-        .expect("int subclass mro should be valid");
+    let class = PyClassObject::new(intern("IntSubclass"), &[ClassId(TypeId::INT.raw())], |id| {
+        Some(builtin_class_mro(class_id_to_type_id(id)).into())
+    })
+    .expect("int subclass mro should be valid");
     let class = register_test_class(class);
 
     let instance = super::invoke_callable_value(
@@ -517,9 +504,8 @@ fn test_invoke_callable_value_instantiates_bytes_subclass_with_native_new() {
     )
     .expect("bytes subclass mro should be valid");
     let class = register_test_class(class);
-    let source = Value::object_ptr(
-        Box::into_raw(Box::new(BytesObject::from_slice(b"auth"))) as *const ()
-    );
+    let source =
+        Value::object_ptr(Box::into_raw(Box::new(BytesObject::from_slice(b"auth"))) as *const ());
 
     let instance = super::invoke_callable_value(
         &mut vm,
@@ -566,9 +552,8 @@ fn test_instantiate_user_defined_dict_subclass_allocates_native_dict_backing() {
     .expect("dict subclass should build");
     let class = register_test_class(class);
 
-    let instance =
-        super::instantiate_user_defined_class_from_values(&mut vm, class.as_ref(), &[])
-            .expect("dict subclass instantiation should succeed");
+    let instance = super::instantiate_user_defined_class_from_values(&mut vm, class.as_ref(), &[])
+        .expect("dict subclass instantiation should succeed");
     let instance_ptr = instance
         .as_object_ptr()
         .expect("instantiation should return a heap instance");
@@ -594,9 +579,8 @@ fn test_instantiate_user_defined_list_subclass_allocates_native_list_backing() {
     .expect("list subclass should build");
     let class = register_test_class(class);
 
-    let instance =
-        super::instantiate_user_defined_class_from_values(&mut vm, class.as_ref(), &[])
-            .expect("list subclass instantiation should succeed");
+    let instance = super::instantiate_user_defined_class_from_values(&mut vm, class.as_ref(), &[])
+        .expect("list subclass instantiation should succeed");
     let instance_ptr = instance
         .as_object_ptr()
         .expect("instantiation should return a heap instance");
@@ -653,9 +637,9 @@ fn test_invoke_callable_value_with_keywords_forwards_staticmethod_keywords() {
         Arc::from("sorted"),
         crate::builtins::builtin_sorted,
     )));
-    let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(
-        Value::object_ptr(sorted_ptr as *const ()),
-    )));
+    let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(Value::object_ptr(
+        sorted_ptr as *const (),
+    ))));
     let iterable_ptr = Box::into_raw(Box::new(TupleObject::from_slice(&[
         Value::int(1).unwrap(),
         Value::int(3).unwrap(),
@@ -735,9 +719,9 @@ fn test_invoke_callable_value_with_keywords_supports_import_fromlist() {
         .builtins
         .get("__import__")
         .expect("__import__ builtin should be registered");
-    let fromlist_ptr = Box::into_raw(Box::new(ListObject::from_slice(&[Value::string(
-        intern("VALUE"),
-    )])));
+    let fromlist_ptr = Box::into_raw(Box::new(ListObject::from_slice(&[Value::string(intern(
+        "VALUE",
+    ))])));
 
     let value = invoke_callable_value_with_keywords(
         &mut vm,

@@ -45,12 +45,12 @@ use super::iteration::{IterStep, next_step};
 mod function_creation;
 mod function_defaults;
 
-pub use function_creation::{make_closure, make_function};
-pub use function_defaults::set_function_defaults;
+use function_creation::materialize_function_invocation_closure;
 pub(crate) use function_creation::{
     capture_closure_environment, initialize_closure_cellvars_from_locals,
 };
-use function_creation::materialize_function_invocation_closure;
+pub use function_creation::{make_closure, make_function};
+pub use function_defaults::set_function_defaults;
 
 static OBJECT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -3245,7 +3245,6 @@ pub fn call_kw_ex(_vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
         "CallKwEx executed directly (bytecode corruption)",
     ))
 }
-
 
 /// TailCall: call reusing current frame
 ///
