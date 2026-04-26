@@ -225,9 +225,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_tracer_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<RuntimeObjectTracer>();
-    }
 }

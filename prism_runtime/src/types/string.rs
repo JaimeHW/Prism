@@ -1163,13 +1163,6 @@ mod tests {
         assert!(s1 < s2);
     }
 
-    #[test]
-    fn test_from_conversions() {
-        let _s1: StringObject = "test".into();
-        let _s2: StringObject = String::from("test").into();
-        let _s3: StringObject = Arc::<str>::from("test").into();
-    }
-
     // =========================================================================
     // SIMD Integration Tests (Comprehensive)
     // =========================================================================

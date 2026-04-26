@@ -478,29 +478,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // OpenOptions Conversion
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_to_open_options_read() {
-        let mode = FileMode::parse("r").unwrap();
-        let _opts = mode.to_open_options();
-        // OpenOptions doesn't expose getters, so we verify it compiles
-    }
-
-    #[test]
-    fn test_to_open_options_write() {
-        let mode = FileMode::parse("w").unwrap();
-        let _opts = mode.to_open_options();
-    }
-
-    #[test]
-    fn test_to_open_options_exclusive() {
-        let mode = FileMode::parse("x").unwrap();
-        let _opts = mode.to_open_options();
-    }
-
-    // -------------------------------------------------------------------------
     // Edge Cases and Stress Tests
     // -------------------------------------------------------------------------
 

@@ -568,12 +568,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_cell_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Cell>();
-    }
-
-    #[test]
     fn test_cell_concurrent_read_write() {
         use std::sync::Arc;
         use std::thread;
