@@ -17,6 +17,7 @@ pub mod _abc;
 pub mod _ast;
 pub mod _codecs;
 pub mod _contextvars;
+pub mod _functools;
 pub mod _imp;
 pub mod _overlapped;
 pub mod _random;
@@ -26,8 +27,10 @@ pub mod _sre;
 pub mod _ssl;
 pub mod _string;
 pub mod _struct;
+pub mod _testcapi;
 pub mod _thread;
 pub mod _tokenize;
+pub mod _tracemalloc;
 pub mod _warnings;
 pub mod _weakref;
 pub mod _winapi;
@@ -35,6 +38,7 @@ pub mod array;
 pub mod atexit;
 pub mod binascii;
 pub mod collections;
+pub mod ctypes;
 pub mod errno;
 pub mod exceptions;
 pub mod fnmatch;
@@ -215,6 +219,13 @@ impl StdlibRegistry {
 
         Self::insert_module(
             &mut modules,
+            "_functools",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_functools::FunctoolsNativeModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
             "_imp",
             StdlibResolutionPolicy::PreferNative,
             Box::new(_imp::ImpModule::new()),
@@ -283,6 +294,20 @@ impl StdlibRegistry {
             Box::new(_thread::ThreadModule::new()),
         );
 
+        Self::insert_module(
+            &mut modules,
+            "_testcapi",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_testcapi::TestCapiModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "_tracemalloc",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(_tracemalloc::TraceMallocModule::new()),
+        );
+
         if cfg!(windows) {
             Self::insert_module(
                 &mut modules,
@@ -346,6 +371,13 @@ impl StdlibRegistry {
             "binascii",
             StdlibResolutionPolicy::PreferNative,
             Box::new(binascii::BinasciiModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "ctypes",
+            StdlibResolutionPolicy::PreferNative,
+            Box::new(ctypes::CtypesModule::new()),
         );
 
         Self::insert_module(
@@ -459,7 +491,7 @@ impl StdlibRegistry {
         Self::insert_module(
             &mut modules,
             "re",
-            StdlibResolutionPolicy::PreferNative,
+            StdlibResolutionPolicy::PreferSourceWhenAvailable,
             Box::new(re::ReModule::new()),
         );
 
@@ -569,11 +601,13 @@ mod tests {
         assert!(registry.contains("math"));
         assert!(registry.contains("errno"));
         assert!(registry.contains("gc"));
+        assert!(registry.contains("ctypes"));
         assert!(registry.contains("builtins"));
         assert!(registry.contains("signal"));
         assert!(registry.contains("select"));
         assert!(registry.contains("_codecs"));
         assert!(registry.contains("_contextvars"));
+        assert!(registry.contains("_functools"));
         assert!(registry.contains("_imp"));
         assert!(registry.contains("_random"));
         assert!(registry.contains("_sha2"));
@@ -631,7 +665,7 @@ mod tests {
     fn test_registry_marks_fallback_source_preferred_modules() {
         let registry = StdlibRegistry::new();
 
-        assert!(!registry.prefers_source_when_available("re"));
+        assert!(registry.prefers_source_when_available("re"));
         assert!(!registry.prefers_source_when_available("collections"));
         assert!(registry.prefers_source_when_available("os"));
         assert!(!registry.prefers_source_when_available("sys"));
@@ -640,6 +674,7 @@ mod tests {
         assert!(!registry.prefers_source_when_available("select"));
         assert!(!registry.prefers_source_when_available("_codecs"));
         assert!(!registry.prefers_source_when_available("_imp"));
+        assert!(!registry.prefers_source_when_available("_functools"));
         assert!(!registry.prefers_source_when_available("_random"));
         assert!(!registry.prefers_source_when_available("_sha2"));
         assert!(!registry.prefers_source_when_available("_socket"));
@@ -656,6 +691,7 @@ mod tests {
     #[test]
     fn test_builtin_module_name_registry_contains_importlib_bootstrap_modules() {
         assert!(is_builtin_module_name("_contextvars"));
+        assert!(is_builtin_module_name("_functools"));
         assert!(is_builtin_module_name("_imp"));
         assert!(is_builtin_module_name("_io"));
         assert!(is_builtin_module_name("_random"));

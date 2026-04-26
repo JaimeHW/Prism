@@ -1225,7 +1225,7 @@ fn invoke_user_function_with_implicit_self(
     let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
     let module = resolve_function_module(vm, func);
 
-    let bound = {
+    let mut bound = {
         let caller_frame = vm.current_frame();
         let positional_args = std::iter::once(implicit_self)
             .chain((0..posargc).map(|i| caller_frame.get_reg(dst_reg + 1 + i as u8)));
@@ -1253,19 +1253,24 @@ fn invoke_user_function_with_implicit_self(
     }
     .map_err(|err| RuntimeError::type_error(err.to_error_message()))?;
 
+    let (varargs_value, varkw_value) = allocate_bound_variadics(vm, &mut bound)?;
+
+    if is_generator_code(&code) {
+        return generator_value_from_bound_arguments(
+            vm,
+            &code,
+            function_module_ptr(vm, func),
+            closure,
+            &bound,
+            varargs_value,
+            varkw_value,
+        );
+    }
+
     let stop_depth = vm.call_depth();
     vm.push_frame_with_closure_and_module(Arc::clone(&code), dst_reg, closure, module)?;
 
     let arg_count = code.arg_count as usize;
-    let varargs_value = match bound.varargs {
-        Some(tuple) => Some(alloc_heap_value(vm, *tuple, "bound varargs tuple")?),
-        None => None,
-    };
-    let varkw_value = match bound.varkw {
-        Some(dict) => Some(alloc_heap_value(vm, *dict, "bound kwargs dict")?),
-        None => None,
-    };
-
     let new_frame = vm.current_frame_mut();
     let mut local_idx = 0u8;
 
@@ -1290,6 +1295,9 @@ fn invoke_user_function_with_implicit_self(
     }
 
     initialize_closure_cellvars_from_locals(new_frame, local_idx as usize);
+    if vm.dispatch_prepared_current_frame_via_jit()? {
+        return Ok(vm.current_frame().get_reg(dst_reg));
+    }
     let target_frame_id = vm.current_frame_id();
     match vm.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)? {
         NestedTargetFrameOutcome::Returned(value) => Ok(value),
@@ -1354,6 +1362,31 @@ fn create_generator_from_bound_arguments(
     varargs_value: Option<Value>,
     varkw_value: Option<Value>,
 ) -> ControlFlow {
+    let value = match generator_value_from_bound_arguments(
+        vm,
+        code,
+        module_ptr,
+        closure,
+        bound,
+        varargs_value,
+        varkw_value,
+    ) {
+        Ok(value) => value,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    vm.current_frame_mut().set_reg(dst_reg, value);
+    ControlFlow::Continue
+}
+
+fn generator_value_from_bound_arguments(
+    vm: &mut VirtualMachine,
+    code: &Arc<CodeObject>,
+    module_ptr: *const (),
+    closure: Option<Arc<ClosureEnv>>,
+    bound: &BoundArguments,
+    varargs_value: Option<Value>,
+    varkw_value: Option<Value>,
+) -> Result<Value, RuntimeError> {
     let arg_count = code.arg_count as usize;
     let mut locals = [Value::none(); 256];
     let mut local_idx = 0usize;
@@ -1384,10 +1417,7 @@ fn create_generator_from_bound_arguments(
         generator.set_closure(closure);
     }
     generator.seed_locals(&locals, prefix_liveness(local_idx));
-    let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
-    vm.current_frame_mut()
-        .set_reg(dst_reg, Value::object_ptr(gen_ptr));
-    ControlFlow::Continue
+    alloc_heap_value(vm, generator, "generator object")
 }
 
 fn create_generator_from_values(
@@ -1409,9 +1439,11 @@ fn create_generator_from_values(
         generator.set_closure(closure);
     }
     generator.seed_locals(&locals, prefix_liveness(args.len()));
-    let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
-    vm.current_frame_mut()
-        .set_reg(dst_reg, Value::object_ptr(gen_ptr));
+    let value = match alloc_heap_value(vm, generator, "generator object") {
+        Ok(value) => value,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    vm.current_frame_mut().set_reg(dst_reg, value);
     ControlFlow::Continue
 }
 
@@ -1464,6 +1496,9 @@ pub(crate) fn call_user_function_from_values(
         }
 
         initialize_closure_cellvars_from_locals(vm.current_frame_mut(), positional_args.len());
+        if let Err(err) = vm.dispatch_prepared_current_frame_via_jit() {
+            return ControlFlow::Error(err);
+        }
         return ControlFlow::Continue;
     }
 
@@ -1514,6 +1549,9 @@ pub(crate) fn call_user_function_from_values(
         )
     };
     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
+    if let Err(err) = vm.dispatch_prepared_current_frame_via_jit() {
+        return ControlFlow::Error(err);
+    }
     ControlFlow::Continue
 }
 
@@ -1598,6 +1636,7 @@ fn invoke_user_function_direct_impl(
     };
 
     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
+    vm.dispatch_prepared_current_frame_via_jit()?;
     let result = if vm.call_depth() == stop_depth {
         Ok(InvokeCallableOutcome::Returned(
             vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG),
@@ -1694,6 +1733,7 @@ fn invoke_user_function_direct_with_keywords(
     };
 
     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
+    vm.dispatch_prepared_current_frame_via_jit()?;
     let result = if vm.call_depth() == stop_depth {
         Ok(vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG))
     } else {
@@ -2415,6 +2455,9 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     }
 
                     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), argc);
+                    if let Err(err) = vm.dispatch_prepared_current_frame_via_jit() {
+                        return ControlFlow::Error(err);
+                    }
                     ControlFlow::Continue
                 } else {
                     // Use full binder for defaults, *args/**kwargs, and kw-only semantics.
@@ -2984,9 +3027,11 @@ fn call_kw_user_function(
         let mut generator = GeneratorObject::from_code(Arc::clone(&code));
         generator.set_module_ptr(function_module_ptr(vm, func));
         generator.seed_locals(&locals, prefix_liveness(local_idx));
-        let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
-        vm.current_frame_mut()
-            .set_reg(dst_reg, Value::object_ptr(gen_ptr));
+        let value = match alloc_heap_value(vm, generator, "generator object") {
+            Ok(value) => value,
+            Err(err) => return ControlFlow::Error(err),
+        };
+        vm.current_frame_mut().set_reg(dst_reg, value);
         return ControlFlow::Continue;
     }
 
@@ -3003,34 +3048,39 @@ fn call_kw_user_function(
     // - [arg_count + varargs_offset..]: keyword-only parameters
     // - [after kwonly]: **kwargs (if VARKEYWORDS)
 
-    let new_frame = vm.current_frame_mut();
-    let mut local_idx = 0u8;
+    {
+        let new_frame = vm.current_frame_mut();
+        let mut local_idx = 0u8;
 
-    // Set positional parameters
-    for i in 0..arg_count {
-        new_frame.set_reg(local_idx, bound_args[i]);
-        local_idx += 1;
+        // Set positional parameters
+        for i in 0..arg_count {
+            new_frame.set_reg(local_idx, bound_args[i]);
+            local_idx += 1;
+        }
+
+        // Set *args tuple if present
+        if let Some(tuple_val) = varargs_value {
+            new_frame.set_reg(local_idx, tuple_val);
+            local_idx += 1;
+        }
+
+        // Set keyword-only parameters
+        for i in arg_count..total_params {
+            new_frame.set_reg(local_idx, bound_args[i]);
+            local_idx += 1;
+        }
+
+        // Set **kwargs dict if present
+        if let Some(dict_val) = varkw_value {
+            new_frame.set_reg(local_idx, dict_val);
+        }
+
+        let initialized_local_count = local_idx as usize + usize::from(varkw_value.is_some());
+        initialize_closure_cellvars_from_locals(new_frame, initialized_local_count);
     }
-
-    // Set *args tuple if present
-    if let Some(tuple_val) = varargs_value {
-        new_frame.set_reg(local_idx, tuple_val);
-        local_idx += 1;
+    if let Err(err) = vm.dispatch_prepared_current_frame_via_jit() {
+        return ControlFlow::Error(err);
     }
-
-    // Set keyword-only parameters
-    for i in arg_count..total_params {
-        new_frame.set_reg(local_idx, bound_args[i]);
-        local_idx += 1;
-    }
-
-    // Set **kwargs dict if present
-    if let Some(dict_val) = varkw_value {
-        new_frame.set_reg(local_idx, dict_val);
-    }
-
-    let initialized_local_count = local_idx as usize + usize::from(varkw_value.is_some());
-    initialize_closure_cellvars_from_locals(new_frame, initialized_local_count);
     ControlFlow::Continue
 }
 
@@ -3060,9 +3110,11 @@ fn create_generator_from_simple_call(
         generator.set_closure(closure);
     }
     generator.seed_locals(&locals, prefix_liveness(argc));
-    let gen_ptr = Box::into_raw(Box::new(generator)) as *const ();
-    vm.current_frame_mut()
-        .set_reg(dst_reg, Value::object_ptr(gen_ptr));
+    let value = match alloc_heap_value(vm, generator, "generator object") {
+        Ok(value) => value,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    vm.current_frame_mut().set_reg(dst_reg, value);
     ControlFlow::Continue
 }
 

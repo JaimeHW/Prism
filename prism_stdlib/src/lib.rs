@@ -21,6 +21,7 @@ const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_ast",
     "_codecs",
     "_contextvars",
+    "_functools",
     "_imp",
     "_io",
     "_overlapped",
@@ -58,6 +59,7 @@ const WINDOWS_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_ast",
     "_codecs",
     "_contextvars",
+    "_functools",
     "_imp",
     "_io",
     "_overlapped",
@@ -97,6 +99,7 @@ const POSIX_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_ast",
     "_codecs",
     "_contextvars",
+    "_functools",
     "_imp",
     "_io",
     "_random",
@@ -147,14 +150,13 @@ pub fn is_builtin_module_name(name: &str) -> bool {
 /// Returns the native stdlib resolution policy for a module, if Prism ships one.
 pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
     match name {
-        "builtins" | "_abc" | "_ast" | "_codecs" | "_contextvars" | "_imp" | "_random"
-        | "_sha2" | "_socket" | "_ssl" | "_sre" | "_io" | "_string" | "_struct" | "_thread"
-        | "_tokenize" | "_warnings" | "_weakref" | "array" | "atexit" | "math" | "errno" | "gc"
-        | "sys" | "time" | "typing" | "signal" | "select" | "weakref" | "re" | "collections"
-        | "fnmatch" | "inspect" | "itertools" | "io" | "marshal" | "binascii" => {
-            Some(StdlibResolutionPolicy::PreferNative)
-        }
-        "os" | "os.path" | "json" | "functools" => {
+        "builtins" | "_abc" | "_ast" | "_codecs" | "_contextvars" | "_functools" | "_imp"
+        | "_random" | "_sha2" | "_socket" | "_ssl" | "_sre" | "_io" | "_string" | "_struct"
+        | "_testcapi" | "_thread" | "_tokenize" | "_tracemalloc" | "_warnings" | "_weakref"
+        | "array" | "atexit" | "math" | "errno" | "gc" | "sys" | "time" | "typing" | "signal"
+        | "select" | "weakref" | "collections" | "ctypes" | "fnmatch" | "inspect" | "itertools"
+        | "io" | "marshal" | "binascii" => Some(StdlibResolutionPolicy::PreferNative),
+        "os" | "os.path" | "json" | "functools" | "re" => {
             Some(StdlibResolutionPolicy::PreferSourceWhenAvailable)
         }
         "_overlapped" | "_winapi" | "msvcrt" | "nt" | "winreg" if cfg!(windows) => {
@@ -184,6 +186,7 @@ mod tests {
     fn test_builtin_module_names_match_platform_surface() {
         assert!(is_builtin_module_name("_imp"));
         assert!(is_builtin_module_name("_io"));
+        assert!(is_builtin_module_name("_functools"));
         assert!(is_builtin_module_name("_socket"));
         assert!(is_builtin_module_name("_ssl"));
         assert!(is_builtin_module_name("_sre"));
@@ -226,6 +229,14 @@ mod tests {
         );
         assert_eq!(
             native_module_policy("binascii"),
+            Some(StdlibResolutionPolicy::PreferNative)
+        );
+        assert_eq!(
+            native_module_policy("ctypes"),
+            Some(StdlibResolutionPolicy::PreferNative)
+        );
+        assert_eq!(
+            native_module_policy("_functools"),
             Some(StdlibResolutionPolicy::PreferNative)
         );
         assert_eq!(

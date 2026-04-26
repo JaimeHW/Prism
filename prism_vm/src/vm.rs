@@ -4,7 +4,7 @@
 //! It manages frames, globals, builtins, and the dispatch loop.
 
 use crate::allocator::GcAllocator;
-use crate::builtins::BuiltinRegistry;
+use crate::builtins::{BuiltinRegistry, set_exception_traceback_for_value};
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, RuntimeErrorKind, TracebackEntry, VmResult};
 use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
@@ -13,7 +13,8 @@ use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
 use crate::import::{
-    ImportError, ImportResolver, ModuleExportError, ModuleObject, resolve_relative_import,
+    FrozenModuleSource, ImportError, ImportLoadPlan, ImportResolver, ModuleExportError,
+    ModuleObject, resolve_relative_import,
 };
 use crate::inline_cache::InlineCacheStore;
 use crate::jit_context::{JitConfig, JitContext};
@@ -28,14 +29,30 @@ use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
-use prism_code::CodeObject;
+use prism_code::{CodeObject, Instruction, LineTableEntry, Opcode};
 use prism_compiler::{OptimizationLevel, compile_source_code};
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
 use prism_runtime::allocation_context::RuntimeHeapBinding;
 use prism_runtime::object::class::ClassDict;
+use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
+use prism_runtime::types::dict::DictObject;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, Weak};
+
+static SHARED_FUNCTION_CLOSURES: LazyLock<RwLock<HashMap<usize, Weak<crate::frame::ClosureEnv>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+pub(crate) type SharedManagedHeap = Arc<Mutex<ManagedHeap>>;
+
+fn new_shared_managed_heap() -> SharedManagedHeap {
+    Arc::new(Mutex::new(ManagedHeap::with_defaults()))
+}
+
+fn bind_runtime_heap(heap: &SharedManagedHeap) -> RuntimeHeapBinding {
+    let guard = heap.lock().expect("managed heap lock poisoned");
+    RuntimeHeapBinding::register(guard.heap())
+}
 
 fn standard_runtime_builtins_and_import_resolver(
     sys_args: Option<Vec<String>>,
@@ -189,11 +206,15 @@ pub struct VirtualMachine {
     jit: Option<JitContext>,
     /// Temporary storage for JIT return value when root frame executes via JIT.
     jit_return_value: Option<Value>,
-    /// Captured closure environments keyed by function object pointer.
+    /// VM-owned captured closure environments keyed by function object pointer.
     ///
-    /// Function objects currently do not carry VM-native closure environments,
-    /// so MakeClosure registers captured cells here and call dispatch looks them up.
+    /// Ordinary same-VM function calls hit this table directly. A weak process-wide
+    /// index mirrors these entries so Python threads, which execute in a fresh VM,
+    /// can recover the exact same closure cells without copying or widening the
+    /// hot-path function object layout.
     function_closures: HashMap<*const (), Arc<crate::frame::ClosureEnv>>,
+    /// Per-interpreter target used by worker threads to route `_thread.interrupt_main()`.
+    thread_interrupt_target: u64,
 
     // =========================================================================
     // GC Integration
@@ -204,9 +225,13 @@ pub struct VirtualMachine {
     /// stale heap binding.
     _runtime_heap_binding: RuntimeHeapBinding,
     /// GC-managed heap for object allocation.
-    /// Stored behind a box so the underlying `GcHeap` address remains stable even
-    /// if the `VirtualMachine` itself moves.
-    heap: Box<ManagedHeap>,
+    ///
+    /// Python threads spawned from a VM share this heap so objects allocated by a
+    /// worker can safely escape into shared Python containers and module globals.
+    /// The mutex protects collection/root bookkeeping. Python execution is not
+    /// serialized by a global interpreter lock; shared runtime structures own
+    /// their own synchronization.
+    heap: SharedManagedHeap,
 
     // =========================================================================
     // Exception Handling State
@@ -253,8 +278,15 @@ impl VirtualMachine {
     pub fn module_from_globals_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
         if ptr.is_null() {
             None
+        } else if let Some(module) = self.import_resolver.module_from_ptr(ptr) {
+            Some(module)
         } else {
-            self.import_resolver.module_from_ptr(ptr)
+            let module = unsafe { Arc::from_raw(ptr as *const ModuleObject) };
+            let cloned = Arc::clone(&module);
+            std::mem::forget(module);
+            self.import_resolver
+                .insert_module(cloned.name(), Arc::clone(&cloned));
+            Some(cloned)
         }
     }
 
@@ -379,6 +411,57 @@ impl VirtualMachine {
         self.run_loop()
     }
 
+    pub fn run_shutdown_hooks(&mut self) -> Vec<RuntimeError> {
+        self.execution_budget.reset_counter();
+
+        let baseline_depth = self.frames.len();
+        if baseline_depth == 0 {
+            let code = Arc::new(CodeObject::new("<shutdown>", "<shutdown>"));
+            if let Err(err) = self.push_frame_with_module(code, 0, self.current_module_cloned()) {
+                return vec![err];
+            }
+        }
+
+        let exception_context = self.capture_exception_context();
+        self.clear_exception_context_for_shutdown();
+
+        let mut errors = Vec::new();
+        self.run_threading_shutdown(&mut errors);
+        if let Err(err) = crate::stdlib::atexit::run_exitfuncs(self) {
+            errors.push(RuntimeError::from(err));
+        }
+
+        while self.frames.len() > baseline_depth {
+            self.pop_top_frame_for_unwind();
+        }
+
+        self.restore_exception_context(exception_context);
+
+        errors
+    }
+
+    fn clear_exception_context_for_shutdown(&mut self) {
+        self.exc_state = ExceptionState::Normal;
+        self.handler_stack.clear();
+        self.active_exception = None;
+        self.active_exception_type_id = None;
+        self.exc_info_stack.clear();
+        self.active_except_handlers.clear();
+    }
+
+    fn run_threading_shutdown(&mut self, errors: &mut Vec<RuntimeError>) {
+        let Some(threading) = self.import_resolver.get_cached("threading") else {
+            return;
+        };
+        let Some(shutdown) = threading.get_attr("_shutdown") else {
+            return;
+        };
+
+        if let Err(err) = invoke_callable_value(self, shutdown, &[]) {
+            errors.push(err);
+        }
+    }
+
     #[inline]
     pub fn set_compiler_optimization(&mut self, level: OptimizationLevel) {
         self.compiler_optimization = level;
@@ -468,12 +551,15 @@ impl VirtualMachine {
     }
 
     fn run_nested_module_until_depth(&mut self, stop_depth: usize) -> VmResult<()> {
+        let _execution_region = crate::threading_runtime::enter_execution_region();
         loop {
             if self.frames.len() <= stop_depth {
                 return Ok(());
             }
 
             self.execution_budget.consume_step()?;
+            crate::threading_runtime::checkpoint();
+            self.poll_pending_main_interrupt_to_depth(stop_depth)?;
 
             let inst = {
                 let frame = &mut self.frames[self.current_frame_idx];
@@ -567,6 +653,9 @@ impl VirtualMachine {
                     self.frames[self.current_frame_idx].set_reg(0, send_value);
                 }
                 ControlFlow::Error(err) => {
+                    if err.is_control_transferred() {
+                        continue;
+                    }
                     self.propagate_runtime_error_to_depth(stop_depth, err)?;
                 }
             }
@@ -600,7 +689,63 @@ impl VirtualMachine {
 
     #[inline]
     fn route_nested_runtime_error(&mut self, stop_depth: usize, err: RuntimeError) -> VmResult<()> {
+        if err.is_control_transferred() {
+            return Ok(());
+        }
         self.propagate_runtime_error_to_depth(stop_depth, err)
+    }
+
+    #[inline]
+    fn poll_pending_main_interrupt_to_depth(&mut self, min_depth: usize) -> VmResult<()> {
+        self.poll_pending_async_exception_to_depth(min_depth)?;
+
+        let Some(signum) =
+            crate::stdlib::_thread::take_pending_main_interrupt(self.thread_interrupt_target)
+        else {
+            return Ok(());
+        };
+
+        if let Err(err) = crate::stdlib::_thread::deliver_interrupt_signal(self, signum) {
+            self.propagate_runtime_error_to_depth(min_depth, err)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn poll_pending_async_exception_to_depth(&mut self, min_depth: usize) -> VmResult<()> {
+        let Some(exception) =
+            crate::stdlib::_thread::take_pending_async_exception_for_current_thread()
+        else {
+            return Ok(());
+        };
+
+        let (exception, type_id) = self.normalize_async_exception(exception)?;
+        self.set_active_exception_with_type(exception, type_id);
+        self.propagate_exception_to_depth(min_depth, type_id)
+    }
+
+    fn normalize_async_exception(&mut self, exception: Value) -> VmResult<(Value, u16)> {
+        use crate::ops::exception::helpers::{
+            extract_type_id_from_value, is_exception_class_value, is_exception_instance_value,
+        };
+
+        let normalized = if is_exception_instance_value(&exception) {
+            exception
+        } else if is_exception_class_value(&exception) {
+            invoke_callable_value(self, exception, &[])?
+        } else {
+            return Err(RuntimeError::type_error(
+                "async exception must derive from BaseException",
+            ));
+        };
+
+        if !is_exception_instance_value(&normalized) {
+            return Err(RuntimeError::type_error(
+                "async exception construction must yield an exception instance",
+            ));
+        }
+
+        Ok((normalized, extract_type_id_from_value(&normalized)))
     }
 
     #[inline]
@@ -642,6 +787,7 @@ impl VirtualMachine {
         stop_depth: usize,
         target_frame_id: u32,
     ) -> VmResult<NestedTargetFrameOutcome> {
+        let _execution_region = crate::threading_runtime::enter_execution_region();
         if stop_depth == 0 {
             return Err(RuntimeError::internal(
                 "nested execution requires a caller frame",
@@ -649,6 +795,9 @@ impl VirtualMachine {
         }
 
         loop {
+            crate::threading_runtime::checkpoint();
+            self.poll_pending_main_interrupt_to_depth(stop_depth)?;
+
             if self.frames.len() < stop_depth {
                 return Err(RuntimeError::internal(
                     "nested execution unwound below caller frame",
@@ -798,6 +947,7 @@ impl VirtualMachine {
         module: Option<Arc<ModuleObject>>,
         locals_mapping: Option<Value>,
     ) -> VmResult<NamespaceExecutionResult> {
+        let _execution_region = crate::threading_runtime::enter_execution_region();
         if self.frames.is_empty() {
             self.execution_budget.reset_counter();
         }
@@ -815,6 +965,9 @@ impl VirtualMachine {
         let target_frame_id = self.current_frame_id();
 
         loop {
+            crate::threading_runtime::checkpoint();
+            self.poll_pending_main_interrupt_to_depth(stop_depth)?;
+
             let inst = {
                 let current_frame_idx = self.current_frame_idx;
                 let frame = &mut self.frames[current_frame_idx];
@@ -903,16 +1056,14 @@ impl VirtualMachine {
         }
     }
 
-    fn load_source_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
+    fn load_source_module_from_location(
+        &mut self,
+        name: &str,
+        location: crate::import::SourceModuleLocation,
+    ) -> VmResult<Arc<ModuleObject>> {
         if let Some(module) = self.import_resolver.get_cached(name) {
             return Ok(module);
         }
-
-        let Some(location) = self.import_resolver.resolve_source_location(name) else {
-            return Err(Self::import_error_to_runtime(ImportError::ModuleNotFound {
-                module: Arc::from(name),
-            }));
-        };
 
         if self.import_verbosity > 0 {
             eprintln!("import {} # from {}", name, location.path.display());
@@ -944,16 +1095,14 @@ impl VirtualMachine {
         )
     }
 
-    fn load_frozen_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
+    fn load_frozen_module_source(
+        &mut self,
+        name: &str,
+        frozen: Arc<FrozenModuleSource>,
+    ) -> VmResult<Arc<ModuleObject>> {
         if let Some(module) = self.import_resolver.get_cached(name) {
             return Ok(module);
         }
-
-        let Some(frozen) = self.import_resolver.get_frozen_module(name) else {
-            return Err(Self::import_error_to_runtime(ImportError::ModuleNotFound {
-                module: Arc::from(name),
-            }));
-        };
 
         if self.import_verbosity > 0 {
             eprintln!("import {} # frozen", name);
@@ -1048,11 +1197,26 @@ impl VirtualMachine {
         self.import_resolver.module_from_ptr(ptr)
     }
 
-    fn load_non_stdlib_module(&mut self, name: &str) -> VmResult<Arc<ModuleObject>> {
-        if self.import_resolver.has_frozen_module(name) {
-            self.load_frozen_module(name)
-        } else {
-            self.load_source_module(name)
+    fn load_module_from_plan(
+        &mut self,
+        name: &str,
+        plan: ImportLoadPlan,
+    ) -> VmResult<Arc<ModuleObject>> {
+        match plan {
+            ImportLoadPlan::Cached(module) => Ok(module),
+            ImportLoadPlan::Frozen(frozen) => self.load_frozen_module_source(name, frozen),
+            ImportLoadPlan::Source(location) => {
+                self.load_source_module_from_location(name, location)
+            }
+            ImportLoadPlan::Native => self
+                .import_resolver
+                .import_module(name)
+                .map_err(Self::import_error_to_runtime),
+            ImportLoadPlan::Missing => {
+                Err(Self::import_error_to_runtime(ImportError::ModuleNotFound {
+                    module: Arc::from(name),
+                }))
+            }
         }
     }
 
@@ -1064,25 +1228,9 @@ impl VirtualMachine {
         let absolute_name =
             self.resolve_import_name_with_context(raw_name, current_module.map(Arc::as_ref))?;
 
-        if let Some(module) = self.import_resolver.get_cached(&absolute_name) {
-            return Ok(module);
-        }
-
         if !absolute_name.contains('.') {
-            if self
-                .import_resolver
-                .should_load_from_source_first(&absolute_name)
-            {
-                return self.load_non_stdlib_module(&absolute_name);
-            }
-
-            return match self.import_resolver.import_module(&absolute_name) {
-                Ok(module) => Ok(module),
-                Err(ImportError::ModuleNotFound { .. }) => {
-                    self.load_non_stdlib_module(&absolute_name)
-                }
-                Err(err) => Err(Self::import_error_to_runtime(err)),
-            };
+            let plan = self.import_resolver.resolve_load_plan(&absolute_name);
+            return self.load_module_from_plan(&absolute_name, plan);
         }
 
         let mut segments = absolute_name.split('.');
@@ -1096,25 +1244,10 @@ impl VirtualMachine {
             prefix.push('.');
             prefix.push_str(segment);
 
-            if let Some(module) = self.import_resolver.get_cached(&prefix) {
-                current.set_attr(
-                    segment,
-                    Value::object_ptr(Arc::as_ptr(&module) as *const ()),
-                );
-                current = module;
-                continue;
-            }
-
-            if self.import_resolver.should_load_from_source_first(&prefix) {
-                let next = self.load_non_stdlib_module(&prefix)?;
-                current.set_attr(segment, Value::object_ptr(Arc::as_ptr(&next) as *const ()));
-                current = next;
-                continue;
-            }
-
-            let next = match self.import_resolver.import_module(&prefix) {
-                Ok(module) => module,
-                Err(ImportError::ModuleNotFound { .. }) => {
+            let plan = self.import_resolver.resolve_load_plan(&prefix);
+            let next = match plan {
+                ImportLoadPlan::Cached(module) => module,
+                ImportLoadPlan::Missing => {
                     if let Some(value) = current.get_attr(segment)
                         && let Some(module_ptr) = value.as_object_ptr()
                         && let Some(module) = self.import_resolver.module_from_ptr(module_ptr)
@@ -1123,10 +1256,10 @@ impl VirtualMachine {
                             .insert_module(&prefix, Arc::clone(&module));
                         module
                     } else {
-                        self.load_non_stdlib_module(&prefix)?
+                        self.load_module_from_plan(&prefix, ImportLoadPlan::Missing)?
                     }
                 }
-                Err(err) => return Err(Self::import_error_to_runtime(err)),
+                plan => self.load_module_from_plan(&prefix, plan)?,
             };
 
             current.set_attr(segment, Value::object_ptr(Arc::as_ptr(&next) as *const ()));
@@ -1200,9 +1333,10 @@ impl VirtualMachine {
 
     /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
+        let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let heap = new_shared_managed_heap();
+        let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
-        let heap = Box::new(ManagedHeap::with_defaults());
-        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             frame_pool: FramePool::new(),
@@ -1216,6 +1350,7 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1232,11 +1367,80 @@ impl VirtualMachine {
         }
     }
 
+    /// Create an interpreter VM that allocates into an existing Python heap.
+    ///
+    /// Native Python threads execute with their own VM stacks and execution
+    /// caches, but they must share the spawning VM's heap because Python
+    /// objects can freely escape across thread boundaries.
+    pub(crate) fn with_shared_heap(heap: SharedManagedHeap, thread_interrupt_target: u64) -> Self {
+        let runtime_heap_binding = bind_runtime_heap(&heap);
+        let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
+        drop(runtime_heap_binding);
+        Self::with_shared_heap_and_import_resolver(
+            heap,
+            thread_interrupt_target,
+            builtins,
+            import_resolver,
+        )
+    }
+
+    /// Create an interpreter VM for a native Python thread.
+    ///
+    /// The thread gets an independent frame stack and inline cache state while
+    /// sharing interpreter-wide runtime state such as `sys.modules`, `sys.path`,
+    /// and the import in-progress table with the spawning interpreter.
+    pub(crate) fn with_shared_heap_and_import_resolver(
+        heap: SharedManagedHeap,
+        thread_interrupt_target: u64,
+        builtins: BuiltinRegistry,
+        import_resolver: ImportResolver,
+    ) -> Self {
+        let runtime_heap_binding = bind_runtime_heap(&heap);
+        Self {
+            frames: Vec::with_capacity(64),
+            frame_pool: FramePool::new(),
+            current_frame_idx: 0,
+            globals: GlobalScope::new(),
+            builtins,
+            inline_caches: InlineCacheStore::default(),
+            profiler: Profiler::new(),
+            ic_manager: ICManager::new(),
+            speculation_cache: SpeculationCache::new(),
+            jit: None,
+            jit_return_value: None,
+            function_closures: HashMap::new(),
+            thread_interrupt_target,
+            heap,
+            _runtime_heap_binding: runtime_heap_binding,
+            exc_state: ExceptionState::default(),
+            handler_stack: HandlerStack::new(),
+            active_exception: None,
+            active_exception_type_id: None,
+            exc_info_stack: ExcInfoStack::new(),
+            active_except_handlers: Vec::new(),
+            import_resolver,
+            import_verbosity: 0,
+            compiler_optimization: OptimizationLevel::None,
+            execution_budget: ExecutionBudget::default(),
+            last_aot_error: None,
+        }
+    }
+
+    /// Return the shared heap handle used by native Python threads.
+    pub(crate) fn shared_heap(&self) -> SharedManagedHeap {
+        Arc::clone(&self.heap)
+    }
+
+    pub(crate) fn thread_interrupt_target(&self) -> u64 {
+        self.thread_interrupt_target
+    }
+
     /// Create a new virtual machine with JIT compilation enabled.
     pub fn with_jit() -> Self {
+        let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let heap = new_shared_managed_heap();
+        let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
-        let heap = Box::new(ManagedHeap::with_defaults());
-        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             frame_pool: FramePool::new(),
@@ -1250,6 +1454,7 @@ impl VirtualMachine {
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
             function_closures: HashMap::new(),
+            thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1268,14 +1473,15 @@ impl VirtualMachine {
 
     /// Create a virtual machine with custom JIT configuration.
     pub fn with_jit_config(config: JitConfig) -> Self {
+        let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
         let jit = if config.enabled {
             Some(JitContext::new(config))
         } else {
             None
         };
+        let heap = new_shared_managed_heap();
+        let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
-        let heap = Box::new(ManagedHeap::with_defaults());
-        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             frame_pool: FramePool::new(),
@@ -1289,6 +1495,7 @@ impl VirtualMachine {
             jit,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1307,9 +1514,10 @@ impl VirtualMachine {
 
     /// Create with pre-populated globals.
     pub fn with_globals(globals: GlobalScope) -> Self {
+        let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let heap = new_shared_managed_heap();
+        let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
-        let heap = Box::new(ManagedHeap::with_defaults());
-        let runtime_heap_binding = RuntimeHeapBinding::register(heap.heap());
         Self {
             frames: Vec::with_capacity(64),
             frame_pool: FramePool::new(),
@@ -1323,6 +1531,7 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1411,8 +1620,11 @@ impl VirtualMachine {
     /// Main dispatch loop.
     #[inline(never)] // Prevent inlining for better branch prediction
     fn run_loop(&mut self) -> VmResult<Value> {
+        let _execution_region = crate::threading_runtime::enter_execution_region();
         loop {
             self.execution_budget.consume_step()?;
+            crate::threading_runtime::checkpoint();
+            self.poll_pending_main_interrupt_to_depth(1)?;
 
             // Fetch instruction
             let inst = {
@@ -1566,6 +1778,9 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Error(err) => {
+                    if err.is_control_transferred() {
+                        continue;
+                    }
                     self.propagate_runtime_error_to_depth(1, err)?;
                 }
             }
@@ -1576,15 +1791,24 @@ impl VirtualMachine {
     fn current_traceback_entry(&self) -> TracebackEntry {
         let frame = &self.frames[self.current_frame_idx];
         let pc = frame.ip.saturating_sub(1);
-        let line = frame
-            .code
-            .line_for_pc(pc)
-            .unwrap_or(frame.code.first_lineno);
+        let line = Self::traceback_line_for_pc(&frame.code, pc);
         TracebackEntry {
             func_name: Arc::clone(&frame.code.name),
             filename: Arc::clone(&frame.code.filename),
             line,
         }
+    }
+
+    fn traceback_line_for_pc(code: &CodeObject, pc: u32) -> u32 {
+        code.line_for_pc(pc)
+            .or_else(|| {
+                code.line_table
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.start_pc <= pc)
+                    .map(|entry| entry.line)
+            })
+            .unwrap_or(code.first_lineno)
     }
 
     #[inline]
@@ -1609,13 +1833,81 @@ impl VirtualMachine {
         self.prepend_current_traceback_entry(&mut err.traceback);
     }
 
-    #[inline]
-    fn propagate_exception_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
-        if let Some(handler_entry) = self.find_exception_handler(type_id) {
-            self.frames[self.current_frame_idx].ip = handler_entry;
-            return Ok(());
+    fn alloc_traceback_view<T>(&self, object: T, context: &'static str) -> VmResult<Value>
+    where
+        T: prism_runtime::Trace,
+    {
+        self.allocator()
+            .alloc(object)
+            .map(|ptr| Value::object_ptr(ptr as *const ()))
+            .ok_or_else(|| {
+                RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
+            })
+    }
+
+    fn synthetic_traceback_code(entry: &TracebackEntry) -> Arc<CodeObject> {
+        let line = entry.line.max(1);
+        let mut code = CodeObject::new(Arc::clone(&entry.func_name), Arc::clone(&entry.filename));
+        code.first_lineno = line;
+        code.instructions = vec![Instruction::op(Opcode::Nop)].into_boxed_slice();
+        code.line_table = vec![LineTableEntry {
+            start_pc: 0,
+            end_pc: 1,
+            line,
+        }]
+        .into_boxed_slice();
+        Arc::new(code)
+    }
+
+    fn python_traceback_from_entries(&self, entries: &[TracebackEntry]) -> VmResult<Value> {
+        if entries.is_empty() {
+            return Ok(Value::none());
         }
 
+        let mut frames = Vec::with_capacity(entries.len());
+        let mut back = None;
+        for entry in entries {
+            let globals = self.alloc_traceback_view(DictObject::new(), "traceback globals dict")?;
+            let locals = self.alloc_traceback_view(DictObject::new(), "traceback locals dict")?;
+            let frame = self.alloc_traceback_view(
+                FrameViewObject::new(
+                    Some(Self::synthetic_traceback_code(entry)),
+                    globals,
+                    locals,
+                    entry.line,
+                    0,
+                    back,
+                ),
+                "traceback frame",
+            )?;
+            frames.push(frame);
+            back = Some(frame);
+        }
+
+        let mut next = None;
+        for (entry, frame) in entries.iter().zip(frames.iter()).rev() {
+            let traceback = self.alloc_traceback_view(
+                TracebackViewObject::new(*frame, next, entry.line, 0),
+                "traceback",
+            )?;
+            next = Some(traceback);
+        }
+
+        Ok(next.unwrap_or_else(Value::none))
+    }
+
+    fn attach_active_python_traceback(&self, entries: &[TracebackEntry]) -> VmResult<()> {
+        let Some(exception) = self.active_exception else {
+            return Ok(());
+        };
+        let traceback = self.python_traceback_from_entries(entries)?;
+        set_exception_traceback_for_value(exception, traceback)
+            .map_err(RuntimeError::type_error)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn propagate_exception_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
         let mut traceback = Vec::with_capacity(
             self.frames
                 .len()
@@ -1623,31 +1915,33 @@ impl VirtualMachine {
                 .saturating_add(1),
         );
         self.prepend_current_traceback_entry(&mut traceback);
+
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.attach_active_python_traceback(&traceback)?;
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
 
         loop {
             if self.frames.len() <= min_depth {
                 let mut err = self.uncaught_exception_error(type_id);
                 err.traceback = traceback;
+                self.attach_active_python_traceback(&err.traceback)?;
                 return Err(err);
             }
 
             self.pop_top_frame_for_unwind();
+            self.prepend_current_traceback_entry(&mut traceback);
             if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.attach_active_python_traceback(&traceback)?;
                 self.frames[self.current_frame_idx].ip = handler_entry;
                 return Ok(());
             }
-
-            self.prepend_current_traceback_entry(&mut traceback);
         }
     }
 
     #[inline]
     fn propagate_reraise_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
-        if let Some(handler_entry) = self.find_exception_handler(type_id) {
-            self.frames[self.current_frame_idx].ip = handler_entry;
-            return Ok(());
-        }
-
         let mut traceback = Vec::with_capacity(
             self.frames
                 .len()
@@ -1656,20 +1950,27 @@ impl VirtualMachine {
         );
         self.prepend_current_traceback_entry(&mut traceback);
 
+        if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.attach_active_python_traceback(&traceback)?;
+            self.frames[self.current_frame_idx].ip = handler_entry;
+            return Ok(());
+        }
+
         loop {
             if self.frames.len() <= min_depth {
                 let mut err = self.uncaught_reraised_exception_error(type_id);
                 err.traceback = traceback;
+                self.attach_active_python_traceback(&err.traceback)?;
                 return Err(err);
             }
 
             self.pop_top_frame_for_unwind();
+            self.prepend_current_traceback_entry(&mut traceback);
             if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.attach_active_python_traceback(&traceback)?;
                 self.frames[self.current_frame_idx].ip = handler_entry;
                 return Ok(());
             }
-
-            self.prepend_current_traceback_entry(&mut traceback);
         }
     }
 
@@ -1684,24 +1985,26 @@ impl VirtualMachine {
         }
 
         let type_id = self.materialize_active_exception_from_runtime_error(&err);
+        self.prepend_current_traceback_to_error(&mut err);
         if let Some(handler_entry) = self.find_exception_handler(type_id) {
+            self.attach_active_python_traceback(&err.traceback)?;
             self.frames[self.current_frame_idx].ip = handler_entry;
             return Ok(());
         }
 
-        self.prepend_current_traceback_to_error(&mut err);
         loop {
             if self.frames.len() <= min_depth {
+                self.attach_active_python_traceback(&err.traceback)?;
                 return Err(err);
             }
 
             self.pop_top_frame_for_unwind();
+            self.prepend_current_traceback_to_error(&mut err);
             if let Some(handler_entry) = self.find_exception_handler(type_id) {
+                self.attach_active_python_traceback(&err.traceback)?;
                 self.frames[self.current_frame_idx].ip = handler_entry;
                 return Ok(());
             }
-
-            self.prepend_current_traceback_to_error(&mut err);
         }
     }
 
@@ -1966,12 +2269,13 @@ impl VirtualMachine {
         };
 
         // Restore captured live state (or seeded locals for first start).
+        let restored_liveness = generator.liveness();
         generator.restore(&mut frame.registers);
+        for reg in restored_liveness.iter() {
+            frame.mark_reg_written(reg);
+        }
         if prev_state == RuntimeGeneratorState::Created {
-            initialize_closure_cellvars_from_locals(
-                &mut frame,
-                generator.liveness().count() as usize,
-            );
+            initialize_closure_cellvars_from_locals(&mut frame, restored_liveness.count() as usize);
         }
 
         if prev_state == RuntimeGeneratorState::Suspended
@@ -2006,6 +2310,23 @@ impl VirtualMachine {
                 if let Err(err) = self.execution_budget.consume_step() {
                     failure = Some(err);
                     break 'exec;
+                }
+                if let Some(signum) = crate::stdlib::_thread::take_pending_main_interrupt(
+                    self.thread_interrupt_target,
+                ) {
+                    if let Err(err) = crate::stdlib::_thread::deliver_interrupt_signal(self, signum)
+                    {
+                        if err.is_control_transferred() {
+                            continue;
+                        }
+
+                        let type_id = self.materialize_active_exception_from_runtime_error(&err);
+                        if !self.propagate_exception_within_generator_frames(type_id, caller_depth)
+                        {
+                            failure = Some(err);
+                            break 'exec;
+                        }
+                    }
                 }
 
                 let inst = {
@@ -2204,8 +2525,10 @@ impl VirtualMachine {
 
     /// Push a new frame with an optional captured closure environment.
     ///
-    /// This path intentionally bypasses JIT dispatch because call opcodes must
-    /// bind arguments into frame registers before execution starts.
+    /// Call opcodes bind arguments after this frame is created. Once the frame is
+    /// populated, the call path should invoke
+    /// [`Self::dispatch_prepared_current_frame_via_jit`] before falling back to
+    /// the interpreter loop.
     pub fn push_frame_with_closure(
         &mut self,
         code: Arc<CodeObject>,
@@ -2352,6 +2675,74 @@ impl VirtualMachine {
         self.set_current_frame_idx(self.frames.len() - 1);
 
         Ok(())
+    }
+
+    /// Try to execute the current, already-initialized call frame through JIT.
+    ///
+    /// Ordinary Python calls need their argument registers populated before JIT
+    /// entry. This method is the hot post-binding dispatch hook: it performs the
+    /// same tier-up and compiled-code lookup as root-frame dispatch, but executes
+    /// against the real callee frame instead of allocating a temporary empty
+    /// frame. On return, the callee frame is popped exactly like the interpreter
+    /// return path; on deopt, the frame is left in place at the requested bytecode
+    /// offset.
+    #[inline]
+    pub(crate) fn dispatch_prepared_current_frame_via_jit(&mut self) -> VmResult<bool> {
+        if self.frames.is_empty() || self.execution_budget.step_limit().is_some() {
+            return Ok(false);
+        }
+
+        let frame_idx = self.current_frame_idx;
+        let code = {
+            let frame = &self.frames[frame_idx];
+            if frame.ip != 0 || frame.closure.is_some() {
+                return Ok(false);
+            }
+            Arc::clone(&frame.code)
+        };
+
+        let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
+        let code_ptr_id = Arc::as_ptr(&code) as u64;
+        let execution_result = {
+            let Some(jit) = self.jit.as_mut() else {
+                return Ok(false);
+            };
+
+            let tier_decision = jit.check_tier_up(&self.profiler, code_id);
+            if tier_decision != TierUpDecision::None {
+                jit.handle_tier_up(&code, tier_decision);
+            }
+
+            if jit.lookup(code_ptr_id).is_none() {
+                jit.record_miss();
+                return Ok(false);
+            }
+
+            jit.try_execute(code_ptr_id, &mut self.frames[frame_idx])
+        };
+
+        match execution_result {
+            Some(ExecutionResult::Return(value)) => {
+                if let Some(root_value) = self.pop_frame(value)? {
+                    self.jit_return_value = Some(root_value);
+                }
+                Ok(true)
+            }
+            Some(ExecutionResult::Deopt { bc_offset, reason }) => {
+                if let Some(jit) = self.jit.as_mut() {
+                    jit.handle_deopt(code_ptr_id, reason);
+                }
+                self.frames[frame_idx].ip = bc_offset;
+                Ok(false)
+            }
+            Some(ExecutionResult::Exception(err)) => Err(err),
+            Some(ExecutionResult::TailCall { .. }) | None => {
+                if let Some(jit) = self.jit.as_mut() {
+                    jit.record_miss();
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Pop the top frame during exception/generator unwinding.
@@ -2502,7 +2893,12 @@ impl VirtualMachine {
         func_ptr: *const (),
         closure: Arc<crate::frame::ClosureEnv>,
     ) {
+        let weak_closure = Arc::downgrade(&closure);
         self.function_closures.insert(func_ptr, closure);
+        SHARED_FUNCTION_CLOSURES
+            .write()
+            .expect("shared function closure registry lock poisoned")
+            .insert(func_ptr as usize, weak_closure);
     }
 
     /// Look up captured closure environment for a function object.
@@ -2511,7 +2907,15 @@ impl VirtualMachine {
         &self,
         func_ptr: *const (),
     ) -> Option<Arc<crate::frame::ClosureEnv>> {
-        self.function_closures.get(&func_ptr).cloned()
+        if let Some(closure) = self.function_closures.get(&func_ptr) {
+            return Some(Arc::clone(closure));
+        }
+
+        SHARED_FUNCTION_CLOSURES
+            .read()
+            .expect("shared function closure registry lock poisoned")
+            .get(&(func_ptr as usize))
+            .and_then(Weak::upgrade)
     }
 
     // =========================================================================
@@ -2523,8 +2927,8 @@ impl VirtualMachine {
     /// Use this to query heap statistics, check collection thresholds,
     /// or read heap configuration.
     #[inline]
-    pub fn heap(&self) -> &ManagedHeap {
-        self.heap.as_ref()
+    pub fn heap(&self) -> MutexGuard<'_, ManagedHeap> {
+        self.heap.lock().expect("managed heap lock poisoned")
     }
 
     /// Get mutable access to the managed heap.
@@ -2534,8 +2938,8 @@ impl VirtualMachine {
     /// - Updating root sets
     /// - Modifying heap configuration
     #[inline]
-    pub fn heap_mut(&mut self) -> &mut ManagedHeap {
-        self.heap.as_mut()
+    pub fn heap_mut(&self) -> MutexGuard<'_, ManagedHeap> {
+        self.heap.lock().expect("managed heap lock poisoned")
     }
 
     /// Get a typed allocator for GC-managed object allocation.
@@ -2557,7 +2961,15 @@ impl VirtualMachine {
     /// The allocator itself is stack-allocated and holds only a reference.
     #[inline]
     pub fn allocator(&self) -> GcAllocator<'_> {
-        GcAllocator::new(self.heap.heap())
+        let heap_ptr = {
+            let heap = self.heap.lock().expect("managed heap lock poisoned");
+            heap.heap() as *const _
+        };
+
+        // The shared heap is owned by `self.heap` and its allocation never moves
+        // while the VM holds the Arc. GcHeap allocation is internally atomic; GC
+        // collection remains synchronized through `heap_mut()`.
+        GcAllocator::new(unsafe { &*heap_ptr })
     }
 
     // =========================================================================
@@ -3061,6 +3473,11 @@ mod tests {
         )
     }
 
+    fn compile_source_module_for_test(source: &str, filename: &str) -> Arc<CodeObject> {
+        prism_compiler::compile_source_code(source, filename, OptimizationLevel::Basic)
+            .expect("source should compile")
+    }
+
     #[test]
     fn test_vm_creation() {
         let vm = VirtualMachine::new();
@@ -3530,6 +3947,42 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_user_function_calls_tier_up_and_execute_jit() {
+        let mut vm = VirtualMachine::with_jit_config(JitConfig::for_testing());
+        let module = Arc::new(ModuleObject::new("__main__"));
+
+        vm.execute_in_module_runtime(
+            compile_source_module_for_test(
+                concat!(
+                    "def answer():\n",
+                    "    return 7\n",
+                    "result = 0\n",
+                    "for _ in range(12):\n",
+                    "    result = answer()\n",
+                ),
+                "prepared_jit_call.py",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("prepared user-function calls should execute correctly under JIT");
+
+        assert_eq!(
+            module.get_attr("result").and_then(|value| value.as_int()),
+            Some(7)
+        );
+
+        let stats = vm.jit.as_ref().expect("JIT should be enabled").stats();
+        assert!(
+            stats.compilations_triggered > 0,
+            "ordinary user-function calls should trigger JIT tier-up"
+        );
+        assert!(
+            stats.cache_hits > 0,
+            "ordinary user-function calls should execute compiled code after tier-up"
+        );
+    }
+
+    #[test]
     fn test_imported_builtins_module_shares_runtime_builtin_objects() {
         let mut vm = VirtualMachine::new();
         let builtins_module = vm
@@ -3627,6 +4080,26 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_in_module_restores_generator_seeded_locals_as_assigned() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("__main__"));
+
+        vm.execute_in_module_runtime(
+            compile_module(
+                "def first(seq):\n    return next(x for x in seq)\nresult = first([7])\n",
+                "generator_seeded_locals.py",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("generator hidden iterator argument should remain assigned");
+
+        assert_eq!(
+            module.get_attr("result").and_then(|value| value.as_int()),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn test_execute_in_module_runtime_preserves_nested_traceback_frames() {
         let mut vm = VirtualMachine::new();
         let err = vm
@@ -3651,6 +4124,111 @@ mod tests {
                 ("outer".to_string(), 4),
                 ("inner".to_string(), 2),
             ]
+        );
+    }
+
+    #[test]
+    fn test_handled_runtime_error_attaches_python_traceback_to_exc_info() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("__main__"));
+        vm.execute_in_module_runtime(
+            compile_source_module_for_test(
+                "import sys\ntry:\n    1 / 0\nexcept ZeroDivisionError:\n    tb = sys.exc_info()[2]\n",
+                "handled_traceback.py",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("handled exception should not escape");
+
+        let traceback = module
+            .get_attr("tb")
+            .expect("except handler should store traceback");
+        let traceback_ptr = traceback
+            .as_object_ptr()
+            .expect("traceback should be an object");
+        assert_eq!(
+            crate::ops::objects::extract_type_id(traceback_ptr),
+            TypeId::TRACEBACK
+        );
+
+        let line =
+            crate::ops::objects::get_attribute_value(&mut vm, traceback, &intern("tb_lineno"))
+                .expect("tb_lineno should be readable");
+        assert_eq!(line.as_int(), Some(3));
+
+        let frame =
+            crate::ops::objects::get_attribute_value(&mut vm, traceback, &intern("tb_frame"))
+                .expect("tb_frame should be readable");
+        let code = crate::ops::objects::get_attribute_value(&mut vm, frame, &intern("f_code"))
+            .expect("f_code should be readable");
+        let name = crate::ops::objects::get_attribute_value(&mut vm, code, &intern("co_name"))
+            .expect("co_name should be readable");
+        assert_eq!(name, Value::string(intern("<module>")));
+    }
+
+    #[test]
+    fn test_traceback_for_caller_handler_includes_call_site_and_inner_raise() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("__main__"));
+        vm.execute_in_module_runtime(
+            compile_source_module_for_test(
+                "import sys\ndef inner():\n    raise ValueError('boom')\ndef outer():\n    try:\n        inner()\n    except ValueError:\n        return sys.exc_info()[2]\ntb = outer()\n",
+                "handled_nested_traceback.py",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("handled nested exception should not escape");
+
+        let outer_tb = module
+            .get_attr("tb")
+            .expect("except handler should store traceback");
+        let outer_line =
+            crate::ops::objects::get_attribute_value(&mut vm, outer_tb, &intern("tb_lineno"))
+                .expect("outer tb_lineno should be readable");
+        assert_eq!(outer_line.as_int(), Some(6));
+
+        let inner_tb =
+            crate::ops::objects::get_attribute_value(&mut vm, outer_tb, &intern("tb_next"))
+                .expect("tb_next should be readable");
+        let inner_line =
+            crate::ops::objects::get_attribute_value(&mut vm, inner_tb, &intern("tb_lineno"))
+                .expect("inner tb_lineno should be readable");
+        assert_eq!(inner_line.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_builtin_setattr_property_exception_transfers_to_python_handler() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("__main__"));
+
+        vm.execute_in_module_runtime(
+            compile_source_module_for_test(
+                concat!(
+                    "class Managed:\n",
+                    "    @property\n",
+                    "    def value(self):\n",
+                    "        return 1\n",
+                    "    @value.setter\n",
+                    "    def value(self, new_value):\n",
+                    "        raise RuntimeError('managed setter failed')\n",
+                    "\n",
+                    "obj = Managed()\n",
+                    "try:\n",
+                    "    setattr(obj, 'value', 3)\n",
+                    "except RuntimeError:\n",
+                    "    RESULT = 1\n",
+                    "else:\n",
+                    "    RESULT = 0\n",
+                ),
+                "handled_setattr_property.py",
+            ),
+            Arc::clone(&module),
+        )
+        .expect("handled property setter exception should not escape");
+
+        assert_eq!(
+            module.get_attr("RESULT").and_then(|value| value.as_int()),
+            Some(1)
         );
     }
 

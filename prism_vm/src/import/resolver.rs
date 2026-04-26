@@ -11,6 +11,8 @@ use crate::stdlib::{Module, ModuleError, StdlibRegistry};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::list::value_as_list_ref;
+use prism_runtime::types::string::value_as_string_ref;
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -90,6 +92,21 @@ pub struct SourceModuleLocation {
     pub is_package: bool,
 }
 
+/// Resolved import action for a canonical module name.
+#[derive(Debug, Clone)]
+pub enum ImportLoadPlan {
+    /// Module is already present in `sys.modules`.
+    Cached(Arc<ModuleObject>),
+    /// Execute an AOT/frozen source module.
+    Frozen(Arc<FrozenModuleSource>),
+    /// Compile and execute a filesystem source module.
+    Source(SourceModuleLocation),
+    /// Load Prism's native stdlib implementation.
+    Native,
+    /// No resolver tier can provide the module.
+    Missing,
+}
+
 // =============================================================================
 // ImportState - Concurrent Import Synchronization
 // =============================================================================
@@ -163,41 +180,44 @@ impl ImportState {
 /// # Thread Safety
 ///
 /// Uses `RwLock` for the sys.modules cache to allow concurrent reads
-/// (the common case) while serializing writes.
+/// (the common case) while serializing writes. Cloned resolvers share import
+/// state so native Python threads see one interpreter-wide `sys.modules`,
+/// `sys.path`, frozen module table, and in-progress import lock map.
 ///
 /// # Performance
 ///
 /// - Cache keys are `InternedString` for O(1) hash/equality
 /// - Built-in modules are pre-initialized (no parsing/compilation)
 /// - `Arc<ModuleObject>` for zero-copy module sharing
+#[derive(Clone)]
 pub struct ImportResolver {
     /// sys.modules: canonical cache of all loaded modules.
     /// Uses InternedString keys for O(1) lookup.
-    sys_modules: RwLock<FxHashMap<InternedString, Arc<ModuleObject>>>,
+    sys_modules: Arc<RwLock<FxHashMap<InternedString, Arc<ModuleObject>>>>,
 
     /// Python-visible `sys.modules` mapping shared with imported `sys`.
     sys_modules_value: Value,
 
     /// Stdlib registry for built-in modules (math, os, sys, etc.).
-    stdlib: StdlibRegistry,
+    stdlib: Arc<StdlibRegistry>,
 
     /// sys.path: search paths for source files.
     /// Future use for .py file loading.
-    search_paths: RwLock<Vec<Arc<str>>>,
+    search_paths: Arc<RwLock<Vec<Arc<str>>>>,
 
     /// Frozen source modules installed by the AOT bootstrap path.
-    frozen_modules: RwLock<FxHashMap<InternedString, Arc<FrozenModuleSource>>>,
+    frozen_modules: Arc<RwLock<FxHashMap<InternedString, Arc<FrozenModuleSource>>>>,
 
     /// Modules currently being imported (for circular import detection and wait semantics).
     /// Maps module name to ImportState which tracks the loading thread and provides
     /// a Condvar for other threads to wait on.
-    loading: RwLock<FxHashMap<InternedString, Arc<ImportState>>>,
+    loading: Arc<RwLock<FxHashMap<InternedString, Arc<ImportState>>>>,
 
     /// Fast pointer lookup for imported module objects.
     ///
     /// Keys are raw `ModuleObject` pointers cast to usize. This lets opcode handlers
     /// validate and resolve module pointers without unsafe casting.
-    module_ptrs: RwLock<FxHashMap<usize, Arc<ModuleObject>>>,
+    module_ptrs: Arc<RwLock<FxHashMap<usize, Arc<ModuleObject>>>>,
 }
 
 impl ImportResolver {
@@ -231,16 +251,13 @@ impl ImportResolver {
 
     fn with_stdlib_and_paths(stdlib: StdlibRegistry, paths: Vec<Arc<str>>) -> Self {
         Self {
-            sys_modules: RwLock::new(FxHashMap::default()),
-            sys_modules_value: {
-                let ptr = Box::into_raw(Box::new(DictObject::new())) as *const ();
-                Value::object_ptr(ptr)
-            },
-            stdlib,
-            search_paths: RwLock::new(paths),
-            frozen_modules: RwLock::new(FxHashMap::default()),
-            loading: RwLock::new(FxHashMap::default()),
-            module_ptrs: RwLock::new(FxHashMap::default()),
+            sys_modules: Arc::new(RwLock::new(FxHashMap::default())),
+            sys_modules_value: allocate_sys_modules_dict(),
+            stdlib: Arc::new(stdlib),
+            search_paths: Arc::new(RwLock::new(paths)),
+            frozen_modules: Arc::new(RwLock::new(FxHashMap::default())),
+            loading: Arc::new(RwLock::new(FxHashMap::default())),
+            module_ptrs: Arc::new(RwLock::new(FxHashMap::default())),
         }
     }
 
@@ -330,6 +347,38 @@ impl ImportResolver {
         self.loading.write().unwrap().remove(&key);
 
         result
+    }
+
+    /// Resolve the canonical load plan for `name`.
+    ///
+    /// The VM executes non-native plans because source and frozen modules need
+    /// compiler and frame-stack access. Keeping the tier ordering here prevents
+    /// source-first policy, native fallback, and cache behavior from diverging
+    /// between import call sites.
+    pub fn resolve_load_plan(&self, name: &str) -> ImportLoadPlan {
+        if let Some(module) = self.get_cached(name) {
+            return ImportLoadPlan::Cached(module);
+        }
+
+        if let Some(module) = self.get_frozen_module(name) {
+            return ImportLoadPlan::Frozen(module);
+        }
+
+        let source_location = self.resolve_source_location(name);
+        if self.stdlib.prefers_source_when_available(name)
+            && let Some(location) = source_location.clone()
+        {
+            return ImportLoadPlan::Source(location);
+        }
+
+        if self.stdlib.contains(name) {
+            return ImportLoadPlan::Native;
+        }
+
+        match source_location {
+            Some(location) => ImportLoadPlan::Source(location),
+            None => ImportLoadPlan::Missing,
+        }
     }
 
     /// Import a module using a dotted name (e.g., `os.path`).
@@ -635,7 +684,40 @@ impl ImportResolver {
 
     /// Get current search paths.
     pub fn search_paths(&self) -> Vec<Arc<str>> {
-        self.search_paths.read().unwrap().clone()
+        let mut paths = self.public_sys_path_entries();
+        for path in self.search_paths.read().unwrap().iter() {
+            if !paths
+                .iter()
+                .any(|existing| existing.as_ref() == path.as_ref())
+            {
+                paths.push(Arc::clone(path));
+            }
+        }
+        paths
+    }
+
+    fn public_sys_path_entries(&self) -> Vec<Arc<str>> {
+        let sys_module = self
+            .sys_modules
+            .read()
+            .unwrap()
+            .get(&intern("sys"))
+            .cloned();
+        let Some(sys_module) = sys_module else {
+            return Vec::new();
+        };
+        let Some(path_value) = sys_module.get_attr("path") else {
+            return Vec::new();
+        };
+        let Some(path_list) = value_as_list_ref(path_value) else {
+            return Vec::new();
+        };
+
+        path_list
+            .iter()
+            .filter_map(|value| value_as_string_ref(*value))
+            .map(|path| Arc::<str>::from(path.as_str()))
+            .collect()
     }
 
     /// Resolve a module name to a filesystem source location, if available.
@@ -703,6 +785,11 @@ impl ImportResolver {
     }
 }
 
+#[inline]
+fn allocate_sys_modules_dict() -> Value {
+    prism_runtime::allocation_context::alloc_value_in_current_heap_or_box(DictObject::new())
+}
+
 impl Default for ImportResolver {
     fn default() -> Self {
         Self::new()
@@ -718,7 +805,7 @@ mod tests {
     use super::*;
     use prism_core::intern::{intern, interned_by_ptr};
     use prism_runtime::types::dict::DictObject;
-    use prism_runtime::types::list::ListObject;
+    use prism_runtime::types::list::{ListObject, object_ptr_as_list_mut};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -835,6 +922,32 @@ mod tests {
 
         // Should be the same Arc (pointer equality)
         assert!(Arc::ptr_eq(&math1, &math2));
+    }
+
+    #[test]
+    fn test_cloned_resolvers_share_interpreter_import_state() {
+        let resolver = ImportResolver::new();
+        let cloned = resolver.clone();
+
+        let module = Arc::new(ModuleObject::new("shared_module"));
+        resolver.insert_module("shared_module", Arc::clone(&module));
+
+        let cached = cloned
+            .get_cached("shared_module")
+            .expect("cloned resolver should see cached module");
+        assert!(Arc::ptr_eq(&cached, &module));
+
+        cloned.add_search_path(Arc::from("thread-visible-path"));
+        assert!(
+            resolver
+                .search_paths()
+                .iter()
+                .any(|path| path.as_ref() == "thread-visible-path")
+        );
+
+        let sys_from_parent = resolver.import_module("sys").unwrap();
+        let sys_from_clone = cloned.import_module("sys").unwrap();
+        assert!(Arc::ptr_eq(&sys_from_parent, &sys_from_clone));
     }
 
     #[test]
@@ -1017,6 +1130,34 @@ mod tests {
     }
 
     #[test]
+    fn test_search_paths_include_runtime_sys_path_mutations_first() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("dynamic_path_module.py"), "VALUE = 1\n");
+
+        let resolver = ImportResolver::with_paths(vec![Arc::from("configured")]);
+        let sys = resolver
+            .import_module("sys")
+            .expect("sys import should succeed");
+        let path_value = sys.get_attr("path").expect("sys.path should exist");
+        let path_ptr = path_value
+            .as_object_ptr()
+            .expect("sys.path should be a list object") as *mut ();
+        let path_list = object_ptr_as_list_mut(path_ptr).expect("sys.path should be mutable");
+        let temp_path = temp.path.to_string_lossy().into_owned();
+        path_list.insert(0, Value::string(intern(&temp_path)));
+
+        let paths = resolver.search_paths();
+        assert_eq!(paths.first().map(Arc::as_ref), Some(temp_path.as_str()));
+        assert!(paths.iter().any(|path| path.as_ref() == "configured"));
+
+        let resolved = resolver
+            .resolve_source_location("dynamic_path_module")
+            .expect("runtime sys.path mutation should be visible to imports");
+        assert_eq!(resolved.path, temp.path.join("dynamic_path_module.py"));
+        assert!(!resolved.is_package);
+    }
+
+    #[test]
     fn test_with_paths() {
         let paths = vec![Arc::from("/path1"), Arc::from("/path2")];
         let resolver = ImportResolver::with_paths(paths);
@@ -1056,6 +1197,33 @@ mod tests {
         assert!(resolver.should_load_from_source_first("os.path"));
         assert!(!resolver.should_load_from_source_first("sys"));
         assert!(!resolver.should_load_from_source_first("math"));
+    }
+
+    #[test]
+    fn test_resolve_load_plan_prefers_source_for_fallback_stdlib_when_available() {
+        let temp = TestTempDir::new();
+        write_file(&temp.path.join("re.py"), "VALUE = 1\n");
+
+        let resolver =
+            ImportResolver::with_paths(vec![Arc::from(temp.path.to_string_lossy().into_owned())]);
+
+        match resolver.resolve_load_plan("re") {
+            ImportLoadPlan::Source(location) => {
+                assert_eq!(location.path, temp.path.join("re.py"));
+                assert!(!location.is_package);
+            }
+            plan => panic!("expected source load plan for re.py, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_load_plan_uses_native_for_builtin_without_source_override() {
+        let resolver = ImportResolver::new();
+
+        match resolver.resolve_load_plan("re") {
+            ImportLoadPlan::Native => {}
+            plan => panic!("expected native load plan for re without source path, got {plan:?}"),
+        }
     }
 
     #[test]
