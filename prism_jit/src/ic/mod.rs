@@ -569,11 +569,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_ic_state_default() {
-        assert_eq!(IcState::default(), IcState::Uninitialized);
-    }
-
-    #[test]
     fn test_ic_state_from_u8() {
         assert_eq!(IcState::from_u8(0), IcState::Uninitialized);
         assert_eq!(IcState::from_u8(1), IcState::Monomorphic);

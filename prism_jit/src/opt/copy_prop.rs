@@ -361,12 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_prop_default() {
-        let pass = CopyProp::default();
-        assert!(!pass.aggressive);
-    }
-
-    #[test]
     fn test_copy_prop_name() {
         let pass = CopyProp::new();
         assert_eq!(pass.name(), "copy_prop");

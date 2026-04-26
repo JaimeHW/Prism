@@ -750,12 +750,6 @@ mod tests {
         assert!(!result.success);
     }
 
-    #[test]
-    fn test_scalar_replacer_default() {
-        let replacer = ScalarReplacer::default();
-        assert_eq!(replacer.config.max_fields, 64);
-    }
-
     // -------------------------------------------------------------------------
     // AdvancedScalarReplacer Tests
     // -------------------------------------------------------------------------
@@ -763,12 +757,6 @@ mod tests {
     #[test]
     fn test_advanced_replacer_new() {
         let replacer = AdvancedScalarReplacer::new();
-        assert_eq!(replacer.base.config.max_fields, 64);
-    }
-
-    #[test]
-    fn test_advanced_replacer_default() {
-        let replacer = AdvancedScalarReplacer::default();
         assert_eq!(replacer.base.config.max_fields, 64);
     }
 

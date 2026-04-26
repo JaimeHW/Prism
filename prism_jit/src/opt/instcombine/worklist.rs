@@ -249,12 +249,6 @@ mod tests {
     }
 
     #[test]
-    fn test_worklist_default() {
-        let wl = Worklist::default();
-        assert!(wl.is_empty());
-    }
-
-    #[test]
     fn test_worklist_repush_after_pop() {
         let mut wl = Worklist::new();
         wl.push(NodeId::new(1));

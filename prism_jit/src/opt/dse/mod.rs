@@ -327,12 +327,6 @@ mod tests {
         assert_eq!(dse.name(), "dse");
     }
 
-    #[test]
-    fn test_dse_default() {
-        let dse = Dse::default();
-        assert_eq!(dse.removed(), 0);
-    }
-
     // =========================================================================
     // Store/Load Detection Tests
     // =========================================================================

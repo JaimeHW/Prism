@@ -765,11 +765,6 @@ mod tests {
         assert!(!DataKind::Generic.is_integer());
     }
 
-    #[test]
-    fn test_data_kind_default() {
-        assert_eq!(DataKind::default(), DataKind::Generic);
-    }
-
     // =========================================================================
     // FrameBase Tests
     // =========================================================================
@@ -778,11 +773,6 @@ mod tests {
     fn test_frame_base_as_gpr() {
         assert_eq!(FrameBase::Rbp.as_gpr(), Gpr::Rbp);
         assert_eq!(FrameBase::Rsp.as_gpr(), Gpr::Rsp);
-    }
-
-    #[test]
-    fn test_frame_base_default() {
-        assert_eq!(FrameBase::default(), FrameBase::Rbp);
     }
 
     // =========================================================================

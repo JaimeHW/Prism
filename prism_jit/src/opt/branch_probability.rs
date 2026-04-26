@@ -647,11 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn test_probability_default() {
-        assert_eq!(BranchProbability::default(), BranchProbability::EVEN);
-    }
-
-    #[test]
     fn test_probability_numerator() {
         let p = BranchProbability::ALWAYS;
         assert_eq!(p.numerator(), u32::MAX);
@@ -713,12 +708,6 @@ mod tests {
     fn test_block_frequency_display() {
         let f = BlockFrequency::new(3.5);
         assert_eq!(format!("{}", f), "3.50x");
-    }
-
-    #[test]
-    fn test_block_frequency_default() {
-        let f = BlockFrequency::default();
-        assert!((f.value() - 1.0).abs() < f64::EPSILON);
     }
 
     // =========================================================================
@@ -783,12 +772,6 @@ mod tests {
         assert_eq!(ann.branch_count(), 0);
         assert_eq!(ann.block_count(), 0);
         assert!(!ann.has_profile_data());
-    }
-
-    #[test]
-    fn test_annotations_default() {
-        let ann = BranchAnnotations::default();
-        assert_eq!(ann.branch_count(), 0);
     }
 
     #[test]

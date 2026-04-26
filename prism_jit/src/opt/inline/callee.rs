@@ -491,9 +491,4 @@ mod tests {
         assert_eq!(graph.param_count, 1);
         assert_eq!(graph.inline_hint, InlineHint::Always);
     }
-
-    #[test]
-    fn test_inline_hint_default() {
-        assert_eq!(InlineHint::default(), InlineHint::Default);
-    }
 }

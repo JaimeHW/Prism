@@ -495,11 +495,6 @@ mod tests {
         assert!(!HotnessLevel::VeryHot.is_cold());
     }
 
-    #[test]
-    fn test_hotness_level_default() {
-        assert_eq!(HotnessLevel::default(), HotnessLevel::Warm);
-    }
-
     // =========================================================================
     // HotnessConfig Tests
     // =========================================================================

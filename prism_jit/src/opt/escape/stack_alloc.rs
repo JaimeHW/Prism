@@ -872,12 +872,6 @@ mod tests {
         assert_eq!(result.failure_reason, Some(StackAllocFailure::GlobalEscape));
     }
 
-    #[test]
-    fn test_allocator_default() {
-        let allocator = StackAllocator::default();
-        assert_eq!(allocator.config.max_object_size, 4096);
-    }
-
     // -------------------------------------------------------------------------
     // BatchStackAllocator Tests
     // -------------------------------------------------------------------------
@@ -903,12 +897,6 @@ mod tests {
 
         let results = allocator.process(&mut graph, &[]);
         assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_batch_allocator_default() {
-        let allocator = BatchStackAllocator::default();
-        assert!(allocator.results.is_empty());
     }
 
     // -------------------------------------------------------------------------

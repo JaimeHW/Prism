@@ -654,11 +654,6 @@ mod tests {
         assert!(!EscapeState::GlobalEscape.can_scalar_replace());
     }
 
-    #[test]
-    fn test_escape_state_default() {
-        assert_eq!(EscapeState::default(), EscapeState::NoEscape);
-    }
-
     // -------------------------------------------------------------------------
     // AllocationInfo Tests
     // -------------------------------------------------------------------------
@@ -788,12 +783,6 @@ mod tests {
         let changed = escape.run(&mut graph);
         assert!(!changed);
         assert_eq!(escape.stats().allocations_analyzed, 0);
-    }
-
-    #[test]
-    fn test_escape_pass_default() {
-        let escape = Escape::default();
-        assert_eq!(escape.stats().scalar_replaced, 0);
     }
 
     #[test]

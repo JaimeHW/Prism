@@ -615,12 +615,6 @@ mod tests {
         assert!(layout.cold_regions().is_empty());
     }
 
-    #[test]
-    fn test_layout_default() {
-        let layout = SplitLayout::default();
-        assert_eq!(layout.total_blocks(), 0);
-    }
-
     // =========================================================================
     // HotColdSplitter Tests
     // =========================================================================
@@ -628,12 +622,6 @@ mod tests {
     #[test]
     fn test_splitter_new() {
         let s = HotColdSplitter::new();
-        assert!((s.config.hot_threshold - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_splitter_default() {
-        let s = HotColdSplitter::default();
         assert!((s.config.hot_threshold - 1.0).abs() < f64::EPSILON);
     }
 

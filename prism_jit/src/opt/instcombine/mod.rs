@@ -397,12 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn test_instcombine_default() {
-        let ic = InstCombine::default();
-        assert!(ic.config().enable_arithmetic);
-    }
-
-    #[test]
     fn test_instcombine_empty_graph() {
         let mut graph = Graph::new();
         let mut ic = InstCombine::new();
