@@ -10,7 +10,9 @@ use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
 use crate::ops::calls::{invoke_callable_value_with_keywords, value_supports_call_protocol};
+use crate::ops::comparison::{compare_order_result, eq_result, ne_result};
 use crate::ops::objects::{dict_storage_ref_from_ptr, extract_type_id};
+use crate::ops::protocols::RichCompareOp;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
@@ -33,6 +35,31 @@ static PARTIAL_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static PARTIAL_CALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm_kw(Arc::from("_functools.partial.__call__"), partial_call)
 });
+static CMP_TO_KEY_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("_functools.cmp_to_key"), cmp_to_key)
+});
+static KEYWRAPPER_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_keywrapper_class);
+static KEYWRAPPER_CALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("functools.KeyWrapper.__call__"), keywrapper_call)
+});
+static KEYWRAPPER_LT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("functools.KeyWrapper.__lt__"), keywrapper_lt)
+});
+static KEYWRAPPER_LE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("functools.KeyWrapper.__le__"), keywrapper_le)
+});
+static KEYWRAPPER_GT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("functools.KeyWrapper.__gt__"), keywrapper_gt)
+});
+static KEYWRAPPER_GE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("functools.KeyWrapper.__ge__"), keywrapper_ge)
+});
+static KEYWRAPPER_EQ_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("functools.KeyWrapper.__eq__"), keywrapper_eq)
+});
+static KEYWRAPPER_NE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("functools.KeyWrapper.__ne__"), keywrapper_ne)
+});
 
 /// Native `_functools` module descriptor.
 #[derive(Debug, Clone)]
@@ -44,7 +71,7 @@ impl FunctoolsNativeModule {
     /// Create a new `_functools` module descriptor.
     pub fn new() -> Self {
         Self {
-            attrs: vec![Arc::from("partial")],
+            attrs: vec![Arc::from("partial"), Arc::from("cmp_to_key")],
         }
     }
 }
@@ -63,6 +90,7 @@ impl Module for FunctoolsNativeModule {
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
             "partial" => Ok(partial_class_value()),
+            "cmp_to_key" => Ok(cmp_to_key_function_value()),
             _ => Err(ModuleError::AttributeError(format!(
                 "module '_functools' has no attribute '{}'",
                 name
@@ -85,6 +113,11 @@ pub(crate) fn partial_class_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&PARTIAL_CLASS) as *const ())
 }
 
+#[inline]
+pub(crate) fn cmp_to_key_function_value() -> Value {
+    builtin_value(&CMP_TO_KEY_FUNCTION)
+}
+
 fn build_partial_class() -> Arc<PyClassObject> {
     let mut class = PyClassObject::new_simple(intern("partial"));
     class.set_attr(intern("__module__"), Value::string(intern("functools")));
@@ -98,6 +131,33 @@ fn build_partial_class() -> Arc<PyClassObject> {
     class.set_attr(intern("__init__"), builtin_value(&PARTIAL_INIT_METHOD));
     class.set_attr(intern("__call__"), builtin_value(&PARTIAL_CALL_METHOD));
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::HAS_INIT | ClassFlags::NATIVE_HEAPTYPE);
+
+    let mut bitmap = SubclassBitmap::new();
+    for &class_id in class.mro() {
+        bitmap.set_bit(class_id_to_type_id(class_id));
+    }
+    let class = Arc::new(class);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
+}
+
+fn build_keywrapper_class() -> Arc<PyClassObject> {
+    let mut class = PyClassObject::new_simple(intern("KeyWrapper"));
+    class.set_attr(intern("__module__"), Value::string(intern("functools")));
+    class.set_attr(intern("__qualname__"), Value::string(intern("KeyWrapper")));
+    class.set_attr(
+        intern("__doc__"),
+        Value::string(intern("Key wrapper returned by functools.cmp_to_key().")),
+    );
+    class.set_attr(intern("__call__"), builtin_value(&KEYWRAPPER_CALL_METHOD));
+    class.set_attr(intern("__lt__"), builtin_value(&KEYWRAPPER_LT_METHOD));
+    class.set_attr(intern("__le__"), builtin_value(&KEYWRAPPER_LE_METHOD));
+    class.set_attr(intern("__gt__"), builtin_value(&KEYWRAPPER_GT_METHOD));
+    class.set_attr(intern("__ge__"), builtin_value(&KEYWRAPPER_GE_METHOD));
+    class.set_attr(intern("__eq__"), builtin_value(&KEYWRAPPER_EQ_METHOD));
+    class.set_attr(intern("__ne__"), builtin_value(&KEYWRAPPER_NE_METHOD));
+    class.set_attr(intern("__hash__"), Value::none());
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
 
     let mut bitmap = SubclassBitmap::new();
     for &class_id in class.mro() {
@@ -124,8 +184,23 @@ fn partial_keywords_attr() -> InternedString {
 }
 
 #[inline]
+fn keywrapper_cmp_attr() -> InternedString {
+    intern("cmp")
+}
+
+#[inline]
+fn keywrapper_obj_attr() -> InternedString {
+    intern("obj")
+}
+
+#[inline]
 fn partial_type_id() -> TypeId {
     PARTIAL_CLASS.class_type_id()
+}
+
+#[inline]
+fn keywrapper_type_id() -> TypeId {
+    KEYWRAPPER_CLASS.class_type_id()
 }
 
 #[inline]
@@ -143,6 +218,14 @@ fn is_partial_value(value: Value) -> bool {
         .is_some_and(|ptr| is_partial_type(extract_type_id(ptr)))
 }
 
+#[inline]
+fn is_keywrapper_type(type_id: TypeId) -> bool {
+    type_id == keywrapper_type_id()
+        || (type_id.raw() >= TypeId::FIRST_USER_TYPE
+            && global_class_bitmap(ClassId(type_id.raw()))
+                .is_some_and(|bitmap| bitmap.is_subclass_of(keywrapper_type_id())))
+}
+
 fn partial_object(
     value: Value,
     context: &'static str,
@@ -156,6 +239,23 @@ fn partial_object(
         return Err(BuiltinError::TypeError(format!(
             "{context} requires a functools.partial object"
         )));
+    }
+    Ok(unsafe { &*(ptr as *const ShapedObject) })
+}
+
+fn keywrapper_object(
+    value: Value,
+    context: &'static str,
+) -> Result<&'static ShapedObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "{context} requires a functools.KeyWrapper object"
+        )));
+    };
+    if !is_keywrapper_type(extract_type_id(ptr)) {
+        return Err(BuiltinError::TypeError(
+            "other argument must be K instance".to_string(),
+        ));
     }
     Ok(unsafe { &*(ptr as *const ShapedObject) })
 }
@@ -183,6 +283,12 @@ fn partial_attr(value: Value, name: InternedString) -> Result<Value, BuiltinErro
         .ok_or_else(|| {
             BuiltinError::TypeError("invalid functools.partial object state".to_string())
         })
+}
+
+fn keywrapper_attr(value: Value, name: InternedString) -> Result<Value, BuiltinError> {
+    keywrapper_object(value, "KeyWrapper")?
+        .get_property_interned(&name)
+        .ok_or_else(|| BuiltinError::AttributeError("object".to_string()))
 }
 
 fn dict_ref(value: Value, context: &'static str) -> Result<&'static DictObject, BuiltinError> {
@@ -223,6 +329,145 @@ fn overlay_keyword_args(dict: &mut DictObject, keywords: &[(&str, Value)]) {
     for &(name, value) in keywords {
         dict.set(Value::string(intern(name)), value);
     }
+}
+
+fn cmp_to_key(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let cmp = parse_single_argument(args, keywords, "cmp_to_key", "mycmp", 0)?;
+    if !value_supports_call_protocol(cmp) {
+        return Err(BuiltinError::TypeError(
+            "the first argument must be callable".to_string(),
+        ));
+    }
+
+    new_keywrapper(vm, cmp, None)
+}
+
+fn keywrapper_call(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "KeyWrapper.__call__() missing required self argument".to_string(),
+        ));
+    }
+
+    let wrapped = parse_single_argument(args, keywords, "K", "obj", 1)?;
+    let cmp = keywrapper_attr(args[0], keywrapper_cmp_attr())?;
+    new_keywrapper(vm, cmp, Some(wrapped))
+}
+
+fn parse_single_argument(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    function_name: &'static str,
+    parameter_name: &'static str,
+    positional_offset: usize,
+) -> Result<Value, BuiltinError> {
+    let positional_count = args.len().saturating_sub(positional_offset);
+    if positional_count > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{function_name}() takes exactly one argument ({positional_count} given)"
+        )));
+    }
+
+    let mut value = args.get(positional_offset).copied();
+    for &(name, keyword_value) in keywords {
+        if name != parameter_name {
+            return Err(BuiltinError::TypeError(format!(
+                "{function_name}() got an unexpected keyword argument '{}'",
+                name
+            )));
+        }
+        if value.replace(keyword_value).is_some() {
+            return Err(BuiltinError::TypeError(format!(
+                "{function_name}() got multiple values for argument '{}'",
+                parameter_name
+            )));
+        }
+    }
+
+    value.ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "{function_name}() missing required argument '{}'",
+            parameter_name
+        ))
+    })
+}
+
+fn new_keywrapper(
+    vm: &mut VirtualMachine,
+    cmp: Value,
+    object: Option<Value>,
+) -> Result<Value, BuiltinError> {
+    let class = &*KEYWRAPPER_CLASS;
+    let registry = shape_registry();
+    let mut wrapper = ShapedObject::new(class.class_type_id(), Arc::clone(class.instance_shape()));
+    wrapper.set_property(keywrapper_cmp_attr(), cmp, registry);
+    if let Some(object) = object {
+        wrapper.set_property(keywrapper_obj_attr(), object, registry);
+    }
+    alloc_value(vm, wrapper, "functools.KeyWrapper")
+}
+
+fn keywrapper_lt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    keywrapper_compare(vm, args, RichCompareOp::Lt)
+}
+
+fn keywrapper_le(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    keywrapper_compare(vm, args, RichCompareOp::Le)
+}
+
+fn keywrapper_gt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    keywrapper_compare(vm, args, RichCompareOp::Gt)
+}
+
+fn keywrapper_ge(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    keywrapper_compare(vm, args, RichCompareOp::Ge)
+}
+
+fn keywrapper_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    keywrapper_compare(vm, args, RichCompareOp::Eq)
+}
+
+fn keywrapper_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    keywrapper_compare(vm, args, RichCompareOp::Ne)
+}
+
+fn keywrapper_compare(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    op: RichCompareOp,
+) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "KeyWrapper comparison expected 1 argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let cmp = keywrapper_attr(args[0], keywrapper_cmp_attr())?;
+    let left = keywrapper_attr(args[0], keywrapper_obj_attr())?;
+    let right = keywrapper_attr(args[1], keywrapper_obj_attr())?;
+    let result = crate::ops::calls::invoke_callable_value(vm, cmp, &[left, right])
+        .map_err(runtime_error_to_builtin_error)?;
+    let zero = Value::int(0).expect("zero is always tagged");
+
+    let truth = match op {
+        RichCompareOp::Eq => eq_result(vm, result, zero),
+        RichCompareOp::Ne => ne_result(vm, result, zero),
+        RichCompareOp::Lt | RichCompareOp::Le | RichCompareOp::Gt | RichCompareOp::Ge => {
+            compare_order_result(vm, result, zero, op)
+        }
+    }
+    .map_err(runtime_error_to_builtin_error)?;
+
+    Ok(Value::bool(truth))
 }
 
 fn keyword_entries_from_dict(dict: &DictObject) -> Result<Vec<(String, Value)>, BuiltinError> {

@@ -132,12 +132,12 @@ impl Module for FunctoolsModule {
             "lru_cache" => Ok(builtin_value(&LRU_CACHE_FUNCTION)),
             "cache" => Ok(builtin_value(&CACHE_FUNCTION)),
             "partial" => Ok(crate::stdlib::_functools::partial_class_value()),
+            "cmp_to_key" => Ok(crate::stdlib::_functools::cmp_to_key_function_value()),
             "WRAPPER_ASSIGNMENTS" => Ok(tuple_value(&WRAPPER_ASSIGNMENTS_VALUE)),
             "WRAPPER_UPDATES" => Ok(tuple_value(&WRAPPER_UPDATES_VALUE)),
             "reduce"
             | "partialmethod"
             | "cached_property"
-            | "cmp_to_key"
             | "total_ordering"
             | "singledispatch"
             | "singledispatchmethod" => Err(ModuleError::AttributeError(format!(
