@@ -32,7 +32,7 @@ use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
-use prism_code::{CodeObject, Instruction, LineTableEntry, Opcode};
+use prism_code::{CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode};
 use prism_compiler::compile_source_code;
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
@@ -189,6 +189,16 @@ struct ExecutionBudget {
     steps_executed: u64,
 }
 
+/// Native-to-Python re-entry depth before raising RecursionError.
+///
+/// Ordinary Python calls run on the VM frame stack and are governed by
+/// `MAX_RECURSION_DEPTH`. Some runtime protocols, such as descriptors,
+/// properties, and special method hooks, synchronously invoke Python from Rust.
+/// Those paths consume host call stack while the nested VM frame executes, so
+/// they need a smaller guard that trips before Windows debug builds can exhaust
+/// the native stack.
+const MAX_NATIVE_RECURSION_DEPTH: usize = 64;
+
 impl ExecutionBudget {
     #[inline]
     fn set_step_limit(&mut self, limit: Option<u64>) {
@@ -293,6 +303,8 @@ pub struct VirtualMachine {
     compiler_optimization: SourceOptimization,
     /// Deterministic interpreter execution budget.
     execution_budget: ExecutionBudget,
+    /// Depth of synchronous runtime re-entry into Python code.
+    native_recursion_depth: usize,
     /// Most recent runtime error reported by a native AOT helper call.
     last_aot_error: Option<RuntimeError>,
     /// Interpreter-local codec registry shared by native Python threads.
@@ -765,9 +777,9 @@ impl VirtualMachine {
 
         let namespace = ClassDict::new();
         for (slot, name) in frame.code.locals.iter().enumerate() {
-            let slot = slot as u8;
-            if frame.reg_is_written(slot) {
-                namespace.set(intern(name.as_ref()), frame.get_reg(slot));
+            let slot = slot as u16;
+            if frame.local_is_written(slot) {
+                namespace.set(intern(name.as_ref()), frame.get_local(slot));
             }
         }
         namespace
@@ -1478,6 +1490,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            native_recursion_depth: 0,
             last_aot_error: None,
         }
     }
@@ -1549,6 +1562,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            native_recursion_depth: 0,
             last_aot_error: None,
         }
     }
@@ -1628,6 +1642,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            native_recursion_depth: 0,
             last_aot_error: None,
         }
     }
@@ -1676,6 +1691,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            native_recursion_depth: 0,
             last_aot_error: None,
         }
     }
@@ -1719,6 +1735,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            native_recursion_depth: 0,
             last_aot_error: None,
         }
     }
@@ -2473,7 +2490,11 @@ impl VirtualMachine {
         self.profiler.record_call(code_id);
 
         // Handle JIT: check for compiled code, handle tier-up, and try execution
-        if allow_jit && closure.is_none() && self.execution_budget.step_limit().is_none() {
+        if allow_jit
+            && closure.is_none()
+            && !code.flags.contains(CodeFlags::SEPARATE_LOCALS)
+            && self.execution_budget.step_limit().is_none()
+        {
             enum JitDispatchOutcome {
                 Returned(Value),
                 Deopt(Frame),
@@ -2621,7 +2642,10 @@ impl VirtualMachine {
         let frame_idx = self.current_frame_idx;
         let code = {
             let frame = &self.frames[frame_idx];
-            if frame.ip != 0 || frame.closure.is_some() {
+            if frame.ip != 0
+                || frame.closure.is_some()
+                || frame.code.flags.contains(CodeFlags::SEPARATE_LOCALS)
+            {
                 return Ok(false);
             }
             Arc::clone(&frame.code)
@@ -2783,6 +2807,28 @@ impl VirtualMachine {
         self.frames.len()
     }
 
+    /// Execute a native runtime callback that may synchronously re-enter Python.
+    ///
+    /// This is deliberately separate from the VM frame recursion limit. Most
+    /// Python calls advance the register VM without growing Rust's call stack;
+    /// direct callbacks from descriptors and special-method machinery do grow
+    /// it, so this guard prevents hostile or simply recursive protocols from
+    /// overflowing the host stack.
+    #[inline(always)]
+    pub(crate) fn with_native_recursion_guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> VmResult<T>,
+    ) -> VmResult<T> {
+        if self.native_recursion_depth >= MAX_NATIVE_RECURSION_DEPTH {
+            return Err(RuntimeError::recursion_error(self.native_recursion_depth));
+        }
+
+        self.native_recursion_depth += 1;
+        let result = f(self);
+        self.native_recursion_depth -= 1;
+        result
+    }
+
     /// Check if VM is idle (no frames).
     #[inline]
     pub(crate) fn is_idle(&self) -> bool {
@@ -2801,6 +2847,7 @@ impl VirtualMachine {
         self.active_exception_type_id = None;
         self.exc_info_stack.clear();
         self.active_except_handlers.clear();
+        self.native_recursion_depth = 0;
     }
 
     /// Clear only the frame stack (keep globals).
@@ -2813,6 +2860,7 @@ impl VirtualMachine {
         self.exc_info_stack.clear();
         self.active_except_handlers.clear();
         self.exc_state = ExceptionState::Normal;
+        self.native_recursion_depth = 0;
     }
 
     // =========================================================================

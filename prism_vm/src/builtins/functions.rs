@@ -27,6 +27,7 @@ use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::{object_ptr_as_string_ref, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
@@ -731,6 +732,28 @@ pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
 
 /// VM-aware sum builtin.
 pub fn builtin_sum_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_sum_vm_kw(vm, args, &[])
+}
+
+/// VM-aware sum builtin with CPython-compatible keyword handling.
+pub fn builtin_sum_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if keywords.is_empty() {
+        return builtin_sum_vm_positional(vm, args);
+    }
+
+    let args = parse_sum_args(args, keywords)?;
+    builtin_sum_vm_positional(vm, &args)
+}
+
+#[inline]
+fn builtin_sum_vm_positional(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
     if args.is_empty() || args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
             "sum expected 1 or 2 arguments, got {}",
@@ -752,6 +775,35 @@ pub fn builtin_sum_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
             IterStep::Exhausted => return acc.into_value_in_vm(vm),
         }
     }
+}
+
+#[inline]
+fn parse_sum_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<SmallVec<[Value; 2]>, BuiltinError> {
+    let mut parsed = SmallVec::<[Value; 2]>::new();
+    parsed.extend_from_slice(args);
+
+    for &(name, value) in keywords {
+        match name {
+            "start" => {
+                if parsed.len() >= 2 {
+                    return Err(BuiltinError::TypeError(
+                        "sum() got multiple values for argument 'start'".to_string(),
+                    ));
+                }
+                parsed.push(value);
+            }
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "sum() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+
+    Ok(parsed)
 }
 
 #[derive(Clone)]

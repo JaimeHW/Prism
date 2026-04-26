@@ -1119,9 +1119,48 @@ impl PublishedClassRegistry {
         }
     }
 
+    pub fn direct_subclasses_of(&self, root_type_id: TypeId) -> Vec<Arc<PyClassObject>> {
+        let mut subclasses = Vec::new();
+
+        for slot in self.entries.iter() {
+            if let Some(entry) = slot.load_full()
+                && class_directly_inherits(entry.class.as_ref(), root_type_id)
+            {
+                subclasses.push(entry.class.clone());
+            }
+        }
+
+        let overflow = self.overflow.lock();
+        for slot in overflow.iter() {
+            if let Some(entry) = slot.entry.load_full()
+                && class_directly_inherits(entry.class.as_ref(), root_type_id)
+            {
+                subclasses.push(entry.class.clone());
+            }
+        }
+
+        subclasses
+    }
+
     pub fn len(&self) -> usize {
         self.registered.load(Ordering::Relaxed) as usize
     }
+}
+
+#[inline]
+fn class_directly_inherits(class: &PyClassObject, root_type_id: TypeId) -> bool {
+    if class.class_type_id() == root_type_id {
+        return false;
+    }
+
+    if class.bases().is_empty() {
+        return root_type_id == TypeId::OBJECT;
+    }
+
+    class
+        .bases()
+        .iter()
+        .any(|&base| class_id_to_type_id(base) == root_type_id)
 }
 
 fn publish_heap_type_object(class: &PyClassObject) {
@@ -1257,6 +1296,12 @@ pub fn global_class_version(id: ClassId) -> Option<u64> {
     (id.0 >= TypeId::FIRST_USER_TYPE)
         .then(|| global_class_registry().class_version(id))
         .flatten()
+}
+
+/// Return the currently published direct heap subclasses of a type.
+#[inline]
+pub fn global_direct_subclasses(type_id: TypeId) -> Vec<Arc<PyClassObject>> {
+    global_class_registry().direct_subclasses_of(type_id)
 }
 
 /// Refresh published method layouts for a class and its registered subclasses.

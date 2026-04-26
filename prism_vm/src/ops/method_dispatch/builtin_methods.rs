@@ -76,6 +76,8 @@ static LIST_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__len__"), list_len));
 static LIST_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__getitem__"), list_getitem));
+static LIST_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__add__"), list_add));
 static LIST_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.append"), list_append));
 static LIST_EXTEND_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -233,8 +235,9 @@ static DICT_SETDEFAULT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.setdefault"), dict_setdefault));
 static DICT_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.clear"), dict_clear));
-static DICT_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.update"), dict_update_with_vm));
+static DICT_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("dict.update"), dict_update_with_vm_kw)
+});
 static DICT_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.copy"), dict_copy));
 static MAPPING_PROXY_KEYS_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -374,6 +377,7 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
         "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_GETITEM_METHOD,
         ))),
+        "__add__" => Some(CachedMethod::simple(builtin_method_value(&LIST_ADD_METHOD))),
         "append" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_APPEND_METHOD,
         ))),
@@ -862,6 +866,22 @@ fn list_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
     let index = expect_integer_like_index(args[1])?;
     list.get(index)
         .ok_or_else(|| BuiltinError::IndexError("list index out of range".to_string()))
+}
+
+#[inline]
+fn list_add(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__add__", args, 1)?;
+    let left = expect_list_ref(args[0], "__add__")?;
+    let right = args[1]
+        .as_object_ptr()
+        .and_then(list_storage_ref_from_ptr)
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "can only concatenate list (not \"{}\") to list",
+                args[1].type_name()
+            ))
+        })?;
+    Ok(to_object_value(left.concat(right)))
 }
 
 #[inline]
@@ -1602,6 +1622,15 @@ fn dict_clear(args: &[Value]) -> Result<Value, BuiltinError> {
 
 #[inline]
 fn dict_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    dict_update_with_vm_kw(vm, args, &[])
+}
+
+#[inline]
+fn dict_update_with_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
     if args.len() > 2 {
         let given = args.len().saturating_sub(1);
         return Err(BuiltinError::TypeError(format!(
@@ -1609,17 +1638,26 @@ fn dict_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
         )));
     }
 
-    if args.len() == 1 {
+    if args.len() == 1 && keywords.is_empty() {
         expect_dict_receiver(args[0], "update")?;
         return Ok(Value::none());
     }
 
-    let entries = collect_dict_update_entries(vm, args[1])?;
+    let entries = if args.len() == 2 {
+        collect_dict_update_entries(vm, args[1])?
+    } else {
+        Vec::new()
+    };
     let dict = expect_dict_mut(args[0], "update")?;
+
     for (key, value) in entries {
         ensure_hashable(key)?;
         dict.set(key, value);
     }
+    for &(name, value) in keywords {
+        dict.set(Value::string(intern(name)), value);
+    }
+
     Ok(Value::none())
 }
 

@@ -3,9 +3,11 @@ use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
-use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::class::{ClassFlags, PyClassObject};
 use prism_runtime::object::mro::ClassId;
-use prism_runtime::object::type_builtins::{builtin_class_mro, class_id_to_type_id, global_class};
+use prism_runtime::object::type_builtins::{
+    builtin_class_mro, class_id_to_type_id, global_class, global_direct_subclasses,
+};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DescriptorViewObject, MappingProxyObject, MethodWrapperObject};
 use prism_runtime::types::dict::DictObject;
@@ -58,6 +60,8 @@ static TYPE_PREPARE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("type.__prepare__"), type_prepare));
 static TYPE_MRO_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("type.mro"), type_mro));
+static TYPE_SUBCLASSES_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("type.__subclasses__"), type_subclasses));
 static TUPLE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("tuple.__new__"), super::types::builtin_tuple_new)
 });
@@ -150,6 +154,7 @@ enum ReflectedValueKind {
     NameString,
     QualNameString,
     ModuleString,
+    FlagsValue,
     WrapperDescriptor,
     MethodDescriptor,
     ClassMethodDescriptor,
@@ -184,6 +189,10 @@ const TYPE_ATTRS: &[AttrSpec] = &[
     },
     AttrSpec {
         name: "mro",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+    AttrSpec {
+        name: "__subclasses__",
         kind: ReflectedValueKind::MethodDescriptor,
     },
 ];
@@ -315,6 +324,7 @@ const LIST_METHOD_NAMES: &[&str] = &[
     "__iter__",
     "__len__",
     "__getitem__",
+    "__add__",
     "append",
     "extend",
     "insert",
@@ -533,6 +543,7 @@ fn reflected_type_attr_kind(name: &InternedString) -> Option<ReflectedValueKind>
         "__name__" => Some(ReflectedValueKind::NameString),
         "__qualname__" => Some(ReflectedValueKind::QualNameString),
         "__module__" => Some(ReflectedValueKind::ModuleString),
+        "__flags__" => Some(ReflectedValueKind::FlagsValue),
         _ => None,
     }
 }
@@ -574,7 +585,8 @@ fn descriptor_type_id(kind: ReflectedValueKind) -> Option<TypeId> {
         | ReflectedValueKind::DocValue
         | ReflectedValueKind::NameString
         | ReflectedValueKind::QualNameString
-        | ReflectedValueKind::ModuleString => None,
+        | ReflectedValueKind::ModuleString
+        | ReflectedValueKind::FlagsValue => None,
     }
 }
 
@@ -584,6 +596,116 @@ fn builtin_type_doc_value(owner: TypeId) -> Value {
         Some(doc) => Value::string(intern(doc)),
         None => Value::none(),
     }
+}
+
+pub(crate) const PY_TPFLAGS_HAVE_VECTORCALL: i64 = 1 << 11;
+pub(crate) const PY_TPFLAGS_METHOD_DESCRIPTOR: i64 = 1 << 17;
+
+#[inline]
+fn python_flags_value(bits: i64) -> Value {
+    Value::int(bits).expect("CPython-compatible type flags fit in Prism immediate ints")
+}
+
+#[inline]
+fn python_type_flags_value_for_builtin(owner: TypeId) -> Value {
+    python_flags_value(python_type_flags_for_builtin(owner))
+}
+
+#[inline]
+fn python_type_flags_value_for_heap_type(class: &PyClassObject) -> Value {
+    python_flags_value(python_type_flags_for_heap_type(class))
+}
+
+pub(crate) fn python_type_flags_for_type_value(value: Value) -> Option<i64> {
+    let ptr = value.as_object_ptr()?;
+    if crate::builtins::builtin_type_object_type_id(ptr).is_some() {
+        return crate::builtins::builtin_type_object_type_id(ptr)
+            .map(python_type_flags_for_builtin);
+    }
+
+    let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+    if header.type_id != TypeId::TYPE {
+        return None;
+    }
+
+    let class = unsafe { &*(ptr as *const PyClassObject) };
+    Some(python_type_flags_for_heap_type(class))
+}
+
+pub(crate) fn python_type_has_vectorcall_flag(value: Value) -> Option<bool> {
+    python_type_flags_for_type_value(value).map(|flags| flags & PY_TPFLAGS_HAVE_VECTORCALL != 0)
+}
+
+fn python_type_flags_for_builtin(owner: TypeId) -> i64 {
+    let mut flags = 0;
+    if matches!(
+        owner,
+        TypeId::FUNCTION
+            | TypeId::CLOSURE
+            | TypeId::WRAPPER_DESCRIPTOR
+            | TypeId::METHOD_DESCRIPTOR
+            | TypeId::CLASSMETHOD_DESCRIPTOR
+    ) {
+        flags |= PY_TPFLAGS_METHOD_DESCRIPTOR;
+    }
+    flags
+}
+
+fn python_type_flags_for_heap_type(class: &PyClassObject) -> i64 {
+    let mut flags = 0;
+    if heap_type_has_effective_vectorcall(class) {
+        flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+    }
+    if class.flags().contains(ClassFlags::METHOD_DESCRIPTOR) {
+        flags |= PY_TPFLAGS_METHOD_DESCRIPTOR;
+    }
+    flags
+}
+
+fn heap_type_has_effective_vectorcall(class: &PyClassObject) -> bool {
+    if class_direct_call_overrides_inherited_vectorcall(class) {
+        return false;
+    }
+    if class.flags().contains(ClassFlags::HAS_VECTORCALL) {
+        return true;
+    }
+
+    class.mro().iter().copied().skip(1).any(|class_id| {
+        if class_id.0 < TypeId::FIRST_USER_TYPE {
+            return false;
+        }
+        global_class(class_id).is_some_and(|base| heap_type_has_effective_vectorcall(base.as_ref()))
+    })
+}
+
+fn class_direct_call_overrides_inherited_vectorcall(class: &PyClassObject) -> bool {
+    let Some(call) = class.get_attr(&intern("__call__")) else {
+        return false;
+    };
+
+    if !class.flags().contains(ClassFlags::HAS_VECTORCALL) {
+        return true;
+    }
+
+    !is_native_vectorcall_call_value(call)
+}
+
+fn is_native_vectorcall_call_value(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+    if header.type_id != TypeId::BUILTIN_FUNCTION {
+        return false;
+    }
+
+    let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    matches!(
+        builtin.name(),
+        "_testcapi.MethodDescriptor.__call__"
+            | "_testcapi.MethodDescriptor2.__call__"
+            | "_testcapi.VectorCallClass.__call__"
+    )
 }
 
 #[inline]
@@ -701,6 +823,46 @@ fn type_mro(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(leak_object_value(ListObject::from_iter(mro_values)))
 }
 
+fn type_subclasses(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "type.__subclasses__() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let root = subclasses_root_type_id(args[0])?;
+    let subclasses: Vec<Value> = global_direct_subclasses(root)
+        .into_iter()
+        .map(|class| Value::object_ptr(Arc::as_ptr(&class) as *const ()))
+        .collect();
+
+    Ok(leak_object_value(ListObject::from_iter(subclasses)))
+}
+
+fn subclasses_root_type_id(class_value: Value) -> Result<TypeId, BuiltinError> {
+    let ptr = class_value.as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__subclasses__' requires a type".to_string())
+    })?;
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::TYPE => Ok(
+            crate::builtins::builtin_type_object_type_id(ptr).unwrap_or_else(|| {
+                let class = unsafe { &*(ptr as *const PyClassObject) };
+                class.class_type_id()
+            }),
+        ),
+        TypeId::EXCEPTION_TYPE => crate::builtins::exception_proxy_class_id_from_ptr(ptr)
+            .map(class_id_to_type_id)
+            .ok_or_else(|| {
+                BuiltinError::TypeError("descriptor '__subclasses__' requires a type".to_string())
+            }),
+        _ => Err(BuiltinError::TypeError(
+            "descriptor '__subclasses__' requires a type".to_string(),
+        )),
+    }
+}
+
 #[inline]
 fn user_type_doc_value(class: &PyClassObject) -> Value {
     class
@@ -751,6 +913,7 @@ fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
     match (owner, name) {
         (TypeId::TYPE, "mro") => Some(builtin_method_value(&TYPE_MRO_METHOD)),
         (TypeId::TYPE, "__prepare__") => Some(builtin_method_value(&TYPE_PREPARE_METHOD)),
+        (TypeId::TYPE, "__subclasses__") => Some(builtin_method_value(&TYPE_SUBCLASSES_METHOD)),
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
         (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
@@ -766,6 +929,7 @@ fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
 fn builtin_type_class_method_value(owner: TypeId, name: &str) -> Option<Value> {
     match (owner, name) {
         (TypeId::TYPE, "__prepare__") => Some(builtin_method_value(&TYPE_PREPARE_METHOD)),
+        (TypeId::TYPE, "__subclasses__") => Some(builtin_method_value(&TYPE_SUBCLASSES_METHOD)),
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
         (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
@@ -834,6 +998,7 @@ fn materialize_attr_value(
             TypeId::DEQUE => "collections",
             _ => "builtins",
         }))),
+        ReflectedValueKind::FlagsValue => Ok(python_type_flags_value_for_builtin(owner)),
         other => {
             let type_id = descriptor_type_id(other)
                 .expect("descriptor type id required for non-mapping-proxy reflection");
@@ -875,6 +1040,7 @@ fn materialize_attr_value_static(
             TypeId::DEQUE => "collections",
             _ => "builtins",
         }))),
+        ReflectedValueKind::FlagsValue => Ok(python_type_flags_value_for_builtin(owner)),
         other => {
             let type_id = descriptor_type_id(other)
                 .expect("descriptor type id required for non-mapping-proxy reflection");
@@ -1089,6 +1255,9 @@ fn user_type_attribute_value(
                 .get_attr(&intern("__module__"))
                 .unwrap_or_else(|| Value::string(intern("__main__"))),
         )),
+        Some(ReflectedValueKind::FlagsValue) => {
+            Ok(Some(python_type_flags_value_for_heap_type(class)))
+        }
         _ => resolve_heap_type_mro_value(vm, class, name, owner_value, |vm, owner| {
             builtin_bound_type_attribute_value(vm, owner, owner_value, name)
         }),
@@ -1137,6 +1306,9 @@ fn user_type_attribute_value_static(
                 .get_attr(&intern("__module__"))
                 .unwrap_or_else(|| Value::string(intern("__main__"))),
         )),
+        Some(ReflectedValueKind::FlagsValue) => {
+            Ok(Some(python_type_flags_value_for_heap_type(class)))
+        }
         _ => resolve_heap_type_mro_value_static(class, name, owner_value, |owner| {
             builtin_bound_type_attribute_value_static(owner, owner_value, name)
         }),

@@ -20,26 +20,40 @@ def abstractmethod(funcobj):
 class abstractclassmethod(classmethod):
     __isabstractmethod__ = True
 
-    def __init__(self, callable):
+    def __new__(cls, callable):
         callable.__isabstractmethod__ = True
-        super().__init__(callable)
+        return classmethod(callable)
+
+    def __init__(self, callable):
+        pass
 
 
 class abstractstaticmethod(staticmethod):
     __isabstractmethod__ = True
 
-    def __init__(self, callable):
+    def __new__(cls, callable):
         callable.__isabstractmethod__ = True
-        super().__init__(callable)
+        return staticmethod(callable)
+
+    def __init__(self, callable):
+        pass
 
 
 class abstractproperty(property):
     __isabstractmethod__ = True
 
+    def __new__(cls, fget=None, fset=None, fdel=None, doc=None):
+        if fget is not None:
+            fget.__isabstractmethod__ = True
+        return property(fget, fset, fdel, doc)
+
+    def __init__(self, fget=None, fset=None, fdel=None, doc=None):
+        pass
+
 
 class ABCMeta(type):
-    def __new__(mcls, name, bases, namespace, **kwargs):
-        cls = type.__new__(mcls, name, bases, namespace)
+    def __new__(mcls, name, bases, namespace, /, **kwargs):
+        cls = type.__new__(mcls, name, bases, namespace, **kwargs)
         _abc_init(cls)
         return cls
 
@@ -67,8 +81,23 @@ class ABCMeta(type):
 
 
 class ABC(metaclass=ABCMeta):
-    pass
+    __slots__ = ()
 
 
 def update_abstractmethods(cls):
+    if not hasattr(cls, "__abstractmethods__"):
+        return cls
+
+    abstracts = set()
+    for scls in cls.__bases__:
+        for name in getattr(scls, "__abstractmethods__", ()):
+            value = getattr(cls, name, None)
+            if getattr(value, "__isabstractmethod__", False):
+                abstracts.add(name)
+
+    for name, value in cls.__dict__.items():
+        if getattr(value, "__isabstractmethod__", False):
+            abstracts.add(name)
+
+    cls.__abstractmethods__ = frozenset(abstracts)
     return cls

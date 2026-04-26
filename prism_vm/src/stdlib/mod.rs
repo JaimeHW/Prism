@@ -27,6 +27,7 @@ pub mod _sre;
 pub mod _ssl;
 pub mod _string;
 pub mod _struct;
+pub mod _testcapi;
 pub mod _thread;
 pub mod _tokenize;
 pub mod _tracemalloc;
@@ -64,11 +65,13 @@ pub mod signal;
 pub mod sys;
 pub mod test_support;
 pub mod time;
+pub mod types;
 pub mod typing;
 pub mod weakref;
 pub mod winreg;
 
 use crate::builtins::BuiltinRegistry;
+use crate::import::ModuleObject;
 use prism_core::Value;
 pub use prism_stdlib::StdlibResolutionPolicy;
 use std::sync::Arc;
@@ -128,6 +131,23 @@ pub trait Module {
     /// List all attribute names.
     fn dir(&self) -> Vec<Arc<str>> {
         Vec::new() // Default empty impl
+    }
+
+    /// Populate an imported module object with native attributes.
+    ///
+    /// Most native modules expose a static attribute table and can use the
+    /// default implementation. Modules that need the real Python module object
+    /// during initialization, such as C-API compatibility modules with
+    /// module-bound callables, can override this hook.
+    fn populate(&self, module: &ModuleObject) -> Result<(), ModuleError> {
+        for attr_name in self.dir() {
+            match self.get_attr(&attr_name) {
+                Ok(value) => module.set_attr(&attr_name, value),
+                Err(ModuleError::AttributeError(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -250,6 +270,16 @@ impl StdlibRegistry {
             "_struct",
             Box::new(_struct::StructModule::new()),
         );
+        Self::insert_module(
+            &mut modules,
+            "_testcapi",
+            Box::new(_testcapi::TestCapiModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "struct",
+            Box::new(_struct::StructModule::with_name("struct")),
+        );
 
         Self::insert_module(
             &mut modules,
@@ -361,6 +391,7 @@ impl StdlibRegistry {
 
         // Register time module
         Self::insert_module(&mut modules, "time", Box::new(time::TimeModule::new()));
+        Self::insert_module(&mut modules, "types", Box::new(types::TypesModule::new()));
 
         Self::insert_module(
             &mut modules,

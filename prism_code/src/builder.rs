@@ -131,6 +131,8 @@ pub struct FunctionBuilder {
 
     /// Code flags.
     flags: CodeFlags,
+    /// Whether local slots are stored separately from the register file.
+    separate_locals: bool,
 
     /// Next register to allocate.
     next_register: u8,
@@ -214,6 +216,7 @@ impl FunctionBuilder {
             posonlyarg_count: 0,
             kwonlyarg_count: 0,
             flags: CodeFlags::NONE,
+            separate_locals: false,
             next_register: 0,
             max_registers: 0,
             free_registers: Vec::new(),
@@ -293,6 +296,18 @@ impl FunctionBuilder {
     /// Add code flags.
     pub fn add_flags(&mut self, flags: CodeFlags) {
         self.flags |= flags;
+    }
+
+    /// Store locals in a dedicated frame-local array instead of reserving a
+    /// register for every local slot.
+    ///
+    /// This mode is used for large Python functions where CPython permits
+    /// hundreds or thousands of parameters. It keeps the fixed 8-bit register
+    /// bytecode format hot for ordinary functions while preserving correct
+    /// semantics for oversized local layouts.
+    pub fn use_separate_locals(&mut self) {
+        self.separate_locals = true;
+        self.flags |= CodeFlags::SEPARATE_LOCALS;
     }
 
     // =========================================================================
@@ -532,12 +547,15 @@ impl FunctionBuilder {
         let slot = LocalSlot::new(self.locals.len() as u16);
         self.local_map.insert(name.clone(), slot);
         self.locals.push(name);
-        // Locals are addressed by register index at runtime.
-        // Reserve the backing register so temporary allocation never clobbers locals.
-        let required = (slot.0 as usize) + 1;
-        if required > self.next_register as usize {
-            self.next_register = u8::try_from(required).expect("register overflow");
-            self.max_registers = self.max_registers.max(self.next_register);
+        if !self.separate_locals {
+            // In the compact hot-frame layout locals are addressed by register
+            // index at runtime. Reserve the backing register so temporary
+            // allocation never clobbers locals.
+            let required = (slot.0 as usize) + 1;
+            if required > self.next_register as usize {
+                self.next_register = u8::try_from(required).expect("register overflow");
+                self.max_registers = self.max_registers.max(self.next_register);
+            }
         }
         slot
     }
@@ -1452,7 +1470,11 @@ impl FunctionBuilder {
             posonlyarg_count: self.posonlyarg_count,
             kwonlyarg_count: self.kwonlyarg_count,
             register_count: self.max_registers as u16,
-            flags: self.flags,
+            flags: if self.separate_locals {
+                self.flags | CodeFlags::SEPARATE_LOCALS
+            } else {
+                self.flags
+            },
             line_table: self.line_table.into_boxed_slice(),
             exception_table: self.exception_entries.into_boxed_slice(),
             nested_code_objects: self.nested_code_objects.into_boxed_slice(),

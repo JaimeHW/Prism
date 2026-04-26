@@ -5,6 +5,11 @@ try:
 except Exception:
     _prism_warnings = None
 
+try:
+    import re as _prism_re
+except Exception:
+    _prism_re = None
+
 
 class SkipTest(Exception):
     pass
@@ -17,6 +22,20 @@ def skip(reason):
         return obj
 
     return decorate
+
+
+def skipIf(condition, reason):
+    if condition:
+        return skip(reason)
+
+    def decorate(obj):
+        return obj
+
+    return decorate
+
+
+def skipUnless(condition, reason):
+    return skipIf(not condition, reason)
 
 
 class _Outcome:
@@ -53,8 +72,14 @@ class _AssertRaisesContext:
             self.test_case.fail("expected exception was not raised")
         if not issubclass(exc_type, self.expected):
             return False
-        if self.expected_regex is not None and self.expected_regex not in str(exc):
-            self.test_case.fail("exception message did not match")
+        if self.expected_regex is not None:
+            message = str(exc)
+            if _prism_re is None:
+                matched = self.expected_regex in message
+            else:
+                matched = _prism_re.search(self.expected_regex, message) is not None
+            if not matched:
+                self.test_case.fail("exception message did not match")
         self.exception = exc
         return True
 
@@ -198,6 +223,10 @@ class TestCase:
     def assertGreaterEqual(self, first, second, msg=None):
         if not first >= second:
             self.fail(msg or (repr(first) + " is less than " + repr(second)))
+
+    def assertGreater(self, first, second, msg=None):
+        if not first > second:
+            self.fail(msg or (repr(first) + " is not greater than " + repr(second)))
 
     def assertIn(self, member, container, msg=None):
         if member not in container:

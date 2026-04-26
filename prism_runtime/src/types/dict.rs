@@ -27,7 +27,9 @@ pub struct DictObject {
 #[derive(Debug, Clone, Default)]
 struct DictEntries {
     items: FxHashMap<HashableValue, Value>,
-    order: Vec<HashableValue>,
+    order: Vec<Option<HashableValue>>,
+    positions: FxHashMap<HashableValue, usize>,
+    tombstones: usize,
 }
 
 impl DictObject {
@@ -47,7 +49,9 @@ impl DictObject {
             header: ObjectHeader::new(TypeId::DICT),
             entries: DictEntries {
                 items: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+                positions: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 order: Vec::with_capacity(capacity),
+                tombstones: 0,
             },
         }
     }
@@ -75,7 +79,8 @@ impl DictObject {
     pub fn set(&mut self, key: Value, value: Value) {
         let key = HashableValue(key);
         if self.entries.items.insert(key, value).is_none() {
-            self.entries.order.push(key);
+            self.entries.positions.insert(key, self.entries.order.len());
+            self.entries.order.push(Some(key));
         }
     }
 
@@ -85,7 +90,13 @@ impl DictObject {
         let key = HashableValue(key);
         let removed = self.entries.items.remove(&key);
         if removed.is_some() {
-            self.entries.order.retain(|existing| existing != &key);
+            if let Some(index) = self.entries.positions.remove(&key)
+                && let Some(slot) = self.entries.order.get_mut(index)
+                && slot.take().is_some()
+            {
+                self.entries.tombstones += 1;
+            }
+            self.maybe_compact_order();
         }
         removed
     }
@@ -101,27 +112,32 @@ impl DictObject {
     pub fn clear(&mut self) {
         self.entries.items.clear();
         self.entries.order.clear();
+        self.entries.positions.clear();
+        self.entries.tombstones = 0;
     }
 
     /// Get an iterator over keys.
     pub fn keys(&self) -> impl Iterator<Item = Value> + '_ {
-        self.entries.order.iter().map(|key| key.0)
+        self.entries
+            .order
+            .iter()
+            .filter_map(|key| key.as_ref().map(|key| key.0))
     }
 
     /// Get an iterator over values.
     pub fn values(&self) -> impl Iterator<Item = Value> + '_ {
-        self.entries
-            .order
-            .iter()
-            .filter_map(move |key| self.entries.items.get(key).copied())
+        self.entries.order.iter().filter_map(move |key| {
+            key.as_ref()
+                .and_then(|key| self.entries.items.get(key).copied())
+        })
     }
 
     /// Get an iterator over key-value pairs.
     pub fn iter(&self) -> impl Iterator<Item = (Value, Value)> + '_ {
-        self.entries
-            .order
-            .iter()
-            .filter_map(move |key| self.entries.items.get(key).map(|value| (key.0, *value)))
+        self.entries.order.iter().filter_map(move |key| {
+            key.as_ref()
+                .and_then(|key| self.entries.items.get(key).map(|value| (key.0, *value)))
+        })
     }
 
     /// Update this dict with items from another.
@@ -147,11 +163,84 @@ impl DictObject {
         self.get_or_insert(key, default)
     }
 
+    /// Move an existing key to either end of the insertion order.
+    pub fn move_to_end(&mut self, key: Value, last: bool) -> bool {
+        let key = HashableValue(key);
+        let Some(index) = self.entries.positions.get(&key).copied() else {
+            return false;
+        };
+
+        if last {
+            if self.entries.order.last().and_then(Option::as_ref) == Some(&key) {
+                return true;
+            }
+
+            if let Some(slot) = self.entries.order.get_mut(index)
+                && slot.take().is_some()
+            {
+                self.entries.tombstones += 1;
+            }
+            self.entries.positions.insert(key, self.entries.order.len());
+            self.entries.order.push(Some(key));
+            self.maybe_compact_order();
+            return true;
+        }
+
+        self.compact_order_with_prefix(key);
+        true
+    }
+
     /// Pop a key and return (key, value) or None.
     pub fn popitem(&mut self) -> Option<(Value, Value)> {
-        let key = self.entries.order.pop()?;
+        let key = loop {
+            match self.entries.order.pop()? {
+                Some(key) => break key,
+                None => self.entries.tombstones = self.entries.tombstones.saturating_sub(1),
+            }
+        };
+        self.entries.positions.remove(&key);
         let value = self.entries.items.remove(&key)?;
         Some((key.0, value))
+    }
+
+    #[inline]
+    fn maybe_compact_order(&mut self) {
+        if self.entries.tombstones > 16 && self.entries.tombstones > self.entries.items.len() {
+            self.compact_order();
+        }
+    }
+
+    fn compact_order(&mut self) {
+        if self.entries.tombstones == 0 {
+            return;
+        }
+
+        let mut compacted = Vec::with_capacity(self.entries.items.len());
+        self.entries.positions.clear();
+        for key in self.entries.order.iter().filter_map(|key| *key) {
+            self.entries.positions.insert(key, compacted.len());
+            compacted.push(Some(key));
+        }
+        self.entries.order = compacted;
+        self.entries.tombstones = 0;
+    }
+
+    fn compact_order_with_prefix(&mut self, prefix: HashableValue) {
+        let mut compacted = Vec::with_capacity(self.entries.items.len());
+        self.entries.positions.clear();
+        self.entries.positions.insert(prefix, 0);
+        compacted.push(Some(prefix));
+
+        for key in self.entries.order.iter().filter_map(|key| *key) {
+            if key == prefix {
+                continue;
+            }
+            self.entries.positions.insert(key, compacted.len());
+            compacted.push(Some(key));
+        }
+
+        self.entries.order = compacted;
+        self.entries.tombstones = 0;
     }
 }
 

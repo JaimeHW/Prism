@@ -33,6 +33,12 @@ impl Compiler {
             let tuple_reg = self.builder.alloc_register();
             self.builder.emit_build_tuple(tuple_reg, tuple_reg, 0);
             tuple_reg
+        } else if args.len() == 1
+            && let ExprKind::Starred(inner) = &args[0].kind
+        {
+            // Preserve the exact starred object for `CallEx`. The VM expands
+            // non-tuples itself, while exact tuples avoid an unnecessary copy.
+            self.compile_expr(inner)?
         } else {
             if args.len() > 24 {
                 return Err(CompileError {

@@ -6,7 +6,7 @@ use super::{
     builtin_type_has_attribute, heap_type_attribute_value_static, heap_type_has_attribute,
 };
 use crate::VirtualMachine;
-use crate::error::RuntimeErrorKind;
+use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::import::ModuleObject;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
@@ -25,8 +25,9 @@ use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::super_obj::SuperObject;
 use prism_runtime::object::type_builtins::{
-    global_class, global_class_bitmap, global_class_registry, register_global_class, type_new,
-    type_new_with_metaclass, unregister_global_class,
+    builtin_class_mro, class_id_to_type_id, global_class, global_class_bitmap,
+    global_class_registry, register_global_class, type_new, type_new_with_metaclass,
+    unregister_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{MappingProxyObject, UnionTypeObject};
@@ -42,7 +43,7 @@ use prism_runtime::types::set::SetObject;
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::{StringObject, clone_string_value};
 use prism_runtime::types::tuple::TupleObject;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{LazyLock, Mutex};
 
 mod numeric;
@@ -282,7 +283,7 @@ fn class_value_to_type_id(class_value: Value) -> Option<TypeId> {
         })),
         TypeId::EXCEPTION_TYPE => crate::builtins::exception_proxy_class_id_from_ptr(ptr)
             .map(|class_id| TypeId::from_raw(class_id.0)),
-        _ => None,
+        _ => crate::stdlib::typing::typing_marker_type_id(class_value),
     }
 }
 
@@ -410,9 +411,6 @@ fn parse_class_spec(value: Value, fn_name: &'static str) -> Result<Vec<TypeId>, 
         return Err(class_spec_error(fn_name));
     }
 
-    if out.is_empty() {
-        return Err(class_spec_error(fn_name));
-    }
     Ok(out)
 }
 
@@ -481,10 +479,250 @@ fn parse_class_spec_values(
         return Err(class_spec_error(fn_name));
     }
 
-    if out.is_empty() {
-        return Err(class_spec_error(fn_name));
-    }
     Ok(out)
+}
+
+const ABSTRACT_INSTANCE_CHECK_RECURSION_LIMIT: usize = 128;
+
+#[inline]
+fn recursion_limit_error(depth: usize) -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::recursion_error(depth))
+}
+
+#[inline]
+fn issubclass_arg1_error() -> BuiltinError {
+    BuiltinError::TypeError("issubclass() arg 1 must be a class".to_string())
+}
+
+#[inline]
+fn tuple_items_vec(value: Value) -> Option<Vec<Value>> {
+    let ptr = value.as_object_ptr()?;
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::TUPLE {
+        return None;
+    }
+
+    let tuple = unsafe { &*(ptr as *const TupleObject) };
+    Some(tuple.as_slice().to_vec())
+}
+
+#[inline]
+fn class_value_for_class_id(class_id: ClassId) -> Option<Value> {
+    if class_id.0 < TypeId::FIRST_USER_TYPE {
+        return Some(builtin_type_object_for_type_id(class_id_to_type_id(
+            class_id,
+        )));
+    }
+
+    if let Some(exception_type_id) = crate::builtins::exception_type_id_for_proxy_class_id(class_id)
+    {
+        return crate::builtins::exception_type_value_for_id(exception_type_id);
+    }
+
+    global_class(class_id)
+        .map(|class| Value::object_ptr(std::sync::Arc::as_ptr(&class) as *const ()))
+}
+
+fn real_class_direct_bases(value: Value) -> Option<Vec<Value>> {
+    let type_id = class_value_to_type_id(value)?;
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return builtin_class_mro(type_id)
+            .into_iter()
+            .nth(1)
+            .and_then(class_value_for_class_id)
+            .map(|base| vec![base]);
+    }
+
+    let class = global_class(ClassId(type_id.raw()))?;
+    let bases = if class.bases().is_empty() {
+        vec![ClassId::OBJECT]
+    } else {
+        class.bases().to_vec()
+    };
+    bases.into_iter().map(class_value_for_class_id).collect()
+}
+
+fn lookup_class_like_bases_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    invalid_error: BuiltinError,
+) -> Result<Option<Vec<Value>>, BuiltinError> {
+    if let Some(bases) = real_class_direct_bases(value) {
+        return Ok(Some(bases));
+    }
+
+    let bases_value =
+        match crate::ops::objects::get_attribute_value(vm, value, &intern("__bases__")) {
+            Ok(value) => value,
+            Err(err) if err.is_attribute_error() => return Ok(None),
+            Err(err) => return Err(runtime_error_to_builtin_error(err)),
+        };
+
+    tuple_items_vec(bases_value).map(Some).ok_or(invalid_error)
+}
+
+fn collect_class_spec_values_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    fn_name: &'static str,
+    depth: usize,
+    out: &mut Vec<Value>,
+) -> Result<(), BuiltinError> {
+    if depth >= ABSTRACT_INSTANCE_CHECK_RECURSION_LIMIT {
+        return Err(recursion_limit_error(depth));
+    }
+
+    if class_value_to_type_id(value).is_some() {
+        out.push(value);
+        return Ok(());
+    }
+
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(|| class_spec_error(fn_name))?;
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::UNION => {
+            let union = unsafe { &*(ptr as *const UnionTypeObject) };
+            for &member in union.members() {
+                out.push(class_value_for_type_id(member).ok_or_else(|| class_spec_error(fn_name))?);
+            }
+            Ok(())
+        }
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            for item in tuple.as_slice() {
+                collect_class_spec_values_vm(vm, *item, fn_name, depth + 1, out)?;
+            }
+            Ok(())
+        }
+        _ => {
+            if lookup_class_like_bases_vm(vm, value, class_spec_error(fn_name))?.is_some() {
+                out.push(value);
+                Ok(())
+            } else {
+                Err(class_spec_error(fn_name))
+            }
+        }
+    }
+}
+
+fn parse_class_spec_values_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    fn_name: &'static str,
+) -> Result<Vec<Value>, BuiltinError> {
+    let mut out = Vec::new();
+    collect_class_spec_values_vm(vm, value, fn_name, 0, &mut out)?;
+    Ok(out)
+}
+
+fn validate_issubclass_arg_vm(vm: &mut VirtualMachine, value: Value) -> Result<(), BuiltinError> {
+    if class_value_to_type_id(value).is_some() {
+        return Ok(());
+    }
+
+    if lookup_class_like_bases_vm(vm, value, issubclass_arg1_error())?.is_some() {
+        Ok(())
+    } else {
+        Err(issubclass_arg1_error())
+    }
+}
+
+fn abstract_issubclass_value_vm(
+    vm: &mut VirtualMachine,
+    subclass: Value,
+    target: Value,
+    depth: usize,
+    active: &mut FxHashSet<(u64, u64)>,
+) -> Result<bool, BuiltinError> {
+    if depth >= ABSTRACT_INSTANCE_CHECK_RECURSION_LIMIT {
+        return Err(recursion_limit_error(depth));
+    }
+    if subclass.raw_bits() == target.raw_bits() {
+        return Ok(true);
+    }
+    if let Some(target_type) = class_value_to_type_id(target)
+        && class_value_is_subtype(subclass, target_type)
+    {
+        return Ok(true);
+    }
+
+    let key = (subclass.raw_bits(), target.raw_bits());
+    if !active.insert(key) {
+        return Err(recursion_limit_error(depth));
+    }
+
+    let Some(bases) = lookup_class_like_bases_vm(vm, subclass, issubclass_arg1_error())? else {
+        active.remove(&key);
+        return Ok(false);
+    };
+
+    for base in bases {
+        if abstract_issubclass_value_vm(vm, base, target, depth + 1, active)? {
+            active.remove(&key);
+            return Ok(true);
+        }
+    }
+
+    active.remove(&key);
+    Ok(false)
+}
+
+fn abstract_isinstance_value_vm(
+    vm: &mut VirtualMachine,
+    instance: Value,
+    target: Value,
+) -> Result<bool, BuiltinError> {
+    let class_value =
+        match crate::ops::objects::get_attribute_value(vm, instance, &intern("__class__")) {
+            Ok(value) => value,
+            Err(err) if err.is_attribute_error() => return Ok(false),
+            Err(err) => return Err(runtime_error_to_builtin_error(err)),
+        };
+
+    let mut active = FxHashSet::default();
+    abstract_issubclass_value_vm(vm, class_value, target, 0, &mut active)
+}
+
+fn isinstance_single_target_vm(
+    vm: &mut VirtualMachine,
+    instance: Value,
+    target: Value,
+) -> Result<bool, BuiltinError> {
+    if exact_class_match(instance, target) {
+        return Ok(true);
+    }
+    if let Some(result) = invoke_metaclass_check(vm, target, "__instancecheck__", instance)? {
+        return Ok(result);
+    }
+    if class_value_to_type_id(target).is_some() && raw_isinstance_value(instance, target)? {
+        return Ok(true);
+    }
+    abstract_isinstance_value_vm(vm, instance, target)
+}
+
+fn issubclass_single_target_vm(
+    vm: &mut VirtualMachine,
+    subclass: Value,
+    target: Value,
+) -> Result<bool, BuiltinError> {
+    let subclass_is_real_class = class_value_to_type_id(subclass).is_some();
+    if subclass_is_real_class {
+        if is_exact_type_target(target) && raw_issubclass_value(subclass, target)? {
+            return Ok(true);
+        }
+    }
+    if let Some(result) = invoke_metaclass_check(vm, target, "__subclasscheck__", subclass)? {
+        return Ok(result);
+    }
+    if subclass_is_real_class
+        && class_value_to_type_id(target).is_some()
+        && raw_issubclass_value(subclass, target)?
+    {
+        return Ok(true);
+    }
+
+    let mut active = FxHashSet::default();
+    abstract_issubclass_value_vm(vm, subclass, target, 0, &mut active)
 }
 
 #[inline]
@@ -1974,6 +2212,14 @@ pub(crate) fn builtin_type_new_with_vm(
     vm: &mut VirtualMachine,
     args: &[Value],
 ) -> Result<Value, BuiltinError> {
+    builtin_type_new_with_keywords_vm(vm, args, &[])
+}
+
+pub(crate) fn builtin_type_new_with_keywords_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
     if args.len() != 4 {
         return Err(BuiltinError::TypeError(format!(
             "type.__new__() takes exactly 4 arguments ({} given)",
@@ -2009,7 +2255,7 @@ pub(crate) fn builtin_type_new_with_vm(
         unregister_global_class(class_id);
         return Err(runtime_error_to_builtin_error(err));
     }
-    if let Err(err) = crate::ops::class::invoke_init_subclass_hook(vm, class_value, &[]) {
+    if let Err(err) = crate::ops::class::invoke_init_subclass_hook(vm, class_value, keywords) {
         unregister_global_class(class_id);
         return Err(runtime_error_to_builtin_error(err));
     }
@@ -2030,6 +2276,9 @@ pub fn builtin_isinstance(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     let targets = parse_class_spec_values(args[1], "isinstance")?;
     for target in targets {
+        if class_value_to_type_id(target).is_none() {
+            continue;
+        }
         if raw_isinstance_value(args[0], target)? {
             return Ok(Value::bool(true));
         }
@@ -2049,18 +2298,9 @@ pub fn builtin_isinstance_vm(
         )));
     }
 
-    let targets = parse_class_spec_values(args[1], "isinstance")?;
+    let targets = parse_class_spec_values_vm(vm, args[1], "isinstance")?;
     for target in targets {
-        if exact_class_match(args[0], target) {
-            return Ok(Value::bool(true));
-        }
-        if let Some(result) = invoke_metaclass_check(vm, target, "__instancecheck__", args[0])? {
-            if result {
-                return Ok(Value::bool(true));
-            }
-            continue;
-        }
-        if raw_isinstance_value(args[0], target)? {
+        if isinstance_single_target_vm(vm, args[0], target)? {
             return Ok(Value::bool(true));
         }
     }
@@ -2078,6 +2318,9 @@ pub fn builtin_issubclass(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     let targets = parse_class_spec_values(args[1], "issubclass")?;
     for target in targets {
+        if class_value_to_type_id(target).is_none() {
+            continue;
+        }
         if raw_issubclass_value(args[0], target)? {
             return Ok(Value::bool(true));
         }
@@ -2096,24 +2339,11 @@ pub fn builtin_issubclass_vm(
             args.len()
         )));
     }
-    if class_value_to_type_id(args[0]).is_none() {
-        return Err(BuiltinError::TypeError(
-            "issubclass() arg 1 must be a class".to_string(),
-        ));
-    }
+    validate_issubclass_arg_vm(vm, args[0])?;
 
-    let targets = parse_class_spec_values(args[1], "issubclass")?;
+    let targets = parse_class_spec_values_vm(vm, args[1], "issubclass")?;
     for target in targets {
-        if is_exact_type_target(target) && raw_issubclass_value(args[0], target)? {
-            return Ok(Value::bool(true));
-        }
-        if let Some(result) = invoke_metaclass_check(vm, target, "__subclasscheck__", args[0])? {
-            if result {
-                return Ok(Value::bool(true));
-            }
-            continue;
-        }
-        if raw_issubclass_value(args[0], target)? {
+        if issubclass_single_target_vm(vm, args[0], target)? {
             return Ok(Value::bool(true));
         }
     }

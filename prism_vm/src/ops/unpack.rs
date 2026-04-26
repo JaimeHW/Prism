@@ -7,7 +7,7 @@
 
 use prism_code::{Instruction, Opcode};
 use prism_core::Value;
-use prism_core::intern::interned_by_ptr;
+use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
@@ -27,6 +27,7 @@ use crate::ops::calls::{
     call_callable_value_with_keywords_from_values, invoke_builtin, invoke_callable_value,
 };
 use crate::ops::iteration::collect_iterable_values;
+use crate::ops::objects::{dict_storage_ref_from_ptr, get_attribute_value};
 
 fn keyword_key_to_name(key: Value) -> Result<Arc<str>, RuntimeError> {
     if let Some(ptr) = key.as_string_object_ptr() {
@@ -83,6 +84,36 @@ fn collect_unpack_sources(
     }
 
     Ok(result)
+}
+
+fn mapping_entries_for_unpack(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+) -> Result<Vec<(Value, Value)>, RuntimeError> {
+    if let Some(ptr) = mapping.as_object_ptr()
+        && let Some(dict) = dict_storage_ref_from_ptr(ptr)
+    {
+        return Ok(dict.iter().collect());
+    }
+
+    let keys = get_attribute_value(vm, mapping, &intern("keys")).map_err(|err| {
+        if matches!(
+            err.kind(),
+            crate::error::RuntimeErrorKind::AttributeError { .. }
+        ) {
+            RuntimeError::type_error("keyword argument unpacking requires a mapping")
+        } else {
+            err
+        }
+    })?;
+    let keys = invoke_callable_value(vm, keys, &[])?;
+    let keys = collect_iterable_values(vm, keys)?;
+    let getitem = get_attribute_value(vm, mapping, &intern("__getitem__"))?;
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        entries.push((key, invoke_callable_value(vm, getitem, &[key])?));
+    }
+    Ok(entries)
 }
 
 /// Handle BuildTupleUnpack opcode.
@@ -203,12 +234,12 @@ pub fn build_dict_unpack(vm: &mut VirtualMachine, inst: Instruction) -> ControlF
         let should_unpack = (unpack_flags & (1 << i)) != 0;
 
         if should_unpack {
-            // Merge dict - iterate and add all key-value pairs
-            if let Some(dict_ptr) = value.as_object_ptr() {
-                let src_dict = unsafe { &*(dict_ptr as *const DictObject) };
-                for (key, val) in src_dict.iter() {
-                    dict.set(key, val);
-                }
+            let entries = match mapping_entries_for_unpack(vm, value) {
+                Ok(entries) => entries,
+                Err(err) => return ControlFlow::Error(err),
+            };
+            for (key, val) in entries {
+                dict.set(key, val);
             }
         }
     }
@@ -255,34 +286,41 @@ pub fn call_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         None
     };
 
-    // Extract args tuple
-    let args: Vec<Value> = if let Some(tuple_ptr) = args_tuple_val.as_object_ptr() {
+    if !has_kwargs
+        && crate::stdlib::_testcapi::is_method_descriptor_nop_get_instance(func_val)
+        && args_tuple_val.as_object_ptr().is_some_and(|ptr| {
+            (unsafe { (*(ptr as *const ObjectHeader)).type_id }) == TypeId::TUPLE
+        })
+    {
+        vm.current_frame_mut().set_reg(dst, args_tuple_val);
+        return ControlFlow::Continue;
+    }
+
+    // Extract positional arguments. Exact tuples are passed through without the
+    // compiler copying them first; other starred values are expanded here.
+    let args: Vec<Value> = if let Some(tuple_ptr) = args_tuple_val.as_object_ptr().filter(|ptr| {
+        let raw = *ptr;
+        (unsafe { (*(raw as *const ObjectHeader)).type_id }) == TypeId::TUPLE
+    }) {
         let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
-        (0..tuple.len())
-            .filter_map(|i| tuple.get(i as i64))
-            .collect()
+        tuple.iter().copied().collect()
     } else {
-        vec![args_tuple_val] // Single value fallback
+        match collect_iterable_values(vm, args_tuple_val) {
+            Ok(values) => values,
+            Err(err) => return ControlFlow::Error(err),
+        }
     };
 
     let keyword_entries = match kwargs_dict_val {
         None => Vec::new(),
         Some(value) if value.is_none() => Vec::new(),
         Some(value) => {
-            let Some(ptr) = value.as_object_ptr() else {
-                return ControlFlow::Error(RuntimeError::type_error(
-                    "keyword argument unpacking requires a dict",
-                ));
+            let mapping_entries = match mapping_entries_for_unpack(vm, value) {
+                Ok(entries) => entries,
+                Err(err) => return ControlFlow::Error(err),
             };
-            if unsafe { (*(ptr as *const ObjectHeader)).type_id } != TypeId::DICT {
-                return ControlFlow::Error(RuntimeError::type_error(
-                    "keyword argument unpacking requires a dict",
-                ));
-            }
-
-            let dict = unsafe { &*(ptr as *const DictObject) };
-            let mut entries = Vec::with_capacity(dict.len());
-            for (key, value) in dict.iter() {
+            let mut entries = Vec::with_capacity(mapping_entries.len());
+            for (key, value) in mapping_entries {
                 let name = match keyword_key_to_name(key) {
                     Ok(name) => name,
                     Err(err) => return ControlFlow::Error(err),

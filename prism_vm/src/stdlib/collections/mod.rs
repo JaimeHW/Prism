@@ -138,6 +138,18 @@ static ORDEREDDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
         ordered_dict_repr,
     )
 });
+static ORDEREDDICT_INIT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("collections.OrderedDict.__init__"),
+        ordered_dict_init,
+    )
+});
+static ORDEREDDICT_MOVE_TO_END: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("collections.OrderedDict.move_to_end"),
+        ordered_dict_move_to_end,
+    )
+});
 static DEFAULTDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("collections.defaultdict.__repr__"),
@@ -259,7 +271,11 @@ static ORDEREDDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
     build_native_collection_class(
         "OrderedDict",
         &[ClassId(TypeId::DICT.raw())],
-        &[("__repr__", builtin_value(&ORDEREDDICT_REPR))],
+        &[
+            ("__init__", builtin_value(&ORDEREDDICT_INIT)),
+            ("__repr__", builtin_value(&ORDEREDDICT_REPR)),
+            ("move_to_end", builtin_value(&ORDEREDDICT_MOVE_TO_END)),
+        ],
     )
 });
 static DEFAULTDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
@@ -426,7 +442,11 @@ fn build_native_collection_class(
     for &(attr_name, attr_value) in attrs {
         class.set_attr(intern(attr_name), attr_value);
     }
-    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
+    let mut flags = ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE;
+    if attrs.iter().any(|(name, _)| *name == "__init__") {
+        flags |= ClassFlags::HAS_INIT;
+    }
+    class.add_flags(flags);
 
     let mut bitmap = SubclassBitmap::new();
     for &class_id in class.mro() {
@@ -1195,6 +1215,17 @@ fn dict_repr_body(dict: &DictObject) -> Result<String, BuiltinError> {
     Ok(out)
 }
 
+fn expect_collection_dict_mut_from_ptr(
+    ptr: *const (),
+    descriptor_name: &str,
+) -> Result<&'static mut DictObject, BuiltinError> {
+    dict_storage_mut_from_ptr(ptr).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '{descriptor_name}' requires a dict-backed collections object"
+        ))
+    })
+}
+
 fn expect_bound_collection_receiver(
     args: &[Value],
     descriptor_name: &str,
@@ -1432,6 +1463,182 @@ fn first_mapping_missing_key_error(key: Value) -> Result<BuiltinError, BuiltinEr
         "Key not found in the first mapping: {}",
         collection_repr_text(key)?
     )))
+}
+
+fn ordered_dict_init(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "OrderedDict.__init__() missing required argument 'self'".to_string(),
+        ));
+    }
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "OrderedDict expected at most 1 argument, got {}",
+            args.len() - 1
+        )));
+    }
+
+    let ptr = expect_bound_collection_receiver(args, "__init__")?;
+    let entries = match args.get(1).copied() {
+        Some(source) => ordered_dict_entries_from_value(vm, source)?,
+        None => Vec::new(),
+    };
+
+    let dict = expect_collection_dict_mut_from_ptr(ptr, "__init__")?;
+    dict.clear();
+    for (key, value) in entries {
+        dict.set(key, value);
+    }
+    for &(name, value) in keywords {
+        dict.set(Value::string(intern(name)), value);
+    }
+
+    Ok(Value::none())
+}
+
+fn ordered_dict_entries_from_value(
+    vm: &mut VirtualMachine,
+    source: Value,
+) -> Result<Vec<(Value, Value)>, BuiltinError> {
+    if let Some(ptr) = source.as_object_ptr()
+        && let Some(dict) = dict_storage_ref_from_ptr(ptr)
+    {
+        return Ok(dict.iter().collect());
+    }
+
+    match get_attribute_value(vm, source, &intern("keys")) {
+        Ok(keys_method) => {
+            let keys_value =
+                invoke_callable_value(vm, keys_method, &[]).map_err(BuiltinError::Raised)?;
+            let keys =
+                collect_iterable_values_runtime(vm, keys_value).map_err(BuiltinError::Raised)?;
+            let mut entries = Vec::with_capacity(keys.len());
+            for key in keys {
+                entries.push((
+                    key,
+                    mapping_get_item(vm, source, key).map_err(BuiltinError::Raised)?,
+                ));
+            }
+            Ok(entries)
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            let values =
+                collect_iterable_values_runtime(vm, source).map_err(BuiltinError::Raised)?;
+            let mut entries = Vec::with_capacity(values.len());
+            for (index, item) in values.into_iter().enumerate() {
+                entries.push(ordered_dict_item_to_pair(vm, item, index)?);
+            }
+            Ok(entries)
+        }
+        Err(err) => Err(BuiltinError::Raised(err)),
+    }
+}
+
+fn ordered_dict_item_to_pair(
+    vm: &mut VirtualMachine,
+    item: Value,
+    index: usize,
+) -> Result<(Value, Value), BuiltinError> {
+    if let Some(ptr) = item.as_object_ptr() {
+        match extract_type_id(ptr) {
+            TypeId::TUPLE => {
+                let tuple = tuple_storage_ref_from_ptr(ptr).ok_or_else(|| {
+                    BuiltinError::TypeError(
+                        "dictionary update sequence element is not a tuple".to_string(),
+                    )
+                })?;
+                return ordered_dict_pair_from_slice(
+                    tuple.len(),
+                    |i| tuple.get(i as i64).unwrap(),
+                    index,
+                );
+            }
+            TypeId::LIST => {
+                let list = list_storage_ref_from_ptr(ptr).ok_or_else(|| {
+                    BuiltinError::TypeError(
+                        "dictionary update sequence element is not a list".to_string(),
+                    )
+                })?;
+                return ordered_dict_pair_from_slice(
+                    list.len(),
+                    |i| list.get(i as i64).unwrap(),
+                    index,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let values = collect_iterable_values_runtime(vm, item).map_err(|_| {
+        BuiltinError::TypeError(format!(
+            "cannot convert dictionary update sequence element #{} to a sequence",
+            index
+        ))
+    })?;
+    ordered_dict_pair_from_slice(values.len(), |i| values[i], index)
+}
+
+fn ordered_dict_pair_from_slice<F>(
+    len: usize,
+    value_at: F,
+    index: usize,
+) -> Result<(Value, Value), BuiltinError>
+where
+    F: Fn(usize) -> Value,
+{
+    if len != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "dictionary update sequence element #{} has length {}; 2 is required",
+            index, len
+        )));
+    }
+    Ok((value_at(0), value_at(1)))
+}
+
+fn ordered_dict_move_to_end(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "move_to_end() takes 2 or 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut last = args.get(2).copied();
+    for &(name, value) in keywords {
+        if name != "last" {
+            return Err(BuiltinError::TypeError(format!(
+                "move_to_end() got an unexpected keyword argument '{}'",
+                name
+            )));
+        }
+        if last.is_some() {
+            return Err(BuiltinError::TypeError(
+                "move_to_end() got multiple values for argument 'last'".to_string(),
+            ));
+        }
+        last = Some(value);
+    }
+
+    let last = match last {
+        Some(value) => try_is_truthy(vm, value).map_err(BuiltinError::Raised)?,
+        None => true,
+    };
+
+    let ptr = expect_bound_collection_receiver(args, "move_to_end")?;
+    let dict = expect_collection_dict_mut_from_ptr(ptr, "move_to_end")?;
+    if !dict.move_to_end(args[1], last) {
+        return Err(BuiltinError::KeyError(collection_repr_text(args[1])?));
+    }
+
+    Ok(Value::none())
 }
 
 fn shaped_property_repr(ptr: *const (), name: &str) -> Result<Option<String>, BuiltinError> {

@@ -84,6 +84,10 @@ bitflags::bitflags! {
         /// Runtime-native heap type whose builtin function class attributes
         /// should bind like method descriptors on instance access.
         const NATIVE_HEAPTYPE = 1 << 11;
+        /// Type owns a native vectorcall-compatible call entry.
+        const HAS_VECTORCALL = 1 << 12;
+        /// Type behaves as a method descriptor for CPython-compatible flags.
+        const METHOD_DESCRIPTOR = 1 << 13;
     }
 }
 

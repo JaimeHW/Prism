@@ -45,6 +45,11 @@ pub enum BindingError {
         func_name: Arc<str>,
         param_name: Arc<str>,
     },
+    /// Positional-only parameter passed by keyword.
+    PositionalOnlyAsKeyword {
+        func_name: Arc<str>,
+        param_name: Arc<str>,
+    },
     /// Unexpected keyword argument (no matching parameter and no **kwargs).
     UnexpectedKeyword {
         func_name: Arc<str>,
@@ -84,6 +89,15 @@ impl BindingError {
             } => {
                 format!(
                     "{}() got multiple values for argument '{}'",
+                    func_name, param_name
+                )
+            }
+            BindingError::PositionalOnlyAsKeyword {
+                func_name,
+                param_name,
+            } => {
+                format!(
+                    "{}() got some positional-only arguments passed as keyword arguments: '{}'",
                     func_name, param_name
                 )
             }
@@ -257,6 +271,23 @@ impl ArgumentBinder {
         };
 
         for (kw_name, kw_value) in keyword_args {
+            if let Some(param_idx) = Self::find_positional_only_param_index(func, kw_name) {
+                if let Some(ref mut kwargs_dict) = extra_kwargs {
+                    kwargs_dict.set(Self::create_string_key(kw_name), kw_value);
+                    continue;
+                }
+
+                let param_name = code
+                    .locals
+                    .get(param_idx)
+                    .map(|s| Arc::clone(s))
+                    .unwrap_or_else(|| "?".into());
+                return Err(BindingError::PositionalOnlyAsKeyword {
+                    func_name: Arc::clone(&code.name),
+                    param_name,
+                });
+            }
+
             // Find parameter index by name
             if let Some(param_idx) = Self::find_param_index(func, kw_name) {
                 // Check for duplicate binding
@@ -368,11 +399,12 @@ impl ArgumentBinder {
     fn find_param_index(func: &FunctionObject, name: &str) -> Option<usize> {
         let code = &func.code;
         let arg_count = code.arg_count as usize;
+        let posonly_count = code.posonlyarg_count as usize;
         let kwonly_count = code.kwonlyarg_count as usize;
         let has_varargs = func.has_varargs();
 
         // Search positional parameters first (locals[0..arg_count])
-        for i in 0..arg_count {
+        for i in posonly_count..arg_count {
             if let Some(param_name) = code.locals.get(i) {
                 if param_name.as_ref() == name {
                     return Some(i); // param_idx == locals_idx for positional
@@ -394,6 +426,20 @@ impl ArgumentBinder {
             }
         }
 
+        None
+    }
+
+    #[inline]
+    fn find_positional_only_param_index(func: &FunctionObject, name: &str) -> Option<usize> {
+        let code = &func.code;
+        let posonly_count = code.posonlyarg_count as usize;
+        for i in 0..posonly_count {
+            if let Some(param_name) = code.locals.get(i)
+                && param_name.as_ref() == name
+            {
+                return Some(i);
+            }
+        }
         None
     }
 

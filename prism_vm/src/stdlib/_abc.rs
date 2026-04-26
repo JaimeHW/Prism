@@ -5,11 +5,14 @@
 //! import path short and avoids pulling in `_weakrefset` during bootstrap.
 
 use super::{Module, ModuleError, ModuleResult};
+use crate::VirtualMachine;
 use crate::builtins::{
-    BuiltinError, BuiltinFunctionObject, builtin_issubclass, builtin_type,
+    BuiltinError, BuiltinFunctionObject, builtin_issubclass, builtin_issubclass_vm, builtin_type,
     builtin_type_object_for_type_id, builtin_type_object_type_id,
 };
+use crate::error::RuntimeError;
 use crate::ops::objects::{descriptor_is_abstract, extract_type_id};
+use crate::stdlib::exceptions::types::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::object::class::PyClassObject;
@@ -39,14 +42,14 @@ static GET_CACHE_TOKEN_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new
     BuiltinFunctionObject::new(Arc::from("_abc.get_cache_token"), abc_get_cache_token)
 });
 static ABC_INIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_abc._abc_init"), abc_init));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_abc._abc_init"), abc_init));
 static ABC_REGISTER_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_abc._abc_register"), abc_register));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_abc._abc_register"), abc_register));
 static ABC_INSTANCECHECK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_abc._abc_instancecheck"), abc_instancecheck)
+    BuiltinFunctionObject::new_vm(Arc::from("_abc._abc_instancecheck"), abc_instancecheck)
 });
 static ABC_SUBCLASSCHECK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_abc._abc_subclasscheck"), abc_subclasscheck)
+    BuiltinFunctionObject::new_vm(Arc::from("_abc._abc_subclasscheck"), abc_subclasscheck)
 });
 static GET_DUMP_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_abc._get_dump"), abc_get_dump));
@@ -231,13 +234,20 @@ fn names_from_abstract_value(value: Value) -> FxHashSet<InternedString> {
     names
 }
 
-fn abstract_method_names(class: &PyClassObject) -> FxHashSet<InternedString> {
+fn abstract_method_names(
+    vm: &mut VirtualMachine,
+    class_value: Value,
+    class: &PyClassObject,
+) -> Result<FxHashSet<InternedString>, BuiltinError> {
     let mut names = FxHashSet::default();
-    class.for_each_attr(|name, value| {
-        if descriptor_is_abstract(value) {
+    let mut entries = Vec::new();
+    class.for_each_attr(|name, value| entries.push((name.clone(), value)));
+
+    for (name, value) in entries {
+        if value_is_abstract(vm, value)? {
             names.insert(name.clone());
         }
-    });
+    }
 
     for &base_id in class.bases() {
         let Some(base_value) = class_value_from_class_id(base_id) else {
@@ -251,16 +261,32 @@ fn abstract_method_names(class: &PyClassObject) -> FxHashSet<InternedString> {
         };
 
         for name in names_from_abstract_value(base_abstracts) {
-            match class.get_attr(&name) {
-                Some(value) if !descriptor_is_abstract(value) => {}
-                _ => {
-                    names.insert(name);
+            match crate::ops::objects::get_attribute_value(vm, class_value, &name) {
+                Ok(value) if !value_is_abstract(vm, value)? => {}
+                Ok(_) => {
+                    names.insert(name.clone());
                 }
+                Err(err) if err.is_attribute_error() => {
+                    names.insert(name.clone());
+                }
+                Err(err) => return Err(BuiltinError::Raised(err)),
             }
         }
     }
 
-    names
+    Ok(names)
+}
+
+fn value_is_abstract(vm: &mut VirtualMachine, value: Value) -> Result<bool, BuiltinError> {
+    if descriptor_is_abstract(value) {
+        return Ok(true);
+    }
+
+    match crate::ops::objects::get_attribute_value(vm, value, &intern("__isabstractmethod__")) {
+        Ok(flag) => crate::truthiness::try_is_truthy(vm, flag).map_err(BuiltinError::Raised),
+        Err(err) if err.is_attribute_error() => Ok(false),
+        Err(err) => Err(BuiltinError::Raised(err)),
+    }
 }
 
 fn frozenset_of_strings(names: impl IntoIterator<Item = InternedString>) -> Value {
@@ -299,7 +325,68 @@ fn python_issubclass(subclass: Value, cls: Value) -> Result<bool, BuiltinError> 
     builtin_issubclass(&[subclass, cls]).map(|value| value.as_bool().unwrap_or(false))
 }
 
-fn abc_subclasscheck_value(cls: Value, subclass: Value) -> Result<Value, BuiltinError> {
+fn python_issubclass_vm(
+    vm: &mut VirtualMachine,
+    subclass: Value,
+    cls: Value,
+) -> Result<bool, BuiltinError> {
+    builtin_issubclass_vm(vm, &[subclass, cls]).map(|value| value.as_bool().unwrap_or(false))
+}
+
+fn runtime_error(message: &'static str) -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::RuntimeError.as_u8() as u16,
+        message,
+    ))
+}
+
+fn call_subclass_hook(
+    vm: &mut VirtualMachine,
+    cls: Value,
+    subclass: Value,
+) -> Result<Option<bool>, BuiltinError> {
+    let hook = match crate::ops::objects::get_attribute_value(vm, cls, &intern("__subclasshook__"))
+    {
+        Ok(value) => value,
+        Err(err) if err.is_attribute_error() => return Ok(None),
+        Err(err) => return Err(BuiltinError::Raised(err)),
+    };
+
+    let result = crate::ops::calls::invoke_callable_value(vm, hook, &[subclass])
+        .map_err(BuiltinError::Raised)?;
+    if result == crate::builtins::builtin_not_implemented_value() {
+        return Ok(None);
+    }
+
+    crate::truthiness::try_is_truthy(vm, result)
+        .map(Some)
+        .map_err(BuiltinError::Raised)
+}
+
+fn validated_subclasses(vm: &mut VirtualMachine, cls: Value) -> Result<Vec<Value>, BuiltinError> {
+    let subclasses =
+        match crate::ops::objects::get_attribute_value(vm, cls, &intern("__subclasses__")) {
+            Ok(value) => value,
+            Err(err) if err.is_attribute_error() => return Ok(Vec::new()),
+            Err(err) => return Err(BuiltinError::Raised(err)),
+        };
+    let result = crate::ops::calls::invoke_callable_value(vm, subclasses, &[])
+        .map_err(BuiltinError::Raised)?;
+    let values =
+        crate::ops::iteration::collect_iterable_values(vm, result).map_err(BuiltinError::Raised)?;
+
+    for value in &values {
+        ensure_class_value(*value, "__subclasses__() returned non-class")?;
+    }
+
+    Ok(values)
+}
+
+fn abc_subclasscheck_value_vm(
+    vm: &mut VirtualMachine,
+    cls: Value,
+    subclass: Value,
+) -> Result<Value, BuiltinError> {
     let counter = current_counter();
     let mut registry_snapshot = Vec::new();
 
@@ -324,6 +411,18 @@ fn abc_subclasscheck_value(cls: Value, subclass: Value) -> Result<Value, Builtin
         registry_snapshot.extend(state.registry.iter().copied());
     }
 
+    if let Some(hook_result) = call_subclass_hook(vm, cls, subclass)? {
+        with_abc_state_mut(cls, |state| {
+            if hook_result {
+                state.cache.insert(subclass);
+            } else {
+                state.negative_cache.insert(subclass);
+                state.negative_cache_version = counter;
+            }
+        });
+        return Ok(Value::bool(hook_result));
+    }
+
     if python_issubclass(subclass, cls)? {
         with_abc_state_mut(cls, |state| {
             state.cache.insert(subclass);
@@ -332,7 +431,16 @@ fn abc_subclasscheck_value(cls: Value, subclass: Value) -> Result<Value, Builtin
     }
 
     for registered in registry_snapshot {
-        if python_issubclass(subclass, registered)? {
+        if python_issubclass_vm(vm, subclass, registered)? {
+            with_abc_state_mut(cls, |state| {
+                state.cache.insert(subclass);
+            });
+            return Ok(Value::bool(true));
+        }
+    }
+
+    for child in validated_subclasses(vm, cls)? {
+        if python_issubclass_vm(vm, subclass, child)? {
             with_abc_state_mut(cls, |state| {
                 state.cache.insert(subclass);
             });
@@ -359,7 +467,7 @@ fn abc_get_cache_token(args: &[Value]) -> Result<Value, BuiltinError> {
         .ok_or_else(|| BuiltinError::OverflowError("ABC cache token overflow".to_string()))
 }
 
-fn abc_init(args: &[Value]) -> Result<Value, BuiltinError> {
+fn abc_init(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "_abc_init() takes 1 argument ({} given)",
@@ -369,7 +477,7 @@ fn abc_init(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let cls = ensure_class_value(args[0], "_abc_init expects a class")?;
     if let Some(class) = user_class_from_value(cls) {
-        let abstracts = abstract_method_names(class);
+        let abstracts = abstract_method_names(vm, cls, class)?;
         class.set_attr(
             intern("__abstractmethods__"),
             frozenset_of_strings(abstracts),
@@ -384,7 +492,7 @@ fn abc_init(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::none())
 }
 
-fn abc_register(args: &[Value]) -> Result<Value, BuiltinError> {
+fn abc_register(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
             "_abc_register() takes 2 arguments ({} given)",
@@ -395,8 +503,11 @@ fn abc_register(args: &[Value]) -> Result<Value, BuiltinError> {
     let cls = ensure_class_value(args[0], "Can only register classes")?;
     let subclass = ensure_class_value(args[1], "Can only register classes")?;
 
-    if python_issubclass(subclass, cls)? {
+    if python_issubclass_vm(vm, subclass, cls)? {
         return Ok(subclass);
+    }
+    if python_issubclass_vm(vm, cls, subclass)? {
+        return Err(runtime_error("Refusing to create an inheritance cycle"));
     }
 
     with_abc_state_mut(cls, |state| {
@@ -406,7 +517,7 @@ fn abc_register(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(subclass)
 }
 
-fn abc_instancecheck(args: &[Value]) -> Result<Value, BuiltinError> {
+fn abc_instancecheck(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
             "_abc_instancecheck() takes 2 arguments ({} given)",
@@ -415,11 +526,32 @@ fn abc_instancecheck(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let cls = ensure_class_value(args[0], "_abc_instancecheck expects a class")?;
+    let instance_class =
+        match crate::ops::objects::get_attribute_value(vm, args[1], &intern("__class__")) {
+            Ok(value) => value,
+            Err(err) if err.is_attribute_error() => builtin_type(&[args[1]])?,
+            Err(err) => return Err(BuiltinError::Raised(err)),
+        };
+
+    if abc_state_snapshot(cls).cache.contains(&instance_class) {
+        return Ok(Value::bool(true));
+    }
+
     let instance_type = builtin_type(&[args[1]])?;
-    abc_subclasscheck_value(cls, instance_type)
+    if instance_type == instance_class {
+        return abc_subclasscheck_value_vm(vm, cls, instance_class);
+    }
+
+    if abc_subclasscheck_value_vm(vm, cls, instance_class)?
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Ok(Value::bool(true));
+    }
+    abc_subclasscheck_value_vm(vm, cls, instance_type)
 }
 
-fn abc_subclasscheck(args: &[Value]) -> Result<Value, BuiltinError> {
+fn abc_subclasscheck(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
             "_abc_subclasscheck() takes 2 arguments ({} given)",
@@ -429,7 +561,7 @@ fn abc_subclasscheck(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let cls = ensure_class_value(args[0], "_abc_subclasscheck expects a class")?;
     let subclass = ensure_class_value(args[1], "issubclass() arg 1 must be a class")?;
-    abc_subclasscheck_value(cls, subclass)
+    abc_subclasscheck_value_vm(vm, cls, subclass)
 }
 
 fn abc_get_dump(args: &[Value]) -> Result<Value, BuiltinError> {

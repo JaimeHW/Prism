@@ -492,32 +492,20 @@ impl ImportResolver {
         name: &str,
         stdlib: &(dyn Module + Send + Sync),
     ) -> Result<Arc<ModuleObject>, ImportError> {
-        let module = ModuleObject::new(name);
+        let module = Arc::new(ModuleObject::new(name));
 
-        // Get all attributes from the stdlib module
-        for attr_name in stdlib.dir() {
-            match stdlib.get_attr(&attr_name) {
-                Ok(value) => {
-                    module.set_attr(&attr_name, value);
-                }
-                Err(ModuleError::AttributeError(_)) => {
-                    // Skip attributes that error (shouldn't happen, but be defensive)
-                    continue;
-                }
-                Err(e) => {
-                    return Err(ImportError::LoadError {
-                        module: Arc::from(name),
-                        message: Arc::from(e.to_string()),
-                    });
-                }
-            }
+        if let Err(e) = stdlib.populate(module.as_ref()) {
+            return Err(ImportError::LoadError {
+                module: Arc::from(name),
+                message: Arc::from(e.to_string()),
+            });
         }
 
         if name == "sys" {
             module.set_attr("modules", self.sys_modules_value);
         }
 
-        Ok(Arc::new(module))
+        Ok(module)
     }
 
     /// Import a specific attribute from a module.

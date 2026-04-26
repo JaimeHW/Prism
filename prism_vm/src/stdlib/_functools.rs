@@ -81,7 +81,7 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn partial_class_value() -> Value {
+pub(crate) fn partial_class_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&PARTIAL_CLASS) as *const ())
 }
 

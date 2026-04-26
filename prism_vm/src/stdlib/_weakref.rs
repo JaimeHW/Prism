@@ -550,15 +550,9 @@ impl ReachabilityMarker {
         if !frame.code.flags.contains(CodeFlags::MODULE)
             && !frame.code.flags.contains(CodeFlags::CLASS)
         {
-            let local_count = frame
-                .code
-                .locals
-                .len()
-                .min(frame.active_register_count() as usize)
-                .min(frame.registers.len());
-            for slot in 0..local_count {
-                if frame.reg_is_written(slot as u8) {
-                    self.push(frame.registers[slot]);
+            for slot in 0..frame.code.locals.len() {
+                if frame.local_is_written(slot as u16) {
+                    self.push(frame.get_local(slot as u16));
                 }
             }
         }

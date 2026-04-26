@@ -35,6 +35,7 @@ use prism_runtime::object::views::DescriptorViewObject;
 use prism_runtime::types::Cell;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
@@ -356,6 +357,12 @@ fn class_object_from_type_ptr(ptr: *const ()) -> Option<&'static PyClassObject> 
 }
 
 #[inline]
+fn function_vectorcall_override_result(func: &FunctionObject) -> Option<Value> {
+    func.has_test_vectorcall_override()
+        .then(|| Value::string(intern("overridden")))
+}
+
+#[inline]
 fn alloc_heap_value<T>(
     _vm: &mut VirtualMachine,
     object: T,
@@ -551,6 +558,8 @@ fn instantiate_user_defined_class(
     kwargc: usize,
     kwnames_idx: u16,
 ) -> Result<Value, RuntimeError> {
+    reject_abstract_class_instantiation(class)?;
+
     let class_value = Value::object_ptr(class as *const PyClassObject as *const ());
     let new_result = if let Some(new_callable) = resolve_instantiation_slot(class, "__new__") {
         invoke_class_new(
@@ -604,6 +613,8 @@ fn instantiate_user_defined_class_from_values(
     class: &PyClassObject,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
+    reject_abstract_class_instantiation(class)?;
+
     let class_value = Value::object_ptr(class as *const PyClassObject as *const ());
     let new_result = if let Some(new_callable) = resolve_instantiation_slot(class, "__new__") {
         invoke_class_new_direct(vm, class_value, new_callable, args)?
@@ -641,6 +652,8 @@ fn instantiate_user_defined_class_from_values_with_keywords(
     args: &[Value],
     keywords: &[(&str, Value)],
 ) -> Result<Value, RuntimeError> {
+    reject_abstract_class_instantiation(class)?;
+
     let class_value = Value::object_ptr(class as *const PyClassObject as *const ());
     let new_result = if let Some(new_callable) = resolve_instantiation_slot(class, "__new__") {
         invoke_class_new_direct_with_keywords(vm, class_value, new_callable, args, keywords)?
@@ -677,6 +690,73 @@ fn instantiate_user_defined_class_from_values_with_keywords(
     }
 
     Ok(new_result)
+}
+
+fn reject_abstract_class_instantiation(class: &PyClassObject) -> Result<(), RuntimeError> {
+    let Some(abstracts) = class.get_attr(&intern("__abstractmethods__")) else {
+        return Ok(());
+    };
+
+    let mut names = abstract_method_names(abstracts);
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    names.sort_unstable();
+    let method_word = if names.len() == 1 {
+        "method"
+    } else {
+        "methods"
+    };
+    let rendered_names = names
+        .into_iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(RuntimeError::type_error(format!(
+        "Can't instantiate abstract class {} without an implementation for abstract {method_word} {rendered_names}",
+        class.name()
+    )))
+}
+
+fn abstract_method_names(value: Value) -> Vec<String> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Vec::new();
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::SET | TypeId::FROZENSET => {
+            let set = unsafe { &*(ptr as *const SetObject) };
+            set.iter().filter_map(abstract_method_name).collect()
+        }
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            tuple
+                .iter()
+                .copied()
+                .filter_map(abstract_method_name)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn abstract_method_name(value: Value) -> Option<String> {
+    if value.is_string() {
+        let ptr = value.as_string_object_ptr()?;
+        return interned_by_ptr(ptr as *const u8).map(|name| name.as_str().to_string());
+    }
+
+    let ptr = value.as_object_ptr()?;
+    if extract_type_id(ptr) != TypeId::STR {
+        return None;
+    }
+
+    Some(
+        unsafe { &*(ptr as *const StringObject) }
+            .as_str()
+            .to_string(),
+    )
 }
 
 #[inline]
@@ -1246,6 +1326,9 @@ fn invoke_user_function_with_implicit_self(
     kwnames_idx: u16,
 ) -> Result<Value, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
+    if let Some(result) = function_vectorcall_override_result(func) {
+        return Ok(result);
+    }
     let code = Arc::clone(&func.code);
     let closure = materialize_function_invocation_closure(func, &code)?;
     let module = resolve_function_module(vm, func);
@@ -1295,31 +1378,17 @@ fn invoke_user_function_with_implicit_self(
     let stop_depth = vm.call_depth();
     vm.push_frame_with_closure_and_module(Arc::clone(&code), dst_reg, closure, module)?;
 
-    let arg_count = code.arg_count as usize;
-    let new_frame = vm.current_frame_mut();
-    let mut local_idx = 0u8;
-
-    for i in 0..arg_count {
-        new_frame.set_reg(local_idx, bound.parameters[i]);
-        local_idx += 1;
-    }
-
-    if let Some(tuple_val) = varargs_value {
-        new_frame.set_reg(local_idx, tuple_val);
-        local_idx += 1;
-    }
-
-    for i in arg_count..bound.parameters.len() {
-        new_frame.set_reg(local_idx, bound.parameters[i]);
-        local_idx += 1;
-    }
-
-    if let Some(dict_val) = varkw_value {
-        new_frame.set_reg(local_idx, dict_val);
-        local_idx += 1;
-    }
-
-    initialize_closure_cellvars_from_locals(new_frame, local_idx as usize);
+    let initialized_local_count = {
+        let new_frame = vm.current_frame_mut();
+        write_bound_arguments_to_frame(
+            new_frame,
+            &bound,
+            code.arg_count as usize,
+            varargs_value,
+            varkw_value,
+        )
+    };
+    initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
     if vm.dispatch_prepared_current_frame_via_jit()? {
         return Ok(vm.current_frame().get_reg(dst_reg));
     }
@@ -1352,29 +1421,29 @@ fn write_bound_arguments_to_frame(
     varargs_value: Option<Value>,
     varkw_value: Option<Value>,
 ) -> usize {
-    let mut local_idx = 0u8;
+    let mut local_idx = 0usize;
 
     for i in 0..arg_count {
-        frame.set_reg(local_idx, bound.parameters[i]);
+        frame.set_local(local_idx as u16, bound.parameters[i]);
         local_idx += 1;
     }
 
     if let Some(tuple_val) = varargs_value {
-        frame.set_reg(local_idx, tuple_val);
+        frame.set_local(local_idx as u16, tuple_val);
         local_idx += 1;
     }
 
     for i in arg_count..bound.parameters.len() {
-        frame.set_reg(local_idx, bound.parameters[i]);
+        frame.set_local(local_idx as u16, bound.parameters[i]);
         local_idx += 1;
     }
 
     if let Some(dict_val) = varkw_value {
-        frame.set_reg(local_idx, dict_val);
+        frame.set_local(local_idx as u16, dict_val);
         local_idx += 1;
     }
 
-    local_idx as usize
+    local_idx
 }
 
 fn create_generator_from_bound_arguments(
@@ -1480,6 +1549,10 @@ pub(crate) fn call_user_function_from_values(
     keyword_args: &[(&str, Value)],
 ) -> ControlFlow {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
+    if let Some(result) = function_vectorcall_override_result(func) {
+        vm.current_frame_mut().set_reg(dst_reg, result);
+        return ControlFlow::Continue;
+    }
     let code = Arc::clone(&func.code);
     let module_ptr = function_module_ptr(vm, func);
     let closure = match materialize_function_invocation_closure(func, &code) {
@@ -1517,7 +1590,7 @@ pub(crate) fn call_user_function_from_values(
         }
 
         for (i, arg) in positional_args.iter().copied().enumerate() {
-            vm.current_frame_mut().set_reg(i as u8, arg);
+            vm.current_frame_mut().set_local(i as u16, arg);
         }
 
         initialize_closure_cellvars_from_locals(vm.current_frame_mut(), positional_args.len());
@@ -1597,7 +1670,21 @@ fn invoke_user_function_direct_impl(
     args: &[Value],
     allow_control_transfer: bool,
 ) -> Result<InvokeCallableOutcome, RuntimeError> {
+    vm.with_native_recursion_guard(|vm| {
+        invoke_user_function_direct_impl_guarded(vm, func_ptr, args, allow_control_transfer)
+    })
+}
+
+fn invoke_user_function_direct_impl_guarded(
+    vm: &mut VirtualMachine,
+    func_ptr: *const (),
+    args: &[Value],
+    allow_control_transfer: bool,
+) -> Result<InvokeCallableOutcome, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
+    if let Some(result) = function_vectorcall_override_result(func) {
+        return Ok(InvokeCallableOutcome::Returned(result));
+    }
     let code = Arc::clone(&func.code);
     let closure = materialize_function_invocation_closure(func, &code)?;
     let module = resolve_function_module(vm, func);
@@ -1696,7 +1783,21 @@ fn invoke_user_function_direct_with_keywords(
     args: &[Value],
     keywords: &[(&str, Value)],
 ) -> Result<Value, RuntimeError> {
+    vm.with_native_recursion_guard(|vm| {
+        invoke_user_function_direct_with_keywords_guarded(vm, func_ptr, args, keywords)
+    })
+}
+
+fn invoke_user_function_direct_with_keywords_guarded(
+    vm: &mut VirtualMachine,
+    func_ptr: *const (),
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
+    if let Some(result) = function_vectorcall_override_result(func) {
+        return Ok(result);
+    }
     let code = Arc::clone(&func.code);
     let closure = materialize_function_invocation_closure(func, &code)?;
     let module = resolve_function_module(vm, func);
@@ -2336,7 +2437,8 @@ fn invoke_type_new_builtin_with_keywords(
     }
 
     let full_args = prepend_bound_self_if_present(builtin, args);
-    crate::builtins::builtin_type_new_with_vm(vm, &full_args).map_err(RuntimeError::from)
+    crate::builtins::builtin_type_new_with_keywords_vm(vm, &full_args, keywords)
+        .map_err(RuntimeError::from)
 }
 
 #[inline]
@@ -2436,6 +2538,10 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
             TypeId::FUNCTION | TypeId::CLOSURE => {
                 let func = unsafe { &*(ptr as *const FunctionObject) };
+                if let Some(result) = function_vectorcall_override_result(func) {
+                    vm.current_frame_mut().set_reg(dst_reg, result);
+                    return ControlFlow::Continue;
+                }
                 let code = &func.code;
                 let closure = match materialize_function_invocation_closure(func, code) {
                     Ok(closure) => closure,
@@ -2477,7 +2583,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
                     for i in 0..argc {
                         let arg = vm.frames[caller_frame_idx].get_reg(dst_reg + 1 + i as u8);
-                        vm.current_frame_mut().set_reg(i as u8, arg);
+                        vm.current_frame_mut().set_local(i as u16, arg);
                     }
 
                     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), argc);
@@ -2516,6 +2622,29 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     0,
                     "__call__",
                 ) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(e) => ControlFlow::Error(e),
+                }
+            }
+            TypeId::WRAPPER_DESCRIPTOR
+            | TypeId::METHOD_DESCRIPTOR
+            | TypeId::CLASSMETHOD_DESCRIPTOR => {
+                let Some(target) = reflected_descriptor_callable_target(func_val) else {
+                    return ControlFlow::Error(RuntimeError::type_error(format!(
+                        "'{}' object is not callable",
+                        type_id.name()
+                    )));
+                };
+                let frame = vm.current_frame();
+                let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
+                for i in 0..argc {
+                    args.push(frame.get_reg(dst_reg + 1 + i as u8));
+                }
+
+                match invoke_callable_value(vm, target, &args) {
                     Ok(result) => {
                         vm.current_frame_mut().set_reg(dst_reg, result);
                         ControlFlow::Continue
@@ -2690,6 +2819,44 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     Err(e) => ControlFlow::Error(e),
                 }
             }
+            TypeId::WRAPPER_DESCRIPTOR
+            | TypeId::METHOD_DESCRIPTOR
+            | TypeId::CLASSMETHOD_DESCRIPTOR => {
+                let Some(target) = reflected_descriptor_callable_target(func_val) else {
+                    return ControlFlow::Error(RuntimeError::type_error(format!(
+                        "'{}' object is not callable",
+                        type_id.name()
+                    )));
+                };
+
+                let caller_frame = &vm.frames[vm.call_depth() - 1];
+                let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(posargc);
+                for i in 0..posargc {
+                    args.push(caller_frame.get_reg(dst_reg + 1 + i as u8));
+                }
+                let keyword_args = match collect_call_keyword_args(
+                    caller_frame,
+                    dst_reg,
+                    posargc,
+                    kwargc,
+                    kwnames_idx,
+                ) {
+                    Ok(keyword_args) => keyword_args,
+                    Err(err) => return ControlFlow::Error(err),
+                };
+                let keyword_refs: SmallVec<[(&str, Value); 4]> = keyword_args
+                    .iter()
+                    .map(|(name, value)| (name.as_ref(), *value))
+                    .collect();
+
+                match invoke_callable_value_with_keywords(vm, target, &args, &keyword_refs) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(e) => ControlFlow::Error(e),
+                }
+            }
             _ => match resolve_dunder_call_target(func_val) {
                 Some(resolved) => match invoke_resolved_callable(
                     vm,
@@ -2794,6 +2961,10 @@ fn call_kw_user_function(
     kwnames_idx: u16,
 ) -> ControlFlow {
     let func = unsafe { &*(ptr as *const FunctionObject) };
+    if let Some(result) = function_vectorcall_override_result(func) {
+        vm.current_frame_mut().set_reg(dst_reg, result);
+        return ControlFlow::Continue;
+    }
     let code = Arc::clone(&func.code);
     let closure = match materialize_function_invocation_closure(func, &code) {
         Ok(closure) => closure,
@@ -3062,29 +3233,29 @@ fn call_kw_user_function(
 
     {
         let new_frame = vm.current_frame_mut();
-        let mut local_idx = 0u8;
+        let mut local_idx = 0usize;
 
         // Set positional parameters
         for i in 0..arg_count {
-            new_frame.set_reg(local_idx, bound_args[i]);
+            new_frame.set_local(local_idx as u16, bound_args[i]);
             local_idx += 1;
         }
 
         // Set *args tuple if present
         if let Some(tuple_val) = varargs_value {
-            new_frame.set_reg(local_idx, tuple_val);
+            new_frame.set_local(local_idx as u16, tuple_val);
             local_idx += 1;
         }
 
         // Set keyword-only parameters
         for i in arg_count..total_params {
-            new_frame.set_reg(local_idx, bound_args[i]);
+            new_frame.set_local(local_idx as u16, bound_args[i]);
             local_idx += 1;
         }
 
         // Set **kwargs dict if present
         if let Some(dict_val) = varkw_value {
-            new_frame.set_reg(local_idx, dict_val);
+            new_frame.set_local(local_idx as u16, dict_val);
         }
 
         let initialized_local_count = local_idx as usize + usize::from(varkw_value.is_some());

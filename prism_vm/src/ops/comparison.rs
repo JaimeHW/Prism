@@ -177,6 +177,10 @@ fn contains_bytes_value(needle: Value, haystack: &[u8]) -> Result<bool, RuntimeE
 
 #[inline]
 fn union_member_type_ids(value: Value) -> Option<Vec<TypeId>> {
+    if value.is_none() {
+        return Some(vec![TypeId::NONE]);
+    }
+
     let ptr = value.as_object_ptr()?;
     match crate::ops::objects::extract_type_id(ptr) {
         TypeId::TYPE => Some(vec![builtin_type_object_type_id(ptr).unwrap_or_else(
@@ -189,7 +193,7 @@ fn union_member_type_ids(value: Value) -> Option<Vec<TypeId>> {
             let union = unsafe { &*(ptr as *const UnionTypeObject) };
             Some(union.members().to_vec())
         }
-        _ => None,
+        _ => crate::stdlib::typing::typing_marker_type_id(value).map(|type_id| vec![type_id]),
     }
 }
 

@@ -233,10 +233,10 @@ pub(crate) fn initialize_closure_cellvars_from_locals(
         else {
             continue;
         };
-        if local_slot >= initialized_locals || local_slot > u8::MAX as usize {
+        if local_slot >= initialized_locals {
             continue;
         }
-        let value = frame.get_reg(local_slot as u8);
+        let value = frame.get_local(local_slot as u16);
         env.set(cell_idx, value);
     }
 }

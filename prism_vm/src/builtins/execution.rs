@@ -16,9 +16,13 @@
 
 use super::BuiltinError;
 use crate::VirtualMachine;
-use crate::builtins::{SyntaxErrorDetails, create_exception_with_syntax_details};
-use crate::error::RuntimeError;
+use crate::builtins::{
+    SyntaxErrorDetails, create_exception_with_syntax_details, runtime_error_to_builtin_error,
+};
+use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::import::ModuleObject;
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
     alloc_heap_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
     snapshot_frame_locals_dict,
@@ -512,8 +516,74 @@ fn optional_compile_int_arg(
         .transpose()
 }
 
+fn optional_compile_int_arg_vm(
+    vm: &mut VirtualMachine,
+    value: Option<Value>,
+    index: usize,
+    label: &str,
+) -> Result<Option<i64>, BuiltinError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    coerce_compile_int_arg(vm, value, index, label).map(Some)
+}
+
+fn coerce_compile_int_arg(
+    vm: &mut VirtualMachine,
+    value: Value,
+    index: usize,
+    label: &str,
+) -> Result<i64, BuiltinError> {
+    if let Some(integer) = int_like_value(value) {
+        return Ok(integer);
+    }
+
+    let index_method = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(BuiltinError::TypeError(format!(
+                "compile() arg {index} ({label}) must be an integer"
+            )));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+    let indexed =
+        invoke_zero_arg_bound_method(vm, index_method).map_err(runtime_error_to_builtin_error)?;
+    int_like_value(indexed).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        ))
+    })
+}
+
+fn invoke_zero_arg_bound_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, RuntimeError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+}
+
 fn compile_optimize_arg(value: Option<Value>) -> Result<OptimizationLevel, BuiltinError> {
     let optimize = optional_compile_int_arg(value, 6, "optimize")?.unwrap_or(-1);
+    match optimize {
+        -1 | 0 => Ok(OptimizationLevel::None),
+        1 => Ok(OptimizationLevel::Basic),
+        2 => Ok(OptimizationLevel::Full),
+        _ => Err(BuiltinError::ValueError(
+            "compile() optimize value must be -1, 0, 1, or 2".to_string(),
+        )),
+    }
+}
+
+fn compile_optimize_arg_vm(
+    vm: &mut VirtualMachine,
+    value: Option<Value>,
+) -> Result<OptimizationLevel, BuiltinError> {
+    let optimize = optional_compile_int_arg_vm(vm, value, 6, "optimize")?.unwrap_or(-1);
     match optimize {
         -1 | 0 => Ok(OptimizationLevel::None),
         1 => Ok(OptimizationLevel::Basic),
@@ -601,6 +671,28 @@ fn compile_from_parsed_args(args: CompileArgs) -> Result<Value, BuiltinError> {
     let _dont_inherit = optional_compile_int_arg(args.dont_inherit, 5, "dont_inherit")?;
     let optimize = compile_optimize_arg(args.optimize)?;
     let _feature_version = optional_compile_int_arg(args.feature_version, 7, "_feature_version")?;
+    let code = compile_source_for_mode(
+        &source,
+        &filename,
+        mode,
+        optimize,
+        ModuleNamespaceMode::Standard,
+    )?;
+    Ok(boxed_code_value(code))
+}
+
+fn compile_from_parsed_args_vm(
+    vm: &mut VirtualMachine,
+    args: CompileArgs,
+) -> Result<Value, BuiltinError> {
+    let source = source_text_for_compile(args.source)?;
+    let filename = compile_filename_arg(args.filename)?;
+    let mode = compile_mode_arg(args.mode)?;
+    let _flags = optional_compile_int_arg_vm(vm, args.flags, 4, "flags")?;
+    let _dont_inherit = optional_compile_int_arg_vm(vm, args.dont_inherit, 5, "dont_inherit")?;
+    let optimize = compile_optimize_arg_vm(vm, args.optimize)?;
+    let _feature_version =
+        optional_compile_int_arg_vm(vm, args.feature_version, 7, "_feature_version")?;
     let code = compile_source_for_mode(
         &source,
         &filename,
@@ -995,6 +1087,15 @@ pub fn builtin_compile_kw(
     keywords: &[(&str, Value)],
 ) -> Result<Value, BuiltinError> {
     compile_from_parsed_args(parse_compile_args(args, keywords)?)
+}
+
+/// VM-aware keyword entry point so integer-like arguments can honor `__index__`.
+pub fn builtin_compile_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    compile_from_parsed_args_vm(vm, parse_compile_args(args, keywords)?)
 }
 
 // =============================================================================

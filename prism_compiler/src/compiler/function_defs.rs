@@ -144,6 +144,9 @@ impl Compiler {
         let mut func_builder = FunctionBuilder::new(name);
         func_builder.set_filename(&*self.filename);
         func_builder.set_first_lineno(definition_line);
+        if Self::should_use_separate_locals(args, &func_locals) {
+            func_builder.use_separate_locals();
+        }
 
         // Set function flags
         if is_async {
@@ -368,6 +371,44 @@ impl Compiler {
         Ok(())
     }
 
+    #[inline]
+    fn should_use_separate_locals(
+        args: &prism_parser::ast::Arguments,
+        analyzed_locals: &[Arc<str>],
+    ) -> bool {
+        const REGISTER_LOCAL_SPILL_THRESHOLD: usize = 192;
+        Self::estimated_local_slot_count(args, analyzed_locals) > REGISTER_LOCAL_SPILL_THRESHOLD
+    }
+
+    fn estimated_local_slot_count(
+        args: &prism_parser::ast::Arguments,
+        analyzed_locals: &[Arc<str>],
+    ) -> usize {
+        let mut names: Vec<&str> = Vec::with_capacity(
+            args.posonlyargs.len()
+                + args.args.len()
+                + args.kwonlyargs.len()
+                + usize::from(args.vararg.is_some())
+                + usize::from(args.kwarg.is_some())
+                + analyzed_locals.len(),
+        );
+
+        names.extend(args.posonlyargs.iter().map(|arg| arg.arg.as_str()));
+        names.extend(args.args.iter().map(|arg| arg.arg.as_str()));
+        if let Some(vararg) = &args.vararg {
+            names.push(vararg.arg.as_str());
+        }
+        names.extend(args.kwonlyargs.iter().map(|arg| arg.arg.as_str()));
+        if let Some(kwarg) = &args.kwarg {
+            names.push(kwarg.arg.as_str());
+        }
+        names.extend(analyzed_locals.iter().map(|name| name.as_ref()));
+
+        names.sort_unstable();
+        names.dedup();
+        names.len()
+    }
+
     /// Find a child scope by kind and name in the current scope.
     ///
     /// Uses a per-scope cursor so repeated nested definitions with the same
@@ -460,6 +501,9 @@ impl Compiler {
         let mut lambda_builder = FunctionBuilder::new("<lambda>");
         lambda_builder.set_filename(&*self.filename);
         lambda_builder.set_first_lineno(definition_line);
+        if Self::should_use_separate_locals(args, &lambda_locals) {
+            lambda_builder.use_separate_locals();
+        }
 
         // Calculate argument counts
         let posonly_count = args.posonlyargs.len() as u16;

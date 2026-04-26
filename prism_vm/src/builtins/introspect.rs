@@ -114,8 +114,7 @@ fn dir_of_current_scope(vm: &VirtualMachine) -> Result<Value, BuiltinError> {
     let frame = vm.current_frame();
     if frame.locals_mapping().is_none() {
         for (slot, name) in frame.code.locals.iter().enumerate() {
-            let slot = slot as u8;
-            if frame.reg_is_written(slot) {
+            if frame.local_is_written(slot as u16) {
                 push_unique_name(&mut names, &mut seen, intern(name.as_ref()));
             }
         }

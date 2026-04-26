@@ -5,7 +5,7 @@
 
 use crate::exception::InlineHandlerCache;
 use crate::import::ModuleObject;
-use prism_code::{CodeObject, Constant};
+use prism_code::{CodeFlags, CodeObject, Constant};
 use prism_core::Value;
 use prism_runtime::types::int::bigint_to_value;
 use std::sync::Arc;
@@ -72,6 +72,13 @@ pub struct Frame {
     /// This lets the VM distinguish "never assigned" from an explicit
     /// `None` value for Python local-slot semantics.
     written_registers: [u64; REGISTER_WORD_COUNT],
+
+    /// Optional frame-local storage for code objects whose local slot count is
+    /// too large to reserve one register per local.
+    separate_locals: Vec<Value>,
+
+    /// Bitset tracking writes into `separate_locals`.
+    written_separate_locals: Vec<u64>,
 
     /// Number of registers that must be cleared before reusing this frame.
     active_register_count: u16,
@@ -148,6 +155,8 @@ impl Frame {
             closure: None,
             registers: [Value::none(); REGISTER_COUNT],
             written_registers: [0; REGISTER_WORD_COUNT],
+            separate_locals: Vec::new(),
+            written_separate_locals: Vec::new(),
             active_register_count: 0,
             locals_mapping: None,
             yield_point: 0,
@@ -187,6 +196,7 @@ impl Frame {
         self.module = module;
         self.closure = closure;
         self.active_register_count = Self::active_register_count_for(&self.code);
+        self.prepare_separate_locals();
         self.locals_mapping = None;
         self.yield_point = 0;
         self.handler_cache = InlineHandlerCache::new();
@@ -195,6 +205,7 @@ impl Frame {
     fn prepare_for_pool(&mut self) {
         self.clear_register_window(self.active_register_count.into());
         self.written_registers.fill(0);
+        self.clear_separate_locals();
         self.code = pooled_frame_code();
         self.ip = 0;
         self.return_frame = None;
@@ -212,6 +223,33 @@ impl Frame {
         if count > 0 {
             self.registers[..count].fill(Value::none());
         }
+    }
+
+    #[inline]
+    fn uses_separate_locals_code(code: &CodeObject) -> bool {
+        code.flags.contains(CodeFlags::SEPARATE_LOCALS)
+    }
+
+    fn prepare_separate_locals(&mut self) {
+        if !Self::uses_separate_locals_code(&self.code) {
+            self.clear_separate_locals();
+            return;
+        }
+
+        let local_count = self.code.locals.len();
+        self.separate_locals.resize(local_count, Value::none());
+        self.separate_locals.fill(Value::none());
+
+        let word_count = local_count.div_ceil(64);
+        self.written_separate_locals.resize(word_count, 0);
+        self.written_separate_locals.fill(0);
+    }
+
+    fn clear_separate_locals(&mut self) {
+        self.separate_locals.fill(Value::none());
+        self.separate_locals.clear();
+        self.written_separate_locals.fill(0);
+        self.written_separate_locals.clear();
     }
 
     /// Create a new frame for executing a code object.
@@ -330,6 +368,58 @@ impl Frame {
         let word = reg_idx / 64;
         let bit = reg_idx % 64;
         (self.written_registers[word] & (1u64 << bit)) != 0
+    }
+
+    #[inline(always)]
+    pub fn uses_separate_locals(&self) -> bool {
+        Self::uses_separate_locals_code(&self.code)
+    }
+
+    #[inline(always)]
+    pub fn get_local(&self, slot: u16) -> Value {
+        if self.uses_separate_locals() {
+            unsafe { *self.separate_locals.get_unchecked(slot as usize) }
+        } else {
+            self.get_reg(slot as u8)
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_local(&mut self, slot: u16, value: Value) {
+        if self.uses_separate_locals() {
+            let slot_idx = slot as usize;
+            unsafe { *self.separate_locals.get_unchecked_mut(slot_idx) = value };
+            let word = slot_idx / 64;
+            let bit = slot_idx % 64;
+            unsafe { *self.written_separate_locals.get_unchecked_mut(word) |= 1u64 << bit };
+        } else {
+            self.set_reg(slot as u8, value);
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear_local(&mut self, slot: u16) {
+        if self.uses_separate_locals() {
+            let slot_idx = slot as usize;
+            unsafe { *self.separate_locals.get_unchecked_mut(slot_idx) = Value::none() };
+            let word = slot_idx / 64;
+            let bit = slot_idx % 64;
+            unsafe { *self.written_separate_locals.get_unchecked_mut(word) &= !(1u64 << bit) };
+        } else {
+            self.clear_reg(slot as u8);
+        }
+    }
+
+    #[inline(always)]
+    pub fn local_is_written(&self, slot: u16) -> bool {
+        if self.uses_separate_locals() {
+            let slot_idx = slot as usize;
+            let word = slot_idx / 64;
+            let bit = slot_idx % 64;
+            unsafe { (*self.written_separate_locals.get_unchecked(word) & (1u64 << bit)) != 0 }
+        } else {
+            self.reg_is_written(slot as u8)
+        }
     }
 
     #[inline(always)]

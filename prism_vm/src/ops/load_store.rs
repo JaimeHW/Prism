@@ -69,7 +69,7 @@ pub fn setup_annotations(vm: &mut VirtualMachine, _inst: Instruction) -> Control
 /// may be used for explicit local variable access semantics.
 #[inline(always)]
 pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let slot = inst.imm16() as u8;
+    let slot = inst.imm16();
     let dst = inst.dst().0;
 
     if let Some(mapping) = vm.current_frame().locals_mapping() {
@@ -85,7 +85,7 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     {
         let frame = vm.current_frame();
-        if frame.code.flags.contains(CodeFlags::CLASS) && !frame.reg_is_written(slot) {
+        if frame.code.flags.contains(CodeFlags::CLASS) && !frame.local_is_written(slot) {
             let name = mapped_local_name(frame, slot);
             return match load_module_or_builtin(vm, &name) {
                 Ok(value) => {
@@ -98,11 +98,11 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     let frame = vm.current_frame();
-    if !frame.reg_is_written(slot) {
+    if !frame.local_is_written(slot) {
         return ControlFlow::Error(RuntimeError::unbound_local(mapped_local_name(frame, slot)));
     }
 
-    let value = frame.get_reg(slot);
+    let value = frame.get_local(slot);
     vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
@@ -110,7 +110,7 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// StoreLocal: frame.registers[imm16] = dst-register
 #[inline(always)]
 pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let slot = inst.imm16() as u8;
+    let slot = inst.imm16();
     if let Some(mapping) = vm.current_frame().locals_mapping() {
         let (value, name) = {
             let frame = vm.current_frame();
@@ -118,7 +118,7 @@ pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         };
         return match store_mapped_local(vm, mapping, &name, value) {
             Ok(()) => {
-                vm.current_frame_mut().set_reg(slot, value);
+                vm.current_frame_mut().set_local(slot, value);
                 ControlFlow::Continue
             }
             Err(err) => ControlFlow::Error(err),
@@ -129,19 +129,19 @@ pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // Store opcodes use DstImm16 encoding where the source register is carried
     // in the dst field and imm16 is the destination slot index.
     let value = frame.get_reg(inst.dst().0);
-    frame.set_reg(slot, value);
+    frame.set_local(slot, value);
     ControlFlow::Continue
 }
 
 /// DeleteLocal: frame.registers[imm16] = undefined
 #[inline(always)]
 pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let slot = inst.imm16() as u8;
+    let slot = inst.imm16();
     if let Some(mapping) = vm.current_frame().locals_mapping() {
         let name = mapped_local_name(vm.current_frame(), slot);
         return match delete_mapped_local(vm, mapping, &name) {
             Ok(true) => {
-                vm.current_frame_mut().clear_reg(slot);
+                vm.current_frame_mut().clear_local(slot);
                 crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
                 ControlFlow::Continue
             }
@@ -151,14 +151,14 @@ pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     let frame = vm.current_frame_mut();
-    frame.clear_reg(slot);
+    frame.clear_local(slot);
     crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
     ControlFlow::Continue
 }
 
 #[inline]
-fn mapped_local_name(frame: &crate::frame::Frame, slot: u8) -> Arc<str> {
-    Arc::clone(frame.get_local_name(slot as u16))
+fn mapped_local_name(frame: &crate::frame::Frame, slot: u16) -> Arc<str> {
+    Arc::clone(frame.get_local_name(slot))
 }
 
 #[inline]
@@ -185,16 +185,16 @@ fn ensure_annotations_namespace(vm: &mut VirtualMachine) -> Result<(), RuntimeEr
                 .locals
                 .iter()
                 .position(|local| local.as_ref() == "__annotations__")
-                .map(|slot| slot as u8)
+                .map(|slot| slot as u16)
         } else {
             None
         }
     };
 
     if let Some(slot) = class_local_slot {
-        if !vm.current_frame().reg_is_written(slot) {
+        if !vm.current_frame().local_is_written(slot) {
             let value = alloc_heap_value(vm, DictObject::new(), "__annotations__ dict")?;
-            vm.current_frame_mut().set_reg(slot, value);
+            vm.current_frame_mut().set_local(slot, value);
         }
         return Ok(());
     }

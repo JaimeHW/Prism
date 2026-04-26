@@ -17,6 +17,7 @@ use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use rustc_hash::FxHashSet;
 use std::sync::{Arc, LazyLock};
@@ -35,6 +36,9 @@ static ISMODULE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("inspect.ismodule"), inspect_ismodule));
 static ISCLASS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("inspect.isclass"), inspect_isclass));
+static ISABSTRACT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("inspect.isabstract"), inspect_isabstract)
+});
 static ISFUNCTION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("inspect.isfunction"), inspect_isfunction)
 });
@@ -106,6 +110,7 @@ impl InspectModule {
             Arc::from("signature"),
             Arc::from("ismodule"),
             Arc::from("isclass"),
+            Arc::from("isabstract"),
             Arc::from("isfunction"),
             Arc::from("iscoroutinefunction"),
             Arc::from("isawaitable"),
@@ -147,6 +152,7 @@ impl Module for InspectModule {
             "signature" => Ok(builtin_value(&SIGNATURE_FUNCTION)),
             "ismodule" => Ok(builtin_value(&ISMODULE_FUNCTION)),
             "isclass" => Ok(builtin_value(&ISCLASS_FUNCTION)),
+            "isabstract" => Ok(builtin_value(&ISABSTRACT_FUNCTION)),
             "isfunction" => Ok(builtin_value(&ISFUNCTION_FUNCTION)),
             "iscoroutinefunction" => Ok(builtin_value(&ISCOROUTINEFUNCTION_FUNCTION)),
             "isawaitable" => Ok(builtin_value(&ISAWAITABLE_FUNCTION)),
@@ -319,6 +325,20 @@ fn value_to_string(value: Value) -> Option<String> {
     Some(string.as_str().to_string())
 }
 
+fn abstract_methods_non_empty(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::SET | TypeId::FROZENSET => !unsafe { &*(ptr as *const SetObject) }.is_empty(),
+        TypeId::TUPLE => {
+            !unsafe { &*(ptr as *const prism_runtime::types::tuple::TupleObject) }.is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn extract_annotations_mapping(value: Value) -> Option<Value> {
     let ptr = value.as_object_ptr()?;
     let type_id = crate::ops::objects::extract_type_id(ptr);
@@ -425,6 +445,22 @@ fn inspect_ismodule(args: &[Value]) -> Result<Value, BuiltinError> {
 fn inspect_isclass(args: &[Value]) -> Result<Value, BuiltinError> {
     predicate_result("isclass", args, |value| {
         object_type_id(value).is_some_and(|type_id| type_id == TypeId::TYPE)
+    })
+}
+
+fn inspect_isabstract(args: &[Value]) -> Result<Value, BuiltinError> {
+    predicate_result("isabstract", args, |value| {
+        let Some(ptr) = value.as_object_ptr() else {
+            return false;
+        };
+        if crate::ops::objects::extract_type_id(ptr) != TypeId::TYPE {
+            return false;
+        }
+
+        let class = unsafe { &*(ptr as *const prism_runtime::object::class::PyClassObject) };
+        class
+            .get_attr(&intern("__abstractmethods__"))
+            .is_some_and(abstract_methods_non_empty)
     })
 }
 

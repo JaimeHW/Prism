@@ -15,7 +15,7 @@ use crate::builtins::{
 };
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
-use crate::frame::{Frame, REGISTER_COUNT};
+use crate::frame::Frame;
 use crate::ops::attribute::is_user_defined_type;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::method_cache::method_cache;
@@ -231,11 +231,91 @@ fn bind_user_class_attribute_value_in_vm(
 }
 
 #[inline]
+fn bind_type_attribute_value(value: Value, defining_class: ClassId, type_instance: Value) -> Value {
+    let Some(ptr) = value.as_object_ptr() else {
+        return value;
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => {
+            let bound = Box::leak(Box::new(BoundMethod::new(value, type_instance)));
+            Value::object_ptr(bound as *mut BoundMethod as *const ())
+        }
+        TypeId::CLASSMETHOD => {
+            let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            desc.bind_value(type_instance)
+        }
+        TypeId::STATICMETHOD => {
+            let desc = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            desc.function()
+        }
+        TypeId::BUILTIN_FUNCTION
+            if defining_class_binds_builtin_instance_attributes(defining_class) =>
+        {
+            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            if builtin.bound_self().is_some() {
+                value
+            } else {
+                let bound = Box::leak(Box::new(builtin.bind(type_instance)));
+                Value::object_ptr(bound as *mut BuiltinFunctionObject as *const ())
+            }
+        }
+        TypeId::BUILTIN_FUNCTION => value,
+        _ => value,
+    }
+}
+
+#[inline]
+fn bind_type_attribute_value_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    defining_class: ClassId,
+    type_instance: Value,
+) -> Result<Value, RuntimeError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(value);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => {
+            let bound = Box::leak(Box::new(BoundMethod::new(value, type_instance)));
+            Ok(Value::object_ptr(bound as *mut BoundMethod as *const ()))
+        }
+        TypeId::CLASSMETHOD => {
+            let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            bind_wrapped_classmethod_value(vm, desc.function(), type_instance)
+        }
+        TypeId::STATICMETHOD => {
+            let desc = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            Ok(desc.function())
+        }
+        TypeId::BUILTIN_FUNCTION
+            if defining_class_binds_builtin_instance_attributes(defining_class) =>
+        {
+            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            if builtin.bound_self().is_some() {
+                Ok(value)
+            } else {
+                let bound = Box::leak(Box::new(builtin.bind(type_instance)));
+                Ok(Value::object_ptr(
+                    bound as *mut BuiltinFunctionObject as *const (),
+                ))
+            }
+        }
+        TypeId::BUILTIN_FUNCTION => Ok(value),
+        _ => Ok(
+            invoke_descriptor_get_in_vm(vm, value, type_instance, type_instance)?.unwrap_or(value),
+        ),
+    }
+}
+
+#[inline]
 fn bind_user_class_slot(slot: MethodSlot, instance: Value) -> Value {
     bind_user_class_attribute_value(slot.value, slot.defining_class, instance)
 }
 
 fn lookup_builtin_base_instance_attr(
+    vm: &mut VirtualMachine,
     obj: Value,
     type_id: TypeId,
     name: &InternedString,
@@ -254,7 +334,7 @@ fn lookup_builtin_base_instance_attr(
             return Ok(Some(bind_cached_builtin_method(cached.method, obj)));
         }
 
-        if let Some(value) = builtin_bound_type_attribute_value_static(owner, obj, name)? {
+        if let Some(value) = builtin_instance_attribute_value(vm, owner, obj, name)? {
             return Ok(Some(value));
         }
     }
@@ -299,7 +379,30 @@ fn bind_super_lookup_value(
             if name.as_str() == "__new__" {
                 resolve_class_attribute(value, super_obj.obj())
             } else {
-                bind_user_class_attribute_value(value, defining_class, super_obj.obj())
+                bind_type_attribute_value(value, defining_class, super_obj.obj())
+            }
+        }
+    }
+}
+
+#[inline]
+fn bind_super_lookup_value_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    defining_class: ClassId,
+    super_obj: &SuperObject,
+    name: &InternedString,
+) -> Result<Value, RuntimeError> {
+    match super_obj.binding() {
+        SuperBinding::Unbound => Ok(value),
+        SuperBinding::Instance => {
+            bind_user_class_attribute_value_in_vm(vm, value, defining_class, super_obj.obj())
+        }
+        SuperBinding::Type => {
+            if name.as_str() == "__new__" {
+                resolve_class_attribute_in_vm(vm, value, super_obj.obj())
+            } else {
+                bind_type_attribute_value_in_vm(vm, value, defining_class, super_obj.obj())
             }
         }
     }
@@ -452,6 +555,82 @@ pub(crate) fn super_attribute_value_static(
     Ok(None)
 }
 
+pub(crate) fn super_attribute_value_in_vm(
+    vm: &mut VirtualMachine,
+    super_value: Value,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let ptr = super_value
+        .as_object_ptr()
+        .ok_or_else(|| RuntimeError::attribute_error("super", name.as_str()))?;
+    if extract_type_id(ptr) != TypeId::SUPER {
+        return Ok(None);
+    }
+
+    let super_obj = unsafe { &*(ptr as *const SuperObject) };
+    match name.as_str() {
+        "__self__" => {
+            return Ok(Some(match super_obj.binding() {
+                SuperBinding::Unbound => Value::none(),
+                SuperBinding::Instance | SuperBinding::Type => super_obj.obj(),
+            }));
+        }
+        "__self_class__" => {
+            return Ok(Some(
+                class_id_to_value(super_obj.obj_type()).unwrap_or_else(Value::none),
+            ));
+        }
+        "__thisclass__" => {
+            return Ok(Some(
+                class_id_to_value(super_obj.this_type()).unwrap_or_else(Value::none),
+            ));
+        }
+        _ => {}
+    }
+
+    let mro = if super_obj.obj_type().0 < TypeId::FIRST_USER_TYPE {
+        builtin_class_mro(class_id_to_type_id(super_obj.obj_type()))
+    } else {
+        let Some(class) = global_class(super_obj.obj_type()) else {
+            return Ok(None);
+        };
+        class.mro().to_vec()
+    };
+
+    let start = mro
+        .iter()
+        .position(|&class_id| class_id == super_obj.this_type())
+        .map_or(0, |index| index + 1);
+
+    for &class_id in &mro[start..] {
+        if class_id.0 < TypeId::FIRST_USER_TYPE {
+            let owner = class_id_to_type_id(class_id);
+            if super_obj.binding() != SuperBinding::Unbound
+                && let Some(cached) = resolve_builtin_instance_method(owner, name.as_str())
+            {
+                return Ok(Some(bind_cached_builtin_method(
+                    cached.method,
+                    super_obj.obj(),
+                )));
+            }
+            if let Some(value) =
+                builtin_bound_type_attribute_value_static(owner, super_obj.obj(), name)?
+            {
+                return Ok(Some(value));
+            }
+            continue;
+        }
+
+        if let Some(class) = global_class(class_id)
+            && let Some(value) = class.get_attr(name)
+        {
+            return bind_super_lookup_value_in_vm(vm, value, class_id, super_obj, name).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
 #[inline]
 pub(crate) fn super_attribute_exists(super_value: Value, name: &InternedString) -> bool {
     super_attribute_value_static(super_value, name)
@@ -581,12 +760,12 @@ pub(crate) fn snapshot_frame_locals_dict(frame: &Frame) -> DictObject {
 
     let mut dict = DictObject::with_capacity(frame.code.locals.len());
     for (slot, name) in frame.code.locals.iter().enumerate() {
-        if slot >= REGISTER_COUNT || !frame.reg_is_written(slot as u8) {
+        if !frame.local_is_written(slot as u16) {
             continue;
         }
         dict.set(
             Value::string(intern(name.as_ref())),
-            frame.get_reg(slot as u8),
+            frame.get_local(slot as u16),
         );
     }
     dict
@@ -1396,10 +1575,6 @@ fn lookup_user_defined_instance_attribute_default(
     type_id: TypeId,
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
-    if name.as_str() == "__class__" {
-        return Ok(class_id_to_value(ClassId(type_id.raw())));
-    }
-
     let class_slot = lookup_instance_class_slot(type_id, name);
     if let Some(descriptor) = class_slot
         .as_ref()
@@ -1428,6 +1603,10 @@ fn lookup_user_defined_instance_attribute_default(
             .map(Some);
     }
 
+    if name.as_str() == "__class__" {
+        return Ok(class_id_to_value(ClassId(type_id.raw())));
+    }
+
     if name.as_str() == "__dict__" {
         return Ok(Some(ensure_user_defined_instance_dict_value(ptr)));
     }
@@ -1449,7 +1628,7 @@ fn lookup_user_defined_instance_attribute_default(
             .map(Some);
     }
 
-    if let Some(value) = lookup_builtin_base_instance_attr(obj, type_id, name)? {
+    if let Some(value) = lookup_builtin_base_instance_attr(vm, obj, type_id, name)? {
         return Ok(Some(value));
     }
 
@@ -1587,6 +1766,18 @@ pub(crate) fn get_attribute_value(
                     || crate::builtins::builtin_type_object_for_type_id(TypeId::EXCEPTION),
                 ),
             );
+        }
+
+        if type_id == TypeId::TYPE
+            && name.as_str() == "__class__"
+            && let Some(class) = class_object_from_type_ptr(ptr)
+        {
+            let metaclass = class.metaclass();
+            return Ok(if metaclass.is_none() {
+                crate::builtins::builtin_type_object_for_type_id(TypeId::TYPE)
+            } else {
+                metaclass
+            });
         }
 
         if type_id != TypeId::EXCEPTION_TYPE
@@ -1799,7 +1990,7 @@ pub(crate) fn get_attribute_value(
                     _ => Err(RuntimeError::attribute_error("cell", name.as_str())),
                 }
             }
-            TypeId::SUPER => super_attribute_value_static(obj, name)?
+            TypeId::SUPER => super_attribute_value_in_vm(vm, obj, name)?
                 .ok_or_else(|| RuntimeError::attribute_error("super", name.as_str())),
             TypeId::TYPE => {
                 if let Some(represented) = crate::builtins::builtin_type_object_type_id(ptr)

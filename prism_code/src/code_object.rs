@@ -118,6 +118,9 @@ impl CodeFlags {
     pub const MODULE: CodeFlags = CodeFlags(1 << 8);
     /// This is class body code.
     pub const CLASS: CodeFlags = CodeFlags(1 << 9);
+    /// Local slots are stored in a separate frame-local array instead of being
+    /// backed directly by registers.
+    pub const SEPARATE_LOCALS: CodeFlags = CodeFlags(1 << 10);
 
     /// Bitmask of all currently defined flags.
     pub const ALL_BITS: u32 = Self::VARARGS.bits()
@@ -129,7 +132,8 @@ impl CodeFlags {
         | Self::HAS_FREEVARS.bits()
         | Self::HAS_CELLVARS.bits()
         | Self::MODULE.bits()
-        | Self::CLASS.bits();
+        | Self::CLASS.bits()
+        | Self::SEPARATE_LOCALS.bits();
 
     /// Check if a flag is set.
     #[inline]
@@ -586,7 +590,18 @@ impl CodeObject {
     }
 
     fn validate_local_slot(&self, pc: usize, slot: u16) -> Result<(), CodeValidationError> {
-        if slot >= REGISTER_FILE_SIZE {
+        if usize::from(slot) >= self.locals.len() {
+            return Err(CodeValidationError::new(
+                pc,
+                CodeValidationErrorKind::PoolIndexOutOfBounds {
+                    pool: "local",
+                    index: slot,
+                    len: self.locals.len(),
+                },
+            ));
+        }
+
+        if !self.flags.contains(CodeFlags::SEPARATE_LOCALS) && slot >= REGISTER_FILE_SIZE {
             return Err(CodeValidationError::new(
                 pc,
                 CodeValidationErrorKind::LocalSlotTooWide { slot },

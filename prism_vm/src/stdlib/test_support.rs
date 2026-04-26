@@ -6,7 +6,11 @@
 //! before the whole support stack is implemented.
 
 use super::{Module, ModuleError, ModuleResult};
-use crate::builtins::{BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class};
+use crate::VirtualMachine;
+use crate::builtins::{
+    BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class,
+    runtime_error_to_builtin_error,
+};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
@@ -16,15 +20,20 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 const TESTFN: &str = "@prism_test_tmp";
+const C_RECURSION_LIMIT: i64 = 64;
 
 static ALWAYS_EQ_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_sentinel_class("_ALWAYS_EQ", &ALWAYS_EQ_METHODS));
 static NEVER_EQ_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_sentinel_class("_NEVER_EQ", &NEVER_EQ_METHODS));
+static INFINITE_RECURSION_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(build_infinite_recursion_class);
 static ALWAYS_EQ_VALUE: LazyLock<Value> =
     LazyLock::new(|| sentinel_instance(ALWAYS_EQ_CLASS.as_ref()));
 static NEVER_EQ_VALUE: LazyLock<Value> =
     LazyLock::new(|| sentinel_instance(NEVER_EQ_CLASS.as_ref()));
+static INFINITE_RECURSION_VALUE: LazyLock<Value> =
+    LazyLock::new(|| sentinel_instance(INFINITE_RECURSION_CLASS.as_ref()));
 
 static ALWAYS_EQ_EQ_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support._ALWAYS_EQ.__eq__"), always_eq_eq)
@@ -40,6 +49,36 @@ static NEVER_EQ_NE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| 
 });
 static NEVER_EQ_HASH_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support._NEVER_EQ.__hash__"), never_eq_hash)
+});
+static INFINITE_RECURSION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.infinite_recursion"),
+        infinite_recursion,
+    )
+});
+static INFINITE_RECURSION_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support._InfiniteRecursion.__enter__"),
+        infinite_recursion_enter,
+    )
+});
+static INFINITE_RECURSION_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support._InfiniteRecursion.__exit__"),
+        infinite_recursion_exit,
+    )
+});
+static CPYTHON_ONLY_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("test.support.cpython_only"), cpython_only)
+});
+static REQUIRES_LIMITED_API_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("test.support.requires_limited_api"),
+        requires_limited_api,
+    )
+});
+static SKIP_ON_S390X_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("test.support.skip_on_s390x"), identity_decorator)
 });
 
 const ALWAYS_EQ_METHODS: [(&str, &LazyLock<BuiltinFunctionObject>); 2] = [
@@ -64,8 +103,15 @@ impl SupportModule {
         Self {
             attrs: vec![
                 Arc::from("ALWAYS_EQ"),
+                Arc::from("C_RECURSION_LIMIT"),
                 Arc::from("NEVER_EQ"),
+                Arc::from("Py_DEBUG"),
+                Arc::from("cpython_only"),
+                Arc::from("infinite_recursion"),
+                Arc::from("is_wasi"),
                 Arc::from("os_helper"),
+                Arc::from("requires_limited_api"),
+                Arc::from("skip_on_s390x"),
             ],
         }
     }
@@ -85,7 +131,16 @@ impl Module for SupportModule {
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
             "ALWAYS_EQ" => Ok(*ALWAYS_EQ_VALUE),
+            "C_RECURSION_LIMIT" => {
+                Ok(Value::int(C_RECURSION_LIMIT).expect("recursion test limit fits"))
+            }
             "NEVER_EQ" => Ok(*NEVER_EQ_VALUE),
+            "Py_DEBUG" => Ok(Value::bool(false)),
+            "cpython_only" => Ok(builtin_value(&CPYTHON_ONLY_FUNCTION)),
+            "infinite_recursion" => Ok(builtin_value(&INFINITE_RECURSION_FUNCTION)),
+            "is_wasi" => Ok(Value::bool(false)),
+            "requires_limited_api" => Ok(builtin_value(&REQUIRES_LIMITED_API_FUNCTION)),
+            "skip_on_s390x" => Ok(builtin_value(&SKIP_ON_S390X_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support' has no attribute '{}'",
                 name
@@ -114,6 +169,30 @@ fn build_sentinel_class(
             | ClassFlags::HAS_EQ
             | ClassFlags::HASHABLE,
     );
+
+    let class = Arc::new(class);
+    let mut bitmap = SubclassBitmap::for_type(class.class_type_id());
+    bitmap.set_bit(TypeId::OBJECT);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
+}
+
+fn build_infinite_recursion_class() -> Arc<PyClassObject> {
+    let mut class = PyClassObject::new_simple(intern("_InfiniteRecursion"));
+    class.set_attr(intern("__module__"), Value::string(intern("test.support")));
+    class.set_attr(
+        intern("__qualname__"),
+        Value::string(intern("_InfiniteRecursion")),
+    );
+    class.set_attr(
+        intern("__enter__"),
+        builtin_value(&INFINITE_RECURSION_ENTER_FUNCTION),
+    );
+    class.set_attr(
+        intern("__exit__"),
+        builtin_value(&INFINITE_RECURSION_EXIT_FUNCTION),
+    );
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
 
     let class = Arc::new(class);
     let mut bitmap = SubclassBitmap::for_type(class.class_type_id());
@@ -170,6 +249,90 @@ fn never_eq_hash(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     Ok(Value::int(1).expect("constant hash fits in tagged int"))
+}
+
+fn infinite_recursion(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "infinite_recursion() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(*INFINITE_RECURSION_VALUE)
+}
+
+fn infinite_recursion_enter(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "__enter__() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(args[0])
+}
+
+fn infinite_recursion_exit(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "__exit__() takes exactly 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(Value::bool(false))
+}
+
+fn mark_unittest_skip(
+    vm: &mut VirtualMachine,
+    target: Value,
+    reason: &'static str,
+) -> Result<Value, BuiltinError> {
+    crate::ops::objects::set_attribute_value(
+        vm,
+        target,
+        &intern("__unittest_skip__"),
+        Value::bool(true),
+    )
+    .map_err(runtime_error_to_builtin_error)?;
+    crate::ops::objects::set_attribute_value(
+        vm,
+        target,
+        &intern("__unittest_skip_why__"),
+        Value::string(intern(reason)),
+    )
+    .map_err(runtime_error_to_builtin_error)?;
+    Ok(target)
+}
+
+fn cpython_only(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "cpython_only() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    mark_unittest_skip(vm, args[0], "CPython implementation detail")
+}
+
+fn requires_limited_api(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "requires_limited_api() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    mark_unittest_skip(vm, args[0], "needs Limited API support")
+}
+
+fn identity_decorator(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "decorator takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    Ok(args[0])
 }
 
 /// Native `test.support.os_helper` module descriptor.

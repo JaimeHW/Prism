@@ -31,6 +31,8 @@ pub mod wraps;
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::ops::calls::value_supports_call_protocol;
+use crate::python_numeric::int_like_value;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -54,6 +56,11 @@ static UPDATE_WRAPPER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
         builtin_update_wrapper,
     )
 });
+static LRU_CACHE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("functools.lru_cache"), builtin_lru_cache)
+});
+static CACHE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("functools.cache"), builtin_cache));
 static WRAPS_DECORATOR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("functools._identity_decorator"),
@@ -122,13 +129,13 @@ impl Module for FunctoolsModule {
         match name {
             "wraps" => Ok(builtin_value(&WRAPS_FUNCTION)),
             "update_wrapper" => Ok(builtin_value(&UPDATE_WRAPPER_FUNCTION)),
+            "lru_cache" => Ok(builtin_value(&LRU_CACHE_FUNCTION)),
+            "cache" => Ok(builtin_value(&CACHE_FUNCTION)),
+            "partial" => Ok(crate::stdlib::_functools::partial_class_value()),
             "WRAPPER_ASSIGNMENTS" => Ok(tuple_value(&WRAPPER_ASSIGNMENTS_VALUE)),
             "WRAPPER_UPDATES" => Ok(tuple_value(&WRAPPER_UPDATES_VALUE)),
             "reduce"
-            | "partial"
             | "partialmethod"
-            | "lru_cache"
-            | "cache"
             | "cached_property"
             | "cmp_to_key"
             | "total_ordering"
@@ -187,6 +194,70 @@ fn builtin_update_wrapper(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
+    Ok(args[0])
+}
+
+fn builtin_lru_cache(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "lru_cache() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut maxsize = args.first().copied();
+    let mut typed = args.get(1).copied();
+    for &(name, value) in keywords {
+        match name {
+            "maxsize" => {
+                if maxsize.replace(value).is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "lru_cache() got multiple values for argument 'maxsize'".to_string(),
+                    ));
+                }
+            }
+            "typed" => {
+                if typed.replace(value).is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "lru_cache() got multiple values for argument 'typed'".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "lru_cache() got an unexpected keyword argument '{}'",
+                    name
+                )));
+            }
+        }
+    }
+
+    if let Some(candidate) = maxsize
+        && value_supports_call_protocol(candidate)
+        && typed.is_none()
+    {
+        return Ok(candidate);
+    }
+
+    if let Some(value) = maxsize
+        && !value.is_none()
+        && int_like_value(value).is_none()
+    {
+        return Err(BuiltinError::TypeError(
+            "Expected first argument to be an integer, a callable, or None".to_string(),
+        ));
+    }
+
+    Ok(builtin_value(&WRAPS_DECORATOR))
+}
+
+fn builtin_cache(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "cache() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     Ok(args[0])
 }
 

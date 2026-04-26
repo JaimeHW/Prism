@@ -13,6 +13,7 @@ use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // =============================================================================
 // Closure Environment
@@ -322,6 +323,12 @@ pub struct FunctionObject {
     globals_ptr: *const (),
     /// Lazily populated custom function attributes and optional live __dict__.
     attrs: RwLock<FunctionAttrs>,
+    /// Native vectorcall override state used by C-API compatibility helpers.
+    ///
+    /// The hot function-call path reads this as one relaxed byte before the
+    /// normal frame setup. Keeping it out of the attribute dictionary avoids a
+    /// lock and keeps the default path branch-predictable.
+    vectorcall_override: AtomicU8,
 }
 
 // Safety: FunctionObject is Send + Sync because:
@@ -347,6 +354,7 @@ impl FunctionObject {
             closure,
             globals_ptr: std::ptr::null(),
             attrs: RwLock::new(FunctionAttrs::default()),
+            vectorcall_override: AtomicU8::new(0),
         }
     }
 
@@ -368,6 +376,7 @@ impl FunctionObject {
             closure: None,
             globals_ptr,
             attrs: RwLock::new(FunctionAttrs::default()),
+            vectorcall_override: AtomicU8::new(0),
         }
     }
 
@@ -483,6 +492,18 @@ impl FunctionObject {
     #[inline]
     pub unsafe fn set_globals_ptr(&mut self, globals_ptr: *const ()) {
         self.globals_ptr = globals_ptr;
+    }
+
+    /// Install the `_testcapi.function_setvectorcall` override.
+    #[inline]
+    pub fn set_test_vectorcall_override(&self) {
+        self.vectorcall_override.store(1, Ordering::Release);
+    }
+
+    /// Whether calls should take the `_testcapi.function_setvectorcall` path.
+    #[inline]
+    pub fn has_test_vectorcall_override(&self) -> bool {
+        self.vectorcall_override.load(Ordering::Acquire) != 0
     }
 }
 

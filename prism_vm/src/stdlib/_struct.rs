@@ -61,13 +61,20 @@ static STRUCT_ITER_UNPACK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::ne
 /// Native `_struct` module descriptor.
 #[derive(Debug, Clone)]
 pub struct StructModule {
+    name: &'static str,
     attrs: Vec<Arc<str>>,
 }
 
 impl StructModule {
     /// Create a new `_struct` module descriptor.
     pub fn new() -> Self {
+        Self::with_name("_struct")
+    }
+
+    /// Create a struct-compatible module descriptor with a public module name.
+    pub fn with_name(name: &'static str) -> Self {
         Self {
+            name,
             attrs: vec![
                 Arc::from("__doc__"),
                 Arc::from("_clearcache"),
@@ -92,7 +99,7 @@ impl Default for StructModule {
 
 impl Module for StructModule {
     fn name(&self) -> &str {
-        "_struct"
+        self.name
     }
 
     fn get_attr(&self, name: &str) -> ModuleResult {
@@ -108,8 +115,8 @@ impl Module for StructModule {
             "unpack" => Ok(builtin_value(&UNPACK_FUNCTION)),
             "unpack_from" => Ok(builtin_value(&UNPACK_FROM_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
-                "module '_struct' has no attribute '{}'",
-                name
+                "module '{}' has no attribute '{}'",
+                self.name, name
             ))),
         }
     }

@@ -17,6 +17,7 @@ use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
     SubclassBitmap, class_id_to_type_id, register_global_class,
 };
+use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -355,6 +356,31 @@ fn marker_text(value: Value) -> Result<InternedString, BuiltinError> {
     }
     let string = unsafe { &*(ptr as *const prism_runtime::types::string::StringObject) };
     Ok(intern(string.as_str()))
+}
+
+/// Return the concrete runtime type represented by a native typing marker.
+///
+/// This keeps the compact native `typing` module useful for CPython
+/// compatibility tests without putting typing-specific checks into the core
+/// object model. Unknown or purely static typing forms intentionally return
+/// `None` so runtime checks still reject them.
+pub(crate) fn typing_marker_type_id(value: Value) -> Option<TypeId> {
+    let ptr = value.as_object_ptr()?;
+    if crate::ops::objects::extract_type_id(ptr).raw() < TypeId::FIRST_USER_TYPE {
+        return None;
+    }
+
+    let object = unsafe { &*(ptr as *const ShapedObject) };
+    let name = marker_text(object.get_property("__typing_name__")?).ok()?;
+    match name.as_str() {
+        "Dict" => Some(TypeId::DICT),
+        "FrozenSet" => Some(TypeId::FROZENSET),
+        "List" => Some(TypeId::LIST),
+        "Set" => Some(TypeId::SET),
+        "Tuple" => Some(TypeId::TUPLE),
+        "Type" => Some(TypeId::TYPE),
+        _ => None,
+    }
 }
 
 fn typing_form_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
