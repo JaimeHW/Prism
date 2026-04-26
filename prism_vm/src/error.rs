@@ -4,6 +4,7 @@
 //! Errors are designed for minimal allocation and fast construction on hot paths.
 
 use crate::builtins::BuiltinError;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::{PrismError, Span, Value};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -263,6 +264,18 @@ impl RuntimeError {
         Self::new(RuntimeErrorKind::ValueError {
             message: message.into(),
         })
+    }
+
+    #[inline]
+    pub fn overflow_error(message: impl Into<Arc<str>>) -> Self {
+        Self::new(RuntimeErrorKind::OverflowError {
+            message: message.into(),
+        })
+    }
+
+    #[inline]
+    pub fn memory_error(message: impl Into<Arc<str>>) -> Self {
+        Self::exception(ExceptionTypeId::MemoryError.as_u8() as u16, message)
     }
 
     #[inline]

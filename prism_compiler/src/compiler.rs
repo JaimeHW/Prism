@@ -3062,29 +3062,26 @@ impl Compiler {
             BinOp::BitAnd => self.builder.emit_bitwise_and(dst, left, right),
             BinOp::BitOr => self.builder.emit_bitwise_or(dst, left, right),
             BinOp::BitXor => self.builder.emit_bitwise_xor(dst, left, right),
-            BinOp::MatMult => {
-                // Matrix multiplication - use generic multiply for now
-                self.builder.emit_mul(dst, left, right)
-            }
+            BinOp::MatMult => self.builder.emit_matmul(dst, left, right),
         }
     }
 
     /// Emit an augmented assignment operation.
     fn emit_augop(&mut self, op: AugOp, dst: Register, left: Register, right: Register) {
         match op {
-            AugOp::Add => self.builder.emit_add(dst, left, right),
-            AugOp::Sub => self.builder.emit_sub(dst, left, right),
-            AugOp::Mult => self.builder.emit_mul(dst, left, right),
-            AugOp::Div => self.builder.emit_div(dst, left, right),
-            AugOp::FloorDiv => self.builder.emit_floor_div(dst, left, right),
-            AugOp::Mod => self.builder.emit_mod(dst, left, right),
-            AugOp::Pow => self.builder.emit_pow(dst, left, right),
-            AugOp::LShift => self.builder.emit_shl(dst, left, right),
-            AugOp::RShift => self.builder.emit_shr(dst, left, right),
-            AugOp::BitAnd => self.builder.emit_bitwise_and(dst, left, right),
-            AugOp::BitOr => self.builder.emit_bitwise_or(dst, left, right),
-            AugOp::BitXor => self.builder.emit_bitwise_xor(dst, left, right),
-            AugOp::MatMult => self.builder.emit_mul(dst, left, right),
+            AugOp::Add => self.builder.emit_inplace_add(dst, left, right),
+            AugOp::Sub => self.builder.emit_inplace_sub(dst, left, right),
+            AugOp::Mult => self.builder.emit_inplace_mul(dst, left, right),
+            AugOp::Div => self.builder.emit_inplace_div(dst, left, right),
+            AugOp::FloorDiv => self.builder.emit_inplace_floor_div(dst, left, right),
+            AugOp::Mod => self.builder.emit_inplace_mod(dst, left, right),
+            AugOp::Pow => self.builder.emit_inplace_pow(dst, left, right),
+            AugOp::LShift => self.builder.emit_inplace_shl(dst, left, right),
+            AugOp::RShift => self.builder.emit_inplace_shr(dst, left, right),
+            AugOp::BitAnd => self.builder.emit_inplace_bitwise_and(dst, left, right),
+            AugOp::BitOr => self.builder.emit_inplace_bitwise_or(dst, left, right),
+            AugOp::BitXor => self.builder.emit_inplace_bitwise_xor(dst, left, right),
+            AugOp::MatMult => self.builder.emit_inplace_matmul(dst, left, right),
         }
     }
 

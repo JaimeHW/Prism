@@ -7,12 +7,22 @@
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::builtins::{
+    BuiltinError, BuiltinFunctionObject, builtin_not_implemented_value,
+    runtime_error_to_builtin_error, try_len_value,
+};
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::{compare_order_result, contains_value, eq_result, ne_result};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::objects::extract_type_id;
 use crate::ops::protocols::RichCompareOp;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::truthiness::try_is_truthy;
+use num_bigint::{BigInt, Sign};
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use std::sync::{Arc, LazyLock};
 
@@ -22,6 +32,9 @@ static NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.not_"), operator_not));
 static CONTAINS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("operator.contains"), operator_contains)
+});
+static LENGTH_HINT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("operator.length_hint"), operator_length_hint)
 });
 static LT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.lt"), operator_lt));
@@ -41,7 +54,18 @@ static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
 
 const EXPORTS: &[&str] = &[
-    "contains", "eq", "ge", "gt", "is_", "is_not", "le", "lt", "ne", "not_", "truth",
+    "contains",
+    "eq",
+    "ge",
+    "gt",
+    "is_",
+    "is_not",
+    "le",
+    "length_hint",
+    "lt",
+    "ne",
+    "not_",
+    "truth",
 ];
 
 /// Native `operator` module descriptor.
@@ -83,6 +107,7 @@ impl Module for OperatorModule {
             "truth" => Ok(builtin_value(&TRUTH_FUNCTION)),
             "not_" => Ok(builtin_value(&NOT_FUNCTION)),
             "contains" => Ok(builtin_value(&CONTAINS_FUNCTION)),
+            "length_hint" => Ok(builtin_value(&LENGTH_HINT_FUNCTION)),
             "eq" => Ok(builtin_value(&EQ_FUNCTION)),
             "ne" => Ok(builtin_value(&NE_FUNCTION)),
             "lt" => Ok(builtin_value(&LT_FUNCTION)),
@@ -148,6 +173,148 @@ fn operator_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
     contains_value(vm, args[1], args[0])
         .map(Value::bool)
         .map_err(BuiltinError::Raised)
+}
+
+fn operator_length_hint(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "length_hint expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let default = match args.get(1).copied() {
+        Some(value) => parse_default_hint(value)?,
+        None => BigInt::from(0),
+    };
+
+    match try_len_value(vm, args[0]) {
+        Ok(len) => return ssize_len_to_value(len),
+        Err(err) if is_type_error(&err) => {}
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    }
+
+    let target = match resolve_special_method(args[0], "__length_hint__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => return Ok(bigint_to_value(default)),
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let hint = match invoke_zero_arg_bound_method(vm, target) {
+        Ok(value) => value,
+        Err(err) if is_type_error(&err) => return Ok(bigint_to_value(default)),
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    if hint == builtin_not_implemented_value() {
+        return Ok(bigint_to_value(default));
+    }
+
+    normalize_length_hint_result(hint)
+}
+
+#[inline]
+fn invoke_zero_arg_bound_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, RuntimeError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+}
+
+#[inline]
+fn parse_default_hint(value: Value) -> Result<BigInt, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(BigInt::from(usize::from(flag)));
+    }
+
+    let Some(default) = value_to_bigint(value) else {
+        return Err(BuiltinError::TypeError(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value_type_name(value)
+        )));
+    };
+
+    if default < BigInt::from(isize::MIN) || default > BigInt::from(isize::MAX) {
+        return Err(BuiltinError::OverflowError(
+            "Python int too large to convert to C ssize_t".to_string(),
+        ));
+    }
+
+    Ok(default)
+}
+
+#[inline]
+fn normalize_length_hint_result(value: Value) -> Result<Value, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(bigint_to_value(BigInt::from(usize::from(flag))));
+    }
+
+    let Some(length) = value_to_bigint(value) else {
+        return Err(BuiltinError::TypeError(format!(
+            "__length_hint__ must be an integer, not {}",
+            value_type_name(value)
+        )));
+    };
+
+    if length.sign() == Sign::Minus {
+        return Err(BuiltinError::ValueError(
+            "__length_hint__() should return >= 0".to_string(),
+        ));
+    }
+    if length > BigInt::from(isize::MAX) {
+        return Err(BuiltinError::OverflowError(
+            "cannot fit 'int' into an index-sized integer".to_string(),
+        ));
+    }
+
+    Ok(bigint_to_value(length))
+}
+
+#[inline]
+fn ssize_len_to_value(len: usize) -> Result<Value, BuiltinError> {
+    if len > isize::MAX as usize {
+        return Err(BuiltinError::OverflowError(
+            "cannot fit 'int' into an index-sized integer".to_string(),
+        ));
+    }
+    Ok(bigint_to_value(BigInt::from(len)))
+}
+
+#[inline]
+fn is_type_error(err: &RuntimeError) -> bool {
+    match err.kind() {
+        RuntimeErrorKind::TypeError { .. }
+        | RuntimeErrorKind::UnsupportedOperandTypes { .. }
+        | RuntimeErrorKind::NotCallable { .. }
+        | RuntimeErrorKind::NotIterable { .. }
+        | RuntimeErrorKind::NotSubscriptable { .. } => true,
+        RuntimeErrorKind::Exception { type_id, .. } => {
+            *type_id == ExceptionTypeId::TypeError.as_u8() as u16
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+fn value_type_name(value: Value) -> &'static str {
+    if value.is_none() {
+        "NoneType"
+    } else if value.as_bool().is_some() {
+        "bool"
+    } else if value.as_int().is_some() {
+        "int"
+    } else if value.as_float().is_some() {
+        "float"
+    } else if value.is_string() {
+        "str"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        extract_type_id(ptr).name()
+    } else {
+        "object"
+    }
 }
 
 fn operator_lt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {

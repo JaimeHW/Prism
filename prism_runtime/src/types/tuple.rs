@@ -117,15 +117,23 @@ impl TupleObject {
     }
 
     /// Create a new tuple by repeating n times.
-    pub fn repeat(&self, n: usize) -> TupleObject {
+    pub fn repeat(&self, n: usize) -> Option<TupleObject> {
         if n == 0 || self.is_empty() {
-            return TupleObject::empty();
+            return Some(TupleObject::empty());
         }
-        let mut items = Vec::with_capacity(self.len() * n);
-        for _ in 0..n {
-            items.extend_from_slice(&self.items);
+
+        let total_len = self.len().checked_mul(n)?;
+        let mut items = Vec::new();
+        items.try_reserve_exact(total_len).ok()?;
+        items.extend_from_slice(&self.items);
+
+        while items.len() < total_len {
+            let remaining = total_len - items.len();
+            let copy_len = items.len().min(remaining);
+            items.extend_from_within(..copy_len);
         }
-        TupleObject::from_vec(items)
+
+        Some(TupleObject::from_vec(items))
     }
 
     /// Get a slice as a new tuple.

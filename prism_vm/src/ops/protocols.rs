@@ -157,6 +157,16 @@ pub(crate) fn binary_special_method(
 }
 
 #[inline]
+pub(crate) fn inplace_special_method(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    method_name: &'static str,
+) -> Result<Option<Value>, RuntimeError> {
+    try_special_method_call(vm, left, method_name, right)
+}
+
+#[inline]
 pub(crate) fn rich_compare_bool(
     vm: &mut VirtualMachine,
     left: Value,

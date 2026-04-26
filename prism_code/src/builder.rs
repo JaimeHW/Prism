@@ -820,6 +820,51 @@ impl FunctionBuilder {
         self.emit(Instruction::op_dss(Opcode::Pow, dst, src1, src2));
     }
 
+    /// Generic matrix multiply: dst = src1 @ src2.
+    pub fn emit_matmul(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::MatMul, dst, src1, src2));
+    }
+
+    /// In-place add: dst = src1; dst += src2.
+    pub fn emit_inplace_add(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceAdd, dst, src1, src2));
+    }
+
+    /// In-place subtract: dst = src1; dst -= src2.
+    pub fn emit_inplace_sub(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceSub, dst, src1, src2));
+    }
+
+    /// In-place multiply: dst = src1; dst *= src2.
+    pub fn emit_inplace_mul(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceMul, dst, src1, src2));
+    }
+
+    /// In-place true divide: dst = src1; dst /= src2.
+    pub fn emit_inplace_div(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceTrueDiv, dst, src1, src2));
+    }
+
+    /// In-place floor divide: dst = src1; dst //= src2.
+    pub fn emit_inplace_floor_div(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(
+            Opcode::InPlaceFloorDiv,
+            dst,
+            src1,
+            src2,
+        ));
+    }
+
+    /// In-place modulo: dst = src1; dst %= src2.
+    pub fn emit_inplace_mod(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceMod, dst, src1, src2));
+    }
+
+    /// In-place power: dst = src1; dst **= src2.
+    pub fn emit_inplace_pow(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlacePow, dst, src1, src2));
+    }
+
     /// Generic negate: dst = -src.
     pub fn emit_neg(&mut self, dst: Register, src: Register) {
         self.emit(Instruction::op_ds(Opcode::Neg, dst, src));
@@ -892,6 +937,51 @@ impl FunctionBuilder {
     /// Right shift: dst = src1 >> src2.
     pub fn emit_shr(&mut self, dst: Register, src1: Register, src2: Register) {
         self.emit(Instruction::op_dss(Opcode::Shr, dst, src1, src2));
+    }
+
+    /// In-place bitwise and: dst = src1; dst &= src2.
+    pub fn emit_inplace_bitwise_and(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(
+            Opcode::InPlaceBitwiseAnd,
+            dst,
+            src1,
+            src2,
+        ));
+    }
+
+    /// In-place bitwise or: dst = src1; dst |= src2.
+    pub fn emit_inplace_bitwise_or(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(
+            Opcode::InPlaceBitwiseOr,
+            dst,
+            src1,
+            src2,
+        ));
+    }
+
+    /// In-place bitwise xor: dst = src1; dst ^= src2.
+    pub fn emit_inplace_bitwise_xor(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(
+            Opcode::InPlaceBitwiseXor,
+            dst,
+            src1,
+            src2,
+        ));
+    }
+
+    /// In-place left shift: dst = src1; dst <<= src2.
+    pub fn emit_inplace_shl(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceShl, dst, src1, src2));
+    }
+
+    /// In-place right shift: dst = src1; dst >>= src2.
+    pub fn emit_inplace_shr(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceShr, dst, src1, src2));
+    }
+
+    /// In-place matrix multiply: dst = src1; dst @= src2.
+    pub fn emit_inplace_matmul(&mut self, dst: Register, src1: Register, src2: Register) {
+        self.emit(Instruction::op_dss(Opcode::InPlaceMatMul, dst, src1, src2));
     }
 
     /// Logical not: dst = not src.

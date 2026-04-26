@@ -14,6 +14,39 @@ use prism_core::Value;
 use prism_core::intern::{InternedString, interned_by_ptr};
 use std::fmt;
 
+/// Host-provided fast length reader for guarded snapshot iterators.
+///
+/// The iterator type lives in `prism_runtime`, while some owner objects, such
+/// as `collections.deque`, are implemented by `prism_vm`. A function pointer
+/// keeps the runtime independent while still allowing O(1) mutation checks.
+pub type IteratorLenGuard = fn(Value) -> Option<usize>;
+
+/// Error raised while advancing a native iterator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IteratorAdvanceError {
+    message: &'static str,
+}
+
+impl IteratorAdvanceError {
+    #[inline]
+    fn mutated(message: &'static str) -> Self {
+        Self { message }
+    }
+
+    #[inline]
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl fmt::Display for IteratorAdvanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for IteratorAdvanceError {}
+
 // =============================================================================
 // Tuple creation helpers for composite iterators
 // =============================================================================
@@ -106,6 +139,20 @@ enum IterKind {
     /// Used as fallback for custom iterables.
     Values { values: Vec<Value>, index: usize },
 
+    /// Snapshot iterator guarded by the source container's current length.
+    ///
+    /// CPython's dict, set, and deque iterators raise `RuntimeError` once a
+    /// size-changing mutation is observed. Capturing a compact snapshot keeps
+    /// iteration cache-local while the O(1) guard preserves that contract.
+    GuardedValues {
+        owner: Value,
+        expected_len: usize,
+        len_guard: IteratorLenGuard,
+        mutation_message: &'static str,
+        values: Vec<Value>,
+        index: usize,
+    },
+
     /// Proxy over an existing iterator value.
     ///
     /// This preserves Python's iterator identity semantics for composite
@@ -190,6 +237,19 @@ enum IterKind {
     Reversed {
         values: Vec<Value>,
         /// Index counting back from end (starts at values.len() - 1)
+        reverse_index: usize,
+    },
+
+    /// Reverse iterator over a live list.
+    ReversedList { list: Value, reverse_index: usize },
+
+    /// Reverse snapshot iterator guarded by source container length.
+    GuardedReversedValues {
+        owner: Value,
+        expected_len: usize,
+        len_guard: IteratorLenGuard,
+        mutation_message: &'static str,
+        values: Vec<Value>,
         reverse_index: usize,
     },
 
@@ -448,6 +508,30 @@ impl IteratorObject {
         }
     }
 
+    /// Create a snapshot iterator that checks the backing collection length.
+    #[inline]
+    pub fn guarded_values(
+        owner: Value,
+        values: Vec<Value>,
+        len_guard: IteratorLenGuard,
+        mutation_message: &'static str,
+    ) -> Self {
+        let exhausted = values.is_empty();
+        let expected_len = len_guard(owner).unwrap_or(values.len());
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::GuardedValues {
+                owner,
+                expected_len,
+                len_guard,
+                mutation_message,
+                values,
+                index: 0,
+            },
+            exhausted,
+        }
+    }
+
     /// Create a proxy iterator that forwards to an existing iterator object.
     #[inline]
     pub fn from_existing_iterator(iterator: Value) -> Self {
@@ -578,6 +662,44 @@ impl IteratorObject {
         }
     }
 
+    /// Create a reverse iterator over a live list.
+    #[inline]
+    pub fn reversed_list(list: Value) -> Self {
+        let len = list_from_value(list).len();
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::ReversedList {
+                list,
+                reverse_index: len,
+            },
+            exhausted: len == 0,
+        }
+    }
+
+    /// Create a reverse snapshot iterator guarded by backing collection length.
+    #[inline]
+    pub fn guarded_reversed_values(
+        owner: Value,
+        values: Vec<Value>,
+        len_guard: IteratorLenGuard,
+        mutation_message: &'static str,
+    ) -> Self {
+        let len = values.len();
+        let expected_len = len_guard(owner).unwrap_or(len);
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::GuardedReversedValues {
+                owner,
+                expected_len,
+                len_guard,
+                mutation_message,
+                values,
+                reverse_index: len,
+            },
+            exhausted: len == 0,
+        }
+    }
+
     /// Create a dict keys iterator.
     #[inline]
     pub fn dict_keys(keys: Vec<Value>) -> Self {
@@ -642,15 +764,15 @@ impl IteratorObject {
         }
     }
 
-    /// Get the next value from the iterator.
+    /// Get the next value from the iterator, preserving iterator errors.
     ///
     /// Returns `Some(value)` if there are more elements, `None` if exhausted.
-    pub fn next(&mut self) -> Option<Value> {
+    pub fn next_checked(&mut self) -> Result<Option<Value>, IteratorAdvanceError> {
         if self.exhausted {
-            return None;
+            return Ok(None);
         }
 
-        match &mut self.kind {
+        let next = match &mut self.kind {
             IterKind::Range(iter) => match iter.next() {
                 Some(v) => Some(v),
                 None => {
@@ -723,7 +845,7 @@ impl IteratorObject {
                 let s = string.as_str();
                 if *byte_offset >= s.len() {
                     self.exhausted = true;
-                    return None;
+                    return Ok(None);
                 }
 
                 // Get the next char and its byte length
@@ -763,10 +885,32 @@ impl IteratorObject {
                 }
             }
 
+            IterKind::GuardedValues {
+                owner,
+                expected_len,
+                len_guard,
+                mutation_message,
+                values,
+                index,
+            } => {
+                if len_guard(*owner) != Some(*expected_len) {
+                    self.exhausted = true;
+                    return Err(IteratorAdvanceError::mutated(mutation_message));
+                }
+                if *index < values.len() {
+                    let value = values[*index];
+                    *index += 1;
+                    Some(value)
+                } else {
+                    self.exhausted = true;
+                    None
+                }
+            }
+
             IterKind::SharedIterator { iterator } => {
                 match native_iterator_from_value_mut(*iterator) {
                     Some(iter) => {
-                        let value = iter.next();
+                        let value = iter.next_checked()?;
                         self.exhausted = iter.is_exhausted();
                         value
                     }
@@ -784,8 +928,8 @@ impl IteratorObject {
             // =================================================================
             IterKind::Chain { iterators, current } => {
                 while *current < iterators.len() {
-                    if let Some(value) = iterators[*current].next() {
-                        return Some(value);
+                    if let Some(value) = iterators[*current].next_checked()? {
+                        return Ok(Some(value));
                     }
                     *current += 1;
                 }
@@ -795,7 +939,7 @@ impl IteratorObject {
             }
 
             IterKind::Enumerate { inner, index } => {
-                match inner.next() {
+                match inner.next_checked()? {
                     Some(value) => {
                         let idx = *index;
                         *index += 1;
@@ -812,18 +956,18 @@ impl IteratorObject {
             IterKind::Zip { iterators } => {
                 if iterators.is_empty() {
                     self.exhausted = true;
-                    return None;
+                    return Ok(None);
                 }
 
                 // Collect one element from each iterator
                 let mut values = Vec::with_capacity(iterators.len());
                 for iter in iterators.iter_mut() {
-                    match iter.next() {
+                    match iter.next_checked()? {
                         Some(v) => values.push(v),
                         None => {
                             // Any exhausted iterator ends zip
                             self.exhausted = true;
-                            return None;
+                            return Ok(None);
                         }
                     }
                 }
@@ -834,7 +978,7 @@ impl IteratorObject {
             IterKind::Map { func: _, inner } => {
                 // Map iterator: returns raw value, caller must apply function
                 // This is a "lazy" map that requires VM integration for the call
-                match inner.next() {
+                match inner.next_checked()? {
                     Some(value) => Some(value),
                     None => {
                         self.exhausted = true;
@@ -847,23 +991,23 @@ impl IteratorObject {
                 // Identity filter when func is None: skip falsy values
                 if func.is_none() {
                     loop {
-                        match inner.next() {
+                        match inner.next_checked()? {
                             Some(value) => {
                                 if value.is_truthy() {
-                                    return Some(value);
+                                    return Ok(Some(value));
                                 }
                                 // Skip falsy, continue loop
                             }
                             None => {
                                 self.exhausted = true;
-                                return None;
+                                return Ok(None);
                             }
                         }
                     }
                 } else {
                     // With predicate function: caller must evaluate
                     // For now, just return next value (VM must handle predicate)
-                    match inner.next() {
+                    match inner.next_checked()? {
                         Some(value) => Some(value),
                         None => {
                             self.exhausted = true;
@@ -882,18 +1026,18 @@ impl IteratorObject {
             } => {
                 if stop.is_some_and(|stop_index| *next_yield >= stop_index) {
                     self.exhausted = true;
-                    return None;
+                    return Ok(None);
                 }
 
                 while *pos < *next_yield {
-                    if inner.next().is_none() {
+                    if inner.next_checked()?.is_none() {
                         self.exhausted = true;
-                        return None;
+                        return Ok(None);
                     }
                     *pos += 1;
                 }
 
-                match inner.next() {
+                match inner.next_checked()? {
                     Some(value) => {
                         *pos += 1;
                         *next_yield = next_yield.saturating_add(*step);
@@ -912,10 +1056,45 @@ impl IteratorObject {
             } => {
                 if *reverse_index == 0 {
                     self.exhausted = true;
-                    return None;
+                    return Ok(None);
                 }
                 *reverse_index -= 1;
                 Some(values[*reverse_index])
+            }
+
+            IterKind::ReversedList {
+                list,
+                reverse_index,
+            } => {
+                let list = list_from_value(*list);
+                if *reverse_index == 0 || list.len() < *reverse_index {
+                    self.exhausted = true;
+                    None
+                } else {
+                    *reverse_index -= 1;
+                    list.get(*reverse_index as i64)
+                }
+            }
+
+            IterKind::GuardedReversedValues {
+                owner,
+                expected_len,
+                len_guard,
+                mutation_message,
+                values,
+                reverse_index,
+            } => {
+                if len_guard(*owner) != Some(*expected_len) {
+                    self.exhausted = true;
+                    return Err(IteratorAdvanceError::mutated(mutation_message));
+                }
+                if *reverse_index == 0 {
+                    self.exhausted = true;
+                    None
+                } else {
+                    *reverse_index -= 1;
+                    Some(values[*reverse_index])
+                }
             }
 
             IterKind::DictKeys { keys, index } => {
@@ -961,7 +1140,19 @@ impl IteratorObject {
                     None
                 }
             }
-        }
+        };
+
+        Ok(next)
+    }
+
+    /// Get the next value from the iterator.
+    ///
+    /// This legacy infallible entry point is kept for static runtime helpers
+    /// that cannot surface Python exceptions. VM-facing iteration should use
+    /// `next_checked` or `next_with`.
+    #[inline]
+    pub fn next(&mut self) -> Option<Value> {
+        self.next_checked().ok().flatten()
     }
 
     /// Get the remaining length hint, if known.
@@ -999,6 +1190,20 @@ impl IteratorObject {
                 Some(bytes_from_value(*bytes).len().saturating_sub(*index))
             }
             IterKind::Values { values, index } => Some(values.len().saturating_sub(*index)),
+            IterKind::GuardedValues {
+                owner,
+                expected_len,
+                len_guard,
+                values,
+                index,
+                ..
+            } => {
+                if len_guard(*owner) == Some(*expected_len) {
+                    Some(values.len().saturating_sub(*index))
+                } else {
+                    Some(0)
+                }
+            }
             IterKind::SharedIterator { iterator } => {
                 native_iterator_from_value(*iterator).and_then(IteratorObject::size_hint)
             }
@@ -1033,6 +1238,30 @@ impl IteratorObject {
                 values,
                 reverse_index,
             } => Some(*reverse_index.min(&values.len())),
+            IterKind::ReversedList {
+                list,
+                reverse_index,
+            } => {
+                if list_from_value(*list).len() < *reverse_index {
+                    Some(0)
+                } else {
+                    Some(*reverse_index)
+                }
+            }
+            IterKind::GuardedReversedValues {
+                owner,
+                expected_len,
+                len_guard,
+                values,
+                reverse_index,
+                ..
+            } => {
+                if len_guard(*owner) == Some(*expected_len) {
+                    Some(*reverse_index.min(&values.len()))
+                } else {
+                    Some(0)
+                }
+            }
             IterKind::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
             IterKind::DictValues { values, index } => Some(values.len().saturating_sub(*index)),
             IterKind::DictItems { items, index } => Some(items.len().saturating_sub(*index)),
@@ -1060,6 +1289,7 @@ impl IteratorObject {
         advance_iterator: &mut N,
     ) -> Result<Option<Value>, E>
     where
+        E: From<IteratorAdvanceError>,
         F: FnMut(Value, &[Value]) -> Result<Value, E>,
         T: FnMut(Value) -> Result<bool, E>,
         N: FnMut(Value) -> Result<Option<Value>, E>,
@@ -1172,7 +1402,7 @@ impl IteratorObject {
             _ => {}
         }
 
-        Ok(self.next())
+        self.next_checked().map_err(E::from)
     }
 }
 
@@ -1187,6 +1417,7 @@ impl fmt::Debug for IteratorObject {
             IterKind::StringChars { .. } => "str_iterator",
             IterKind::Bytes { .. } => "bytes_iterator",
             IterKind::Values { .. } => "iterator",
+            IterKind::GuardedValues { .. } => "iterator",
             IterKind::SharedIterator { .. } => "iterator",
             IterKind::Empty => "empty_iterator",
             // Composite iterators
@@ -1197,6 +1428,8 @@ impl fmt::Debug for IteratorObject {
             IterKind::Filter { .. } => "filter",
             IterKind::ISlice { .. } => "islice",
             IterKind::Reversed { .. } => "reversed",
+            IterKind::ReversedList { .. } => "list_reverseiterator",
+            IterKind::GuardedReversedValues { .. } => "reversed",
             IterKind::DictKeys { .. } => "dict_keys",
             IterKind::DictValues { .. } => "dict_values",
             IterKind::DictItems { .. } => "dict_items",

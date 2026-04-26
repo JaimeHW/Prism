@@ -1,9 +1,11 @@
 use super::BuiltinError;
 use crate::VirtualMachine;
 use crate::ops::iteration::{IterStep, collect_iterable_values, ensure_iterator_value, next_step};
+use crate::stdlib::collections::deque::{DequeObject, value_as_deque};
 use num_traits::{One, Zero};
 use prism_core::Value;
 use prism_runtime::types::int::value_to_bigint;
+use prism_runtime::types::list::value_as_list_ref;
 use prism_runtime::types::range::RangeObject;
 
 // =============================================================================
@@ -395,19 +397,32 @@ pub fn builtin_filter(args: &[Value]) -> Result<Value, BuiltinError> {
 ///
 /// # Performance
 ///
-/// - O(n) construction (materializes sequence into Vec)
-/// - O(1) per iteration step
-///
-/// # Note
-///
-/// Currently materializes the entire sequence. A future optimization would
-/// check for __reversed__ or use index-based backwards traversal.
+/// - Lists use a live reverse iterator: O(1) construction and CPython-compatible
+///   shrink handling.
+/// - Deques use a guarded snapshot: O(n) construction and O(1) mutation checks.
+/// - Other iterables currently materialize into a compact reverse iterator.
 pub fn builtin_reversed(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "reversed expected 1 argument, got {}",
             args.len()
         )));
+    }
+
+    if value_as_list_ref(args[0]).is_some() {
+        let reversed = prism_runtime::types::iter::IteratorObject::reversed_list(args[0]);
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
+    }
+
+    if let Some(deque) = value_as_deque(&args[0]) {
+        let values = deque.deque().iter().copied().collect();
+        let reversed = prism_runtime::types::iter::IteratorObject::guarded_reversed_values(
+            args[0],
+            values,
+            deque_len_guard,
+            "deque mutated during iteration",
+        );
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
     }
 
     // Convert to iterator and collect all values
@@ -417,6 +432,11 @@ pub fn builtin_reversed(args: &[Value]) -> Result<Value, BuiltinError> {
     // Create reversed iterator
     let reversed = prism_runtime::types::iter::IteratorObject::reversed(values);
     Ok(super::iter_dispatch::iterator_to_value(reversed))
+}
+
+#[inline]
+fn deque_len_guard(value: Value) -> Option<usize> {
+    value_as_deque(&value).map(DequeObject::len)
 }
 
 // =============================================================================

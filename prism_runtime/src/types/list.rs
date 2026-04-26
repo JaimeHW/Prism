@@ -243,21 +243,55 @@ impl ListObject {
     /// Mirrors Python's `list * int` semantics by returning a new list and
     /// preserving element order for each repetition.
     #[inline]
-    pub fn repeat(&self, n: usize) -> Self {
+    pub fn repeat(&self, n: usize) -> Option<Self> {
         if n == 0 || self.items.is_empty() {
-            return Self::new();
+            return Some(Self::new());
         }
 
-        let total_len = self.items.len() * n;
-        let mut result = Vec::with_capacity(total_len);
-        for _ in 0..n {
-            result.extend(self.items.iter().copied());
+        let total_len = self.items.len().checked_mul(n)?;
+        let mut result = Vec::new();
+        result.try_reserve_exact(total_len).ok()?;
+        result.extend_from_slice(&self.items);
+
+        while result.len() < total_len {
+            let remaining = total_len - result.len();
+            let copy_len = result.len().min(remaining);
+            result.extend_from_within(..copy_len);
         }
 
-        Self {
+        Some(Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: result,
+        })
+    }
+
+    /// Repeat this list in place while preserving object identity.
+    ///
+    /// Uses the same doubling copy strategy as `repeat` so `list *= n` stays
+    /// O(len * n) with logarithmic source copies and exact preallocation.
+    #[inline]
+    pub fn repeat_in_place(&mut self, n: usize) -> Option<()> {
+        if n == 0 || self.items.is_empty() {
+            self.items.clear();
+            return Some(());
         }
+        if n == 1 {
+            return Some(());
+        }
+
+        let original_len = self.items.len();
+        let total_len = original_len.checked_mul(n)?;
+        self.items
+            .try_reserve_exact(total_len - original_len)
+            .ok()?;
+
+        while self.items.len() < total_len {
+            let remaining = total_len - self.items.len();
+            let copy_len = self.items.len().min(remaining);
+            self.items.extend_from_within(..copy_len);
+        }
+
+        Some(())
     }
 
     /// Get a slice of the list.

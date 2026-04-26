@@ -1,7 +1,7 @@
 //! Shared iteration helpers for VM-side iterator and generator driving.
 
 use crate::VirtualMachine;
-use crate::builtins::{iterator_to_value, value_to_iterator};
+use crate::builtins::{iterator_to_value, try_length_hint, value_to_iterator};
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
@@ -11,8 +11,15 @@ use crate::stdlib::generators::GeneratorObject;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::iter::IteratorObject;
+use prism_runtime::types::iter::{IteratorAdvanceError, IteratorObject};
 use std::cell::RefCell;
+
+impl From<IteratorAdvanceError> for RuntimeError {
+    #[inline]
+    fn from(err: IteratorAdvanceError) -> Self {
+        RuntimeError::exception(ExceptionTypeId::RuntimeError.as_u8() as u16, err.message())
+    }
+}
 
 /// Result of advancing an iterator-like object by one step.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,8 +155,12 @@ pub(crate) fn collect_iterable_values(
     vm: &mut VirtualMachine,
     iterable: Value,
 ) -> Result<Vec<Value>, RuntimeError> {
+    let capacity = try_length_hint(vm, iterable, 0)?;
     let iterator = ensure_iterator_value(vm, iterable)?;
     let mut values = Vec::new();
+    values
+        .try_reserve(capacity)
+        .map_err(|_| RuntimeError::memory_error("length hint is too large"))?;
 
     loop {
         match next_step(vm, iterator)? {

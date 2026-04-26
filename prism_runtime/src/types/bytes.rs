@@ -252,9 +252,14 @@ impl BytesObject {
             return Some(Self::from_vec_with_type(Vec::new(), self.header.type_id));
         }
 
-        let mut data = Vec::with_capacity(total_len);
-        for _ in 0..n {
-            data.extend_from_slice(&self.data);
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_len).ok()?;
+        data.extend_from_slice(&self.data);
+
+        while data.len() < total_len {
+            let remaining = total_len - data.len();
+            let copy_len = data.len().min(remaining);
+            data.extend_from_within(..copy_len);
         }
         Some(Self::from_vec_with_type(data, self.header.type_id))
     }

@@ -29,12 +29,14 @@ use crate::error::RuntimeError;
 use crate::ops::calls::value_supports_call_protocol;
 use crate::ops::objects::{snapshot_frame_globals_dict, snapshot_frame_locals_dict};
 use crate::stdlib::exceptions::ExceptionTypeId;
+use num_bigint::BigInt;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::views::FrameViewObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::bigint_to_value;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -288,7 +290,7 @@ impl Module for SysModule {
             "api_version" => Ok(Value::int(API_VERSION as i64).unwrap()),
 
             // Limits
-            "maxsize" => Ok(Value::int(MAX_SIZE).unwrap()),
+            "maxsize" => Ok(bigint_to_value(BigInt::from(MAX_SIZE))),
             "maxunicode" => Ok(Value::int(MAX_UNICODE as i64).unwrap()),
 
             // Recursion limit as int

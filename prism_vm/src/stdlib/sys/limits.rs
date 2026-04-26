@@ -4,15 +4,14 @@
 //! range validation.
 
 use super::super::ModuleError;
-use prism_core::value::SMALL_INT_MAX;
-
 // =============================================================================
 // Size Limits
 // =============================================================================
 
 /// Maximum size for containers (sys.maxsize).
-/// This is the largest positive integer that can be stored inline in a Value.
-pub const MAX_SIZE: i64 = SMALL_INT_MAX;
+/// This mirrors CPython's `PY_SSIZE_T_MAX`, independent of Prism's tagged-int
+/// representation limit.
+pub const MAX_SIZE: i64 = isize::MAX as i64;
 
 /// Maximum Unicode code point (sys.maxunicode).
 pub const MAX_UNICODE: u32 = 0x10FFFF;

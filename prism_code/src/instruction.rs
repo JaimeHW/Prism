@@ -409,6 +409,8 @@ pub enum Opcode {
     Pos = 0x56,
     /// Logical not: dst = not src.
     Not = 0x57,
+    /// Matrix multiply: dst = src1 @ src2.
+    MatMul = 0x58,
 
     // =========================================================================
     // Object Operations (0x60-0x6F)
@@ -634,6 +636,36 @@ pub enum Opcode {
     /// immediately following `AttrName` instruction and reads its `imm16`.
     /// Executing this opcode directly is bytecode corruption.
     AttrName = 0xAC,
+
+    // =========================================================================
+    // In-place Binary Operations (0xB0-0xBC)
+    // =========================================================================
+    /// In-place add: dst = src1; dst += src2.
+    InPlaceAdd = 0xB0,
+    /// In-place subtract: dst = src1; dst -= src2.
+    InPlaceSub = 0xB1,
+    /// In-place multiply: dst = src1; dst *= src2.
+    InPlaceMul = 0xB2,
+    /// In-place true divide: dst = src1; dst /= src2.
+    InPlaceTrueDiv = 0xB3,
+    /// In-place floor divide: dst = src1; dst //= src2.
+    InPlaceFloorDiv = 0xB4,
+    /// In-place modulo: dst = src1; dst %= src2.
+    InPlaceMod = 0xB5,
+    /// In-place power: dst = src1; dst **= src2.
+    InPlacePow = 0xB6,
+    /// In-place left shift: dst = src1; dst <<= src2.
+    InPlaceShl = 0xB7,
+    /// In-place right shift: dst = src1; dst >>= src2.
+    InPlaceShr = 0xB8,
+    /// In-place bitwise and: dst = src1; dst &= src2.
+    InPlaceBitwiseAnd = 0xB9,
+    /// In-place bitwise or: dst = src1; dst |= src2.
+    InPlaceBitwiseOr = 0xBA,
+    /// In-place bitwise xor: dst = src1; dst ^= src2.
+    InPlaceBitwiseXor = 0xBB,
+    /// In-place matrix multiply: dst = src1; dst @= src2.
+    InPlaceMatMul = 0xBC,
 }
 
 impl Opcode {
@@ -722,6 +754,7 @@ impl Opcode {
             0x55 => Some(Opcode::Shr),
             0x56 => Some(Opcode::Pos),
             0x57 => Some(Opcode::Not),
+            0x58 => Some(Opcode::MatMul),
 
             0x60 => Some(Opcode::GetAttr),
             0x61 => Some(Opcode::SetAttr),
@@ -795,6 +828,20 @@ impl Opcode {
             0xA7 => Some(Opcode::AbortExcept),
             0xAC => Some(Opcode::AttrName),
 
+            0xB0 => Some(Opcode::InPlaceAdd),
+            0xB1 => Some(Opcode::InPlaceSub),
+            0xB2 => Some(Opcode::InPlaceMul),
+            0xB3 => Some(Opcode::InPlaceTrueDiv),
+            0xB4 => Some(Opcode::InPlaceFloorDiv),
+            0xB5 => Some(Opcode::InPlaceMod),
+            0xB6 => Some(Opcode::InPlacePow),
+            0xB7 => Some(Opcode::InPlaceShl),
+            0xB8 => Some(Opcode::InPlaceShr),
+            0xB9 => Some(Opcode::InPlaceBitwiseAnd),
+            0xBA => Some(Opcode::InPlaceBitwiseOr),
+            0xBB => Some(Opcode::InPlaceBitwiseXor),
+            0xBC => Some(Opcode::InPlaceMatMul),
+
             _ => None,
         }
     }
@@ -835,8 +882,12 @@ impl Opcode {
             AddInt | SubInt | MulInt | FloorDivInt | ModInt | PowInt | AddFloat | SubFloat
             | MulFloat | DivFloat | FloorDivFloat | ModFloat | PowFloat | Add | Sub | Mul
             | TrueDiv | FloorDiv | Mod | Pow | Lt | Le | Eq | Ne | Gt | Ge | Is | IsNot | In
-            | NotIn | BitwiseAnd | BitwiseOr | BitwiseXor | Shl | Shr | GetItem | SetItem
-            | DelItem | BuildSlice => DstSrcSrc,
+            | NotIn | BitwiseAnd | BitwiseOr | BitwiseXor | Shl | Shr | MatMul | InPlaceAdd
+            | InPlaceSub | InPlaceMul | InPlaceTrueDiv | InPlaceFloorDiv | InPlaceMod
+            | InPlacePow | InPlaceShl | InPlaceShr | InPlaceBitwiseAnd | InPlaceBitwiseOr
+            | InPlaceBitwiseXor | InPlaceMatMul | GetItem | SetItem | DelItem | BuildSlice => {
+                DstSrcSrc
+            }
 
             // Object ops with name index
             GetAttr | SetAttr | DelAttr => DstSrcSrc,

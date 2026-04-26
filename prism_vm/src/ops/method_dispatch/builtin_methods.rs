@@ -10,7 +10,7 @@ use crate::builtins::{
     builtin_hash, builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
     builtin_mapping_proxy_get_item_static, builtin_mapping_proxy_len,
     builtin_not_implemented_value, get_exception_type, get_iterator_mut, iterator_to_value,
-    value_to_iterator,
+    try_length_hint, value_to_iterator,
 };
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
@@ -42,7 +42,7 @@ use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObj
 use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
-use prism_runtime::types::iter::IteratorObject;
+use prism_runtime::types::iter::{IteratorAdvanceError, IteratorObject};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::{
     MemoryViewFormat, MemoryViewObject, value_as_memoryview_mut, value_as_memoryview_ref,
@@ -78,6 +78,10 @@ static LIST_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__getitem__"), list_getitem));
 static LIST_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__add__"), list_add));
+static LIST_IADD_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.__iadd__"), list_iadd_with_vm));
+static LIST_IMUL_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__imul__"), list_imul));
 static LIST_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.append"), list_append));
 static LIST_EXTEND_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -378,6 +382,12 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
             &LIST_GETITEM_METHOD,
         ))),
         "__add__" => Some(CachedMethod::simple(builtin_method_value(&LIST_ADD_METHOD))),
+        "__iadd__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_IADD_METHOD,
+        ))),
+        "__imul__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_IMUL_METHOD,
+        ))),
         "append" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_APPEND_METHOD,
         ))),
@@ -832,10 +842,8 @@ fn ensure_hashable(value: Value) -> Result<(), BuiltinError> {
 #[inline]
 fn list_iter(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "__iter__", args, 0)?;
-    let list = expect_list_ref(args[0], "__iter__")?;
-    Ok(iterator_to_value(IteratorObject::from_values(
-        list.as_slice().to_vec(),
-    )))
+    expect_list_ref(args[0], "__iter__")?;
+    Ok(iterator_to_value(IteratorObject::from_list(args[0])))
 }
 
 #[inline]
@@ -882,6 +890,38 @@ fn list_add(args: &[Value]) -> Result<Value, BuiltinError> {
             ))
         })?;
     Ok(to_object_value(left.concat(right)))
+}
+
+#[inline]
+fn list_iadd_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__iadd__", args, 1)?;
+
+    let items = collect_iterable_values_with_vm(vm, args[1])?;
+    let list = expect_list_mut(args[0], "__iadd__")?;
+    list.extend(items);
+    Ok(args[0])
+}
+
+#[inline]
+fn list_imul(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__imul__", args, 1)?;
+    let repeat = repeat_count_for_list(expect_integer_like_index(args[1])?)?;
+    let list = expect_list_mut(args[0], "__imul__")?;
+    list.repeat_in_place(repeat).ok_or_else(|| {
+        BuiltinError::Raised(RuntimeError::memory_error("repeated sequence is too long"))
+    })?;
+    Ok(args[0])
+}
+
+#[inline]
+fn repeat_count_for_list(count: i64) -> Result<usize, BuiltinError> {
+    if count <= 0 {
+        return Ok(0);
+    }
+
+    usize::try_from(count).map_err(|_| {
+        BuiltinError::Raised(RuntimeError::memory_error("repeated sequence is too long"))
+    })
 }
 
 #[inline]
@@ -2239,7 +2279,17 @@ fn iterator_next(args: &[Value]) -> Result<Value, BuiltinError> {
     let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
         BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
     })?;
-    iter.next().ok_or(BuiltinError::StopIteration)
+    iter.next_checked()
+        .map_err(iterator_advance_error_to_builtin_error)?
+        .ok_or(BuiltinError::StopIteration)
+}
+
+#[inline]
+fn iterator_advance_error_to_builtin_error(err: IteratorAdvanceError) -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::RuntimeError.as_u8() as u16,
+        err.message(),
+    ))
 }
 
 fn iterator_length_hint(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -2533,8 +2583,12 @@ fn collect_iterable_values_with_vm(
     vm: &mut VirtualMachine,
     iterable: Value,
 ) -> Result<Vec<Value>, BuiltinError> {
+    let capacity = try_length_hint(vm, iterable, 0).map_err(runtime_error_to_builtin_error)?;
     let iterator = ensure_iterator_value(vm, iterable).map_err(runtime_error_to_builtin_error)?;
     let mut values = Vec::new();
+    values.try_reserve(capacity).map_err(|_| {
+        BuiltinError::Raised(RuntimeError::memory_error("length hint is too large"))
+    })?;
 
     loop {
         match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
@@ -2546,8 +2600,8 @@ fn collect_iterable_values_with_vm(
 
 #[inline]
 fn runtime_error_to_builtin_error(err: crate::error::RuntimeError) -> BuiltinError {
-    let display = err.to_string();
-    match err.into_kind() {
+    let kind = err.kind().clone();
+    match kind {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
             format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
@@ -2573,7 +2627,7 @@ fn runtime_error_to_builtin_error(err: crate::error::RuntimeError) -> BuiltinErr
             BuiltinError::OverflowError(message.to_string())
         }
         RuntimeErrorKind::StopIteration => BuiltinError::StopIteration,
-        _ => BuiltinError::TypeError(display),
+        _ => BuiltinError::Raised(err),
     }
 }
 

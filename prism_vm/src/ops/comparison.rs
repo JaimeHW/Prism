@@ -9,7 +9,7 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
-use crate::ops::protocols::{RichCompareOp, rich_compare_bool};
+use crate::ops::protocols::{RichCompareOp, binary_special_method, rich_compare_bool};
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
 };
@@ -1486,14 +1486,18 @@ pub fn bitwise_and(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
-    let frame = vm.current_frame_mut();
-
     match bitwise_int_result("&", a, b, |x, y| x & y) {
         Ok(value) => {
-            frame.set_reg(dst, value);
+            vm.current_frame_mut().set_reg(dst, value);
             ControlFlow::Continue
         }
-        Err(err) => ControlFlow::Error(err),
+        Err(int_err) => {
+            match try_binary_special_method_result(vm, dst, a, b, "__and__", "__rand__") {
+                Ok(true) => ControlFlow::Continue,
+                Ok(false) => ControlFlow::Error(int_err),
+                Err(err) => ControlFlow::Error(err),
+            }
+        }
     }
 }
 
@@ -1553,7 +1557,13 @@ pub fn bitwise_or(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             vm.current_frame_mut().set_reg(dst, value);
             ControlFlow::Continue
         }
-        Err(err) => ControlFlow::Error(err),
+        Err(int_err) => {
+            match try_binary_special_method_result(vm, dst, a, b, "__or__", "__ror__") {
+                Ok(true) => ControlFlow::Continue,
+                Ok(false) => ControlFlow::Error(int_err),
+                Err(err) => ControlFlow::Error(err),
+            }
+        }
     }
 }
 
@@ -1572,14 +1582,18 @@ pub fn bitwise_xor(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
-    let frame = vm.current_frame_mut();
-
     match bitwise_int_result("^", a, b, |x, y| x ^ y) {
         Ok(value) => {
-            frame.set_reg(dst, value);
+            vm.current_frame_mut().set_reg(dst, value);
             ControlFlow::Continue
         }
-        Err(err) => ControlFlow::Error(err),
+        Err(int_err) => {
+            match try_binary_special_method_result(vm, dst, a, b, "__xor__", "__rxor__") {
+                Ok(true) => ControlFlow::Continue,
+                Ok(false) => ControlFlow::Error(int_err),
+                Err(err) => ControlFlow::Error(err),
+            }
+        }
     }
 }
 
@@ -1612,8 +1626,11 @@ pub fn bitwise_not(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Shl: dst = src1 << src2
 #[inline(always)]
 pub fn shl(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let (a, b, dst) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, inst.dst().0)
+    };
 
     match (numeric_value_to_bigint(a), numeric_value_to_bigint(b)) {
         (Some(_), Some(shift)) if shift.sign() == num_bigint::Sign::Minus => {
@@ -1627,22 +1644,30 @@ pub fn shl(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     },
                 ));
             };
-            frame.set_reg(inst.dst().0, bigint_to_value(value << shift_amount));
+            vm.current_frame_mut()
+                .set_reg(dst, bigint_to_value(value << shift_amount));
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand(
-            "<<",
-            a.type_name(),
-            b.type_name(),
-        )),
+        _ => match try_binary_special_method_result(vm, dst, a, b, "__lshift__", "__rlshift__") {
+            Ok(true) => ControlFlow::Continue,
+            Ok(false) => ControlFlow::Error(RuntimeError::unsupported_operand(
+                "<<",
+                a.type_name(),
+                b.type_name(),
+            )),
+            Err(err) => ControlFlow::Error(err),
+        },
     }
 }
 
 /// Shr: dst = src1 >> src2
 #[inline(always)]
 pub fn shr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let (a, b, dst) = {
+        let frame = vm.current_frame();
+        let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (a, b, inst.dst().0)
+    };
 
     match (numeric_value_to_bigint(a), numeric_value_to_bigint(b)) {
         (Some(_), Some(shift)) if shift.sign() == num_bigint::Sign::Minus => {
@@ -1655,16 +1680,68 @@ pub fn shr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 } else {
                     Value::int(0).unwrap()
                 };
-                frame.set_reg(inst.dst().0, result);
+                vm.current_frame_mut().set_reg(dst, result);
                 return ControlFlow::Continue;
             };
-            frame.set_reg(inst.dst().0, bigint_to_value(value >> shift_amount));
+            vm.current_frame_mut()
+                .set_reg(dst, bigint_to_value(value >> shift_amount));
             ControlFlow::Continue
         }
-        _ => ControlFlow::Error(RuntimeError::unsupported_operand(
-            ">>",
-            a.type_name(),
-            b.type_name(),
-        )),
+        _ => match try_binary_special_method_result(vm, dst, a, b, "__rshift__", "__rrshift__") {
+            Ok(true) => ControlFlow::Continue,
+            Ok(false) => ControlFlow::Error(RuntimeError::unsupported_operand(
+                ">>",
+                a.type_name(),
+                b.type_name(),
+            )),
+            Err(err) => ControlFlow::Error(err),
+        },
     }
+}
+
+/// InPlaceBitwiseAnd: dst = src1; dst &= src2.
+#[inline(always)]
+pub fn inplace_bitwise_and(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::arithmetic::inplace_binary_with_fallback(vm, inst, "__iand__", bitwise_and)
+}
+
+/// InPlaceBitwiseOr: dst = src1; dst |= src2.
+#[inline(always)]
+pub fn inplace_bitwise_or(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::arithmetic::inplace_binary_with_fallback(vm, inst, "__ior__", bitwise_or)
+}
+
+/// InPlaceBitwiseXor: dst = src1; dst ^= src2.
+#[inline(always)]
+pub fn inplace_bitwise_xor(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::arithmetic::inplace_binary_with_fallback(vm, inst, "__ixor__", bitwise_xor)
+}
+
+/// InPlaceShl: dst = src1; dst <<= src2.
+#[inline(always)]
+pub fn inplace_shl(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::arithmetic::inplace_binary_with_fallback(vm, inst, "__ilshift__", shl)
+}
+
+/// InPlaceShr: dst = src1; dst >>= src2.
+#[inline(always)]
+pub fn inplace_shr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::arithmetic::inplace_binary_with_fallback(vm, inst, "__irshift__", shr)
+}
+
+#[inline]
+fn try_binary_special_method_result(
+    vm: &mut VirtualMachine,
+    dst: u8,
+    left: Value,
+    right: Value,
+    left_method: &'static str,
+    right_method: &'static str,
+) -> Result<bool, RuntimeError> {
+    if let Some(value) = binary_special_method(vm, left, right, left_method, right_method)? {
+        vm.current_frame_mut().set_reg(dst, value);
+        return Ok(true);
+    }
+
+    Ok(false)
 }

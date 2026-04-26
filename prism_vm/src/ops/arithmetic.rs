@@ -13,8 +13,9 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
+use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
-use crate::ops::protocols::binary_special_method;
+use crate::ops::protocols::{binary_special_method, inplace_special_method};
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
 };
@@ -29,7 +30,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
-use prism_runtime::types::list::ListObject;
+use prism_runtime::types::list::{ListObject, object_ptr_as_list_mut};
 use prism_runtime::types::string::{
     StringObject, concat_string_objects, repeat_string_object, value_as_string_ref,
 };
@@ -652,7 +653,8 @@ pub(crate) fn repeat_string_value_in_vm(
         return Ok(Some(string));
     }
 
-    let result = repeat_string_object(string, count).expect("validated string operand");
+    let result = repeat_string_object(string, count)
+        .ok_or_else(|| RuntimeError::overflow_error("repeated string is too long"))?;
     alloc_string_value(vm, result).map(Some)
 }
 
@@ -1017,38 +1019,61 @@ fn repeat_sequence_value(value: Value, count: i64) -> Result<Option<Value>, Runt
         return Ok(None);
     };
 
-    let repeat =
-        usize::try_from(count.max(0)).map_err(|_| RuntimeError::value_error("Integer overflow"))?;
+    let repeat = repeat_count(count)?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
 
     match header.type_id {
         TypeId::LIST => {
             let list = unsafe { &*(ptr as *const ListObject) };
             ensure_repeated_sequence_len(list.len(), repeat)?;
-            Ok(Some(boxed_list_value(list.repeat(repeat))))
+            let repeated = list
+                .repeat(repeat)
+                .ok_or_else(sequence_repeat_memory_error)?;
+            Ok(Some(boxed_list_value(repeated)))
         }
         TypeId::TUPLE => {
+            if repeat == 1 {
+                return Ok(Some(value));
+            }
             let tuple = unsafe { &*(ptr as *const TupleObject) };
             ensure_repeated_sequence_len(tuple.len(), repeat)?;
-            Ok(Some(boxed_tuple_value(tuple.repeat(repeat))))
+            let repeated = tuple
+                .repeat(repeat)
+                .ok_or_else(sequence_repeat_memory_error)?;
+            Ok(Some(boxed_tuple_value(repeated)))
         }
         TypeId::BYTES | TypeId::BYTEARRAY => {
             let bytes = unsafe { &*(ptr as *const BytesObject) };
             ensure_repeated_sequence_len(bytes.len(), repeat)?;
             let repeated = bytes
                 .repeat_sequence(repeat)
-                .ok_or_else(|| RuntimeError::value_error("repeated sequence is too long"))?;
+                .ok_or_else(sequence_repeat_memory_error)?;
             Ok(Some(boxed_bytes_value(repeated)))
         }
         _ => Ok(None),
     }
 }
 
+#[inline]
+fn repeat_count(count: i64) -> Result<usize, RuntimeError> {
+    if count <= 0 {
+        return Ok(0);
+    }
+
+    usize::try_from(count).map_err(|_| sequence_repeat_memory_error())
+}
+
+#[inline]
 fn ensure_repeated_sequence_len(len: usize, repeat: usize) -> Result<(), RuntimeError> {
     let _ = len
         .checked_mul(repeat)
-        .ok_or_else(|| RuntimeError::value_error("repeated sequence is too long"))?;
+        .ok_or_else(sequence_repeat_memory_error)?;
     Ok(())
+}
+
+#[inline]
+fn sequence_repeat_memory_error() -> RuntimeError {
+    RuntimeError::memory_error("repeated sequence is too long")
 }
 
 #[inline]
@@ -1547,6 +1572,173 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     vm.current_frame_mut()
         .set_reg(inst.dst().0, Value::float(x.powf(y)));
     ControlFlow::Continue
+}
+
+/// MatMul: dst = src1 @ src2.
+///
+/// Prism does not currently have built-in matrix types, so the fast path is the
+/// special-method protocol itself. That keeps scientific/user numeric types on
+/// the correct Python semantics without adding an artificial allocation layer.
+#[inline(always)]
+pub fn matmul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    let (left, right, dst) = {
+        let frame = vm.current_frame();
+        let (left, right) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (left, right, inst.dst().0)
+    };
+
+    match try_binary_special_method_result(vm, dst, left, right, "__matmul__", "__rmatmul__") {
+        Ok(true) => ControlFlow::Continue,
+        Ok(false) => ControlFlow::Error(RuntimeError::unsupported_operand(
+            "@",
+            left.type_name(),
+            right.type_name(),
+        )),
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
+/// InPlaceAdd: dst = src1; dst += src2.
+#[inline(always)]
+pub fn inplace_add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    match inplace_list_extend(vm, inst) {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
+    inplace_binary_with_fallback(vm, inst, "__iadd__", add)
+}
+
+/// InPlaceSub: dst = src1; dst -= src2.
+#[inline(always)]
+pub fn inplace_sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    inplace_binary_with_fallback(vm, inst, "__isub__", sub)
+}
+
+/// InPlaceMul: dst = src1; dst *= src2.
+#[inline(always)]
+pub fn inplace_mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    match inplace_list_repeat(vm, inst) {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
+    inplace_binary_with_fallback(vm, inst, "__imul__", mul)
+}
+
+/// InPlaceTrueDiv: dst = src1; dst /= src2.
+#[inline(always)]
+pub fn inplace_true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    inplace_binary_with_fallback(vm, inst, "__itruediv__", true_div)
+}
+
+/// InPlaceFloorDiv: dst = src1; dst //= src2.
+#[inline(always)]
+pub fn inplace_floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    inplace_binary_with_fallback(vm, inst, "__ifloordiv__", floor_div)
+}
+
+/// InPlaceMod: dst = src1; dst %= src2.
+#[inline(always)]
+pub fn inplace_mod(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    inplace_binary_with_fallback(vm, inst, "__imod__", modulo)
+}
+
+/// InPlacePow: dst = src1; dst **= src2.
+#[inline(always)]
+pub fn inplace_pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    inplace_binary_with_fallback(vm, inst, "__ipow__", pow)
+}
+
+/// InPlaceMatMul: dst = src1; dst @= src2.
+#[inline(always)]
+pub fn inplace_matmul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    inplace_binary_with_fallback(vm, inst, "__imatmul__", matmul)
+}
+
+#[inline]
+pub(crate) fn inplace_binary_with_fallback(
+    vm: &mut VirtualMachine,
+    inst: Instruction,
+    inplace_method: &'static str,
+    fallback: fn(&mut VirtualMachine, Instruction) -> ControlFlow,
+) -> ControlFlow {
+    let (left, right, dst) = {
+        let frame = vm.current_frame();
+        let (left, right) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (left, right, inst.dst().0)
+    };
+
+    match inplace_special_method(vm, left, right, inplace_method) {
+        Ok(Some(value)) => {
+            vm.current_frame_mut().set_reg(dst, value);
+            ControlFlow::Continue
+        }
+        Ok(None) => fallback(vm, inst),
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
+#[inline]
+fn inplace_list_extend(vm: &mut VirtualMachine, inst: Instruction) -> Result<bool, RuntimeError> {
+    let (left, right, dst) = {
+        let frame = vm.current_frame();
+        let (left, right) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (left, right, inst.dst().0)
+    };
+
+    if !is_exact_list(left) {
+        return Ok(false);
+    }
+
+    let items = collect_iterable_values(vm, right)?;
+    let list = object_ptr_as_list_mut(
+        left.as_object_ptr()
+            .expect("exact list value must have an object pointer") as *mut (),
+    )
+    .expect("exact list value must point at a list object");
+    list.extend(items);
+    vm.current_frame_mut().set_reg(dst, left);
+    Ok(true)
+}
+
+#[inline]
+fn inplace_list_repeat(vm: &mut VirtualMachine, inst: Instruction) -> Result<bool, RuntimeError> {
+    let (left, right, dst) = {
+        let frame = vm.current_frame();
+        let (left, right) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (left, right, inst.dst().0)
+    };
+
+    if !is_exact_list(left) {
+        return Ok(false);
+    }
+
+    let Some(count) = int_like_value(right) else {
+        return Ok(false);
+    };
+    let repeat = repeat_count(count)?;
+    let list = object_ptr_as_list_mut(
+        left.as_object_ptr()
+            .expect("exact list value must have an object pointer") as *mut (),
+    )
+    .expect("exact list value must point at a list object");
+    ensure_repeated_sequence_len(list.len(), repeat)?;
+    list.repeat_in_place(repeat)
+        .ok_or_else(sequence_repeat_memory_error)?;
+    vm.current_frame_mut().set_reg(dst, left);
+    Ok(true)
+}
+
+#[inline]
+fn is_exact_list(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    header.type_id == TypeId::LIST
 }
 
 /// Neg: dst = -src1 (generic)

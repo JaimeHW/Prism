@@ -208,6 +208,15 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::Pow as usize] = arithmetic::pow;
     table[Opcode::Neg as usize] = arithmetic::neg;
     table[Opcode::Pos as usize] = arithmetic::pos;
+    table[Opcode::MatMul as usize] = arithmetic::matmul;
+    table[Opcode::InPlaceAdd as usize] = arithmetic::inplace_add;
+    table[Opcode::InPlaceSub as usize] = arithmetic::inplace_sub;
+    table[Opcode::InPlaceMul as usize] = arithmetic::inplace_mul;
+    table[Opcode::InPlaceTrueDiv as usize] = arithmetic::inplace_true_div;
+    table[Opcode::InPlaceFloorDiv as usize] = arithmetic::inplace_floor_div;
+    table[Opcode::InPlaceMod as usize] = arithmetic::inplace_mod;
+    table[Opcode::InPlacePow as usize] = arithmetic::inplace_pow;
+    table[Opcode::InPlaceMatMul as usize] = arithmetic::inplace_matmul;
 
     // Comparison (0x40-0x4F)
     table[Opcode::Lt as usize] = comparison::lt;
@@ -229,6 +238,11 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::Shl as usize] = comparison::shl;
     table[Opcode::Shr as usize] = comparison::shr;
     table[Opcode::Not as usize] = comparison::not;
+    table[Opcode::InPlaceBitwiseAnd as usize] = comparison::inplace_bitwise_and;
+    table[Opcode::InPlaceBitwiseOr as usize] = comparison::inplace_bitwise_or;
+    table[Opcode::InPlaceBitwiseXor as usize] = comparison::inplace_bitwise_xor;
+    table[Opcode::InPlaceShl as usize] = comparison::inplace_shl;
+    table[Opcode::InPlaceShr as usize] = comparison::inplace_shr;
 
     // Object Operations (0x60-0x6F)
     table[Opcode::GetAttr as usize] = objects::get_attr;

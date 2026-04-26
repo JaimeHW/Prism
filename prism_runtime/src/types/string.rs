@@ -237,10 +237,7 @@ pub fn repeat_string_object(string: Value, count: i64) -> Option<StringObject> {
         return Some(clone_string_value(string)?);
     }
 
-    Some(StringObject::repeat_slice(
-        string_ref.as_str(),
-        count as usize,
-    ))
+    StringObject::repeat_slice(string_ref.as_str(), count as usize)
 }
 
 impl StringRepr {
@@ -530,31 +527,26 @@ impl StringObject {
     /// 4. **SSO Path**: Results ≤23 bytes use inline storage
     /// 5. **Pre-Sized Heap**: Larger results use pre-allocated String
     ///
-    /// # Panics
-    ///
-    /// Panics if `self.len() * n` overflows `usize`.
     #[inline(always)]
-    pub fn repeat(&self, n: usize) -> StringObject {
+    pub fn repeat(&self, n: usize) -> Option<StringObject> {
         // FAST PATH 1: n == 0 → return empty (zero allocation via static)
         if n == 0 {
-            return empty_string().clone();
+            return Some(empty_string().clone());
         }
 
         // FAST PATH 2: n == 1 → return clone (avoid all computation)
         if n == 1 {
-            return self.clone();
+            return Some(self.clone());
         }
 
         Self::repeat_slice(self.as_str(), n)
     }
 
     #[inline(always)]
-    fn repeat_slice(s: &str, n: usize) -> StringObject {
+    fn repeat_slice(s: &str, n: usize) -> Option<StringObject> {
         let s_len = s.len();
 
-        let Some(total_len) = s_len.checked_mul(n) else {
-            panic!("string repeat overflow: {} * {} overflows", s_len, n);
-        };
+        let total_len = s_len.checked_mul(n)?;
 
         if s_len == 1 {
             let byte = s.as_bytes()[0];
@@ -562,9 +554,9 @@ impl StringObject {
         }
 
         if total_len <= SSO_MAX_LEN {
-            Self::repeat_sso(s, s_len, n, total_len)
+            Some(Self::repeat_sso(s, s_len, n, total_len))
         } else {
-            Self::repeat_heap(s, n)
+            Self::repeat_heap(s, total_len)
         }
     }
 
@@ -573,7 +565,7 @@ impl StringObject {
     /// For single-character strings, we can use a highly optimized byte fill
     /// which the compiler often vectorizes using SIMD instructions.
     #[inline(always)]
-    fn repeat_single_byte(byte: u8, n: usize, total_len: usize) -> StringObject {
+    fn repeat_single_byte(byte: u8, n: usize, total_len: usize) -> Option<StringObject> {
         if total_len <= SSO_MAX_LEN {
             // Fill SSO buffer with single byte - compiler can use SIMD
             let mut data = [byte; SSO_MAX_LEN];
@@ -581,20 +573,21 @@ impl StringObject {
             for i in total_len..SSO_MAX_LEN {
                 data[i] = 0;
             }
-            StringObject {
+            Some(StringObject {
                 header: ObjectHeader::new(TypeId::STR),
                 repr: StringRepr::Inline(InlineString {
                     len: total_len as u8,
                     data,
                 }),
-            }
+            })
         } else {
             // Heap path for large single-byte repetition
-            // Use vec! macro which is highly optimized for fills
-            let bytes = vec![byte; n];
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(total_len).ok()?;
+            bytes.resize(n, byte);
             // SAFETY: Single ASCII byte repeated is always valid UTF-8
             let s = unsafe { String::from_utf8_unchecked(bytes) };
-            StringObject::from_string(s)
+            Some(StringObject::from_string(s))
         }
     }
 
@@ -626,8 +619,20 @@ impl StringObject {
 
     /// Heap repetition (cold path).
     #[inline(never)]
-    fn repeat_heap(s: &str, n: usize) -> StringObject {
-        StringObject::from_string(s.repeat(n))
+    fn repeat_heap(s: &str, total_len: usize) -> Option<StringObject> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(total_len).ok()?;
+        bytes.extend_from_slice(s.as_bytes());
+
+        while bytes.len() < total_len {
+            let remaining = total_len - bytes.len();
+            let copy_len = bytes.len().min(remaining);
+            bytes.extend_from_within(..copy_len);
+        }
+
+        // SAFETY: Repeating a valid UTF-8 byte string preserves UTF-8 validity.
+        let repeated = unsafe { String::from_utf8_unchecked(bytes) };
+        Some(StringObject::from_string(repeated))
     }
 
     /// Get a character by index (0-based, supports negative indexing).

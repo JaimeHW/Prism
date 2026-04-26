@@ -90,6 +90,10 @@ impl From<IterError> for BuiltinError {
     }
 }
 
+const DICT_MUTATED: &str = "dictionary changed size during iteration";
+const SET_MUTATED: &str = "set changed size during iteration";
+const DEQUE_MUTATED: &str = "deque mutated during iteration";
+
 // =============================================================================
 // Type Extraction Helpers
 // =============================================================================
@@ -149,6 +153,21 @@ fn value_as_set(value: &Value) -> Option<&SetObject> {
 fn value_as_deque(value: &Value) -> Option<&DequeObject> {
     let ptr = value.as_object_ptr()?;
     Some(unsafe { &*(ptr as *const DequeObject) })
+}
+
+#[inline(always)]
+fn dict_len_guard(value: Value) -> Option<usize> {
+    value_as_dict(&value).map(DictObject::len)
+}
+
+#[inline(always)]
+fn set_len_guard(value: Value) -> Option<usize> {
+    value_as_set(&value).map(SetObject::len)
+}
+
+#[inline(always)]
+fn deque_len_guard(value: Value) -> Option<usize> {
+    value_as_deque(&value).map(DequeObject::len)
 }
 
 /// Extract IteratorObject from Value (mutable).
@@ -259,7 +278,12 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             // dict iteration yields keys by default
             let dict = value_as_dict(value).ok_or(IterError::InvalidObject)?;
             let keys: Vec<Value> = dict.keys().collect();
-            Ok(IteratorObject::from_values(keys))
+            Ok(IteratorObject::guarded_values(
+                *value,
+                keys,
+                dict_len_guard,
+                DICT_MUTATED,
+            ))
         }
 
         TypeId::MAPPING_PROXY => {
@@ -310,19 +334,38 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             } else {
                 return Err(IterError::InvalidObject);
             };
-            Ok(IteratorObject::from_values(values))
+            if dict_len_guard(dict_value).is_some() {
+                Ok(IteratorObject::guarded_values(
+                    dict_value,
+                    values,
+                    dict_len_guard,
+                    DICT_MUTATED,
+                ))
+            } else {
+                Ok(IteratorObject::from_values(values))
+            }
         }
 
         TypeId::SET | TypeId::FROZENSET => {
             let set = value_as_set(value).ok_or(IterError::InvalidObject)?;
             let values: Vec<Value> = set.iter().collect();
-            Ok(IteratorObject::from_values(values))
+            Ok(IteratorObject::guarded_values(
+                *value,
+                values,
+                set_len_guard,
+                SET_MUTATED,
+            ))
         }
 
         TypeId::DEQUE => {
             let deque = value_as_deque(value).ok_or(IterError::InvalidObject)?;
             let values: Vec<Value> = deque.deque().iter().copied().collect();
-            Ok(IteratorObject::from_values(values))
+            Ok(IteratorObject::guarded_values(
+                *value,
+                values,
+                deque_len_guard,
+                DEQUE_MUTATED,
+            ))
         }
 
         TypeId::BYTES | TypeId::BYTEARRAY => value

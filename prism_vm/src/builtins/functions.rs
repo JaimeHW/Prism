@@ -95,6 +95,36 @@ pub(crate) fn try_len_value(vm: &mut VirtualMachine, value: Value) -> Result<usi
     normalize_len_protocol_result(len_value)
 }
 
+pub(crate) fn try_length_hint(
+    vm: &mut VirtualMachine,
+    value: Value,
+    default: usize,
+) -> Result<usize, RuntimeError> {
+    match try_len_value(vm, value) {
+        Ok(len) => return Ok(len),
+        Err(err) if runtime_error_is_type_error(&err) => {}
+        Err(err) => return Err(err),
+    }
+
+    let target = match resolve_special_method(value, "__length_hint__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => return Ok(default),
+        Err(err) => return Err(err),
+    };
+
+    let hint = match invoke_zero_arg_bound_method(vm, target) {
+        Ok(value) => value,
+        Err(err) if runtime_error_is_type_error(&err) => return Ok(default),
+        Err(err) => return Err(err),
+    };
+
+    if hint == super::builtin_not_implemented_value() {
+        return Ok(default);
+    }
+
+    normalize_length_hint_protocol_result(hint)
+}
+
 #[inline]
 fn exact_len(value: Value) -> Result<Option<usize>, RuntimeError> {
     if let Some(string) = value_as_string_ref(value) {
@@ -227,6 +257,47 @@ fn normalize_len_protocol_result(value: Value) -> Result<usize, RuntimeError> {
         "'{}' object cannot be interpreted as an integer",
         value_type_name(value)
     )))
+}
+
+#[inline]
+fn normalize_length_hint_protocol_result(value: Value) -> Result<usize, RuntimeError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(usize::from(flag));
+    }
+
+    if let Some(length) = value_to_bigint(value) {
+        if length.sign() == Sign::Minus {
+            return Err(RuntimeError::value_error(
+                "__length_hint__() should return >= 0",
+            ));
+        }
+
+        return length.to_usize().ok_or_else(|| {
+            RuntimeError::new(RuntimeErrorKind::OverflowError {
+                message: "cannot fit 'int' into an index-sized integer".into(),
+            })
+        });
+    }
+
+    Err(RuntimeError::type_error(format!(
+        "__length_hint__ must be an integer, not {}",
+        value_type_name(value)
+    )))
+}
+
+#[inline]
+fn runtime_error_is_type_error(err: &RuntimeError) -> bool {
+    match err.kind() {
+        RuntimeErrorKind::TypeError { .. }
+        | RuntimeErrorKind::UnsupportedOperandTypes { .. }
+        | RuntimeErrorKind::NotCallable { .. }
+        | RuntimeErrorKind::NotIterable { .. }
+        | RuntimeErrorKind::NotSubscriptable { .. } => true,
+        RuntimeErrorKind::Exception { type_id, .. } => {
+            *type_id == crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16
+        }
+        _ => false,
+    }
 }
 
 // =============================================================================
