@@ -1349,18 +1349,19 @@ impl FunctionBuilder {
     /// * `name_idx` - Index into the names table for the attribute name
     ///
     /// # Instruction Encoding
-    /// Uses extended format: opcode(8) | dst(8) | module_reg(8) | name_idx_lo(8)
-    /// with name_idx_hi packed in a following instruction if needed.
-    /// For simplicity, we use a compact encoding with src1=module_reg, imm8=name_idx_lo.
+    /// Uses the same compact-plus-extension name encoding as attribute
+    /// opcodes: inline indices below 255 stay in the primary instruction, and
+    /// larger indices use a trailing `AttrName` metadata instruction.
     #[inline]
-    pub fn emit_import_from(&mut self, dst: Register, module_reg: Register, name_idx: u8) {
-        // Compact encoding: dst | module_reg | name_idx (8-bit for now)
+    pub fn emit_import_from(&mut self, dst: Register, module_reg: Register, name_idx: u16) {
+        let inline_name = self.emit_attr_name_operand(name_idx);
         self.emit(Instruction::new(
             Opcode::ImportFrom,
             dst.0,
             module_reg.0,
-            name_idx,
+            inline_name,
         ));
+        self.emit_attr_name_extension_if_needed(inline_name, name_idx);
     }
 
     /// Import all public names from a module.
@@ -1688,6 +1689,25 @@ mod tests {
         assert_eq!(inst.opcode(), Opcode::LoadMethod as u8);
         assert_eq!(inst.dst().0, dst.0);
         assert_eq!(inst.src1().0, obj.0);
+        assert_eq!(inst.src2().0, u8::MAX);
+        assert_eq!(ext.opcode(), Opcode::AttrName as u8);
+        assert_eq!(ext.imm16(), 0x0123);
+    }
+
+    #[test]
+    fn test_emit_import_from_uses_full_name_index_extension() {
+        let mut builder = FunctionBuilder::new("import_from");
+        let dst = builder.alloc_register();
+        let module = builder.alloc_register();
+
+        builder.emit_import_from(dst, module, 0x0123);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+        let ext = code.instructions[1];
+
+        assert_eq!(inst.opcode(), Opcode::ImportFrom as u8);
+        assert_eq!(inst.dst().0, dst.0);
+        assert_eq!(inst.src1().0, module.0);
         assert_eq!(inst.src2().0, u8::MAX);
         assert_eq!(ext.opcode(), Opcode::AttrName as u8);
         assert_eq!(ext.imm16(), 0x0123);

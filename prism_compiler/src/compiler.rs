@@ -1394,13 +1394,10 @@ impl Compiler {
                         let attr_name_idx = self.builder.add_name(alias.name.clone());
                         let store_name_idx = self.builder.add_name(local_name.clone());
 
-                        // We need the name index as u8 for ImportFrom encoding
-                        let attr_idx_u8 = (attr_name_idx & 0xFF) as u8;
-
                         // Emit ImportFrom: reg = module.attr
                         let attr_reg = self.builder.alloc_register();
                         self.builder
-                            .emit_import_from(attr_reg, mod_reg, attr_idx_u8);
+                            .emit_import_from(attr_reg, mod_reg, attr_name_idx);
 
                         // Store in the appropriate scope
                         match self.resolve_variable(local_name) {
