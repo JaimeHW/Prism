@@ -55,8 +55,10 @@ use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
+use prism_runtime::allocation_context::alloc_static_value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};
+use prism_runtime::object::descriptor::StaticMethodDescriptor;
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::{
     global_class_registry, register_global_class, type_new,
@@ -871,6 +873,15 @@ fn exception_proxy_base_ids(exception_type_id: ExceptionTypeId) -> Vec<ClassId> 
     bases
 }
 
+#[inline]
+fn exception_proxy_namespace_value(method_name: &str, method: Value) -> Value {
+    if method_name == "__new__" {
+        alloc_static_value(StaticMethodDescriptor::new(method))
+    } else {
+        method
+    }
+}
+
 fn build_exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClassObject> {
     let bases = exception_proxy_base_ids(exception_type_id);
     let namespace = ClassDict::new();
@@ -882,7 +893,10 @@ fn build_exception_proxy_class(exception_type_id: ExceptionTypeId) -> Arc<PyClas
         "with_traceback",
     ] {
         if let Some(method) = super::exception_method_value(method_name) {
-            namespace.set(intern(method_name), method);
+            namespace.set(
+                intern(method_name),
+                exception_proxy_namespace_value(method_name, method),
+            );
         }
     }
     let name = intern(
@@ -1022,6 +1036,8 @@ pub(crate) fn supplemental_exception_class(name: &str) -> Option<&'static Arc<Py
 mod tests {
     use super::*;
     use crate::builtins::ExceptionValue;
+    use prism_gc::heap::GcHeap;
+    use prism_runtime::allocation_context::RuntimeHeapBinding;
 
     // ════════════════════════════════════════════════════════════════════════
     // Memory Layout Tests
@@ -1426,6 +1442,24 @@ mod tests {
                 "exception proxy should expose {name}"
             );
         }
+    }
+
+    #[test]
+    fn test_exception_proxy_new_staticmethod_ignores_bound_vm_heap() {
+        let heap = GcHeap::with_defaults();
+        let _binding = RuntimeHeapBinding::register(&heap);
+        let method = crate::builtins::exception_method_value("__new__")
+            .expect("BaseException.__new__ should be registered");
+
+        let value = exception_proxy_namespace_value("__new__", method);
+        let ptr = value
+            .as_object_ptr()
+            .expect("staticmethod descriptor should be object-backed");
+        let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+
+        assert_eq!(descriptor.header.type_id, TypeId::STATICMETHOD);
+        assert_eq!(descriptor.function(), method);
+        assert!(!heap.contains(ptr));
     }
 
     #[test]

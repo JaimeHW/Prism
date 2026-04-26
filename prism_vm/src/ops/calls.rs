@@ -2065,7 +2065,7 @@ fn invoke_builtin_with_keywords(
             invoke_namedtuple_builtin_with_keywords(vm, builtin, args, keywords)
         }
         "type.__init__" => invoke_type_init_builtin_with_keywords(builtin, args, keywords),
-        "type.__new__" => invoke_type_new_builtin_with_keywords(builtin, args, keywords),
+        "type.__new__" => invoke_type_new_builtin_with_keywords(vm, builtin, args, keywords),
         _ if builtin.accepts_keywords() => builtin
             .call_with_vm_and_keywords(vm, args, keywords)
             .map_err(RuntimeError::from),
@@ -2301,16 +2301,17 @@ fn invoke_type_init_builtin_with_keywords(
 }
 
 fn invoke_type_new_builtin_with_keywords(
+    vm: &mut VirtualMachine,
     builtin: &BuiltinFunctionObject,
     args: &[Value],
     keywords: &[(&str, Value)],
 ) -> Result<Value, RuntimeError> {
     if keywords.is_empty() {
-        return builtin.call(args).map_err(RuntimeError::from);
+        return builtin.call_with_vm(vm, args).map_err(RuntimeError::from);
     }
 
     let full_args = prepend_bound_self_if_present(builtin, args);
-    crate::builtins::builtin_type_new(&full_args).map_err(RuntimeError::from)
+    crate::builtins::builtin_type_new_with_vm(vm, &full_args).map_err(RuntimeError::from)
 }
 
 #[inline]

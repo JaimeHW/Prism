@@ -559,7 +559,9 @@ fn builtin_namedtuple(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     for &class_id in class.mro() {
         bitmap.set_bit(class_id_to_type_id(class_id));
     }
+    let class_id = class.class_id();
     register_global_class(Arc::clone(&class), bitmap);
+    vm.record_published_class(class_id);
 
     Ok(Value::object_ptr(Arc::into_raw(class) as *const ()))
 }
@@ -2104,6 +2106,35 @@ mod module_tests {
             drop(Box::from_raw(fields_ptr as *mut TupleObject));
             drop(Arc::from_raw(class_ptr as *const PyClassObject));
         }
+    }
+
+    #[test]
+    fn test_namedtuple_factory_unregisters_vm_owned_heap_type_on_vm_drop() {
+        let class_id = {
+            let mut vm = VirtualMachine::new();
+            let class_value = builtin_namedtuple(
+                &mut vm,
+                &[
+                    Value::string(intern("ScopedPair")),
+                    Value::string(intern("left right")),
+                ],
+            )
+            .expect("namedtuple should construct class");
+
+            let class_ptr = class_value
+                .as_object_ptr()
+                .expect("namedtuple class should be object-backed");
+            let class = unsafe { &*(class_ptr as *const PyClassObject) };
+            let class_id = class.class_id();
+            assert!(global_class(class_id).is_some());
+
+            unsafe {
+                drop(Arc::from_raw(class_ptr as *const PyClassObject));
+            }
+            class_id
+        };
+
+        assert!(global_class(class_id).is_none());
     }
 
     #[test]

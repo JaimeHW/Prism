@@ -1234,7 +1234,7 @@ mod tests {
         let class = PyClassObject::new_simple(intern("AttrHolder"));
         class.set_attr(intern("value"), Value::int_unchecked(42));
         let class = register_test_class(class);
-        let instance = ShapedObject::new(class.class_type_id(), class.instance_shape().clone());
+        let instance = ShapedObject::new(class.class_type_id(), shape_registry().empty_shape());
         let instance_ptr = Box::into_raw(Box::new(instance));
         let instance_value = Value::object_ptr(instance_ptr as *const ());
 
@@ -1396,6 +1396,7 @@ mod tests {
         let instance_value = Value::object_ptr(instance_ptr as *const ());
 
         let mut vm = vm_with_names(&["method"]);
+        let method_name_ptr = vm.current_frame().code.names[0].as_ptr() as u64;
         vm.current_frame_mut().set_reg(1, instance_value);
         let inst = Instruction::op_dss(
             Opcode::LoadMethod,
@@ -1407,7 +1408,11 @@ mod tests {
         assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
         assert_eq!(vm.current_frame().get_reg(2), first_value);
         assert_eq!(vm.current_frame().get_reg(3), instance_value);
-        assert_eq!(method_cache().len(), 1);
+        let first_cache_version = method_cache_version(class.class_type_id());
+        let cached = method_cache()
+            .get(class.class_type_id(), method_name_ptr, first_cache_version)
+            .expect("heap method should be cached at the current class version");
+        assert_eq!(cached.method, first_value);
 
         let (second_ptr, second_value) = make_test_function_value("method_v2");
         class.set_attr(method_name, second_value);
@@ -1417,7 +1422,18 @@ mod tests {
         assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
         assert_eq!(vm.current_frame().get_reg(2), second_value);
         assert_eq!(vm.current_frame().get_reg(3), instance_value);
-        assert_eq!(method_cache().len(), 1);
+        let second_cache_version = method_cache_version(class.class_type_id());
+        assert_ne!(second_cache_version, first_cache_version);
+        assert!(
+            method_cache()
+                .get(class.class_type_id(), method_name_ptr, first_cache_version)
+                .is_none(),
+            "stale cache entries must not be returned after class version changes"
+        );
+        let cached = method_cache()
+            .get(class.class_type_id(), method_name_ptr, second_cache_version)
+            .expect("heap method should be refreshed at the new class version");
+        assert_eq!(cached.method, second_value);
 
         unsafe {
             drop(Box::from_raw(instance_ptr));
@@ -1432,18 +1448,20 @@ mod tests {
     fn test_load_method_does_not_share_type_object_cache_between_heap_classes() {
         method_cache().clear();
 
+        let method_name = intern("method");
         let (first_ptr, first_value) = make_test_function_value("type_method_v1");
         let (second_ptr, second_value) = make_test_function_value("type_method_v2");
 
         let mut first = PyClassObject::new_simple(intern("TypeLoadOne"));
-        first.set_attr(intern("method"), first_value);
+        first.set_attr(method_name.clone(), first_value);
         let first = register_test_class(first);
 
         let mut second = PyClassObject::new_simple(intern("TypeLoadTwo"));
-        second.set_attr(intern("method"), second_value);
+        second.set_attr(method_name.clone(), second_value);
         let second = register_test_class(second);
 
         let mut vm = vm_with_names(&["method"]);
+        let method_name_ptr = vm.current_frame().code.names[0].as_ptr() as u64;
         let inst = Instruction::op_dss(
             Opcode::LoadMethod,
             Register::new(2),
@@ -1464,7 +1482,16 @@ mod tests {
         assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
         assert_eq!(vm.current_frame().get_reg(2), second_value);
         assert!(vm.current_frame().get_reg(3).is_none());
-        assert_eq!(method_cache().len(), 0);
+        assert!(
+            method_cache()
+                .get(
+                    TypeId::TYPE,
+                    method_name_ptr,
+                    method_cache_version(TypeId::TYPE)
+                )
+                .is_none(),
+            "type-object method loads must bypass the instance method cache"
+        );
 
         unsafe {
             drop(Box::from_raw(first_ptr));

@@ -369,6 +369,7 @@ fn construct_class_value(
             unregister_global_class(class_id);
             return Err(err);
         }
+        vm.record_published_class(class_id);
         return Ok(Value::object_ptr(Arc::into_raw(result.class) as *const ()));
     }
 

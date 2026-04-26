@@ -38,7 +38,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 static NEXT_THREAD_IDENT: AtomicU64 = AtomicU64::new(1);
@@ -50,12 +50,76 @@ static ACTIVE_THREAD_IDENTS: LazyLock<Mutex<FxHashSet<u64>>> =
     LazyLock::new(|| Mutex::new(FxHashSet::default()));
 static PENDING_ASYNC_EXCEPTIONS: LazyLock<Mutex<FxHashMap<u64, Value>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
-
 thread_local! {
     static THREAD_IDENT: Cell<Option<u64>> = const { Cell::new(None) };
     static THREAD_SENTINELS: RefCell<Vec<Arc<NativeLock>>> = const { RefCell::new(Vec::new()) };
     static THREAD_INTERRUPT_TARGET: Cell<u64> = const { Cell::new(0) };
     static THREAD_IS_PYTHON_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) type SharedThreadGroup = Arc<ThreadGroup>;
+
+#[derive(Debug, Default)]
+pub(crate) struct ThreadGroup {
+    handles: Mutex<FxHashMap<u64, JoinHandle<()>>>,
+}
+
+impl ThreadGroup {
+    #[inline]
+    fn register(&self, ident: u64, handle: JoinHandle<()>) {
+        self.handles
+            .lock()
+            .expect("thread handle registry lock poisoned")
+            .insert(ident, handle);
+    }
+
+    #[inline]
+    pub(crate) fn handle_count(&self) -> u64 {
+        self.handles
+            .lock()
+            .expect("thread handle registry lock poisoned")
+            .len() as u64
+    }
+
+    pub(crate) fn join_finished(&self) {
+        let mut finished = Vec::new();
+        {
+            let mut handles = self
+                .handles
+                .lock()
+                .expect("thread handle registry lock poisoned");
+            let finished_idents = handles
+                .iter()
+                .filter_map(|(ident, handle)| handle.is_finished().then_some(*ident))
+                .collect::<Vec<_>>();
+            for ident in finished_idents {
+                if let Some(handle) = handles.remove(&ident) {
+                    finished.push(handle);
+                }
+            }
+        }
+
+        for handle in finished {
+            let _ = handle.join();
+        }
+    }
+
+    pub(crate) fn join_all_finished_before(&self, deadline: Instant) -> bool {
+        loop {
+            self.join_finished();
+            if self.handle_count() == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+pub(crate) fn new_thread_group() -> SharedThreadGroup {
+    Arc::new(ThreadGroup::default())
 }
 
 static GET_IDENT_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -385,10 +449,12 @@ fn local_type_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&LOCAL_CLASS) as *const ())
 }
 
+#[cfg(test)]
 pub(crate) fn active_thread_count() -> u64 {
     ACTIVE_THREAD_COUNT.load(Ordering::SeqCst)
 }
 
+#[cfg(test)]
 pub(crate) fn wait_for_active_thread_count_at_most(target: u64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -522,11 +588,18 @@ fn thread_start_new_thread(vm: &mut VirtualMachine, args: &[Value]) -> Result<Va
     let builtins = vm.builtins.clone();
     let import_resolver = vm.import_resolver.clone();
     let shared_heap = vm.shared_heap();
+    let class_publications = vm.class_publications();
+    let codec_registry = vm.shared_codec_registry();
+    let thread_group = vm.thread_group();
+    let worker_thread_group = Arc::clone(&thread_group);
 
     ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
     let spawn_result = thread::Builder::new()
         .name(format!("prism-python-thread-{ident}"))
         .spawn(move || {
+            set_current_thread_ident(ident);
+            set_interrupt_context(interrupt_target, true);
+
             run_thread_callable(
                 ident,
                 callable,
@@ -536,13 +609,23 @@ fn thread_start_new_thread(vm: &mut VirtualMachine, args: &[Value]) -> Result<Va
                 interrupt_target,
                 builtins,
                 import_resolver,
-            )
+                class_publications,
+                codec_registry,
+                worker_thread_group,
+            );
+
+            release_thread_sentinels();
+            unregister_thread_ident(ident);
+            ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
         });
-    if let Err(err) = spawn_result {
-        ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
-        return Err(runtime_error_builtin(format!(
-            "can't start new thread: {err}"
-        )));
+    match spawn_result {
+        Ok(handle) => thread_group.register(ident, handle),
+        Err(err) => {
+            ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
+            return Err(runtime_error_builtin(format!(
+                "can't start new thread: {err}"
+            )));
+        }
     }
 
     Ok(Value::int(ident as i64).expect("thread identifiers should fit in i64"))
@@ -592,11 +675,10 @@ fn run_thread_callable(
     interrupt_target: u64,
     builtins: crate::builtins::BuiltinRegistry,
     import_resolver: crate::import::ImportResolver,
+    class_publications: crate::vm::SharedClassPublications,
+    codec_registry: crate::stdlib::_codecs::SharedCodecRegistry,
+    thread_group: SharedThreadGroup,
 ) {
-    let _count_guard = ActiveThreadCountGuard;
-    set_current_thread_ident(ident);
-    set_interrupt_context(interrupt_target, true);
-
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _execution_region = crate::threading_runtime::enter_execution_region();
         let mut vm = VirtualMachine::with_shared_heap_and_import_resolver(
@@ -604,6 +686,10 @@ fn run_thread_callable(
             interrupt_target,
             builtins,
             import_resolver,
+            class_publications,
+            codec_registry,
+            thread_group,
+            false,
         );
 
         let module = callable_module(callable);
@@ -630,21 +716,6 @@ fn run_thread_callable(
         eprintln!("Exception in Prism thread {ident}: {err}");
     } else if result.is_err() {
         eprintln!("Exception in Prism thread {ident}: native thread panicked");
-    }
-
-    release_thread_sentinels();
-}
-
-struct ActiveThreadCountGuard;
-
-impl Drop for ActiveThreadCountGuard {
-    fn drop(&mut self) {
-        ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
-        THREAD_IDENT.with(|ident| {
-            if let Some(ident) = ident.get() {
-                unregister_thread_ident(ident);
-            }
-        });
     }
 }
 
@@ -1720,14 +1791,12 @@ mod tests {
             .expect("thread count test lock should not be poisoned");
         let baseline = ACTIVE_THREAD_COUNT.load(Ordering::SeqCst);
 
-        {
-            ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
-            let _guard = ActiveThreadCountGuard;
-            assert_eq!(
-                thread_count(&[]).unwrap().as_int().unwrap(),
-                (baseline + 1) as i64
-            );
-        }
+        ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            thread_count(&[]).unwrap().as_int().unwrap(),
+            (baseline + 1) as i64
+        );
+        ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
 
         assert_eq!(
             thread_count(&[]).unwrap().as_int().unwrap(),
@@ -1900,6 +1969,7 @@ mod tests {
             .expect("thread count test lock should not be poisoned");
         let baseline = ACTIVE_THREAD_COUNT.load(Ordering::SeqCst);
         let mut vm = VirtualMachine::new();
+        assert_eq!(vm.thread_group().handle_count(), 0);
         let args = prism_runtime::types::tuple::TupleObject::from_slice(&[]);
         let args_ptr = Box::into_raw(Box::new(args));
         let token = thread_start_new_thread(
@@ -1914,13 +1984,16 @@ mod tests {
         .expect("start_new_thread should return an int");
         assert!(token > 0);
 
-        for _ in 0..100 {
-            if ACTIVE_THREAD_COUNT.load(Ordering::SeqCst) == baseline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            vm.join_owned_threads(Duration::from_secs(2)),
+            "worker thread should finish and join"
+        );
+        assert!(
+            wait_for_active_thread_count_at_most(baseline, Duration::from_secs(2)),
+            "worker thread count should return to baseline"
+        );
         assert_eq!(ACTIVE_THREAD_COUNT.load(Ordering::SeqCst), baseline);
+        assert_eq!(vm.thread_group().handle_count(), 0);
 
         unsafe {
             drop(Box::from_raw(args_ptr));

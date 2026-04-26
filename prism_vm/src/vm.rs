@@ -25,6 +25,8 @@ use crate::ops::calls::{
 use crate::ops::objects::list_storage_ref_from_ptr;
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
 use crate::speculative::SpeculationCache;
+use crate::stdlib::_codecs::{SharedCodecRegistry, new_shared_codec_registry};
+use crate::stdlib::_thread::{SharedThreadGroup, new_thread_group};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
@@ -35,15 +37,57 @@ use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
 use prism_runtime::allocation_context::{RuntimeHeapBinding, alloc_value_in_current_heap_or_box};
 use prism_runtime::object::class::ClassDict;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::unregister_global_class;
 use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
 use prism_runtime::types::dict::DictObject;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub(crate) type SharedManagedHeap = Arc<Mutex<ManagedHeap>>;
+pub(crate) type SharedClassPublications = Arc<PublishedClassScope>;
+
+#[derive(Debug, Default)]
+pub(crate) struct PublishedClassScope {
+    class_ids: Mutex<HashSet<ClassId>>,
+}
+
+impl PublishedClassScope {
+    #[inline]
+    fn record(&self, class_id: ClassId) {
+        self.class_ids
+            .lock()
+            .expect("published class scope lock poisoned")
+            .insert(class_id);
+    }
+}
+
+impl Drop for PublishedClassScope {
+    fn drop(&mut self) {
+        let class_ids = std::mem::take(
+            self.class_ids
+                .get_mut()
+                .expect("published class scope lock poisoned"),
+        );
+        if class_ids.is_empty() {
+            return;
+        }
+
+        crate::ops::method_dispatch::method_cache().clear();
+        crate::stdlib::_abc::clear_abc_state_for_class_ids(class_ids.iter().copied());
+        for class_id in class_ids {
+            unregister_global_class(class_id);
+        }
+    }
+}
 
 fn new_shared_managed_heap() -> SharedManagedHeap {
     Arc::new(Mutex::new(ManagedHeap::with_defaults()))
+}
+
+fn new_shared_class_publications() -> SharedClassPublications {
+    Arc::new(PublishedClassScope::default())
 }
 
 fn bind_runtime_heap(heap: &SharedManagedHeap) -> RuntimeHeapBinding {
@@ -218,24 +262,10 @@ pub struct VirtualMachine {
     validated_code_objects: HashMap<usize, Arc<CodeObject>>,
     /// Per-interpreter target used by worker threads to route `_thread.interrupt_main()`.
     thread_interrupt_target: u64,
-
-    // =========================================================================
-    // GC Integration
-    // =========================================================================
-    /// Thread-local binding that exposes this heap to runtime helpers.
-    ///
-    /// This must drop before `heap` so runtime helper teardown cannot observe a
-    /// stale heap binding.
-    _runtime_heap_binding: RuntimeHeapBinding,
-    /// GC-managed heap for object allocation.
-    ///
-    /// Python threads spawned from a VM share this heap so objects allocated by a
-    /// worker can safely escape into shared Python containers and module globals.
-    /// The mutex protects collection/root bookkeeping. Python execution is not
-    /// serialized by a global interpreter lock; shared runtime structures own
-    /// their own synchronization.
-    heap: SharedManagedHeap,
-
+    /// Native Python threads owned by this interpreter.
+    thread_group: SharedThreadGroup,
+    /// Whether this VM is responsible for joining its thread group during teardown.
+    join_threads_on_drop: bool,
     // =========================================================================
     // Exception Handling State
     // =========================================================================
@@ -261,6 +291,35 @@ pub struct VirtualMachine {
     execution_budget: ExecutionBudget,
     /// Most recent runtime error reported by a native AOT helper call.
     last_aot_error: Option<RuntimeError>,
+    /// Interpreter-local codec registry shared by native Python threads.
+    codec_registry: SharedCodecRegistry,
+    /// Heap-type publications whose class dictionaries may reference this VM heap.
+    ///
+    /// Process-global type/class registries are fast, but Python-defined class
+    /// dictionaries can hold raw `Value` pointers into a VM heap. This scope is
+    /// shared by native Python worker VMs and unregisters those heap classes
+    /// before the owning heap can disappear.
+    class_publications: SharedClassPublications,
+
+    // =========================================================================
+    // GC Integration
+    // =========================================================================
+    /// Thread-local binding that exposes this heap to runtime helpers.
+    ///
+    /// This must drop before `heap` so runtime helper teardown cannot observe a
+    /// stale heap binding.
+    _runtime_heap_binding: RuntimeHeapBinding,
+    /// GC-managed heap for object allocation.
+    ///
+    /// Python threads spawned from a VM share this heap so objects allocated by a
+    /// worker can safely escape into shared Python containers and module globals.
+    /// The mutex protects collection/root bookkeeping. Python execution is not
+    /// serialized by a global interpreter lock; shared runtime structures own
+    /// their own synchronization.
+    ///
+    /// Keep this as the final field. Many VM fields contain raw `Value` pointers
+    /// into the heap, and Rust drops fields in declaration order.
+    heap: SharedManagedHeap,
 }
 
 impl VirtualMachine {
@@ -1349,7 +1408,10 @@ impl VirtualMachine {
     /// Create a new virtual machine (interpreter only, no JIT).
     pub fn new() -> Self {
         let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let thread_group = new_thread_group();
         let heap = new_shared_managed_heap();
+        let class_publications = new_shared_class_publications();
+        let codec_registry = new_shared_codec_registry();
         let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
@@ -1366,6 +1428,10 @@ impl VirtualMachine {
             jit_return_value: None,
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
+            thread_group,
+            join_threads_on_drop: true,
+            class_publications,
+            codec_registry,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1396,6 +1462,10 @@ impl VirtualMachine {
             thread_interrupt_target,
             builtins,
             import_resolver,
+            new_shared_class_publications(),
+            new_shared_codec_registry(),
+            new_thread_group(),
+            true,
         )
     }
 
@@ -1409,6 +1479,10 @@ impl VirtualMachine {
         thread_interrupt_target: u64,
         builtins: BuiltinRegistry,
         import_resolver: ImportResolver,
+        class_publications: SharedClassPublications,
+        codec_registry: SharedCodecRegistry,
+        thread_group: SharedThreadGroup,
+        join_threads_on_drop: bool,
     ) -> Self {
         let runtime_heap_binding = bind_runtime_heap(&heap);
         Self {
@@ -1425,6 +1499,10 @@ impl VirtualMachine {
             jit_return_value: None,
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
+            thread_group,
+            join_threads_on_drop,
+            class_publications,
+            codec_registry,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1446,6 +1524,33 @@ impl VirtualMachine {
         Arc::clone(&self.heap)
     }
 
+    pub(crate) fn class_publications(&self) -> SharedClassPublications {
+        Arc::clone(&self.class_publications)
+    }
+
+    pub(crate) fn thread_group(&self) -> SharedThreadGroup {
+        Arc::clone(&self.thread_group)
+    }
+
+    pub(crate) fn join_owned_threads(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        self.thread_group.join_all_finished_before(deadline)
+    }
+
+    pub(crate) fn shared_codec_registry(&self) -> SharedCodecRegistry {
+        Arc::clone(&self.codec_registry)
+    }
+
+    #[inline]
+    pub(crate) fn codec_registry(&self) -> &SharedCodecRegistry {
+        &self.codec_registry
+    }
+
+    #[inline]
+    pub(crate) fn record_published_class(&self, class_id: ClassId) {
+        self.class_publications.record(class_id);
+    }
+
     pub(crate) fn thread_interrupt_target(&self) -> u64 {
         self.thread_interrupt_target
     }
@@ -1453,7 +1558,10 @@ impl VirtualMachine {
     /// Create a new virtual machine with JIT compilation enabled.
     pub fn with_jit() -> Self {
         let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let thread_group = new_thread_group();
         let heap = new_shared_managed_heap();
+        let class_publications = new_shared_class_publications();
+        let codec_registry = new_shared_codec_registry();
         let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
@@ -1470,6 +1578,10 @@ impl VirtualMachine {
             jit_return_value: None,
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
+            thread_group,
+            join_threads_on_drop: true,
+            class_publications,
+            codec_registry,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1489,6 +1601,9 @@ impl VirtualMachine {
     /// Create a virtual machine with custom JIT configuration.
     pub fn with_jit_config(config: JitConfig) -> Self {
         let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let thread_group = new_thread_group();
+        let class_publications = new_shared_class_publications();
+        let codec_registry = new_shared_codec_registry();
         let jit = if config.enabled {
             Some(JitContext::new(config))
         } else {
@@ -1511,6 +1626,10 @@ impl VirtualMachine {
             jit_return_value: None,
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
+            thread_group,
+            join_threads_on_drop: true,
+            class_publications,
+            codec_registry,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -1530,7 +1649,10 @@ impl VirtualMachine {
     /// Create with pre-populated globals.
     pub fn with_globals(globals: GlobalScope) -> Self {
         let thread_interrupt_target = crate::stdlib::_thread::new_main_interrupt_target();
+        let thread_group = new_thread_group();
         let heap = new_shared_managed_heap();
+        let class_publications = new_shared_class_publications();
+        let codec_registry = new_shared_codec_registry();
         let runtime_heap_binding = bind_runtime_heap(&heap);
         let (builtins, import_resolver) = standard_runtime_builtins_and_import_resolver(None);
         Self {
@@ -1547,6 +1669,10 @@ impl VirtualMachine {
             jit_return_value: None,
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
+            thread_group,
+            join_threads_on_drop: true,
+            class_publications,
+            codec_registry,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
             exc_state: ExceptionState::default(),
@@ -3446,6 +3572,18 @@ impl Default for VirtualMachine {
     }
 }
 
+impl Drop for VirtualMachine {
+    fn drop(&mut self) {
+        if !self.join_threads_on_drop {
+            return;
+        }
+
+        crate::threading_runtime::blocking_operation(|| {
+            let _ = self.join_owned_threads(Duration::from_secs(5));
+        });
+    }
+}
+
 fn module_package_name(name: &str, is_package: bool) -> Arc<str> {
     if is_package {
         Arc::from(name)
@@ -3503,6 +3641,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_published_class_scope_unregisters_vm_owned_heap_classes() {
+        use crate::ops::method_dispatch::{CachedMethod, method_cache};
+        use prism_runtime::object::type_builtins::{
+            SubclassBitmap, global_class, global_class_version, register_global_class,
+        };
+
+        method_cache().clear();
+        let scope = new_shared_class_publications();
+        let class = Arc::new(PyClassObject::new_simple(intern("ScopedHeapType")));
+        let class_id = class.class_id();
+        let mut bitmap = SubclassBitmap::new();
+        bitmap.set_bit(class.class_type_id());
+
+        register_global_class(Arc::clone(&class), bitmap);
+        scope.record(class_id);
+        assert!(global_class(class_id).is_some());
+
+        let method_name = intern("__scoped_method_cache_probe__");
+        let method_name_ptr = method_name.as_ptr() as u64;
+        let version = global_class_version(class_id).expect("published class version");
+        method_cache().insert(
+            class.class_type_id(),
+            method_name_ptr,
+            version,
+            CachedMethod::simple(Value::int_unchecked(17)),
+        );
+        assert!(
+            method_cache()
+                .get(class.class_type_id(), method_name_ptr, version)
+                .is_some()
+        );
+
+        drop(scope);
+        assert!(global_class(class_id).is_none());
+        assert!(
+            method_cache()
+                .get(class.class_type_id(), method_name_ptr, version)
+                .is_none()
+        );
+    }
+
     fn write_file(path: &std::path::Path, content: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("failed to create parent dir");
@@ -3537,19 +3717,17 @@ mod tests {
         name: &str,
         exception_table: Vec<ExceptionEntry>,
     ) -> Arc<CodeObject> {
-        let instruction_count = exception_table
-            .iter()
-            .fold(1_u32, |count, entry| {
-                let finally_limit = if entry.finally_pc == u32::MAX {
-                    0
-                } else {
-                    entry.finally_pc.saturating_add(1)
-                };
-                count
-                    .max(entry.end_pc)
-                    .max(entry.handler_pc.saturating_add(1))
-                    .max(finally_limit)
-            }) as usize;
+        let instruction_count = exception_table.iter().fold(1_u32, |count, entry| {
+            let finally_limit = if entry.finally_pc == u32::MAX {
+                0
+            } else {
+                entry.finally_pc.saturating_add(1)
+            };
+            count
+                .max(entry.end_pc)
+                .max(entry.handler_pc.saturating_add(1))
+                .max(finally_limit)
+        }) as usize;
         Arc::new(CodeObject {
             name: Arc::from(name),
             register_count: 1,
@@ -4551,9 +4729,9 @@ mod tests {
             other => panic!("expected missing nested import error, got {other:?}"),
         }
         assert!(
-            err.traceback.iter().any(|entry| {
-                entry.filename.as_ref().ends_with("child.py") && entry.line == 1
-            }),
+            err.traceback
+                .iter()
+                .any(|entry| { entry.filename.as_ref().ends_with("child.py") && entry.line == 1 }),
             "nested import failure should retain the child module traceback"
         );
     }

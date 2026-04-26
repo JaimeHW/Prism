@@ -166,6 +166,35 @@ fn class_value_from_class_id(class_id: ClassId) -> Option<Value> {
     (type_id.raw() < TypeId::FIRST_USER_TYPE).then(|| builtin_type_object_for_type_id(type_id))
 }
 
+pub(crate) fn clear_abc_state_for_class_ids(class_ids: impl IntoIterator<Item = ClassId>) {
+    let stale_values = class_ids
+        .into_iter()
+        .filter_map(class_value_from_class_id)
+        .map(state_key)
+        .collect::<FxHashSet<_>>();
+    if stale_values.is_empty() {
+        return;
+    }
+
+    let mut states = ABC_STATES.write().unwrap();
+    states.retain(|class_key, state| {
+        if stale_values.contains(class_key) {
+            return false;
+        }
+
+        state
+            .registry
+            .retain(|value| !stale_values.contains(&value.raw_bits()));
+        state
+            .cache
+            .retain(|value| !stale_values.contains(&value.raw_bits()));
+        state
+            .negative_cache
+            .retain(|value| !stale_values.contains(&value.raw_bits()));
+        true
+    });
+}
+
 fn value_to_interned_string(value: Value) -> Option<InternedString> {
     if value.is_string() {
         let ptr = value.as_string_object_ptr()? as *const u8;
@@ -530,6 +559,38 @@ mod tests {
 
         let set = unsafe { &*(ptr as *const SetObject) };
         assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn test_clear_abc_state_for_class_ids_drops_vm_scoped_values() {
+        use prism_runtime::object::type_builtins::{
+            SubclassBitmap, register_global_class, unregister_global_class,
+        };
+
+        let class = Arc::new(PyClassObject::new_simple(intern("ScopedAbc")));
+        let class_id = class.class_id();
+        let class_value = Value::object_ptr(Arc::as_ptr(&class) as *const ());
+        let mut bitmap = SubclassBitmap::new();
+        bitmap.set_bit(class.class_type_id());
+        register_global_class(Arc::clone(&class), bitmap);
+
+        with_abc_state_mut(class_value, |state| {
+            state.registry.insert(class_value);
+            state.cache.insert(class_value);
+            state.negative_cache.insert(class_value);
+        });
+        assert!(ABC_STATES
+            .read()
+            .unwrap()
+            .contains_key(&state_key(class_value)));
+
+        clear_abc_state_for_class_ids([class_id]);
+        assert!(!ABC_STATES
+            .read()
+            .unwrap()
+            .contains_key(&state_key(class_value)));
+
+        unregister_global_class(class_id);
     }
 
     #[test]

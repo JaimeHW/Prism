@@ -3031,6 +3031,7 @@ pub fn builtin_type_with_vm(
         unregister_global_class(class_id);
         return Err(runtime_error_to_builtin_error(err));
     }
+    vm.record_published_class(class_id);
 
     Ok(Value::object_ptr(
         std::sync::Arc::into_raw(result.class) as *const ()
@@ -3114,6 +3115,7 @@ pub(crate) fn builtin_type_new_with_vm(
         unregister_global_class(class_id);
         return Err(runtime_error_to_builtin_error(err));
     }
+    vm.record_published_class(class_id);
 
     Ok(Value::object_ptr(
         std::sync::Arc::into_raw(result.class) as *const ()

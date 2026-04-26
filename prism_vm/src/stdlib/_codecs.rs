@@ -18,8 +18,9 @@ use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
-static REGISTER_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_codecs.register"), builtin_register));
+static REGISTER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_codecs.register"), builtin_register)
+});
 static LOOKUP_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_codecs.lookup"), builtin_lookup));
 static ENCODE_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -27,10 +28,10 @@ static ENCODE_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static DECODE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_codecs.decode"), builtin_decode));
 static REGISTER_ERROR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_codecs.register_error"), builtin_register_error)
+    BuiltinFunctionObject::new_vm(Arc::from("_codecs.register_error"), builtin_register_error)
 });
 static LOOKUP_ERROR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_codecs.lookup_error"), builtin_lookup_error)
+    BuiltinFunctionObject::new_vm(Arc::from("_codecs.lookup_error"), builtin_lookup_error)
 });
 
 static ASCII_ENCODE_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -132,8 +133,11 @@ static RAW_UNICODE_ESCAPE_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
 static RAW_UNICODE_ESCAPE_CODEC_DECODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_decode(CodecKind::RawUnicodeEscape));
 
-static REGISTRY: LazyLock<RwLock<CodecRegistry>> =
-    LazyLock::new(|| RwLock::new(CodecRegistry::new()));
+pub(crate) type SharedCodecRegistry = Arc<RwLock<CodecRegistry>>;
+
+pub(crate) fn new_shared_codec_registry() -> SharedCodecRegistry {
+    Arc::new(RwLock::new(CodecRegistry::new()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CodecKind {
@@ -197,7 +201,7 @@ impl CodecKind {
     }
 }
 
-struct CodecRegistry {
+pub(crate) struct CodecRegistry {
     search_functions: Vec<Value>,
     error_handlers: FxHashMap<InternedString, Value>,
 }
@@ -379,7 +383,7 @@ fn codec_method_decode(kind: CodecKind) -> BuiltinFunctionObject {
     )
 }
 
-fn builtin_register(args: &[Value]) -> Result<Value, BuiltinError> {
+fn builtin_register(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "register() takes exactly one argument ({} given)",
@@ -392,7 +396,11 @@ fn builtin_register(args: &[Value]) -> Result<Value, BuiltinError> {
             args[0].type_name()
         )));
     }
-    REGISTRY.write().unwrap().search_functions.push(args[0]);
+    vm.codec_registry()
+        .write()
+        .unwrap()
+        .search_functions
+        .push(args[0]);
     Ok(Value::none())
 }
 
@@ -409,7 +417,7 @@ fn builtin_lookup(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Buil
         return Ok(kind.codec_info_value());
     }
 
-    let search_functions = REGISTRY.read().unwrap().search_functions.clone();
+    let search_functions = vm.codec_registry().read().unwrap().search_functions.clone();
     let name_arg = Value::string(intern(&encoding));
     for search in search_functions {
         let value = invoke_callable_value(vm, search, &[name_arg])
@@ -435,7 +443,7 @@ fn builtin_decode(args: &[Value]) -> Result<Value, BuiltinError> {
     decode_value(input, lookup_codec(&encoding)?, &errors)
 }
 
-fn builtin_register_error(args: &[Value]) -> Result<Value, BuiltinError> {
+fn builtin_register_error(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
             "register_error() takes exactly 2 arguments ({} given)",
@@ -451,7 +459,7 @@ fn builtin_register_error(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    REGISTRY
+    vm.codec_registry()
         .write()
         .unwrap()
         .error_handlers
@@ -459,7 +467,7 @@ fn builtin_register_error(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::none())
 }
 
-fn builtin_lookup_error(args: &[Value]) -> Result<Value, BuiltinError> {
+fn builtin_lookup_error(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "lookup_error() takes exactly one argument ({} given)",
@@ -468,7 +476,7 @@ fn builtin_lookup_error(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let name = expect_string(args[0], "lookup_error() argument must be str")?;
-    REGISTRY
+    vm.codec_registry()
         .read()
         .unwrap()
         .error_handlers
@@ -907,15 +915,16 @@ mod tests {
         });
 
         let module = CodecsModule::new();
+        let mut vm = VirtualMachine::new();
         builtin_from_value(module.get_attr("register_error").unwrap())
-            .call(&[
+            .call_with_vm(&mut vm, &[
                 Value::string(intern("codex-handler")),
                 builtin_value(&HANDLER),
             ])
             .expect("register_error should succeed");
 
         let value = builtin_from_value(module.get_attr("lookup_error").unwrap())
-            .call(&[Value::string(intern("codex-handler"))])
+            .call_with_vm(&mut vm, &[Value::string(intern("codex-handler"))])
             .expect("lookup_error should succeed");
         assert_eq!(
             value.as_object_ptr().expect("handler should be object"),
@@ -924,13 +933,46 @@ mod tests {
     }
 
     #[test]
+    fn test_registered_error_handlers_are_vm_local() {
+        static HANDLER: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+            BuiltinFunctionObject::new(Arc::from("tests.local_handler"), |_args| Ok(Value::none()))
+        });
+
+        let module = CodecsModule::new();
+        let register_error = builtin_from_value(module.get_attr("register_error").unwrap());
+        let lookup_error = builtin_from_value(module.get_attr("lookup_error").unwrap());
+        let mut first = VirtualMachine::new();
+        let mut second = VirtualMachine::new();
+
+        register_error
+            .call_with_vm(&mut first, &[
+                Value::string(intern("vm-local-handler")),
+                builtin_value(&HANDLER),
+            ])
+            .expect("register_error should succeed");
+
+        assert!(
+            lookup_error
+                .call_with_vm(&mut first, &[Value::string(intern("vm-local-handler"))])
+                .is_ok()
+        );
+        assert!(matches!(
+            lookup_error
+                .call_with_vm(&mut second, &[Value::string(intern("vm-local-handler"))])
+                .expect_err("second VM should not see first VM's handler"),
+            BuiltinError::KeyError(_)
+        ));
+    }
+
+    #[test]
     fn test_lookup_error_exposes_surrogate_handlers() {
         let lookup_error =
             builtin_from_value(CodecsModule::new().get_attr("lookup_error").unwrap());
+        let mut vm = VirtualMachine::new();
 
         for handler_name in ["surrogateescape", "surrogatepass", "backslashreplace"] {
             let value = lookup_error
-                .call(&[Value::string(intern(handler_name))])
+                .call_with_vm(&mut vm, &[Value::string(intern(handler_name))])
                 .expect("built-in surrogate handler should resolve");
             assert!(
                 value.as_object_ptr().is_some(),

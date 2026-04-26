@@ -43,15 +43,17 @@ fn execute_with_search_paths_and_step_limit(
     )
     .map_err(|e| format!("Compile error: {:?}", e))?;
 
-    // Execute
     let mut vm = VirtualMachine::new();
     for path in search_paths {
         let path = Arc::<str>::from(path.to_string_lossy().into_owned());
         vm.import_resolver.add_search_path(path);
     }
     vm.set_execution_step_limit(step_limit);
-    vm.execute(code)
-        .map_err(|e| format!("Runtime error: {:?}", e))
+    let main = Arc::new(ModuleObject::new("__main__"));
+    let value = vm
+        .execute_in_module_runtime(code, Arc::clone(&main))
+        .map_err(|e| format!("Runtime error: {:?}", e))?;
+    Ok(main.get_attr("RESULT").unwrap_or(value))
 }
 
 fn cpython_lib_dir() -> std::path::PathBuf {
@@ -457,6 +459,55 @@ finally:
     );
 
     assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_cpython_subinterp_threading_does_not_poison_later_heap_exception_matching() {
+    let first = execute_with_cpython_lib_and_step_limit(
+        r#"
+import os
+import test.support
+
+r, w = os.pipe()
+try:
+    code = (
+        "import os, threading\n"
+        f"w = {w}\n"
+        "class LocalThread(threading.Thread):\n"
+        "    pass\n"
+        "def worker():\n"
+        "    os.write(w, b'x')\n"
+        "LocalThread(target=worker).start()\n"
+    )
+    assert test.support.run_in_subinterp(code) == 0
+    assert os.read(r, 1) == b"x"
+finally:
+    os.close(r)
+    os.close(w)
+"#,
+        20_000_000,
+    );
+    assert!(first.is_ok(), "Failed: {:?}", first);
+
+    let second = execute_with_cpython_lib(
+        r#"
+import unittest
+
+class Case(unittest.TestCase):
+    def runTest(self):
+        self.skipTest("subinterpreter teardown")
+
+result = unittest.TestResult()
+Case().run(result)
+
+if len(result.errors) != 0:
+    raise RuntimeError(result.errors[0][1])
+assert len(result.failures) == 0, result.failures
+assert len(result.skipped) == 1
+assert result.skipped[0][1] == "subinterpreter teardown"
+"#,
+    );
+    assert!(second.is_ok(), "Failed: {:?}", second);
 }
 
 #[test]
@@ -7358,7 +7409,10 @@ class Case(unittest.TestCase):
 result = unittest.TestResult()
 Case().run(result)
 
-assert result.wasSuccessful()
+if not result.wasSuccessful():
+    raise RuntimeError(
+        f"errors={len(result.errors)} failures={len(result.failures)} skipped={len(result.skipped)}"
+    )
 assert len(result.skipped) == 1
 assert result.skipped[0][1] == "threading compatibility"
 "#,

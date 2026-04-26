@@ -85,7 +85,6 @@ fn execute_subinterpreter_source(
     vm: &mut VirtualMachine,
     source: String,
 ) -> Result<Value, BuiltinError> {
-    let baseline_threads = super::_thread::active_thread_count();
     let code = compile_source_code(&source, "<subinterpreter>", OptimizationLevel::None)
         .map_err(|err| BuiltinError::SyntaxError(err.to_string()))?;
     let module = Arc::new(ModuleObject::new("__subinterp__"));
@@ -99,21 +98,18 @@ fn execute_subinterpreter_source(
     let status = match sub_vm.execute_in_module_runtime(code, module) {
         Ok(_) => 0,
         Err(err) => {
-            wait_for_subinterpreter_threads(baseline_threads);
+            wait_for_subinterpreter_threads(&sub_vm);
             return Err(runtime_error_to_builtin_error(err));
         }
     };
 
-    wait_for_subinterpreter_threads(baseline_threads);
+    wait_for_subinterpreter_threads(&sub_vm);
     Ok(Value::int(status).expect("subinterpreter status should fit"))
 }
 
-fn wait_for_subinterpreter_threads(baseline_threads: u64) {
+fn wait_for_subinterpreter_threads(sub_vm: &VirtualMachine) {
     crate::threading_runtime::blocking_operation(|| {
-        let _ = super::_thread::wait_for_active_thread_count_at_most(
-            baseline_threads,
-            Duration::from_secs(5),
-        );
+        let _ = sub_vm.join_owned_threads(Duration::from_secs(5));
     });
 }
 
