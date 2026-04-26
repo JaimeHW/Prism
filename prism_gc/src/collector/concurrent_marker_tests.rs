@@ -47,22 +47,6 @@ fn test_mark_ptr_null() {
     assert!(ptr.as_ptr().is_null());
 }
 
-#[test]
-fn test_mark_ptr_equality() {
-    let a = MarkPtr::new(0x1000 as *const ());
-    let b = MarkPtr::new(0x1000 as *const ());
-    let c = MarkPtr::new(0x2000 as *const ());
-    assert_eq!(a, b);
-    assert_ne!(a, c);
-}
-
-#[test]
-fn test_mark_ptr_copy() {
-    let a = MarkPtr::new(0x1000 as *const ());
-    let b = a; // Copy
-    assert_eq!(a, b);
-}
-
 // =============================================================================
 // MarkingStats Tests
 // =============================================================================

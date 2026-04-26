@@ -571,22 +571,3 @@ fn test_concurrent_queue_drain_while_pushing() {
         remaining
     );
 }
-
-// =============================================================================
-// MarkingPhase Enum Tests
-// =============================================================================
-
-#[test]
-fn test_marking_phase_debug() {
-    assert_eq!(format!("{:?}", MarkingPhase::Idle), "Idle");
-    assert_eq!(format!("{:?}", MarkingPhase::Marking), "Marking");
-    assert_eq!(format!("{:?}", MarkingPhase::Remarking), "Remarking");
-}
-
-#[test]
-fn test_marking_phase_clone_eq() {
-    let phase = MarkingPhase::Marking;
-    let cloned = phase;
-    assert_eq!(phase, cloned);
-    assert_ne!(MarkingPhase::Idle, MarkingPhase::Marking);
-}

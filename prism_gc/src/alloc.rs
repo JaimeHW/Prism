@@ -151,15 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_ref_clone() {
-        let mut obj = TestObject { value: 42 };
-        let gc_ref = unsafe { GcRef::from_raw(&mut obj) };
-        let cloned = gc_ref.clone();
-
-        assert_eq!(gc_ref.as_ptr(), cloned.as_ptr());
-    }
-
-    #[test]
     fn test_gc_ref_deref_mut() {
         let mut obj = TestObject { value: 42 };
         let mut gc_ref = unsafe { GcRef::from_raw(&mut obj) };

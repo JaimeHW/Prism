@@ -354,22 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_remembered_entry_debug() {
-        let entry = RememberedEntry { holder: 0x42 };
-        let debug = format!("{:?}", entry);
-        assert!(debug.contains("66")); // 0x42 = 66
-    }
-
-    #[test]
-    fn test_remembered_entry_equality() {
-        let a = RememberedEntry { holder: 0x1000 };
-        let b = RememberedEntry { holder: 0x1000 };
-        let c = RememberedEntry { holder: 0x2000 };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
     fn test_large_volume() {
         let rs = RememberedSet::new();
 

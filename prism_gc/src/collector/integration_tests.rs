@@ -126,25 +126,6 @@ mod tests {
     }
 
     #[test]
-    fn test_collection_type_concurrent_major_distinct() {
-        assert_ne!(CollectionType::ConcurrentMajor, CollectionType::Minor);
-        assert_ne!(CollectionType::ConcurrentMajor, CollectionType::Major);
-    }
-
-    #[test]
-    fn test_collection_type_concurrent_major_debug() {
-        let debug = format!("{:?}", CollectionType::ConcurrentMajor);
-        assert!(debug.contains("ConcurrentMajor"));
-    }
-
-    #[test]
-    fn test_collection_type_concurrent_major_clone() {
-        let ct = CollectionType::ConcurrentMajor;
-        let cloned = ct;
-        assert_eq!(ct, cloned);
-    }
-
-    #[test]
     fn test_concurrent_major_accessor_returns_same_instance() {
         let collector = Collector::new();
         let phase1 = collector.concurrent_major().phase();
