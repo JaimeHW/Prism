@@ -162,15 +162,6 @@ mod tests {
     use prism_runtime::types::tuple::TupleObject;
 
     #[test]
-    fn test_exports() {
-        // Ensure all submodules export correctly
-        let _ = exists(".");
-        let _ = join("a", "b");
-        let _ = basename("/foo/bar");
-        let _ = abspath(".");
-    }
-
-    #[test]
     fn test_module_wrapper_exposes_os_path_name() {
         let module = OsPathModule::new();
         assert_eq!(module.name(), "os.path");

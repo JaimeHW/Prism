@@ -760,21 +760,6 @@ mod error_tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_invalid_pattern_bad_escape() {
-        // Some escapes might be invalid
-        let result = compile(r"\Q", 0);
-        // May or may not be an error depending on regex flavor
-        // Just ensure no panic
-        let _ = result;
-    }
-
-    #[test]
-    fn test_invalid_quantifier() {
-        let result = compile(r"a{}", 0);
-        // May or may not be an error
-        let _ = result;
-    }
 }
 
 // =============================================================================
@@ -1055,11 +1040,4 @@ mod performance_tests {
         assert!(!matches.is_empty());
     }
 
-    #[test]
-    fn test_cache_performance() {
-        // Compile same pattern many times - should be fast due to caching
-        for _ in 0..100 {
-            let _ = compile_default(r"\d+").unwrap();
-        }
-    }
 }

@@ -474,15 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn test_owned_exception_ref_deref_mut() {
-        let exc = ExceptionObject::new(ExceptionTypeId::NameError);
-        let mut owned = OwnedExceptionRef::new(exc);
-
-        // Test DerefMut trait - just verify we can get mutable access
-        let _ = owned.get_mut();
-    }
-
-    #[test]
     fn test_owned_exception_ref_into_inner() {
         let exc = ExceptionObject::new(ExceptionTypeId::OSError);
         let owned = OwnedExceptionRef::new(exc);

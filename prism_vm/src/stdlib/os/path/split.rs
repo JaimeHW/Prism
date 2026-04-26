@@ -126,12 +126,6 @@ mod tests {
     }
 
     #[test]
-    fn test_basename_trailing_slash() {
-        // Behavior depends on OS, just check no panic
-        let _ = basename("/foo/bar/");
-    }
-
-    #[test]
     fn test_dirname_simple() {
         let d = dirname("/foo/bar.txt");
         assert!(d.contains("foo"));

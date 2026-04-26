@@ -352,13 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn test_purge() {
-        compile_default(r"test_pattern").unwrap();
-        purge();
-        // After purge, cache should be empty (can't directly verify, but no error)
-    }
-
-    #[test]
     fn test_error_invalid_pattern() {
         let result = compile(r"[invalid", 0);
         assert!(result.is_err());

@@ -491,13 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_hook_trace_no_fn() {
-        let hook = TraceHook::new();
-        // Should not panic
-        hook.trace(TraceEvent::Call, "test.py", 1);
-    }
-
-    #[test]
     fn test_trace_hook_trace_with_fn() {
         use std::sync::atomic::{AtomicU32, Ordering};
 

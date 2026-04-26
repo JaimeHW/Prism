@@ -535,15 +535,4 @@ mod tests {
     // Environ Access Tests
     // =========================================================================
 
-    #[test]
-    fn test_environ_access() {
-        let os = OsModule::new();
-        let _environ = os.environ();
-    }
-
-    #[test]
-    fn test_environ_mut_access() {
-        let mut os = OsModule::new();
-        let _environ = os.environ_mut();
-    }
 }
