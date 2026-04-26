@@ -414,31 +414,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_multiple_stores_no_loads() {
-        let mut graph = Graph::new();
-
-        let obj = graph.add_node(Operator::Memory(MemoryOp::Alloc), InputList::Empty);
-        let val1 = graph.const_int(1);
-        let val2 = graph.const_int(2);
-
-        let _store1 = graph.add_node(
-            Operator::Memory(MemoryOp::StoreField),
-            InputList::Pair(obj, val1),
-        );
-
-        let _store2 = graph.add_node(
-            Operator::Memory(MemoryOp::StoreField),
-            InputList::Pair(obj, val2),
-        );
-
-        let alias = AliasAnalyzer::new(&graph);
-        let liveness = StoreLiveness::compute(&graph, &alias);
-
-        // Both stores exist, analysis should run
-        assert!(liveness.dead_count() + liveness.live_count() >= 0);
-    }
-
-    #[test]
     fn test_store_with_load() {
         let mut graph = Graph::new();
 

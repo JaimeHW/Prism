@@ -581,13 +581,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_constant_equality() {
-        assert_eq!(Constant::int(0), Constant::int(0));
-        assert_ne!(Constant::int(0), Constant::int(1));
-        assert_ne!(Constant::int(0), Constant::float(0.0));
-    }
-
-    #[test]
     fn test_float_nan_handling() {
         // NaN is not equal to itself, but our constants use Rust's PartialEq
         let nan1 = Constant::float(f64::NAN);

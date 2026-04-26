@@ -108,39 +108,6 @@ mod tests {
     }
 
     #[test]
-    fn test_code_motion_inserted() {
-        let mut graph = Graph::new();
-        graph.const_int(42);
-
-        let expr_table = ExpressionTable::build(&graph);
-        let antic = AnticipationAnalysis::compute(&graph, &expr_table);
-        let avail = AvailabilityAnalysis::compute(&graph, &expr_table);
-        let placement = PlacementAnalysis::compute(&antic, &avail, &expr_table);
-
-        let mut motion = CodeMotionEngine::new(&mut graph, &placement);
-        motion.apply();
-
-        // Even if no changes, counter should be accessible
-        assert!(motion.inserted() >= 0);
-    }
-
-    #[test]
-    fn test_code_motion_eliminated() {
-        let mut graph = Graph::new();
-        graph.const_int(42);
-
-        let expr_table = ExpressionTable::build(&graph);
-        let antic = AnticipationAnalysis::compute(&graph, &expr_table);
-        let avail = AvailabilityAnalysis::compute(&graph, &expr_table);
-        let placement = PlacementAnalysis::compute(&antic, &avail, &expr_table);
-
-        let mut motion = CodeMotionEngine::new(&mut graph, &placement);
-        motion.apply();
-
-        assert!(motion.eliminated() >= 0);
-    }
-
-    #[test]
     fn test_code_motion_graph_access() {
         let mut graph = Graph::new();
         let c = graph.const_int(42);

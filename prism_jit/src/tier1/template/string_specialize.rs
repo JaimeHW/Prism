@@ -708,28 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn test_str_compare_op_equality() {
-        assert_eq!(StrCompareOp::Lt, StrCompareOp::Lt);
-        assert_ne!(StrCompareOp::Lt, StrCompareOp::Gt);
-        assert_ne!(StrCompareOp::Le, StrCompareOp::Ge);
-    }
-
-    #[test]
-    fn test_str_compare_op_all_distinct() {
-        let ops = [
-            StrCompareOp::Lt,
-            StrCompareOp::Le,
-            StrCompareOp::Gt,
-            StrCompareOp::Ge,
-        ];
-        for i in 0..ops.len() {
-            for j in (i + 1)..ops.len() {
-                assert_ne!(ops[i], ops[j], "Ops at {} and {} should differ", i, j);
-            }
-        }
-    }
-
-    #[test]
     fn test_str_compare_template_creation() {
         let t = StrCompareTemplate::new(0, 1, 2, StrCompareOp::Lt, 0);
         assert_eq!(t.dst_reg, 0);

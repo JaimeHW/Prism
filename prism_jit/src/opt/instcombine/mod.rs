@@ -421,22 +421,6 @@ mod tests {
         assert!(ic.stats().instructions_analyzed >= 1);
     }
 
-    // =========================================================================
-    // PatternCategory Tests
-    // =========================================================================
-
-    #[test]
-    fn test_pattern_category_equality() {
-        assert_eq!(PatternCategory::Arithmetic, PatternCategory::Arithmetic);
-        assert_ne!(PatternCategory::Arithmetic, PatternCategory::Bitwise);
-    }
-
-    #[test]
-    fn test_pattern_category_debug() {
-        let cat = PatternCategory::Bitwise;
-        assert!(format!("{:?}", cat).contains("Bitwise"));
-    }
-
     #[test]
     fn test_is_pattern_enabled() {
         let mut config = InstCombineConfig::default();

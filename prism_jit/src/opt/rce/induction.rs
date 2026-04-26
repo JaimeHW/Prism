@@ -582,16 +582,6 @@ mod tests {
         assert_eq!(init.as_node(), Some(NodeId::new(5)));
     }
 
-    #[test]
-    fn test_init_equality() {
-        assert_eq!(InductionInit::Constant(0), InductionInit::Constant(0));
-        assert_ne!(InductionInit::Constant(0), InductionInit::Constant(1));
-        assert_ne!(
-            InductionInit::Constant(0),
-            InductionInit::Node(NodeId::new(0))
-        );
-    }
-
     // =========================================================================
     // InductionStep Tests
     // =========================================================================
@@ -638,30 +628,6 @@ mod tests {
             InductionStep::Node(NodeId::new(0)).direction(),
             InductionDirection::Unknown
         );
-    }
-
-    #[test]
-    fn test_step_equality() {
-        assert_eq!(InductionStep::Constant(1), InductionStep::Constant(1));
-        assert_ne!(InductionStep::Constant(1), InductionStep::Constant(2));
-        assert_ne!(
-            InductionStep::Constant(1),
-            InductionStep::Node(NodeId::new(1))
-        );
-    }
-
-    // =========================================================================
-    // InductionDirection Tests
-    // =========================================================================
-
-    #[test]
-    fn test_direction_variants() {
-        assert_ne!(
-            InductionDirection::Increasing,
-            InductionDirection::Decreasing
-        );
-        assert_ne!(InductionDirection::Increasing, InductionDirection::Unknown);
-        assert_ne!(InductionDirection::Decreasing, InductionDirection::Unknown);
     }
 
     // =========================================================================

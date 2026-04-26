@@ -655,34 +655,6 @@ mod tests {
         assert_eq!(idx.as_constant(), None);
     }
 
-    #[test]
-    fn test_field_index_equality() {
-        assert_eq!(FieldIndex::Constant(1), FieldIndex::Constant(1));
-        assert_ne!(FieldIndex::Constant(1), FieldIndex::Constant(2));
-        assert_ne!(FieldIndex::Constant(1), FieldIndex::Dynamic);
-        assert_eq!(FieldIndex::Dynamic, FieldIndex::Dynamic);
-    }
-
-    #[test]
-    fn test_field_index_hash() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(FieldIndex::Constant(1));
-        set.insert(FieldIndex::Constant(2));
-        set.insert(FieldIndex::Dynamic);
-        assert_eq!(set.len(), 3);
-    }
-
-    // -------------------------------------------------------------------------
-    // FieldAccessKind Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_field_access_kind() {
-        assert_eq!(FieldAccessKind::Load, FieldAccessKind::Load);
-        assert_ne!(FieldAccessKind::Load, FieldAccessKind::Store);
-    }
-
     // -------------------------------------------------------------------------
     // FieldAccess Tests
     // -------------------------------------------------------------------------

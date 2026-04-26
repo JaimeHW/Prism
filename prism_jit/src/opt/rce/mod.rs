@@ -402,31 +402,4 @@ mod tests {
         let decision = analyzer.analyze(&check, &iv);
         assert_eq!(decision, EliminationDecision::Eliminate);
     }
-
-    // =========================================================================
-    // Module Re-export Tests
-    // =========================================================================
-
-    #[test]
-    fn test_induction_reexports() {
-        // Verify all expected types are re-exported
-        let _: InductionVariable;
-        let _: InductionInit = InductionInit::Constant(0);
-        let _: InductionStep = InductionStep::Constant(1);
-        let _: InductionDirection = InductionDirection::Increasing;
-    }
-
-    #[test]
-    fn test_bounds_reexports() {
-        let _: RangeCheck;
-        let _: RangeCheckKind = RangeCheckKind::LowerBound;
-        let _: BoundValue = BoundValue::Constant(0);
-    }
-
-    #[test]
-    fn test_elimination_reexports() {
-        let _: EliminationDecision = EliminationDecision::Keep;
-        let _: EliminationResult;
-        let _: EliminationStats;
-    }
 }

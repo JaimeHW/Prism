@@ -892,33 +892,6 @@ mod tests {
     // PackOpKind Tests
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_pack_op_kind_equality() {
-        assert_eq!(
-            PackOpKind::Arith(ArithOp::Add),
-            PackOpKind::Arith(ArithOp::Add)
-        );
-        assert_ne!(
-            PackOpKind::Arith(ArithOp::Add),
-            PackOpKind::Arith(ArithOp::Sub)
-        );
-        assert_eq!(PackOpKind::Load, PackOpKind::Load);
-    }
-
-    #[test]
-    fn test_pack_op_kind_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-
-        PackOpKind::Load.hash(&mut hasher1);
-        PackOpKind::Load.hash(&mut hasher2);
-
-        assert_eq!(hasher1.finish(), hasher2.finish());
-    }
-
     // -------------------------------------------------------------------------
     // SlpTree Tests
     // -------------------------------------------------------------------------

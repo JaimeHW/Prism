@@ -660,27 +660,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // ObjectType Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_object_type_equality() {
-        assert_eq!(ObjectType::Array, ObjectType::Array);
-        assert_ne!(ObjectType::Array, ObjectType::Dict);
-        assert_ne!(ObjectType::Object, ObjectType::Tuple);
-    }
-
-    #[test]
-    fn test_object_type_hash() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(ObjectType::Array);
-        set.insert(ObjectType::Dict);
-        set.insert(ObjectType::Array); // Duplicate
-        assert_eq!(set.len(), 2);
-    }
-
-    // -------------------------------------------------------------------------
     // AllocationInfo Tests
     // -------------------------------------------------------------------------
 

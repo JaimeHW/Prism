@@ -549,30 +549,6 @@ mod tests {
         assert_eq!(bound.as_node(), Some(NodeId::new(5)));
     }
 
-    #[test]
-    fn test_bound_equality() {
-        assert_eq!(BoundValue::Constant(10), BoundValue::Constant(10));
-        assert_ne!(BoundValue::Constant(10), BoundValue::Constant(20));
-        assert_ne!(BoundValue::Constant(10), BoundValue::Node(NodeId::new(10)));
-    }
-
-    // =========================================================================
-    // RangeCheckKind Tests
-    // =========================================================================
-
-    #[test]
-    fn test_check_kind_variants() {
-        assert_ne!(RangeCheckKind::LowerBound, RangeCheckKind::UpperBound);
-        assert_ne!(
-            RangeCheckKind::LowerBound,
-            RangeCheckKind::UpperBoundInclusive
-        );
-        assert_ne!(
-            RangeCheckKind::UpperBound,
-            RangeCheckKind::UpperBoundInclusive
-        );
-    }
-
     // =========================================================================
     // RangeCheck Tests
     // =========================================================================

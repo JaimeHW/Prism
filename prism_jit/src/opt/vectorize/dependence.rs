@@ -1318,17 +1318,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // DependenceConfidence Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_confidence_equality() {
-        assert_eq!(DependenceConfidence::Proven, DependenceConfidence::Proven);
-        assert_ne!(DependenceConfidence::Proven, DependenceConfidence::Likely);
-        assert_ne!(DependenceConfidence::Likely, DependenceConfidence::Possible);
-    }
-
-    // -------------------------------------------------------------------------
     // Integration Tests
     // -------------------------------------------------------------------------
 

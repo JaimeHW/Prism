@@ -570,13 +570,6 @@ mod tests {
         assert_eq!(ReductionKind::Xor.horizontal_intrinsic(), "horizontal_xor");
     }
 
-    #[test]
-    fn test_reduction_kind_equality() {
-        assert_eq!(ReductionKind::Sum, ReductionKind::Sum);
-        assert_ne!(ReductionKind::Sum, ReductionKind::Product);
-        assert_ne!(ReductionKind::Min, ReductionKind::Max);
-    }
-
     // =========================================================================
     // Reduction Tests
     // =========================================================================

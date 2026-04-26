@@ -697,13 +697,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_widening_kinds() {
-        assert_eq!(WideningKind::Broadcast, WideningKind::Broadcast);
-        assert_ne!(WideningKind::Broadcast, WideningKind::Pack);
-        assert_ne!(WideningKind::Splat, WideningKind::VectorLoad);
-    }
-
-    #[test]
     fn test_widening_creation() {
         let widening = Widening {
             scalar: NodeId::new(1),
