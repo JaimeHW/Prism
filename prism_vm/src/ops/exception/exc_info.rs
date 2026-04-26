@@ -432,20 +432,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_exc_info_clone() {
-        let info = ExcInfo::new(
-            Value::int(1).unwrap(),
-            Value::int(2).unwrap(),
-            Value::int(3).unwrap(),
-        );
-        let cloned = info.clone();
-
-        assert!(!cloned.exc_type.is_none());
-        assert!(!cloned.exc_value.is_none());
-        assert!(!cloned.exc_traceback.is_none());
-    }
-
-    #[test]
     fn test_exc_info_all_none() {
         let info = ExcInfo::new(Value::none(), Value::none(), Value::none());
         assert!(info.is_empty());

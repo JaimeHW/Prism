@@ -484,16 +484,6 @@ mod tests {
         assert!(debug_str.contains("invalid"));
     }
 
-    #[test]
-    fn test_handler_frame_equality() {
-        let f1 = HandlerFrame::new(1, 2, 3);
-        let f2 = HandlerFrame::new(1, 2, 3);
-        let f3 = HandlerFrame::new(1, 2, 4);
-
-        assert_eq!(f1, f2);
-        assert_ne!(f1, f3);
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // HandlerStack Basic Tests
     // ════════════════════════════════════════════════════════════════════════

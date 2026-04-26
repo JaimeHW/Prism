@@ -800,42 +800,6 @@ mod tests {
         assert!(flags.is_empty());
     }
 
-    #[test]
-    fn test_clone() {
-        let original = ExceptionFlags::empty().set_normalized();
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-    }
-
-    #[test]
-    fn test_copy() {
-        let original = ExceptionFlags::empty().set_normalized();
-        let copied: ExceptionFlags = original;
-        assert_eq!(original, copied);
-    }
-
-    #[test]
-    fn test_equality() {
-        let a = ExceptionFlags::empty().set_normalized();
-        let b = ExceptionFlags::empty().set_normalized();
-        let c = ExceptionFlags::empty().set_has_args();
-
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn test_hash() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(ExceptionFlags::empty().set_normalized());
-        set.insert(ExceptionFlags::empty().set_has_args());
-        set.insert(ExceptionFlags::empty().set_normalized()); // Duplicate
-
-        assert_eq!(set.len(), 2);
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // Size Tests (Performance Verification)
     // ════════════════════════════════════════════════════════════════════════

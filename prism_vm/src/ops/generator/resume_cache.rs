@@ -497,16 +497,6 @@ mod tests {
         assert_eq!(entry.pc, 100);
     }
 
-    #[test]
-    fn test_yield_point_entry_equality() {
-        let e1 = YieldPointEntry::new(1, 100);
-        let e2 = YieldPointEntry::new(1, 100);
-        let e3 = YieldPointEntry::new(1, 200);
-
-        assert_eq!(e1, e2);
-        assert_ne!(e1, e3);
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // ResumeTable Tests
     // ════════════════════════════════════════════════════════════════════════

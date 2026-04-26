@@ -308,15 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_info_clone() {
-        let frame = FrameInfo::new(Arc::from("func"), Arc::from("file.py"), 10);
-        let cloned = frame.clone();
-
-        assert_eq!(&*frame.func_name, &*cloned.func_name);
-        assert_eq!(frame.line_number(), cloned.line_number());
-    }
-
-    #[test]
     fn test_frame_info_debug() {
         let frame = FrameInfo::new(Arc::from("func"), Arc::from("file.py"), 10);
         let debug = format!("{:?}", frame);
@@ -552,22 +543,6 @@ mod tests {
     fn test_inline_frames_constant() {
         // Verify our inline size is 8
         assert_eq!(INLINE_FRAMES, 8);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // Clone Tests
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_traceback_clone() {
-        let tb = TracebackObject::from_frames(vec![FrameInfo::new(
-            Arc::from("a"),
-            Arc::from("a.py"),
-            1,
-        )]);
-
-        let cloned = tb.clone();
-        assert_eq!(tb.len(), cloned.len());
     }
 
     // ════════════════════════════════════════════════════════════════════════

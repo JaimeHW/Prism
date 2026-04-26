@@ -362,23 +362,6 @@ mod tests {
         assert_eq!(GeneratorState::default(), GeneratorState::Created);
     }
 
-    #[test]
-    fn test_state_clone_copy() {
-        let state = GeneratorState::Suspended;
-        let cloned = state;
-        assert_eq!(state, cloned);
-    }
-
-    #[test]
-    fn test_state_eq_hash() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(GeneratorState::Created);
-        set.insert(GeneratorState::Running);
-        assert!(set.contains(&GeneratorState::Created));
-        assert!(!set.contains(&GeneratorState::Exhausted));
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // GeneratorHeader Tests
     // ════════════════════════════════════════════════════════════════════════

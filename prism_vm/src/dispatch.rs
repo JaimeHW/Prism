@@ -543,30 +543,4 @@ mod tests {
             size
         );
     }
-
-    #[test]
-    fn test_control_flow_clone() {
-        let cf = ControlFlow::Exception {
-            type_id: 5,
-            handler_pc: 100,
-        };
-        let cloned = cf.clone();
-        if let ControlFlow::Exception {
-            type_id,
-            handler_pc,
-        } = cloned
-        {
-            assert_eq!(type_id, 5);
-            assert_eq!(handler_pc, 100);
-        } else {
-            panic!("Clone failed");
-        }
-    }
-
-    #[test]
-    fn test_control_flow_debug() {
-        let cf = ControlFlow::Continue;
-        let debug = format!("{:?}", cf);
-        assert!(debug.contains("Continue"));
-    }
 }

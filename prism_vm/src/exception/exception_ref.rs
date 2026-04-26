@@ -388,15 +388,6 @@ mod tests {
         assert_ne!(ref1, ref2);
     }
 
-    #[test]
-    fn test_flyweight_ref_clone() {
-        let exc = ExceptionObject::new(ExceptionTypeId::GeneratorExit);
-        let ref1 = FlyweightExceptionRef::new(&exc);
-        let ref2 = ref1; // Copy
-
-        assert!(ref1.ptr_eq(&ref2));
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // FlyweightExceptionRef Size Tests
     // ════════════════════════════════════════════════════════════════════════

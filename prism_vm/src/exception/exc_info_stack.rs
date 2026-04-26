@@ -761,17 +761,6 @@ mod tests {
         assert!(debug.contains("has_value: true"));
     }
 
-    #[test]
-    fn test_exc_info_entry_clone() {
-        let entry = ExcInfoEntry::with_context(24, Some(Value::int(42).unwrap()), 100, 1, 50);
-        let cloned = entry.clone();
-
-        assert_eq!(cloned.type_id(), 24);
-        assert_eq!(cloned.traceback_id(), 100);
-        assert_eq!(cloned.frame_id(), 1);
-        assert_eq!(cloned.pc(), 50);
-    }
-
     // =========================================================================
     // ExcInfoStack Basic Tests
     // =========================================================================

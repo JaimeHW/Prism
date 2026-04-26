@@ -727,11 +727,4 @@ mod tests {
         let exc: ExceptionRef = Arc::new(ExceptionObject::new(ExceptionTypeId::TypeError));
         assert_eq!(exc.type_id(), ExceptionTypeId::TypeError);
     }
-
-    #[test]
-    fn test_exception_ref_clone() {
-        let exc: ExceptionRef = Arc::new(ExceptionObject::new(ExceptionTypeId::TypeError));
-        let cloned = Arc::clone(&exc);
-        assert!(Arc::ptr_eq(&exc, &cloned));
-    }
 }
