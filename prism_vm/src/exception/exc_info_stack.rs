@@ -130,6 +130,9 @@ impl EntryFlags {
     /// Exception came from a `raise ... from ...` statement.
     pub const FROM_RAISE_FROM: u8 = 1 << 4;
 
+    /// Exception was saved while running a finally cleanup.
+    pub const FINALLY: u8 = 1 << 5;
+
     /// Creates flags from raw value.
     #[inline]
     pub const fn from_raw(value: u8) -> Self {
@@ -196,6 +199,9 @@ impl fmt::Debug for EntryFlags {
         }
         if self.has(Self::FROM_RAISE_FROM) {
             flags.push("FROM_RAISE_FROM");
+        }
+        if self.has(Self::FINALLY) {
+            flags.push("FINALLY");
         }
         write!(f, "EntryFlags({})", flags.join("|"))
     }

@@ -440,6 +440,9 @@ pub(crate) fn normalize_python_pattern(pattern: &str) -> EngineResult<String> {
             '\\' => {
                 let (translated, consumed) = normalize_escape_sequence(pattern, offset, in_class)?;
                 normalized.push_str(&translated);
+                if in_class {
+                    class_item_count += 1;
+                }
                 offset += consumed;
             }
             '[' if !in_class => {
@@ -1176,6 +1179,41 @@ mod tests {
             StandardEngine::compile(r"foo\Z", RegexFlags::default()).expect(r"\Z should compile");
         assert!(engine.is_match("foo"));
         assert!(!engine.is_match("foo\n"));
+    }
+
+    #[test]
+    fn test_fancy_engine_accepts_python_end_of_string_anchor() {
+        let engine = FancyEngine::compile(r"(?=foo)foo\Z", RegexFlags::default())
+            .expect(r"\Z should normalize before fancy-regex parsing");
+        assert!(engine.is_match("foo"));
+        assert!(!engine.is_match("foo\n"));
+    }
+
+    #[test]
+    fn test_fancy_engine_compiles_cpython_textwrap_wordsep_anchor() {
+        let whitespace = concat!("[", "\\\t", "\\\n", "\\\x0b", "\\\x0c", "\\\r", "\\ ", "]");
+        let pattern = r#"
+            ( # any whitespace
+              %(ws)s+
+            | # em-dash between words
+              (?<=[\w!"'&.,?]) -{2,} (?=\w)
+            | # word, possibly hyphenated
+              [^%(ws_tail)s+? (?:
+                # hyphenated word
+                  -(?: (?<=[^\d\W]{2}-) | (?<=[^\d\W]-[^\d\W]-))
+                  (?= [^\d\W] -? [^\d\W])
+                | # end of word
+                  (?=%(ws)s|\Z)
+                | # em-dash
+                  (?<=[\w!"'&.,?]) (?=-{2,}\w)
+                )
+            )"#
+        .replace("%(ws)s", whitespace)
+        .replace("%(ws_tail)s", &whitespace[1..]);
+
+        let engine = FancyEngine::compile(&pattern, RegexFlags::new(RegexFlags::VERBOSE))
+            .expect("CPython textwrap word separator pattern should compile");
+        assert!(engine.is_match("word"));
     }
 
     #[test]

@@ -254,8 +254,9 @@ impl CompilationQueue {
                 stats.completed.fetch_add(1, Ordering::Relaxed);
             }
             Err(_e) => {
-                #[cfg(debug_assertions)]
-                eprintln!("Background compilation failed (codegen): {}", _e);
+                if std::env::var_os("PRISM_JIT_LOG_FAILURES").is_some() {
+                    eprintln!("Background compilation failed (codegen): {}", _e);
+                }
                 stats.failed.fetch_add(1, Ordering::Relaxed);
             }
         }

@@ -6,6 +6,7 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::protocols::invoke_bound_method_with_operand;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::GeneratorObject;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
@@ -107,7 +108,13 @@ pub(crate) fn next_step(
                     Ok(IterStep::Yielded(value))
                 }
                 Ok(crate::vm::GeneratorResumeOutcome::Returned(_)) => Ok(IterStep::Exhausted),
-                Err(err) if matches!(err.kind, RuntimeErrorKind::StopIteration) => {
+                Err(err)
+                    if runtime_error_matches_exception(
+                        vm,
+                        &err,
+                        ExceptionTypeId::StopIteration,
+                    ) =>
+                {
                     Ok(IterStep::Exhausted)
                 }
                 Err(err) => Err(err),
@@ -117,9 +124,17 @@ pub(crate) fn next_step(
             let bound = resolve_special_method(iterator, "__next__").map_err(|_| {
                 RuntimeError::type_error(format!("'{}' object is not an iterator", type_id.name()))
             })?;
+            let caller_exception_context = vm.capture_exception_context();
             match call_bound_method_target(vm, bound) {
                 Ok(value) => Ok(IterStep::Yielded(value)),
-                Err(err) if matches!(err.kind, RuntimeErrorKind::StopIteration) => {
+                Err(err)
+                    if runtime_error_matches_exception(
+                        vm,
+                        &err,
+                        ExceptionTypeId::StopIteration,
+                    ) =>
+                {
+                    vm.restore_exception_context(caller_exception_context);
                     Ok(IterStep::Exhausted)
                 }
                 Err(err) => Err(err),
@@ -170,14 +185,23 @@ fn iterator_from_sequence_getitem(
 
     let mut values = Vec::new();
     let mut index = 0_i64;
+    let caller_exception_context = vm.capture_exception_context();
 
     loop {
         let index_value = Value::int(index)
             .ok_or_else(|| RuntimeError::value_error("sequence index overflow"))?;
         match invoke_bound_method_with_operand(vm, bound, index_value) {
             Ok(item) => values.push(item),
-            Err(err) if matches!(err.kind, RuntimeErrorKind::IndexError { .. }) => break,
-            Err(err) if matches!(err.kind, RuntimeErrorKind::StopIteration) => break,
+            Err(err) if runtime_error_matches_exception(vm, &err, ExceptionTypeId::IndexError) => {
+                vm.restore_exception_context(caller_exception_context);
+                break;
+            }
+            Err(err)
+                if runtime_error_matches_exception(vm, &err, ExceptionTypeId::StopIteration) =>
+            {
+                vm.restore_exception_context(caller_exception_context);
+                break;
+            }
             Err(err) => return Err(err),
         }
         index = index
@@ -196,4 +220,125 @@ fn supports_next_protocol(value: Value) -> bool {
     let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
     matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR)
         || resolve_special_method(value, "__next__").is_ok()
+}
+
+#[inline]
+fn runtime_error_matches_exception(
+    vm: &VirtualMachine,
+    err: &RuntimeError,
+    expected: ExceptionTypeId,
+) -> bool {
+    match &err.kind {
+        RuntimeErrorKind::IndexError { .. } => {
+            expected == ExceptionTypeId::IndexError
+                || ExceptionTypeId::IndexError.is_subclass_of(expected)
+        }
+        RuntimeErrorKind::StopIteration => {
+            expected == ExceptionTypeId::StopIteration
+                || ExceptionTypeId::StopIteration.is_subclass_of(expected)
+        }
+        RuntimeErrorKind::Exception { type_id, .. } => ExceptionTypeId::from_u8(*type_id as u8)
+            .is_some_and(|actual| actual.is_subclass_of(expected)),
+        RuntimeErrorKind::ControlTransferred => vm
+            .get_active_exception_type_id()
+            .and_then(|type_id| u8::try_from(type_id).ok())
+            .and_then(ExceptionTypeId::from_u8)
+            .is_some_and(|actual| actual.is_subclass_of(expected)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_compiler::Compiler;
+    use prism_parser::parse;
+    use std::sync::Arc;
+
+    fn execute(source: &str) -> Result<Value, String> {
+        let module = parse(source).map_err(|err| format!("parse error: {err:?}"))?;
+        let code = Compiler::compile_module(&module, "<iteration-test>")
+            .map_err(|err| format!("compile error: {err:?}"))?;
+
+        let mut vm = VirtualMachine::new();
+        vm.execute_runtime(Arc::new(code))
+            .map_err(|err| format!("runtime error: {err:?}"))
+    }
+
+    #[test]
+    fn test_sequence_getitem_exhaustion_does_not_leak_exc_info() {
+        let result = execute(
+            r#"
+import sys
+
+class Seq:
+    def __getitem__(self, index):
+        if index < 2:
+            return index
+        raise IndexError("done")
+
+seen = []
+for value in Seq():
+    seen.append(value)
+
+assert seen == [0, 1]
+assert sys.exc_info() == (None, None, None)
+"#,
+        );
+
+        assert!(
+            result.is_ok(),
+            "sequence fallback should clear exhaustion: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_sequence_getitem_exhaustion_is_clean_for_type_constructors() {
+        let result = execute(
+            r#"
+import sys
+
+class Seq:
+    def __getitem__(self, index):
+        if index < 2:
+            return index
+        raise IndexError("done")
+
+assert list(Seq()) == [0, 1]
+assert tuple(Seq()) == (0, 1)
+assert sys.exc_info() == (None, None, None)
+"#,
+        );
+
+        assert!(
+            result.is_ok(),
+            "sequence fallback should make constructor collection clean: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_protocol_next_exhaustion_does_not_leak_exc_info() {
+        let result = execute(
+            r#"
+import sys
+
+class It:
+    def __iter__(self):
+        return self
+    def __next__(self):
+        raise StopIteration
+
+for value in It():
+    raise AssertionError("iterator should be empty")
+
+assert next(It(), "sentinel") == "sentinel"
+assert sys.exc_info() == (None, None, None)
+"#,
+        );
+
+        assert!(
+            result.is_ok(),
+            "protocol StopIteration should be consumed cleanly: {result:?}"
+        );
+    }
 }

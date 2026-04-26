@@ -23,6 +23,7 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 use prism_code::Instruction;
 use prism_core::Value;
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
@@ -606,12 +607,10 @@ fn concat_byte_sequence_values(left: Value, right: Value) -> Option<Value> {
 
 #[inline]
 pub(crate) fn alloc_string_value(
-    vm: &VirtualMachine,
+    _vm: &VirtualMachine,
     string: StringObject,
 ) -> Result<Value, RuntimeError> {
-    vm.allocator()
-        .alloc_value(string)
-        .ok_or_else(|| RuntimeError::internal("out of memory: failed to allocate string"))
+    Ok(alloc_value_in_current_heap_or_box(string))
 }
 
 #[inline]

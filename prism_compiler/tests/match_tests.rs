@@ -40,8 +40,8 @@ fn compile(source: &str) -> prism_compiler::CodeObject {
 }
 
 /// Helper to assert that code compiles successfully.
-fn assert_compiles(source: &str) {
-    let _ = compile(source);
+fn assert_compiles(source: &str) -> prism_compiler::CodeObject {
+    compile(source)
 }
 
 /// Helper to assert that incomplete pattern forms fail loudly instead of
@@ -613,7 +613,7 @@ match obj:
     case Point():
         result = "is a point"
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -623,7 +623,7 @@ match point:
     case Point(x, y):
         result = x + y
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -633,7 +633,7 @@ match point:
     case Point(x=x, y=y):
         result = (x, y)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -643,7 +643,7 @@ match rect:
     case Rectangle(x, y, width=w, height=h):
         result = (x, y, w, h)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -657,7 +657,7 @@ match point:
     case Point(x, 0):
         result = "on x-axis"
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -671,7 +671,7 @@ match value:
     case list():
         result = "list"
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -681,7 +681,7 @@ match shape:
     case Circle(Point(x, y), radius):
         result = (x, y, radius)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -691,7 +691,7 @@ match point:
     case Point(x, y) if x > 0 and y > 0:
         result = "first quadrant"
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -705,7 +705,7 @@ match event:
     case WindowResize(w, h):
         result = ("resize", w, h)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -719,7 +719,7 @@ match animal:
     case Animal(name=name):
         result = ("animal", name)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -731,7 +731,7 @@ match obj:
     case Circle(_, r):
         result = ("circle", r)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -743,7 +743,7 @@ match obj:
     case shapes.Circle(center, radius):
         result = (center, radius)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 // ============================================================================
@@ -933,7 +933,7 @@ match s:
     case str() as text if text.endswith(".py"):
         result = "python file"
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    assert_compiles(source);
 }
 
 #[test]
@@ -1131,7 +1131,8 @@ match obj:
     case Point(x, y):
         result = (x, y)
 "#;
-    assert_rejects_unsupported_pattern(source, "MatchClass");
+    let code = assert_compiles(source);
+    assert_has_opcode(&code, Opcode::MatchClass);
 }
 
 #[test]

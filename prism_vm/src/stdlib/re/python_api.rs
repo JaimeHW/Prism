@@ -12,6 +12,7 @@ use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use prism_gc::trace::{Trace, Tracer};
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::{ObjectHeader, PyObject};
@@ -2067,13 +2068,11 @@ fn split_result_to_value(
 }
 
 fn alloc_value<T: Trace>(
-    vm: &mut VirtualMachine,
+    _vm: &mut VirtualMachine,
     value: T,
-    context: &'static str,
+    _context: &'static str,
 ) -> Result<Value, BuiltinError> {
-    vm.allocator()
-        .alloc_value(value)
-        .ok_or_else(|| BuiltinError::TypeError(format!("out of memory allocating {context}")))
+    Ok(alloc_value_in_current_heap_or_box(value))
 }
 
 fn alloc_tenured_value<T: Trace>(
@@ -2088,13 +2087,11 @@ fn alloc_tenured_value<T: Trace>(
 }
 
 fn alloc_runtime_value<T: Trace>(
-    vm: &mut VirtualMachine,
+    _vm: &mut VirtualMachine,
     value: T,
-    context: &'static str,
+    _context: &'static str,
 ) -> Result<Value, RuntimeError> {
-    vm.allocator()
-        .alloc_value(value)
-        .ok_or_else(|| RuntimeError::internal(format!("out of memory allocating {context}")))
+    Ok(alloc_value_in_current_heap_or_box(value))
 }
 
 fn try_parse_python_string(value: Value) -> Option<String> {
@@ -2310,6 +2307,27 @@ mod tests {
     fn dict_entries(value: Value) -> Vec<(Value, Value)> {
         let ptr = value.as_object_ptr().expect("expected dict object");
         unsafe { &*(ptr as *const DictObject) }.iter().collect()
+    }
+
+    fn exhaust_nursery(vm: &VirtualMachine) {
+        while vm.allocator().alloc(DictObject::new()).is_some() {}
+    }
+
+    #[test]
+    fn test_pattern_search_allocates_match_after_full_nursery() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(&mut vm, &[Value::string(intern(r"\d+"))])
+            .expect("compile should succeed");
+
+        exhaust_nursery(&vm);
+
+        let searched =
+            builtin_pattern_search(&mut vm, &[pattern, Value::string(intern("abc123def"))])
+                .expect("search should allocate a match after nursery exhaustion");
+        assert!(!searched.is_none());
+
+        let group = builtin_match_group(&mut vm, &[searched]).expect("group should allocate");
+        assert_eq!(string_value(group), "123");
     }
 
     #[test]

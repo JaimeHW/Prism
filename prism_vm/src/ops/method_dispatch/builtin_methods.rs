@@ -21,7 +21,7 @@ use crate::ops::exception::helpers::{
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
-    delete_attribute_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
+    alloc_heap_value, delete_attribute_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
     get_attribute_value, list_storage_mut_from_ptr, list_storage_ref_from_ptr,
     object_getattribute_default, set_attribute_value, tuple_storage_ref_from_ptr,
 };
@@ -29,6 +29,7 @@ use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{CloseResult, GeneratorObject, prepare_close};
 use crate::vm::GeneratorResumeOutcome;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
@@ -47,9 +48,11 @@ use prism_runtime::types::memoryview::{
     MemoryViewFormat, MemoryViewObject, value_as_memoryview_mut, value_as_memoryview_ref,
 };
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::simd::search::{
+    bytes_count as simd_bytes_count, bytes_find as simd_bytes_find,
+};
 use prism_runtime::types::slice::SliceObject;
-use prism_runtime::types::string::StringObject;
-use prism_runtime::types::string::value_as_string_ref;
+use prism_runtime::types::string::{StringObject, StringValueRef, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
@@ -336,6 +339,16 @@ static BYTES_TRANSLATE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.translate"), bytes_translate));
 static BYTES_JOIN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("bytes.join"), bytes_join_with_vm));
+static BYTES_FIND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.find"), bytes_find_method));
+static BYTES_RFIND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.rfind"), bytes_rfind_method));
+static BYTES_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.index"), bytes_index_method));
+static BYTES_RINDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.rindex"), bytes_rindex_method));
+static BYTES_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.count"), bytes_count_method));
 static STR_UPPER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.upper"), str_upper));
 static STR_LOWER_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -356,6 +369,8 @@ static STR_SPLITLINES_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.splitlines"), str_splitlines_kw));
 static STR_EXPANDTABS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.expandtabs"), str_expandtabs_kw));
+static STR_TRANSLATE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("str.translate"), str_translate));
 static STR_FIND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.find"), str_find));
 static STR_RFIND_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -533,6 +548,16 @@ static BYTEARRAY_TRANSLATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::n
 static BYTEARRAY_JOIN_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("bytearray.join"), bytearray_join_with_vm)
 });
+static BYTEARRAY_FIND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.find"), bytearray_find));
+static BYTEARRAY_RFIND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.rfind"), bytearray_rfind));
+static BYTEARRAY_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.index"), bytearray_index));
+static BYTEARRAY_RINDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.rindex"), bytearray_rindex));
+static BYTEARRAY_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.count"), bytearray_count));
 static MEMORYVIEW_TOBYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("memoryview.tobytes"), memoryview_tobytes)
 });
@@ -971,6 +996,9 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         "expandtabs" => Some(CachedMethod::simple(builtin_method_value(
             &STR_EXPANDTABS_METHOD,
         ))),
+        "translate" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_TRANSLATE_METHOD,
+        ))),
         "find" => Some(CachedMethod::simple(builtin_method_value(&STR_FIND_METHOD))),
         "rfind" => Some(CachedMethod::simple(builtin_method_value(
             &STR_RFIND_METHOD,
@@ -1075,6 +1103,21 @@ pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
         ))),
         "join" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_JOIN_METHOD,
+        ))),
+        "find" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_FIND_METHOD,
+        ))),
+        "rfind" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_RFIND_METHOD,
+        ))),
+        "index" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_INDEX_METHOD,
+        ))),
+        "rindex" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_RINDEX_METHOD,
+        ))),
+        "count" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_COUNT_METHOD,
         ))),
         _ => None,
     }
@@ -1200,6 +1243,21 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
         ))),
         "join" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_JOIN_METHOD,
+        ))),
+        "find" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_FIND_METHOD,
+        ))),
+        "rfind" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_RFIND_METHOD,
+        ))),
+        "index" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_INDEX_METHOD,
+        ))),
+        "rindex" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_RINDEX_METHOD,
+        ))),
+        "count" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_COUNT_METHOD,
         ))),
         _ => None,
     }
@@ -2621,6 +2679,112 @@ fn bytearray_join_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Val
 }
 
 #[inline]
+fn bytes_find_method(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytes",
+        "find",
+        expect_bytes_ref,
+        SearchDirection::Forward,
+        MissingNeedle::ReturnMinusOne,
+    )
+}
+
+#[inline]
+fn bytes_rfind_method(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytes",
+        "rfind",
+        expect_bytes_ref,
+        SearchDirection::Reverse,
+        MissingNeedle::ReturnMinusOne,
+    )
+}
+
+#[inline]
+fn bytes_index_method(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytes",
+        "index",
+        expect_bytes_ref,
+        SearchDirection::Forward,
+        MissingNeedle::RaiseValueError,
+    )
+}
+
+#[inline]
+fn bytes_rindex_method(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytes",
+        "rindex",
+        expect_bytes_ref,
+        SearchDirection::Reverse,
+        MissingNeedle::RaiseValueError,
+    )
+}
+
+#[inline]
+fn bytes_count_method(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_count(args, "bytes", expect_bytes_ref)
+}
+
+#[inline]
+fn bytearray_find(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytearray",
+        "find",
+        expect_bytearray_ref,
+        SearchDirection::Forward,
+        MissingNeedle::ReturnMinusOne,
+    )
+}
+
+#[inline]
+fn bytearray_rfind(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytearray",
+        "rfind",
+        expect_bytearray_ref,
+        SearchDirection::Reverse,
+        MissingNeedle::ReturnMinusOne,
+    )
+}
+
+#[inline]
+fn bytearray_index(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytearray",
+        "index",
+        expect_bytearray_ref,
+        SearchDirection::Forward,
+        MissingNeedle::RaiseValueError,
+    )
+}
+
+#[inline]
+fn bytearray_rindex(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_find_like(
+        args,
+        "bytearray",
+        "rindex",
+        expect_bytearray_ref,
+        SearchDirection::Reverse,
+        MissingNeedle::RaiseValueError,
+    )
+}
+
+#[inline]
+fn bytearray_count(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_count(args, "bytearray", expect_bytearray_ref)
+}
+
+#[inline]
 fn decode_bytes_method(
     args: &[Value],
     receiver_name: &'static str,
@@ -2726,6 +2890,136 @@ fn bytes_like_join_part(value: Value) -> Option<Vec<u8>> {
         return None;
     }
     Some(view.to_vec())
+}
+
+#[inline]
+fn byte_sequence_find_like(
+    args: &[Value],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    direction: SearchDirection,
+    missing: MissingNeedle,
+) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.{method_name}() takes from 1 to 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let bytes = receiver(args[0], method_name)?;
+    let needle = byte_sequence_search_needle(args[1])?;
+    let Some((start, end)) =
+        normalize_byte_search_bounds(args, bytes.len(), receiver_name, method_name)?
+    else {
+        return byte_sequence_missing_result(missing);
+    };
+
+    let haystack = &bytes.as_bytes()[start..end];
+    let offset = match direction {
+        SearchDirection::Forward => simd_bytes_find(haystack, &needle),
+        SearchDirection::Reverse => byte_sequence_rfind(haystack, &needle),
+    };
+
+    match offset {
+        Some(index) => Ok(Value::int((start + index) as i64).expect("byte index should fit int")),
+        None => byte_sequence_missing_result(missing),
+    }
+}
+
+#[inline]
+fn byte_sequence_count(
+    args: &[Value],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.count() takes from 1 to 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let bytes = receiver(args[0], "count")?;
+    let needle = byte_sequence_search_needle(args[1])?;
+    let Some((start, end)) =
+        normalize_byte_search_bounds(args, bytes.len(), receiver_name, "count")?
+    else {
+        return Ok(Value::int(0).unwrap());
+    };
+
+    let count = simd_bytes_count(&bytes.as_bytes()[start..end], &needle);
+    Ok(Value::int(count as i64).expect("byte count should fit int"))
+}
+
+#[inline]
+fn byte_sequence_search_needle(value: Value) -> Result<Vec<u8>, BuiltinError> {
+    if value.as_int().is_some() || value.as_bool().is_some() {
+        let byte = expect_integer_like_index(value)?;
+        return u8::try_from(byte)
+            .map(|byte| vec![byte])
+            .map_err(|_| BuiltinError::ValueError("byte must be in range(0, 256)".to_string()));
+    }
+
+    bytes_like_argument_bytes(value).map_err(|err| match err {
+        BuiltinError::TypeError(_) => BuiltinError::TypeError(format!(
+            "argument should be integer or bytes-like object, not '{}'",
+            value.type_name()
+        )),
+        other => other,
+    })
+}
+
+#[inline]
+fn normalize_byte_search_bounds(
+    args: &[Value],
+    len: usize,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Option<(usize, usize)>, BuiltinError> {
+    let start = clamp_slice_index(
+        parse_slice_bound(args.get(2).copied(), 0, receiver_name, method_name)?,
+        len,
+    );
+    let end = clamp_slice_index(
+        parse_slice_bound(
+            args.get(3).copied(),
+            len as isize,
+            receiver_name,
+            method_name,
+        )?,
+        len,
+    );
+
+    Ok((start <= end).then_some((start, end)))
+}
+
+#[inline]
+fn byte_sequence_missing_result(missing: MissingNeedle) -> Result<Value, BuiltinError> {
+    match missing {
+        MissingNeedle::ReturnMinusOne => Ok(Value::int(-1).unwrap()),
+        MissingNeedle::RaiseValueError => {
+            Err(BuiltinError::ValueError("subsection not found".to_string()))
+        }
+    }
+}
+
+#[inline]
+fn byte_sequence_rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(haystack.len());
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    if needle.len() == 1 {
+        return haystack.iter().rposition(|&byte| byte == needle[0]);
+    }
+
+    haystack
+        .windows(needle.len())
+        .rposition(|candidate| candidate == needle)
 }
 
 #[inline]
@@ -3308,6 +3602,149 @@ fn str_splitlines_kw(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value
             split_lines(value, keepends).as_slice(),
         )))
     })
+}
+
+#[inline]
+fn str_translate(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", "translate", args, 1)?;
+    let table = args[1];
+
+    with_str_receiver(args[0], "translate", |value| {
+        let mut translated: Option<String> = None;
+
+        for (byte_index, ch) in value.char_indices() {
+            let Some(replacement) = str_translate_lookup(vm, table, ch as u32)? else {
+                if let Some(output) = translated.as_mut() {
+                    output.push(ch);
+                }
+                continue;
+            };
+
+            let action = str_translate_action(replacement)?;
+            if let Some(output) = translated.as_mut() {
+                push_str_translate_action(output, &action);
+            } else if !str_translate_action_is_unchanged(&action, ch) {
+                let mut output = String::with_capacity(value.len());
+                output.push_str(&value[..byte_index]);
+                push_str_translate_action(&mut output, &action);
+                translated = Some(output);
+            }
+        }
+
+        match translated {
+            Some(output) => {
+                alloc_heap_value(vm, StringObject::new(&output), "str.translate result")
+                    .map_err(runtime_error_to_builtin_error)
+            }
+            None => Ok(args[0]),
+        }
+    })
+}
+
+#[inline]
+fn str_translate_lookup(
+    vm: &mut VirtualMachine,
+    table: Value,
+    ordinal: u32,
+) -> Result<Option<Value>, BuiltinError> {
+    let key = Value::int(ordinal as i64).expect("Unicode ordinal should fit in tagged int");
+
+    if let Some(ptr) = table.as_object_ptr() {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        match header.type_id {
+            TypeId::DICT => {
+                let dict = unsafe { &*(ptr as *const DictObject) };
+                return Ok(dict.get(key));
+            }
+            TypeId::MAPPING_PROXY => {
+                let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+                return builtin_mapping_proxy_get_item_static(proxy, key)
+                    .map_err(runtime_error_to_builtin_error);
+            }
+            _ => {}
+        }
+    }
+
+    let get_item =
+        resolve_special_method(table, "__getitem__").map_err(runtime_error_to_builtin_error)?;
+    match invoke_bound_method_with_arg(vm, &get_item, key) {
+        Ok(value) => Ok(Some(value)),
+        Err(BuiltinError::KeyError(_) | BuiltinError::IndexError(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+enum StrTranslateAction {
+    Delete,
+    Char(char),
+    Text(StringValueRef<'static>),
+}
+
+#[inline]
+fn str_translate_action(value: Value) -> Result<StrTranslateAction, BuiltinError> {
+    if value.is_none() {
+        return Ok(StrTranslateAction::Delete);
+    }
+
+    if let Some(text) = value_as_string_ref(value) {
+        return Ok(StrTranslateAction::Text(text));
+    }
+
+    if let Some(codepoint) = str_translate_codepoint(value)? {
+        let Some(ch) = char::from_u32(codepoint) else {
+            return Err(BuiltinError::ValueError(
+                "character mapping must be in range(0x110000)".to_string(),
+            ));
+        };
+        return Ok(StrTranslateAction::Char(ch));
+    }
+
+    Err(BuiltinError::TypeError(
+        "character mapping must return integer, None or str".to_string(),
+    ))
+}
+
+#[inline]
+fn str_translate_codepoint(value: Value) -> Result<Option<u32>, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(Some(if flag { 1 } else { 0 }));
+    }
+
+    let Some(integer) = value_to_bigint(value) else {
+        return Ok(None);
+    };
+    let Some(codepoint) = integer.to_u32() else {
+        return Err(BuiltinError::ValueError(
+            "character mapping must be in range(0x110000)".to_string(),
+        ));
+    };
+    if codepoint > 0x10ffff {
+        return Err(BuiltinError::ValueError(
+            "character mapping must be in range(0x110000)".to_string(),
+        ));
+    }
+    Ok(Some(codepoint))
+}
+
+#[inline]
+fn push_str_translate_action(output: &mut String, action: &StrTranslateAction) {
+    match action {
+        StrTranslateAction::Delete => {}
+        StrTranslateAction::Char(ch) => output.push(*ch),
+        StrTranslateAction::Text(text) => output.push_str(text.as_str()),
+    }
+}
+
+#[inline]
+fn str_translate_action_is_unchanged(action: &StrTranslateAction, original: char) -> bool {
+    match action {
+        StrTranslateAction::Delete => false,
+        StrTranslateAction::Char(ch) => *ch == original,
+        StrTranslateAction::Text(text) => {
+            let mut chars = text.as_str().chars();
+            chars.next() == Some(original) && chars.next().is_none()
+        }
+    }
 }
 
 #[inline]
@@ -7522,6 +7959,7 @@ mod tests {
             "index",
             "rindex",
             "count",
+            "translate",
             "isascii",
             "isalpha",
             "isdigit",
@@ -7556,6 +7994,67 @@ mod tests {
         let already_lower = Value::string(prism_core::intern::intern("path"));
         let unchanged = str_lower(&[already_lower]).expect("lower should preserve lowercase");
         assert_eq!(unchanged, already_lower);
+    }
+
+    #[test]
+    fn test_str_translate_applies_mapping_values_and_preserves_missing_chars() {
+        let mut vm = VirtualMachine::new();
+        let mut table = DictObject::new();
+        table.set(
+            Value::int('a' as i64).unwrap(),
+            Value::int('A' as i64).unwrap(),
+        );
+        table.set(
+            Value::int('.' as i64).unwrap(),
+            Value::string(intern("\\.")),
+        );
+        table.set(Value::int('x' as i64).unwrap(), Value::none());
+        let table_ptr = Box::into_raw(Box::new(table));
+        let table_value = Value::object_ptr(table_ptr as *const ());
+
+        let translated = str_translate(&mut vm, &[Value::string(intern("a.x!")), table_value])
+            .expect("translate should apply integer, string, and deletion mappings");
+        assert_eq!(string_value(translated), "A\\.!");
+
+        unsafe {
+            drop(Box::from_raw(table_ptr));
+        }
+    }
+
+    #[test]
+    fn test_str_translate_reuses_receiver_and_validates_mapping_results() {
+        let mut vm = VirtualMachine::new();
+        let empty_table_ptr = Box::into_raw(Box::new(DictObject::new()));
+        let empty_table_value = Value::object_ptr(empty_table_ptr as *const ());
+        let source = Value::string(intern("plain"));
+
+        let unchanged = str_translate(&mut vm, &[source, empty_table_value])
+            .expect("missing translations should leave characters unchanged");
+        assert_eq!(unchanged, source);
+
+        let mut invalid_table = DictObject::new();
+        let invalid_replacement = to_object_value(ListObject::new());
+        invalid_table.set(Value::int('p' as i64).unwrap(), invalid_replacement);
+        let invalid_table_ptr = Box::into_raw(Box::new(invalid_table));
+        let invalid_table_value = Value::object_ptr(invalid_table_ptr as *const ());
+        let err = str_translate(&mut vm, &[source, invalid_table_value])
+            .expect_err("unsupported mapping result should fail");
+        assert_eq!(
+            err.to_string(),
+            "TypeError: character mapping must return integer, None or str"
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                invalid_replacement.as_object_ptr().unwrap() as *mut ListObject
+            ));
+            drop(Box::from_raw(
+                invalid_table_value.as_object_ptr().unwrap() as *mut DictObject
+            ));
+            drop(Box::from_raw(
+                empty_table_value.as_object_ptr().unwrap() as *mut DictObject
+            ));
+        }
     }
 
     #[test]
@@ -9112,6 +9611,11 @@ mod tests {
             "rstrip",
             "translate",
             "join",
+            "find",
+            "rfind",
+            "index",
+            "rindex",
+            "count",
         ] {
             let method =
                 resolve_bytes_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
@@ -9153,6 +9657,11 @@ mod tests {
             "rstrip",
             "translate",
             "join",
+            "find",
+            "rfind",
+            "index",
+            "rindex",
+            "count",
         ] {
             let method =
                 resolve_bytearray_method(name).unwrap_or_else(|| panic!("{name} should resolve"));
@@ -9557,6 +10066,114 @@ mod tests {
             drop(Box::from_raw(prefixes_ptr));
             drop(Box::from_raw(suffix_ptr));
             drop(Box::from_raw(prefix_ptr));
+            drop(Box::from_raw(bytes_ptr));
+        }
+    }
+
+    #[test]
+    fn test_bytes_and_bytearray_search_methods_match_python_bounds_and_needles() {
+        let bytes_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"abaaba")));
+        let bytes_value = Value::object_ptr(bytes_ptr as *const ());
+        let needle_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"ba")));
+        let needle_value = Value::object_ptr(needle_ptr as *const ());
+        let empty_ptr = Box::into_raw(Box::new(BytesObject::from_slice(b"")));
+        let empty_value = Value::object_ptr(empty_ptr as *const ());
+        let bytearray_ptr = Box::into_raw(Box::new(BytesObject::bytearray_from_slice(&[
+            0, 1, 2, 1, 0,
+        ])));
+        let bytearray_value = Value::object_ptr(bytearray_ptr as *const ());
+
+        assert_eq!(
+            bytes_find_method(&[bytes_value, needle_value])
+                .expect("bytes.find should work")
+                .as_int(),
+            Some(1)
+        );
+        assert_eq!(
+            bytes_rfind_method(&[bytes_value, needle_value])
+                .expect("bytes.rfind should work")
+                .as_int(),
+            Some(4)
+        );
+        assert_eq!(
+            bytes_count_method(&[bytes_value, needle_value])
+                .expect("bytes.count should work")
+                .as_int(),
+            Some(2)
+        );
+        assert_eq!(
+            bytes_find_method(&[
+                bytes_value,
+                needle_value,
+                Value::int(4).unwrap(),
+                Value::int(2).unwrap(),
+            ])
+            .expect("empty search interval should not be reordered")
+            .as_int(),
+            Some(-1)
+        );
+        assert_eq!(
+            bytes_find_method(&[
+                bytes_value,
+                empty_value,
+                Value::int(3).unwrap(),
+                Value::int(3).unwrap(),
+            ])
+            .expect("empty needle should match a valid zero-length interval")
+            .as_int(),
+            Some(3)
+        );
+        assert_eq!(
+            bytes_rfind_method(&[
+                bytes_value,
+                empty_value,
+                Value::int(0).unwrap(),
+                Value::int(4).unwrap(),
+            ])
+            .expect("rfind empty needle should return the clamped end")
+            .as_int(),
+            Some(4)
+        );
+        assert_eq!(
+            bytearray_find(&[
+                bytearray_value,
+                Value::int(1).unwrap(),
+                Value::int(2).unwrap(),
+            ])
+            .expect("bytearray.find should accept an integer needle")
+            .as_int(),
+            Some(3)
+        );
+        assert_eq!(
+            bytearray_count(&[bytearray_value, Value::int(1).unwrap()])
+                .expect("bytearray.count should accept an integer needle")
+                .as_int(),
+            Some(2)
+        );
+
+        let missing = bytes_index_method(&[bytes_value, Value::int(b'z' as i64).unwrap()])
+            .expect_err("bytes.index should raise for a missing subsection");
+        assert!(missing.to_string().contains("subsection not found"));
+
+        let out_of_range = bytearray_find(&[bytearray_value, Value::int(256).unwrap()])
+            .expect_err("integer needles must be valid bytes");
+        assert_eq!(
+            out_of_range.to_string(),
+            "ValueError: byte must be in range(0, 256)"
+        );
+
+        let wrong_type =
+            bytes_find_method(&[bytes_value, Value::string(intern("ba"))]).unwrap_err();
+        assert!(
+            wrong_type
+                .to_string()
+                .contains("argument should be integer or bytes-like object, not 'str'")
+        );
+
+        unsafe {
+            drop(Box::from_raw(bytearray_ptr));
+            drop(Box::from_raw(empty_ptr));
+            drop(Box::from_raw(needle_ptr));
             drop(Box::from_raw(bytes_ptr));
         }
     }

@@ -5,7 +5,7 @@
 //! [`num_bigint::BigInt`]. This mirrors CPython's single visible `int` type
 //! while preserving the fast small-int representation.
 
-use crate::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
+use crate::allocation_context::try_alloc_value_in_current_heap;
 use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
@@ -129,12 +129,11 @@ pub fn bigint_to_value(value: BigInt) -> Value {
         }
     }
 
-    if has_current_heap_binding() {
-        alloc_value_in_current_heap(IntObject::new(value))
-            .expect("bound heap should satisfy int allocation")
-    } else {
-        Value::object_ptr(PINNED_INT_OBJECTS.alloc(IntObject::new(value)) as *const ())
-    }
+    let object = match try_alloc_value_in_current_heap(IntObject::new(value)) {
+        Ok(value) => return value,
+        Err(object) => object,
+    };
+    Value::object_ptr(PINNED_INT_OBJECTS.alloc(object) as *const ())
 }
 
 #[cfg(test)]
@@ -180,6 +179,27 @@ mod tests {
 
         assert_eq!(PINNED_INT_OBJECTS.len(), baseline);
         let obj = value_as_heap_int(value).expect("bound heap should allocate managed int");
+        assert_eq!(obj.value(), &big);
+    }
+
+    #[test]
+    fn test_bigint_to_value_falls_back_after_bound_heap_exhaustion() {
+        let heap = GcHeap::new(GcConfig {
+            nursery_size: 64 * 1024,
+            minor_gc_trigger: 64 * 1024,
+            ..GcConfig::default()
+        });
+        let _binding = RuntimeHeapBinding::register(&heap);
+
+        while crate::allocation_context::alloc_value_in_current_heap(
+            crate::types::dict::DictObject::new(),
+        )
+        .is_some()
+        {}
+
+        let big = BigInt::from(1_u8) << 100_u32;
+        let value = bigint_to_value(big.clone());
+        let obj = value_as_heap_int(value).expect("large integer should survive exhaustion");
         assert_eq!(obj.value(), &big);
     }
 

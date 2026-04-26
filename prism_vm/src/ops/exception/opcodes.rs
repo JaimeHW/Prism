@@ -249,8 +249,7 @@ pub fn end_finally(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
         vm.clear_reraise_flag();
         ControlFlow::Reraise
     } else {
-        // Normal exit from finally - clear any exception state
-        vm.clear_exception_state();
+        vm.finish_finally_without_reraise();
         ControlFlow::Continue
     }
 }

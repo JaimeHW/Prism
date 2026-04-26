@@ -4248,11 +4248,21 @@ impl Compiler {
                 ));
             }
 
-            PatternKind::MatchClass { .. } => {
-                return Err(self.unsupported_pattern_error(
+            PatternKind::MatchClass {
+                cls,
+                patterns,
+                kwd_attrs,
+                kwd_patterns,
+            } => {
+                self.compile_class_pattern_match(
                     pattern,
-                    "class patterns require CPython-compatible isinstance, __match_args__, and descriptor-aware attribute matching",
-                ));
+                    cls,
+                    patterns,
+                    kwd_attrs,
+                    kwd_patterns,
+                    subject_reg,
+                    fail_label,
+                )?;
             }
 
             PatternKind::MatchStar(_name) => {
@@ -4314,6 +4324,100 @@ impl Compiler {
             }
         }
 
+        Ok(())
+    }
+
+    fn compile_class_pattern_match(
+        &mut self,
+        pattern: &prism_parser::ast::Pattern,
+        cls: &Expr,
+        patterns: &[prism_parser::ast::Pattern],
+        kwd_attrs: &[String],
+        kwd_patterns: &[prism_parser::ast::Pattern],
+        subject_reg: Register,
+        fail_label: Label,
+    ) -> CompileResult<()> {
+        if kwd_attrs.len() != kwd_patterns.len() {
+            return Err(self.unsupported_pattern_error(
+                pattern,
+                "class pattern keyword attribute and pattern counts differ",
+            ));
+        }
+
+        let mut seen_attrs = std::collections::HashSet::new();
+        for attr in kwd_attrs {
+            if !seen_attrs.insert(attr.as_str()) {
+                return Err(CompileError {
+                    message: format!("duplicate attribute name in class pattern: {attr}"),
+                    line: self.line_for_span(pattern.span),
+                    column: 0,
+                });
+            }
+        }
+
+        if patterns.len() > u8::MAX as usize {
+            return Err(CompileError {
+                message: "class pattern has too many positional subpatterns".to_string(),
+                line: self.line_for_span(pattern.span),
+                column: 0,
+            });
+        }
+
+        let class_reg = self.compile_expr(cls)?;
+        let matches_class_reg = self.builder.alloc_register();
+        self.builder.emit(Instruction::op_dss(
+            Opcode::MatchClass,
+            matches_class_reg,
+            subject_reg,
+            class_reg,
+        ));
+        self.builder
+            .emit_jump_if_false(matches_class_reg, fail_label);
+        self.builder.free_register(matches_class_reg);
+
+        if !patterns.is_empty() {
+            let match_args_reg = self.builder.alloc_register();
+            self.builder.emit(Instruction::op_ds(
+                Opcode::GetMatchArgs,
+                match_args_reg,
+                class_reg,
+            ));
+
+            for (index, sub_pattern) in patterns.iter().enumerate() {
+                let index_const = self.builder.add_int(index as i64);
+                let index_reg = self.builder.alloc_register();
+                self.builder.emit_load_const(index_reg, index_const);
+
+                let attr_name_reg = self.builder.alloc_register();
+                self.builder
+                    .emit_get_item(attr_name_reg, match_args_reg, index_reg);
+                self.builder.free_register(index_reg);
+
+                let attr_value_reg = self.builder.alloc_register();
+                self.emit_named_call_from_regs(
+                    "getattr",
+                    &[subject_reg, attr_name_reg],
+                    attr_value_reg,
+                )?;
+                self.builder.free_register(attr_name_reg);
+
+                self.compile_pattern_match(sub_pattern, attr_value_reg, fail_label)?;
+                self.builder.free_register(attr_value_reg);
+            }
+
+            self.builder.free_register(match_args_reg);
+        }
+
+        for (attr, sub_pattern) in kwd_attrs.iter().zip(kwd_patterns.iter()) {
+            let attr_reg = self.builder.alloc_register();
+            let attr_name_idx = self.builder.add_name(Arc::<str>::from(attr.as_str()));
+            self.builder
+                .emit_get_attr(attr_reg, subject_reg, attr_name_idx);
+            self.compile_pattern_match(sub_pattern, attr_reg, fail_label)?;
+            self.builder.free_register(attr_reg);
+        }
+
+        self.builder.free_register(class_reg);
         Ok(())
     }
 

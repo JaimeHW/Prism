@@ -33,7 +33,7 @@ use prism_code::{CodeObject, Instruction, LineTableEntry, Opcode};
 use prism_compiler::{OptimizationLevel, compile_source_code};
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
-use prism_runtime::allocation_context::RuntimeHeapBinding;
+use prism_runtime::allocation_context::{RuntimeHeapBinding, alloc_value_in_current_heap_or_box};
 use prism_runtime::object::class::ClassDict;
 use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
 use prism_runtime::types::dict::DictObject;
@@ -112,6 +112,12 @@ struct ActiveExceptHandler {
 pub(crate) enum NestedTargetFrameOutcome {
     Returned(Value),
     ControlTransferred,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryHandlerPolicy {
+    IncludeBoundary,
+    ExcludeBoundary,
 }
 
 /// Snapshot of caller-visible exception bookkeeping around a synchronous
@@ -679,12 +685,20 @@ impl VirtualMachine {
 
     #[inline]
     fn route_nested_exception(&mut self, stop_depth: usize, type_id: u16) -> VmResult<()> {
-        self.propagate_exception_to_depth(stop_depth, type_id)
+        self.propagate_exception_to_depth_with_policy(
+            stop_depth,
+            type_id,
+            BoundaryHandlerPolicy::ExcludeBoundary,
+        )
     }
 
     #[inline]
     fn route_nested_reraise(&mut self, stop_depth: usize, type_id: u16) -> VmResult<()> {
-        self.propagate_reraise_to_depth(stop_depth, type_id)
+        self.propagate_reraise_to_depth_with_policy(
+            stop_depth,
+            type_id,
+            BoundaryHandlerPolicy::ExcludeBoundary,
+        )
     }
 
     #[inline]
@@ -692,7 +706,11 @@ impl VirtualMachine {
         if err.is_control_transferred() {
             return Ok(());
         }
-        self.propagate_runtime_error_to_depth(stop_depth, err)
+        self.propagate_runtime_error_to_depth_with_policy(
+            stop_depth,
+            err,
+            BoundaryHandlerPolicy::ExcludeBoundary,
+        )
     }
 
     #[inline]
@@ -1833,16 +1851,11 @@ impl VirtualMachine {
         self.prepend_current_traceback_entry(&mut err.traceback);
     }
 
-    fn alloc_traceback_view<T>(&self, object: T, context: &'static str) -> VmResult<Value>
+    fn alloc_traceback_view<T>(&self, object: T) -> Value
     where
         T: prism_runtime::Trace,
     {
-        self.allocator()
-            .alloc(object)
-            .map(|ptr| Value::object_ptr(ptr as *const ()))
-            .ok_or_else(|| {
-                RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
-            })
+        alloc_value_in_current_heap_or_box(object)
     }
 
     fn synthetic_traceback_code(entry: &TracebackEntry) -> Arc<CodeObject> {
@@ -1867,29 +1880,24 @@ impl VirtualMachine {
         let mut frames = Vec::with_capacity(entries.len());
         let mut back = None;
         for entry in entries {
-            let globals = self.alloc_traceback_view(DictObject::new(), "traceback globals dict")?;
-            let locals = self.alloc_traceback_view(DictObject::new(), "traceback locals dict")?;
-            let frame = self.alloc_traceback_view(
-                FrameViewObject::new(
-                    Some(Self::synthetic_traceback_code(entry)),
-                    globals,
-                    locals,
-                    entry.line,
-                    0,
-                    back,
-                ),
-                "traceback frame",
-            )?;
+            let globals = self.alloc_traceback_view(DictObject::new());
+            let locals = self.alloc_traceback_view(DictObject::new());
+            let frame = self.alloc_traceback_view(FrameViewObject::new(
+                Some(Self::synthetic_traceback_code(entry)),
+                globals,
+                locals,
+                entry.line,
+                0,
+                back,
+            ));
             frames.push(frame);
             back = Some(frame);
         }
 
         let mut next = None;
         for (entry, frame) in entries.iter().zip(frames.iter()).rev() {
-            let traceback = self.alloc_traceback_view(
-                TracebackViewObject::new(*frame, next, entry.line, 0),
-                "traceback",
-            )?;
+            let traceback =
+                self.alloc_traceback_view(TracebackViewObject::new(*frame, next, entry.line, 0));
             next = Some(traceback);
         }
 
@@ -1908,6 +1916,20 @@ impl VirtualMachine {
 
     #[inline]
     fn propagate_exception_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
+        self.propagate_exception_to_depth_with_policy(
+            min_depth,
+            type_id,
+            BoundaryHandlerPolicy::IncludeBoundary,
+        )
+    }
+
+    #[inline]
+    fn propagate_exception_to_depth_with_policy(
+        &mut self,
+        min_depth: usize,
+        type_id: u16,
+        boundary_policy: BoundaryHandlerPolicy,
+    ) -> VmResult<()> {
         let mut traceback = Vec::with_capacity(
             self.frames
                 .len()
@@ -1931,6 +1953,15 @@ impl VirtualMachine {
             }
 
             self.pop_top_frame_for_unwind();
+            if boundary_policy == BoundaryHandlerPolicy::ExcludeBoundary
+                && self.frames.len() <= min_depth
+            {
+                let mut err = self.uncaught_exception_error(type_id);
+                err.traceback = traceback;
+                self.attach_active_python_traceback(&err.traceback)?;
+                return Err(err);
+            }
+
             self.prepend_current_traceback_entry(&mut traceback);
             if let Some(handler_entry) = self.find_exception_handler(type_id) {
                 self.attach_active_python_traceback(&traceback)?;
@@ -1942,6 +1973,20 @@ impl VirtualMachine {
 
     #[inline]
     fn propagate_reraise_to_depth(&mut self, min_depth: usize, type_id: u16) -> VmResult<()> {
+        self.propagate_reraise_to_depth_with_policy(
+            min_depth,
+            type_id,
+            BoundaryHandlerPolicy::IncludeBoundary,
+        )
+    }
+
+    #[inline]
+    fn propagate_reraise_to_depth_with_policy(
+        &mut self,
+        min_depth: usize,
+        type_id: u16,
+        boundary_policy: BoundaryHandlerPolicy,
+    ) -> VmResult<()> {
         let mut traceback = Vec::with_capacity(
             self.frames
                 .len()
@@ -1965,6 +2010,15 @@ impl VirtualMachine {
             }
 
             self.pop_top_frame_for_unwind();
+            if boundary_policy == BoundaryHandlerPolicy::ExcludeBoundary
+                && self.frames.len() <= min_depth
+            {
+                let mut err = self.uncaught_reraised_exception_error(type_id);
+                err.traceback = traceback;
+                self.attach_active_python_traceback(&err.traceback)?;
+                return Err(err);
+            }
+
             self.prepend_current_traceback_entry(&mut traceback);
             if let Some(handler_entry) = self.find_exception_handler(type_id) {
                 self.attach_active_python_traceback(&traceback)?;
@@ -1978,7 +2032,21 @@ impl VirtualMachine {
     fn propagate_runtime_error_to_depth(
         &mut self,
         min_depth: usize,
+        err: RuntimeError,
+    ) -> VmResult<()> {
+        self.propagate_runtime_error_to_depth_with_policy(
+            min_depth,
+            err,
+            BoundaryHandlerPolicy::IncludeBoundary,
+        )
+    }
+
+    #[inline]
+    fn propagate_runtime_error_to_depth_with_policy(
+        &mut self,
+        min_depth: usize,
         mut err: RuntimeError,
+        boundary_policy: BoundaryHandlerPolicy,
     ) -> VmResult<()> {
         if err.is_control_transferred() {
             return Ok(());
@@ -1999,6 +2067,13 @@ impl VirtualMachine {
             }
 
             self.pop_top_frame_for_unwind();
+            if boundary_policy == BoundaryHandlerPolicy::ExcludeBoundary
+                && self.frames.len() <= min_depth
+            {
+                self.attach_active_python_traceback(&err.traceback)?;
+                return Err(err);
+            }
+
             self.prepend_current_traceback_to_error(&mut err);
             if let Some(handler_entry) = self.find_exception_handler(type_id) {
                 self.attach_active_python_traceback(&err.traceback)?;
@@ -3003,13 +3078,21 @@ impl VirtualMachine {
     /// Get the active exception if any.
     #[inline]
     pub fn get_active_exception(&self) -> Option<&Value> {
-        self.active_exception.as_ref()
+        if self.has_active_exception() {
+            self.active_exception.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Check if there's an active exception.
     #[inline]
     pub fn has_active_exception(&self) -> bool {
-        self.active_exception.is_some()
+        self.exc_state.has_exception()
+            && self.active_exception.is_some()
+            && self
+                .active_exception_type_id
+                .is_some_and(|type_id| type_id != 0)
     }
 
     /// Clear the active exception.
@@ -3145,6 +3228,18 @@ impl VirtualMachine {
         self.exc_state = ExceptionState::Normal;
     }
 
+    /// Finish a finally cleanup that did not need to reraise.
+    #[inline]
+    pub fn finish_finally_without_reraise(&mut self) {
+        match self.exc_state {
+            ExceptionState::Handling | ExceptionState::Finally => {}
+            ExceptionState::Normal | ExceptionState::Propagating | ExceptionState::Unhandled => {
+                self.clear_active_exception();
+                self.exc_state = ExceptionState::Normal;
+            }
+        }
+    }
+
     /// Get the current exception state.
     #[inline]
     pub fn exception_state(&self) -> ExceptionState {
@@ -3276,11 +3371,22 @@ impl VirtualMachine {
     pub fn push_exc_info(&mut self) -> bool {
         use crate::exception::{EntryFlags, ExcInfoEntry};
 
-        let type_id = self.get_active_exception_type_id().unwrap_or(0);
-        let value = self.active_exception.clone();
+        let has_active_exception = self.has_active_exception();
+        let type_id = if has_active_exception {
+            self.get_active_exception_type_id().unwrap_or(0)
+        } else {
+            0
+        };
+        let value = if has_active_exception {
+            self.active_exception
+        } else {
+            None
+        };
         let mut entry = ExcInfoEntry::new(type_id, value);
         if self.exc_state == ExceptionState::Handling {
             entry.flags_mut().set(EntryFlags::HANDLING);
+        } else if self.exc_state == ExceptionState::Finally {
+            entry.flags_mut().set(EntryFlags::FINALLY);
         }
         self.exc_info_stack.push(entry)
     }
@@ -3296,6 +3402,8 @@ impl VirtualMachine {
                 self.active_exception_type_id = Some(entry.type_id());
                 self.exc_state = if entry.flags().has(EntryFlags::HANDLING) {
                     ExceptionState::Handling
+                } else if entry.flags().has(EntryFlags::FINALLY) {
+                    ExceptionState::Finally
                 } else {
                     ExceptionState::Propagating
                 };
@@ -3313,7 +3421,7 @@ impl VirtualMachine {
     /// Check if there's exception info on the stack.
     #[inline]
     pub fn has_exc_info(&self) -> bool {
-        !self.exc_info_stack.is_empty() || self.active_exception.is_some()
+        !self.exc_info_stack.is_empty() || self.has_active_exception()
     }
 
     /// Get current exception info as (type_id, value, traceback_id).
@@ -4128,6 +4236,30 @@ mod tests {
     }
 
     #[test]
+    fn test_python_traceback_allocation_survives_full_nursery() {
+        let vm = VirtualMachine::new();
+        let mut exhausted = false;
+
+        for _ in 0..200_000 {
+            if vm.allocator().alloc(DictObject::new()).is_none() {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted, "test setup should fill the nursery");
+
+        let traceback = vm
+            .python_traceback_from_entries(&[TracebackEntry {
+                func_name: Arc::from("boom"),
+                filename: Arc::from("traceback_exhaustion.py"),
+                line: 7,
+            }])
+            .expect("traceback allocation should not turn nursery exhaustion into OOM");
+
+        assert!(traceback.as_object_ptr().is_some());
+    }
+
+    #[test]
     fn test_handled_runtime_error_attaches_python_traceback_to_exc_info() {
         let mut vm = VirtualMachine::new();
         let module = Arc::new(ModuleObject::new("__main__"));
@@ -4420,6 +4552,58 @@ mod tests {
         assert!(vm.get_active_exception().is_none());
         assert_eq!(vm.get_active_exception_type_id(), None);
         assert_eq!(vm.exception_state(), ExceptionState::Normal);
+    }
+
+    #[test]
+    fn test_push_exc_info_ignores_stale_normal_exception_value() {
+        let mut vm = VirtualMachine::new();
+        vm.set_active_exception_with_type(Value::int(11).unwrap(), 24);
+        vm.clear_exception_state();
+
+        assert!(!vm.has_active_exception());
+        assert!(vm.get_active_exception().is_none());
+        assert!(!vm.has_exc_info());
+
+        assert!(vm.push_exc_info());
+        vm.set_active_exception_with_type(Value::int(22).unwrap(), 5);
+        assert!(vm.pop_exc_info());
+
+        assert!(vm.get_active_exception().is_none());
+        assert_eq!(vm.get_active_exception_type_id(), None);
+        assert_eq!(vm.exception_state(), ExceptionState::Normal);
+    }
+
+    #[test]
+    fn test_pop_exc_info_restores_handling_state() {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(empty_code("handler"), 0).unwrap();
+
+        vm.set_active_exception_with_type(Value::int(31).unwrap(), 24);
+        assert!(vm.enter_except_handler());
+        assert!(vm.push_exc_info());
+
+        vm.set_active_exception_with_type(Value::int(32).unwrap(), 5);
+        assert!(vm.pop_exc_info());
+
+        assert_eq!(vm.exception_state(), ExceptionState::Handling);
+        assert_eq!(vm.get_active_exception_type_id(), Some(24));
+        assert_eq!(vm.get_active_exception().and_then(Value::as_int), Some(31));
+    }
+
+    #[test]
+    fn test_pop_exc_info_restores_finally_state() {
+        let mut vm = VirtualMachine::new();
+
+        vm.set_active_exception_with_type(Value::int(41).unwrap(), 24);
+        vm.set_exception_state(ExceptionState::Finally);
+        assert!(vm.push_exc_info());
+
+        vm.set_active_exception_with_type(Value::int(42).unwrap(), 5);
+        assert!(vm.pop_exc_info());
+
+        assert_eq!(vm.exception_state(), ExceptionState::Finally);
+        assert_eq!(vm.get_active_exception_type_id(), Some(24));
+        assert_eq!(vm.get_active_exception().and_then(Value::as_int), Some(41));
     }
 
     #[test]

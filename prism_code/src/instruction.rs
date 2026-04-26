@@ -586,7 +586,7 @@ pub enum Opcode {
     /// src1 = mapping, src2 = tuple of keys to exclude.
     /// Used for **rest capture in mapping patterns.
     CopyDictWithoutKeys = 0x9E,
-    /// Get __match_args__: dst = getattr(type(src), '__match_args__', ()).
+    /// Get __match_args__: dst = getattr(cls, '__match_args__', ()).
     /// Used to determine positional attributes for class patterns.
     GetMatchArgs = 0x9F,
 
@@ -866,7 +866,7 @@ impl Opcode {
             MatchMapping | MatchSequence => DstSrc, // dst = bool, src = subject
             MatchKeys => DstSrcSrc,  // dst = values tuple, src1 = mapping, src2 = keys tuple
             CopyDictWithoutKeys => DstSrcSrc, // dst = new dict, src1 = mapping, src2 = keys to exclude
-            GetMatchArgs => DstSrc,           // dst = __match_args__ tuple, src = subject
+            GetMatchArgs => DstSrc,           // dst = __match_args__ tuple, src = class
 
             // Coroutine/async (PEP 492/525/530)
             GetAwaitable | GetAIter | GetANext => DstSrc, // dst = result, src = object

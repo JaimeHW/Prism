@@ -1701,6 +1701,35 @@ mod tests {
     }
 
     #[test]
+    fn test_sys_exc_info_ignores_stale_normal_exception_value() {
+        let sys = SysModule::new();
+        let hook = sys.get_attr("exc_info").expect("sys.exc_info should exist");
+        let ptr = hook
+            .as_object_ptr()
+            .expect("sys.exc_info should be a builtin function");
+        let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+        let mut vm = crate::VirtualMachine::new();
+        let stale_exception =
+            create_exception(ExceptionTypeId::IndexError, Some(Arc::from("stale")));
+        vm.set_active_exception_with_type(
+            stale_exception,
+            ExceptionTypeId::IndexError.as_u8() as u16,
+        );
+        vm.clear_exception_state();
+
+        let value = builtin
+            .call_with_vm(&mut vm, &[])
+            .expect("sys.exc_info should accept zero arguments");
+        let tuple_ptr = value
+            .as_object_ptr()
+            .expect("sys.exc_info should return a tuple");
+        let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+
+        assert_eq!(tuple.len(), 3);
+        assert!(tuple.iter().all(Value::is_none));
+    }
+
+    #[test]
     fn test_sys_exception_returns_none_without_active_exception() {
         let sys = SysModule::new();
         let hook = sys

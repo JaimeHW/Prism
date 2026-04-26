@@ -18,7 +18,7 @@ use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_gc::trace::{Trace, Tracer};
-use prism_runtime::allocation_context::{alloc_value_in_current_heap, has_current_heap_binding};
+use prism_runtime::allocation_context::try_alloc_value_in_current_heap;
 use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
@@ -498,13 +498,13 @@ impl ExceptionValue {
     /// Create exception on heap and return as Value.
     pub fn into_value(self) -> Value {
         ensure_exception_gc_dispatch_registered();
-        if has_current_heap_binding() {
-            return alloc_value_in_current_heap(self)
-                .expect("bound heap should satisfy exception allocation");
-        }
+        let value = match try_alloc_value_in_current_heap(self) {
+            Ok(value) => return value,
+            Err(value) => value,
+        };
 
         PINNED_EXCEPTION_VALUES.with(|store| {
-            let pinned = Box::into_pin(Box::new(self));
+            let pinned = Box::into_pin(Box::new(value));
             let ptr = (&*pinned) as *const ExceptionValue as *const ();
             store.borrow_mut().push(pinned);
             Value::object_ptr(ptr)

@@ -17,9 +17,10 @@
 
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
-use crate::ops::objects::extract_type_id;
+use crate::ops::objects::{alloc_heap_value, extract_type_id, get_attribute_value};
 use prism_code::Instruction;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -155,42 +156,30 @@ pub fn match_mapping(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 /// traversal for user-defined classes.
 #[inline(always)]
 pub fn match_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let subject_reg = inst.src1().0;
-    let class_reg = inst.src2().0;
-    let dst = inst.dst().0;
-
-    let subject = frame.get_reg(subject_reg);
-    let class_val = frame.get_reg(class_reg);
-
-    // Get subject's type
-    let subject_type_id = get_type_id_from_value(subject);
-    let class_type_id = get_type_id_from_value(class_val);
-
-    // Fast path: exact type match for builtins
-    let result = match (subject_type_id, class_type_id) {
-        (Some(subj_tid), Some(cls_tid)) if cls_tid == TypeId::TYPE => {
-            // class_val is a type object
-            // TODO: Extract target TypeId from type object and compare
-            // For now, perform simple isinstance-like check
-            subj_tid == cls_tid
-        }
-        _ => {
-            // Slower path for user-defined classes
-            // TODO: Implement full MRO-based isinstance check
-            false
-        }
+    let (dst, subject, class_val) = {
+        let frame = vm.current_frame();
+        (
+            inst.dst().0,
+            frame.get_reg(inst.src1().0),
+            frame.get_reg(inst.src2().0),
+        )
     };
 
-    frame.set_reg(dst, Value::bool(result));
-    ControlFlow::Continue
+    match crate::builtins::builtin_isinstance_vm(vm, &[subject, class_val]) {
+        Ok(value) => {
+            vm.current_frame_mut()
+                .set_reg(dst, Value::bool(value.as_bool().unwrap_or(false)));
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err.into()),
+    }
 }
 
 // =============================================================================
 // GetMatchArgs (0x9F)
 // =============================================================================
 
-/// GetMatchArgs: dst = getattr(type(src), '__match_args__', ())
+/// GetMatchArgs: dst = getattr(cls, '__match_args__', ())
 ///
 /// PEP 634 §10.6: For class patterns with positional sub-patterns,
 /// `__match_args__` defines the attribute names to match.
@@ -205,20 +194,23 @@ pub fn match_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Caches __match_args__ lookup per type to avoid repeated attribute access.
 #[inline(always)]
 pub fn get_match_args(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let _subject_reg = inst.src1().0;
-    let dst = inst.dst().0;
+    let (dst, class_value) = {
+        let frame = vm.current_frame();
+        (inst.dst().0, frame.get_reg(inst.src1().0))
+    };
 
-    let _subject = frame.get_reg(_subject_reg);
+    let match_args = match get_attribute_value(vm, class_value, &intern("__match_args__")) {
+        Ok(value) => value,
+        Err(err) if err.is_attribute_error() => {
+            match alloc_heap_value(vm, TupleObject::empty(), "empty __match_args__ tuple") {
+                Ok(value) => value,
+                Err(err) => return ControlFlow::Error(err),
+            }
+        }
+        Err(err) => return ControlFlow::Error(err),
+    };
 
-    // TODO: Implement proper __match_args__ lookup:
-    // 1. Get type(subject)
-    // 2. Look up '__match_args__' attribute
-    // 3. Return tuple or empty tuple if not found
-
-    // For now, return None (no positional attribute matching)
-    // Full implementation needs type system integration
-    frame.set_reg(dst, Value::none());
+    vm.current_frame_mut().set_reg(dst, match_args);
     ControlFlow::Continue
 }
 

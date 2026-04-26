@@ -9,6 +9,7 @@ use crate::ops::iteration::collect_iterable_values;
 use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
@@ -34,19 +35,10 @@ pub fn build_list(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             .collect()
     };
 
-    // Allocate on GC heap
     let list = ListObject::from_slice(&values);
-    let ptr = match vm.allocator().alloc(list) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate list",
-            ));
-        }
-    };
+    let value = alloc_value_in_current_heap_or_box(list);
 
-    // Store as object Value
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -65,19 +57,10 @@ pub fn build_tuple(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             .collect()
     };
 
-    // Allocate on GC heap
     let tuple = TupleObject::from_slice(&values);
-    let ptr = match vm.allocator().alloc(tuple) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate tuple",
-            ));
-        }
-    };
+    let value = alloc_value_in_current_heap_or_box(tuple);
 
-    // Store as object Value
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -99,18 +82,9 @@ pub fn build_set(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         set
     };
 
-    // Allocate on GC heap
-    let ptr = match vm.allocator().alloc(set) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate set",
-            ));
-        }
-    };
+    let value = alloc_value_in_current_heap_or_box(set);
 
-    // Store as object Value
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -133,18 +107,9 @@ pub fn build_dict(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         dict
     };
 
-    // Allocate on GC heap
-    let ptr = match vm.allocator().alloc(dict) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate dict",
-            ));
-        }
-    };
+    let value = alloc_value_in_current_heap_or_box(dict);
 
-    // Store as object Value
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -203,16 +168,9 @@ pub fn build_string(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     let string = StringObject::from_string(joined);
-    let ptr = match vm.allocator().alloc(string) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate joined string",
-            ));
-        }
-    };
+    let value = alloc_value_in_current_heap_or_box(string);
 
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -306,7 +264,7 @@ pub fn unpack_sequence(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
 
     // Get the sequence value
     let sequence = vm.current_frame().get_reg(inst.src1().0);
-    let values = match collect_iterable_values(vm, sequence) {
+    let values: Vec<Value> = match collect_iterable_values(vm, sequence) {
         Ok(values) => values,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -352,7 +310,7 @@ pub fn unpack_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let after_count = (packed & 0x0F) as usize;
     let min_required = before_count + after_count;
 
-    let values = match collect_iterable_values(vm, sequence) {
+    let values: Vec<Value> = match collect_iterable_values(vm, sequence) {
         Ok(values) => values,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -375,19 +333,12 @@ pub fn unpack_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     }
 
-    // 2. Create rest list on GC heap and assign
+    // 2. Create rest list on the active heap and assign
     let rest_values: Vec<Value> = values[before_count..before_count + rest_count].to_vec();
     let rest_list = ListObject::from_slice(&rest_values);
-    let rest_ptr = match vm.allocator().alloc(rest_list) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate unpack rest list",
-            ));
-        }
-    };
+    let rest_value = alloc_value_in_current_heap_or_box(rest_list);
     vm.current_frame_mut()
-        .set_reg(dst_start + before_count as u8, Value::object_ptr(rest_ptr));
+        .set_reg(dst_start + before_count as u8, rest_value);
 
     // 3. Assign after values
     {
@@ -468,18 +419,11 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Error(RuntimeError::value_error("slice step cannot be zero"));
     }
 
-    // Create slice on GC heap
+    // Create slice on the active heap
     let slice = SliceObject::new(start, stop, step);
-    let ptr = match vm.allocator().alloc(slice) {
-        Some(p) => p as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate slice",
-            ));
-        }
-    };
+    let value = alloc_value_in_current_heap_or_box(slice);
 
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -603,5 +547,57 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
 #[cfg(test)]
 mod tests {
-    // Container tests require full VM setup with object system
+    use super::*;
+    use prism_code::{CodeObject, Opcode, Register};
+    use std::sync::Arc;
+
+    fn vm_with_frame() -> VirtualMachine {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(CodeObject::new("containers", "<test>")), 0)
+            .expect("frame push should succeed");
+        vm
+    }
+
+    fn exhaust_nursery(vm: &VirtualMachine) {
+        for _ in 0..200_000 {
+            if vm.allocator().alloc(DictObject::new()).is_none() {
+                return;
+            }
+        }
+        panic!("test setup should fill the nursery");
+    }
+
+    #[test]
+    fn test_build_list_allocates_after_full_nursery() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(0, Value::int(1).unwrap());
+        vm.current_frame_mut().set_reg(1, Value::int(2).unwrap());
+        exhaust_nursery(&vm);
+
+        let inst = Instruction::op_dss(
+            Opcode::BuildList,
+            Register::new(4),
+            Register::new(0),
+            Register::new(2),
+        );
+        assert!(matches!(build_list(&mut vm, inst), ControlFlow::Continue));
+        assert!(vm.current_frame().get_reg(4).as_object_ptr().is_some());
+    }
+
+    #[test]
+    fn test_build_tuple_allocates_after_full_nursery() {
+        let mut vm = vm_with_frame();
+        vm.current_frame_mut().set_reg(0, Value::int(1).unwrap());
+        vm.current_frame_mut().set_reg(1, Value::int(2).unwrap());
+        exhaust_nursery(&vm);
+
+        let inst = Instruction::op_dss(
+            Opcode::BuildTuple,
+            Register::new(4),
+            Register::new(0),
+            Register::new(2),
+        );
+        assert!(matches!(build_tuple(&mut vm, inst), ControlFlow::Continue));
+        assert!(vm.current_frame().get_reg(4).as_object_ptr().is_some());
+    }
 }

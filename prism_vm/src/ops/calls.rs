@@ -4,7 +4,7 @@
 //!
 //! # Performance Notes
 //!
-//! - Function objects are heap-allocated with Box::into_raw for stable pointers
+//! - Function objects allocate through the active VM heap with stable fallback storage
 //! - Call dispatch uses O(1) type discrimination via ObjectHeader
 //! - Arguments are passed via register file, avoiding heap allocation
 
@@ -23,6 +23,7 @@ use crate::vm::NestedTargetFrameOutcome;
 use prism_code::{CodeFlags, CodeObject, Instruction};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::{BoundMethod, StaticMethodDescriptor};
@@ -334,19 +335,14 @@ fn class_object_from_type_ptr(ptr: *const ()) -> Option<&'static PyClassObject> 
 
 #[inline]
 fn alloc_heap_value<T>(
-    vm: &mut VirtualMachine,
+    _vm: &mut VirtualMachine,
     object: T,
-    context: &'static str,
+    _context: &'static str,
 ) -> Result<Value, RuntimeError>
 where
     T: prism_runtime::Trace,
 {
-    vm.allocator()
-        .alloc(object)
-        .map(|ptr| Value::object_ptr(ptr as *const ()))
-        .ok_or_else(|| {
-            RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
-        })
+    Ok(alloc_value_in_current_heap_or_box(object))
 }
 
 fn snapshot_module_dict(module: &crate::import::ModuleObject) -> DictObject {
@@ -2968,14 +2964,7 @@ fn call_kw_user_function(
             Some(vals) if !vals.is_empty() => TupleObject::from_slice(&vals),
             _ => TupleObject::empty(),
         };
-        match vm.allocator().alloc(tuple) {
-            Some(ptr) => Some(Value::object_ptr(ptr as *const ())),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate varargs tuple",
-                ));
-            }
-        }
+        Some(alloc_value_in_current_heap_or_box(tuple))
     } else {
         None
     };
@@ -2988,14 +2977,7 @@ fn call_kw_user_function(
                 dict.set(*key, *val);
             }
         }
-        match vm.allocator().alloc(dict) {
-            Some(ptr) => Some(Value::object_ptr(ptr as *const ())),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate varkw dict",
-                ));
-            }
-        }
+        Some(alloc_value_in_current_heap_or_box(dict))
     } else {
         None
     };
@@ -3395,18 +3377,8 @@ pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     // Create FunctionObject
     let func = new_function_object(vm, code_clone);
 
-    // Allocate on GC heap
-    let func_ptr = match vm.allocator().alloc(func) {
-        Some(ptr) => ptr as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate function",
-            ));
-        }
-    };
-
-    vm.current_frame_mut()
-        .set_reg(dst, Value::object_ptr(func_ptr));
+    let func_value = alloc_value_in_current_heap_or_box(func);
+    vm.current_frame_mut().set_reg(dst, func_value);
     ControlFlow::Continue
 }
 
@@ -3435,21 +3407,17 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // Create FunctionObject
     let func = new_function_object(vm, code_clone);
 
-    // Allocate on GC heap
-    let func_ptr = match vm.allocator().alloc(func) {
-        Some(ptr) => ptr as *const (),
-        None => {
-            return ControlFlow::Error(RuntimeError::internal(
-                "out of memory: failed to allocate closure",
-            ));
-        }
+    let func_value = alloc_value_in_current_heap_or_box(func);
+    let Some(func_ptr) = func_value.as_object_ptr() else {
+        return ControlFlow::Error(RuntimeError::internal(
+            "function allocation produced a non-object value",
+        ));
     };
 
     if let Some(captured_closure) = captured_closure {
         vm.register_function_closure(func_ptr, captured_closure);
     }
-    vm.current_frame_mut()
-        .set_reg(dst, Value::object_ptr(func_ptr));
+    vm.current_frame_mut().set_reg(dst, func_value);
     ControlFlow::Continue
 }
 
@@ -3647,7 +3615,7 @@ mod tests {
     use crate::VirtualMachine;
     use crate::builtins::{BuiltinError, BuiltinFunctionObject};
     use crate::dispatch::ControlFlow;
-    use prism_code::{CodeObject, Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Constant, Instruction, Opcode, Register};
     use prism_core::Value;
     use prism_core::intern::intern;
     use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};
@@ -3733,6 +3701,15 @@ mod tests {
         Ok(Value::none())
     }
 
+    fn exhaust_nursery(vm: &VirtualMachine) {
+        for _ in 0..200_000 {
+            if vm.allocator().alloc(DictObject::new()).is_none() {
+                return;
+            }
+        }
+        panic!("test setup should fill the nursery");
+    }
+
     #[test]
     fn test_bound_args_inline_tracks_edges() {
         let mut bound = BoundArgs::new(64);
@@ -3764,6 +3741,45 @@ mod tests {
         let mut bound = BoundArgs::new(65);
         bound.set_bound(70);
         assert!(!bound.is_bound(70));
+    }
+
+    #[test]
+    fn test_bound_variadics_allocate_after_full_nursery() {
+        let mut vm = VirtualMachine::new();
+        exhaust_nursery(&vm);
+
+        let mut bound = crate::ops::kw_binding::BoundArguments {
+            parameters: Vec::new(),
+            varargs: Some(Box::new(TupleObject::from_slice(&[Value::int(1).unwrap()]))),
+            varkw: Some(Box::new(DictObject::new())),
+        };
+
+        let (varargs, varkw) = super::allocate_bound_variadics(&mut vm, &mut bound)
+            .expect("bound variadics should use stable fallback storage");
+        assert!(varargs.and_then(|value| value.as_object_ptr()).is_some());
+        assert!(varkw.and_then(|value| value.as_object_ptr()).is_some());
+    }
+
+    #[test]
+    fn test_make_function_allocates_after_full_nursery() {
+        let child_code = Arc::new(CodeObject::new("child", "<test>"));
+        let mut root_code = CodeObject::new("root", "<test>");
+        root_code.constants = vec![Constant::Value(Value::object_ptr(
+            Arc::as_ptr(&child_code) as *const ()
+        ))]
+        .into_boxed_slice();
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(root_code), 0)
+            .expect("frame push should succeed");
+        exhaust_nursery(&vm);
+
+        let inst = Instruction::op_di(Opcode::MakeFunction, Register::new(0), 0);
+        assert!(matches!(
+            super::make_function(&mut vm, inst),
+            ControlFlow::Continue
+        ));
+        assert!(vm.current_frame().get_reg(0).as_object_ptr().is_some());
     }
 
     #[test]

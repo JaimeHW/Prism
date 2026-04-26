@@ -100,6 +100,78 @@ assert seen == [2, 3]
 }
 
 #[test]
+fn test_list_slice_assignment_accepts_sequence_getitem_protocol() {
+    let result = execute(
+        r#"
+class SequenceOnly:
+    def __init__(self):
+        self.values = [10, 11]
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+items = [0, 1, 2, 3]
+items[1:3] = SequenceOnly()
+assert items == [0, 10, 11, 3]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_sequence_getitem_iteration_preserves_outer_except_context() {
+    let result = execute(
+        r#"
+import sys
+
+class SequenceOnly:
+    def __getitem__(self, index):
+        if index == 0:
+            return "value"
+        raise IndexError("done")
+
+seen = []
+
+try:
+    raise ValueError("outer")
+except ValueError:
+    iterator = iter(SequenceOnly())
+    seen.append(next(iterator))
+    try:
+        next(iterator)
+    except StopIteration:
+        seen.append("stop")
+    assert sys.exc_info()[0] is ValueError
+
+seen.append("after")
+assert sys.exc_info() == (None, None, None)
+assert seen == ["value", "stop", "after"]
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
+fn test_uncaught_sequence_getitem_callback_exception_reaches_python_handler() {
+    let result = execute(
+        r#"
+class BadSequence:
+    def __getitem__(self, index):
+        raise RuntimeError("boom")
+
+caught = False
+try:
+    iter(BadSequence())
+except RuntimeError as exc:
+    caught = str(exc) == "boom"
+
+assert caught
+"#,
+    );
+    assert!(result.is_ok(), "Failed: {:?}", result);
+}
+
+#[test]
 fn test_cpython_threading_thread_runs_and_joins_native_worker() {
     let result = execute_with_cpython_lib_and_step_limit(
         r#"

@@ -134,8 +134,10 @@ fn class_value(class: &Arc<PyClassObject>) -> Value {
 
 fn build_root_class(name: &str) -> Arc<PyClassObject> {
     let mut class = PyClassObject::new_simple(intern(name));
+    let empty_fields = empty_tuple_value();
     class.set_attr(intern("__module__"), Value::string(intern("_ast")));
-    class.set_attr(intern("_fields"), empty_tuple_value());
+    class.set_attr(intern("_fields"), empty_fields);
+    class.set_attr(intern("__match_args__"), empty_fields);
     class.set_attr(intern("_attributes"), empty_tuple_value());
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
     register_native_type(class)
@@ -170,8 +172,10 @@ fn build_subclass(name: &str, base: &Arc<PyClassObject>, fields: &[&str]) -> Arc
         global_class(id).map(|class| class.mro().iter().copied().collect())
     })
     .unwrap_or_else(|err| panic!("failed to build _ast.{name}: {err}"));
+    let fields_tuple = tuple_of_names(fields);
     class.set_attr(intern("__module__"), Value::string(intern("_ast")));
-    class.set_attr(intern("_fields"), tuple_of_names(fields));
+    class.set_attr(intern("_fields"), fields_tuple);
+    class.set_attr(intern("__match_args__"), fields_tuple);
     class.set_attr(intern("_attributes"), empty_tuple_value());
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
     register_native_type(class)

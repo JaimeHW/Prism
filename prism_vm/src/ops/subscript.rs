@@ -7,12 +7,13 @@
 //! - Proper error handling with IndexError/KeyError/TypeError
 
 use crate::VirtualMachine;
-use crate::builtins::{builtin_mapping_proxy_get_item, value_to_iterator};
+use crate::builtins::builtin_mapping_proxy_get_item;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::calls::{
     InvokeCallableOutcome, invoke_callable_value, invoke_callable_value_with_control_transfer,
 };
+use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
@@ -22,6 +23,7 @@ use num_traits::ToPrimitive;
 use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
@@ -32,6 +34,7 @@ use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::MemoryViewObject;
+use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -57,6 +60,8 @@ enum SubscriptResult {
     AllocList(ListObject),
     /// A TupleObject that needs GC allocation (from slice operation).
     AllocTuple(TupleObject),
+    /// A RangeObject that needs GC allocation (from slice operation).
+    AllocRange(RangeObject),
 }
 
 #[inline]
@@ -149,14 +154,7 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
             };
 
             let alias = GenericAliasObject::new(container, args);
-            let value = match vm.allocator().alloc(alias) {
-                Some(alias_ptr) => Value::object_ptr(alias_ptr as *const ()),
-                None => {
-                    return ControlFlow::Error(RuntimeError::internal(
-                        "out of memory: failed to allocate generic alias",
-                    ));
-                }
-            };
+            let value = alloc_value_in_current_heap_or_box(alias);
             vm.current_frame_mut().set_reg(dst, value);
             return ControlFlow::Continue;
         }
@@ -195,38 +193,11 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 fn finish_subscr(vm: &mut VirtualMachine, dst: u8, result: SubscriptResult) -> ControlFlow {
     let value = match result {
         SubscriptResult::Value(v) => v,
-        SubscriptResult::AllocBytes(bytes) => match vm.allocator().alloc(bytes) {
-            Some(ptr) => Value::object_ptr(ptr as *const ()),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate bytes",
-                ));
-            }
-        },
-        SubscriptResult::AllocString(s) => match vm.allocator().alloc(s) {
-            Some(ptr) => Value::object_ptr(ptr as *const ()),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate string",
-                ));
-            }
-        },
-        SubscriptResult::AllocList(l) => match vm.allocator().alloc(l) {
-            Some(ptr) => Value::object_ptr(ptr as *const ()),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate list",
-                ));
-            }
-        },
-        SubscriptResult::AllocTuple(t) => match vm.allocator().alloc(t) {
-            Some(ptr) => Value::object_ptr(ptr as *const ()),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate tuple",
-                ));
-            }
-        },
+        SubscriptResult::AllocBytes(bytes) => alloc_value_in_current_heap_or_box(bytes),
+        SubscriptResult::AllocString(string) => alloc_value_in_current_heap_or_box(string),
+        SubscriptResult::AllocList(list) => alloc_value_in_current_heap_or_box(list),
+        SubscriptResult::AllocTuple(tuple) => alloc_value_in_current_heap_or_box(tuple),
+        SubscriptResult::AllocRange(range) => alloc_value_in_current_heap_or_box(range),
     };
     vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
@@ -362,11 +333,52 @@ fn subscr_slice(
                 let result = string_slice(string, slice);
                 return Ok(Some(SubscriptResult::AllocString(result)));
             }
+            TypeId::RANGE => {
+                let range = unsafe { &*(ptr as *const RangeObject) };
+                let result = range_slice(range, slice)?;
+                return Ok(Some(SubscriptResult::AllocRange(result)));
+            }
             _ => {}
         }
     }
 
     Ok(None)
+}
+
+#[inline]
+fn range_slice(range: &RangeObject, slice: &SliceObject) -> Result<RangeObject, ControlFlow> {
+    let len = range.try_len().ok_or_else(|| range_slice_overflow())?;
+    let indices = slice.indices(len);
+    if indices.length == 0 {
+        return Ok(RangeObject::new(0, 0, 1));
+    }
+
+    let first = range
+        .get(indices.start as i64)
+        .ok_or_else(|| ControlFlow::Error(RuntimeError::index_error(indices.start as i64, len)))?;
+    let base_step = range.step_i64().ok_or_else(range_slice_overflow)?;
+    let slice_step = i64::try_from(indices.step).map_err(|_| range_slice_overflow())?;
+    let new_step = base_step
+        .checked_mul(slice_step)
+        .ok_or_else(range_slice_overflow)?;
+    let length = i64::try_from(indices.length).map_err(|_| range_slice_overflow())?;
+    let stop = first
+        .checked_add(
+            new_step
+                .checked_mul(length)
+                .ok_or_else(range_slice_overflow)?,
+        )
+        .ok_or_else(range_slice_overflow)?;
+
+    Ok(RangeObject::new(first, stop, new_step))
+}
+
+#[inline]
+fn range_slice_overflow() -> ControlFlow {
+    ControlFlow::Error(RuntimeError::exception(
+        crate::stdlib::exceptions::ExceptionTypeId::OverflowError.as_u8() as u16,
+        "range slice result is too large",
+    ))
 }
 
 #[inline]
@@ -497,7 +509,10 @@ fn bytearray_assignment_byte(value: Value) -> Result<u8, RuntimeError> {
     u8::try_from(integer).map_err(|_| RuntimeError::value_error("byte must be in range(0, 256)"))
 }
 
-fn bytearray_replacement_bytes(value: Value) -> Result<Vec<u8>, RuntimeError> {
+fn bytearray_replacement_bytes(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Vec<u8>, RuntimeError> {
     if let Some(bytes) = value_as_bytes_ref(value) {
         return Ok(bytes.to_vec());
     }
@@ -515,10 +530,7 @@ fn bytearray_replacement_bytes(value: Value) -> Result<Vec<u8>, RuntimeError> {
         }
     }
 
-    let mut iterator =
-        value_to_iterator(&value).map_err(|err| RuntimeError::type_error(err.to_string()))?;
-    iterator
-        .collect_remaining()
+    collect_iterable_values(vm, value)?
         .into_iter()
         .map(bytearray_assignment_byte)
         .collect()
@@ -557,13 +569,10 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
 
             if let Some(slice) = slice_from_value(key) {
-                let mut iterator = match value_to_iterator(&value) {
-                    Ok(iter) => iter,
-                    Err(err) => {
-                        return ControlFlow::Error(RuntimeError::type_error(err.to_string()));
-                    }
+                let replacement = match collect_iterable_values(vm, value) {
+                    Ok(values) => values,
+                    Err(err) => return ControlFlow::Error(err),
                 };
-                let replacement = iterator.collect_remaining();
                 return match list.assign_slice(slice, replacement) {
                     Ok(()) => ControlFlow::Continue,
                     Err(err) => ControlFlow::Error(RuntimeError::value_error(err.to_string())),
@@ -591,7 +600,7 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
 
                 if let Some(slice) = slice_from_value(key) {
-                    let replacement = match bytearray_replacement_bytes(value) {
+                    let replacement = match bytearray_replacement_bytes(vm, value) {
                         Ok(bytes) => bytes,
                         Err(err) => return ControlFlow::Error(err),
                     };
@@ -823,7 +832,7 @@ fn invoke_bound_method_with_args_allow_control_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_code::{Instruction, Opcode, Register};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_core::intern::intern;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::mro::ClassId;
@@ -872,6 +881,59 @@ mod tests {
             TupleObject::from_slice(items),
         )));
         (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn vm_with_frame() -> VirtualMachine {
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(CodeObject::new("sub", "<test>")), 0)
+            .expect("frame push failed");
+        vm
+    }
+
+    fn exhaust_nursery(vm: &VirtualMachine) {
+        while vm.allocator().alloc(DictObject::new()).is_some() {}
+    }
+
+    #[test]
+    fn test_finish_subscr_allocates_after_full_nursery() {
+        let mut vm = vm_with_frame();
+        exhaust_nursery(&vm);
+
+        assert!(matches!(
+            finish_subscr(
+                &mut vm,
+                1,
+                SubscriptResult::AllocBytes(BytesObject::from_slice(b"abc"))
+            ),
+            ControlFlow::Continue
+        ));
+        let bytes_ptr = vm
+            .current_frame()
+            .get_reg(1)
+            .as_object_ptr()
+            .expect("bytes slice should allocate");
+        assert_eq!(
+            unsafe { &*(bytes_ptr as *const BytesObject) }.as_bytes(),
+            b"abc"
+        );
+
+        assert!(matches!(
+            finish_subscr(
+                &mut vm,
+                2,
+                SubscriptResult::AllocString(StringObject::from_string("slice".to_string()))
+            ),
+            ControlFlow::Continue
+        ));
+        let string_ptr = vm
+            .current_frame()
+            .get_reg(2)
+            .as_object_ptr()
+            .expect("string slice should allocate");
+        assert_eq!(
+            unsafe { &*(string_ptr as *const StringObject) }.as_str(),
+            "slice"
+        );
     }
 
     // ==========================================================================
@@ -1100,6 +1162,32 @@ mod tests {
     }
 
     #[test]
+    fn test_range_slice_reverse_returns_range() {
+        let range = RangeObject::from_stop(5);
+        let range_ptr = Box::leak(Box::new(range)) as *mut RangeObject as *const ();
+        let slice = SliceObject::new(None, None, Some(-1));
+        let result =
+            subscr_slice(Value::object_ptr(range_ptr), &slice).expect("range slicing should work");
+
+        match result {
+            Some(SubscriptResult::AllocRange(range)) => {
+                assert_eq!(
+                    range.to_vec(),
+                    vec![
+                        Value::int_unchecked(4),
+                        Value::int_unchecked(3),
+                        Value::int_unchecked(2),
+                        Value::int_unchecked(1),
+                        Value::int_unchecked(0),
+                    ]
+                );
+            }
+            Some(_) => panic!("expected range slice result"),
+            None => panic!("expected range slice fast path"),
+        }
+    }
+
+    #[test]
     fn test_tagged_string_integer_subscript_forward() {
         let result = subscr_integer(Value::string(intern("hello")), 1)
             .expect("tagged string indexing should succeed");
@@ -1110,6 +1198,7 @@ mod tests {
             Some(SubscriptResult::AllocBytes(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected allocated string result"),
+            Some(SubscriptResult::AllocRange(_)) => panic!("expected allocated string result"),
             None => panic!("expected integer fast path"),
         }
     }
@@ -1125,6 +1214,7 @@ mod tests {
             Some(SubscriptResult::AllocBytes(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected allocated string result"),
+            Some(SubscriptResult::AllocRange(_)) => panic!("expected allocated string result"),
             None => panic!("expected integer fast path"),
         }
     }
@@ -1141,6 +1231,7 @@ mod tests {
             Some(SubscriptResult::AllocBytes(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected allocated string result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected allocated string result"),
+            Some(SubscriptResult::AllocRange(_)) => panic!("expected allocated string result"),
             None => panic!("expected slice fast path"),
         }
     }
@@ -1160,6 +1251,7 @@ mod tests {
             Some(SubscriptResult::AllocString(_)) => panic!("expected integer value result"),
             Some(SubscriptResult::AllocList(_)) => panic!("expected integer value result"),
             Some(SubscriptResult::AllocTuple(_)) => panic!("expected integer value result"),
+            Some(SubscriptResult::AllocRange(_)) => panic!("expected integer value result"),
             None => panic!("expected integer fast path"),
         }
     }
@@ -1185,6 +1277,9 @@ mod tests {
                 panic!("expected allocated byte sequence result")
             }
             Some(SubscriptResult::AllocTuple(_)) => {
+                panic!("expected allocated byte sequence result")
+            }
+            Some(SubscriptResult::AllocRange(_)) => {
                 panic!("expected allocated byte sequence result")
             }
             None => panic!("expected slice fast path"),

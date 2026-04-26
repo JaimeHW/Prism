@@ -735,7 +735,7 @@ fn collect_iterable_values_with_vm(
     value: Value,
 ) -> Result<Vec<Value>, BuiltinError> {
     crate::ops::iteration::collect_iterable_values(vm, value)
-        .map_err(|err| BuiltinError::TypeError(err.to_string()))
+        .map_err(|err: RuntimeError| BuiltinError::TypeError(err.to_string()))
 }
 
 fn collect_iterable_values_runtime(

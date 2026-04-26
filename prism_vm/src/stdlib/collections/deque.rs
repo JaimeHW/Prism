@@ -33,6 +33,7 @@
 
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, get_iterator_mut, value_to_iterator};
+use crate::error::RuntimeError;
 use prism_core::Value;
 use prism_gc::trace::{Trace, Tracer};
 use prism_runtime::object::type_obj::TypeId;
@@ -225,7 +226,7 @@ fn collect_iterable_values_with_vm(
     value: Value,
 ) -> Result<Vec<Value>, BuiltinError> {
     crate::ops::iteration::collect_iterable_values(vm, value)
-        .map_err(|err| BuiltinError::TypeError(err.to_string()))
+        .map_err(|err: RuntimeError| BuiltinError::TypeError(err.to_string()))
 }
 
 fn normalize_maxlen(value: Option<Value>) -> Result<Option<usize>, BuiltinError> {

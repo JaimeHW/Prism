@@ -25,6 +25,7 @@ use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_code::{Constant, Instruction};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::{MethodSlot, PyClassObject};
 use prism_runtime::object::descriptor::{
@@ -452,19 +453,14 @@ pub(crate) fn super_attribute_exists(super_value: Value, name: &InternedString) 
 
 #[inline]
 pub(crate) fn alloc_heap_value<T>(
-    vm: &mut VirtualMachine,
+    _vm: &mut VirtualMachine,
     object: T,
-    context: &'static str,
+    _context: &'static str,
 ) -> Result<Value, RuntimeError>
 where
     T: prism_runtime::Trace,
 {
-    vm.allocator()
-        .alloc(object)
-        .map(|ptr| Value::object_ptr(ptr as *const ()))
-        .ok_or_else(|| {
-            RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
-        })
+    Ok(alloc_value_in_current_heap_or_box(object))
 }
 
 static CODE_CO_POSITIONS_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -1561,6 +1557,15 @@ pub(crate) fn get_attribute_value(
         if type_id == TypeId::MODULE {
             let module = unsafe { &*(ptr as *const crate::import::ModuleObject) };
             return module_attribute_value(vm, module, name);
+        }
+
+        if type_id == TypeId::EXCEPTION && name.as_str() == "__class__" {
+            let exc = unsafe { &*(ptr as *const ExceptionValue) };
+            return Ok(
+                crate::builtins::exception_type_value_for_id(exc.exception_type_id).unwrap_or_else(
+                    || crate::builtins::builtin_type_object_for_type_id(TypeId::EXCEPTION),
+                ),
+            );
         }
 
         if type_id != TypeId::EXCEPTION_TYPE
@@ -2671,6 +2676,10 @@ mod tests {
         let code = Arc::new(CodeObject::new("test_len", "<test>"));
         vm.push_frame(code, 0).expect("frame push failed");
         vm
+    }
+
+    fn exhaust_nursery(vm: &VirtualMachine) {
+        while vm.allocator().alloc(DictObject::new()).is_some() {}
     }
 
     fn boxed_value<T>(obj: T) -> (Value, *mut T) {
@@ -3906,6 +3915,22 @@ mod tests {
     }
 
     #[test]
+    fn test_native_exception_class_attribute_preserves_concrete_type() {
+        let mut vm = vm_with_names(&[]);
+        let exc = crate::builtins::create_exception(
+            crate::stdlib::exceptions::ExceptionTypeId::TypeError,
+            Some(Arc::from("boom")),
+        );
+
+        let class_value = get_attribute_value(&mut vm, exc, &intern("__class__"))
+            .expect("__class__ should be readable");
+        let class_name = get_attribute_value(&mut vm, class_value, &intern("__name__"))
+            .expect("__class__.__name__ should be readable");
+
+        assert_eq!(class_name, Value::string(intern("TypeError")));
+    }
+
+    #[test]
     fn test_get_attr_exposes_os_error_metadata_from_args() {
         let mut vm = vm_with_names(&[]);
         let exc = crate::builtins::create_exception_with_args(
@@ -4267,6 +4292,35 @@ mod tests {
             drop_boxed(frame_ptr);
             drop_boxed(globals_ptr);
             drop_boxed(locals_ptr);
+        }
+    }
+
+    #[test]
+    fn test_frame_code_view_allocates_after_full_nursery() {
+        let code = Arc::new(CodeObject::new("frame_code", "frame_probe.py"));
+        let (frame_value, frame_ptr) = boxed_value(FrameViewObject::new(
+            Some(Arc::clone(&code)),
+            Value::none(),
+            Value::none(),
+            27,
+            3,
+            None,
+        ));
+        let mut vm = vm_with_frame();
+
+        exhaust_nursery(&vm);
+
+        let code_value = get_attribute_value(&mut vm, frame_value, &intern("f_code"))
+            .expect("f_code should allocate even after nursery exhaustion");
+        let code_ptr = code_value
+            .as_object_ptr()
+            .expect("f_code should be an object");
+        assert_eq!(extract_type_id(code_ptr), TypeId::CODE);
+        let code_view = unsafe { &*(code_ptr as *const CodeObjectView) };
+        assert_eq!(code_view.code().name.as_ref(), "frame_code");
+
+        unsafe {
+            drop_boxed(frame_ptr);
         }
     }
 
