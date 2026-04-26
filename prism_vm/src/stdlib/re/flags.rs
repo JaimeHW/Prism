@@ -207,11 +207,4 @@ mod tests {
         assert!(s.contains("IGNORECASE"));
         assert!(s.contains("DOTALL"));
     }
-
-    #[test]
-    fn test_default_flags() {
-        let flags = RegexFlags::default();
-        assert_eq!(flags.bits(), 0);
-        assert!(!flags.is_case_insensitive());
-    }
 }

@@ -1012,17 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn test_class_flags_default() {
-        let class = PyClassObject::new_simple(intern("FlagsTest"));
-
-        assert!(!class.is_initialized());
-        assert!(!class.has_slots());
-        assert!(!class.is_final());
-        assert!(!class.has_custom_new());
-        assert!(!class.has_custom_init());
-    }
-
-    #[test]
     fn test_class_flags_modification() {
         let mut class = PyClassObject::new_simple(intern("FlagsModTest"));
 

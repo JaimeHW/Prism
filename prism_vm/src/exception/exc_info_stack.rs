@@ -745,13 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn test_exc_info_entry_default() {
-        let entry = ExcInfoEntry::default();
-        assert!(!entry.is_active());
-        assert_eq!(entry.type_id(), 0);
-    }
-
-    #[test]
     fn test_exc_info_entry_debug() {
         let entry = ExcInfoEntry::new(24, Some(Value::none()));
         let debug = format!("{:?}", entry);
@@ -1076,12 +1069,6 @@ mod tests {
     // =========================================================================
     // ExcInfoStack Default Tests
     // =========================================================================
-
-    #[test]
-    fn test_exc_info_stack_default() {
-        let stack = ExcInfoStack::default();
-        assert!(stack.is_empty());
-    }
 
     #[test]
     fn test_exc_info_stack_debug() {

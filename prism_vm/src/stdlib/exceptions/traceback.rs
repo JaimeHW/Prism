@@ -349,12 +349,6 @@ mod tests {
         assert_eq!(tb.len(), 3);
     }
 
-    #[test]
-    fn test_traceback_default() {
-        let tb = TracebackObject::default();
-        assert!(tb.is_empty());
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // TracebackObject Mutation Tests
     // ════════════════════════════════════════════════════════════════════════

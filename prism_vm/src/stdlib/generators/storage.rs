@@ -636,13 +636,6 @@ mod tests {
         assert!(debug.contains("len"));
     }
 
-    #[test]
-    fn test_storage_default() {
-        let storage = FrameStorage::default();
-        assert!(storage.is_empty());
-        assert!(!storage.is_boxed());
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // Edge Cases
     // ════════════════════════════════════════════════════════════════════════

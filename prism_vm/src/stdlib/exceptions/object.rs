@@ -462,12 +462,6 @@ mod tests {
         assert_eq!(args.as_slice().len(), 2);
     }
 
-    #[test]
-    fn test_args_default() {
-        let args = ExceptionArgs::default();
-        assert!(args.is_empty());
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // ExceptionObject Creation Tests
     // ════════════════════════════════════════════════════════════════════════

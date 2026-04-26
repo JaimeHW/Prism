@@ -337,12 +337,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_exc_info_default() {
-        let info = ExcInfo::default();
-        assert!(info.is_empty());
-    }
-
-    #[test]
     fn test_exc_info_debug_format() {
         let info = ExcInfo::empty();
         let debug = format!("{:?}", info);

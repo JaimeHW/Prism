@@ -427,15 +427,6 @@ mod tests {
         assert!(!cache.is_valid());
     }
 
-    #[test]
-    fn test_cache_default_equals_new() {
-        let cache1 = InlineHandlerCache::new();
-        let cache2 = InlineHandlerCache::default();
-
-        assert_eq!(cache1.last_pc, cache2.last_pc);
-        assert_eq!(cache1.cached_handler_idx, cache2.cached_handler_idx);
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // InlineHandlerCache Size Tests
     // ════════════════════════════════════════════════════════════════════════

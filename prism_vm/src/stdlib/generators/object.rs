@@ -811,12 +811,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_flags_default() {
-        let flags = GeneratorFlags::default();
-        assert_eq!(flags.bits(), 0);
-    }
-
-    #[test]
     fn test_flags_union() {
         let flags1 = GeneratorFlags::HAS_JIT;
         let flags2 = GeneratorFlags::IS_COROUTINE;

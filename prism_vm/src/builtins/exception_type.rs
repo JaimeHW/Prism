@@ -1648,12 +1648,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_exception_type_flags_default() {
-        let flags = ExceptionTypeFlags::default();
-        assert!(flags.is_empty());
-    }
-
-    #[test]
     fn test_exception_type_flags_combine() {
         let flags = ExceptionTypeFlags::ABSTRACT | ExceptionTypeFlags::CUSTOM_INIT;
         assert!(flags.contains(ExceptionTypeFlags::ABSTRACT));

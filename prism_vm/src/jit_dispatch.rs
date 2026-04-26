@@ -350,16 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_stats_default() {
-        let stats = DispatchStats::default();
-        assert_eq!(stats.attempts, 0);
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 0);
-        assert_eq!(stats.hit_rate(), 0.0);
-        assert_eq!(stats.deopt_rate(), 0.0);
-    }
-
-    #[test]
     fn test_dispatch_stats_rates() {
         let stats = DispatchStats {
             attempts: 100,

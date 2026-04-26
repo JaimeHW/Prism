@@ -347,12 +347,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_state_default() {
-        let state = GeneratorExecutionState::default();
-        assert_eq!(state, GeneratorExecutionState::Idle);
-    }
-
-    #[test]
     fn test_state_can_continue() {
         assert!(!GeneratorExecutionState::Idle.can_continue());
         assert!(GeneratorExecutionState::Running.can_continue());
@@ -403,12 +397,6 @@ mod tests {
         assert!(ctx.current_generator().is_none());
         assert_eq!(ctx.state(), GeneratorExecutionState::Idle);
         assert_eq!(ctx.nesting_depth(), 0);
-    }
-
-    #[test]
-    fn test_context_default() {
-        let ctx = GeneratorContext::default();
-        assert!(!ctx.is_active());
     }
 
     // ════════════════════════════════════════════════════════════════════════

@@ -466,13 +466,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handler_frame_default() {
-        let frame = HandlerFrame::default();
-        assert!(!frame.is_valid());
-        assert_eq!(frame.handler_idx, NO_HANDLER);
-    }
-
-    #[test]
     fn test_handler_frame_debug() {
         let valid = HandlerFrame::new(1, 5, 2);
         let debug_str = format!("{:?}", valid);

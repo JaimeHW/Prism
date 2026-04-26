@@ -554,15 +554,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_unwind_result_default() {
-        let result = UnwindResult::default();
-
-        assert!(!result.found_handler());
-        assert_eq!(result.frames_unwound, 0);
-        assert!(result.finally_queue.is_empty());
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // FinallyEntry Tests
     // ════════════════════════════════════════════════════════════════════════

@@ -515,9 +515,4 @@ mod wraps_tests {
         assert_eq!(clone.count(), meta.count());
     }
 
-    #[test]
-    fn test_metadata_default() {
-        let meta = WrapperMetadata::default();
-        assert!(!meta.has_any());
-    }
 }

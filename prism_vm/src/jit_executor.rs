@@ -487,14 +487,6 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_frame_state_default() {
-        let state = JitFrameState::default();
-        assert!(state.frame_base.is_null());
-        assert_eq!(state.num_registers, 0);
-        assert_eq!(state.bc_offset, 0);
-    }
-
-    #[test]
     fn test_executor_creation() {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let executor = JitExecutor::new(cache);

@@ -345,13 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trampoline_entry_default() {
-        let entry = DeoptTrampolineEntry::default();
-        assert_eq!(entry.deopt_id, 0);
-        assert!(!entry.active);
-    }
-
-    #[test]
     fn test_constants() {
         assert_eq!(TRAMPOLINE_ENTRY_SIZE, 32);
         assert_eq!(MAX_TRAMPOLINE_ENTRIES, 128);

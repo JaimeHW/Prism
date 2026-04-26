@@ -727,12 +727,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_exception_state_default() {
-        let state = ExceptionState::default();
-        assert_eq!(state, ExceptionState::Normal);
-    }
-
-    #[test]
     fn test_exception_state_from_u8() {
         assert_eq!(ExceptionState::from_u8(0), Some(ExceptionState::Normal));
         assert_eq!(

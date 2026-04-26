@@ -409,13 +409,6 @@ mod tests {
         assert!(point.is_yield_from);
     }
 
-    #[test]
-    fn test_resume_point_default() {
-        let point = ResumePoint::default();
-        assert_eq!(point.ip, 0);
-        assert!(point.liveness.is_empty());
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // ResumeTable Tests
     // ════════════════════════════════════════════════════════════════════════

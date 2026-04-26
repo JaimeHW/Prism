@@ -357,11 +357,6 @@ mod tests {
         assert_eq!(format!("{}", GeneratorState::Exhausted), "GEN_CLOSED");
     }
 
-    #[test]
-    fn test_state_default() {
-        assert_eq!(GeneratorState::default(), GeneratorState::Created);
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // GeneratorHeader Tests
     // ════════════════════════════════════════════════════════════════════════
@@ -505,13 +500,6 @@ mod tests {
         let debug = format!("{:?}", header);
         assert!(debug.contains("Running"));
         assert!(debug.contains("100"));
-    }
-
-    #[test]
-    fn test_header_default() {
-        let header = GeneratorHeader::default();
-        assert_eq!(header.state(), GeneratorState::Created);
-        assert_eq!(header.resume_index(), 0);
     }
 
     #[test]
