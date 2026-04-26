@@ -551,9 +551,12 @@ fn builtin_base_type_error(type_id: TypeId) -> Option<TypeCreationError> {
 // =============================================================================
 
 use crate::object::class::{ClassDict, ClassFlags, PyClassObject};
-use crate::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
+use crate::object::descriptor::{ClassMethodDescriptor, SlotDescriptor, StaticMethodDescriptor};
 use crate::object::registry::global_registry;
 use crate::object::type_obj::{TypeFlags, TypeObject};
+use crate::types::list::ListObject;
+use crate::types::string::value_as_string_ref;
+use crate::types::tuple::TupleObject;
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use prism_core::intern::InternedString;
@@ -786,9 +789,12 @@ where
 
     // Check for __slots__
     let slots_name = prism_core::intern::intern("__slots__");
-    if namespace.contains(&slots_name) {
+    let slot_names = if let Some(slots_value) = namespace.get(&slots_name) {
         flags |= ClassFlags::HAS_SLOTS;
-    }
+        Some(extract_slot_names(slots_value, namespace)?)
+    } else {
+        None
+    };
 
     // Check for __hash__
     let hash_name = prism_core::intern::intern("__hash__");
@@ -814,6 +820,18 @@ where
         class.set_attr(name.clone(), normalize_class_namespace_value(name, value));
     });
 
+    if let Some(slot_names) = slot_names {
+        class.set_slots(slot_names.clone());
+        for (index, slot_name) in slot_names.into_iter().enumerate() {
+            let descriptor = SlotDescriptor::read_write(
+                slot_name.clone(),
+                index as u16,
+                SlotDescriptor::compute_offset(index as u16),
+            );
+            class.set_attr(slot_name, alloc_value_in_current_heap_or_box(descriptor));
+        }
+    }
+
     // Set detected flags
     class.set_flags(flags);
     class.rebuild_method_layout(|id| registry.get_class(id));
@@ -825,6 +843,90 @@ where
         bitmap,
         flags,
     })
+}
+
+fn extract_slot_names(
+    slots_value: Value,
+    namespace: &ClassDict,
+) -> Result<Vec<InternedString>, TypeCreationError> {
+    let mut names = Vec::new();
+    collect_slot_names(slots_value, &mut names)?;
+
+    for i in 0..names.len() {
+        if names[i].as_str().is_empty() {
+            return Err(TypeCreationError::SlotsConflict {
+                message: "slot names must be non-empty strings".to_string(),
+            });
+        }
+
+        if namespace.contains(&names[i]) {
+            return Err(TypeCreationError::SlotsConflict {
+                message: format!(
+                    "'{}' in __slots__ conflicts with class variable",
+                    names[i].as_str()
+                ),
+            });
+        }
+
+        if names[..i].iter().any(|existing| existing == &names[i]) {
+            return Err(TypeCreationError::SlotsConflict {
+                message: format!("duplicate slot name '{}'", names[i].as_str()),
+            });
+        }
+    }
+
+    Ok(names)
+}
+
+fn collect_slot_names(
+    value: Value,
+    out: &mut Vec<InternedString>,
+) -> Result<(), TypeCreationError> {
+    if let Some(name) = value_as_string_ref(value) {
+        out.push(prism_core::intern::intern(name.as_str()));
+        return Ok(());
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(invalid_slots_value());
+    };
+    let type_id = unsafe { (*(ptr as *const crate::object::ObjectHeader)).type_id };
+    match type_id {
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            for item in tuple.iter().copied() {
+                collect_single_slot_name(item, out)?;
+            }
+            Ok(())
+        }
+        TypeId::LIST => {
+            let list = unsafe { &*(ptr as *const ListObject) };
+            for item in list.iter().copied() {
+                collect_single_slot_name(item, out)?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid_slots_value()),
+    }
+}
+
+fn collect_single_slot_name(
+    value: Value,
+    out: &mut Vec<InternedString>,
+) -> Result<(), TypeCreationError> {
+    let Some(name) = value_as_string_ref(value) else {
+        return Err(TypeCreationError::SlotsConflict {
+            message: "__slots__ items must be strings".to_string(),
+        });
+    };
+    out.push(prism_core::intern::intern(name.as_str()));
+    Ok(())
+}
+
+fn invalid_slots_value() -> TypeCreationError {
+    TypeCreationError::SlotsConflict {
+        message: "__slots__ must be a string or an iterable of strings".to_string(),
+    }
 }
 
 #[inline]

@@ -163,6 +163,22 @@ pub trait Descriptor: Debug + Send + Sync {
     /// The attribute value, or an error (typically AttributeError).
     fn get(&self, obj: Option<Value>, objtype: Value) -> PrismResult<Value>;
 
+    /// `__get__` with a runtime-provided call bridge.
+    ///
+    /// Descriptors whose semantics require executing Python callables should
+    /// implement this method and use the invoker instead of returning a
+    /// placeholder value. The plain `get` method remains available for
+    /// descriptors that can complete without VM help.
+    fn get_with_invoker(
+        &self,
+        obj: Option<Value>,
+        objtype: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<Value> {
+        let _ = invoker;
+        self.get(obj, objtype)
+    }
+
     /// `__set__(self, obj, value)` - Called when attribute is assigned.
     ///
     /// # Arguments
@@ -176,6 +192,17 @@ pub trait Descriptor: Debug + Send + Sync {
     fn set(&self, obj: Value, value: Value) -> PrismResult<()> {
         let _ = (obj, value);
         Err(prism_core::PrismError::attribute("attribute is read-only"))
+    }
+
+    /// `__set__` with a runtime-provided call bridge.
+    fn set_with_invoker(
+        &self,
+        obj: Value,
+        value: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<()> {
+        let _ = invoker;
+        self.set(obj, value)
     }
 
     /// `__delete__(self, obj)` - Called when attribute is deleted.
@@ -194,11 +221,32 @@ pub trait Descriptor: Debug + Send + Sync {
         ))
     }
 
+    /// `__delete__` with a runtime-provided call bridge.
+    fn delete_with_invoker(
+        &self,
+        obj: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<()> {
+        let _ = invoker;
+        self.delete(obj)
+    }
+
     /// Check if this is a data descriptor.
     #[inline]
     fn is_data_descriptor(&self) -> bool {
         self.flags().contains(DescriptorFlags::DATA_DESCRIPTOR)
     }
+}
+
+/// Runtime hook used by descriptors that execute Python callables.
+///
+/// The runtime crate deliberately does not own VM execution. This tiny,
+/// object-safe bridge keeps descriptor metadata reusable while making computed
+/// descriptors impossible to "succeed" without actually invoking their
+/// accessor functions.
+pub trait DescriptorInvoker {
+    /// Invoke a descriptor accessor with positional arguments.
+    fn call(&mut self, callable: Value, args: &[Value]) -> PrismResult<Value>;
 }
 
 // =============================================================================
@@ -268,15 +316,47 @@ impl DescriptorObject {
         self.inner.get(obj, objtype)
     }
 
+    /// Get attribute value using a runtime call bridge.
+    #[inline]
+    pub fn get_with_invoker(
+        &self,
+        obj: Option<Value>,
+        objtype: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<Value> {
+        self.inner.get_with_invoker(obj, objtype, invoker)
+    }
+
     /// Set attribute value.
     #[inline]
     pub fn set(&self, obj: Value, value: Value) -> PrismResult<()> {
         self.inner.set(obj, value)
     }
 
+    /// Set attribute value using a runtime call bridge.
+    #[inline]
+    pub fn set_with_invoker(
+        &self,
+        obj: Value,
+        value: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<()> {
+        self.inner.set_with_invoker(obj, value, invoker)
+    }
+
     /// Delete attribute.
     #[inline]
     pub fn delete(&self, obj: Value) -> PrismResult<()> {
         self.inner.delete(obj)
+    }
+
+    /// Delete attribute using a runtime call bridge.
+    #[inline]
+    pub fn delete_with_invoker(
+        &self,
+        obj: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<()> {
+        self.inner.delete_with_invoker(obj, invoker)
     }
 }

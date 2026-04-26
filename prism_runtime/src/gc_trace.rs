@@ -26,7 +26,7 @@ use prism_gc::trace::{Trace, Tracer};
 
 use crate::object::ObjectHeader;
 use crate::object::descriptor::{
-    BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
+    BoundMethod, ClassMethodDescriptor, PropertyDescriptor, SlotDescriptor, StaticMethodDescriptor,
 };
 use crate::object::shaped_object::ShapedObject;
 use crate::object::views::{
@@ -452,6 +452,12 @@ unsafe impl Trace for PropertyDescriptor {
             tracer.trace_value(value);
         }
     }
+}
+
+/// Safety: Slot descriptors hold interned metadata only and no GC values.
+unsafe impl Trace for SlotDescriptor {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {}
 }
 
 /// Safety: Traces both the callable and bound receiver.

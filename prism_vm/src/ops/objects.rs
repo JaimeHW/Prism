@@ -29,7 +29,8 @@ use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::{MethodSlot, PyClassObject};
 use prism_runtime::object::descriptor::{
-    BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
+    BoundMethod, ClassMethodDescriptor, Descriptor, PropertyDescriptor, SlotDescriptor,
+    StaticMethodDescriptor,
 };
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shape::shape_registry;
@@ -323,6 +324,13 @@ fn property_descriptor_from_value(value: Value) -> Option<&'static PropertyDescr
     let ptr = value.as_object_ptr()?;
     (extract_type_id(ptr) == TypeId::PROPERTY)
         .then(|| unsafe { &*(ptr as *const PropertyDescriptor) })
+}
+
+#[inline]
+fn slot_descriptor_from_value(value: Value) -> Option<&'static SlotDescriptor> {
+    let ptr = value.as_object_ptr()?;
+    (extract_type_id(ptr) == TypeId::MEMBER_DESCRIPTOR)
+        .then(|| unsafe { &*(ptr as *const SlotDescriptor) })
 }
 
 #[inline]
@@ -1400,6 +1408,18 @@ fn lookup_user_defined_instance_attribute_default(
         return invoke_property_getter(vm, descriptor, obj).map(Some);
     }
 
+    if let Some(descriptor) = class_slot
+        .as_ref()
+        .map(|slot| slot.value)
+        .and_then(slot_descriptor_from_value)
+    {
+        let owner = class_id_to_value(ClassId(type_id.raw())).unwrap_or_else(Value::none);
+        return descriptor
+            .get(Some(obj), owner)
+            .map(Some)
+            .map_err(RuntimeError::from);
+    }
+
     if let Some(ref slot) = class_slot
         && descriptor_is_data_descriptor_in_vm(vm, slot.value)?
     {
@@ -2008,6 +2028,14 @@ pub(crate) fn set_attribute_value(
 
                     if let Some(descriptor) =
                         lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
+                        && let Some(descriptor) = slot_descriptor_from_value(descriptor)
+                    {
+                        descriptor.set(obj, value).map_err(RuntimeError::from)?;
+                        return Ok(());
+                    }
+
+                    if let Some(descriptor) =
+                        lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
                         && invoke_descriptor_set_in_vm(vm, descriptor, obj, value)?
                     {
                         return Ok(());
@@ -2171,6 +2199,14 @@ pub(crate) fn delete_attribute_value(
                         .and_then(property_descriptor_from_value)
                     {
                         invoke_property_deleter(vm, descriptor, obj)?;
+                        return Ok(());
+                    }
+
+                    if let Some(descriptor) =
+                        lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
+                        && let Some(descriptor) = slot_descriptor_from_value(descriptor)
+                    {
+                        descriptor.delete(obj).map_err(RuntimeError::from)?;
                         return Ok(());
                     }
 

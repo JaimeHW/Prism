@@ -31,7 +31,7 @@
 //! - Function pointers stored directly (no indirection)
 //! - Inline caching can specialize property access
 
-use super::{Descriptor, DescriptorFlags, DescriptorKind};
+use super::{Descriptor, DescriptorFlags, DescriptorInvoker, DescriptorKind};
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use prism_core::{PrismError, PrismResult, Value};
@@ -265,41 +265,76 @@ impl Descriptor for PropertyDescriptor {
             return Ok(Value::object_ptr(self as *const Self as *const ()));
         }
 
-        let obj = obj.unwrap();
-
-        // Call the getter if we have one
-        if let Some(_getter) = self.getter {
-            // TODO: Actually call the getter function
-            // For now, return a placeholder
-            // In real implementation: call_function(getter, &[obj])
-            let _ = obj;
+        if self.getter.is_some() {
             let _ = objtype;
-            Ok(Value::none())
+            Err(PrismError::internal(
+                "property getter requires a DescriptorInvoker",
+            ))
         } else {
             Err(PrismError::attribute("property has no getter"))
         }
     }
 
+    fn get_with_invoker(
+        &self,
+        obj: Option<Value>,
+        objtype: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<Value> {
+        if obj.is_none() {
+            let _ = objtype;
+            return Ok(Value::object_ptr(self as *const Self as *const ()));
+        }
+
+        let getter = self
+            .getter
+            .ok_or_else(|| PrismError::attribute("property has no getter"))?;
+        invoker.call(getter, &[obj.expect("checked above")])
+    }
+
     fn set(&self, obj: Value, value: Value) -> PrismResult<()> {
-        if let Some(_setter) = self.setter {
-            // TODO: Actually call the setter function
-            // In real implementation: call_function(setter, &[obj, value])
+        if self.setter.is_some() {
             let _ = (obj, value);
-            Ok(())
+            Err(PrismError::internal(
+                "property setter requires a DescriptorInvoker",
+            ))
         } else {
             Err(PrismError::attribute("property is read-only"))
         }
     }
 
+    fn set_with_invoker(
+        &self,
+        obj: Value,
+        value: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<()> {
+        let setter = self
+            .setter
+            .ok_or_else(|| PrismError::attribute("property is read-only"))?;
+        invoker.call(setter, &[obj, value]).map(|_| ())
+    }
+
     fn delete(&self, obj: Value) -> PrismResult<()> {
-        if let Some(_deleter) = self.deleter {
-            // TODO: Actually call the deleter function
-            // In real implementation: call_function(deleter, &[obj])
+        if self.deleter.is_some() {
             let _ = obj;
-            Ok(())
+            Err(PrismError::internal(
+                "property deleter requires a DescriptorInvoker",
+            ))
         } else {
             Err(PrismError::attribute("property does not support deletion"))
         }
+    }
+
+    fn delete_with_invoker(
+        &self,
+        obj: Value,
+        invoker: &mut dyn DescriptorInvoker,
+    ) -> PrismResult<()> {
+        let deleter = self
+            .deleter
+            .ok_or_else(|| PrismError::attribute("property does not support deletion"))?;
+        invoker.call(deleter, &[obj]).map(|_| ())
     }
 }
 
@@ -310,5 +345,71 @@ impl PyObject for PropertyDescriptor {
 
     fn header_mut(&mut self) -> &mut ObjectHeader {
         &mut self.header
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingInvoker {
+        calls: Vec<(Value, Vec<Value>)>,
+        returns: Vec<Value>,
+    }
+
+    impl DescriptorInvoker for RecordingInvoker {
+        fn call(&mut self, callable: Value, args: &[Value]) -> PrismResult<Value> {
+            self.calls.push((callable, args.to_vec()));
+            Ok(self.returns.pop().unwrap_or_else(Value::none))
+        }
+    }
+
+    #[test]
+    fn property_get_uses_invoker() {
+        let getter = Value::int_unchecked(100);
+        let instance = Value::int_unchecked(7);
+        let expected = Value::int_unchecked(42);
+        let property = PropertyDescriptor::new_getter(getter);
+        let mut invoker = RecordingInvoker {
+            returns: vec![expected],
+            ..RecordingInvoker::default()
+        };
+
+        assert_eq!(
+            property
+                .get_with_invoker(Some(instance), Value::none(), &mut invoker)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(invoker.calls, vec![(getter, vec![instance])]);
+        assert!(property.get(Some(instance), Value::none()).is_err());
+    }
+
+    #[test]
+    fn property_set_and_delete_use_invoker() {
+        let instance = Value::int_unchecked(7);
+        let setter = Value::int_unchecked(101);
+        let deleter = Value::int_unchecked(102);
+        let assigned = Value::int_unchecked(9);
+        let property = PropertyDescriptor::new_full(None, Some(setter), Some(deleter), None);
+        let mut invoker = RecordingInvoker::default();
+
+        property
+            .set_with_invoker(instance, assigned, &mut invoker)
+            .unwrap();
+        property
+            .delete_with_invoker(instance, &mut invoker)
+            .unwrap();
+
+        assert_eq!(
+            invoker.calls,
+            vec![
+                (setter, vec![instance, assigned]),
+                (deleter, vec![instance])
+            ]
+        );
+        assert!(property.set(instance, assigned).is_err());
+        assert!(property.delete(instance).is_err());
     }
 }

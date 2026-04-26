@@ -41,6 +41,10 @@
 //! ```
 
 use super::{Descriptor, DescriptorFlags, DescriptorKind};
+use crate::object::shape::shape_registry;
+use crate::object::shaped_object::ShapedObject;
+use crate::object::type_obj::TypeId;
+use crate::object::{ObjectHeader, PyObject};
 use prism_core::intern::InternedString;
 use prism_core::{PrismError, PrismResult, Value};
 
@@ -83,8 +87,11 @@ impl Default for SlotAccess {
 ///
 /// SlotDescriptor itself is small (24 bytes) and stored in the class dict.
 /// The actual slot values are stored inline in each instance.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[repr(C)]
 pub struct SlotDescriptor {
+    /// Object header for heap storage and fast type dispatch.
+    pub header: ObjectHeader,
     /// Name of the slot (for error messages and debugging).
     name: InternedString,
     /// Offset in bytes from instance start to this slot.
@@ -106,6 +113,7 @@ impl SlotDescriptor {
     /// * `access` - Read/write access mode
     pub fn new(name: InternedString, index: u16, offset: u16, access: SlotAccess) -> Self {
         Self {
+            header: ObjectHeader::new(TypeId::MEMBER_DESCRIPTOR),
             name,
             offset,
             index,
@@ -174,6 +182,45 @@ impl SlotDescriptor {
         HEADER_SIZE + (slot_index * SLOT_SIZE)
     }
 
+    #[inline]
+    fn self_value(&self) -> Value {
+        Value::object_ptr(self as *const Self as *const ())
+    }
+
+    #[inline]
+    fn shaped_object(&self, obj: Value) -> PrismResult<&'static ShapedObject> {
+        let ptr = obj
+            .as_object_ptr()
+            .ok_or_else(|| PrismError::type_error("slot descriptor requires an object"))?;
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id != TypeId::OBJECT && type_id.raw() < TypeId::FIRST_USER_TYPE {
+            return Err(PrismError::type_error(format!(
+                "slot '{}' cannot be read from '{}'",
+                self.name.as_str(),
+                type_id.name()
+            )));
+        }
+
+        Ok(unsafe { &*(ptr as *const ShapedObject) })
+    }
+
+    #[inline]
+    fn shaped_object_mut(&self, obj: Value) -> PrismResult<&'static mut ShapedObject> {
+        let ptr = obj
+            .as_object_ptr()
+            .ok_or_else(|| PrismError::type_error("slot descriptor requires an object"))?;
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id != TypeId::OBJECT && type_id.raw() < TypeId::FIRST_USER_TYPE {
+            return Err(PrismError::type_error(format!(
+                "slot '{}' cannot be written on '{}'",
+                self.name.as_str(),
+                type_id.name()
+            )));
+        }
+
+        Ok(unsafe { &mut *(ptr as *mut ShapedObject) })
+    }
+
     /// Read the slot value from an instance.
     ///
     /// # Safety
@@ -206,6 +253,18 @@ impl SlotDescriptor {
     }
 }
 
+impl Clone for SlotDescriptor {
+    fn clone(&self) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::MEMBER_DESCRIPTOR),
+            name: self.name.clone(),
+            offset: self.offset,
+            index: self.index,
+            access: self.access,
+        }
+    }
+}
+
 impl Descriptor for SlotDescriptor {
     fn kind(&self) -> DescriptorKind {
         DescriptorKind::Slot
@@ -229,8 +288,7 @@ impl Descriptor for SlotDescriptor {
     fn get(&self, obj: Option<Value>, _objtype: Value) -> PrismResult<Value> {
         // If accessed through class (obj is None), return the descriptor itself
         if obj.is_none() {
-            // In a full implementation, we'd return self as a Value
-            return Ok(Value::none());
+            return Ok(self.self_value());
         }
 
         if !self.is_readable() {
@@ -240,15 +298,13 @@ impl Descriptor for SlotDescriptor {
             )));
         }
 
-        let _obj = obj.unwrap();
-
-        // TODO: Actually read from the instance slot
-        // In real implementation:
-        // let ptr = obj.as_object_ptr().unwrap() as *const u8;
-        // unsafe { Ok(self.read_unchecked(ptr)) }
-
-        // Placeholder - return None to indicate uninitialized
-        Ok(Value::none())
+        let shaped = self.shaped_object(obj.expect("checked above"))?;
+        shaped.get_property_interned(&self.name).ok_or_else(|| {
+            PrismError::attribute(format!(
+                "slot '{}' has not been assigned",
+                self.name.as_str()
+            ))
+        })
     }
 
     fn set(&self, obj: Value, value: Value) -> PrismResult<()> {
@@ -259,27 +315,31 @@ impl Descriptor for SlotDescriptor {
             )));
         }
 
-        let _ = (obj, value);
-
-        // TODO: Actually write to the instance slot
-        // In real implementation:
-        // let ptr = obj.as_object_ptr().unwrap() as *mut u8;
-        // unsafe { self.write_unchecked(ptr, value) };
-
+        let shaped = self.shaped_object_mut(obj)?;
+        shaped.set_property(self.name.clone(), value, shape_registry());
         Ok(())
     }
 
     fn delete(&self, obj: Value) -> PrismResult<()> {
-        // Deleting a slot sets it to an uninitialized sentinel value
-        // This allows AttributeError on subsequent reads
-        let _ = obj;
+        let shaped = self.shaped_object_mut(obj)?;
+        if shaped.delete_property_interned(&self.name) {
+            Ok(())
+        } else {
+            Err(PrismError::attribute(format!(
+                "slot '{}' has not been assigned",
+                self.name.as_str()
+            )))
+        }
+    }
+}
 
-        // TODO: Set to uninitialized sentinel
-        // In real implementation:
-        // let ptr = obj.as_object_ptr().unwrap() as *mut u8;
-        // unsafe { self.write_unchecked(ptr, Value::UNINITIALIZED) };
+impl PyObject for SlotDescriptor {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
 
-        Ok(())
+    fn header_mut(&mut self) -> &mut ObjectHeader {
+        &mut self.header
     }
 }
 
@@ -357,5 +417,46 @@ impl SlotCollection {
     /// Iterate over slots.
     pub fn iter(&self) -> impl Iterator<Item = &SlotDescriptor> {
         self.slots.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::shape::shape_registry;
+    use prism_core::intern::intern;
+
+    #[test]
+    fn slot_descriptor_reads_writes_and_deletes_storage() {
+        let name = intern("x");
+        let descriptor = SlotDescriptor::read_write(name.clone(), 0, 0);
+        let mut instance = ShapedObject::new(TypeId::OBJECT, shape_registry().empty_shape());
+        let instance_value = Value::object_ptr(&mut instance as *mut ShapedObject as *const ());
+        let assigned = Value::int_unchecked(42);
+
+        assert!(descriptor.get(Some(instance_value), Value::none()).is_err());
+        descriptor.set(instance_value, assigned).unwrap();
+        assert_eq!(
+            descriptor.get(Some(instance_value), Value::none()).unwrap(),
+            assigned
+        );
+        descriptor.delete(instance_value).unwrap();
+        assert!(descriptor.get(Some(instance_value), Value::none()).is_err());
+    }
+
+    #[test]
+    fn slot_descriptor_preserves_none_as_assigned_value() {
+        let name = intern("maybe");
+        let descriptor = SlotDescriptor::read_write(name, 0, 0);
+        let mut instance = ShapedObject::new(TypeId::OBJECT, shape_registry().empty_shape());
+        let instance_value = Value::object_ptr(&mut instance as *mut ShapedObject as *const ());
+
+        descriptor.set(instance_value, Value::none()).unwrap();
+        assert_eq!(
+            descriptor.get(Some(instance_value), Value::none()).unwrap(),
+            Value::none()
+        );
+        descriptor.delete(instance_value).unwrap();
+        assert!(descriptor.get(Some(instance_value), Value::none()).is_err());
     }
 }
