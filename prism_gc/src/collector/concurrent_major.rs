@@ -242,7 +242,7 @@ impl ConcurrentMajorCollector {
 
         // Phase 2: Concurrent Mark
         let concurrent_start = Instant::now();
-        let mark_stats = self.concurrent_mark(initial_roots, object_tracer);
+        let mark_stats = self.concurrent_mark(heap, initial_roots, object_tracer);
         result.concurrent_mark_duration = concurrent_start.elapsed();
 
         result.objects_marked = mark_stats.objects_marked;
@@ -277,8 +277,7 @@ impl ConcurrentMajorCollector {
         // Recreate bitmap (clear all bits from previous collection)
         self.bitmap = Arc::new(AtomicMarkBitmap::new(0, self.config.bitmap_coverage));
 
-        // Clear LOS marks
-        heap.large_objects().clear_marks();
+        heap.clear_major_marks();
 
         // Activate SATB write barrier
         self.marking_state.start_marking();
@@ -306,6 +305,7 @@ impl ConcurrentMajorCollector {
     /// Returns marking statistics.
     fn concurrent_mark<T: ObjectTracer>(
         &mut self,
+        heap: &GcHeap,
         initial_roots: Vec<MarkPtr>,
         object_tracer: &T,
     ) -> ConcurrentMarkStats {
@@ -341,6 +341,7 @@ impl ConcurrentMajorCollector {
                 // Trace the object's children
                 let mut tracer = ConcurrentObjectTracer {
                     bitmap: &self.bitmap,
+                    heap,
                     push_fn,
                 };
                 // SAFETY: obj_ptr points to a valid old-gen object that is pinned
@@ -380,14 +381,14 @@ impl ConcurrentMajorCollector {
         self.marking_state.start_remark();
 
         // Drain SATB queue — mark all captured old-values
-        let satb_processed = self.process_satb_queue(object_tracer);
+        let satb_processed = self.process_satb_queue(heap, object_tracer);
 
         // Re-scan roots for references created during concurrent marking
         let rescan_roots = self.rescan_roots(heap, roots);
 
         // Process any newly discovered root pointers
         if !rescan_roots.is_empty() {
-            self.trace_additional_roots(rescan_roots, object_tracer);
+            self.trace_additional_roots(heap, rescan_roots, object_tracer);
         }
 
         // Deactivate SATB barrier
@@ -406,7 +407,7 @@ impl ConcurrentMajorCollector {
     ///
     /// Each captured old-value is marked in the bitmap and traced
     /// to discover any children that might have been missed.
-    fn process_satb_queue<T: ObjectTracer>(&mut self, object_tracer: &T) -> usize {
+    fn process_satb_queue<T: ObjectTracer>(&mut self, heap: &GcHeap, object_tracer: &T) -> usize {
         let mut processed = 0;
 
         // Drain all flushed SATB buffers
@@ -418,13 +419,13 @@ impl ConcurrentMajorCollector {
                 }
 
                 // Mark in bitmap if not already marked
-                let addr = ptr as usize;
-                if self.bitmap.mark(addr) == Some(true) {
+                if heap.mark_major_live(ptr) && self.bitmap.mark(ptr as usize) == Some(true) {
                     processed += 1;
 
                     // Trace children of newly discovered object
                     let mut tracer = SatbRemarkTracer {
                         bitmap: &self.bitmap,
+                        heap,
                     };
                     unsafe {
                         object_tracer.trace_object(ptr, &mut tracer);
@@ -448,13 +449,19 @@ impl ConcurrentMajorCollector {
     }
 
     /// Trace additional roots discovered during remark.
-    fn trace_additional_roots<T: ObjectTracer>(&mut self, roots: Vec<MarkPtr>, object_tracer: &T) {
+    fn trace_additional_roots<T: ObjectTracer>(
+        &mut self,
+        heap: &GcHeap,
+        roots: Vec<MarkPtr>,
+        object_tracer: &T,
+    ) {
         // Simple recursive tracing for remark (STW, so no concurrency needed)
         let mut worklist: Vec<MarkPtr> = roots;
 
         while let Some(obj_ptr) = worklist.pop() {
             let mut tracer = RemarkTracer {
                 bitmap: &self.bitmap,
+                heap,
                 worklist: &mut worklist,
             };
             unsafe {
@@ -532,14 +539,9 @@ impl<'a> Tracer for InitialMarkTracer<'a> {
             return;
         }
 
-        // Only process old-gen objects
-        if !self.heap.is_old(ptr) {
+        // Only process major-collected objects.
+        if !self.heap.mark_major_live(ptr) {
             return;
-        }
-
-        // Mark in LOS if applicable
-        if self.heap.large_objects().contains(ptr) {
-            self.heap.large_objects().mark(ptr);
         }
 
         // Mark in bitmap — if newly marked, add to worklist
@@ -559,6 +561,7 @@ impl<'a> Tracer for InitialMarkTracer<'a> {
 /// which provides a dynamically-dispatched push function per worker.
 struct ConcurrentObjectTracer<'a> {
     bitmap: &'a AtomicMarkBitmap,
+    heap: &'a GcHeap,
     push_fn: &'a dyn Fn(MarkPtr),
 }
 
@@ -576,9 +579,7 @@ impl<'a> Tracer for ConcurrentObjectTracer<'a> {
             return;
         }
 
-        let addr = ptr as usize;
-        // Mark in bitmap — if newly marked, push to work-stealing deque
-        if self.bitmap.mark(addr) == Some(true) {
+        if self.heap.mark_major_live(ptr) && self.bitmap.mark(ptr as usize) == Some(true) {
             (self.push_fn)(MarkPtr::new(ptr));
         }
     }
@@ -587,6 +588,7 @@ impl<'a> Tracer for ConcurrentObjectTracer<'a> {
 /// Tracer for SATB remark — marks children during SATB processing.
 struct SatbRemarkTracer<'a> {
     bitmap: &'a AtomicMarkBitmap,
+    heap: &'a GcHeap,
 }
 
 impl<'a> Tracer for SatbRemarkTracer<'a> {
@@ -605,13 +607,16 @@ impl<'a> Tracer for SatbRemarkTracer<'a> {
         // Mark children in bitmap (no further tracing needed for SATB —
         // they'll be picked up if the worklist is still active, or
         // they're already marked from the concurrent phase)
-        let _ = self.bitmap.mark(ptr as usize);
+        if self.heap.mark_major_live(ptr) {
+            let _ = self.bitmap.mark(ptr as usize);
+        }
     }
 }
 
 /// Tracer for remark phase — marks children and pushes to local worklist.
 struct RemarkTracer<'a> {
     bitmap: &'a AtomicMarkBitmap,
+    heap: &'a GcHeap,
     worklist: &'a mut Vec<MarkPtr>,
 }
 
@@ -629,8 +634,7 @@ impl<'a> Tracer for RemarkTracer<'a> {
             return;
         }
 
-        let addr = ptr as usize;
-        if self.bitmap.mark(addr) == Some(true) {
+        if self.heap.mark_major_live(ptr) && self.bitmap.mark(ptr as usize) == Some(true) {
             self.worklist.push(MarkPtr::new(ptr));
         }
     }

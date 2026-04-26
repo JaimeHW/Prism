@@ -102,6 +102,33 @@ impl OldSpace {
         blocks.iter().any(|block| block.contains(ptr))
     }
 
+    /// Clear block liveness before a major mark phase.
+    pub fn clear_live_counts(&self) {
+        let blocks = self.blocks.lock();
+        for block in blocks.iter() {
+            block.header().live_count.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark the block containing `ptr` as live for the current major cycle.
+    ///
+    /// Old space is still block-granular: any live object keeps its whole block
+    /// until per-object mark metadata is available.
+    pub fn mark_block_live(&self, ptr: *const ()) -> bool {
+        let blocks = self.blocks.lock();
+        for block in blocks.iter() {
+            if block.contains(ptr) {
+                let _ = block.header().live_count.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |count| count.checked_add(1),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get total capacity in bytes.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -233,5 +260,30 @@ mod tests {
         // This should allocate a new block
         let ptr = old_space.alloc(128).expect("Alloc in new block failed");
         assert!(old_space.contains(ptr.as_ptr() as *const ()));
+    }
+
+    #[test]
+    fn test_mark_block_live_preserves_allocated_block() {
+        let mut old_space = OldSpace::new(1024, 512);
+        let ptr = old_space.alloc(128).expect("Alloc failed");
+
+        old_space.clear_live_counts();
+        assert!(old_space.mark_block_live(ptr.as_ptr() as *const ()));
+        let (bytes_freed, _) = old_space.sweep();
+
+        assert_eq!(bytes_freed, 0);
+        assert_eq!(old_space.usage(), 128);
+    }
+
+    #[test]
+    fn test_sweep_reclaims_unmarked_block() {
+        let mut old_space = OldSpace::new(1024, 512);
+        old_space.alloc(128).expect("Alloc failed");
+
+        old_space.clear_live_counts();
+        let (bytes_freed, _) = old_space.sweep();
+
+        assert_eq!(bytes_freed, 128);
+        assert_eq!(old_space.usage(), 0);
     }
 }

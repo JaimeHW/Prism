@@ -94,15 +94,20 @@ impl LargeObjectSpace {
     }
 
     /// Mark a large object as live.
+    ///
+    /// Returns `true` when `ptr` points inside a managed large object.
     pub fn mark(&self, ptr: *const ()) -> bool {
         let mut objects = self.objects.lock();
-        if let Some(obj) = objects.get_mut(&(ptr as usize)) {
-            let was_marked = obj.marked;
-            obj.marked = true;
-            !was_marked // Return true if newly marked
-        } else {
-            false
+        let addr = ptr as usize;
+        for obj in objects.values_mut() {
+            let start = obj.ptr.as_ptr() as usize;
+            let end = start + obj.size();
+            if addr >= start && addr < end {
+                obj.marked = true;
+                return true;
+            }
         }
+        false
     }
 
     /// Clear all marks (before GC).
@@ -221,6 +226,22 @@ mod tests {
         assert_eq!(los.count(), 1);
         assert!(los.contains(ptr1.as_ptr() as *const ()));
         assert!(!los.contains(ptr2.as_ptr() as *const ()));
+    }
+
+    #[test]
+    fn test_large_object_mark_accepts_interior_pointer() {
+        let los = LargeObjectSpace::new();
+
+        let ptr = los.alloc(1024).expect("Alloc failed");
+        let interior = unsafe { ptr.as_ptr().add(32) } as *const ();
+
+        assert!(los.mark(interior));
+        let (bytes_freed, objects_freed) = los.sweep();
+
+        assert_eq!(bytes_freed, 0);
+        assert_eq!(objects_freed, 0);
+        assert_eq!(los.count(), 1);
+        assert!(los.contains(ptr.as_ptr() as *const ()));
     }
 
     #[test]

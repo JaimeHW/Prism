@@ -203,6 +203,20 @@ impl GcHeap {
             || self.large_objects.contains(ptr)
     }
 
+    /// Clear all major-collection mark state before tracing roots.
+    pub fn clear_major_marks(&self) {
+        self.old_space.clear_live_counts();
+        self.large_objects.clear_marks();
+    }
+
+    /// Mark an old-generation or large object as live for major collection.
+    ///
+    /// Returns `true` when the pointer belongs to a major-collected space.
+    #[inline]
+    pub fn mark_major_live(&self, ptr: *const ()) -> bool {
+        self.old_space.mark_block_live(ptr) || self.large_objects.mark(ptr)
+    }
+
     /// Get the generation of an object.
     pub fn generation_of(&self, ptr: *const ()) -> Option<Generation> {
         if self.nursery.contains(ptr) {

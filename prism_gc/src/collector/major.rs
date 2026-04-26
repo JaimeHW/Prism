@@ -101,8 +101,7 @@ impl MajorCollector {
         self.marked.clear();
 
         // Phase 1: Clear marks (all objects white)
-        heap.large_objects().clear_marks();
-        // Note: Old space marks are stored in object headers
+        heap.clear_major_marks();
 
         // Phase 2: Mark from roots
         {
@@ -131,11 +130,13 @@ impl MajorCollector {
             }
         }
 
-        // Phase 4: Sweep precisely tracked spaces.
+        // Phase 4: Sweep major-collected spaces.
         //
-        // Old-space blocks do not yet have per-object mark metadata wired into
-        // this collector. Sweeping them by block live_count would reclaim live
-        // objects, so old space remains pinned until exact object marks exist.
+        // Old-space reclamation is currently block-granular. A live object keeps
+        // its whole block, while blocks with no marked roots are reset for reuse.
+        let (old_freed, old_objects) = heap.old_space_mut().sweep();
+        result.bytes_freed += old_freed;
+        result.objects_freed += old_objects;
 
         // Sweep large object space
         let (los_freed, los_objects) = heap.large_objects().sweep();
@@ -155,7 +156,7 @@ impl MajorCollector {
         self.worklist.clear();
         self.marked.clear();
 
-        heap.large_objects().clear_marks();
+        heap.clear_major_marks();
 
         {
             let mut tracer = MarkingTracer {
@@ -169,6 +170,10 @@ impl MajorCollector {
         while let Some(_obj_ptr) = self.worklist.pop_front() {
             result.objects_marked += 1;
         }
+
+        let (old_freed, old_objects) = heap.old_space_mut().sweep();
+        result.bytes_freed += old_freed;
+        result.objects_freed += old_objects;
 
         let (los_freed, los_objects) = heap.large_objects().sweep();
         result.bytes_freed += los_freed;
@@ -247,15 +252,10 @@ impl<'a> Tracer for MarkingTracer<'a> {
             return;
         }
 
-        // Only mark objects in old generation or LOS
-        // Young generation objects are handled by minor GC
-        if !self.heap.is_old(ptr) {
+        // Only mark objects in old generation or LOS. Young generation objects
+        // are handled by minor GC.
+        if !self.heap.mark_major_live(ptr) {
             return;
-        }
-
-        // Mark the object in LOS if applicable
-        if self.heap.large_objects().contains(ptr) {
-            self.heap.large_objects().mark(ptr);
         }
 
         // Mark gray and add to worklist
@@ -271,6 +271,7 @@ impl<'a> Tracer for MarkingTracer<'a> {
 mod tests {
     use super::*;
     use crate::config::GcConfig;
+    use crate::roots::RawHandle;
     use crate::trace::NoopObjectTracer;
 
     #[test]
@@ -304,6 +305,41 @@ mod tests {
 
         assert_eq!(result.bytes_freed, 0);
         assert_eq!(result.objects_marked, 0);
+    }
+
+    #[test]
+    fn test_major_collection_reclaims_unrooted_old_space_block() {
+        let mut collector = MajorCollector::new();
+        let mut heap = GcHeap::new(GcConfig::default());
+        let roots = RootSet::new();
+
+        heap.alloc_tenured(128)
+            .expect("old-space allocation should succeed");
+
+        let result = collector.collect_roots_only(&mut heap, &roots);
+
+        assert_eq!(result.bytes_freed, 128);
+        assert_eq!(result.live_bytes, 0);
+        assert_eq!(heap.old_space().usage(), 0);
+    }
+
+    #[test]
+    fn test_major_collection_preserves_rooted_old_space_block() {
+        let mut collector = MajorCollector::new();
+        let mut heap = GcHeap::new(GcConfig::default());
+        let roots = RootSet::new();
+
+        let ptr = heap
+            .alloc_tenured(128)
+            .expect("old-space allocation should succeed");
+        roots.register_handle(RawHandle::new(ptr.as_ptr() as *const ()));
+
+        let result = collector.collect_roots_only(&mut heap, &roots);
+
+        assert_eq!(result.bytes_freed, 0);
+        assert_eq!(result.live_bytes, 128);
+        assert_eq!(heap.old_space().usage(), 128);
+        assert_eq!(result.objects_marked, 1);
     }
 
     #[test]
