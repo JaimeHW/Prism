@@ -1,4 +1,7 @@
 target/
-*.txt
+prism-build/
 *.log
 .codex*
+scratch/
+.work/
+thread_*.txt
