@@ -200,6 +200,8 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "marshal"
         | "binascii"
         | "keyword"
+        | "operator"
+        | "pickle"
         | "test.support"
         | "test.support.os_helper" => Some(StdlibResolutionPolicy::PreferNative),
         "os" | "os.path" | "json" | "functools" | "re" => {

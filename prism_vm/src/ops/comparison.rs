@@ -159,11 +159,10 @@ fn value_as_bytes_ref(value: Value) -> Option<&'static [u8]> {
 }
 
 #[inline]
-fn contains_bytes_value(needle: Value, haystack: &[u8]) -> Result<bool, ControlFlow> {
+fn contains_bytes_value(needle: Value, haystack: &[u8]) -> Result<bool, RuntimeError> {
     if let Some(value) = int_like_value(needle) {
-        let byte = u8::try_from(value).map_err(|_| {
-            ControlFlow::Error(RuntimeError::value_error("byte must be in range(0, 256)"))
-        })?;
+        let byte = u8::try_from(value)
+            .map_err(|_| RuntimeError::value_error("byte must be in range(0, 256)"))?;
         return Ok(haystack.contains(&byte));
     }
 
@@ -171,9 +170,9 @@ fn contains_bytes_value(needle: Value, haystack: &[u8]) -> Result<bool, ControlF
         return Ok(bytes_contains(haystack, needle_bytes));
     }
 
-    Err(ControlFlow::Error(RuntimeError::type_error(
+    Err(RuntimeError::type_error(
         "'in <bytes>' requires bytes-like object or integer as left operand",
-    )))
+    ))
 }
 
 #[inline]
@@ -496,7 +495,7 @@ fn compare_sequence_result(
     Ok(Some(result))
 }
 
-fn compare_order_result(
+pub(crate) fn compare_order_result(
     vm: &mut VirtualMachine,
     a: Value,
     b: Value,
@@ -1061,7 +1060,7 @@ pub fn in_op(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             frame.set_reg(inst.dst().0, Value::bool(result));
             ControlFlow::Continue
         }
-        Err(cf) => cf,
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -1080,7 +1079,7 @@ pub fn not_in(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             frame.set_reg(inst.dst().0, Value::bool(!result));
             ControlFlow::Continue
         }
-        Err(cf) => cf,
+        Err(err) => ControlFlow::Error(err),
     }
 }
 
@@ -1102,11 +1101,11 @@ pub fn not_in(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// String containment uses SSE4.2 PCMPESTRI for needles ≤16 bytes,
 /// AVX2 dual-byte filter for longer needles.
 #[inline]
-fn contains_value(
+pub(crate) fn contains_value(
     vm: &mut VirtualMachine,
     needle: Value,
     container: Value,
-) -> Result<bool, ControlFlow> {
+) -> Result<bool, RuntimeError> {
     use prism_runtime::object::type_obj::TypeId;
     use prism_runtime::object::views::MappingProxyObject;
     use prism_runtime::types::range::RangeObject;
@@ -1116,9 +1115,7 @@ fn contains_value(
 
     if let Some(haystack) = value_as_string_ref(container) {
         let needle = value_as_string_ref(needle).ok_or_else(|| {
-            ControlFlow::Error(RuntimeError::type_error(
-                "'in <string>' requires string as left operand",
-            ))
+            RuntimeError::type_error("'in <string>' requires string as left operand")
         })?;
         return Ok(str_contains(haystack.as_str(), needle.as_str()));
     }
@@ -1140,7 +1137,7 @@ fn contains_value(
                 let list = unsafe { &*(ptr as *const ListObject) };
                 for i in 0..list.len() {
                     if let Some(val) = list.get(i as i64) {
-                        if contains_match(vm, needle, val).map_err(ControlFlow::Error)? {
+                        if contains_match(vm, needle, val)? {
                             return Ok(true);
                         }
                     }
@@ -1153,7 +1150,7 @@ fn contains_value(
                 let tuple = unsafe { &*(ptr as *const TupleObject) };
                 for i in 0..tuple.len() {
                     if let Some(val) = tuple.get(i as i64) {
-                        if contains_match(vm, needle, val).map_err(ControlFlow::Error)? {
+                        if contains_match(vm, needle, val)? {
                             return Ok(true);
                         }
                     }
@@ -1175,8 +1172,7 @@ fn contains_value(
 
             TypeId::MAPPING_PROXY => {
                 let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
-                return crate::builtins::builtin_mapping_proxy_contains_key(proxy, needle)
-                    .map_err(ControlFlow::Error);
+                return crate::builtins::builtin_mapping_proxy_contains_key(proxy, needle);
             }
 
             // String: SIMD-accelerated substring search
@@ -1196,9 +1192,9 @@ fn contains_value(
                 }
 
                 // Non-string needle in string container is always false
-                return Err(ControlFlow::Error(RuntimeError::type_error(
+                return Err(RuntimeError::type_error(
                     "'in <string>' requires string as left operand",
-                )));
+                ));
             }
 
             // Range: O(1) arithmetic containment
@@ -1227,9 +1223,7 @@ fn contains_value(
         }
 
         if supports_membership_iteration_fallback(type_id) {
-            if let Some(result) =
-                contains_via_special_method(vm, needle, container).map_err(ControlFlow::Error)?
-            {
+            if let Some(result) = contains_via_special_method(vm, needle, container)? {
                 return Ok(result);
             }
 
@@ -1239,19 +1233,17 @@ fn contains_value(
                 }
             }
 
-            return contains_via_iteration(vm, needle, container).map_err(ControlFlow::Error);
+            return contains_via_iteration(vm, needle, container);
         }
 
-        return Err(ControlFlow::Error(RuntimeError::type_error(format!(
+        return Err(RuntimeError::type_error(format!(
             "argument of type '{}' is not iterable",
             type_id.name()
-        ))));
+        )));
     }
 
     // Inline types: integers, floats, bools cannot be containers
-    Err(ControlFlow::Error(RuntimeError::type_error(
-        "argument of type is not iterable",
-    )))
+    Err(RuntimeError::type_error("argument of type is not iterable"))
 }
 
 #[inline]

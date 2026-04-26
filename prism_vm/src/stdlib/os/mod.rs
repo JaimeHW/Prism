@@ -38,17 +38,23 @@ use crate::ops::method_dispatch::load_method::resolve_special_method;
 use crate::ops::objects::extract_type_id;
 use crate::stdlib::secure_random::urandom_value_from_args;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::value_as_bytes_ref;
 use prism_runtime::types::string::value_as_string_ref;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 static OS_URANDOM_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.urandom"), os_urandom));
 static OS_FSPATH_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("os.fspath"), os_fspath));
+static OS_REMOVE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.remove"), os_remove));
+static OS_UNLINK_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.unlink"), os_unlink));
 
 /// The os module providing operating system interface.
 pub struct OsModule {
@@ -92,22 +98,25 @@ impl Module for OsModule {
     fn get_attr(&self, name: &str) -> Result<Value, ModuleError> {
         match name {
             // Platform constants
-            "name" => Ok(Value::none()), // TODO: Return interned "nt" or "posix"
-            "sep" => Ok(Value::none()),  // TODO: Return interned "/" or "\\"
-            "pathsep" => Ok(Value::none()), // TODO: Return interned ":" or ";"
-            "linesep" => Ok(Value::none()), // TODO: Return interned "\n" or "\r\n"
-            "curdir" => Ok(Value::none()), // "."
-            "pardir" => Ok(Value::none()), // ".."
-            "extsep" => Ok(Value::none()), // "."
-            "altsep" => Ok(Value::none()), // "/" on Windows, None on Unix
-            "devnull" => Ok(Value::none()), // "/dev/null" or "nul"
+            "name" => Ok(string_value(OS_NAME)),
+            "sep" => Ok(string_value(SEP_STR)),
+            "pathsep" => Ok(string_value(PATHSEP_STR)),
+            "linesep" => Ok(string_value(LINESEP)),
+            "curdir" => Ok(string_value(CURDIR)),
+            "pardir" => Ok(string_value(PARDIR)),
+            "extsep" => Ok(string_value(".")),
+            "altsep" => Ok(ALTSEP
+                .map(|separator| string_value(&separator.to_string()))
+                .unwrap_or_else(Value::none)),
+            "devnull" => Ok(string_value(DEVNULL)),
 
             // Functions (return None placeholders for now)
-            "getcwd" | "chdir" | "mkdir" | "makedirs" | "rmdir" | "removedirs" | "remove"
-            | "unlink" | "rename" | "replace" | "stat" | "lstat" | "listdir" | "scandir"
-            | "walk" | "fwalk" | "getenv" | "putenv" | "unsetenv" | "getpid" | "getppid"
-            | "kill" | "system" | "popen" | "access" | "chmod" | "chown" | "link" | "symlink"
-            | "readlink" => {
+            "remove" => Ok(builtin_value(&OS_REMOVE_FUNCTION)),
+            "unlink" => Ok(builtin_value(&OS_UNLINK_FUNCTION)),
+            "getcwd" | "chdir" | "mkdir" | "makedirs" | "rmdir" | "removedirs" | "rename"
+            | "replace" | "stat" | "lstat" | "listdir" | "scandir" | "walk" | "fwalk"
+            | "getenv" | "putenv" | "unsetenv" | "getpid" | "getppid" | "kill" | "system"
+            | "popen" | "access" | "chmod" | "chown" | "link" | "symlink" | "readlink" => {
                 Ok(Value::none()) // Placeholder for callable
             }
             "urandom" => Ok(builtin_value(&OS_URANDOM_FUNCTION)),
@@ -203,8 +212,56 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
 }
 
+#[inline]
+fn string_value(value: &str) -> Value {
+    Value::string(intern(value))
+}
+
 fn os_urandom(args: &[Value]) -> Result<Value, BuiltinError> {
     urandom_value_from_args(args, "urandom")
+}
+
+fn os_remove(args: &[Value]) -> Result<Value, BuiltinError> {
+    remove_path(args, "remove")
+}
+
+fn os_unlink(args: &[Value]) -> Result<Value, BuiltinError> {
+    remove_path(args, "unlink")
+}
+
+fn remove_path(args: &[Value], function: &str) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{function}() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let path = path_from_value(args[0], function)?;
+    std::fs::remove_file(&path).map_err(|err| {
+        BuiltinError::OSError(format!(
+            "{function}() failed for '{}': {}",
+            path.display(),
+            err
+        ))
+    })?;
+    Ok(Value::none())
+}
+
+fn path_from_value(value: Value, function: &str) -> Result<PathBuf, BuiltinError> {
+    if let Some(path) = value_as_string_ref(value) {
+        return Ok(PathBuf::from(path.as_str()));
+    }
+    if let Some(bytes) = value_as_bytes_ref(value) {
+        let path = std::str::from_utf8(bytes.as_bytes()).map_err(|_| {
+            BuiltinError::ValueError(format!("{function}() path bytes are not valid UTF-8"))
+        })?;
+        return Ok(PathBuf::from(path));
+    }
+    Err(BuiltinError::TypeError(format!(
+        "{function}() path should be str, bytes or os.PathLike, not {}",
+        python_type_name(value)
+    )))
 }
 
 pub(crate) fn os_fspath(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {

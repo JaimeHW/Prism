@@ -53,7 +53,9 @@ pub mod marshal;
 pub mod math;
 pub mod msvcrt;
 pub mod nt;
+pub mod operator;
 pub mod os;
+pub mod pickle;
 pub mod python_builtins;
 pub mod re;
 pub(crate) mod secure_random;
@@ -428,6 +430,16 @@ impl StdlibRegistry {
             &mut modules,
             "keyword",
             Box::new(keyword::KeywordModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "operator",
+            Box::new(operator::OperatorModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "pickle",
+            Box::new(pickle::PickleModule::new()),
         );
 
         Self::insert_module(
