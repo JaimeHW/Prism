@@ -3386,6 +3386,64 @@ mod tests {
     }
 
     #[test]
+    fn test_get_attribute_value_prefers_callable_descriptor_doc_metadata() {
+        let mut vm = vm_with_names(&[]);
+        let (func_ptr, func_value) = make_test_function_value("documented_callable");
+        let callable_doc = Value::string(intern("callable docs"));
+        unsafe { &*func_ptr }.set_attr(intern("__doc__"), callable_doc);
+
+        assert_eq!(
+            get_attribute_value(&mut vm, func_value, &intern("__doc__"))
+                .expect("function __doc__ should resolve"),
+            callable_doc
+        );
+
+        let method_value = bind_instance_attribute(func_value, Value::int(7).unwrap());
+        assert_eq!(
+            get_attribute_value(&mut vm, method_value, &intern("__doc__"))
+                .expect("bound method __doc__ should resolve"),
+            callable_doc
+        );
+
+        let classmethod_ptr = Box::into_raw(Box::new(ClassMethodDescriptor::new(func_value)));
+        let classmethod_value = Value::object_ptr(classmethod_ptr as *const ());
+        assert_eq!(
+            get_attribute_value(&mut vm, classmethod_value, &intern("__doc__"))
+                .expect("classmethod __doc__ should resolve"),
+            callable_doc
+        );
+
+        let staticmethod_ptr = Box::into_raw(Box::new(StaticMethodDescriptor::new(func_value)));
+        let staticmethod_value = Value::object_ptr(staticmethod_ptr as *const ());
+        assert_eq!(
+            get_attribute_value(&mut vm, staticmethod_value, &intern("__doc__"))
+                .expect("staticmethod __doc__ should resolve"),
+            callable_doc
+        );
+
+        let property_doc = Value::string(intern("property docs"));
+        let property_ptr = Box::into_raw(Box::new(PropertyDescriptor::new_full(
+            None,
+            None,
+            None,
+            Some(property_doc),
+        )));
+        let property_value = Value::object_ptr(property_ptr as *const ());
+        assert_eq!(
+            get_attribute_value(&mut vm, property_value, &intern("__doc__"))
+                .expect("property __doc__ should resolve"),
+            property_doc
+        );
+
+        unsafe {
+            drop(Box::from_raw(property_ptr));
+            drop(Box::from_raw(staticmethod_ptr));
+            drop(Box::from_raw(classmethod_ptr));
+            drop(Box::from_raw(func_ptr));
+        }
+    }
+
+    #[test]
     fn test_get_attr_binds_builtin_dict_items_method_for_dict_subclass() {
         let mut vm = vm_with_names(&["items"]);
         let class = register_dict_subclass("DictSubclassAttr");

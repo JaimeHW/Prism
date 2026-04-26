@@ -579,6 +579,21 @@ fn builtin_type_doc_value(owner: TypeId) -> Value {
     }
 }
 
+#[inline]
+fn builtin_instance_inherits_type_doc(type_id: TypeId) -> bool {
+    type_id.raw() < TypeId::FIRST_USER_TYPE
+        && !matches!(
+            type_id,
+            TypeId::FUNCTION
+                | TypeId::CLOSURE
+                | TypeId::METHOD
+                | TypeId::BUILTIN_FUNCTION
+                | TypeId::CLASSMETHOD
+                | TypeId::STATICMETHOD
+                | TypeId::PROPERTY
+        )
+}
+
 const NONE_TYPE_DOC: &str = "The type of the None singleton.";
 
 #[inline]
@@ -1476,7 +1491,7 @@ pub(crate) fn builtin_instance_attribute_value(
         (owner, "__class__") if owner.raw() < TypeId::FIRST_USER_TYPE => Ok(Some(
             crate::builtins::builtin_type_object_for_type_id(owner),
         )),
-        (owner, "__doc__") if owner.raw() < TypeId::FIRST_USER_TYPE => {
+        (owner, "__doc__") if builtin_instance_inherits_type_doc(owner) => {
             Ok(Some(builtin_type_doc_value(owner)))
         }
         (TypeId::INT, "real") | (TypeId::INT, "numerator") => Ok(Some(receiver)),
@@ -1509,7 +1524,7 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
         return true;
     }
 
-    if name.as_str() == "__doc__" && type_id.raw() < TypeId::FIRST_USER_TYPE {
+    if name.as_str() == "__doc__" && builtin_instance_inherits_type_doc(type_id) {
         return true;
     }
 
