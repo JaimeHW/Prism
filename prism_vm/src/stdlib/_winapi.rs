@@ -100,6 +100,7 @@ static PIPE_HANDLE_STATE: LazyLock<Mutex<PipeHandleState>> =
 struct PipeHandleState {
     handles: FxHashSet<i64>,
     duplicate_sources: FxHashMap<i64, i64>,
+    closed_parent_sources: FxHashSet<i64>,
 }
 
 static CLOSE_HANDLE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -337,7 +338,9 @@ fn handle_from_i64(value: i64) -> HANDLE {
 #[cfg(windows)]
 #[inline]
 fn handle_value(handle: HANDLE) -> Result<Value, BuiltinError> {
-    int_value(handle as isize as i64, "Windows handle")
+    let handle = handle_to_i64(handle);
+    mark_handle_live(handle);
+    int_value(handle, "Windows handle")
 }
 
 #[cfg(windows)]
@@ -351,8 +354,12 @@ fn track_pipe_handles(read_pipe: HANDLE, write_pipe: HANDLE) {
     let mut state = PIPE_HANDLE_STATE
         .lock()
         .expect("_winapi pipe handle state mutex poisoned");
-    state.handles.insert(handle_to_i64(read_pipe));
-    state.handles.insert(handle_to_i64(write_pipe));
+    let read_pipe = handle_to_i64(read_pipe);
+    let write_pipe = handle_to_i64(write_pipe);
+    state.handles.insert(read_pipe);
+    state.handles.insert(write_pipe);
+    state.closed_parent_sources.remove(&read_pipe);
+    state.closed_parent_sources.remove(&write_pipe);
 }
 
 #[cfg(windows)]
@@ -364,6 +371,7 @@ fn track_pipe_duplicate(source_handle: i64, target_handle: HANDLE) {
     if state.handles.contains(&source_handle) {
         state.handles.insert(target_handle);
         state.duplicate_sources.insert(target_handle, source_handle);
+        state.closed_parent_sources.remove(&target_handle);
     }
 }
 
@@ -377,6 +385,16 @@ fn unregister_tracked_handle(handle: i64) {
     state
         .duplicate_sources
         .retain(|_, source_handle| *source_handle != handle);
+    state.closed_parent_sources.remove(&handle);
+}
+
+#[cfg(windows)]
+fn mark_handle_live(handle: i64) {
+    PIPE_HANDLE_STATE
+        .lock()
+        .expect("_winapi pipe handle state mutex poisoned")
+        .closed_parent_sources
+        .remove(&handle);
 }
 
 #[cfg(windows)]
@@ -398,10 +416,20 @@ fn take_pipe_duplicate_source_for_parent_close(
     }
     state.duplicate_sources.remove(&duplicate_handle);
     state.handles.remove(&source_handle);
+    state.closed_parent_sources.insert(source_handle);
     state
         .duplicate_sources
         .retain(|_, candidate| *candidate != source_handle);
     Some(source_handle)
+}
+
+#[cfg(windows)]
+fn was_closed_by_parent_pipe_cleanup(handle: i64) -> bool {
+    PIPE_HANDLE_STATE
+        .lock()
+        .expect("_winapi pipe handle state mutex poisoned")
+        .closed_parent_sources
+        .contains(&handle)
 }
 
 #[cfg(windows)]
@@ -630,6 +658,12 @@ fn winapi_close_handle(args: &[Value]) -> Result<Value, BuiltinError> {
 
     #[cfg(windows)]
     {
+        if was_closed_by_parent_pipe_cleanup(handle) {
+            return Err(BuiltinError::OSError(
+                "CloseHandle() failed: handle was already closed by CreateProcess startup cleanup"
+                    .to_string(),
+            ));
+        }
         if unsafe { CloseHandle(handle_from_i64(handle)) } == 0 {
             return Err(last_os_error("CloseHandle() failed"));
         }
