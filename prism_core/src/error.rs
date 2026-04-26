@@ -520,5 +520,4 @@ mod tests {
         assert_eq!(err.exception_type(), "SystemExit");
         assert_eq!(err.to_string(), "SystemExit: exit code 1");
     }
-
 }

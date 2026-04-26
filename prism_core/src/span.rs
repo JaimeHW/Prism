@@ -529,5 +529,4 @@ mod tests {
         let spanned = Spanned::new(42, Span::new(0, 2));
         assert_eq!(format!("{}", spanned), "42");
     }
-
 }
