@@ -794,6 +794,10 @@ mod tests {
         assert_eq!(parsed["formatVersion"], 1);
         assert_eq!(parsed["entry"]["canonicalModule"], "__main__");
         assert!(parsed["modules"].is_array());
+        assert_eq!(
+            parsed["modules"][0]["compilationMode"].as_str(),
+            Some("frozen-bytecode-plus-native-init")
+        );
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub struct ModuleManifest {
     pub static_imports: Vec<String>,
     /// Candidate submodules referenced through `from ... import ...`.
     pub from_import_candidates: Vec<String>,
+    /// Concrete backend path used for this module today.
+    pub compilation_mode: String,
     /// Whether the current native lowering subset can emit a module-init stub.
     pub native_init_supported: bool,
     /// Stable symbol name for the native init stub when available.
@@ -146,6 +148,11 @@ impl From<&BuildPlan> for BuildManifest {
                     nested_code_object_count: module.nested_code_object_count,
                     static_imports: module.static_imports.clone(),
                     from_import_candidates: module.from_import_candidates.clone(),
+                    compilation_mode: if module.native_init.is_some() {
+                        "frozen-bytecode-plus-native-init".to_string()
+                    } else {
+                        "frozen-bytecode".to_string()
+                    },
                     native_init_supported: module.native_init.is_some(),
                     native_init_symbol: module
                         .native_init

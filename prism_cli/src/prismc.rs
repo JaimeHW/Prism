@@ -485,6 +485,10 @@ mod tests {
             })
             .expect("manifest should contain the entry module");
         let expected_symbol = prism_aot::native_init_symbol("__main__");
+        assert_eq!(
+            entry_module["compilationMode"].as_str(),
+            Some("frozen-bytecode-plus-native-init")
+        );
         assert_eq!(entry_module["nativeInitSupported"], true);
         assert_eq!(
             entry_module["nativeInitSymbol"].as_str(),
