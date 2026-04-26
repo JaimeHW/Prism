@@ -17,11 +17,19 @@
 //! - Interned strings: Hash-consing for deduplication
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Constant, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
+
+fn box_constants(values: Vec<Value>) -> Box<[Constant]> {
+    values
+        .into_iter()
+        .map(Constant::Value)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 // =============================================================================
 // String Benchmark Helpers
@@ -45,7 +53,7 @@ fn create_string_concat_code(a: &str, b: &str) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -78,7 +86,7 @@ fn create_string_repeat_code(s: &str, n: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -111,7 +119,7 @@ fn create_string_compare_code(a: &str, b: &str) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -212,7 +220,7 @@ fn create_string_build_loop(iterations: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),

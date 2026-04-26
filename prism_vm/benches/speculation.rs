@@ -3,10 +3,18 @@
 //! Measures execution performance of speculative operations.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Constant, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
+
+fn box_constants(values: Vec<Value>) -> Box<[Constant]> {
+    values
+        .into_iter()
+        .map(Constant::Value)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 // =============================================================================
 // Benchmark Helpers
@@ -29,7 +37,7 @@ fn create_int_add_code(a: i64, b: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -61,7 +69,7 @@ fn create_float_add_code(a: f64, b: f64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -93,7 +101,7 @@ fn create_mul_code(a: i64, b: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -164,7 +172,7 @@ fn create_hot_loop_code(n: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -289,7 +297,7 @@ fn bench_vm_overhead(c: &mut Criterion) {
             posonlyarg_count: 0,
             kwonlyarg_count: 0,
             instructions: instructions.into_boxed_slice(),
-            constants: constants.into_boxed_slice(),
+            constants: box_constants(constants),
             names: Box::new([]),
             locals: Box::new([]),
             freevars: Box::new([]),

@@ -17,10 +17,18 @@
 //! - OSR warm entry: < 10μs
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use prism_code::{CodeFlags, CodeObject, Instruction, Opcode, Register};
+use prism_code::{CodeFlags, CodeObject, Constant, Instruction, Opcode, Register};
 use prism_core::Value;
 use prism_vm::{JitConfig, VirtualMachine};
 use std::sync::Arc;
+
+fn box_constants(values: Vec<Value>) -> Box<[Constant]> {
+    values
+        .into_iter()
+        .map(Constant::Value)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 // =============================================================================
 // Guard/Deopt Test Code Generators
@@ -45,7 +53,7 @@ fn create_type_stable_code() -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -82,7 +90,7 @@ fn create_type_varying_code(use_float: bool) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
@@ -174,7 +182,7 @@ fn create_osr_candidate_loop(n: i64) -> Arc<CodeObject> {
         posonlyarg_count: 0,
         kwonlyarg_count: 0,
         instructions: instructions.into_boxed_slice(),
-        constants: constants.into_boxed_slice(),
+        constants: box_constants(constants),
         names: Box::new([]),
         locals: Box::new([]),
         freevars: Box::new([]),
