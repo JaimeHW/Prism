@@ -181,7 +181,7 @@ mod tests {
 
         let template = LoadFloatTemplate {
             dst_reg: 0,
-            value: 3.14,
+            value: 3.125,
         };
         template.emit(&mut ctx);
 

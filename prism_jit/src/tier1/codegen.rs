@@ -2668,7 +2668,7 @@ mod tests {
             TemplateInstruction::LoadFloat {
                 bc_offset: 8,
                 dst: 1,
-                value: 3.14,
+                value: 3.125,
             },
             TemplateInstruction::GuardFloat {
                 bc_offset: 12,

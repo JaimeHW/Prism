@@ -404,8 +404,7 @@ impl OsrEntryStub {
     /// Get the entry point address (once code is placed in executable memory).
     #[inline]
     pub fn entry_address(&self, base: *const u8) -> *const u8 {
-        // SAFETY: Adding entry_offset to base is within bounds
-        unsafe { base.add(self.entry_offset) }
+        base.wrapping_add(self.entry_offset)
     }
 
     /// Get the size of the stub.

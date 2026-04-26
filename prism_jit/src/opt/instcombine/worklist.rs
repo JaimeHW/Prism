@@ -67,12 +67,13 @@ impl Worklist {
 
     /// Pop the next node from the worklist.
     pub fn pop(&mut self) -> Option<NodeId> {
-        while let Some(node) = self.queue.pop_front() {
+        if let Some(node) = self.queue.pop_front() {
             self.in_queue.remove(&node);
             self.total_processed += 1;
-            return Some(node);
+            Some(node)
+        } else {
+            None
         }
-        None
     }
 
     /// Check if the worklist is empty.

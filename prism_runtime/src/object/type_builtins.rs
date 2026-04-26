@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn test_type_of_float() {
-        let value = Value::from(3.14f64);
+        let value = Value::from(3.125f64);
         assert_eq!(type_of_value(value), TypeId::FLOAT);
     }
 

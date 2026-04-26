@@ -369,16 +369,17 @@ impl DominatorTree {
     /// Intersect for dominator computation.
     fn intersect(&self, mut b1: BlockId, mut b2: BlockId, cfg: &Cfg) -> BlockId {
         while b1 != b2 {
-            let po1 = cfg.postorder.get(b1).copied().unwrap_or(0);
-            let po2 = cfg.postorder.get(b2).copied().unwrap_or(0);
-
-            while po1 < po2 {
+            while cfg.postorder.get(b1).copied().unwrap_or(0)
+                < cfg.postorder.get(b2).copied().unwrap_or(0)
+            {
                 b1 = self.idom[b1];
                 if !b1.is_valid() {
                     return b2;
                 }
             }
-            while po2 < po1 {
+            while cfg.postorder.get(b2).copied().unwrap_or(0)
+                < cfg.postorder.get(b1).copied().unwrap_or(0)
+            {
                 b2 = self.idom[b2];
                 if !b2.is_valid() {
                     return b1;

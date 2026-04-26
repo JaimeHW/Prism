@@ -344,10 +344,10 @@ mod tests {
 
     #[test]
     fn test_constant_float() {
-        let c = Constant::float(3.14);
+        let c = Constant::float(3.125);
         assert!(c.is_float());
         assert!(!c.is_int());
-        assert_eq!(c.as_float(), Some(3.14));
+        assert_eq!(c.as_float(), Some(3.125));
     }
 
     #[test]
@@ -498,9 +498,9 @@ mod tests {
         let b = LatticeValue::int(42);
         assert_eq!(a.meet(&b), LatticeValue::int(42));
 
-        let x = LatticeValue::float(3.14);
-        let y = LatticeValue::float(3.14);
-        assert_eq!(x.meet(&y), LatticeValue::float(3.14));
+        let x = LatticeValue::float(3.125);
+        let y = LatticeValue::float(3.125);
+        assert_eq!(x.meet(&y), LatticeValue::float(3.125));
     }
 
     #[test]

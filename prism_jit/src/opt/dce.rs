@@ -258,7 +258,7 @@ mod tests {
         // Create unused constants
         let _c1 = builder.const_int(42);
         let _c2 = builder.const_int(100);
-        let _c3 = builder.const_float(3.14);
+        let _c3 = builder.const_float(3.125);
 
         // But only use one
         let used = builder.const_int(1);

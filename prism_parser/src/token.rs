@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn test_token_kind_literals_display() {
         assert_eq!(format!("{}", TokenKind::Int(42)), "42");
-        assert_eq!(format!("{}", TokenKind::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", TokenKind::Float(3.125)), "3.125");
         assert_eq!(
             format!("{}", TokenKind::String("hello".to_string())),
             "\"hello\""

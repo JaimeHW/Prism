@@ -99,8 +99,8 @@ fn test_const_float_values() {
     let mut builder = GraphBuilder::new(4, 0);
 
     let zero = builder.const_float(0.0);
-    let positive = builder.const_float(3.14159);
-    let negative = builder.const_float(-2.718);
+    let positive = builder.const_float(3.125);
+    let negative = builder.const_float(-2.75);
     let inf = builder.const_float(f64::INFINITY);
     let neg_inf = builder.const_float(f64::NEG_INFINITY);
 
@@ -236,7 +236,7 @@ fn test_int_chained_operations() {
 fn test_float_add_sub() {
     let mut builder = GraphBuilder::new(4, 0);
 
-    let a = builder.const_float(3.14);
+    let a = builder.const_float(3.125);
     let b = builder.const_float(2.71);
 
     let sum = builder.float_add(a, b);
@@ -281,7 +281,7 @@ fn test_float_mul_div() {
 fn test_float_neg() {
     let mut builder = GraphBuilder::new(4, 0);
 
-    let a = builder.const_float(3.14);
+    let a = builder.const_float(3.125);
     let neg_a = builder.float_neg(a);
 
     let graph = builder.finish();
@@ -766,7 +766,7 @@ fn test_container_build_tuple_with_elements() {
     let mut builder = GraphBuilder::new(4, 0);
 
     let e1 = builder.const_int(10);
-    let e2 = builder.const_float(3.14);
+    let e2 = builder.const_float(3.125);
 
     let tuple = builder.build_tuple(&[e1, e2]);
 

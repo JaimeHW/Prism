@@ -1148,8 +1148,8 @@ mod tests {
     fn test_constant_pool() {
         let mut pool = ConstantPool::new();
 
-        let idx1 = pool.add_f64(3.14);
-        let idx2 = pool.add_f64(3.14); // Should be deduplicated
+        let idx1 = pool.add_f64(3.125);
+        let idx2 = pool.add_f64(3.125); // Should be deduplicated
         let idx3 = pool.add_i64(42);
 
         assert_eq!(idx1, idx2);

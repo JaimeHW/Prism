@@ -492,9 +492,9 @@ mod tests {
 
     #[test]
     fn test_node_const_float() {
-        let node = Node::const_float(3.14);
+        let node = Node::const_float(3.125);
         assert!(node.is_constant());
-        assert_eq!(node.as_float(), Some(3.14));
+        assert_eq!(node.as_float(), Some(3.125));
         assert_eq!(node.ty, ValueType::Float64);
     }
 

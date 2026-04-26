@@ -330,10 +330,10 @@ mod tests {
 
     #[test]
     fn test_cell_new_with_float() {
-        let cell = Cell::new(Value::float(3.14159));
+        let cell = Cell::new(Value::float(3.125));
         assert!(cell.is_bound());
         let val = cell.get().unwrap();
-        assert!((val.as_float().unwrap() - 3.14159).abs() < 1e-10);
+        assert!((val.as_float().unwrap() - 3.125).abs() < 1e-10);
     }
 
     #[test]

@@ -328,71 +328,66 @@ impl<'src> Lexer<'src> {
     /// Handle the start of a logical line (indentation processing).
     fn handle_line_start(&mut self) -> Option<Token> {
         // Skip blank lines and comments
-        loop {
-            // Measure indentation
-            let mut indent = 0;
-            while !self.cursor.is_eof() {
-                match self.cursor.first() {
-                    ' ' => {
-                        indent += 1;
+        let mut indent = 0;
+        while !self.cursor.is_eof() {
+            match self.cursor.first() {
+                ' ' => {
+                    indent += 1;
+                    self.cursor.bump();
+                }
+                '\t' => {
+                    // Tabs align to 8-space boundaries
+                    indent = (indent / 8 + 1) * 8;
+                    self.cursor.bump();
+                }
+                '#' => {
+                    // Comment - skip to end of line
+                    self.skip_comment();
+                    self.cursor.eat('\r');
+                    self.cursor.eat('\n');
+                    indent = 0;
+                    continue;
+                }
+                '\n' | '\r' => {
+                    // Blank line - skip
+                    self.cursor.bump();
+                    if self.cursor.first() == '\n' {
                         self.cursor.bump();
                     }
-                    '\t' => {
-                        // Tabs align to 8-space boundaries
-                        indent = (indent / 8 + 1) * 8;
-                        self.cursor.bump();
-                    }
-                    '#' => {
-                        // Comment - skip to end of line
-                        self.skip_comment();
-                        self.cursor.eat('\r');
-                        self.cursor.eat('\n');
-                        indent = 0;
-                        continue;
-                    }
-                    '\n' | '\r' => {
-                        // Blank line - skip
-                        self.cursor.bump();
-                        if self.cursor.first() == '\n' {
-                            self.cursor.bump();
-                        }
-                        indent = 0;
-                        continue;
-                    }
-                    _ => break,
+                    indent = 0;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        // Check for EOF
+        if self.cursor.is_eof() {
+            return None;
+        }
+
+        // Process the indentation level
+        match self.indent.process_indent(indent) {
+            Ok(Some(true)) => {
+                // INDENT
+                self.token_start = self.cursor.pos();
+                return Some(self.make_token(TokenKind::Indent));
+            }
+            Ok(Some(false)) => {
+                // DEDENT(s) - will be handled by pending_dedents
+                self.token_start = self.cursor.pos();
+                if self.indent.has_pending_dedents() {
+                    self.indent.consume_dedent();
+                    return Some(self.make_token(TokenKind::Dedent));
                 }
             }
-
-            // Check for EOF
-            if self.cursor.is_eof() {
-                return None;
+            Ok(None) => {
+                // Same level, continue
             }
-
-            // Process the indentation level
-            match self.indent.process_indent(indent) {
-                Ok(Some(true)) => {
-                    // INDENT
-                    self.token_start = self.cursor.pos();
-                    return Some(self.make_token(TokenKind::Indent));
-                }
-                Ok(Some(false)) => {
-                    // DEDENT(s) - will be handled by pending_dedents
-                    self.token_start = self.cursor.pos();
-                    if self.indent.has_pending_dedents() {
-                        self.indent.consume_dedent();
-                        return Some(self.make_token(TokenKind::Dedent));
-                    }
-                }
-                Ok(None) => {
-                    // Same level, continue
-                }
-                Err(msg) => {
-                    self.token_start = self.cursor.pos();
-                    return Some(self.make_token(TokenKind::Error(msg.to_string())));
-                }
+            Err(msg) => {
+                self.token_start = self.cursor.pos();
+                return Some(self.make_token(TokenKind::Error(msg.to_string())));
             }
-
-            break;
         }
 
         None

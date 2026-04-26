@@ -1153,9 +1153,9 @@ mod tests {
 
     #[test]
     fn test_float() {
-        let expr = parse("3.14");
+        let expr = parse("3.125");
         if let ExprKind::Float(f) = expr.kind {
-            assert!((f - 3.14).abs() < 0.001);
+            assert!((f - 3.125).abs() < 0.001);
         } else {
             panic!("expected Float, got {:?}", expr.kind);
         }

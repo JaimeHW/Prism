@@ -439,7 +439,7 @@ mod tests {
     fn test_clone_preserves_types() {
         let mut source = Graph::new();
         let int_const = source.const_int(42);
-        let float_const = source.const_float(3.14);
+        let float_const = source.const_float(3.125);
 
         let int_type = source.node(int_const).ty;
         let float_type = source.node(float_const).ty;

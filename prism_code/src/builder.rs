@@ -2161,7 +2161,7 @@ mod tests {
 
         let int_idx = builder.add_int(42);
         let str_idx = builder.add_string("hello");
-        let float_idx = builder.add_float(3.14);
+        let float_idx = builder.add_float(3.125);
         let str_idx2 = builder.add_string("world");
 
         // All should have unique indices

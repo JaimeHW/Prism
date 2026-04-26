@@ -481,18 +481,18 @@ pub struct PatchStats {
 /// Returns the 5-byte encoding of `jmp rel32`.
 #[inline]
 pub fn encode_jmp_rel32(from: *const u8, to: *const u8) -> Option<[u8; 5]> {
-    // SAFETY: Pointer arithmetic is safe for offset calculation
-    let next_ip = unsafe { from.add(5) } as isize;
-    let target = to as isize;
+    let next_ip = (from as usize).checked_add(5)? as i128;
+    let target = to as usize as i128;
     let offset = target - next_ip;
 
-    if offset > i32::MAX as isize || offset < i32::MIN as isize {
+    if offset > i128::from(i32::MAX) || offset < i128::from(i32::MIN) {
         return None;
     }
 
+    let offset = i32::try_from(offset).ok()?;
     let mut bytes = [0u8; 5];
     bytes[0] = JMP_REL32_OPCODE;
-    let offset_bytes = (offset as i32).to_le_bytes();
+    let offset_bytes = offset.to_le_bytes();
     bytes[1..5].copy_from_slice(&offset_bytes);
 
     Some(bytes)

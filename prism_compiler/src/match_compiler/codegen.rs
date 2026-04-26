@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn test_load_literal_float() {
         let mut builder = FunctionBuilder::new("test");
-        let reg = load_literal_value(&mut builder, &LiteralValue::Float(3.14)).unwrap();
+        let reg = load_literal_value(&mut builder, &LiteralValue::Float(3.125)).unwrap();
 
         let code = builder.finish();
         assert_eq!(code.instructions.len(), 1);
