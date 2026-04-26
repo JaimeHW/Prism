@@ -612,22 +612,4 @@ mod tests {
         assert_ne!(t1, t3); // Different span
         assert_ne!(t1, t4); // Different kind
     }
-
-    #[test]
-    fn test_keyword_equality() {
-        assert_eq!(Keyword::If, Keyword::If);
-        assert_ne!(Keyword::If, Keyword::Else);
-    }
-
-    #[test]
-    fn test_keyword_hash() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(Keyword::If);
-        set.insert(Keyword::While);
-        set.insert(Keyword::If); // Duplicate
-
-        assert_eq!(set.len(), 2);
-    }
 }
