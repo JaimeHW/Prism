@@ -9,10 +9,10 @@ use crate::types::dict::DictObject;
 use prism_code::CodeObject;
 use prism_core::Value;
 use prism_core::intern::InternedString;
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 // =============================================================================
 // Closure Environment
@@ -427,31 +427,31 @@ impl FunctionObject {
     /// Get a custom function attribute.
     #[inline]
     pub fn get_attr(&self, name: &InternedString) -> Option<Value> {
-        self.attrs.read().unwrap().get(name)
+        self.attrs.read().get(name)
     }
 
     /// Set a custom function attribute.
     #[inline]
     pub fn set_attr(&self, name: InternedString, value: Value) {
-        self.attrs.write().unwrap().set(name, value);
+        self.attrs.write().set(name, value);
     }
 
     /// Delete a custom function attribute.
     #[inline]
     pub fn del_attr(&self, name: &InternedString) -> Option<Value> {
-        self.attrs.write().unwrap().remove(name)
+        self.attrs.write().remove(name)
     }
 
     /// Check whether a custom function attribute exists.
     #[inline]
     pub fn has_attr(&self, name: &InternedString) -> bool {
-        self.attrs.read().unwrap().contains(name)
+        self.attrs.read().contains(name)
     }
 
     /// Return the live function attribute dictionary if it has been materialized.
     #[inline]
     pub fn attr_dict_ptr(&self) -> Option<*mut DictObject> {
-        self.attrs.read().unwrap().dict_ptr()
+        self.attrs.read().dict_ptr()
     }
 
     /// Materialize and return the live function attribute dictionary.
@@ -459,7 +459,7 @@ impl FunctionObject {
     where
         F: FnOnce(DictObject) -> Result<*mut DictObject, E>,
     {
-        self.attrs.write().unwrap().materialize_dict(alloc)
+        self.attrs.write().materialize_dict(alloc)
     }
 
     /// Visit each custom function attribute value.
@@ -467,13 +467,13 @@ impl FunctionObject {
     where
         F: FnMut(Value),
     {
-        self.attrs.read().unwrap().for_each_value(|value| f(value));
+        self.attrs.read().for_each_value(|value| f(value));
     }
 
     /// Number of custom function attributes.
     #[inline]
     pub fn attr_len(&self) -> usize {
-        self.attrs.read().unwrap().len()
+        self.attrs.read().len()
     }
 
     /// Update the function's module globals pointer.

@@ -37,9 +37,11 @@ use prism_core::Value;
 /// Number of bits in inline storage (covers all built-in types).
 const INLINE_BITS: usize = 64;
 
-/// Number of u64 words in overflow storage.
-/// Supports up to 64 * 16 = 1024 type IDs without reallocation.
-const OVERFLOW_WORDS: usize = 16;
+/// Initial number of u64 words in overflow storage.
+///
+/// This covers type ids 64..1088 without reallocation while still allowing the
+/// bitmap to grow for long-lived processes that create many heap types.
+const INITIAL_OVERFLOW_WORDS: usize = 16;
 
 /// Compact bitmap for O(1) subclass testing.
 ///
@@ -51,7 +53,7 @@ const OVERFLOW_WORDS: usize = 16;
 /// ```text
 /// SubclassBitmap (24 bytes typical)
 /// ├── inline: u64 (8 bytes) - bits 0-63 (built-in types)
-/// └── overflow: Option<Box<[u64; 16]>> (16 bytes)
+/// └── overflow: Option<Box<[u64]>> (16 bytes)
 /// ```
 ///
 /// # Algorithm
@@ -68,8 +70,8 @@ pub struct SubclassBitmap {
     inline: u64,
 
     /// Overflow storage for user-defined types (TypeId >= 64).
-    /// Lazily allocated only when needed.
-    overflow: Option<Box<[u64; OVERFLOW_WORDS]>>,
+    /// Lazily allocated and grown only when needed.
+    overflow: Option<Box<[u64]>>,
 }
 
 impl SubclassBitmap {
@@ -159,9 +161,7 @@ impl SubclassBitmap {
 
         // Merge overflow bits if present
         if let Some(ref other_overflow) = other.overflow {
-            let overflow = self
-                .overflow
-                .get_or_insert_with(|| Box::new([0u64; OVERFLOW_WORDS]));
+            let overflow = self.ensure_overflow_words(other_overflow.len());
             for (dst, src) in overflow.iter_mut().zip(other_overflow.iter()) {
                 *dst |= *src;
             }
@@ -175,13 +175,12 @@ impl SubclassBitmap {
         let word_idx = overflow_bit / 64;
         let bit_idx = overflow_bit % 64;
 
-        if word_idx >= OVERFLOW_WORDS {
-            return false;
-        }
-
         match &self.overflow {
-            Some(overflow) => (overflow[word_idx] & (1u64 << bit_idx)) != 0,
+            Some(overflow) if word_idx < overflow.len() => {
+                (overflow[word_idx] & (1u64 << bit_idx)) != 0
+            }
             None => false,
+            Some(_) => false,
         }
     }
 
@@ -192,16 +191,28 @@ impl SubclassBitmap {
         let word_idx = overflow_bit / 64;
         let bit_idx = overflow_bit % 64;
 
-        if word_idx >= OVERFLOW_WORDS {
-            // Type ID too large - would need dynamic growth
-            // This is extremely rare (>1024 types in hierarchy)
-            return;
+        let overflow = self.ensure_overflow_words(word_idx + 1);
+        overflow[word_idx] |= 1u64 << bit_idx;
+    }
+
+    #[cold]
+    fn ensure_overflow_words(&mut self, min_words: usize) -> &mut [u64] {
+        debug_assert!(min_words > 0);
+
+        let needs_grow = self
+            .overflow
+            .as_ref()
+            .map_or(true, |overflow| overflow.len() < min_words);
+        if needs_grow {
+            let new_len = min_words.next_power_of_two().max(INITIAL_OVERFLOW_WORDS);
+            let mut new_overflow = vec![0u64; new_len].into_boxed_slice();
+            if let Some(old_overflow) = self.overflow.take() {
+                new_overflow[..old_overflow.len()].copy_from_slice(&old_overflow);
+            }
+            self.overflow = Some(new_overflow);
         }
 
-        let overflow = self
-            .overflow
-            .get_or_insert_with(|| Box::new([0u64; OVERFLOW_WORDS]));
-        overflow[word_idx] |= 1u64 << bit_idx;
+        self.overflow.as_deref_mut().expect("overflow allocated")
     }
 
     /// Get the number of bits set (for debugging).
@@ -1209,6 +1220,20 @@ mod tests {
     }
 
     #[test]
+    fn test_bitmap_grows_for_high_heap_type_ids() {
+        let mut bitmap = SubclassBitmap::new();
+        let parent = TypeId::from_raw(1_500);
+        let child = TypeId::from_raw(4_096);
+
+        bitmap.set_bit(parent);
+        bitmap.set_bit(child);
+
+        assert!(bitmap.is_subclass_of(parent));
+        assert!(bitmap.is_subclass_of(child));
+        assert!(!bitmap.is_subclass_of(TypeId::from_raw(4_095)));
+    }
+
+    #[test]
     fn test_bitmap_merge() {
         let mut parent1 = SubclassBitmap::new();
         parent1.set_bit(TypeId::INT);
@@ -1228,6 +1253,24 @@ mod tests {
         assert!(child.is_subclass_of(TypeId::STR));
         assert!(child.is_subclass_of(TypeId::OBJECT));
         assert!(child.is_subclass_of(TypeId::from_raw(300)));
+    }
+
+    #[test]
+    fn test_bitmap_merge_preserves_high_heap_type_ids() {
+        let high_parent_type = TypeId::from_raw(2_048);
+        let high_child_type = TypeId::from_raw(4_096);
+
+        let mut parent = SubclassBitmap::new();
+        parent.set_bit(high_parent_type);
+        parent.set_bit(TypeId::OBJECT);
+
+        let mut child = SubclassBitmap::new();
+        child.set_bit(high_child_type);
+        child.merge(&parent);
+
+        assert!(child.is_subclass_of(high_child_type));
+        assert!(child.is_subclass_of(high_parent_type));
+        assert!(child.is_subclass_of(TypeId::OBJECT));
     }
 
     #[test]
