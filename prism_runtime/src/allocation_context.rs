@@ -71,6 +71,28 @@ pub fn alloc_value_in_current_heap<T: Trace>(value: T) -> Option<Value> {
     })
 }
 
+/// Allocate a traceable object in the bound VM heap when possible, otherwise
+/// fall back to a stable boxed pointer for standalone runtime helpers.
+#[inline]
+pub fn alloc_value_in_current_heap_or_box<T: Trace>(value: T) -> Value {
+    let heap = CURRENT_HEAP_BINDINGS.with(|bindings| bindings.borrow().last().copied());
+    if let Some(heap) = heap {
+        let heap = unsafe { &*heap.heap };
+        let layout = Layout::new::<T>();
+        let size = layout.size().max(8);
+        if let Some(ptr) = heap.alloc(size) {
+            let typed_ptr = ptr.as_ptr() as *mut T;
+            unsafe {
+                std::ptr::write(typed_ptr, value);
+            }
+            return Value::object_ptr(typed_ptr as *const ());
+        }
+    }
+
+    let ptr = Box::into_raw(Box::new(value)) as *const ();
+    Value::object_ptr(ptr)
+}
+
 #[inline]
 fn alloc_value_in_heap<T: Trace>(heap: &GcHeap, value: T) -> Option<Value> {
     let layout = Layout::new::<T>();
@@ -94,4 +116,23 @@ pub fn has_current_heap_binding() -> bool {
 #[cfg(test)]
 pub fn current_heap_binding_depth() -> usize {
     CURRENT_HEAP_BINDINGS.with(|bindings| bindings.borrow().len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::dict::DictObject;
+
+    #[test]
+    fn alloc_value_in_current_heap_or_box_uses_bound_heap() {
+        let heap = GcHeap::with_defaults();
+        let _binding = RuntimeHeapBinding::register(&heap);
+
+        let value = alloc_value_in_current_heap_or_box(DictObject::new());
+        let ptr = value
+            .as_object_ptr()
+            .expect("allocated value should be an object pointer");
+
+        assert!(heap.contains(ptr));
+    }
 }

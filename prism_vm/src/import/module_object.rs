@@ -5,6 +5,7 @@
 
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
@@ -347,7 +348,7 @@ impl ModuleObject {
         for (name, value) in attrs.iter() {
             dict.set(Value::string(name.clone()), *value);
         }
-        let value = Value::object_ptr(Box::into_raw(Box::new(dict)) as *const ());
+        let value = alloc_value_in_current_heap_or_box(dict);
         *dict_slot = Some(value);
         value
     }
@@ -474,9 +475,9 @@ fn package_search_path_value(
     let file = file?;
     let package_dir = Path::new(file.as_ref()).parent()?.to_str()?;
     let entries = [Value::string(intern(package_dir))];
-    Some(Value::object_ptr(
-        Box::into_raw(Box::new(ListObject::from_slice(&entries))) as *const (),
-    ))
+    Some(alloc_value_in_current_heap_or_box(ListObject::from_slice(
+        &entries,
+    )))
 }
 
 // =============================================================================
@@ -486,6 +487,8 @@ fn package_search_path_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_gc::heap::GcHeap;
+    use prism_runtime::allocation_context::RuntimeHeapBinding;
 
     #[test]
     fn test_module_new() {
@@ -507,6 +510,21 @@ mod tests {
         assert!(module.has_attr("foo"));
         let val = module.get_attr("foo").unwrap();
         assert_eq!(val.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_module_dict_value_uses_bound_runtime_heap() {
+        let heap = GcHeap::with_defaults();
+        let _binding = RuntimeHeapBinding::register(&heap);
+        let module = ModuleObject::new("test");
+        module.set_attr("foo", Value::int(42).unwrap());
+
+        let value = module.dict_value();
+        let ptr = value
+            .as_object_ptr()
+            .expect("module __dict__ should be an object pointer");
+
+        assert!(heap.contains(ptr));
     }
 
     #[test]
