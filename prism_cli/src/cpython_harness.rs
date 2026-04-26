@@ -671,13 +671,26 @@ fn configure_child_environment(command: &mut Command, search_root: &Path) {
             command.env_remove(name);
         }
     }
-    command.env("PYTHONPATH", search_root);
+    command.env("PYTHONPATH", harness_python_path(search_root));
     command.env("PYTHONDONTWRITEBYTECODE", "1");
     command.env("PYTHONUNBUFFERED", "1");
 }
 
 fn is_python_env_var(name: &OsString) -> bool {
     name.to_string_lossy().starts_with("PYTHON")
+}
+
+fn harness_python_path(search_root: &Path) -> OsString {
+    let mut paths = vec![search_root.to_path_buf()];
+    if let Some(stdlib_path) = source_stdlib_path() {
+        paths.push(stdlib_path);
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| search_root.as_os_str().to_os_string())
+}
+
+fn source_stdlib_path() -> Option<PathBuf> {
+    let path = PathBuf::from(prism_stdlib::source_stdlib_path());
+    path.is_dir().then_some(path)
 }
 
 fn resolve_test_layout(args: &CliArgs) -> Result<TestLayout, HarnessError> {

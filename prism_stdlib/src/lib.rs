@@ -16,6 +16,16 @@ pub enum StdlibResolutionPolicy {
     PreferSourceWhenAvailable,
 }
 
+/// Absolute path to Prism's source-backed Python stdlib modules in this checkout.
+///
+/// Native modules remain the preferred implementation for hot runtime paths.
+/// This directory is for compatibility modules whose performance is irrelevant
+/// to user code startup or steady-state execution, such as test infrastructure.
+#[inline]
+pub fn source_stdlib_path() -> &'static str {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/python")
+}
+
 const COMMON_BUILTIN_MODULE_NAMES: &[&str] = &[
     "_abc",
     "_ast",
@@ -150,12 +160,48 @@ pub fn is_builtin_module_name(name: &str) -> bool {
 /// Returns the native stdlib resolution policy for a module, if Prism ships one.
 pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
     match name {
-        "builtins" | "_abc" | "_ast" | "_codecs" | "_contextvars" | "_functools" | "_imp"
-        | "_random" | "_sha2" | "_socket" | "_ssl" | "_sre" | "_io" | "_string" | "_struct"
-        | "_thread" | "_tokenize" | "_tracemalloc" | "_warnings" | "_weakref"
-        | "array" | "atexit" | "math" | "errno" | "gc" | "sys" | "time" | "typing" | "signal"
-        | "select" | "weakref" | "collections" | "ctypes" | "fnmatch" | "inspect" | "itertools"
-        | "io" | "marshal" | "binascii" => Some(StdlibResolutionPolicy::PreferNative),
+        "builtins"
+        | "_abc"
+        | "_ast"
+        | "_codecs"
+        | "_contextvars"
+        | "_functools"
+        | "_imp"
+        | "_random"
+        | "_sha2"
+        | "_socket"
+        | "_ssl"
+        | "_sre"
+        | "_io"
+        | "_string"
+        | "_struct"
+        | "_thread"
+        | "_tokenize"
+        | "_tracemalloc"
+        | "_warnings"
+        | "_weakref"
+        | "array"
+        | "atexit"
+        | "math"
+        | "errno"
+        | "gc"
+        | "sys"
+        | "time"
+        | "typing"
+        | "signal"
+        | "select"
+        | "weakref"
+        | "collections"
+        | "ctypes"
+        | "fnmatch"
+        | "inspect"
+        | "itertools"
+        | "io"
+        | "marshal"
+        | "binascii"
+        | "keyword"
+        | "test.support"
+        | "test.support.os_helper" => Some(StdlibResolutionPolicy::PreferNative),
         "os" | "os.path" | "json" | "functools" | "re" => {
             Some(StdlibResolutionPolicy::PreferSourceWhenAvailable)
         }

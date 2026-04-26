@@ -320,11 +320,17 @@ fn module_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd);
+        push_unique_path(&mut paths, cwd);
     }
 
     if let Some(pythonpath) = std::env::var_os("PYTHONPATH") {
-        paths.extend(std::env::split_paths(&pythonpath));
+        for path in std::env::split_paths(&pythonpath) {
+            push_unique_path(&mut paths, path);
+        }
+    }
+
+    if let Some(stdlib_path) = source_stdlib_path() {
+        push_unique_path(&mut paths, stdlib_path);
     }
 
     paths
@@ -341,6 +347,17 @@ fn script_search_paths(path: &Path) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn source_stdlib_path() -> Option<PathBuf> {
+    let path = PathBuf::from(prism_stdlib::source_stdlib_path());
+    path.is_dir().then_some(path)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| existing == &candidate) {
+        paths.push(candidate);
+    }
 }
 
 fn resolve_module_path_in_search_paths(module: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {

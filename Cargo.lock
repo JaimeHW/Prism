@@ -553,6 +553,7 @@ dependencies = [
  "prism_aot",
  "prism_compiler",
  "prism_core",
+ "prism_stdlib",
  "prism_vm",
  "serde",
  "serde_json",

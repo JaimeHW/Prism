@@ -48,6 +48,7 @@ pub mod inspect;
 pub mod io;
 pub mod itertools;
 pub mod json;
+pub mod keyword;
 pub mod marshal;
 pub mod math;
 pub mod msvcrt;
@@ -59,6 +60,7 @@ pub(crate) mod secure_random;
 pub mod select;
 pub mod signal;
 pub mod sys;
+pub mod test_support;
 pub mod time;
 pub mod typing;
 pub mod weakref;
@@ -420,6 +422,23 @@ impl StdlibRegistry {
             &mut modules,
             "itertools",
             Box::new(itertools::ItertoolsModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "keyword",
+            Box::new(keyword::KeywordModule::new()),
+        );
+
+        Self::insert_module(
+            &mut modules,
+            "test.support",
+            Box::new(test_support::SupportModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "test.support.os_helper",
+            Box::new(test_support::OsHelperModule::new()),
         );
 
         Self::insert_module(&mut modules, "io", Box::new(io::IoModule::new()));
