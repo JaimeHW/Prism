@@ -340,7 +340,7 @@ mod tests {
                 .expect("pattern attribute lookup should succeed")
                 .expect("flags attribute should exist")
                 .as_int(),
-            Some(RegexFlags::IGNORECASE as i64)
+            Some((RegexFlags::IGNORECASE | RegexFlags::UNICODE) as i64)
         );
 
         let matched = builtin_pattern_match(&mut vm, &[pattern, Value::string(intern("HELLO"))])

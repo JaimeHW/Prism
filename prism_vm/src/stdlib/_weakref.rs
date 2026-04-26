@@ -17,7 +17,8 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
-    SubclassBitmap, global_class_bitmap, global_class_registry, register_global_class, type_new,
+    SubclassBitmap, global_class, global_class_bitmap, global_class_registry,
+    register_global_class, type_new,
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{
@@ -211,7 +212,7 @@ fn expect_object_arg(args: &[Value], fn_name: &str) -> Result<Value, BuiltinErro
         )));
     }
 
-    if args[0].as_object_ptr().is_none() && !args[0].is_string() {
+    if aligned_object_ptr(args[0]).is_none() && !args[0].is_string() {
         return Err(BuiltinError::TypeError(format!(
             "{fn_name}() argument 1 must be an object"
         )));
@@ -242,8 +243,15 @@ pub(crate) fn builtin_getweakrefs(args: &[Value]) -> Result<Value, BuiltinError>
     Ok(leak_object_value(ListObject::new()))
 }
 
+#[inline]
+fn aligned_object_ptr(value: Value) -> Option<*const ()> {
+    let ptr = value.as_object_ptr()?;
+    let addr = ptr as usize;
+    (addr != 0 && addr % std::mem::align_of::<ObjectHeader>() == 0).then_some(ptr)
+}
+
 fn reference_self(args: &[Value], fn_name: &str) -> Result<*mut ShapedObject, BuiltinError> {
-    let Some(self_ptr) = args.first().and_then(|value| value.as_object_ptr()) else {
+    let Some(self_ptr) = args.first().copied().and_then(aligned_object_ptr) else {
         return Err(BuiltinError::TypeError(format!(
             "{fn_name}() requires a weak reference instance"
         )));
@@ -261,7 +269,7 @@ fn reference_callback_property() -> prism_core::intern::InternedString {
 }
 
 fn register_weakref(reference: Value) {
-    if let Some(ptr) = reference.as_object_ptr() {
+    if let Some(ptr) = aligned_object_ptr(reference) {
         let ptr = ptr as usize;
         let mut weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
         if !weakrefs.contains(&ptr) {
@@ -330,7 +338,7 @@ impl ReachabilityMarker {
 
     #[inline]
     fn push(&mut self, value: Value) {
-        if value.as_object_ptr().is_some() {
+        if aligned_object_ptr(value).is_some() {
             self.stack.push(value);
         }
     }
@@ -342,7 +350,7 @@ impl ReachabilityMarker {
     }
 
     fn mark_value(&mut self, value: Value) {
-        let Some(ptr) = value.as_object_ptr() else {
+        let Some(ptr) = aligned_object_ptr(value) else {
             return;
         };
         let ptr_key = ptr as usize;
@@ -574,8 +582,11 @@ impl ReachabilityMarker {
 
 #[inline]
 fn is_shaped_object(value: Value, type_id: TypeId) -> bool {
-    type_id.raw() >= TypeId::FIRST_USER_TYPE
-        || (type_id == TypeId::OBJECT && super::_thread::is_native_thread_object(value))
+    if type_id == TypeId::OBJECT {
+        return super::_thread::is_native_thread_object(value);
+    }
+
+    type_id.raw() >= TypeId::FIRST_USER_TYPE && global_class(ClassId(type_id.raw())).is_some()
 }
 
 fn is_reference_type_id(type_id: TypeId) -> bool {
@@ -861,6 +872,42 @@ mod tests {
         };
 
         assert_eq!(module_name, "_weakref");
+    }
+
+    #[test]
+    fn test_reachability_marker_ignores_misaligned_object_payload() {
+        let mut marker = ReachabilityMarker::new();
+        marker.push(Value::object_ptr(0x7usize as *const ()));
+        marker.drain();
+
+        assert!(marker.reachable.is_empty());
+    }
+
+    #[test]
+    fn test_unregistered_user_type_does_not_trace_as_shaped_object() {
+        #[repr(C)]
+        struct UnknownHeapObject {
+            header: ObjectHeader,
+        }
+
+        let type_id = TypeId::from_raw(TypeId::FIRST_USER_TYPE + 10_000);
+        let object = Box::new(UnknownHeapObject {
+            header: ObjectHeader::new(type_id),
+        });
+        let ptr = Box::into_raw(object);
+        let value = Value::object_ptr(ptr as *const ());
+
+        assert!(!is_shaped_object(value, type_id));
+
+        let mut marker = ReachabilityMarker::new();
+        marker.push(value);
+        marker.drain();
+
+        assert!(marker.reachable.contains(&(ptr as usize)));
+
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
     }
 
     #[test]

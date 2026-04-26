@@ -18,6 +18,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::{ObjectHeader, PyObject};
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::value_to_i64;
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::StringObject;
@@ -1350,12 +1351,23 @@ fn compile_pattern_object(
     }
 
     match parse_text_or_bytes(pattern, "pattern")? {
-        SubjectValue::Text(pattern) => CompiledPattern::compile(&pattern, flags)
-            .map(|pattern| RegexPatternObject::new(RegexPatternKind::Text(pattern)))
-            .map_err(regex_error_to_builtin_error),
+        SubjectValue::Text(pattern) => {
+            CompiledPattern::compile(&pattern, normalize_text_flags(flags))
+                .map(|pattern| RegexPatternObject::new(RegexPatternKind::Text(pattern)))
+                .map_err(regex_error_to_builtin_error)
+        }
         SubjectValue::Bytes(pattern) => CompiledBytesPattern::compile(&pattern, flags)
             .map(|pattern| RegexPatternObject::new(RegexPatternKind::Bytes(pattern)))
             .map_err(regex_error_to_builtin_error),
+    }
+}
+
+#[inline]
+fn normalize_text_flags(flags: RegexFlags) -> RegexFlags {
+    if flags.contains(RegexFlags::ASCII) || flags.contains(RegexFlags::LOCALE) {
+        flags
+    } else {
+        RegexFlags::new(flags.bits() | RegexFlags::UNICODE)
     }
 }
 
@@ -1443,16 +1455,19 @@ fn parse_flags(value: Option<Value>) -> Result<RegexFlags, BuiltinError> {
     }
 
     let raw = value
-        .as_int()
-        .or_else(|| value.as_bool().map(|flag| if flag { 1 } else { 0 }))
+        .as_bool()
+        .map(|flag| if flag { 1 } else { 0 })
+        .or_else(|| value_to_i64(value))
         .ok_or_else(|| BuiltinError::TypeError("flags must be an integer".to_string()))?;
     if raw < 0 {
         return Err(BuiltinError::ValueError(
             "flags must be a non-negative integer".to_string(),
         ));
     }
+    let raw = u32::try_from(raw)
+        .map_err(|_| BuiltinError::OverflowError("flags are too large".to_string()))?;
 
-    Ok(RegexFlags::new(raw as u32))
+    Ok(RegexFlags::new(raw))
 }
 
 fn parse_group_selector(value: Option<Value>) -> Result<GroupSelector, BuiltinError> {
@@ -2309,6 +2324,14 @@ mod tests {
         unsafe { &*(ptr as *const DictObject) }.iter().collect()
     }
 
+    fn pattern_flags(vm: &mut VirtualMachine, pattern: Value) -> i64 {
+        pattern_attr_value(vm, pattern, &intern("flags"))
+            .expect("pattern attribute lookup should succeed")
+            .expect("flags attribute should exist")
+            .as_int()
+            .expect("flags should be returned as a small int")
+    }
+
     fn exhaust_nursery(vm: &VirtualMachine) {
         while vm.allocator().alloc(DictObject::new()).is_some() {}
     }
@@ -2345,6 +2368,68 @@ mod tests {
                 .expect("pattern.search should succeed");
         let group = builtin_match_group(&mut vm, &[searched]).expect("group() should succeed");
         assert_eq!(string_value(group), "123");
+    }
+
+    #[test]
+    fn test_compile_string_pattern_exposes_default_unicode_flag() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(&mut vm, &[Value::string(intern(r"\w+"))])
+            .expect("compile should succeed");
+
+        assert_eq!(pattern_flags(&mut vm, pattern), RegexFlags::UNICODE as i64);
+    }
+
+    #[test]
+    fn test_compile_string_pattern_ascii_flag_suppresses_default_unicode() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(
+            &mut vm,
+            &[
+                Value::string(intern(r"\w+")),
+                Value::int(RegexFlags::ASCII as i64).unwrap(),
+            ],
+        )
+        .expect("compile should succeed");
+
+        assert_eq!(pattern_flags(&mut vm, pattern), RegexFlags::ASCII as i64);
+    }
+
+    #[test]
+    fn test_compile_bytes_pattern_does_not_add_unicode_flag() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(&mut vm, &[bytes_object_value(br"\w+")])
+            .expect("bytes compile should succeed");
+
+        assert_eq!(pattern_flags(&mut vm, pattern), 0);
+    }
+
+    #[test]
+    fn test_parse_flags_accepts_int_backed_heap_values() {
+        let raw = RegexFlags::IGNORECASE | RegexFlags::MULTILINE;
+        let object = prism_runtime::object::shaped_object::ShapedObject::new_int_backed(
+            TypeId::from_raw(TypeId::FIRST_USER_TYPE),
+            prism_runtime::object::shape::Shape::empty(),
+            num_bigint::BigInt::from(raw),
+        );
+        let ptr = Box::into_raw(Box::new(object));
+        let value = Value::object_ptr(ptr as *const ());
+
+        let flags = parse_flags(Some(value)).expect("int-backed flags should parse");
+        unsafe { drop(Box::from_raw(ptr)) };
+
+        assert_eq!(flags.bits(), raw);
+    }
+
+    #[test]
+    fn test_parse_flags_rejects_values_larger_than_sre_flags() {
+        let value = prism_runtime::types::int::bigint_to_value(num_bigint::BigInt::from(
+            u64::from(u32::MAX) + 1,
+        ));
+
+        assert!(matches!(
+            parse_flags(Some(value)),
+            Err(BuiltinError::OverflowError(_))
+        ));
     }
 
     #[test]
