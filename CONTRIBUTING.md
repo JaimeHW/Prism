@@ -30,9 +30,9 @@ cargo test-fast
 ```
 
 Formatting is configured in `rustfmt.toml`, but the repository still needs a
-single mechanical formatting baseline before formatting can be required in CI.
+single mechanical formatting baseline before formatting should be required.
 Strict clippy is useful for cleanup work, but it is not yet part of the default
-PR gate because the current VM baseline still contains legacy lint blockers.
+required check because the current VM baseline still contains legacy lint blockers.
 
 For focused work, also run the smallest relevant test package first. For example:
 

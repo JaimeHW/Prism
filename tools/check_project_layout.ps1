@@ -3,7 +3,6 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 
 $requiredFiles = @(
-    ".github/workflows/ci.yml",
     ".cargo/config.toml",
     "CONTRIBUTING.md",
     "docs/ARCHITECTURE.md",

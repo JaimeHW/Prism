@@ -33,7 +33,7 @@ cargo test-fast
 
 `rustfmt.toml` is checked in so the project has a single formatting contract.
 The current codebase still needs a dedicated mechanical formatting baseline
-before `cargo fmt --all -- --check` can become a required CI gate.
+before `cargo fmt --all -- --check` should become a required check.
 
 Strict clippy is an audit lane until the existing VM baseline is cleaned up.
 Run `cargo clippy --workspace --all-targets --no-deps` before large refactors
@@ -84,16 +84,16 @@ Performance changes should include either:
 Do not use wall-clock timing assertions in normal tests. Use benchmarks for
 timing and tests for semantics.
 
-## CI Contract
+## Verification Contract
 
-CI runs repository-layout checks, workspace checks, and fast tests on Linux and
-Windows. Linux catches common Unix behavior; Windows is required because Prism
-exposes Windows-specific stdlib modules and object-file flows.
+Run repository-layout checks, workspace checks, and fast tests locally before
+merging broad changes. Linux catches common Unix behavior; Windows is required
+because Prism exposes Windows-specific stdlib modules and object-file flows.
 
-CI is a floor, not a full release gate. Release candidates should also run
+Fast local checks are a floor, not a full release gate. Release candidates should also run
 compatibility suites and representative benchmarks.
 
 Use `cargo test --workspace --all-targets` before release candidates. Some
 CPython compatibility tests require a local CPython checkout and can be much
 slower than unit tests; keep those in the compatibility lane rather than the
-fast CI lane.
+fast local lane.

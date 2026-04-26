@@ -192,7 +192,7 @@ cargo bench --workspace
   policy, and current refactor targets
 - [Performance Engineering](docs/PERFORMANCE.md) - hot-path, allocation, JIT,
   GC, and benchmarking standards
-- [Testing Strategy](docs/TESTING.md) - local checks, CI contract, compatibility
+- [Testing Strategy](docs/TESTING.md) - local checks, release checks, compatibility
   tests, and benchmark expectations
 - [Unsafe Code Policy](docs/UNSAFE.md) - required invariants for GC, value
   representation, JIT, and platform code
