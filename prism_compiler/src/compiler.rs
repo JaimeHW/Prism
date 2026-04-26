@@ -5126,7 +5126,13 @@ impl Compiler {
         self.finally_stack = parent_finally_stack;
         let comp_builder = std::mem::replace(&mut self.builder, parent_builder);
         let comp_code = comp_builder.finish();
-        self.emit_comprehension_call(comp_code, captures_freevars, &generators[0].iter, dst)
+        self.emit_comprehension_call(
+            comp_code,
+            captures_freevars,
+            &generators[0].iter,
+            generators[0].is_async,
+            dst,
+        )
     }
 
     fn compile_sequence_comprehension(
@@ -5182,7 +5188,13 @@ impl Compiler {
         self.finally_stack = parent_finally_stack;
         let comp_builder = std::mem::replace(&mut self.builder, parent_builder);
         let comp_code = comp_builder.finish();
-        self.emit_comprehension_call(comp_code, captures_freevars, &generators[0].iter, dst)
+        self.emit_comprehension_call(
+            comp_code,
+            captures_freevars,
+            &generators[0].iter,
+            generators[0].is_async,
+            dst,
+        )
     }
 
     fn comprehension_scope_layout(
@@ -5232,6 +5244,7 @@ impl Compiler {
         comp_code: CodeObject,
         captures_freevars: bool,
         first_iter_expr: &Expr,
+        first_iter_is_async: bool,
         dst: Register,
     ) -> CompileResult<Register> {
         let code_idx = self.builder.add_code_object(Arc::new(comp_code));
@@ -5256,7 +5269,19 @@ impl Compiler {
 
         let first_iter = self.compile_expr(first_iter_expr)?;
         let arg_reg = Register::new(call_block.0 + 1);
-        self.builder.emit_get_iter(arg_reg, first_iter);
+        if first_iter_is_async {
+            if !self.in_async_context {
+                return Err(CompileError {
+                    message: "asynchronous comprehension outside of an async function".to_string(),
+                    line: 0,
+                    column: 0,
+                });
+            }
+            self.builder
+                .emit(Instruction::op_ds(Opcode::GetAIter, arg_reg, first_iter));
+        } else {
+            self.builder.emit_get_iter(arg_reg, first_iter);
+        }
         self.builder.free_register(first_iter);
 
         self.builder.emit_call(call_block, func_reg, 1);
@@ -5378,7 +5403,19 @@ impl Compiler {
         // Compile first iterator and pass it in the dedicated arg slot.
         let first_iter = self.compile_expr(&generators[0].iter)?;
         let arg_reg = Register::new(call_block.0 + 1);
-        self.builder.emit_get_iter(arg_reg, first_iter);
+        if generators[0].is_async {
+            if !self.in_async_context {
+                return Err(CompileError {
+                    message: "asynchronous comprehension outside of an async function".to_string(),
+                    line: 0,
+                    column: 0,
+                });
+            }
+            self.builder
+                .emit(Instruction::op_ds(Opcode::GetAIter, arg_reg, first_iter));
+        } else {
+            self.builder.emit_get_iter(arg_reg, first_iter);
+        }
         self.builder.free_register(first_iter);
 
         self.builder.emit_call(call_block, func_reg, 1);

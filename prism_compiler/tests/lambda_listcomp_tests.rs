@@ -40,12 +40,9 @@ fn count_opcode_recursive(code: &prism_compiler::CodeObject, target: Opcode) -> 
     total
 }
 
-/// Check if any arithmetic opcode exists
-fn has_arithmetic_opcode(code: &prism_compiler::CodeObject) -> bool {
-    has_opcode(code, Opcode::Add)
-        || has_opcode(code, Opcode::Mul)
-        || has_opcode(code, Opcode::Sub)
-        || has_opcode(code, Opcode::TrueDiv)
+/// Recursively check whether an opcode exists in this code object or nested code.
+fn has_opcode_recursive(code: &prism_compiler::CodeObject, target: Opcode) -> bool {
+    count_opcode_recursive(code, target) > 0
 }
 
 /// Check if any comparison opcode exists
@@ -309,7 +306,7 @@ mod listcomp_tests {
     fn test_listcomp_creates_list() {
         let code = compile_source("result = [x for x in items]");
         assert!(
-            has_opcode(&code, Opcode::BuildList),
+            has_opcode_recursive(&code, Opcode::BuildList),
             "List comprehension should build a list"
         );
     }
@@ -318,7 +315,7 @@ mod listcomp_tests {
     fn test_listcomp_has_iterator() {
         let code = compile_source("result = [x for x in items]");
         assert!(
-            has_opcode(&code, Opcode::GetIter),
+            has_opcode_recursive(&code, Opcode::GetIter),
             "List comprehension should get iterator"
         );
     }
@@ -327,7 +324,7 @@ mod listcomp_tests {
     fn test_listcomp_has_for_iter() {
         let code = compile_source("result = [x for x in items]");
         assert!(
-            has_opcode(&code, Opcode::ForIter),
+            has_opcode_recursive(&code, Opcode::ForIter),
             "List comprehension should iterate"
         );
     }
@@ -336,7 +333,7 @@ mod listcomp_tests {
     fn test_listcomp_has_list_append() {
         let code = compile_source("result = [x for x in items]");
         assert!(
-            has_opcode(&code, Opcode::ListAppend),
+            has_opcode_recursive(&code, Opcode::ListAppend),
             "List comprehension should append to list"
         );
     }
@@ -345,7 +342,7 @@ mod listcomp_tests {
     fn test_listcomp_with_expression() {
         let code = compile_source("result = [x * 2 for x in items]");
         assert!(
-            has_opcode(&code, Opcode::Mul),
+            has_opcode_recursive(&code, Opcode::Mul),
             "List comp should evaluate expression"
         );
     }
@@ -354,11 +351,11 @@ mod listcomp_tests {
     fn test_listcomp_with_filter() {
         let code = compile_source("result = [x for x in items if x > 0]");
         assert!(
-            has_opcode(&code, Opcode::Gt),
+            has_opcode_recursive(&code, Opcode::Gt),
             "Filtered listcomp should have comparison"
         );
         assert!(
-            has_opcode(&code, Opcode::JumpIfFalse),
+            has_opcode_recursive(&code, Opcode::JumpIfFalse),
             "Filtered listcomp should have conditional jump"
         );
     }
@@ -367,7 +364,8 @@ mod listcomp_tests {
     fn test_listcomp_with_multiple_filters() {
         let code = compile_source("result = [x for x in items if x > 0 if x < 100]");
         // Should have at least two comparisons (Gt and Lt)
-        let has_both = has_opcode(&code, Opcode::Gt) && has_opcode(&code, Opcode::Lt);
+        let has_both =
+            has_opcode_recursive(&code, Opcode::Gt) && has_opcode_recursive(&code, Opcode::Lt);
         assert!(has_both, "Should have multiple comparisons");
     }
 
@@ -376,7 +374,7 @@ mod listcomp_tests {
         let code = compile_source("result = [[y for y in x] for x in matrix]");
         // Should have nested iteration
         assert!(
-            count_opcode(&code, Opcode::GetIter) >= 2,
+            count_opcode_recursive(&code, Opcode::GetIter) >= 2,
             "Nested listcomp should have multiple iterators"
         );
     }
@@ -385,7 +383,7 @@ mod listcomp_tests {
     fn test_listcomp_with_nested_loop() {
         let code = compile_source("result = [x + y for x in a for y in b]");
         assert!(
-            count_opcode(&code, Opcode::GetIter) >= 2,
+            count_opcode_recursive(&code, Opcode::GetIter) >= 2,
             "Multi-loop listcomp should have multiple iterators"
         );
     }
@@ -395,7 +393,7 @@ mod listcomp_tests {
         let code = compile_source("result = [a + b for a, b in pairs]");
         // When we unpack a tuple target, we iterate and store locals
         assert!(
-            has_opcode(&code, Opcode::ForIter),
+            has_opcode_recursive(&code, Opcode::ForIter),
             "Tuple unpacking in listcomp should iterate"
         );
     }
@@ -404,7 +402,8 @@ mod listcomp_tests {
     fn test_listcomp_with_method_call() {
         let code = compile_source("result = [s.upper() for s in strings]");
         assert!(
-            has_opcode(&code, Opcode::LoadMethod) || has_opcode(&code, Opcode::Call),
+            has_opcode_recursive(&code, Opcode::LoadMethod)
+                || has_opcode_recursive(&code, Opcode::Call),
             "ListComp should call methods"
         );
     }
@@ -413,7 +412,9 @@ mod listcomp_tests {
     fn test_listcomp_with_conditional_expression() {
         let code = compile_source("result = [x if x > 0 else 0 for x in nums]");
         assert!(
-            has_comparison_opcode(&code),
+            has_comparison_opcode(&code)
+                || count_opcode_recursive(&code, Opcode::Gt) > 0
+                || count_opcode_recursive(&code, Opcode::Lt) > 0,
             "Conditional expression in listcomp"
         );
     }
@@ -422,7 +423,7 @@ mod listcomp_tests {
     fn test_listcomp_with_function_call() {
         let code = compile_source("result = [func(x) for x in items]");
         assert!(
-            has_opcode(&code, Opcode::Call),
+            has_opcode_recursive(&code, Opcode::Call),
             "ListComp should call functions"
         );
     }
@@ -431,14 +432,14 @@ mod listcomp_tests {
     fn test_empty_listcomp_elements() {
         // This should still compile even if source is empty at runtime
         let code = compile_source("result = [x for x in []]");
-        assert!(has_opcode(&code, Opcode::BuildList));
+        assert!(has_opcode_recursive(&code, Opcode::BuildList));
     }
 
     #[test]
     fn test_listcomp_with_subscript_element() {
         let code = compile_source("result = [d[k] for k in keys]");
         assert!(
-            has_opcode(&code, Opcode::GetItem),
+            has_opcode_recursive(&code, Opcode::GetItem),
             "ListComp element can use subscript"
         );
     }
@@ -447,7 +448,7 @@ mod listcomp_tests {
     fn test_listcomp_with_attribute_element() {
         let code = compile_source("result = [obj.attr for obj in objects]");
         assert!(
-            has_opcode(&code, Opcode::GetAttr),
+            has_opcode_recursive(&code, Opcode::GetAttr),
             "ListComp element can access attributes"
         );
     }
@@ -456,7 +457,7 @@ mod listcomp_tests {
     fn test_listcomp_deeply_nested() {
         let code = compile_source("result = [z for x in a for y in x for z in y]");
         assert!(
-            count_opcode(&code, Opcode::GetIter) >= 3,
+            count_opcode_recursive(&code, Opcode::GetIter) >= 3,
             "Triple-nested loop should have 3+ iterators"
         );
     }
@@ -464,9 +465,9 @@ mod listcomp_tests {
     #[test]
     fn test_listcomp_with_enumerate() {
         let code = compile_source("result = [(i, x) for i, x in enumerate(items)]");
-        assert!(has_opcode(&code, Opcode::BuildTuple));
+        assert!(has_opcode_recursive(&code, Opcode::BuildTuple));
         // Iteration with tuple target
-        assert!(has_opcode(&code, Opcode::ForIter));
+        assert!(has_opcode_recursive(&code, Opcode::ForIter));
     }
 }
 
@@ -481,7 +482,7 @@ mod setcomp_tests {
     fn test_setcomp_creates_set() {
         let code = compile_source("result = {x for x in items}");
         assert!(
-            has_opcode(&code, Opcode::BuildSet),
+            has_opcode_recursive(&code, Opcode::BuildSet),
             "Set comprehension should build a set"
         );
     }
@@ -490,7 +491,7 @@ mod setcomp_tests {
     fn test_setcomp_has_set_add() {
         let code = compile_source("result = {x for x in items}");
         assert!(
-            has_opcode(&code, Opcode::SetAdd),
+            has_opcode_recursive(&code, Opcode::SetAdd),
             "Set comprehension should add to set"
         );
     }
@@ -498,20 +499,20 @@ mod setcomp_tests {
     #[test]
     fn test_setcomp_with_expression() {
         let code = compile_source("result = {x * 2 for x in items}");
-        assert!(has_opcode(&code, Opcode::Mul));
+        assert!(has_opcode_recursive(&code, Opcode::Mul));
     }
 
     #[test]
     fn test_setcomp_with_filter() {
         let code = compile_source("result = {x for x in items if x > 0}");
-        assert!(has_opcode(&code, Opcode::Gt));
-        assert!(has_opcode(&code, Opcode::JumpIfFalse));
+        assert!(has_opcode_recursive(&code, Opcode::Gt));
+        assert!(has_opcode_recursive(&code, Opcode::JumpIfFalse));
     }
 
     #[test]
     fn test_setcomp_with_nested_loop() {
         let code = compile_source("result = {x + y for x in a for y in b}");
-        assert!(count_opcode(&code, Opcode::GetIter) >= 2);
+        assert!(count_opcode_recursive(&code, Opcode::GetIter) >= 2);
     }
 }
 
@@ -526,7 +527,7 @@ mod dictcomp_tests {
     fn test_dictcomp_creates_dict() {
         let code = compile_source("result = {x: x for x in items}");
         assert!(
-            has_opcode(&code, Opcode::BuildDict),
+            has_opcode_recursive(&code, Opcode::BuildDict),
             "Dict comprehension should build a dict"
         );
     }
@@ -535,7 +536,7 @@ mod dictcomp_tests {
     fn test_dictcomp_sets_items() {
         let code = compile_source("result = {x: x for x in items}");
         assert!(
-            has_opcode(&code, Opcode::SetItem),
+            has_opcode_recursive(&code, Opcode::SetItem),
             "Dict comprehension should set items"
         );
     }
@@ -543,27 +544,27 @@ mod dictcomp_tests {
     #[test]
     fn test_dictcomp_with_expression() {
         let code = compile_source("result = {x: x * 2 for x in items}");
-        assert!(has_opcode(&code, Opcode::Mul));
+        assert!(has_opcode_recursive(&code, Opcode::Mul));
     }
 
     #[test]
     fn test_dictcomp_with_filter() {
         let code = compile_source("result = {x: x for x in items if x > 0}");
-        assert!(has_opcode(&code, Opcode::Gt));
+        assert!(has_opcode_recursive(&code, Opcode::Gt));
     }
 
     #[test]
     fn test_dictcomp_key_value_expressions() {
         let code = compile_source("result = {x + 1: x + 2 for x in pairs}");
         // Should have Add operations for both key and value expressions
-        assert!(count_opcode(&code, Opcode::Add) >= 2);
+        assert!(count_opcode_recursive(&code, Opcode::Add) >= 2);
     }
 
     #[test]
     fn test_dictcomp_invert_mapping() {
         let code = compile_source("result = {x: x * 2 for x in data}");
         // Inverted dict comp should iterate
-        assert!(has_opcode(&code, Opcode::ForIter));
+        assert!(has_opcode_recursive(&code, Opcode::ForIter));
     }
 }
 
@@ -762,9 +763,9 @@ mod integration_tests {
         let code = compile_source(
             "a = [x for x in items]\nb = {x for x in items}\nc = {k: v for k, v in pairs}",
         );
-        assert!(has_opcode(&code, Opcode::BuildList));
-        assert!(has_opcode(&code, Opcode::BuildSet));
-        assert!(has_opcode(&code, Opcode::BuildDict));
+        assert!(has_opcode_recursive(&code, Opcode::BuildList));
+        assert!(has_opcode_recursive(&code, Opcode::BuildSet));
+        assert!(has_opcode_recursive(&code, Opcode::BuildDict));
     }
 
     #[test]
@@ -783,13 +784,13 @@ mod integration_tests {
     fn test_walrus_operator_not_in_comp_condition() {
         // This tests a simple case that should work
         let code = compile_source("result = [x for x in items if x]");
-        assert!(has_opcode(&code, Opcode::JumpIfFalse));
+        assert!(has_opcode_recursive(&code, Opcode::JumpIfFalse));
     }
 
     #[test]
     fn test_complex_comprehension_chain() {
         let code = compile_source("result = [func(x) for x in data if pred(x) for y in x if y]");
-        assert!(count_opcode(&code, Opcode::GetIter) >= 2);
-        assert!(count_opcode(&code, Opcode::JumpIfFalse) >= 2);
+        assert!(count_opcode_recursive(&code, Opcode::GetIter) >= 2);
+        assert!(count_opcode_recursive(&code, Opcode::JumpIfFalse) >= 2);
     }
 }
