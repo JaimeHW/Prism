@@ -150,4 +150,3 @@ macro_rules! barrier_after_store_slice {
         )
     };
 }
-
