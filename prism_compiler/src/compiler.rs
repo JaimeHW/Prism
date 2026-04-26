@@ -3414,7 +3414,7 @@ impl Compiler {
             let handler_abort_label = self.builder.create_label();
 
             // Compile handler match logic
-            let type_idx = if let Some(type_expr) = &handler.typ {
+            if let Some(type_expr) = &handler.typ {
                 // -----------------------------------------------------------
                 // Typed handler: except SomeException as e:
                 // -----------------------------------------------------------
@@ -3464,8 +3464,6 @@ impl Compiler {
                 }
 
                 self.builder.free_register(exc_reg);
-
-                Some(handler_start_pc as u16)
             } else {
                 // -----------------------------------------------------------
                 // Bare except: catches all exceptions
@@ -3480,8 +3478,6 @@ impl Compiler {
                         .emit_store_var(location, exc_reg, Some(name.as_ref()));
                     self.builder.free_register(exc_reg);
                 }
-
-                None
             };
 
             // =============================================================
@@ -3520,7 +3516,7 @@ impl Compiler {
                 handler_pc: handler_start_pc,
                 finally_pc: u32::MAX,
                 depth: stack_depth as u16,
-                exception_type_idx: type_idx.unwrap_or(u16::MAX),
+                exception_type_idx: u16::MAX,
             });
 
             if handler_body_start_pc < handler_body_end_pc {
@@ -7548,6 +7544,29 @@ except ValueError:
         );
         assert!(!code.instructions.is_empty());
         assert!(!code.exception_table.is_empty());
+    }
+
+    #[test]
+    fn test_compile_typed_except_emits_verifiable_dynamic_handler_metadata() {
+        let code = compile(
+            r#"
+try:
+    from _abc import get_cache_token
+except ImportError:
+    get_cache_token = None
+except (AttributeError, TypeError):
+    get_cache_token = lambda: None
+"#,
+        );
+
+        code.validate()
+            .expect("typed except handler metadata should validate");
+        assert!(
+            code.exception_table
+                .iter()
+                .all(|entry| entry.exception_type_idx == u16::MAX),
+            "typed except matching is dynamic and should not encode handler PCs as type metadata"
+        );
     }
 
     #[test]

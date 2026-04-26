@@ -203,8 +203,12 @@ pub struct ExceptionEntry {
     pub finally_pc: u32,
     /// Handler depth for nested handlers.
     pub depth: u16,
-    /// Exception type constant index (for type matching).
-    /// A value of u16::MAX indicates bare `except:`.
+    /// Optional exception type constant index for pre-filtered handlers.
+    ///
+    /// The current compiler emits `u16::MAX` because Python `except`
+    /// expressions are evaluated dynamically in handler bytecode. The VM treats
+    /// the table as a protected-range index and lets `ExceptionMatch` perform
+    /// semantic matching.
     pub exception_type_idx: u16,
 }
 

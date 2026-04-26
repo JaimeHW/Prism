@@ -3319,9 +3319,11 @@ impl VirtualMachine {
 
     /// Find an exception handler for the given exception type in the current frame.
     ///
-    /// Searches the frame's exception table for a handler that:
-    /// 1. Covers the current PC (start_pc <= pc < end_pc)
-    /// 2. Matches the exception type (or is a catch-all with type_idx = 0xFFFF)
+    /// Searches the frame's exception table for a handler chain that covers the
+    /// current PC (`start_pc <= pc < end_pc`). Python `except` expressions are
+    /// evaluated dynamically in the emitted handler bytecode, so this lookup
+    /// deliberately routes to the most specific protected range and leaves type
+    /// matching to `ExceptionMatch`.
     ///
     /// Returns the handler PC if a matching handler is found.
     ///
