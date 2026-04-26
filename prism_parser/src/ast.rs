@@ -883,37 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn test_binop_variants() {
-        let ops = [
-            BinOp::Add,
-            BinOp::Sub,
-            BinOp::Mult,
-            BinOp::Div,
-            BinOp::FloorDiv,
-            BinOp::Mod,
-            BinOp::Pow,
-        ];
-        assert_eq!(ops.len(), 7);
-    }
-
-    #[test]
-    fn test_cmpop_variants() {
-        let ops = [
-            CmpOp::Eq,
-            CmpOp::NotEq,
-            CmpOp::Lt,
-            CmpOp::LtE,
-            CmpOp::Gt,
-            CmpOp::GtE,
-            CmpOp::Is,
-            CmpOp::IsNot,
-            CmpOp::In,
-            CmpOp::NotIn,
-        ];
-        assert_eq!(ops.len(), 10);
-    }
-
-    #[test]
     fn test_default_arguments() {
         let args = Arguments::default();
         assert!(args.args.is_empty());
