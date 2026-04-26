@@ -220,9 +220,25 @@ fn execute_source_entry(
         Some(Arc::clone(&main_module.package_name)),
     ));
 
-    match vm.execute_in_module_runtime(code, main_module) {
+    let execution_result = vm.execute_in_module_runtime(code, main_module);
+    let shutdown_errors = vm.run_shutdown_hooks();
+
+    let exit_code = match execution_result {
         Ok(_) => ExitCode::from(error::EXIT_SUCCESS),
         Err(e) => error::format_runtime_error(&e, Some(source), filename_for_errors.as_ref()),
+    };
+
+    emit_shutdown_errors(&shutdown_errors);
+    exit_code
+}
+
+fn emit_shutdown_errors(errors: &[prism_vm::RuntimeError]) {
+    for err in errors {
+        eprintln!("Exception ignored in Prism shutdown:");
+        eprint!(
+            "{}",
+            error::format_runtime_error_string(err, None, "<shutdown>")
+        );
     }
 }
 

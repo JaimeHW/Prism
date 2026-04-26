@@ -28,6 +28,9 @@
 //! The dispatch table is initialized once at startup (via `init_gc_dispatch`)
 //! and read-only thereafter, making it safe for concurrent access during GC.
 
+use crate::object::descriptor::{
+    BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
+};
 use crate::object::type_obj::TypeId;
 use crate::object::views::{
     CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, GenericAliasObject,
@@ -257,6 +260,42 @@ fn init_dispatch_table() -> DispatchTable {
             trace: trace_function,
             size: size_function,
             finalize: finalize_function,
+        },
+    );
+
+    table.register(
+        TypeId::METHOD,
+        DispatchEntry {
+            trace: trace_bound_method,
+            size: size_bound_method,
+            finalize: finalize_bound_method,
+        },
+    );
+
+    table.register(
+        TypeId::CLASSMETHOD,
+        DispatchEntry {
+            trace: trace_classmethod,
+            size: size_classmethod,
+            finalize: finalize_classmethod,
+        },
+    );
+
+    table.register(
+        TypeId::STATICMETHOD,
+        DispatchEntry {
+            trace: trace_staticmethod,
+            size: size_staticmethod,
+            finalize: finalize_staticmethod,
+        },
+    );
+
+    table.register(
+        TypeId::PROPERTY,
+        DispatchEntry {
+            trace: trace_property,
+            size: size_property,
+            finalize: finalize_property,
         },
     );
 
@@ -654,6 +693,58 @@ unsafe fn finalize_function(ptr: *mut ()) {
     unsafe { std::ptr::drop_in_place(ptr as *mut FunctionObject) };
 }
 
+unsafe fn trace_bound_method(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const BoundMethod) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_bound_method(_ptr: *const ()) -> usize {
+    mem::size_of::<BoundMethod>()
+}
+
+unsafe fn finalize_bound_method(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut BoundMethod) };
+}
+
+unsafe fn trace_classmethod(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_classmethod(_ptr: *const ()) -> usize {
+    mem::size_of::<ClassMethodDescriptor>()
+}
+
+unsafe fn finalize_classmethod(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut ClassMethodDescriptor) };
+}
+
+unsafe fn trace_staticmethod(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_staticmethod(_ptr: *const ()) -> usize {
+    mem::size_of::<StaticMethodDescriptor>()
+}
+
+unsafe fn finalize_staticmethod(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut StaticMethodDescriptor) };
+}
+
+unsafe fn trace_property(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const PropertyDescriptor) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_property(_ptr: *const ()) -> usize {
+    mem::size_of::<PropertyDescriptor>()
+}
+
+unsafe fn finalize_property(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut PropertyDescriptor) };
+}
+
 unsafe fn trace_code_view(ptr: *const (), tracer: &mut dyn Tracer) {
     let obj = unsafe { &*(ptr as *const CodeObjectView) };
     obj.trace(tracer);
@@ -854,7 +945,7 @@ mod tests {
 
         // ListObject should have a valid entry
         let list_entry = table.get(TypeId::LIST);
-        assert!(list_entry.size as usize != size_noop as usize);
+        assert!(list_entry.size as usize != (size_noop as SizeFn) as usize);
     }
 
     #[test]
@@ -954,6 +1045,10 @@ mod tests {
             TypeId::DICT,
             TypeId::SET,
             TypeId::FUNCTION,
+            TypeId::METHOD,
+            TypeId::CLASSMETHOD,
+            TypeId::STATICMETHOD,
+            TypeId::PROPERTY,
             TypeId::RANGE,
             TypeId::ITERATOR,
         ];
@@ -962,7 +1057,7 @@ mod tests {
             let entry = table.get(type_id);
             // Size function should not be noop
             assert!(
-                entry.size as usize != size_noop as usize,
+                entry.size as usize != (size_noop as SizeFn) as usize,
                 "Type {:?} should have non-noop size function",
                 type_id
             );

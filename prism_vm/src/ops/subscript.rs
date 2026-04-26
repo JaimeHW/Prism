@@ -354,7 +354,7 @@ fn subscr_slice(
                     )));
                 }
                 let result = view.slice(slice);
-                let value = Value::object_ptr(Box::into_raw(Box::new(result)) as *const ());
+                let value = crate::alloc_managed_value(result);
                 return Ok(Some(SubscriptResult::Value(value)));
             }
             TypeId::STR => {

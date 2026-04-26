@@ -80,6 +80,12 @@ enum IterKind {
         step: CountStep,
     },
 
+    /// Repeats one value either forever or for a bounded number of iterations.
+    Repeat {
+        value: Value,
+        remaining: Option<usize>,
+    },
+
     /// Iterator over a list.
     List { list: Value, index: usize },
 
@@ -367,6 +373,17 @@ impl IteratorObject {
             kind: IterKind::Count { current, step },
             exhausted: false,
         })
+    }
+
+    /// Create a repeat iterator.
+    #[inline]
+    pub fn repeat(value: Value, remaining: Option<usize>) -> Self {
+        let exhausted = matches!(remaining, Some(0));
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::Repeat { value, remaining },
+            exhausted,
+        }
     }
 
     /// Create an iterator over a list.
@@ -662,6 +679,18 @@ impl IteratorObject {
                 }
             },
 
+            IterKind::Repeat { value, remaining } => match remaining {
+                Some(0) => {
+                    self.exhausted = true;
+                    None
+                }
+                Some(count) => {
+                    *count -= 1;
+                    Some(*value)
+                }
+                None => Some(*value),
+            },
+
             IterKind::List { list, index } => {
                 let list = list_from_value(*list);
                 if *index < list.len() {
@@ -944,6 +973,7 @@ impl IteratorObject {
         match &self.kind {
             IterKind::Range(iter) => iter.remaining_len(),
             IterKind::Count { .. } => None,
+            IterKind::Repeat { remaining, .. } => *remaining,
             IterKind::List { list, index } => {
                 Some(list_from_value(*list).len().saturating_sub(*index))
             }
@@ -1151,6 +1181,7 @@ impl fmt::Debug for IteratorObject {
         let kind_name = match &self.kind {
             IterKind::Range(_) => "range_iterator",
             IterKind::Count { .. } => "count",
+            IterKind::Repeat { .. } => "repeat",
             IterKind::List { .. } => "list_iterator",
             IterKind::Tuple { .. } => "tuple_iterator",
             IterKind::StringChars { .. } => "str_iterator",
@@ -1349,6 +1380,31 @@ mod tests {
         assert_eq!(iter.next().unwrap().as_int(), Some(3));
         assert_eq!(iter.next().unwrap().as_int(), Some(5));
         assert_eq!(iter.next().unwrap().as_int(), Some(7));
+        assert!(!iter.is_exhausted());
+    }
+
+    #[test]
+    fn test_repeat_iterator_tracks_bounded_remaining_length() {
+        let mut iter =
+            IteratorObject::repeat(Value::string(prism_core::intern::intern("x")), Some(2));
+
+        assert_eq!(format!("{:?}", iter), "<repeat>");
+        assert_eq!(iter.size_hint(), Some(2));
+        expect_interned_string(iter.next().unwrap(), "x");
+        assert_eq!(iter.size_hint(), Some(1));
+        expect_interned_string(iter.next().unwrap(), "x");
+        assert_eq!(iter.size_hint(), Some(0));
+        assert!(iter.next().is_none());
+        assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn test_repeat_iterator_can_be_unbounded() {
+        let mut iter = IteratorObject::repeat(Value::int(9).unwrap(), None);
+
+        assert_eq!(iter.size_hint(), None);
+        assert_eq!(iter.next().unwrap().as_int(), Some(9));
+        assert_eq!(iter.next().unwrap().as_int(), Some(9));
         assert!(!iter.is_exhausted());
     }
 

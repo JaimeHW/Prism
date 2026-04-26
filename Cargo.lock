@@ -628,6 +628,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "prism_core",
+ "prism_gc",
 ]
 
 [[package]]

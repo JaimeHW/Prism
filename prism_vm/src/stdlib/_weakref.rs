@@ -5,21 +5,34 @@
 //! early bootstrap does not depend on the much heavier `weakref.py` stack.
 
 use super::{Module, ModuleError, ModuleResult};
+use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::stdlib::collections::deque::DequeObject;
+use prism_code::CodeFlags;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
+use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};
+use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
     SubclassBitmap, global_class_bitmap, global_class_registry, register_global_class, type_new,
 };
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::{
+    CellViewObject, DictViewObject, FrameViewObject, GenericAliasObject, MappingProxyObject,
+    MappingProxySource, MethodWrapperObject, TracebackViewObject,
+};
+use prism_runtime::types::Cell;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
-use std::sync::{Arc, LazyLock};
+use rustc_hash::FxHashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 
 static GETWEAKREFCOUNT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -53,6 +66,7 @@ static PROXY_TYPE_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_placeholder_type("ProxyType"));
 static CALLABLE_PROXY_TYPE_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_placeholder_type("CallableProxyType"));
+static WEAKREFS: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Native `_weakref` module descriptor.
 pub struct WeakRefModule {
@@ -120,9 +134,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 fn export_names_value() -> Value {
@@ -247,6 +260,337 @@ fn reference_callback_property() -> prism_core::intern::InternedString {
     intern("__weakref_callback__")
 }
 
+fn register_weakref(reference: Value) {
+    if let Some(ptr) = reference.as_object_ptr() {
+        let ptr = ptr as usize;
+        let mut weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
+        if !weakrefs.contains(&ptr) {
+            weakrefs.push(ptr);
+        }
+    }
+}
+
+pub(crate) fn clear_unreachable_weakrefs(vm: &VirtualMachine) {
+    let reachable = reachable_object_set(vm);
+    let registry = shape_registry();
+    let target_name = reference_target_property();
+    let mut weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
+
+    weakrefs.retain(|ptr| {
+        if !reachable.contains(ptr) {
+            return false;
+        }
+
+        let object = unsafe { &mut *(*ptr as *mut ShapedObject) };
+        let Some(target) = object.get_property(target_name.as_ref()) else {
+            return false;
+        };
+        if target.is_none() {
+            return false;
+        }
+
+        let target_is_reachable = target
+            .as_object_ptr()
+            .map(|ptr| reachable.contains(&(ptr as usize)))
+            .unwrap_or(true);
+        if !target_is_reachable {
+            object.set_property(target_name.clone(), Value::none(), registry);
+            return false;
+        }
+
+        true
+    });
+}
+
+pub(crate) fn clear_unreachable_weakrefs_if_registered(vm: &VirtualMachine) {
+    let has_registered_weakrefs = {
+        let weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
+        !weakrefs.is_empty()
+    };
+
+    if has_registered_weakrefs {
+        clear_unreachable_weakrefs(vm);
+    }
+}
+
+struct ReachabilityMarker {
+    reachable: FxHashSet<usize>,
+    stack: Vec<Value>,
+    weakref_target_name: prism_core::intern::InternedString,
+}
+
+impl ReachabilityMarker {
+    fn new() -> Self {
+        Self {
+            reachable: FxHashSet::default(),
+            stack: Vec::with_capacity(256),
+            weakref_target_name: reference_target_property(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, value: Value) {
+        if value.as_object_ptr().is_some() {
+            self.stack.push(value);
+        }
+    }
+
+    fn drain(&mut self) {
+        while let Some(value) = self.stack.pop() {
+            self.mark_value(value);
+        }
+    }
+
+    fn mark_value(&mut self, value: Value) {
+        let Some(ptr) = value.as_object_ptr() else {
+            return;
+        };
+        let ptr_key = ptr as usize;
+        if !self.reachable.insert(ptr_key) {
+            return;
+        }
+
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        match header.type_id {
+            TypeId::LIST => {
+                let list = unsafe { &*(ptr as *const ListObject) };
+                for item in list.as_slice() {
+                    self.push(*item);
+                }
+            }
+            TypeId::TUPLE => {
+                let tuple = unsafe { &*(ptr as *const TupleObject) };
+                for item in tuple.as_slice() {
+                    self.push(*item);
+                }
+            }
+            TypeId::DICT => {
+                let dict = unsafe { &*(ptr as *const DictObject) };
+                self.push_dict_entries(dict);
+            }
+            TypeId::SET | TypeId::FROZENSET => {
+                let set = unsafe { &*(ptr as *const SetObject) };
+                for item in set.iter() {
+                    self.push(item);
+                }
+            }
+            TypeId::DEQUE => {
+                let deque = unsafe { &*(ptr as *const DequeObject) };
+                for item in deque.deque().iter() {
+                    self.push(*item);
+                }
+            }
+            TypeId::MODULE => {
+                let module = unsafe { &*(ptr as *const crate::import::ModuleObject) };
+                for (_, value) in module.all_attrs() {
+                    self.push(value);
+                }
+            }
+            TypeId::TYPE => {
+                if crate::builtins::builtin_type_object_type_id(ptr).is_none() {
+                    let class = unsafe { &*(ptr as *const PyClassObject) };
+                    self.push(class.metaclass());
+                    class.for_each_attr(|_, value| self.push(value));
+                }
+            }
+            TypeId::FUNCTION => {
+                let function = unsafe { &*(ptr as *const FunctionObject) };
+                if let Some(defaults) = &function.defaults {
+                    for value in defaults.iter().copied() {
+                        self.push(value);
+                    }
+                }
+                if let Some(defaults) = &function.kwdefaults {
+                    for (_, value) in defaults.iter() {
+                        self.push(*value);
+                    }
+                }
+                if let Some(closure) = function.closure() {
+                    for index in 0..closure.len() {
+                        if let Some(value) = closure.get(index) {
+                            self.push(value);
+                        }
+                    }
+                }
+                function.for_each_attr_value(|value| self.push(value));
+            }
+            TypeId::BUILTIN_FUNCTION => {
+                let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+                if let Some(bound_self) = function.bound_self() {
+                    self.push(bound_self);
+                }
+            }
+            TypeId::CELL => {
+                let cell = unsafe { &*(ptr as *const Cell) };
+                if let Some(value) = cell.get() {
+                    self.push(value);
+                }
+            }
+            TypeId::CELL_VIEW => {
+                let cell = unsafe { &*(ptr as *const CellViewObject) };
+                if let Some(value) = cell.cell().get() {
+                    self.push(value);
+                }
+            }
+            TypeId::GENERIC_ALIAS => {
+                let alias = unsafe { &*(ptr as *const GenericAliasObject) };
+                self.push(alias.origin());
+                for value in alias.args() {
+                    self.push(*value);
+                }
+            }
+            TypeId::MAPPING_PROXY => {
+                let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+                match proxy.source() {
+                    MappingProxySource::Dict(value) => self.push(value),
+                    MappingProxySource::UserClass(ptr) => {
+                        self.push(Value::object_ptr(ptr as *const ()));
+                    }
+                    MappingProxySource::BuiltinType(_) => {}
+                }
+            }
+            TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => {
+                let view = unsafe { &*(ptr as *const DictViewObject) };
+                self.push(view.dict());
+            }
+            TypeId::METHOD_WRAPPER => {
+                let wrapper = unsafe { &*(ptr as *const MethodWrapperObject) };
+                self.push(wrapper.receiver());
+            }
+            TypeId::FRAME => {
+                let frame = unsafe { &*(ptr as *const FrameViewObject) };
+                self.push(frame.globals());
+                self.push(frame.locals());
+                if let Some(back) = frame.back() {
+                    self.push(back);
+                }
+            }
+            TypeId::TRACEBACK => {
+                let traceback = unsafe { &*(ptr as *const TracebackViewObject) };
+                self.push(traceback.frame());
+                if let Some(next) = traceback.next() {
+                    self.push(next);
+                }
+            }
+            type_id if is_shaped_object(value, type_id) => {
+                let object = unsafe { &*(ptr as *const ShapedObject) };
+                self.push_shaped_object(type_id, object);
+            }
+            _ => {}
+        }
+    }
+
+    fn push_dict_entries(&mut self, dict: &DictObject) {
+        for (key, value) in dict.iter() {
+            self.push(key);
+            self.push(value);
+        }
+    }
+
+    fn push_shaped_object(&mut self, type_id: TypeId, object: &ShapedObject) {
+        let is_weakref = is_reference_type_id(type_id);
+        for (name, value) in object.iter_properties() {
+            if is_weakref && name == self.weakref_target_name {
+                continue;
+            }
+            self.push(value);
+        }
+
+        if let Some(value) = object.instance_dict_value() {
+            self.push(value);
+        }
+        if let Some(dict) = object.dict_backing() {
+            self.push_dict_entries(dict);
+        }
+        if let Some(list) = object.list_backing() {
+            for item in list.as_slice() {
+                self.push(*item);
+            }
+        }
+        if let Some(tuple) = object.tuple_backing() {
+            for item in tuple.as_slice() {
+                self.push(*item);
+            }
+        }
+    }
+}
+
+fn reachable_object_set(vm: &VirtualMachine) -> FxHashSet<usize> {
+    let mut marker = ReachabilityMarker::new();
+
+    for frame in &vm.frames {
+        marker.push_frame_roots(frame);
+    }
+    for (_, value) in vm.globals.iter() {
+        marker.push(*value);
+    }
+    for module_name in vm.import_resolver.cached_modules() {
+        if let Some(module) = vm.import_resolver.get_cached(&module_name) {
+            marker.push(Value::object_ptr(Arc::as_ptr(&module) as *const ()));
+            for (_, value) in module.all_attrs() {
+                marker.push(value);
+            }
+        }
+    }
+
+    marker.drain();
+    marker.reachable
+}
+
+impl ReachabilityMarker {
+    fn push_frame_roots(&mut self, frame: &crate::frame::Frame) {
+        if !frame.code.flags.contains(CodeFlags::MODULE)
+            && !frame.code.flags.contains(CodeFlags::CLASS)
+        {
+            let local_count = frame
+                .code
+                .locals
+                .len()
+                .min(frame.active_register_count() as usize)
+                .min(frame.registers.len());
+            for slot in 0..local_count {
+                if frame.reg_is_written(slot as u8) {
+                    self.push(frame.registers[slot]);
+                }
+            }
+        }
+
+        if let Some(mapping) = frame.locals_mapping() {
+            self.push(mapping);
+        }
+        if let Some(closure) = &frame.closure {
+            for index in 0..closure.len() {
+                self.push(closure.get(index));
+            }
+        }
+        if let Some(module) = &frame.module {
+            self.push(Value::object_ptr(Arc::as_ptr(module) as *const ()));
+            for (_, value) in module.all_attrs() {
+                self.push(value);
+            }
+        }
+    }
+}
+
+#[inline]
+fn is_shaped_object(value: Value, type_id: TypeId) -> bool {
+    type_id.raw() >= TypeId::FIRST_USER_TYPE
+        || (type_id == TypeId::OBJECT && super::_thread::is_native_thread_object(value))
+}
+
+fn is_reference_type_id(type_id: TypeId) -> bool {
+    let reference_type_id = REFERENCE_TYPE_CLASS.class_type_id();
+    if type_id == reference_type_id {
+        return true;
+    }
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return false;
+    }
+
+    global_class_bitmap(ClassId(type_id.raw()))
+        .is_some_and(|bitmap| bitmap.is_subclass_of(reference_type_id))
+}
+
 fn reference_new(args: &[Value]) -> Result<Value, BuiltinError> {
     if !(2..=3).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
@@ -288,7 +632,9 @@ fn reference_new(args: &[Value]) -> Result<Value, BuiltinError> {
         registry,
     );
 
-    Ok(leak_object_value(object))
+    let reference = leak_object_value(object);
+    register_weakref(reference);
+    Ok(reference)
 }
 
 fn reference_init(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -308,6 +654,7 @@ fn reference_init(args: &[Value]) -> Result<Value, BuiltinError> {
         args.get(2).copied().unwrap_or_else(Value::none),
         registry,
     );
+    register_weakref(args[0]);
     Ok(Value::none())
 }
 
@@ -358,6 +705,7 @@ pub(crate) fn builtin_remove_dead_weakref(args: &[Value]) -> Result<Value, Built
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_code::CodeObject;
 
     fn builtin_from_value(value: Value) -> &'static BuiltinFunctionObject {
         let ptr = value
@@ -513,5 +861,24 @@ mod tests {
         };
 
         assert_eq!(module_name, "_weakref");
+    }
+
+    #[test]
+    fn test_eager_weakref_sweep_clears_unreachable_target() {
+        let target = leak_object_value(DictObject::new());
+        let reference =
+            reference_new(&[reference_type_value(), target]).expect("weakref creation should work");
+
+        let mut code = CodeObject::new("weakref_root", "<test>");
+        code.locals = vec![Arc::<str>::from("wr")].into_boxed_slice();
+        code.register_count = 1;
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(code), 0).expect("frame push failed");
+        vm.current_frame_mut().set_reg(0, reference);
+
+        clear_unreachable_weakrefs_if_registered(&vm);
+
+        assert!(reference_call(&[reference]).unwrap().is_none());
     }
 }

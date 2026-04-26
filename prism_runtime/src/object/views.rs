@@ -474,6 +474,11 @@ impl TracebackViewObject {
     }
 
     #[inline]
+    pub fn set_next(&mut self, next: Option<Value>) {
+        self.next = next;
+    }
+
+    #[inline]
     pub fn line_number(&self) -> u32 {
         self.line_number
     }
@@ -527,12 +532,15 @@ mod tests {
     #[test]
     fn test_traceback_view_uses_traceback_type_id() {
         let frame = Value::int(7).unwrap();
-        let view = TracebackViewObject::new(frame, Some(Value::none()), 12, 3);
+        let mut view = TracebackViewObject::new(frame, Some(Value::none()), 12, 3);
         assert_eq!(view.header().type_id, TypeId::TRACEBACK);
         assert_eq!(view.frame(), frame);
         assert_eq!(view.next(), Some(Value::none()));
         assert_eq!(view.line_number(), 12);
         assert_eq!(view.lasti(), 3);
+
+        view.set_next(None);
+        assert_eq!(view.next(), None);
     }
 
     #[test]

@@ -37,7 +37,7 @@ static FILTERS_MUTATED_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new
     BuiltinFunctionObject::new(Arc::from("_warnings._filters_mutated"), filters_mutated)
 });
 static WARN_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_warnings.warn"), warn));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm_kw(Arc::from("_warnings.warn"), warn_kw));
 static WARN_EXPLICIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("_warnings.warn_explicit"), warn_explicit)
 });
@@ -111,8 +111,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 fn filters_mutated(_args: &[Value]) -> Result<Value, BuiltinError> {
@@ -132,23 +132,99 @@ pub(crate) fn emit_bool_invert_deprecation_warning(
     )
 }
 
-fn warn(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.is_empty() {
-        return Err(BuiltinError::TypeError(
-            "warn() missing required argument 'message'".to_string(),
-        ));
-    }
+#[derive(Clone, Copy, Debug)]
+struct WarnCall {
+    message: Value,
+    category: Option<Value>,
+    stacklevel: i64,
+}
 
-    let message = warning_message_text(args[0]).map_err(BuiltinError::TypeError)?;
-    let category = warning_category_from_value(args.get(1).copied())
+fn warn_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let call = bind_warn_args(args, keywords)?;
+    let message = warning_message_text(call.message).map_err(BuiltinError::TypeError)?;
+    let category = warning_category_from_value(call.category)
         .map_err(BuiltinError::TypeError)?
         .unwrap_or_else(|| {
             builtin_warning_category(ExceptionTypeId::UserWarning)
                 .expect("UserWarning must be a valid warning category")
         });
-    let context = WarningContext::capture(vm).map_err(BuiltinError::Raised)?;
+    let context = WarningContext::capture_at_depth(vm, warning_stack_depth(call.stacklevel))
+        .map_err(BuiltinError::Raised)?;
     emit_warning(vm, category, &message, &context).map_err(BuiltinError::Raised)?;
     Ok(Value::none())
+}
+
+fn bind_warn_args(args: &[Value], keywords: &[(&str, Value)]) -> Result<WarnCall, BuiltinError> {
+    if args.len() > 5 {
+        return Err(BuiltinError::TypeError(format!(
+            "warn() takes at most 5 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut message = args.first().copied();
+    let mut category = args.get(1).copied();
+    let mut stacklevel = args.get(2).copied();
+    let mut _source = args.get(3).copied();
+    let mut _skip_file_prefixes = args.get(4).copied();
+
+    for (name, value) in keywords {
+        match *name {
+            "message" => assign_warn_keyword(&mut message, *value, "message")?,
+            "category" => assign_warn_keyword(&mut category, *value, "category")?,
+            "stacklevel" => assign_warn_keyword(&mut stacklevel, *value, "stacklevel")?,
+            "source" => assign_warn_keyword(&mut _source, *value, "source")?,
+            "skip_file_prefixes" => {
+                assign_warn_keyword(&mut _skip_file_prefixes, *value, "skip_file_prefixes")?
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "warn() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    let message = message.ok_or_else(|| {
+        BuiltinError::TypeError("warn() missing required argument 'message'".to_string())
+    })?;
+    let stacklevel = stacklevel
+        .filter(|value| !value.is_none())
+        .map(|value| value_to_i64(value, "warn() argument 3 must be int"))
+        .transpose()
+        .map_err(BuiltinError::TypeError)?
+        .unwrap_or(1);
+
+    Ok(WarnCall {
+        message,
+        category,
+        stacklevel,
+    })
+}
+
+fn assign_warn_keyword(
+    slot: &mut Option<Value>,
+    value: Value,
+    name: &'static str,
+) -> Result<(), BuiltinError> {
+    if slot.is_some() {
+        return Err(BuiltinError::TypeError(format!(
+            "warn() got multiple values for argument '{}'",
+            name
+        )));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+#[inline]
+fn warning_stack_depth(stacklevel: i64) -> usize {
+    usize::try_from(stacklevel.saturating_sub(1)).unwrap_or(0)
 }
 
 fn warn_explicit(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -203,17 +279,23 @@ struct WarningContext {
 
 impl WarningContext {
     fn capture(vm: &mut VirtualMachine) -> Result<Self, RuntimeError> {
-        let (filename, lineno) = {
-            let frame = vm.current_frame();
+        Self::capture_at_depth(vm, 0)
+    }
+
+    fn capture_at_depth(vm: &mut VirtualMachine, depth: usize) -> Result<Self, RuntimeError> {
+        let (filename, lineno, module) = {
+            let frame = vm
+                .frame_at_depth(depth)
+                .unwrap_or_else(|| vm.current_frame());
             let pc = frame.ip.saturating_sub(1);
             let line = frame
                 .code
                 .line_for_pc(pc)
                 .unwrap_or(frame.code.first_lineno);
-            (frame.code.filename.to_string(), line)
+            (frame.code.filename.to_string(), line, frame.module.clone())
         };
 
-        let Some(module) = vm.current_module_cloned() else {
+        let Some(module) = module else {
             return Ok(Self {
                 filename,
                 lineno,
@@ -668,7 +750,7 @@ fn module_name_from_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_core::intern::interned_by_ptr;
+    use prism_core::intern::{intern, interned_by_ptr};
 
     #[test]
     fn test_warnings_module_imports_as_builtin_anchor() {
@@ -723,6 +805,46 @@ mod tests {
             let header = unsafe { &*(ptr as *const ObjectHeader) };
             assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
         }
+    }
+
+    #[test]
+    fn test_warn_accepts_cpython_keyword_surface() {
+        let message = Value::string(intern("hello"));
+        let category = category_value(ExceptionTypeId::DeprecationWarning)
+            .expect("DeprecationWarning should be available");
+
+        let call = bind_warn_args(
+            &[],
+            &[
+                ("message", message),
+                ("category", category),
+                ("stacklevel", Value::int(3).unwrap()),
+                ("source", Value::none()),
+                ("skip_file_prefixes", Value::none()),
+            ],
+        )
+        .expect("warn should bind CPython keyword arguments");
+
+        assert_eq!(call.message, message);
+        assert_eq!(call.category, Some(category));
+        assert_eq!(call.stacklevel, 3);
+        assert_eq!(warning_stack_depth(call.stacklevel), 2);
+    }
+
+    #[test]
+    fn test_warn_keyword_binding_rejects_duplicates_and_unknowns() {
+        let message = Value::string(intern("hello"));
+        let duplicate = bind_warn_args(&[message], &[("message", message)])
+            .expect_err("duplicate message should be rejected");
+        assert!(
+            matches!(duplicate, BuiltinError::TypeError(ref msg) if msg.contains("multiple values"))
+        );
+
+        let unknown = bind_warn_args(&[message], &[("bogus", Value::none())])
+            .expect_err("unknown keywords should be rejected");
+        assert!(
+            matches!(unknown, BuiltinError::TypeError(ref msg) if msg.contains("unexpected keyword"))
+        );
     }
 
     #[test]

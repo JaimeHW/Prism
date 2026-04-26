@@ -84,8 +84,7 @@ impl ClassMethodDescriptor {
     /// Create a heap-allocated bound-method value bound to `class`.
     #[inline]
     pub fn bind_value(&self, class: Value) -> Value {
-        let bound = Box::new(self.bind(class));
-        Value::object_ptr(Box::into_raw(bound) as *const ())
+        crate::allocation_context::alloc_value_in_current_heap_or_box(self.bind(class))
     }
 }
 
@@ -200,6 +199,20 @@ mod tests {
         let bound = unsafe { &*(ptr as *const BoundMethod) };
         assert_eq!(bound.function(), func);
         assert_eq!(bound.instance(), class);
+    }
+
+    #[test]
+    fn test_classmethod_bind_value_uses_bound_heap() {
+        let heap = prism_gc::heap::GcHeap::with_defaults();
+        let _binding = crate::allocation_context::RuntimeHeapBinding::register(&heap);
+        let cm = ClassMethodDescriptor::new(Value::int_unchecked(100));
+
+        let value = cm.bind_value(Value::int_unchecked(200));
+        let ptr = value
+            .as_object_ptr()
+            .expect("bound classmethod should allocate a method object");
+
+        assert!(heap.contains(ptr));
     }
 
     #[test]

@@ -39,6 +39,16 @@ pub fn format_runtime_error(
     source: Option<&str>,
     filename: &str,
 ) -> ExitCode {
+    if runtime_error_type_id(error)
+        == Some(prism_vm::stdlib::exceptions::ExceptionTypeId::SystemExit)
+    {
+        let payload = system_exit_stderr_payload(error);
+        if !payload.is_empty() {
+            eprintln!("{payload}");
+        }
+        return exit_code_for_runtime_error(error);
+    }
+
     let output = format_runtime_error_string(error, source, filename);
     eprint!("{}", output);
     exit_code_for_runtime_error(error)
@@ -102,6 +112,17 @@ pub fn format_runtime_error_string(
     _source: Option<&str>,
     filename: &str,
 ) -> String {
+    if runtime_error_type_id(error)
+        == Some(prism_vm::stdlib::exceptions::ExceptionTypeId::SystemExit)
+    {
+        let payload = system_exit_stderr_payload(error);
+        return if payload.is_empty() {
+            String::new()
+        } else {
+            format!("{payload}\n")
+        };
+    }
+
     let mut output = String::new();
     output.push_str(diagnostics::render_traceback_header());
     output.push('\n');
@@ -221,11 +242,7 @@ fn exit_code_for_runtime_error(error: &prism_vm::RuntimeError) -> ExitCode {
     use prism_vm::stdlib::exceptions::ExceptionTypeId;
 
     if runtime_error_type_id(error) == Some(ExceptionTypeId::SystemExit) {
-        let payload = runtime_error_payload(error);
-        if let Ok(code) = payload.parse::<u8>() {
-            return ExitCode::from(code);
-        }
-        return ExitCode::from(EXIT_ERROR);
+        return ExitCode::from(system_exit_status_code(error).unwrap_or(EXIT_ERROR));
     }
 
     match &error.kind {
@@ -233,6 +250,55 @@ fn exit_code_for_runtime_error(error: &prism_vm::RuntimeError) -> ExitCode {
         | RuntimeErrorKind::InvalidOpcode { .. }
         | RuntimeErrorKind::ControlTransferred => ExitCode::from(EXIT_INTERNAL_ERROR),
         _ => ExitCode::from(EXIT_ERROR),
+    }
+}
+
+fn system_exit_status_code(error: &prism_vm::RuntimeError) -> Option<u8> {
+    if let Some(value) = error.raised_value
+        && let Some(exception) = unsafe { prism_vm::builtins::ExceptionValue::from_value(value) }
+    {
+        return match exception.args().unwrap_or(&[]) {
+            [] => Some(EXIT_SUCCESS),
+            [status] => system_exit_status_value(*status),
+            _ => None,
+        };
+    }
+
+    let payload = runtime_error_payload(error);
+    if payload.is_empty() {
+        return Some(EXIT_SUCCESS);
+    }
+    payload.parse::<u8>().ok()
+}
+
+fn system_exit_status_value(value: prism_core::Value) -> Option<u8> {
+    if value.is_none() {
+        return Some(EXIT_SUCCESS);
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Some(if boolean { EXIT_ERROR } else { EXIT_SUCCESS });
+    }
+    value
+        .as_int()
+        .and_then(|integer| u8::try_from(integer).ok())
+}
+
+fn system_exit_stderr_payload(error: &prism_vm::RuntimeError) -> String {
+    if let Some(value) = error.raised_value
+        && let Some(exception) = unsafe { prism_vm::builtins::ExceptionValue::from_value(value) }
+    {
+        return match exception.args().unwrap_or(&[]) {
+            [] => String::new(),
+            [status] if system_exit_status_value(*status).is_some() => String::new(),
+            _ => exception.display_text(),
+        };
+    }
+
+    let payload = runtime_error_payload(error);
+    if payload.is_empty() || payload.parse::<u8>().is_ok() {
+        String::new()
+    } else {
+        payload
     }
 }
 

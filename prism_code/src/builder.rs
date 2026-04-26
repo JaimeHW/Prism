@@ -8,6 +8,7 @@ use super::instruction::{ConstIndex, Instruction, LocalSlot, Opcode, Register};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
+use prism_gc::trace::{Trace, Tracer};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,6 +52,16 @@ impl KwNamesTuple {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
         self.names.iter()
+    }
+}
+
+unsafe impl Trace for KwNamesTuple {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {}
+
+    #[inline]
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>() + self.names.len() * std::mem::size_of::<Arc<str>>()
     }
 }
 
@@ -1449,6 +1460,32 @@ impl FunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kwnames_tuple_is_trace_leaf() {
+        struct CountingTracer {
+            values: usize,
+            ptrs: usize,
+        }
+
+        impl Tracer for CountingTracer {
+            fn trace_value(&mut self, _value: Value) {
+                self.values += 1;
+            }
+
+            fn trace_ptr(&mut self, _ptr: *const ()) {
+                self.ptrs += 1;
+            }
+        }
+
+        let tuple = KwNamesTuple::new(vec![Arc::from("encoding"), Arc::from("errors")]);
+        let mut tracer = CountingTracer { values: 0, ptrs: 0 };
+
+        tuple.trace(&mut tracer);
+
+        assert_eq!(tracer.values, 0);
+        assert_eq!(tracer.ptrs, 0);
+    }
 
     #[test]
     fn test_simple_function() {

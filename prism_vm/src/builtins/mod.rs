@@ -231,8 +231,8 @@ impl BuiltinRegistry {
         registry.register_function("hash", functions::builtin_hash);
         registry.register_function("id", functions::builtin_id);
         registry.register_function("callable", functions::builtin_callable);
-        registry.register_function("repr", functions::builtin_repr);
-        registry.register_function("ascii", functions::builtin_ascii);
+        registry.register_function_vm("repr", functions::builtin_repr_vm);
+        registry.register_function_vm("ascii", functions::builtin_ascii_vm);
 
         // Register numeric formatting functions
         registry.register_function("bin", numeric::builtin_bin);
@@ -251,9 +251,9 @@ impl BuiltinRegistry {
 
         // Register introspection functions
         registry.register_function_vm("dir", introspect::builtin_dir_vm);
-        registry.register_function("vars", introspect::builtin_vars);
-        registry.register_function("globals", introspect::builtin_globals);
-        registry.register_function("locals", introspect::builtin_locals);
+        registry.register_function_vm("vars", introspect::builtin_vars_vm);
+        registry.register_function_vm("globals", introspect::builtin_globals_vm);
+        registry.register_function_vm("locals", introspect::builtin_locals_vm);
         registry.register_function("help", introspect::builtin_help);
         registry.register_function_vm("__import__", introspect::builtin_import_vm);
 

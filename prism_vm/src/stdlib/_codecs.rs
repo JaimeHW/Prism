@@ -311,9 +311,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 fn export_names_value() -> Value {

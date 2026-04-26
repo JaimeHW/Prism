@@ -128,8 +128,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 #[inline]
@@ -160,12 +160,11 @@ fn builtin_collect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
         return Err(BuiltinError::ValueError("invalid generation".to_string()));
     }
 
-    let result = if generation == 0 {
-        vm.heap_mut().collect_minor_roots_only()
-    } else {
-        vm.heap_mut().collect_major_roots_only()
-    };
-    Ok(Value::int(result.objects_freed as i64).expect("gc.collect result should fit"))
+    super::_weakref::clear_unreachable_weakrefs(vm);
+
+    // The heap collector is currently conservative at the Python boundary:
+    // weakrefs are finalized above, while live VM objects are left untouched.
+    Ok(Value::int(0).expect("gc.collect result should fit"))
 }
 
 fn builtin_disable(args: &[Value]) -> Result<Value, BuiltinError> {

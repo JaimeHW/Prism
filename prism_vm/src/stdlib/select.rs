@@ -139,11 +139,11 @@ fn sequence_arg(value: Value, name: &str) -> Result<Vec<Value>, BuiltinError> {
 }
 
 fn tuple_value(items: Vec<Value>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(TupleObject::from_vec(items))) as *const ())
+    crate::alloc_managed_value(TupleObject::from_vec(items))
 }
 
 fn list_value(items: Vec<Value>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(ListObject::from_iter(items))) as *const ())
+    crate::alloc_managed_value(ListObject::from_iter(items))
 }
 
 #[cfg(test)]

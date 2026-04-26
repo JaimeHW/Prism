@@ -140,7 +140,7 @@ fn exception_type_value() -> Value {
 
 #[inline]
 fn bytes_value(data: Vec<u8>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(BytesObject::from_vec(data))) as *const ())
+    crate::alloc_managed_value(BytesObject::from_vec(data))
 }
 
 fn a2b_uu_builtin(args: &[Value]) -> Result<Value, BuiltinError> {

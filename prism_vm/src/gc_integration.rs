@@ -61,6 +61,13 @@ pub struct ManagedHeap {
     config: GcConfig,
 }
 
+// Safety: `ManagedHeap` is only shared between native Python threads behind the
+// VM's `Arc<Mutex<ManagedHeap>>`. Allocation uses `GcHeap`'s atomic allocation
+// paths, while collection/root mutation requires the heap mutex and Prism's
+// shared runtime synchronization. Raw pointers stored by the collector and heap
+// are stable heap addresses, not thread-affine references.
+unsafe impl Send for ManagedHeap {}
+
 impl ManagedHeap {
     /// Create a new managed heap with the given configuration.
     pub fn new(config: GcConfig) -> Self {

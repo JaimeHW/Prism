@@ -361,9 +361,8 @@ fn class_value(kind: Sha2Kind) -> Value {
 }
 
 #[inline]
-fn to_object_value<T>(object: T) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+fn to_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 fn new_hash_instance(kind: Sha2Kind) -> Value {
@@ -389,7 +388,7 @@ fn new_hash_instance_for_receiver(receiver: Value) -> Result<Value, BuiltinError
 
 fn new_hash_instance_from_class(class: &PyClassObject) -> Value {
     let instance = allocate_heap_instance_for_class(class);
-    let value = Value::object_ptr(Box::into_raw(Box::new(instance)) as *const ());
+    let value = crate::alloc_managed_value(instance);
     set_buffer(value, Vec::new()).expect("hash instance initialization should succeed");
     value
 }

@@ -270,7 +270,7 @@ fn new_incremental_newline_decoder_object(decoder: Value, translate: bool, error
 }
 
 fn finalize_incremental_newline_decoder_object(object: ShapedObject) -> Value {
-    let value = Value::object_ptr(Box::into_raw(Box::new(object)) as *const ());
+    let value = crate::alloc_managed_value(object);
     let shaped = unsafe { &mut *(value.as_object_ptr().unwrap() as *mut ShapedObject) };
     for interned in builtins_method_names() {
         let Some(method_value) = shaped.get_property_interned(&interned) else {
@@ -280,10 +280,9 @@ fn finalize_incremental_newline_decoder_object(object: ShapedObject) -> Value {
             .as_object_ptr()
             .expect("newline decoder helper methods should be builtin functions");
         let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
-        let bound = Box::new(builtin.bind(value));
         shaped.set_property(
             interned,
-            Value::object_ptr(Box::into_raw(bound) as *const ()),
+            crate::alloc_managed_value(builtin.bind(value)),
             shape_registry(),
         );
     }
@@ -383,9 +382,7 @@ fn tuple_pair(value: Value, context: &str) -> Result<(Value, Value), BuiltinErro
 }
 
 fn tuple_value(items: &[Value]) -> Result<Value, BuiltinError> {
-    Ok(Value::object_ptr(
-        Box::into_raw(Box::new(TupleObject::from_slice(items))) as *const (),
-    ))
+    Ok(crate::alloc_managed_value(TupleObject::from_slice(items)))
 }
 
 fn decoder_value(receiver: Value) -> Result<Value, BuiltinError> {
@@ -430,12 +427,12 @@ fn string_value(value: &str) -> Value {
     if value.is_empty() {
         Value::string(intern(""))
     } else {
-        Value::object_ptr(Box::into_raw(Box::new(StringObject::new(value))) as *const ())
+        crate::alloc_managed_value(StringObject::new(value))
     }
 }
 
 fn bytes_value(value: &[u8]) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(BytesObject::from_slice(value))) as *const ())
+    crate::alloc_managed_value(BytesObject::from_slice(value))
 }
 
 fn builtins_method_names() -> [InternedString; 4] {

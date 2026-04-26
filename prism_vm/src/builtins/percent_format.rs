@@ -847,13 +847,11 @@ fn string_to_value(text: String) -> Value {
         return Value::string(intern(""));
     }
 
-    let ptr = Box::into_raw(Box::new(StringObject::from_string(text))) as *const ();
-    Value::object_ptr(ptr)
+    crate::alloc_managed_value(StringObject::from_string(text))
 }
 
 fn bytes_to_value(data: Vec<u8>, type_id: TypeId) -> Value {
-    let ptr = Box::into_raw(Box::new(BytesObject::from_vec_with_type(data, type_id))) as *const ();
-    Value::object_ptr(ptr)
+    crate::alloc_managed_value(BytesObject::from_vec_with_type(data, type_id))
 }
 
 fn type_name_of(value: Value) -> &'static str {

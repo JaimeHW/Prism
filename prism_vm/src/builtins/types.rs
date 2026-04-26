@@ -9,7 +9,7 @@ use crate::VirtualMachine;
 use crate::error::RuntimeErrorKind;
 use crate::import::ModuleObject;
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::method_dispatch::load_method::resolve_special_method;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::collections::deque::{builtin_deque, builtin_deque_kw, builtin_deque_with_vm};
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -644,41 +644,38 @@ fn invoke_zero_arg_special_method(
     }
 }
 
+fn invoke_bound_method_with_arg(
+    vm: &mut VirtualMachine,
+    target: &BoundMethodTarget,
+    arg: Value,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self, arg]),
+        None => invoke_callable_value(vm, target.callable, &[arg]),
+    }
+    .map_err(runtime_error_to_builtin_error)
+}
+
+fn mapping_entries_with_vm(
+    vm: &mut VirtualMachine,
+    source: Value,
+) -> Result<Option<Vec<(Value, Value)>>, BuiltinError> {
+    let Some(keys_value) = invoke_zero_arg_special_method(vm, source, "keys")? else {
+        return Ok(None);
+    };
+    let keys = iter_values_with_vm(vm, keys_value)?;
+    let get_item =
+        resolve_special_method(source, "__getitem__").map_err(runtime_error_to_builtin_error)?;
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        entries.push((key, invoke_bound_method_with_arg(vm, &get_item, key)?));
+    }
+    Ok(Some(entries))
+}
+
 #[inline]
 fn runtime_error_to_builtin_error(err: crate::error::RuntimeError) -> BuiltinError {
-    let display = err.to_string();
-    let is_attribute_error = err.is_attribute_error();
-    match err.kind {
-        RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
-        RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
-            format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
-        ),
-        RuntimeErrorKind::NotCallable { type_name } => {
-            BuiltinError::TypeError(format!("'{}' object is not callable", type_name))
-        }
-        RuntimeErrorKind::NotIterable { type_name } => {
-            BuiltinError::TypeError(format!("'{}' object is not iterable", type_name))
-        }
-        RuntimeErrorKind::NotSubscriptable { type_name } => {
-            BuiltinError::TypeError(format!("'{}' object is not subscriptable", type_name))
-        }
-        RuntimeErrorKind::AttributeError { type_name, attr } => BuiltinError::AttributeError(
-            format!("'{}' object has no attribute '{}'", type_name, attr),
-        ),
-        RuntimeErrorKind::Exception { message, .. } if is_attribute_error => {
-            BuiltinError::AttributeError(message.to_string())
-        }
-        RuntimeErrorKind::KeyError { key } => BuiltinError::KeyError(key.to_string()),
-        RuntimeErrorKind::IndexError { index, length } => {
-            BuiltinError::IndexError(format!("index {index} out of range for length {length}"))
-        }
-        RuntimeErrorKind::ValueError { message } => BuiltinError::ValueError(message.to_string()),
-        RuntimeErrorKind::OverflowError { message } => {
-            BuiltinError::OverflowError(message.to_string())
-        }
-        RuntimeErrorKind::StopIteration => BuiltinError::StopIteration,
-        _ => BuiltinError::TypeError(display),
-    }
+    super::runtime_error_to_builtin_error(err)
 }
 
 fn dict_item_to_pair(item: Value, index: usize) -> Result<(Value, Value), BuiltinError> {
@@ -864,6 +861,14 @@ pub(crate) fn call_builtin_type_with_vm(
                     }
                     return Ok(to_object_value(copy));
                 }
+            }
+
+            if let Some(entries) = mapping_entries_with_vm(vm, args[0])? {
+                let mut dict = DictObject::with_capacity(entries.len());
+                for (key, value) in entries {
+                    dict.set(key, value);
+                }
+                return Ok(to_object_value(dict));
             }
 
             let mut dict = DictObject::new();
@@ -1896,9 +1901,7 @@ pub(crate) fn builtin_int_to_bytes(
         .unwrap_or(false);
 
     let bytes = encode_bigint_to_bytes(&value, length, byteorder, signed)?;
-    Ok(Value::object_ptr(
-        Box::into_raw(Box::new(BytesObject::from_vec(bytes))) as *const (),
-    ))
+    Ok(crate::alloc_managed_value(BytesObject::from_vec(bytes)))
 }
 
 fn int_from_bytes_receiver_type(receiver: Value) -> Result<TypeId, BuiltinError> {

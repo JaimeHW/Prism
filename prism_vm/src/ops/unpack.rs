@@ -12,6 +12,8 @@ use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
+use prism_runtime::types::list::ListObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
@@ -48,6 +50,41 @@ fn keyword_key_to_name(key: Value) -> Result<Arc<str>, RuntimeError> {
     ))
 }
 
+fn read_unpack_flags(vm: &mut VirtualMachine, op_name: &'static str) -> Result<u32, RuntimeError> {
+    let ext_inst = vm.current_frame_mut().fetch();
+    if ext_inst.opcode() != Opcode::CallKwEx as u8 {
+        return Err(RuntimeError::internal(format!(
+            "{op_name}: missing extension instruction"
+        )));
+    }
+
+    Ok(ext_inst.dst().0 as u32
+        | ((ext_inst.src1().0 as u32) << 8)
+        | ((ext_inst.src2().0 as u32) << 16))
+}
+
+fn collect_unpack_sources(
+    vm: &mut VirtualMachine,
+    base: u8,
+    count: u8,
+    unpack_flags: u32,
+) -> Result<SmallVec<[Value; 16]>, RuntimeError> {
+    let mut result: SmallVec<[Value; 16]> = SmallVec::new();
+
+    for i in 0..count {
+        let value = vm.current_frame().get_reg(base + i);
+
+        if (unpack_flags & (1 << i)) != 0 {
+            let values = collect_iterable_values(vm, value)?;
+            result.extend(values);
+        } else {
+            result.push(value);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Handle BuildTupleUnpack opcode.
 ///
 /// Format: [BuildTupleUnpack][dst][base][count] + [CallKwEx][flags_lo][flags_mid][flags_hi]
@@ -60,43 +97,14 @@ pub fn build_tuple_unpack(vm: &mut VirtualMachine, inst: Instruction) -> Control
     let base = inst.src1().0;
     let count = inst.src2().0;
 
-    // Read extension instruction to get unpack flags
-    let ext_inst = vm.current_frame_mut().fetch();
-
-    // Verify extension is CallKwEx (used for extension bytes)
-    if ext_inst.opcode() != Opcode::CallKwEx as u8 {
-        return ControlFlow::Error(RuntimeError::internal(
-            "BuildTupleUnpack: missing extension instruction",
-        ));
-    }
-
-    // Extract 24-bit unpack flags
-    let unpack_flags: u32 = ext_inst.dst().0 as u32
-        | ((ext_inst.src1().0 as u32) << 8)
-        | ((ext_inst.src2().0 as u32) << 16);
-
-    // Collect values into result tuple
-    let mut result: SmallVec<[Value; 16]> = SmallVec::new();
-
-    for i in 0..count {
-        let src_reg = base + i;
-        let value = vm.current_frame().get_reg(src_reg);
-
-        let should_unpack = (unpack_flags & (1 << i)) != 0;
-
-        if should_unpack {
-            let values = match collect_iterable_values(vm, value) {
-                Ok(values) => values,
-                Err(err) => return ControlFlow::Error(err),
-            };
-            for item in values {
-                result.push(item);
-            }
-        } else {
-            // Regular value - add directly
-            result.push(value);
-        }
-    }
+    let unpack_flags = match read_unpack_flags(vm, "BuildTupleUnpack") {
+        Ok(flags) => flags,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    let result = match collect_unpack_sources(vm, base, count, unpack_flags) {
+        Ok(values) => values,
+        Err(err) => return ControlFlow::Error(err),
+    };
 
     // Create result tuple
     let tuple = TupleObject::from_vec(result.to_vec());
@@ -106,6 +114,65 @@ pub fn build_tuple_unpack(vm: &mut VirtualMachine, inst: Instruction) -> Control
     // Store result
     vm.current_frame_mut().set_reg(dst, tuple_value);
 
+    ControlFlow::Continue
+}
+
+/// Handle BuildListUnpack opcode.
+pub fn build_list_unpack(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    let dst = inst.dst().0;
+    let base = inst.src1().0;
+    let count = inst.src2().0;
+
+    let unpack_flags = match read_unpack_flags(vm, "BuildListUnpack") {
+        Ok(flags) => flags,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    let values = match collect_unpack_sources(vm, base, count, unpack_flags) {
+        Ok(values) => values,
+        Err(err) => return ControlFlow::Error(err),
+    };
+
+    let list = ListObject::from_slice(&values);
+    let ptr = match vm.allocator().alloc(list) {
+        Some(ptr) => ptr as *const (),
+        None => {
+            return ControlFlow::Error(RuntimeError::internal(
+                "out of memory: failed to allocate list",
+            ));
+        }
+    };
+    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
+    ControlFlow::Continue
+}
+
+/// Handle BuildSetUnpack opcode.
+pub fn build_set_unpack(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    let dst = inst.dst().0;
+    let base = inst.src1().0;
+    let count = inst.src2().0;
+
+    let unpack_flags = match read_unpack_flags(vm, "BuildSetUnpack") {
+        Ok(flags) => flags,
+        Err(err) => return ControlFlow::Error(err),
+    };
+    let values = match collect_unpack_sources(vm, base, count, unpack_flags) {
+        Ok(values) => values,
+        Err(err) => return ControlFlow::Error(err),
+    };
+
+    let mut set = SetObject::new();
+    for value in values {
+        set.add(value);
+    }
+    let ptr = match vm.allocator().alloc(set) {
+        Some(ptr) => ptr as *const (),
+        None => {
+            return ControlFlow::Error(RuntimeError::internal(
+                "out of memory: failed to allocate set",
+            ));
+        }
+    };
+    vm.current_frame_mut().set_reg(dst, Value::object_ptr(ptr));
     ControlFlow::Continue
 }
 
@@ -121,20 +188,10 @@ pub fn build_dict_unpack(vm: &mut VirtualMachine, inst: Instruction) -> ControlF
     let base = inst.src1().0;
     let count = inst.src2().0;
 
-    // Read extension instruction to get unpack flags
-    let ext_inst = vm.current_frame_mut().fetch();
-
-    // Verify extension is CallKwEx
-    if ext_inst.opcode() != Opcode::CallKwEx as u8 {
-        return ControlFlow::Error(RuntimeError::internal(
-            "BuildDictUnpack: missing extension instruction",
-        ));
-    }
-
-    // Extract 24-bit unpack flags
-    let unpack_flags: u32 = ext_inst.dst().0 as u32
-        | ((ext_inst.src1().0 as u32) << 8)
-        | ((ext_inst.src2().0 as u32) << 16);
+    let unpack_flags = match read_unpack_flags(vm, "BuildDictUnpack") {
+        Ok(flags) => flags,
+        Err(err) => return ControlFlow::Error(err),
+    };
 
     // Create result dict
     let mut dict = DictObject::new();

@@ -64,6 +64,7 @@ pub mod osr_trigger;
 pub mod profiler;
 pub mod python_numeric;
 pub mod speculative;
+mod threading_runtime;
 pub mod truthiness;
 pub mod type_feedback;
 
@@ -103,6 +104,7 @@ pub use jit_context::{JitConfig, JitContext, JitStats, ProcessedResult};
 pub use jit_dispatch::{DispatchResult, DispatchStats};
 pub use jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
 pub use osr_trigger::{LoopInfo, OsrDecision, OsrTrigger};
+pub(crate) use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box as alloc_managed_value;
 pub use profiler::{CodeId, Profiler, TierUpDecision};
 pub use vm::VirtualMachine;
 

@@ -101,6 +101,9 @@ pub struct PrismArgs {
     /// `-E`: Ignore `PYTHON*` environment variables.
     pub ignore_environment: bool,
 
+    /// `-I`: Run in isolated mode (implies `-E` and `-s`).
+    pub isolated: bool,
+
     /// `-s`: Don't add user site-packages to `sys.path`.
     pub no_user_site: bool,
 
@@ -129,6 +132,7 @@ impl Default for PrismArgs {
             optimize: OptimizationLevel::None,
             dont_write_bytecode: false,
             ignore_environment: false,
+            isolated: false,
             no_user_site: false,
             no_site: false,
             warnings: Vec::new(),
@@ -340,6 +344,11 @@ pub fn parse_args_vec(args: &[String]) -> Result<PrismArgs, ArgError> {
                 }
                 'B' => result.dont_write_bytecode = true,
                 'E' => result.ignore_environment = true,
+                'I' => {
+                    result.isolated = true;
+                    result.ignore_environment = true;
+                    result.no_user_site = true;
+                }
                 's' => result.no_user_site = true,
                 'S' => result.no_site = true,
                 'd' => result.debug = true,
@@ -401,6 +410,7 @@ Options (and corresponding environment variables):
 -d     : turn on parser debugging output
 -E     : ignore PYTHON* environment variables
 -h     : print this help message and exit (also --help)
+-I     : isolate Prism from the user's environment (implies -E and -s)
 -i     : inspect interactively after running script (PYTHONINSPECT=x)
 -m mod : run library module as a script (terminates option list)
 -O     : remove assert and __debug__-dependent statements; add .opt-1 before
@@ -627,6 +637,14 @@ mod tests {
     }
 
     #[test]
+    fn test_isolated_mode_implies_environment_and_user_site_isolation() {
+        let result = parse(&["-I"]).unwrap();
+        assert!(result.isolated);
+        assert!(result.ignore_environment);
+        assert!(result.no_user_site);
+    }
+
+    #[test]
     fn test_no_user_site() {
         let result = parse(&["-s"]).unwrap();
         assert!(result.no_user_site);
@@ -764,10 +782,12 @@ mod tests {
 
     #[test]
     fn test_bundled_verbose_and_others() {
-        let result = parse(&["-vvBE"]).unwrap();
+        let result = parse(&["-vvBEI"]).unwrap();
         assert_eq!(result.verbose, 2);
         assert!(result.dont_write_bytecode);
         assert!(result.ignore_environment);
+        assert!(result.isolated);
+        assert!(result.no_user_site);
     }
 
     // =========================================================================
@@ -919,6 +939,7 @@ mod tests {
         assert!(ht.contains("-u"));
         assert!(ht.contains("-B"));
         assert!(ht.contains("-E"));
+        assert!(ht.contains("-I"));
         assert!(ht.contains("-O"));
         assert!(ht.contains("-W arg"));
         assert!(ht.contains("-X opt"));
@@ -986,6 +1007,7 @@ mod tests {
         assert_eq!(d.optimize, OptimizationLevel::None);
         assert!(!d.dont_write_bytecode);
         assert!(!d.ignore_environment);
+        assert!(!d.isolated);
         assert!(!d.no_user_site);
         assert!(!d.no_site);
         assert!(d.warnings.is_empty());

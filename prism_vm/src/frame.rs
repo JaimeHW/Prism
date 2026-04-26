@@ -70,7 +70,7 @@ pub struct Frame {
     /// Bitset tracking which registers have been explicitly written.
     ///
     /// This lets the VM distinguish "never assigned" from an explicit
-    /// `None` value for local-slot backed namespaces such as class bodies.
+    /// `None` value for Python local-slot semantics.
     written_registers: [u64; REGISTER_WORD_COUNT],
 
     /// Number of registers that must be cleared before reusing this frame.
@@ -455,6 +455,15 @@ impl Frame {
         self.written_registers[word] &= !(1u64 << bit);
     }
 
+    /// Mark a register as logically assigned without changing its value.
+    #[inline(always)]
+    pub fn mark_reg_written(&mut self, reg: u8) {
+        let reg_idx = reg as usize;
+        let word = reg_idx / 64;
+        let bit = reg_idx % 64;
+        self.written_registers[word] |= 1u64 << bit;
+    }
+
     #[inline(always)]
     pub fn snapshot_register(&self, reg: u8) -> RegisterSnapshot {
         RegisterSnapshot {
@@ -692,6 +701,20 @@ mod tests {
         assert!(frame.get_reg(1).is_none());
         assert!(!frame.reg_is_written(0));
         assert!(!frame.reg_is_written(1));
+    }
+
+    #[test]
+    fn test_mark_reg_written_preserves_value() {
+        let code = Arc::new(CodeObject::new("test", "test.py"));
+        let mut frame = Frame::new(code, None, 0);
+
+        assert!(frame.get_reg(0).is_none());
+        assert!(!frame.reg_is_written(0));
+
+        frame.mark_reg_written(0);
+
+        assert!(frame.get_reg(0).is_none());
+        assert!(frame.reg_is_written(0));
     }
 
     #[test]

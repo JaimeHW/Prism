@@ -3,7 +3,7 @@
 //! Provides access to stdin, stdout, stderr with buffering
 //! and encoding support.
 
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::sync::{Arc, LazyLock, Mutex};
 
 // =============================================================================
@@ -94,6 +94,37 @@ impl StandardStreams {
         Ok(line)
     }
 
+    /// Read bytes from stdin.
+    pub fn read_bytes(&self, count: Option<usize>) -> io::Result<Vec<u8>> {
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin lock poisoned"))?;
+        let mut buffer = Vec::new();
+        match count {
+            Some(limit) => {
+                buffer.resize(limit, 0);
+                let read = guard.read(&mut buffer)?;
+                buffer.truncate(read);
+            }
+            None => {
+                guard.read_to_end(&mut buffer)?;
+            }
+        }
+        Ok(buffer)
+    }
+
+    /// Read a binary line from stdin.
+    pub fn read_line_bytes(&self) -> io::Result<Vec<u8>> {
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin lock poisoned"))?;
+        let mut line = Vec::new();
+        guard.read_until(b'\n', &mut line)?;
+        Ok(line)
+    }
+
     /// Write to stdout.
     pub fn write_stdout(&self, data: &str) -> io::Result<()> {
         let mut guard = self
@@ -101,6 +132,17 @@ impl StandardStreams {
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout lock poisoned"))?;
         guard.write_all(data.as_bytes())?;
+        Ok(())
+    }
+
+    /// Write raw bytes to stdout.
+    pub fn write_stdout_bytes(&self, data: &[u8]) -> io::Result<()> {
+        let mut guard = self
+            .stdout
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout lock poisoned"))?;
+        guard.write_all(data)?;
+        guard.flush()?;
         Ok(())
     }
 
@@ -131,6 +173,17 @@ impl StandardStreams {
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "stderr lock poisoned"))?;
         guard.write_all(data.as_bytes())?;
+        Ok(())
+    }
+
+    /// Write raw bytes to stderr.
+    pub fn write_stderr_bytes(&self, data: &[u8]) -> io::Result<()> {
+        let mut guard = self
+            .stderr
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stderr lock poisoned"))?;
+        guard.write_all(data)?;
+        guard.flush()?;
         Ok(())
     }
 

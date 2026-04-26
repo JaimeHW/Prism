@@ -385,11 +385,18 @@ pub(crate) fn forget_tracked_pipe_handle(handle: i64) {
 }
 
 #[cfg(windows)]
-fn take_pipe_duplicate_source(duplicate_handle: i64) -> Option<i64> {
+fn take_pipe_duplicate_source_for_parent_close(
+    duplicate_handle: i64,
+    preserved_sources: &[i64],
+) -> Option<i64> {
     let mut state = PIPE_HANDLE_STATE
         .lock()
         .expect("_winapi pipe handle state mutex poisoned");
-    let source_handle = state.duplicate_sources.remove(&duplicate_handle)?;
+    let source_handle = *state.duplicate_sources.get(&duplicate_handle)?;
+    if preserved_sources.contains(&source_handle) {
+        return None;
+    }
+    state.duplicate_sources.remove(&duplicate_handle);
     state.handles.remove(&source_handle);
     state
         .duplicate_sources
@@ -398,8 +405,10 @@ fn take_pipe_duplicate_source(duplicate_handle: i64) -> Option<i64> {
 }
 
 #[cfg(windows)]
-fn close_parent_pipe_source_for_duplicate(duplicate_handle: i64) {
-    let Some(source_handle) = take_pipe_duplicate_source(duplicate_handle) else {
+fn close_parent_pipe_source_for_duplicate(duplicate_handle: i64, preserved_sources: &[i64]) {
+    let Some(source_handle) =
+        take_pipe_duplicate_source_for_parent_close(duplicate_handle, preserved_sources)
+    else {
         return;
     };
     let _ = unsafe { CloseHandle(handle_from_i64(source_handle)) };
@@ -410,12 +419,13 @@ fn close_parent_pipe_sources_for_startup(startup: StartupInfoConfig) {
     if startup.dw_flags & STARTF_USESTDHANDLES_FLAG == 0 {
         return;
     }
-    for handle in [
+    let startup_handles = [
         startup.h_std_input,
         startup.h_std_output,
         startup.h_std_error,
-    ] {
-        close_parent_pipe_source_for_duplicate(handle);
+    ];
+    for handle in startup_handles {
+        close_parent_pipe_source_for_duplicate(handle, &startup_handles);
     }
 }
 
@@ -440,7 +450,7 @@ fn pipe_handle_is_tracked_for_test(handle: i64) -> bool {
 
 #[inline]
 fn tuple_value(items: Vec<Value>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(TupleObject::from_vec(items))) as *const ())
+    crate::alloc_managed_value(TupleObject::from_vec(items))
 }
 
 fn wide_null_terminated(text: &str, context: &str) -> Result<Vec<u16>, BuiltinError> {
@@ -1199,6 +1209,74 @@ mod tests {
             matches!(source_write_close, Err(BuiltinError::OSError(_))),
             "CreateProcess should close the original pipe write source after duplicating it"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_startup_cleanup_preserves_chained_duplicate_stdout_handles() {
+        let _guard = WINAPI_TEST_LOCK
+            .lock()
+            .expect("_winapi test lock should not be poisoned");
+        let current_process =
+            winapi_get_current_process(&[]).expect("current process handle should be available");
+        let pipe = winapi_create_pipe(&[Value::none(), Value::int(0).expect("size should fit")])
+            .expect("CreatePipe should allocate a Windows pipe");
+        let pipe = unsafe { &*(pipe.as_object_ptr().unwrap() as *const TupleObject) };
+        let source_read = pipe.as_slice()[0];
+        let source_write = pipe.as_slice()[1];
+
+        let duplicate_stdout = winapi_duplicate_handle(&[
+            current_process,
+            source_write,
+            current_process,
+            Value::int(0).expect("desired access should fit"),
+            Value::bool(true),
+            Value::int(i64::from(DUPLICATE_SAME_ACCESS)).expect("duplicate option should fit"),
+        ])
+        .expect("stdout pipe handle should duplicate");
+        let duplicate_stderr = winapi_duplicate_handle(&[
+            current_process,
+            duplicate_stdout,
+            current_process,
+            Value::int(0).expect("desired access should fit"),
+            Value::bool(true),
+            Value::int(i64::from(DUPLICATE_SAME_ACCESS)).expect("duplicate option should fit"),
+        ])
+        .expect("stderr=STDOUT pipe handle should duplicate from stdout duplicate");
+
+        let source_write_handle =
+            value_to_i64(source_write).expect("source write handle should be integer-backed");
+        let duplicate_stdout_handle = value_to_i64(duplicate_stdout)
+            .expect("duplicate stdout handle should be integer-backed");
+        let duplicate_stderr_handle = value_to_i64(duplicate_stderr)
+            .expect("duplicate stderr handle should be integer-backed");
+        assert_eq!(
+            pipe_duplicate_source_for_test(duplicate_stdout_handle),
+            Some(source_write_handle)
+        );
+        assert_eq!(
+            pipe_duplicate_source_for_test(duplicate_stderr_handle),
+            Some(duplicate_stdout_handle)
+        );
+
+        close_parent_pipe_sources_for_startup(StartupInfoConfig {
+            dw_flags: STARTF_USESTDHANDLES_FLAG,
+            h_std_input: 0,
+            h_std_output: duplicate_stdout_handle,
+            h_std_error: duplicate_stderr_handle,
+            w_show_window: 0,
+        });
+
+        let source_write_close = winapi_close_handle(&[source_write]);
+        assert!(
+            matches!(source_write_close, Err(BuiltinError::OSError(_))),
+            "startup cleanup should close the original stdout pipe source"
+        );
+        winapi_close_handle(&[duplicate_stdout])
+            .expect("stdout startup duplicate must remain owned by subprocess cleanup");
+        winapi_close_handle(&[duplicate_stderr])
+            .expect("stderr startup duplicate must remain owned by subprocess cleanup");
+        winapi_close_handle(&[source_read]).expect("source read handle should close");
     }
 
     #[test]

@@ -506,7 +506,7 @@ fn code_co_positions(args: &[Value]) -> Result<Value, BuiltinError> {
                     optional_u32_to_value(col_offset),
                     optional_u32_to_value(end_col_offset),
                 ]);
-                Value::object_ptr(Box::into_raw(Box::new(tuple)) as *const ())
+                crate::alloc_managed_value(tuple)
             },
         )
         .collect();
@@ -841,6 +841,13 @@ fn builtin_function_display_name(name: &str) -> &str {
 }
 
 #[inline]
+fn builtin_function_module_name(name: &str) -> &str {
+    name.rsplit_once('.')
+        .map(|(module, _)| module)
+        .unwrap_or("builtins")
+}
+
+#[inline]
 pub(crate) fn builtin_function_attr_value(
     builtin: &BuiltinFunctionObject,
     name: &InternedString,
@@ -850,6 +857,9 @@ pub(crate) fn builtin_function_attr_value(
             builtin.name(),
         )))),
         "__qualname__" => Some(Value::string(intern(builtin.name()))),
+        "__module__" => Some(Value::string(intern(builtin_function_module_name(
+            builtin.name(),
+        )))),
         "__doc__" => Some(Value::none()),
         "__self__" => Some(builtin.bound_self().unwrap_or_else(Value::none)),
         _ => None,
@@ -1843,6 +1853,22 @@ fn exception_arg_or_message(exception: &ExceptionValue, index: usize) -> Value {
         .unwrap_or_else(Value::none)
 }
 
+#[inline]
+fn exception_link_ptr(
+    value: Value,
+    attr_name: &'static str,
+) -> Result<Option<*const ExceptionValue>, RuntimeError> {
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    unsafe { ExceptionValue::from_value(value) }
+        .map(|exception| Some(exception as *const ExceptionValue))
+        .ok_or_else(|| {
+            RuntimeError::type_error(format!("{attr_name} must be an exception or None"))
+        })
+}
+
 pub(crate) fn set_attribute_value(
     vm: &mut VirtualMachine,
     obj: Value,
@@ -1897,11 +1923,47 @@ pub(crate) fn set_attribute_value(
                     "__traceback__" => exc
                         .replace_traceback(value)
                         .map_err(RuntimeError::type_error),
+                    "__cause__" => {
+                        exc.cause = exception_link_ptr(value, "__cause__")?;
+                        exc.flags = if exc.cause.is_some() {
+                            exc.flags.with(ExceptionFlags::HAS_CAUSE)
+                        } else {
+                            exc.flags.without(ExceptionFlags::HAS_CAUSE)
+                        }
+                        .with(ExceptionFlags::SUPPRESS_CONTEXT);
+                        Ok(())
+                    }
+                    "__context__" => {
+                        exc.context = exception_link_ptr(value, "__context__")?;
+                        Ok(())
+                    }
+                    "__suppress_context__" => {
+                        let Some(suppress) = value.as_bool() else {
+                            return Err(RuntimeError::type_error(
+                                "__suppress_context__ must be a bool",
+                            ));
+                        };
+                        exc.flags = if suppress {
+                            exc.flags.with(ExceptionFlags::SUPPRESS_CONTEXT)
+                        } else {
+                            exc.flags.without(ExceptionFlags::SUPPRESS_CONTEXT)
+                        };
+                        Ok(())
+                    }
                     _ => Err(RuntimeError::attribute_error(
                         exc.type_name(),
                         name.as_str(),
                     )),
                 }
+            }
+            TypeId::TRACEBACK => {
+                let next = match name.as_str() {
+                    "tb_next" => normalize_traceback_next_assignment(ptr, value)?,
+                    _ => return Err(RuntimeError::attribute_error("traceback", name.as_str())),
+                };
+                let traceback = unsafe { &mut *(ptr as *mut TracebackViewObject) };
+                traceback.set_next(next);
+                Ok(())
             }
             TypeId::TYPE => {
                 let Some(class) = class_object_from_type_ptr(ptr) else {
@@ -1977,6 +2039,46 @@ pub(crate) fn set_attribute_value(
         type_name,
         format!("'{}' object has no attribute '{}'", type_name, name),
     ))
+}
+
+fn normalize_traceback_next_assignment(
+    target_ptr: *const (),
+    value: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    let Some(candidate_ptr) = value.as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "tb_next must be a traceback object or None",
+        ));
+    };
+    if extract_type_id(candidate_ptr) != TypeId::TRACEBACK {
+        return Err(RuntimeError::type_error(
+            "tb_next must be a traceback object or None",
+        ));
+    }
+
+    let mut cursor = Some(value);
+    let mut seen = Vec::new();
+    while let Some(traceback_value) = cursor {
+        let Some(traceback_ptr) = traceback_value.as_object_ptr() else {
+            break;
+        };
+        if traceback_ptr == target_ptr {
+            return Err(RuntimeError::value_error("traceback loop detected"));
+        }
+        if seen.contains(&traceback_ptr) {
+            break;
+        }
+        seen.push(traceback_ptr);
+
+        let traceback = unsafe { &*(traceback_ptr as *const TracebackViewObject) };
+        cursor = traceback.next().filter(|next| !next.is_none());
+    }
+
+    Ok(Some(value))
 }
 
 pub(crate) fn delete_attribute_value(
@@ -2235,6 +2337,22 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
 
         match type_id {
+            TypeId::DEQUE => {
+                let deque = unsafe { &*(ptr as *const DequeObject) };
+                if let Some(idx) = key.as_int() {
+                    let Some(index) = isize::try_from(idx).ok() else {
+                        return ControlFlow::Error(RuntimeError::index_error(idx, deque.len()));
+                    };
+                    if let Some(value) = deque.deque().get(index) {
+                        frame.set_reg(dst, *value);
+                        ControlFlow::Continue
+                    } else {
+                        ControlFlow::Error(RuntimeError::index_error(idx, deque.len()))
+                    }
+                } else {
+                    ControlFlow::Error(RuntimeError::type_error("deque indices must be integers"))
+                }
+            }
             TypeId::DICT => {
                 let dict = unsafe { &*(ptr as *const DictObject) };
                 if let Some(val) = dict.get(key) {
@@ -2540,7 +2658,7 @@ mod tests {
         SubclassBitmap, builtin_class_mro, class_id_to_type_id, register_global_class,
     };
     use prism_runtime::object::type_obj::TypeId;
-    use prism_runtime::object::views::{CodeObjectView, FrameViewObject};
+    use prism_runtime::object::views::{CodeObjectView, FrameViewObject, TracebackViewObject};
     use prism_runtime::types::Cell;
     use prism_runtime::types::dict::DictObject;
     use prism_runtime::types::function::FunctionObject;
@@ -4149,6 +4267,71 @@ mod tests {
             drop_boxed(frame_ptr);
             drop_boxed(globals_ptr);
             drop_boxed(locals_ptr);
+        }
+    }
+
+    #[test]
+    fn test_set_attr_allows_traceback_next_truncation() {
+        let (next_value, next_ptr) =
+            boxed_value(TracebackViewObject::new(Value::none(), None, 20, 0));
+        let (traceback_value, traceback_ptr) = boxed_value(TracebackViewObject::new(
+            Value::none(),
+            Some(next_value),
+            10,
+            0,
+        ));
+        let mut vm = vm_with_frame();
+
+        assert_eq!(
+            get_attribute_value(&mut vm, traceback_value, &intern("tb_next"))
+                .expect("tb_next should be readable"),
+            next_value
+        );
+
+        set_attribute_value(&mut vm, traceback_value, &intern("tb_next"), Value::none())
+            .expect("tb_next should accept None for traceback truncation");
+
+        assert!(
+            get_attribute_value(&mut vm, traceback_value, &intern("tb_next"))
+                .expect("tb_next should remain readable")
+                .is_none()
+        );
+
+        unsafe {
+            drop_boxed(traceback_ptr);
+            drop_boxed(next_ptr);
+        }
+    }
+
+    #[test]
+    fn test_set_attr_validates_traceback_next() {
+        let (traceback_value, traceback_ptr) =
+            boxed_value(TracebackViewObject::new(Value::none(), None, 10, 0));
+        let mut vm = vm_with_frame();
+
+        let non_traceback_err = set_attribute_value(
+            &mut vm,
+            traceback_value,
+            &intern("tb_next"),
+            Value::int(1).unwrap(),
+        )
+        .expect_err("tb_next should reject non-traceback values");
+        assert!(matches!(
+            non_traceback_err.kind,
+            RuntimeErrorKind::TypeError { .. }
+        ));
+
+        let loop_err = set_attribute_value(
+            &mut vm,
+            traceback_value,
+            &intern("tb_next"),
+            traceback_value,
+        )
+        .expect_err("tb_next should reject loops");
+        assert!(matches!(loop_err.kind, RuntimeErrorKind::ValueError { .. }));
+
+        unsafe {
+            drop_boxed(traceback_ptr);
         }
     }
 

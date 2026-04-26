@@ -68,12 +68,8 @@ macro_rules! itertools_stub {
 static COUNT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("itertools.count"), builtin_count));
 itertools_stub!(CYCLE_FUNCTION, builtin_cycle, "itertools.cycle", "cycle");
-itertools_stub!(
-    REPEAT_FUNCTION,
-    builtin_repeat,
-    "itertools.repeat",
-    "repeat"
-);
+static REPEAT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("itertools.repeat"), builtin_repeat));
 itertools_stub!(
     ACCUMULATE_FUNCTION,
     builtin_accumulate,
@@ -293,6 +289,34 @@ fn builtin_count(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(iterator_value(iter))
 }
 
+fn builtin_repeat(args: &[Value]) -> Result<Value, BuiltinError> {
+    match args.len() {
+        0 => {
+            return Err(BuiltinError::TypeError(
+                "repeat expected at least 1 argument, got 0".to_string(),
+            ));
+        }
+        1 | 2 => {}
+        given => {
+            return Err(BuiltinError::TypeError(format!(
+                "repeat expected at most 2 arguments, got {given}"
+            )));
+        }
+    }
+
+    let remaining = match args.get(1).copied() {
+        Some(value) => {
+            let raw = value_to_i64(value).ok_or_else(|| {
+                BuiltinError::TypeError("repeat count must be an integer".to_string())
+            })?;
+            Some(usize::try_from(raw.max(0)).unwrap_or(usize::MAX))
+        }
+        None => None,
+    };
+
+    Ok(iterator_value(IteratorObject::repeat(args[0], remaining)))
+}
+
 fn builtin_chain(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     let mut iterators = Vec::with_capacity(args.len());
     for iterable in args {
@@ -449,6 +473,43 @@ mod mod_tests {
 
         assert!(iter.next().is_none());
         assert!(iter.is_exhausted());
+    }
+
+    #[test]
+    fn test_builtin_repeat_yields_bounded_repeated_values_lazily() {
+        let iter_value = builtin_repeat(&[Value::string(intern("tick")), Value::int_unchecked(3)])
+            .expect("repeat() should accept object and count");
+        let iter = get_iterator_mut(&iter_value).expect("repeat() should return an iterator");
+
+        assert_eq!(iter.size_hint(), Some(3));
+        for expected_remaining in [2, 1, 0] {
+            let value = iter.next().expect("repeat() should yield requested values");
+            assert_eq!(value, Value::string(intern("tick")));
+            assert_eq!(iter.size_hint(), Some(expected_remaining));
+        }
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_builtin_repeat_negative_count_is_empty() {
+        let iter_value = builtin_repeat(&[Value::int_unchecked(7), Value::int_unchecked(-5)])
+            .expect("repeat() should clamp negative counts to zero");
+        let iter = get_iterator_mut(&iter_value).expect("repeat() should return an iterator");
+
+        assert_eq!(iter.size_hint(), Some(0));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_builtin_repeat_without_count_is_unbounded() {
+        let iter_value =
+            builtin_repeat(&[Value::int_unchecked(4)]).expect("repeat() should allow no count");
+        let iter = get_iterator_mut(&iter_value).expect("repeat() should return an iterator");
+
+        assert_eq!(iter.size_hint(), None);
+        assert_eq!(iter.next().unwrap().as_int(), Some(4));
+        assert_eq!(iter.next().unwrap().as_int(), Some(4));
+        assert!(!iter.is_exhausted());
     }
 
     #[test]

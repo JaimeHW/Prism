@@ -5,6 +5,7 @@
 //! stdlib fast paths (`B`, `b`, `c`, `H`, `h`, `I`, `i`, `L`, `l`, `Q`, `q`)
 //! and keeps the original exported object for `memoryview.obj`.
 
+use crate::allocation_context::alloc_value_in_current_heap_or_box;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::bytes::BytesObject;
@@ -332,9 +333,7 @@ impl MemoryViewObject {
             }
             MemoryViewFormat::Char => {
                 let bytes = BytesObject::from_slice(&[chunk[0]]);
-                Some(Value::object_ptr(
-                    Box::into_raw(Box::new(bytes)) as *const ()
-                ))
+                Some(alloc_value_in_current_heap_or_box(bytes))
             }
             MemoryViewFormat::UnsignedShort => {
                 Some(Value::int_unchecked(i64::from(u16::from_ne_bytes([
@@ -435,7 +434,9 @@ fn shape_element_count(shape: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocation_context::RuntimeHeapBinding;
     use prism_core::Value;
+    use prism_gc::heap::GcHeap;
 
     #[test]
     fn test_unsigned_byte_view_indexes_and_slices() {
@@ -466,6 +467,24 @@ mod tests {
         assert_eq!(view.len(), 2);
         assert_eq!(view.get(0).and_then(|value| value.as_int()), Some(7));
         assert_eq!(view.get(-1).and_then(|value| value.as_int()), Some(11));
+    }
+
+    #[test]
+    fn test_char_view_decodes_bytes_into_bound_heap() {
+        let heap = GcHeap::with_defaults();
+        let _binding = RuntimeHeapBinding::register(&heap);
+        let view = MemoryViewObject::from_bytes(Value::none(), b"abc", true)
+            .cast(MemoryViewFormat::Char)
+            .expect("byte length is divisible by char itemsize");
+
+        let value = view.get(0).expect("char view should decode one-byte bytes");
+        let ptr = value
+            .as_object_ptr()
+            .expect("char view should decode to a bytes object");
+        let bytes = unsafe { &*(ptr as *const BytesObject) };
+
+        assert!(heap.contains(ptr));
+        assert_eq!(bytes.as_bytes(), b"a");
     }
 
     #[test]

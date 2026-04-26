@@ -87,8 +87,7 @@ impl SysArgv {
             .map(|arg| Value::string(intern(arg.as_ref())))
             .collect();
         let list = ListObject::from_slice(&values);
-        let ptr = Box::into_raw(Box::new(list)) as *const ();
-        Value::object_ptr(ptr)
+        crate::alloc_managed_value(list)
     }
 }
 

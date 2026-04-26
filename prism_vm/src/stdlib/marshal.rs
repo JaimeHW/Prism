@@ -96,7 +96,7 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 
 #[inline]
 fn bytes_value(value: &[u8]) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(BytesObject::from_slice(value))) as *const ())
+    crate::alloc_managed_value(BytesObject::from_slice(value))
 }
 
 fn marshal_dumps(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -556,15 +556,11 @@ fn decode_value(reader: &mut MarshalReader<'_>) -> Result<Value, BuiltinError> {
             for _ in 0..len {
                 values.push(decode_value(reader)?);
             }
-            Ok(Value::object_ptr(
-                Box::into_raw(Box::new(TupleObject::from_slice(&values))) as *const (),
-            ))
+            Ok(crate::alloc_managed_value(TupleObject::from_slice(&values)))
         }
         TYPE_CODE => {
             let code = decode_code_object(reader)?;
-            Ok(Value::object_ptr(
-                Box::into_raw(Box::new(CodeObjectView::new(code))) as *const (),
-            ))
+            Ok(crate::alloc_managed_value(CodeObjectView::new(code)))
         }
         _ => Err(BuiltinError::ValueError(
             "bad marshal data (unknown type code)".to_string(),
@@ -708,8 +704,8 @@ fn decode_code_constant(
             for _ in 0..len {
                 names.push(reader.read_string()?);
             }
-            Ok(Constant::Value(Value::object_ptr(
-                Box::into_raw(Box::new(KwNamesTuple::new(names))) as *const (),
+            Ok(Constant::Value(crate::alloc_managed_value(
+                KwNamesTuple::new(names),
             )))
         }
         _ => {

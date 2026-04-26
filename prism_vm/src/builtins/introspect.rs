@@ -16,6 +16,10 @@ use crate::VirtualMachine;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::import::ModuleObject;
 use crate::ops::attribute::is_user_defined_type;
+use crate::ops::objects::{
+    alloc_heap_value, get_attribute_value, snapshot_current_globals_dict,
+    snapshot_frame_locals_dict,
+};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::object::class::PyClassObject;
@@ -203,7 +207,7 @@ fn value_owner_type_id(value: Value) -> Option<TypeId> {
 fn dir_from_names(mut names: Vec<InternedString>) -> Result<Value, BuiltinError> {
     names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     let list = ListObject::from_iter(names.into_iter().map(Value::string));
-    Ok(Value::object_ptr(Box::into_raw(Box::new(list)) as *const ()))
+    Ok(crate::alloc_managed_value(list))
 }
 
 #[inline]
@@ -424,6 +428,31 @@ pub fn builtin_vars(args: &[Value]) -> Result<Value, BuiltinError> {
     ))
 }
 
+/// VM-aware `vars([object])` implementation.
+///
+/// This returns the same live namespace object exposed by `obj.__dict__`.
+/// With no argument it follows CPython and delegates to `locals()`.
+pub fn builtin_vars_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "vars() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    if args.is_empty() {
+        return builtin_locals_vm(vm, args);
+    }
+
+    get_attribute_value(vm, args[0], &intern("__dict__")).map_err(|err| {
+        if err.is_attribute_error() {
+            BuiltinError::TypeError("vars() argument must have __dict__ attribute".to_string())
+        } else {
+            super::runtime_error_to_builtin_error(err)
+        }
+    })
+}
+
 // =============================================================================
 // globals() - Global Symbol Table
 // =============================================================================
@@ -450,6 +479,36 @@ pub fn builtin_globals(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::NotImplemented(
         "globals() requires frame introspection".to_string(),
     ))
+}
+
+/// VM-aware `globals()` implementation.
+///
+/// Module-backed frames return the module's live dictionary, so mutations made
+/// through the returned object are immediately visible to global name lookup.
+pub fn builtin_globals_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "globals() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let module = vm
+        .current_frame()
+        .module
+        .as_ref()
+        .cloned()
+        .or_else(|| vm.current_module_cloned());
+    if let Some(module) = module {
+        return Ok(module.dict_value());
+    }
+
+    alloc_heap_value(
+        vm,
+        snapshot_current_globals_dict(vm),
+        "globals namespace dict",
+    )
+    .map_err(super::runtime_error_to_builtin_error)
 }
 
 // =============================================================================
@@ -479,6 +538,35 @@ pub fn builtin_locals(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::NotImplemented(
         "locals() requires frame introspection".to_string(),
     ))
+}
+
+/// VM-aware `locals()` implementation.
+///
+/// At module scope CPython returns the same dictionary as `globals()`. In
+/// function/class scopes without a live mapping, Prism returns a freshly
+/// materialized locals dictionary from the current frame's assigned locals.
+pub fn builtin_locals_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "locals() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let frame = vm.current_frame();
+    if let Some(mapping) = frame.locals_mapping() {
+        return Ok(mapping);
+    }
+
+    if frame.return_frame.is_none()
+        && let Some(module) = frame.module.as_ref().cloned()
+    {
+        return Ok(module.dict_value());
+    }
+
+    let locals = snapshot_frame_locals_dict(frame);
+    alloc_heap_value(vm, locals, "locals namespace dict")
+        .map_err(super::runtime_error_to_builtin_error)
 }
 
 // =============================================================================
@@ -1060,6 +1148,48 @@ import dataclasses
         assert!(result.is_err());
         match result {
             Err(BuiltinError::TypeError(_)) => {}
+            _ => panic!("Expected TypeError"),
+        }
+    }
+
+    #[test]
+    fn test_vars_vm_returns_live_module_dict() {
+        let mut vm = VirtualMachine::new();
+        let module = Arc::new(ModuleObject::new("vars_probe"));
+        module.set_attr("answer", Value::int(42).unwrap());
+        vm.import_resolver
+            .insert_module("vars_probe", Arc::clone(&module));
+
+        let dict_value =
+            builtin_vars_vm(&mut vm, &[module_value(&module)]).expect("module vars should work");
+        assert_eq!(
+            dict_value.as_object_ptr(),
+            module.dict_value().as_object_ptr()
+        );
+
+        let dict = crate::ops::objects::dict_storage_ref_from_ptr(
+            dict_value
+                .as_object_ptr()
+                .expect("vars(module) should return a dictionary"),
+        )
+        .expect("vars(module) should return dict storage");
+        assert_eq!(
+            dict.get(Value::string(intern("answer")))
+                .expect("module dict should expose attributes")
+                .as_int(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_vars_vm_rejects_objects_without_dict() {
+        let mut vm = VirtualMachine::new();
+        let result = builtin_vars_vm(&mut vm, &[Value::int(42).unwrap()]);
+        assert!(result.is_err());
+        match result {
+            Err(BuiltinError::TypeError(msg)) => {
+                assert!(msg.contains("__dict__"));
+            }
             _ => panic!("Expected TypeError"),
         }
     }

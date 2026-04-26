@@ -103,8 +103,9 @@ pub fn compile_source_module_with_namespace_mode(
     module_namespace_mode: ModuleNamespaceMode,
 ) -> Result<SourceCompilation, SourceCompileError> {
     let module = prism_parser::parse(source).map_err(SourceCompileError::Parse)?;
-    let code = Compiler::compile_module_with_namespace_mode(
+    let code = Compiler::compile_module_with_source_and_namespace_mode(
         &module,
+        source,
         filename,
         optimize,
         module_namespace_mode,
@@ -188,5 +189,37 @@ mod tests {
         .expect("dynamic locals compilation should succeed");
 
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_source_code_maps_byte_offsets_to_source_lines() {
+        let source = "\n\nclass C:\n    def run(self):\n        raise ValueError('x')\n";
+        let code = compile_source_code(source, "lineprobe.py", OptimizationLevel::None)
+            .expect("source compilation should succeed");
+
+        let class_code = code
+            .nested_code_objects
+            .first()
+            .expect("class body code object should be emitted");
+        let function_code = class_code
+            .nested_code_objects
+            .first()
+            .expect("method code object should be emitted");
+
+        assert_eq!(class_code.first_lineno, 3);
+        assert_eq!(function_code.first_lineno, 4);
+        assert!(
+            function_code.line_table.iter().any(|entry| entry.line == 5),
+            "method line table should point at the raise statement: {:?}",
+            function_code.line_table
+        );
+        assert!(
+            function_code
+                .line_table
+                .iter()
+                .all(|entry| entry.line < 100),
+            "byte offsets must not leak into line-table entries: {:?}",
+            function_code.line_table
+        );
     }
 }

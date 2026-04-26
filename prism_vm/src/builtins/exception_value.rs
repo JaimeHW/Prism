@@ -294,6 +294,12 @@ impl ExceptionValue {
         self.message.as_deref()
     }
 
+    /// Return the positional payload passed to the exception constructor.
+    #[inline]
+    pub fn args(&self) -> Option<&[Value]> {
+        self.args.as_deref()
+    }
+
     #[inline]
     pub fn import_name(&self) -> Option<&str> {
         self.import_details
@@ -547,6 +553,44 @@ impl ExceptionValue {
     }
 }
 
+pub(crate) fn exception_traceback_for_value(value: Value) -> Option<Value> {
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return exception.traceback();
+    }
+
+    heap_exception_instance_ref(value).and_then(|instance| {
+        instance
+            .get_property_interned(&EXCEPTION_TRACEBACK_ATTR)
+            .or_else(|| instance.get_property("__traceback__"))
+            .filter(|traceback| !traceback.is_none())
+    })
+}
+
+pub(crate) fn set_exception_traceback_for_value(
+    value: Value,
+    traceback: Value,
+) -> Result<bool, &'static str> {
+    let traceback = normalize_traceback_value(traceback)?;
+
+    if let Some(exception) = unsafe { ExceptionValue::from_value_mut(value) } {
+        match traceback {
+            Some(traceback) => exception.set_traceback(traceback),
+            None => exception.clear_traceback(),
+        }
+        return Ok(true);
+    }
+
+    let Some(instance) = heap_exception_instance_mut(value) else {
+        return Ok(false);
+    };
+    instance.set_property(
+        EXCEPTION_TRACEBACK_ATTR.clone(),
+        traceback.unwrap_or_else(Value::none),
+        shape_registry(),
+    );
+    Ok(true)
+}
+
 unsafe impl Trace for ExceptionValue {
     fn trace(&self, tracer: &mut dyn Tracer) {
         if let Some(args) = self.args.as_deref() {
@@ -658,8 +702,8 @@ fn builtin_method_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn boxed_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+fn boxed_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 #[inline]

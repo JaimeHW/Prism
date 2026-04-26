@@ -58,6 +58,8 @@ static STREAM_WRITE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.write"), stream_write));
 static STREAM_FLUSH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.flush"), stream_flush));
+static STREAM_READ_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.read"), stream_read));
 static STREAM_READABLE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.readable"), stream_readable));
 static STREAM_WRITABLE_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -142,6 +144,9 @@ enum StreamKind {
     StdIn,
     StdOut,
     StdErr,
+    StdInBuffer,
+    StdOutBuffer,
+    StdErrBuffer,
 }
 
 impl StreamKind {
@@ -154,6 +159,9 @@ impl StreamKind {
             Self::StdIn => "stdin",
             Self::StdOut => "stdout",
             Self::StdErr => "stderr",
+            Self::StdInBuffer => "stdin.buffer",
+            Self::StdOutBuffer => "stdout.buffer",
+            Self::StdErrBuffer => "stderr.buffer",
         }
     }
 
@@ -171,6 +179,9 @@ impl StreamKind {
             "stdin" => Ok(Self::StdIn),
             "stdout" => Ok(Self::StdOut),
             "stderr" => Ok(Self::StdErr),
+            "stdin.buffer" => Ok(Self::StdInBuffer),
+            "stdout.buffer" => Ok(Self::StdOutBuffer),
+            "stderr.buffer" => Ok(Self::StdErrBuffer),
             _ => Err(BuiltinError::TypeError(format!(
                 "unsupported stream backend '{}'",
                 kind
@@ -650,7 +661,23 @@ fn stream_write(args: &[Value]) -> Result<Value, BuiltinError> {
                 .map_err(host_stream_error)?;
             Ok(Value::int(data.len() as i64).unwrap())
         }
-        StreamKind::StdIn => Err(BuiltinError::OSError("stdin is not writable".to_string())),
+        StreamKind::StdOutBuffer => {
+            let data = bytes_from_value(args[1], "write() argument")?;
+            standard_streams()
+                .write_stdout_bytes(&data)
+                .map_err(host_stream_error)?;
+            Ok(Value::int(data.len() as i64).unwrap())
+        }
+        StreamKind::StdErrBuffer => {
+            let data = bytes_from_value(args[1], "write() argument")?;
+            standard_streams()
+                .write_stderr_bytes(&data)
+                .map_err(host_stream_error)?;
+            Ok(Value::int(data.len() as i64).unwrap())
+        }
+        StreamKind::StdIn | StreamKind::StdInBuffer => {
+            Err(BuiltinError::OSError("stdin is not writable".to_string()))
+        }
     }
 }
 
@@ -663,28 +690,65 @@ fn stream_flush(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     match StreamKind::from_receiver(args[0])? {
-        StreamKind::StdOut => standard_streams()
+        StreamKind::StdOut | StreamKind::StdOutBuffer => standard_streams()
             .flush_stdout()
             .map_err(host_stream_error)?,
-        StreamKind::StdErr => standard_streams()
+        StreamKind::StdErr | StreamKind::StdErrBuffer => standard_streams()
             .flush_stderr()
             .map_err(host_stream_error)?,
         StreamKind::StringIo
         | StreamKind::BytesIo
         | StreamKind::TextFile
         | StreamKind::BinaryFile
-        | StreamKind::StdIn => {}
+        | StreamKind::StdIn
+        | StreamKind::StdInBuffer => {}
     }
 
     Ok(Value::none())
 }
 
+fn stream_read(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "read() takes at most 1 argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let count = optional_count(args.get(1).copied(), "read")?;
+    match StreamKind::from_receiver(receiver)? {
+        StreamKind::StdIn => {
+            let bytes = standard_streams()
+                .read_bytes(count)
+                .map_err(host_stream_error)?;
+            Ok(string_value(&decode_text_bytes(&bytes, "utf-8")?))
+        }
+        StreamKind::StdInBuffer => {
+            let bytes = standard_streams()
+                .read_bytes(count)
+                .map_err(host_stream_error)?;
+            Ok(bytes_value(&bytes))
+        }
+        other => Err(BuiltinError::OSError(format!(
+            "{} is not readable",
+            other.as_str()
+        ))),
+    }
+}
+
 fn stream_readable(args: &[Value]) -> Result<Value, BuiltinError> {
     let receiver = expect_no_method_args(args, "readable")?;
     let readable = match StreamKind::from_receiver(receiver)? {
-        StreamKind::StringIo | StreamKind::BytesIo | StreamKind::StdIn => true,
+        StreamKind::StringIo
+        | StreamKind::BytesIo
+        | StreamKind::StdIn
+        | StreamKind::StdInBuffer => true,
         StreamKind::TextFile | StreamKind::BinaryFile => file_mode(receiver)?.read,
-        StreamKind::StdOut | StreamKind::StdErr => false,
+        StreamKind::StdOut
+        | StreamKind::StdErr
+        | StreamKind::StdOutBuffer
+        | StreamKind::StdErrBuffer => false,
     };
     Ok(Value::bool(readable && !is_closed(receiver)?))
 }
@@ -692,11 +756,14 @@ fn stream_readable(args: &[Value]) -> Result<Value, BuiltinError> {
 fn stream_writable(args: &[Value]) -> Result<Value, BuiltinError> {
     let receiver = expect_no_method_args(args, "writable")?;
     let writable = match StreamKind::from_receiver(receiver)? {
-        StreamKind::StringIo | StreamKind::BytesIo | StreamKind::StdOut | StreamKind::StdErr => {
-            true
-        }
+        StreamKind::StringIo
+        | StreamKind::BytesIo
+        | StreamKind::StdOut
+        | StreamKind::StdErr
+        | StreamKind::StdOutBuffer
+        | StreamKind::StdErrBuffer => true,
         StreamKind::TextFile | StreamKind::BinaryFile => file_mode(receiver)?.write,
-        StreamKind::StdIn => false,
+        StreamKind::StdIn | StreamKind::StdInBuffer => false,
     };
     Ok(Value::bool(writable && !is_closed(receiver)?))
 }
@@ -709,7 +776,12 @@ fn stream_seekable(args: &[Value]) -> Result<Value, BuiltinError> {
             Some(fd) => fd_seek_current(fd).is_ok(),
             None => true,
         },
-        StreamKind::StdIn | StreamKind::StdOut | StreamKind::StdErr => false,
+        StreamKind::StdIn
+        | StreamKind::StdOut
+        | StreamKind::StdErr
+        | StreamKind::StdInBuffer
+        | StreamKind::StdOutBuffer
+        | StreamKind::StdErrBuffer => false,
     };
     Ok(Value::bool(seekable && !is_closed(receiver)?))
 }
@@ -752,7 +824,16 @@ fn stream_readline(args: &[Value]) -> Result<Value, BuiltinError> {
             let line = standard_streams().read_line().map_err(host_stream_error)?;
             Ok(string_value(&line))
         }
-        StreamKind::StdOut | StreamKind::StdErr => {
+        StreamKind::StdInBuffer => {
+            let line = standard_streams()
+                .read_line_bytes()
+                .map_err(host_stream_error)?;
+            Ok(bytes_value(&line))
+        }
+        StreamKind::StdOut
+        | StreamKind::StdErr
+        | StreamKind::StdOutBuffer
+        | StreamKind::StdErrBuffer => {
             Err(BuiltinError::OSError("stream is not readable".to_string()))
         }
     }
@@ -835,7 +916,30 @@ fn stream_readlines(args: &[Value]) -> Result<Value, BuiltinError> {
             }
             lines
         }
-        StreamKind::StdOut | StreamKind::StdErr => {
+        StreamKind::StdInBuffer => {
+            let mut lines = Vec::new();
+            let mut total = 0usize;
+            loop {
+                let line = standard_streams()
+                    .read_line_bytes()
+                    .map_err(host_stream_error)?;
+                if line.is_empty() {
+                    break;
+                }
+                total = total.saturating_add(line.len());
+                lines.push(bytes_value(&line));
+                if let Some(limit) = hint {
+                    if total >= limit {
+                        break;
+                    }
+                }
+            }
+            lines
+        }
+        StreamKind::StdOut
+        | StreamKind::StdErr
+        | StreamKind::StdOutBuffer
+        | StreamKind::StdErrBuffer => {
             return Err(BuiltinError::OSError("stream is not readable".to_string()));
         }
     };
@@ -1104,7 +1208,7 @@ fn stream_exit(args: &[Value]) -> Result<Value, BuiltinError> {
 
 fn new_heap_instance(class: &PyClassObject) -> Value {
     let instance = allocate_heap_instance_for_class(class);
-    Value::object_ptr(Box::into_raw(Box::new(instance)) as *const ())
+    crate::alloc_managed_value(instance)
 }
 
 fn initialize_string_io_state(receiver: Value, initial: &str) -> Result<(), BuiltinError> {
@@ -1157,9 +1261,9 @@ fn initialize_text_io_wrapper_state(
     let buffer_kind = StreamKind::from_receiver(buffer)?;
     let target_kind = match buffer_kind {
         StreamKind::BinaryFile | StreamKind::TextFile => StreamKind::TextFile,
-        StreamKind::StdIn => StreamKind::StdIn,
-        StreamKind::StdOut => StreamKind::StdOut,
-        StreamKind::StdErr => StreamKind::StdErr,
+        StreamKind::StdIn | StreamKind::StdInBuffer => StreamKind::StdIn,
+        StreamKind::StdOut | StreamKind::StdOutBuffer => StreamKind::StdOut,
+        StreamKind::StdErr | StreamKind::StdErrBuffer => StreamKind::StdErr,
         _ => {
             return Err(BuiltinError::TypeError(
                 "TextIOWrapper() argument 'buffer' must be a file-backed or standard stream"
@@ -1369,6 +1473,14 @@ fn install_file_stream_methods(object: &mut ShapedObject) {
 }
 
 fn new_standard_stream_object(kind: StreamKind) -> Value {
+    new_standard_stream_object_inner(kind, true)
+}
+
+fn new_standard_stream_buffer_object(kind: StreamKind) -> Value {
+    new_standard_stream_object_inner(kind, false)
+}
+
+fn new_standard_stream_object_inner(kind: StreamKind, attach_buffer: bool) -> Value {
     let mut object = ShapedObject::with_empty_shape(shape_registry().empty_shape());
     object.set_property(
         intern(STREAM_KIND_ATTR),
@@ -1376,11 +1488,23 @@ fn new_standard_stream_object(kind: StreamKind) -> Value {
         shape_registry(),
     );
     object.set_property(intern(CLOSED_ATTR), Value::bool(false), shape_registry());
-    object.set_property(
-        intern(ENCODING_ATTR),
-        Value::string(intern("utf-8")),
-        shape_registry(),
-    );
+    if matches!(
+        kind,
+        StreamKind::StdIn | StreamKind::StdOut | StreamKind::StdErr
+    ) {
+        object.set_property(
+            intern(ENCODING_ATTR),
+            Value::string(intern("utf-8")),
+            shape_registry(),
+        );
+    }
+    if attach_buffer && let Some(buffer_kind) = standard_stream_buffer_kind(kind) {
+        object.set_property(
+            intern("buffer"),
+            new_standard_stream_buffer_object(buffer_kind),
+            shape_registry(),
+        );
+    }
     object.set_property(
         intern("flush"),
         bound_builtin_value(&STREAM_FLUSH_METHOD, Value::none()),
@@ -1405,6 +1529,11 @@ fn new_standard_stream_object(kind: StreamKind) -> Value {
     match kind {
         StreamKind::StdIn => {
             object.set_property(
+                intern("read"),
+                bound_builtin_value(&STREAM_READ_METHOD, Value::none()),
+                shape_registry(),
+            );
+            object.set_property(
                 intern("readline"),
                 bound_builtin_value(&STREAM_READLINE_METHOD, Value::none()),
                 shape_registry(),
@@ -1422,6 +1551,30 @@ fn new_standard_stream_object(kind: StreamKind) -> Value {
                 shape_registry(),
             );
         }
+        StreamKind::StdInBuffer => {
+            object.set_property(
+                intern("read"),
+                bound_builtin_value(&STREAM_READ_METHOD, Value::none()),
+                shape_registry(),
+            );
+            object.set_property(
+                intern("readline"),
+                bound_builtin_value(&STREAM_READLINE_METHOD, Value::none()),
+                shape_registry(),
+            );
+            object.set_property(
+                intern("readlines"),
+                bound_builtin_value(&STREAM_READLINES_METHOD, Value::none()),
+                shape_registry(),
+            );
+        }
+        StreamKind::StdOutBuffer | StreamKind::StdErrBuffer => {
+            object.set_property(
+                intern("write"),
+                bound_builtin_value(&STREAM_WRITE_METHOD, Value::none()),
+                shape_registry(),
+            );
+        }
         StreamKind::StringIo | StreamKind::BytesIo => {}
         StreamKind::TextFile | StreamKind::BinaryFile => {
             unreachable!("file-backed streams must be created via new_file_stream_object")
@@ -1431,8 +1584,18 @@ fn new_standard_stream_object(kind: StreamKind) -> Value {
     finalize_stream_object(object)
 }
 
+#[inline]
+fn standard_stream_buffer_kind(kind: StreamKind) -> Option<StreamKind> {
+    match kind {
+        StreamKind::StdIn => Some(StreamKind::StdInBuffer),
+        StreamKind::StdOut => Some(StreamKind::StdOutBuffer),
+        StreamKind::StdErr => Some(StreamKind::StdErrBuffer),
+        _ => None,
+    }
+}
+
 fn finalize_stream_object(mut object: ShapedObject) -> Value {
-    let value = Value::object_ptr(Box::into_raw(Box::new(object)) as *const ());
+    let value = crate::alloc_managed_value(object);
     let shaped = unsafe { &mut *(value.as_object_ptr().unwrap() as *mut ShapedObject) };
     for method_name in shaped.property_names() {
         if !matches!(
@@ -1464,10 +1627,9 @@ fn finalize_stream_object(mut object: ShapedObject) -> Value {
             .as_object_ptr()
             .expect("stream helper methods should be builtin functions");
         let builtin = unsafe { &*(method_ptr as *const BuiltinFunctionObject) };
-        let bound = Box::new(builtin.bind(value));
         shaped.set_property(
             method_name,
-            Value::object_ptr(Box::into_raw(bound) as *const ()),
+            crate::alloc_managed_value(builtin.bind(value)),
             shape_registry(),
         );
     }
@@ -2498,16 +2660,16 @@ fn string_value(value: &str) -> Value {
     if value.is_empty() {
         Value::string(intern(""))
     } else {
-        Value::object_ptr(Box::into_raw(Box::new(StringObject::new(value))) as *const ())
+        crate::alloc_managed_value(StringObject::new(value))
     }
 }
 
 fn bytes_value(value: &[u8]) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(BytesObject::from_slice(value))) as *const ())
+    crate::alloc_managed_value(BytesObject::from_slice(value))
 }
 
 fn list_value(items: Vec<Value>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(ListObject::from_iter(items))) as *const ())
+    crate::alloc_managed_value(ListObject::from_iter(items))
 }
 
 fn is_closed(receiver: Value) -> Result<bool, BuiltinError> {

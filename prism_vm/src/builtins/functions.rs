@@ -1,6 +1,6 @@
 //! Core builtin functions (len, abs, min, max, sum, pow, etc.).
 
-use super::BuiltinError;
+use super::{BuiltinError, BuiltinFunctionObject};
 use crate::VirtualMachine;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
@@ -106,15 +106,10 @@ fn exact_len(value: Value) -> Result<Option<usize>, RuntimeError> {
 
     use crate::ops::objects::extract_type_id;
     let type_id = extract_type_id(ptr);
-    let has_builtin_sequence_layout = type_id.raw() < TypeId::FIRST_USER_TYPE;
-    if has_builtin_sequence_layout
-        && let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr)
-    {
+    if let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr) {
         return Ok(Some(list.len()));
     }
-    if has_builtin_sequence_layout
-        && let Some(tuple) = crate::ops::objects::tuple_storage_ref_from_ptr(ptr)
-    {
+    if let Some(tuple) = crate::ops::objects::tuple_storage_ref_from_ptr(ptr) {
         return Ok(Some(tuple.len()));
     }
     match type_id {
@@ -1430,6 +1425,19 @@ pub fn builtin_repr(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::string(intern(&repr)))
 }
 
+/// VM-aware repr(object) that honors Python-level `__repr__` on heap classes.
+pub fn builtin_repr_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "repr() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let repr = repr_value_vm(vm, args[0], 0)?;
+    Ok(Value::string(intern(&repr)))
+}
+
 /// Builtin ascii function.
 ///
 /// ascii(object) - Like repr() but escape non-ASCII characters.
@@ -1442,6 +1450,20 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let repr = repr_value(args[0], 0)?;
+    let ascii = escape_non_ascii(&repr);
+    Ok(Value::string(intern(&ascii)))
+}
+
+/// VM-aware ascii(object) that honors Python-level `__repr__` on heap classes.
+pub fn builtin_ascii_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "ascii() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let repr = repr_value_vm(vm, args[0], 0)?;
     let ascii = escape_non_ascii(&repr);
     Ok(Value::string(intern(&ascii)))
 }
@@ -1490,6 +1512,9 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
         return Ok(quote_python_string(string.as_str()));
     }
     if let Some(text) = crate::builtins::exception_repr_text_for_value(value) {
+        return Ok(text);
+    }
+    if let Some(text) = crate::stdlib::_thread::native_thread_object_repr(value) {
         return Ok(text);
     }
 
@@ -1594,12 +1619,61 @@ fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
                 repr_value(descriptor.function(), depth + 1)?
             ))
         }
+        TypeId::BUILTIN_FUNCTION => {
+            let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            Ok(format!(
+                "<built-in function {}>",
+                builtin_function_short_name(function.name())
+            ))
+        }
         _ => Ok(format!(
             "<{} object at 0x{:x}>",
             type_id.name(),
             ptr as usize
         )),
     }
+}
+
+#[inline]
+fn builtin_function_short_name(name: &str) -> &str {
+    name.rsplit_once('.')
+        .map(|(_, short_name)| short_name)
+        .unwrap_or(name)
+}
+
+fn repr_value_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    depth: usize,
+) -> Result<String, BuiltinError> {
+    if should_use_python_repr_protocol(value) {
+        match resolve_special_method(value, "__repr__") {
+            Ok(target) => {
+                let rendered = invoke_zero_arg_bound_method(vm, target)
+                    .map_err(super::runtime_error_to_builtin_error)?;
+                let Some(text) = value_as_string_ref(rendered) else {
+                    return Err(BuiltinError::TypeError(format!(
+                        "__repr__ returned non-string (type {})",
+                        value_type_name(rendered)
+                    )));
+                };
+                return Ok(text.as_str().to_string());
+            }
+            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {}
+            Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
+        }
+    }
+
+    repr_value(value, depth)
+}
+
+#[inline]
+fn should_use_python_repr_protocol(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+
+    crate::ops::objects::extract_type_id(ptr).raw() >= TypeId::FIRST_USER_TYPE
 }
 
 fn quote_python_string(input: &str) -> String {
@@ -1771,6 +1845,21 @@ mod tests {
         let (value, ptr) = boxed_value(object);
         let result = builtin_len(&[value]).unwrap();
         assert_eq!(result.as_int(), Some(3));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_len_heap_list_subclass_uses_native_backing() {
+        let mut object = ShapedObject::new_list_backed(TypeId::from_raw(512), Shape::empty());
+        object
+            .list_backing_mut()
+            .expect("list backing should exist")
+            .extend([Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let (value, ptr) = boxed_value(object);
+
+        let result = builtin_len(&[value]).unwrap();
+
+        assert_eq!(result.as_int(), Some(2));
         unsafe { drop_boxed(ptr) };
     }
 
@@ -2456,6 +2545,22 @@ mod tests {
             drop_boxed(staticmethod_ptr);
             drop_boxed(function_ptr);
         }
+    }
+
+    #[test]
+    fn test_repr_builtin_function_uses_cpython_display_name() {
+        fn sample_builtin(_args: &[Value]) -> Result<Value, BuiltinError> {
+            Ok(Value::none())
+        }
+
+        let (function_value, function_ptr) = boxed_value(BuiltinFunctionObject::new(
+            Arc::from("time.sleep"),
+            sample_builtin,
+        ));
+        let repr = tagged_string_value_to_rust_string(builtin_repr(&[function_value]).unwrap());
+
+        assert_eq!(repr, "<built-in function sleep>");
+        unsafe { drop_boxed(function_ptr) };
     }
 
     #[test]

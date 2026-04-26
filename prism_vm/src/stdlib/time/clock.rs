@@ -620,7 +620,7 @@ pub fn sleep(seconds: f64) {
     }
 
     let duration = Duration::from_secs_f64(seconds);
-    std::thread::sleep(duration);
+    crate::threading_runtime::blocking_operation(|| std::thread::sleep(duration));
 }
 
 /// Sleep for the specified number of nanoseconds.
@@ -630,5 +630,7 @@ pub fn sleep_ns(nanoseconds: u64) {
         return;
     }
 
-    std::thread::sleep(Duration::from_nanos(nanoseconds));
+    crate::threading_runtime::blocking_operation(|| {
+        std::thread::sleep(Duration::from_nanos(nanoseconds))
+    });
 }

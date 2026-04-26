@@ -367,13 +367,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
-}
-
-#[inline]
 fn tuple_value(values: &[Value]) -> Value {
-    leak_object_value(TupleObject::from_slice(values))
+    crate::alloc_managed_value(TupleObject::from_slice(values))
 }
 
 #[inline]

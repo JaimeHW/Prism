@@ -37,6 +37,9 @@ pub struct RuntimeConfig {
     /// Ignore `PYTHON*` environment variables (`-E`).
     pub ignore_environment: bool,
 
+    /// Isolated mode (`-I`, implies `-E` and `-s`).
+    pub isolated: bool,
+
     /// Don't add user site-packages to `sys.path` (`-s`).
     pub no_user_site: bool,
 
@@ -64,7 +67,8 @@ impl RuntimeConfig {
     ///
     /// Environment variables are only consulted if `-E` was NOT specified.
     pub fn from_args(args: &PrismArgs) -> Self {
-        let ignore_env = args.ignore_environment;
+        let isolated = args.isolated;
+        let ignore_env = args.ignore_environment || isolated;
 
         // Resolve optimization level: CLI flag OR `PYTHONOPTIMIZE` env var.
         let optimize = if args.optimize != OptimizationLevel::None {
@@ -95,7 +99,8 @@ impl RuntimeConfig {
         let inspect = args.inspect || (!ignore_env && Self::env_bool("PYTHONINSPECT"));
 
         // Resolve no_user_site: CLI flag OR `PYTHONNOUSERSITE` env var.
-        let no_user_site = args.no_user_site || (!ignore_env && Self::env_bool("PYTHONNOUSERSITE"));
+        let no_user_site =
+            args.no_user_site || isolated || (!ignore_env && Self::env_bool("PYTHONNOUSERSITE"));
 
         // Resolve hash seed from `PYTHONHASHSEED` env var.
         let hash_seed = if !ignore_env {
@@ -112,6 +117,7 @@ impl RuntimeConfig {
             quiet: args.quiet,
             dont_write_bytecode,
             ignore_environment: ignore_env,
+            isolated,
             no_user_site,
             no_site: args.no_site,
             warnings: args.warnings.clone(),
@@ -216,6 +222,7 @@ mod tests {
         assert_eq!(config.optimize, OptimizationLevel::None);
         assert!(!config.quiet);
         assert!(!config.debug);
+        assert!(!config.isolated);
         assert!(!config.no_site);
         assert!(config.warnings.is_empty());
         assert!(config.x_options.is_empty());
@@ -255,6 +262,19 @@ mod tests {
     }
 
     #[test]
+    fn test_config_isolated_mode_implies_environment_and_user_site_isolation() {
+        let args = PrismArgs {
+            isolated: true,
+            ..Default::default()
+        };
+        let config = RuntimeConfig::from_args(&args);
+        assert!(config.isolated);
+        assert!(config.ignore_environment);
+        assert!(config.no_user_site);
+        assert_eq!(config.hash_seed, None);
+    }
+
+    #[test]
     fn test_config_inherits_all_boolean_flags() {
         let args = PrismArgs {
             inspect: true,
@@ -262,6 +282,7 @@ mod tests {
             quiet: true,
             dont_write_bytecode: true,
             ignore_environment: true,
+            isolated: true,
             no_user_site: true,
             no_site: true,
             debug: true,
@@ -273,6 +294,7 @@ mod tests {
         assert!(config.quiet);
         assert!(config.dont_write_bytecode);
         assert!(config.ignore_environment);
+        assert!(config.isolated);
         assert!(config.no_user_site);
         assert!(config.no_site);
         assert!(config.debug);

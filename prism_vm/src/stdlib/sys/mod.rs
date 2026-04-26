@@ -24,9 +24,11 @@ pub use runtime::*;
 pub use streams::*;
 
 use super::{Module, ModuleError};
-use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::builtins::{BuiltinError, BuiltinFunctionObject, create_exception_with_args};
+use crate::error::RuntimeError;
 use crate::ops::calls::value_supports_call_protocol;
 use crate::ops::objects::{snapshot_frame_globals_dict, snapshot_frame_locals_dict};
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::shape::shape_registry;
@@ -94,6 +96,8 @@ static GET_FILESYSTEM_ENCODEERRORS_FUNCTION: LazyLock<BuiltinFunctionObject> =
             sys_getfilesystemencodeerrors,
         )
     });
+static EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.exit"), sys_exit));
 static INTERN_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.intern"), sys_intern));
 static AUDIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -112,10 +116,38 @@ static GETTRACE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.gettrace"), sys_gettrace));
 static SETTRACE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.settrace"), sys_settrace));
+static GETPROFILE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.getprofile"), sys_getprofile));
+static SETPROFILE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.setprofile"), sys_setprofile));
+static GETSWITCHINTERVAL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("sys.getswitchinterval"), sys_getswitchinterval)
+});
+static SETSWITCHINTERVAL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("sys.setswitchinterval"), sys_setswitchinterval)
+});
+static SETTRACE_ALL_THREADS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("sys._settraceallthreads"),
+        sys_settrace_all_threads,
+    )
+});
+static SETPROFILE_ALL_THREADS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("sys._setprofileallthreads"),
+        sys_setprofile_all_threads,
+    )
+});
 static GETWINDOWSVERSION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("sys.getwindowsversion"), sys_getwindowsversion)
 });
+static GETREFCOUNT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.getrefcount"), sys_getrefcount));
 static CURRENT_TRACE_FUNCTION: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(Value::none()));
+static CURRENT_PROFILE_FUNCTION: LazyLock<Mutex<Value>> =
+    LazyLock::new(|| Mutex::new(Value::none()));
+static CURRENT_SWITCH_INTERVAL: LazyLock<Mutex<SwitchInterval>> =
+    LazyLock::new(|| Mutex::new(SwitchInterval::new()));
 
 impl SysModule {
     /// Create a new sys module with default configuration.
@@ -263,15 +295,23 @@ impl Module for SysModule {
             "recursion_limit" => Ok(Value::int(self.recursion_limit.get() as i64).unwrap()),
 
             // Functions - return None placeholder (would be callable)
-            "exit" | "getrecursionlimit" | "setrecursionlimit" | "getsizeof" | "getrefcount" => {
+            "getrecursionlimit" | "setrecursionlimit" | "getsizeof" => {
                 Ok(Value::none()) // Placeholder for callable
             }
 
+            "getrefcount" => Ok(builtin_value(&GETREFCOUNT_FUNCTION)),
+            "exit" => Ok(builtin_value(&EXIT_FUNCTION)),
             "exc_info" => Ok(builtin_value(&EXC_INFO_FUNCTION)),
             "exception" => Ok(builtin_value(&EXCEPTION_FUNCTION)),
             "_getframe" => Ok(builtin_value(&GETFRAME_FUNCTION)),
             "gettrace" => Ok(builtin_value(&GETTRACE_FUNCTION)),
             "settrace" => Ok(builtin_value(&SETTRACE_FUNCTION)),
+            "getprofile" => Ok(builtin_value(&GETPROFILE_FUNCTION)),
+            "setprofile" => Ok(builtin_value(&SETPROFILE_FUNCTION)),
+            "getswitchinterval" => Ok(builtin_value(&GETSWITCHINTERVAL_FUNCTION)),
+            "setswitchinterval" => Ok(builtin_value(&SETSWITCHINTERVAL_FUNCTION)),
+            "_settraceallthreads" => Ok(builtin_value(&SETTRACE_ALL_THREADS_FUNCTION)),
+            "_setprofileallthreads" => Ok(builtin_value(&SETPROFILE_ALL_THREADS_FUNCTION)),
             "intern" => Ok(builtin_value(&INTERN_FUNCTION)),
             "getfilesystemencoding" => Ok(builtin_value(&GET_FILESYSTEM_ENCODING_FUNCTION)),
             "getfilesystemencodeerrors" => Ok(builtin_value(&GET_FILESYSTEM_ENCODEERRORS_FUNCTION)),
@@ -383,6 +423,12 @@ impl Module for SysModule {
             Arc::from("_getframe"),
             Arc::from("gettrace"),
             Arc::from("settrace"),
+            Arc::from("getprofile"),
+            Arc::from("setprofile"),
+            Arc::from("getswitchinterval"),
+            Arc::from("setswitchinterval"),
+            Arc::from("_settraceallthreads"),
+            Arc::from("_setprofileallthreads"),
             Arc::from("exit"),
             Arc::from("getfilesystemencoding"),
             Arc::from("getfilesystemencodeerrors"),
@@ -426,6 +472,53 @@ fn sys_excepthook(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     Ok(Value::none())
+}
+
+fn sys_exit(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "exit expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
+
+    let exception = create_exception_with_args(
+        ExceptionTypeId::SystemExit,
+        None,
+        args.to_vec().into_boxed_slice(),
+    );
+    let message = if args.is_empty() {
+        Arc::<str>::from("")
+    } else {
+        Arc::<str>::from(system_exit_argument_text(args[0]))
+    };
+    Err(BuiltinError::Raised(RuntimeError::raised_exception(
+        ExceptionTypeId::SystemExit.as_u8() as u16,
+        exception,
+        message,
+    )))
+}
+
+fn system_exit_argument_text(value: Value) -> String {
+    if value.is_none() {
+        return "None".to_string();
+    }
+    if let Some(boolean) = value.as_bool() {
+        return if boolean { "True" } else { "False" }.to_string();
+    }
+    if let Some(integer) = value.as_int() {
+        return integer.to_string();
+    }
+    if let Some(float) = value.as_float() {
+        return float.to_string();
+    }
+    if value.is_string()
+        && let Some(ptr) = value.as_string_object_ptr()
+        && let Some(interned) = prism_core::intern::interned_by_ptr(ptr as *const u8)
+    {
+        return interned.as_str().to_string();
+    }
+    value.type_name().to_string()
 }
 
 fn sys_exc_info(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -500,7 +593,123 @@ fn sys_settrace(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let trace = args[0];
+    set_trace_hook(args[0])
+}
+
+fn sys_getprofile(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getprofile() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(*CURRENT_PROFILE_FUNCTION
+        .lock()
+        .expect("sys profile hook lock poisoned"))
+}
+
+fn sys_setprofile(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "setprofile() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    set_profile_hook(args[0])
+}
+
+fn sys_getswitchinterval(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getswitchinterval() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::float(
+        CURRENT_SWITCH_INTERVAL
+            .lock()
+            .expect("sys switch interval lock poisoned")
+            .get(),
+    ))
+}
+
+fn sys_setswitchinterval(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "setswitchinterval() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let interval = switch_interval_from_value(args[0])?;
+    CURRENT_SWITCH_INTERVAL
+        .lock()
+        .expect("sys switch interval lock poisoned")
+        .set(interval)
+        .map_err(|err| match err {
+            ModuleError::ValueError(message) => BuiltinError::ValueError(message),
+            ModuleError::TypeError(message) => BuiltinError::TypeError(message),
+            other => BuiltinError::ValueError(other.to_string()),
+        })?;
+    Ok(Value::none())
+}
+
+fn switch_interval_from_value(value: Value) -> Result<f64, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(if boolean { 1.0 } else { 0.0 });
+    }
+    if let Some(float) = value.as_float() {
+        return Ok(float);
+    }
+    if let Some(integer) = value.as_int() {
+        return Ok(integer as f64);
+    }
+    Err(BuiltinError::TypeError(format!(
+        "setswitchinterval() argument must be real number, not {}",
+        value.type_name()
+    )))
+}
+
+fn sys_getrefcount(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "getrefcount() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    // Prism is not a reference-counted runtime. CPython includes the temporary
+    // argument reference in this value, so return a conservative positive count
+    // that preserves API shape without exposing false GC internals.
+    Ok(Value::int(2).expect("small refcount fits in Value::int"))
+}
+
+fn sys_settrace_all_threads(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "_settraceallthreads() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    set_trace_hook(args[0])
+}
+
+fn sys_setprofile_all_threads(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "_setprofileallthreads() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    set_profile_hook(args[0])
+}
+
+fn set_trace_hook(trace: Value) -> Result<Value, BuiltinError> {
     if !trace.is_none() && !value_supports_call_protocol(trace) {
         return Err(BuiltinError::TypeError(
             "settrace() argument must be callable or None".to_string(),
@@ -510,6 +719,19 @@ fn sys_settrace(args: &[Value]) -> Result<Value, BuiltinError> {
     *CURRENT_TRACE_FUNCTION
         .lock()
         .expect("sys trace hook lock poisoned") = trace;
+    Ok(Value::none())
+}
+
+fn set_profile_hook(profile: Value) -> Result<Value, BuiltinError> {
+    if !profile.is_none() && !value_supports_call_protocol(profile) {
+        return Err(BuiltinError::TypeError(
+            "setprofile() argument must be callable or None".to_string(),
+        ));
+    }
+
+    *CURRENT_PROFILE_FUNCTION
+        .lock()
+        .expect("sys profile hook lock poisoned") = profile;
     Ok(Value::none())
 }
 
@@ -600,9 +822,8 @@ fn frame_line_number(frame: &crate::frame::Frame) -> u32 {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 #[inline]
@@ -744,7 +965,9 @@ mod tests {
     use prism_runtime::object::views::FrameViewObject;
     use prism_runtime::types::list::ListObject;
     use prism_runtime::types::tuple::TupleObject;
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    static HOOK_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     // =========================================================================
     // SysModule Creation Tests
@@ -1631,6 +1854,7 @@ mod tests {
 
     #[test]
     fn test_sys_gettrace_exists_and_defaults_to_none() {
+        let _guard = HOOK_TEST_LOCK.lock().expect("hook test lock poisoned");
         *CURRENT_TRACE_FUNCTION
             .lock()
             .expect("sys trace hook lock poisoned") = Value::none();
@@ -1658,6 +1882,7 @@ mod tests {
 
     #[test]
     fn test_sys_settrace_updates_visible_trace_hook_and_validates_input() {
+        let _guard = HOOK_TEST_LOCK.lock().expect("hook test lock poisoned");
         *CURRENT_TRACE_FUNCTION
             .lock()
             .expect("sys trace hook lock poisoned") = Value::none();
@@ -1711,6 +1936,179 @@ mod tests {
             .expect_err("settrace should reject non-callables");
         assert!(
             matches!(err, BuiltinError::TypeError(ref message) if message == "settrace() argument must be callable or None")
+        );
+    }
+
+    #[test]
+    fn test_sys_profile_hooks_match_trace_hook_contract() {
+        let _guard = HOOK_TEST_LOCK.lock().expect("hook test lock poisoned");
+        *CURRENT_PROFILE_FUNCTION
+            .lock()
+            .expect("sys profile hook lock poisoned") = Value::none();
+        let sys = SysModule::new();
+        let getprofile = unsafe {
+            &*(sys
+                .get_attr("getprofile")
+                .expect("sys.getprofile should exist")
+                .as_object_ptr()
+                .expect("sys.getprofile should be callable")
+                as *const BuiltinFunctionObject)
+        };
+        let setprofile = unsafe {
+            &*(sys
+                .get_attr("setprofile")
+                .expect("sys.setprofile should exist")
+                .as_object_ptr()
+                .expect("sys.setprofile should be callable")
+                as *const BuiltinFunctionObject)
+        };
+        let intern = sys.get_attr("intern").expect("sys.intern should exist");
+
+        assert!(getprofile.call(&[]).unwrap().is_none());
+        assert!(setprofile.call(&[intern]).unwrap().is_none());
+        assert_eq!(getprofile.call(&[]).unwrap(), intern);
+        assert!(setprofile.call(&[Value::none()]).unwrap().is_none());
+        assert!(getprofile.call(&[]).unwrap().is_none());
+
+        let err = setprofile
+            .call(&[Value::int(1).unwrap()])
+            .expect_err("setprofile should reject non-callables");
+        assert!(
+            matches!(err, BuiltinError::TypeError(ref message) if message == "setprofile() argument must be callable or None")
+        );
+    }
+
+    #[test]
+    fn test_sys_switch_interval_hooks_round_trip_and_validate_input() {
+        let _guard = HOOK_TEST_LOCK.lock().expect("hook test lock poisoned");
+        *CURRENT_SWITCH_INTERVAL
+            .lock()
+            .expect("sys switch interval lock poisoned") = SwitchInterval::new();
+        let sys = SysModule::new();
+        let getinterval = unsafe {
+            &*(sys
+                .get_attr("getswitchinterval")
+                .expect("sys.getswitchinterval should exist")
+                .as_object_ptr()
+                .expect("sys.getswitchinterval should be callable")
+                as *const BuiltinFunctionObject)
+        };
+        let setinterval = unsafe {
+            &*(sys
+                .get_attr("setswitchinterval")
+                .expect("sys.setswitchinterval should exist")
+                .as_object_ptr()
+                .expect("sys.setswitchinterval should be callable")
+                as *const BuiltinFunctionObject)
+        };
+
+        assert_eq!(
+            getinterval
+                .call(&[])
+                .expect("default interval should be readable")
+                .as_float(),
+            Some(DEFAULT_SWITCH_INTERVAL)
+        );
+        assert!(
+            setinterval
+                .call(&[Value::float(0.01)])
+                .expect("positive intervals should be accepted")
+                .is_none()
+        );
+        assert_eq!(
+            getinterval
+                .call(&[])
+                .expect("updated interval should be readable")
+                .as_float(),
+            Some(0.01)
+        );
+
+        assert!(matches!(
+            setinterval.call(&[Value::float(0.0)]),
+            Err(BuiltinError::ValueError(_))
+        ));
+        assert!(matches!(
+            setinterval.call(&[Value::string(intern("slow"))]),
+            Err(BuiltinError::TypeError(_))
+        ));
+
+        *CURRENT_SWITCH_INTERVAL
+            .lock()
+            .expect("sys switch interval lock poisoned") = SwitchInterval::new();
+    }
+
+    #[test]
+    fn test_sys_getrefcount_is_callable_and_positive() {
+        let sys = SysModule::new();
+        let getrefcount = unsafe {
+            &*(sys
+                .get_attr("getrefcount")
+                .expect("sys.getrefcount should exist")
+                .as_object_ptr()
+                .expect("sys.getrefcount should be callable")
+                as *const BuiltinFunctionObject)
+        };
+
+        assert_eq!(
+            getrefcount
+                .call(&[Value::none()])
+                .expect("getrefcount should accept one argument")
+                .as_int(),
+            Some(2)
+        );
+
+        let err = getrefcount
+            .call(&[])
+            .expect_err("getrefcount should reject missing arguments");
+        assert!(matches!(
+            err,
+            BuiltinError::TypeError(ref message)
+                if message == "getrefcount() takes exactly one argument (0 given)"
+        ));
+    }
+
+    #[test]
+    fn test_sys_all_threads_hook_entry_points_update_shared_hooks() {
+        let _guard = HOOK_TEST_LOCK.lock().expect("hook test lock poisoned");
+        *CURRENT_TRACE_FUNCTION
+            .lock()
+            .expect("sys trace hook lock poisoned") = Value::none();
+        *CURRENT_PROFILE_FUNCTION
+            .lock()
+            .expect("sys profile hook lock poisoned") = Value::none();
+        let sys = SysModule::new();
+        let intern = sys.get_attr("intern").expect("sys.intern should exist");
+        let settrace_all = unsafe {
+            &*(sys
+                .get_attr("_settraceallthreads")
+                .expect("sys._settraceallthreads should exist")
+                .as_object_ptr()
+                .expect("sys._settraceallthreads should be callable")
+                as *const BuiltinFunctionObject)
+        };
+        let setprofile_all = unsafe {
+            &*(sys
+                .get_attr("_setprofileallthreads")
+                .expect("sys._setprofileallthreads should exist")
+                .as_object_ptr()
+                .expect("sys._setprofileallthreads should be callable")
+                as *const BuiltinFunctionObject)
+        };
+
+        assert!(settrace_all.call(&[intern]).unwrap().is_none());
+        assert_eq!(
+            *CURRENT_TRACE_FUNCTION
+                .lock()
+                .expect("sys trace hook lock poisoned"),
+            intern
+        );
+
+        assert!(setprofile_all.call(&[intern]).unwrap().is_none());
+        assert_eq!(
+            *CURRENT_PROFILE_FUNCTION
+                .lock()
+                .expect("sys profile hook lock poisoned"),
+            intern
         );
     }
 

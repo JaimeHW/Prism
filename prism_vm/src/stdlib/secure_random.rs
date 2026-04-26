@@ -56,5 +56,5 @@ pub(crate) fn secure_random_u64() -> Result<u64, BuiltinError> {
 }
 
 fn leak_bytes_value(bytes: Vec<u8>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(BytesObject::from_vec(bytes))) as *const ())
+    crate::alloc_managed_value(BytesObject::from_vec(bytes))
 }

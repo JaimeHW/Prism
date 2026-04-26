@@ -25,10 +25,14 @@
 use prism_gc::trace::{Trace, Tracer};
 
 use crate::object::ObjectHeader;
+use crate::object::descriptor::{
+    BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
+};
 use crate::object::shaped_object::ShapedObject;
 use crate::object::views::{
-    CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, GenericAliasObject,
-    MappingProxyObject, MappingProxySource, MethodWrapperObject, UnionTypeObject,
+    CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, FrameViewObject,
+    GenericAliasObject, MappingProxyObject, MappingProxySource, MethodWrapperObject,
+    TracebackViewObject, UnionTypeObject,
 };
 use crate::types::bytes::BytesObject;
 use crate::types::complex::ComplexObject;
@@ -342,6 +346,25 @@ unsafe impl Trace for CellViewObject {
     }
 }
 
+unsafe impl Trace for FrameViewObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.globals());
+        tracer.trace_value(self.locals());
+        if let Some(back) = self.back() {
+            tracer.trace_value(back);
+        }
+    }
+}
+
+unsafe impl Trace for TracebackViewObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.frame());
+        if let Some(next) = self.next() {
+            tracer.trace_value(next);
+        }
+    }
+}
+
 unsafe impl Trace for GenericAliasObject {
     fn trace(&self, tracer: &mut dyn Tracer) {
         tracer.trace_value(self.origin());
@@ -388,6 +411,50 @@ unsafe impl Trace for DescriptorViewObject {
 unsafe impl Trace for MethodWrapperObject {
     fn trace(&self, tracer: &mut dyn Tracer) {
         tracer.trace_value(self.receiver());
+    }
+}
+
+/// Safety: Traces the wrapped callable held by a staticmethod descriptor.
+unsafe impl Trace for StaticMethodDescriptor {
+    #[inline]
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.function());
+    }
+}
+
+/// Safety: Traces the wrapped callable held by a classmethod descriptor.
+unsafe impl Trace for ClassMethodDescriptor {
+    #[inline]
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.function());
+    }
+}
+
+/// Safety: Traces all accessor values retained by a property descriptor.
+unsafe impl Trace for PropertyDescriptor {
+    #[inline]
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        if let Some(value) = self.getter() {
+            tracer.trace_value(value);
+        }
+        if let Some(value) = self.setter() {
+            tracer.trace_value(value);
+        }
+        if let Some(value) = self.deleter() {
+            tracer.trace_value(value);
+        }
+        if let Some(value) = self.doc() {
+            tracer.trace_value(value);
+        }
+    }
+}
+
+/// Safety: Traces both the callable and bound receiver.
+unsafe impl Trace for BoundMethod {
+    #[inline]
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.function());
+        tracer.trace_value(self.instance());
     }
 }
 
@@ -590,6 +657,24 @@ mod tests {
         // ObjectHeader is a leaf type
         assert_eq!(tracer.value_count, 0);
         assert_eq!(tracer.ptr_count, 0);
+    }
+
+    #[test]
+    fn test_descriptor_objects_trace_retained_values() {
+        let mut tracer = CountingTracer::new();
+
+        StaticMethodDescriptor::new(Value::int_unchecked(1)).trace(&mut tracer);
+        ClassMethodDescriptor::new(Value::int_unchecked(2)).trace(&mut tracer);
+        PropertyDescriptor::new_full(
+            Some(Value::int_unchecked(3)),
+            Some(Value::int_unchecked(4)),
+            Some(Value::int_unchecked(5)),
+            Some(Value::int_unchecked(6)),
+        )
+        .trace(&mut tracer);
+        BoundMethod::new(Value::int_unchecked(7), Value::int_unchecked(8)).trace(&mut tracer);
+
+        assert_eq!(tracer.value_count, 8);
     }
 
     #[test]

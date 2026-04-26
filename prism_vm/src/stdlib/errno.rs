@@ -161,8 +161,8 @@ const PLATFORM_ERRNO_ENTRIES: &[(&str, i64)] = &[
 ];
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 /// Native `errno` module descriptor.

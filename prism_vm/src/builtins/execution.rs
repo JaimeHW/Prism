@@ -422,9 +422,15 @@ fn compile_dynamic_module(
 ) -> Result<Arc<prism_code::CodeObject>, BuiltinError> {
     let parsed = parse_module_source(source)
         .map_err(|err| syntax_error_from_prism_error(source, filename, err))?;
-    Compiler::compile_module_with_namespace_mode(&parsed, filename, optimize, namespace_mode)
-        .map(Arc::new)
-        .map_err(|err| syntax_error_from_compile_error(source, filename, err))
+    Compiler::compile_module_with_source_and_namespace_mode(
+        &parsed,
+        source,
+        filename,
+        optimize,
+        namespace_mode,
+    )
+    .map(Arc::new)
+    .map_err(|err| syntax_error_from_compile_error(source, filename, err))
 }
 
 fn compile_dynamic_expression(
@@ -445,9 +451,15 @@ fn compile_dynamic_expression(
         span,
     );
     let module = Module::new(vec![assign], span);
-    Compiler::compile_module_with_namespace_mode(&module, filename, optimize, namespace_mode)
-        .map(Arc::new)
-        .map_err(|err| syntax_error_from_compile_error(source, filename, err))
+    Compiler::compile_module_with_source_and_namespace_mode(
+        &module,
+        source,
+        filename,
+        optimize,
+        namespace_mode,
+    )
+    .map(Arc::new)
+    .map_err(|err| syntax_error_from_compile_error(source, filename, err))
 }
 
 fn code_contains_internal_eval_result(code: &prism_code::CodeObject) -> bool {
@@ -600,7 +612,7 @@ fn compile_from_parsed_args(args: CompileArgs) -> Result<Value, BuiltinError> {
 }
 
 fn boxed_code_value(code: Arc<prism_code::CodeObject>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(CodeObjectView::new(code))) as *const ())
+    crate::alloc_managed_value(CodeObjectView::new(code))
 }
 
 fn dynamic_module_namespace_mode(

@@ -15,6 +15,9 @@ use crate::builtins::{
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
+use crate::ops::exception::helpers::{
+    extract_type_id_from_value, is_exception_class_value, is_exception_instance_value,
+};
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
@@ -55,6 +58,12 @@ use unicode_xid::UnicodeXID;
 
 use super::method_cache::CachedMethod;
 
+static LIST_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__iter__"), list_iter));
+static LIST_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__len__"), list_len));
+static LIST_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__getitem__"), list_getitem));
 static LIST_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.append"), list_append));
 static LIST_EXTEND_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -95,6 +104,10 @@ static DEQUE_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.pop"), deque_pop));
 static DEQUE_POPLEFT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.popleft"), deque_popleft));
+static DEQUE_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.remove"), deque_remove));
+static DEQUE_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.__getitem__"), deque_getitem));
 static REGEX_PATTERN_MATCH_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("Pattern.match"),
@@ -147,6 +160,12 @@ static REGEX_MATCH_GROUP_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new
     BuiltinFunctionObject::new_vm(
         Arc::from("Match.group"),
         crate::stdlib::re::builtin_match_group,
+    )
+});
+static REGEX_MATCH_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("Match.__getitem__"),
+        crate::stdlib::re::builtin_match_getitem,
     )
 });
 static REGEX_MATCH_GROUPS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -324,7 +343,7 @@ static STR_LOWER_METHOD: LazyLock<BuiltinFunctionObject> =
 static STR_CAPITALIZE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.capitalize"), str_capitalize));
 static STR_REPLACE_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.replace"), str_replace));
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("str.replace"), str_replace_kw));
 static STR_REMOVEPREFIX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.removeprefix"), str_removeprefix));
 static STR_REMOVESUFFIX_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -567,6 +586,13 @@ static GENERIC_DUNDER_METHODS: LazyLock<Mutex<FxHashMap<(u32, &'static str), usi
 /// Resolve builtin list methods backed by static builtin function objects.
 pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
     match name {
+        "__iter__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_ITER_METHOD,
+        ))),
+        "__len__" => Some(CachedMethod::simple(builtin_method_value(&LIST_LEN_METHOD))),
+        "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_GETITEM_METHOD,
+        ))),
         "append" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_APPEND_METHOD,
         ))),
@@ -639,6 +665,12 @@ pub fn resolve_deque_method(name: &str) -> Option<CachedMethod> {
         "popleft" => Some(CachedMethod::simple(builtin_method_value(
             &DEQUE_POPLEFT_METHOD,
         ))),
+        "remove" => Some(CachedMethod::simple(builtin_method_value(
+            &DEQUE_REMOVE_METHOD,
+        ))),
+        "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &DEQUE_GETITEM_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -677,6 +709,9 @@ pub fn resolve_regex_pattern_method(name: &str) -> Option<CachedMethod> {
 /// Resolve builtin regex match methods backed by static builtin function objects.
 pub fn resolve_regex_match_method(name: &str) -> Option<CachedMethod> {
     match name {
+        "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &REGEX_MATCH_GETITEM_METHOD,
+        ))),
         "group" => Some(CachedMethod::simple(builtin_method_value(
             &REGEX_MATCH_GROUP_METHOD,
         ))),
@@ -1288,6 +1323,45 @@ fn ensure_hashable(value: Value) -> Result<(), BuiltinError> {
 }
 
 #[inline]
+fn list_iter(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__iter__", args, 0)?;
+    let list = expect_list_ref(args[0], "__iter__")?;
+    Ok(iterator_to_value(IteratorObject::from_values(
+        list.as_slice().to_vec(),
+    )))
+}
+
+#[inline]
+fn list_len(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__len__", args, 0)?;
+    let list = expect_list_ref(args[0], "__len__")?;
+    Ok(Value::int(i64::try_from(list.len()).unwrap_or(i64::MAX))
+        .expect("list length should fit in tagged int"))
+}
+
+#[inline]
+fn list_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__getitem__", args, 1)?;
+    let list = expect_list_ref(args[0], "__getitem__")?;
+
+    if let Some(index) = args[1]
+        .as_object_ptr()
+        .and_then(slice_object_from_value_ptr)
+    {
+        let indices = index.indices(list.len());
+        let mut values = Vec::with_capacity(indices.length);
+        for index in indices.iter() {
+            values.push(list.as_slice()[index]);
+        }
+        return Ok(to_object_value(ListObject::from_iter(values)));
+    }
+
+    let index = expect_integer_like_index(args[1])?;
+    list.get(index)
+        .ok_or_else(|| BuiltinError::IndexError("list index out of range".to_string()))
+}
+
+#[inline]
 fn list_append(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "append", args, 1)?;
     let list = expect_list_mut(args[0], "append")?;
@@ -1808,12 +1882,18 @@ fn invoke_comparison_method(
     target: BoundMethodTarget,
     operand: Value,
 ) -> Result<Value, BuiltinError> {
+    invoke_bound_method_with_arg(vm, &target, operand)
+}
+
+fn invoke_bound_method_with_arg(
+    vm: &mut VirtualMachine,
+    target: &BoundMethodTarget,
+    arg: Value,
+) -> Result<Value, BuiltinError> {
     match target.implicit_self {
-        Some(implicit_self) => {
-            invoke_callable_value(vm, target.callable, &[implicit_self, operand])
-                .map_err(runtime_error_to_builtin_error)
-        }
-        None => invoke_callable_value(vm, target.callable, &[operand])
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self, arg])
+            .map_err(runtime_error_to_builtin_error),
+        None => invoke_callable_value(vm, target.callable, &[arg])
             .map_err(runtime_error_to_builtin_error),
     }
 }
@@ -1852,6 +1932,41 @@ fn deque_popleft(args: &[Value]) -> Result<Value, BuiltinError> {
         .deque_mut()
         .popleft()
         .ok_or_else(|| BuiltinError::IndexError("pop from an empty deque".to_string()))
+}
+
+#[inline]
+fn deque_remove(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("deque", "remove", args, 1)?;
+    let deque = expect_deque_mut(args[0], "remove")?;
+    if deque.deque_mut().remove(&args[1]) {
+        Ok(Value::none())
+    } else {
+        Err(BuiltinError::ValueError(
+            "deque.remove(x): x not in deque".to_string(),
+        ))
+    }
+}
+
+#[inline]
+fn deque_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("deque", "__getitem__", args, 1)?;
+    let deque = expect_deque_ref(args[0], "__getitem__")?;
+    let Some(raw_index) = args[1].as_int() else {
+        return Err(BuiltinError::TypeError(
+            "deque indices must be integers".to_string(),
+        ));
+    };
+    let Some(index) = isize::try_from(raw_index).ok() else {
+        return Err(BuiltinError::IndexError(format!(
+            "index {raw_index} out of range for length {}",
+            deque.len()
+        )));
+    };
+    deque
+        .deque()
+        .get(index)
+        .copied()
+        .ok_or_else(|| BuiltinError::IndexError(format!("deque index out of range: {raw_index}")))
 }
 
 #[inline]
@@ -2972,16 +3087,40 @@ fn str_capitalize(args: &[Value]) -> Result<Value, BuiltinError> {
 
 #[inline]
 fn str_replace(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_replace_kw(args, &[])
+}
+
+fn str_replace_kw(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
     let given = args.len().saturating_sub(1);
     if !(2..=3).contains(&given) {
-        return Err(BuiltinError::TypeError(format!(
-            "str.replace() takes from 2 to 3 arguments ({given} given)"
-        )));
+        if keywords.is_empty() {
+            return Err(BuiltinError::TypeError(format!(
+                "str.replace() takes from 2 to 3 arguments ({given} given)"
+            )));
+        }
+        if given > 3 {
+            return Err(BuiltinError::TypeError(format!(
+                "str.replace() takes from 2 to 3 arguments ({given} given)"
+            )));
+        }
     }
 
-    let old = expect_str_method_string_arg(args[1], "replace", 1)?;
-    let new = expect_str_method_string_arg(args[2], "replace", 2)?;
-    let count = parse_replace_count(args.get(3).copied())?;
+    let (old_arg, new_arg, count_arg) = bind_replace_keyword_args(args, keywords)?;
+    let old = expect_str_method_string_arg(
+        old_arg.ok_or_else(|| {
+            BuiltinError::TypeError("str.replace() missing required argument 'old'".to_string())
+        })?,
+        "replace",
+        1,
+    )?;
+    let new = expect_str_method_string_arg(
+        new_arg.ok_or_else(|| {
+            BuiltinError::TypeError("str.replace() missing required argument 'new'".to_string())
+        })?,
+        "replace",
+        2,
+    )?;
+    let count = parse_replace_count(count_arg)?;
 
     with_str_receiver(args[0], "replace", |value| {
         if count == Some(0) || old == new {
@@ -3847,6 +3986,52 @@ fn bind_split_keyword_args(
 }
 
 #[inline]
+fn bind_replace_keyword_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<(Option<Value>, Option<Value>, Option<Value>), BuiltinError> {
+    let mut old = args.get(1).copied();
+    let mut new = args.get(2).copied();
+    let mut count = args.get(3).copied();
+
+    for (name, value) in keywords {
+        match *name {
+            "old" => {
+                if old.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "replace() got multiple values for argument 'old'".to_string(),
+                    ));
+                }
+                old = Some(*value);
+            }
+            "new" => {
+                if new.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "replace() got multiple values for argument 'new'".to_string(),
+                    ));
+                }
+                new = Some(*value);
+            }
+            "count" => {
+                if count.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "replace() got multiple values for argument 'count'".to_string(),
+                    ));
+                }
+                count = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "str.replace() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok((old, new, count))
+}
+
+#[inline]
 fn parse_split_count(
     count: Option<Value>,
     method_name: &'static str,
@@ -4317,12 +4502,42 @@ fn collect_dict_update_entries(
         }
     }
 
+    if let Some(entries) = collect_mapping_entries_with_vm(vm, source)? {
+        return Ok(entries);
+    }
+
     let items = collect_iterable_values_with_vm(vm, source)?;
     let mut entries = Vec::with_capacity(items.len());
     for item in items {
         entries.push(expect_dict_update_entry(item)?);
     }
     Ok(entries)
+}
+
+fn collect_mapping_entries_with_vm(
+    vm: &mut VirtualMachine,
+    source: Value,
+) -> Result<Option<Vec<(Value, Value)>>, BuiltinError> {
+    let keys = match resolve_special_method(source, "keys") {
+        Ok(target) => {
+            let value = match target.implicit_self {
+                Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+                None => invoke_callable_value(vm, target.callable, &[]),
+            }
+            .map_err(runtime_error_to_builtin_error)?;
+            collect_iterable_values_with_vm(vm, value)?
+        }
+        Err(err) if err.is_attribute_error() => return Ok(None),
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let get_item =
+        resolve_special_method(source, "__getitem__").map_err(runtime_error_to_builtin_error)?;
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        entries.push((key, invoke_bound_method_with_arg(vm, &get_item, key)?));
+    }
+    Ok(Some(entries))
 }
 
 fn expect_dict_update_entry(item: Value) -> Result<(Value, Value), BuiltinError> {
@@ -4947,12 +5162,15 @@ fn expect_method_arg_range(
 }
 
 #[inline]
-fn normalize_generator_throw_arguments(args: &[Value]) -> Result<(Value, u16), BuiltinError> {
+fn normalize_generator_throw_arguments(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<(Value, u16), BuiltinError> {
     let typ = args[0];
     let value = args.get(1).copied();
     let traceback = args.get(2).copied();
 
-    let exception = if unsafe { ExceptionValue::from_value(typ) }.is_some() {
+    let exception = if is_exception_instance_value(&typ) {
         if value.is_some_and(|separate| !separate.is_none()) {
             return Err(BuiltinError::TypeError(
                 "instance exception may not have a separate value".to_string(),
@@ -4961,11 +5179,20 @@ fn normalize_generator_throw_arguments(args: &[Value]) -> Result<(Value, u16), B
         typ
     } else if let Some(exception_type) = exception_type_from_value(typ) {
         match value {
+            Some(arg) if is_exception_instance_value(&arg) => arg,
             Some(arg) if !arg.is_none() => {
                 let constructor_args = [arg];
                 exception_type.construct(&constructor_args)
             }
             _ => exception_type.construct(&[]),
+        }
+    } else if is_exception_class_value(&typ) {
+        match value {
+            Some(arg) if is_exception_instance_value(&arg) => arg,
+            Some(arg) if !arg.is_none() => {
+                invoke_callable_value(vm, typ, &[arg]).map_err(BuiltinError::Raised)?
+            }
+            _ => invoke_callable_value(vm, typ, &[]).map_err(BuiltinError::Raised)?,
         }
     } else {
         return Err(BuiltinError::TypeError(format!(
@@ -4975,22 +5202,52 @@ fn normalize_generator_throw_arguments(args: &[Value]) -> Result<(Value, u16), B
     };
 
     if let Some(traceback) = traceback {
-        let Some(exception_value) = (unsafe { ExceptionValue::from_value_mut(exception) }) else {
-            return Err(BuiltinError::TypeError(
-                "exceptions must derive from BaseException".to_string(),
-            ));
-        };
+        attach_generator_throw_traceback(vm, exception, traceback)?;
+    }
+
+    if !is_exception_instance_value(&exception) {
+        return Err(BuiltinError::TypeError(
+            "exceptions must derive from BaseException".to_string(),
+        ));
+    }
+    let type_id = extract_type_id_from_value(&exception);
+    Ok((exception, type_id))
+}
+
+fn attach_generator_throw_traceback(
+    vm: &mut VirtualMachine,
+    exception: Value,
+    traceback: Value,
+) -> Result<(), BuiltinError> {
+    if let Some(exception_value) = unsafe { ExceptionValue::from_value_mut(exception) } {
         exception_value.replace_traceback(traceback).map_err(|_| {
             BuiltinError::TypeError("throw() third argument must be a traceback object".to_string())
         })?;
+        return Ok(());
     }
 
-    let type_id = unsafe { ExceptionValue::from_value(exception) }
-        .map(|normalized| normalized.exception_type_id)
-        .ok_or_else(|| {
-            BuiltinError::TypeError("exceptions must derive from BaseException".to_string())
-        })?;
-    Ok((exception, type_id))
+    let traceback = normalize_generator_throw_traceback(traceback)?;
+    set_attribute_value(vm, exception, &intern("__traceback__"), traceback)
+        .map_err(BuiltinError::Raised)
+}
+
+fn normalize_generator_throw_traceback(traceback: Value) -> Result<Value, BuiltinError> {
+    if traceback.is_none() {
+        return Ok(traceback);
+    }
+
+    let Some(ptr) = traceback.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(
+            "throw() third argument must be a traceback object".to_string(),
+        ));
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::TRACEBACK {
+        return Err(BuiltinError::TypeError(
+            "throw() third argument must be a traceback object".to_string(),
+        ));
+    }
+    Ok(traceback)
 }
 
 #[inline]
@@ -5344,6 +5601,29 @@ fn expect_deque_mut(
 }
 
 #[inline]
+fn expect_deque_ref(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static DequeObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'deque.{method_name}' requires a 'deque' object but received '{}'",
+            value.type_name()
+        )));
+    };
+
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::DEQUE {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'deque.{method_name}' requires a 'deque' object but received '{}'",
+            header.type_id.name()
+        )));
+    }
+
+    Ok(unsafe { &*(ptr as *const DequeObject) })
+}
+
+#[inline]
 fn expect_dict_receiver(value: Value, method_name: &'static str) -> Result<(), BuiltinError> {
     expect_dict_ref(value, method_name).map(|_| ())
 }
@@ -5694,8 +5974,8 @@ fn generator_close(args: &[Value]) -> Result<Value, BuiltinError> {
 #[inline]
 fn generator_throw(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_range("generator", "throw", args, 1, 3)?;
+    let (exception, type_id) = normalize_generator_throw_arguments(vm, &args[1..])?;
     let generator = expect_generator_mut(args[0], "throw")?;
-    let (exception, type_id) = normalize_generator_throw_arguments(&args[1..])?;
     match vm.resume_generator_for_throw(generator, exception, type_id) {
         Ok(GeneratorResumeOutcome::Yielded(value)) => Ok(value),
         Ok(GeneratorResumeOutcome::Returned(value)) => {
@@ -6057,8 +6337,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_list_method_returns_builtin_for_append_extend_insert_remove_pop_copy_clear_and_reverse()
-     {
+    fn test_resolve_list_method_returns_builtin_for_sequence_protocol_and_mutators() {
+        let iter = resolve_list_method("__iter__").expect("__iter__ should resolve");
+        let len = resolve_list_method("__len__").expect("__len__ should resolve");
+        let getitem = resolve_list_method("__getitem__").expect("__getitem__ should resolve");
         let append = resolve_list_method("append").expect("append should resolve");
         let extend = resolve_list_method("extend").expect("extend should resolve");
         let insert = resolve_list_method("insert").expect("insert should resolve");
@@ -6067,6 +6349,9 @@ mod tests {
         let copy = resolve_list_method("copy").expect("copy should resolve");
         let clear = resolve_list_method("clear").expect("clear should resolve");
         let reverse = resolve_list_method("reverse").expect("reverse should resolve");
+        assert!(iter.method.as_object_ptr().is_some());
+        assert!(len.method.as_object_ptr().is_some());
+        assert!(getitem.method.as_object_ptr().is_some());
         assert!(append.method.as_object_ptr().is_some());
         assert!(extend.method.as_object_ptr().is_some());
         assert!(insert.method.as_object_ptr().is_some());
@@ -6197,20 +6482,36 @@ mod tests {
         let value = Value::object_ptr(object as *const ());
 
         list_append(&[value, Value::int(7).unwrap()]).expect("append should work on subclasses");
+        list_append(&[value, Value::int(11).unwrap()]).expect("append should work on subclasses");
+        let len = list_len(&[value]).expect("__len__ should work on subclasses");
+        let first = list_getitem(&[value, Value::int(0).unwrap()])
+            .expect("__getitem__ should work on subclasses");
+        let iter = list_iter(&[value]).expect("__iter__ should work on subclasses");
         let copied = list_copy(&[value]).expect("copy should work on subclasses");
         list_clear(&[value]).expect("clear should work on subclasses");
         let copied_ptr = copied
             .as_object_ptr()
             .expect("list.copy should still return a concrete list")
             as *mut ListObject;
+        let iter_ptr = iter
+            .as_object_ptr()
+            .expect("list.__iter__ should return an iterator")
+            as *mut IteratorObject;
+        let iter_ref = unsafe { &mut *iter_ptr };
 
         let backing = unsafe { &*object }
             .list_backing()
             .expect("list backing should exist");
         assert!(backing.as_slice().is_empty());
-        assert_eq!(list_values(copied_ptr), vec![7]);
+        assert_eq!(len.as_int(), Some(2));
+        assert_eq!(first.as_int(), Some(7));
+        assert_eq!(iter_ref.next().and_then(|value| value.as_int()), Some(7));
+        assert_eq!(iter_ref.next().and_then(|value| value.as_int()), Some(11));
+        assert!(iter_ref.next().is_none());
+        assert_eq!(list_values(copied_ptr), vec![7, 11]);
 
         unsafe {
+            drop(Box::from_raw(iter_ptr));
             drop(Box::from_raw(copied_ptr));
             drop(Box::from_raw(object));
         }
@@ -7286,6 +7587,34 @@ mod tests {
         ])
         .expect("counted replace should work");
         assert_eq!(string_value(counted), "baNAna");
+    }
+
+    #[test]
+    fn test_str_replace_accepts_cpython_keyword_arguments() {
+        let replaced = str_replace_kw(
+            &[Value::string(intern("banana"))],
+            &[
+                ("old", Value::string(intern("na"))),
+                ("new", Value::string(intern("NA"))),
+                ("count", Value::int(1).unwrap()),
+            ],
+        )
+        .expect("keyword replace should work");
+        assert_eq!(string_value(replaced), "baNAna");
+
+        let mixed = str_replace_kw(
+            &[Value::string(intern("banana")), Value::string(intern("na"))],
+            &[("new", Value::string(intern("NA")))],
+        )
+        .expect("mixed positional and keyword replace should work");
+        assert_eq!(string_value(mixed), "baNANA");
+
+        let duplicate = str_replace_kw(
+            &[Value::string(intern("banana")), Value::string(intern("na"))],
+            &[("old", Value::string(intern("a")))],
+        )
+        .expect_err("duplicate old argument should fail");
+        assert!(duplicate.to_string().contains("multiple values"));
     }
 
     #[test]
@@ -9366,6 +9695,14 @@ mod tests {
         let sub = resolve_regex_pattern_method("sub").expect("sub should resolve");
         assert!(sub.method.as_object_ptr().is_some());
         assert!(!sub.is_descriptor);
+    }
+
+    #[test]
+    fn test_resolve_regex_match_method_returns_builtin_for_getitem() {
+        let getitem =
+            resolve_regex_match_method("__getitem__").expect("__getitem__ should resolve");
+        assert!(getitem.method.as_object_ptr().is_some());
+        assert!(!getitem.is_descriptor);
     }
 
     #[test]

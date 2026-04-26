@@ -474,7 +474,7 @@ fn tuple_value(values: &[Value]) -> Value {
 
 fn bound_builtin_attr_value(function: &'static BuiltinFunctionObject, receiver: Value) -> Value {
     let bound = function.bind(receiver);
-    Value::object_ptr(Box::into_raw(Box::new(bound)) as *const ())
+    crate::alloc_managed_value(bound)
 }
 
 fn windows_version_tuple(value: Value) -> Result<&'static TupleObject, BuiltinError> {
@@ -734,8 +734,8 @@ pub fn hash_info_tuple() -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 // =============================================================================

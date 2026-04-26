@@ -5,6 +5,7 @@
 
 use crate::VirtualMachine;
 use prism_core::Value;
+use prism_gc::trace::{Trace, Tracer};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use smallvec::SmallVec;
@@ -270,6 +271,20 @@ impl std::fmt::Debug for BuiltinFunctionObject {
     }
 }
 
+unsafe impl Trace for BuiltinFunctionObject {
+    #[inline]
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        if let Some(bound_self) = self.bound_self {
+            tracer.trace_value(bound_self);
+        }
+    }
+
+    #[inline]
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>() + self.name.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +383,28 @@ mod tests {
             .call_with_keywords(&[], &[("flag", Value::bool(true))])
             .expect("bound keyword-aware builtin should execute");
         assert_eq!(bound_result.as_int(), Some(2));
+    }
+
+    #[test]
+    fn test_bound_builtin_trace_visits_receiver() {
+        struct CountingTracer {
+            values: usize,
+        }
+
+        impl Tracer for CountingTracer {
+            fn trace_value(&mut self, _value: Value) {
+                self.values += 1;
+            }
+
+            fn trace_ptr(&mut self, _ptr: *const ()) {}
+        }
+
+        let func = BuiltinFunctionObject::new(Arc::from("capture"), capture_args);
+        let bound = func.bind(Value::int(10).unwrap());
+        let mut tracer = CountingTracer { values: 0 };
+
+        bound.trace(&mut tracer);
+
+        assert_eq!(tracer.values, 1);
     }
 }

@@ -149,6 +149,10 @@ fn builtin_ncallbacks(args: &[Value]) -> Result<Value, BuiltinError> {
         .ok_or_else(|| BuiltinError::OverflowError("callback count overflow".to_string()))
 }
 
+pub(crate) fn run_exitfuncs(vm: &mut VirtualMachine) -> Result<Value, BuiltinError> {
+    builtin_run_exitfuncs(vm, &[])
+}
+
 fn builtin_run_exitfuncs(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if !args.is_empty() {
         return Err(BuiltinError::TypeError(format!(

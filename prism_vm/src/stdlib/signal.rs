@@ -6,15 +6,20 @@
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::error::RuntimeError;
+use crate::ops::calls::value_supports_call_protocol;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
-const SIG_DFL: i64 = 0;
-const SIG_IGN: i64 = 1;
-const SIGINT: i64 = 2;
+pub(crate) const SIG_DFL: i64 = 0;
+pub(crate) const SIG_IGN: i64 = 1;
+pub(crate) const SIGINT: i64 = 2;
+pub(crate) const SIGTERM: i64 = 15;
+pub(crate) const NSIG: i64 = 65;
 
 static DEFAULT_INT_HANDLER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -37,8 +42,9 @@ struct SignalState {
 impl SignalState {
     fn new() -> Self {
         let mut handlers = FxHashMap::default();
+        handlers.insert(SIGINT, builtin_value(&DEFAULT_INT_HANDLER_FUNCTION));
         handlers.insert(
-            SIGINT,
+            SIGTERM,
             Value::int(SIG_DFL).expect("signal default constant fits in Value::int"),
         );
         Self { handlers }
@@ -73,6 +79,8 @@ impl SignalModule {
                 Arc::from("SIG_DFL"),
                 Arc::from("SIG_IGN"),
                 Arc::from("SIGINT"),
+                Arc::from("SIGTERM"),
+                Arc::from("NSIG"),
                 Arc::from("default_int_handler"),
                 Arc::from("getsignal"),
                 Arc::from("signal"),
@@ -99,6 +107,8 @@ impl Module for SignalModule {
             "SIG_DFL" => Ok(Value::int(SIG_DFL).expect("SIG_DFL fits in Value::int")),
             "SIG_IGN" => Ok(Value::int(SIG_IGN).expect("SIG_IGN fits in Value::int")),
             "SIGINT" => Ok(Value::int(SIGINT).expect("SIGINT fits in Value::int")),
+            "SIGTERM" => Ok(Value::int(SIGTERM).expect("SIGTERM fits in Value::int")),
+            "NSIG" => Ok(Value::int(NSIG).expect("NSIG fits in Value::int")),
             "default_int_handler" => Ok(builtin_value(&DEFAULT_INT_HANDLER_FUNCTION)),
             "getsignal" => Ok(builtin_value(&GETSIGNAL_FUNCTION)),
             "signal" => Ok(builtin_value(&SIGNAL_FUNCTION)),
@@ -120,9 +130,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 fn export_names_value() -> Value {
@@ -131,6 +140,8 @@ fn export_names_value() -> Value {
             "SIG_DFL",
             "SIG_IGN",
             "SIGINT",
+            "SIGTERM",
+            "NSIG",
             "default_int_handler",
             "getsignal",
             "signal",
@@ -148,11 +159,39 @@ fn parse_signal_number(value: Value, fn_name: &str) -> Result<i64, BuiltinError>
         )));
     };
 
-    match signum {
-        SIGINT => Ok(signum),
-        _ => Err(BuiltinError::ValueError(format!(
-            "{fn_name}() only supports SIGINT in Prism right now"
-        ))),
+    if is_valid_signal_number(signum) {
+        Ok(signum)
+    } else {
+        Err(BuiltinError::ValueError(format!(
+            "{fn_name}() signal number out of range"
+        )))
+    }
+}
+
+#[inline]
+pub(crate) fn is_valid_signal_number(signum: i64) -> bool {
+    signum > 0 && signum < NSIG
+}
+
+#[inline]
+pub(crate) fn handler_for_signal(signum: i64) -> Value {
+    SIGNAL_STATE.read().unwrap().get(signum)
+}
+
+#[inline]
+pub(crate) fn is_default_or_ignored_handler(handler: Value) -> bool {
+    matches!(handler.as_int(), Some(SIG_DFL | SIG_IGN))
+}
+
+fn validate_handler(handler: Value) -> Result<(), BuiltinError> {
+    if matches!(handler.as_int(), Some(SIG_DFL | SIG_IGN)) || value_supports_call_protocol(handler)
+    {
+        Ok(())
+    } else {
+        Err(BuiltinError::TypeError(
+            "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object"
+                .to_string(),
+        ))
     }
 }
 
@@ -164,7 +203,10 @@ fn builtin_default_int_handler(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    Ok(Value::none())
+    Err(BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::KeyboardInterrupt.as_u8() as u16,
+        "",
+    )))
 }
 
 fn builtin_getsignal(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -188,6 +230,7 @@ fn builtin_signal(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let signum = parse_signal_number(args[0], "signal")?;
+    validate_handler(args[1])?;
     Ok(SIGNAL_STATE.write().unwrap().set(signum, args[1]))
 }
 
@@ -211,6 +254,16 @@ mod tests {
             Some(SIGINT),
             "SIGINT constant should round-trip"
         );
+        assert_eq!(
+            module.get_attr("SIGTERM").unwrap().as_int(),
+            Some(SIGTERM),
+            "SIGTERM constant should round-trip"
+        );
+        assert_eq!(
+            module.get_attr("NSIG").unwrap().as_int(),
+            Some(NSIG),
+            "NSIG constant should round-trip"
+        );
         assert!(module.get_attr("signal").unwrap().as_object_ptr().is_some());
         assert!(
             module
@@ -230,16 +283,22 @@ mod tests {
                 .get_attr("getsignal")
                 .expect("getsignal should exist"),
         );
+        let default_handler = module
+            .get_attr("default_int_handler")
+            .expect("default_int_handler should exist");
+        let original = signal
+            .call(&[Value::int(SIGINT).unwrap(), default_handler])
+            .expect("signal should accept default handler");
 
         let previous = getsignal
             .call(&[Value::int(SIGINT).unwrap()])
             .expect("getsignal should succeed");
-        assert_eq!(previous.as_int(), Some(SIG_DFL));
+        assert_eq!(previous.as_object_ptr(), default_handler.as_object_ptr());
 
         let returned = signal
             .call(&[Value::int(SIGINT).unwrap(), Value::int(SIG_IGN).unwrap()])
             .expect("signal should succeed");
-        assert_eq!(returned.as_int(), Some(SIG_DFL));
+        assert_eq!(returned.as_object_ptr(), default_handler.as_object_ptr());
         assert_eq!(
             getsignal
                 .call(&[Value::int(SIGINT).unwrap()])
@@ -248,7 +307,7 @@ mod tests {
             Some(SIG_IGN)
         );
 
-        let _ = signal.call(&[Value::int(SIGINT).unwrap(), Value::int(SIG_DFL).unwrap()]);
+        let _ = signal.call(&[Value::int(SIGINT).unwrap(), original]);
     }
 
     #[test]
@@ -264,5 +323,18 @@ mod tests {
             .call(&[Value::int(SIGINT).unwrap()])
             .expect_err("missing frame argument should error");
         assert!(err.to_string().contains("2 positional arguments"));
+
+        let err = handler
+            .call(&[Value::int(SIGINT).unwrap(), Value::none()])
+            .expect_err("default SIGINT handler should raise KeyboardInterrupt");
+        match err {
+            BuiltinError::Raised(runtime) => match runtime.kind {
+                crate::error::RuntimeErrorKind::Exception { type_id, .. } => {
+                    assert_eq!(type_id, ExceptionTypeId::KeyboardInterrupt.as_u8() as u16);
+                }
+                other => panic!("expected KeyboardInterrupt exception, got {other:?}"),
+            },
+            other => panic!("expected raised KeyboardInterrupt, got {other:?}"),
+        }
     }
 }

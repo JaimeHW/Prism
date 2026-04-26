@@ -34,6 +34,7 @@
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, get_iterator_mut, value_to_iterator};
 use prism_core::Value;
+use prism_gc::trace::{Trace, Tracer};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::{ObjectHeader, PyObject};
 use std::ops::{Index, IndexMut};
@@ -92,6 +93,18 @@ impl PyObject for DequeObject {
 
     fn header_mut(&mut self) -> &mut ObjectHeader {
         &mut self.header
+    }
+}
+
+unsafe impl Trace for DequeObject {
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        for value in self.deque.iter() {
+            tracer.trace_value(*value);
+        }
+    }
+
+    fn size_of(&self) -> usize {
+        std::mem::size_of::<Self>() + self.deque.capacity() * std::mem::size_of::<Option<Value>>()
     }
 }
 
@@ -195,8 +208,7 @@ fn build_deque(
 
 #[inline]
 fn leak_deque_value(object: DequeObject) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+    crate::alloc_managed_value(object)
 }
 
 fn collect_iterable_values_static(value: Value) -> Result<Vec<Value>, BuiltinError> {
@@ -892,6 +904,7 @@ impl DoubleEndedIterator for DequeIntoIter {
 #[cfg(test)]
 mod deque_tests {
     use super::*;
+    use prism_gc::trace::Tracer;
     use prism_runtime::types::list::ListObject;
 
     // =========================================================================
@@ -915,6 +928,32 @@ mod deque_tests {
     fn test_with_capacity_rounds_to_power_of_two() {
         let d = Deque::with_capacity(17);
         assert_eq!(d.capacity(), 32);
+    }
+
+    #[test]
+    fn test_deque_object_trace_visits_live_elements() {
+        struct CountingTracer {
+            values: usize,
+        }
+
+        impl Tracer for CountingTracer {
+            fn trace_value(&mut self, _value: Value) {
+                self.values += 1;
+            }
+
+            fn trace_ptr(&mut self, _ptr: *const ()) {}
+        }
+
+        let object = DequeObject::from_deque(Deque::from_iter([
+            Value::int_unchecked(1),
+            Value::int_unchecked(2),
+            Value::int_unchecked(3),
+        ]));
+        let mut tracer = CountingTracer { values: 0 };
+
+        object.trace(&mut tracer);
+
+        assert_eq!(tracer.values, 3);
     }
 
     #[test]

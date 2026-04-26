@@ -25,6 +25,7 @@
 //! issubclass(Dog, Animal)    # True - O(1) bitmap check
 //! ```
 
+use crate::allocation_context::alloc_value_in_current_heap_or_box;
 use crate::object::mro::ClassId;
 use crate::object::type_obj::TypeId;
 use prism_core::Value;
@@ -855,11 +856,11 @@ fn wrap_implicit_descriptor(value: Value, kind: ImplicitDescriptorKind) -> Value
     match kind {
         ImplicitDescriptorKind::StaticMethod => {
             let descriptor = StaticMethodDescriptor::new(value);
-            Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ())
+            alloc_value_in_current_heap_or_box(descriptor)
         }
         ImplicitDescriptorKind::ClassMethod => {
             let descriptor = ClassMethodDescriptor::new(value);
-            Value::object_ptr(Box::into_raw(Box::new(descriptor)) as *const ())
+            alloc_value_in_current_heap_or_box(descriptor)
         }
     }
 }
@@ -1830,6 +1831,27 @@ mod tests {
             TypeId::STATICMETHOD
         );
         assert_eq!(descriptor.function(), function_value);
+    }
+
+    #[test]
+    fn test_type_new_implicit_descriptor_uses_bound_heap() {
+        let heap = prism_gc::heap::GcHeap::with_defaults();
+        let _binding = crate::allocation_context::RuntimeHeapBinding::register(&heap);
+        let registry = create_test_registry();
+        let name = intern("HeapWrappedNewClass");
+        let namespace = ClassDict::new();
+        namespace.set(intern("__new__"), test_function_value("__new__"));
+
+        let result = type_new(name, &[], &namespace, &registry).unwrap();
+        let stored = result
+            .class
+            .get_attr(&intern("__new__"))
+            .expect("__new__ should be present on the class");
+        let ptr = stored
+            .as_object_ptr()
+            .expect("normalized __new__ should be a descriptor object");
+
+        assert!(heap.contains(ptr));
     }
 
     #[test]

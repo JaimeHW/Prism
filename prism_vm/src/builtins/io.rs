@@ -26,10 +26,15 @@ pub fn builtin_print_vm_kw(
 ) -> Result<Value, BuiltinError> {
     let options = parse_print_options(vm, keywords)?;
     let rendered = format_print_output(args, &options.sep, &options.end);
+    let explicit_file = options.file.is_some();
+    let file = match options.file {
+        Some(file) => Some(file),
+        None => default_print_file(vm),
+    };
 
-    if let Some(file) = options.file {
+    if let Some(file) = file {
         write_print_to_python_file(vm, file, &rendered)?;
-        if options.flush {
+        if options.flush || !explicit_file {
             flush_python_file(vm, file)?;
         }
         return Ok(Value::none());
@@ -41,6 +46,14 @@ pub fn builtin_print_vm_kw(
         stdout.flush().ok();
     }
     Ok(Value::none())
+}
+
+fn default_print_file(vm: &crate::VirtualMachine) -> Option<Value> {
+    vm.import_resolver
+        .get_cached("sys")
+        .or_else(|| vm.import_resolver.import_module("sys").ok())
+        .and_then(|module| module.get_attr("stdout"))
+        .filter(|value| !value.is_none())
 }
 
 struct PrintOptions {

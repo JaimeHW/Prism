@@ -289,14 +289,12 @@ fn dict_binary_operands(
 #[inline]
 pub(crate) fn boxed_set_result(mut set: SetObject, result_type: TypeId) -> Value {
     set.header.type_id = result_type;
-    let ptr = Box::into_raw(Box::new(set));
-    Value::object_ptr(ptr as *const ())
+    crate::alloc_managed_value(set)
 }
 
 #[inline]
 fn boxed_dict_result(dict: DictObject) -> Value {
-    let ptr = Box::into_raw(Box::new(dict));
-    Value::object_ptr(ptr as *const ())
+    crate::alloc_managed_value(dict)
 }
 
 #[inline]

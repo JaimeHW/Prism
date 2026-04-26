@@ -296,7 +296,30 @@ const FUNCTION_TYPE_ATTRS: &[AttrSpec] = &[
     },
 ];
 
-const DEQUE_METHOD_NAMES: &[&str] = &["append", "appendleft", "pop", "popleft"];
+const DEQUE_METHOD_NAMES: &[&str] = &[
+    "__getitem__",
+    "append",
+    "appendleft",
+    "pop",
+    "popleft",
+    "remove",
+];
+const LIST_METHOD_NAMES: &[&str] = &[
+    "__iter__",
+    "__len__",
+    "__getitem__",
+    "append",
+    "extend",
+    "insert",
+    "remove",
+    "pop",
+    "copy",
+    "clear",
+    "count",
+    "index",
+    "reverse",
+    "sort",
+];
 const DICT_METHOD_NAMES: &[&str] = &[
     "__len__",
     "__contains__",
@@ -386,7 +409,15 @@ const REGEX_PATTERN_METHOD_NAMES: &[&str] = &[
     "subn",
     "split",
 ];
-const REGEX_MATCH_METHOD_NAMES: &[&str] = &["group", "groups", "groupdict", "start", "end", "span"];
+const REGEX_MATCH_METHOD_NAMES: &[&str] = &[
+    "__getitem__",
+    "group",
+    "groups",
+    "groupdict",
+    "start",
+    "end",
+    "span",
+];
 
 #[inline]
 fn builtin_type_attr_specs(type_id: TypeId) -> &'static [AttrSpec] {
@@ -427,6 +458,7 @@ fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
         TypeId::OBJECT => OBJECT_METHOD_NAMES,
         TypeId::INT => INT_METHOD_NAMES,
         TypeId::STR => STR_METHOD_NAMES,
+        TypeId::LIST => LIST_METHOD_NAMES,
         TypeId::SET => SET_METHOD_NAMES,
         TypeId::FROZENSET => FROZENSET_METHOD_NAMES,
         TypeId::BYTEARRAY => BYTEARRAY_METHOD_NAMES,
@@ -516,8 +548,8 @@ where
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 #[inline]
@@ -1765,6 +1797,12 @@ mod tests {
         assert!(names.contains(&intern("__getitem__")));
         assert!(names.contains(&intern("count")));
         assert!(names.contains(&intern("index")));
+    }
+
+    #[test]
+    fn test_builtin_mapping_proxy_names_include_regex_match_subscription() {
+        let names = builtin_mapping_proxy_names(TypeId::REGEX_MATCH);
+        assert!(names.contains(&intern("__getitem__")));
     }
 
     #[test]

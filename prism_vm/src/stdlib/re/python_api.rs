@@ -6,11 +6,13 @@ use super::functions;
 use super::match_obj::Match;
 use super::pattern::CompiledPattern;
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinError, iterator_to_value};
+use crate::builtins::{BuiltinError, iterator_to_value, runtime_error_to_builtin_error};
 use crate::error::RuntimeError;
+use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use prism_gc::trace::{Trace, Tracer};
+use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::{ObjectHeader, PyObject};
 use prism_runtime::types::bytes::BytesObject;
@@ -22,7 +24,9 @@ use prism_runtime::types::tuple::TupleObject;
 use regex::bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
 use rustc_hash::FxHashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+
+static REGEX_GC_DISPATCH_ONCE: Once = Once::new();
 
 #[derive(Debug, Clone)]
 enum RegexPatternKind {
@@ -45,6 +49,7 @@ impl Clone for RegexPatternObject {
 
 impl RegexPatternObject {
     fn new(pattern: RegexPatternKind) -> Self {
+        ensure_regex_gc_dispatch_registered();
         Self {
             header: ObjectHeader::new(TypeId::REGEX_PATTERN),
             pattern,
@@ -116,11 +121,61 @@ impl Clone for RegexMatchObject {
 
 impl RegexMatchObject {
     fn new(match_value: RegexMatchKind) -> Self {
+        ensure_regex_gc_dispatch_registered();
         Self {
             header: ObjectHeader::new(TypeId::REGEX_MATCH),
             match_value,
         }
     }
+}
+
+pub(crate) fn ensure_regex_gc_dispatch_registered() {
+    REGEX_GC_DISPATCH_ONCE.call_once(|| {
+        register_external_dispatch(
+            TypeId::REGEX_PATTERN,
+            DispatchEntry {
+                trace: trace_regex_pattern,
+                size: size_regex_pattern,
+                finalize: finalize_regex_pattern,
+            },
+        );
+        register_external_dispatch(
+            TypeId::REGEX_MATCH,
+            DispatchEntry {
+                trace: trace_regex_match,
+                size: size_regex_match,
+                finalize: finalize_regex_match,
+            },
+        );
+    });
+}
+
+unsafe fn trace_regex_pattern(ptr: *const (), tracer: &mut dyn Tracer) {
+    let object = unsafe { &*(ptr as *const RegexPatternObject) };
+    object.trace(tracer);
+}
+
+unsafe fn size_regex_pattern(ptr: *const ()) -> usize {
+    let object = unsafe { &*(ptr as *const RegexPatternObject) };
+    object.size_of()
+}
+
+unsafe fn finalize_regex_pattern(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut RegexPatternObject) };
+}
+
+unsafe fn trace_regex_match(ptr: *const (), tracer: &mut dyn Tracer) {
+    let object = unsafe { &*(ptr as *const RegexMatchObject) };
+    object.trace(tracer);
+}
+
+unsafe fn size_regex_match(ptr: *const ()) -> usize {
+    let object = unsafe { &*(ptr as *const RegexMatchObject) };
+    object.size_of()
+}
+
+unsafe fn finalize_regex_match(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut RegexMatchObject) };
 }
 
 impl PyObject for RegexMatchObject {
@@ -556,6 +611,21 @@ impl BytesMatch {
         Ok(group.as_ref().map_or(-1, |span| span.end as i64))
     }
 
+    fn lastindex(&self) -> Option<usize> {
+        self.groups
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, group)| (index > 0 && group.is_some()).then_some(index))
+    }
+
+    fn lastgroup(&self) -> Option<&str> {
+        let last_index = self.lastindex()?;
+        self.named_groups
+            .iter()
+            .find_map(|(name, &index)| (index == last_index).then_some(name.as_ref()))
+    }
+
     fn with_offset(mut self, text: &[u8], offset: usize) -> Self {
         self.string = Arc::from(text.to_vec());
         self.full_span = (self.full_span.start + offset)..(self.full_span.end + offset);
@@ -785,6 +855,27 @@ pub fn builtin_match_group(vm: &mut VirtualMachine, args: &[Value]) -> Result<Va
     alloc_value(vm, TupleObject::from_vec(items), "regex group tuple")
 }
 
+pub fn builtin_match_getitem(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "descriptor 'Match.__getitem__' requires a 'Match' object".to_string(),
+        ));
+    }
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "Match.__getitem__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let match_value = expect_match_ref(args[0], "__getitem__")?;
+    let selector = parse_group_selector(Some(args[1]))?;
+    match_group_value(vm, match_value, &selector)
+}
+
 pub fn builtin_match_groups(
     vm: &mut VirtualMachine,
     args: &[Value],
@@ -1002,6 +1093,15 @@ pub fn match_attr_value(
                 "regex match source bytes",
             )
             .map(Some),
+        },
+        "lastindex" => Ok(Some(match_lastindex_value(match_value))),
+        "lastgroup" => match &match_value.match_value {
+            RegexMatchKind::Text(match_value) => {
+                match_lastgroup_value(vm, match_value.lastgroup()).map(Some)
+            }
+            RegexMatchKind::Bytes(match_value) => {
+                match_lastgroup_value(vm, match_value.lastgroup()).map(Some)
+            }
         },
         _ => Ok(None),
     }
@@ -1278,6 +1378,7 @@ enum SubjectValue {
 enum ReplacementValue {
     Text(String),
     Bytes(Vec<u8>),
+    Callable(Value),
 }
 
 fn parse_text_or_bytes(
@@ -1417,6 +1518,10 @@ fn parse_replacement_for_pattern(
     value: Value,
     pattern: &RegexPatternObject,
 ) -> Result<ReplacementValue, BuiltinError> {
+    if value_supports_call_protocol(value) {
+        return Ok(ReplacementValue::Callable(value));
+    }
+
     match (&pattern.pattern, parse_text_or_bytes(value, "repl")?) {
         (RegexPatternKind::Text(_), SubjectValue::Text(text)) => {
             Ok(ReplacementValue::Text(translate_text_replacement(&text)?))
@@ -1620,6 +1725,33 @@ fn match_group_value(
     }
 }
 
+fn match_lastindex_value(match_value: &RegexMatchObject) -> Value {
+    let lastindex = match &match_value.match_value {
+        RegexMatchKind::Text(match_value) => match_value.lastindex(),
+        RegexMatchKind::Bytes(match_value) => match_value.lastindex(),
+    };
+    match lastindex {
+        Some(index) => {
+            Value::int(index as i64).expect("regex group index should fit in Value::int")
+        }
+        None => Value::none(),
+    }
+}
+
+fn match_lastgroup_value(
+    vm: &mut VirtualMachine,
+    lastgroup: Option<&str>,
+) -> Result<Value, RuntimeError> {
+    match lastgroup {
+        Some(name) => alloc_runtime_value(
+            vm,
+            StringObject::from_string(name.to_string()),
+            "regex lastgroup string",
+        ),
+        None => Ok(Value::none()),
+    }
+}
+
 fn resolve_text_group_index(
     match_value: &Match,
     selector: &GroupSelector,
@@ -1692,6 +1824,30 @@ fn sub_result_to_value(
             BytesObject::from_slice(&pattern.sub_n(&repl, &bytes, count)),
             "regex substitution bytes",
         ),
+        (
+            RegexPatternKind::Text(pattern),
+            ReplacementValue::Callable(callable),
+            SubjectValue::Text(text),
+        ) => {
+            let (result, _) = substitute_text_callable(vm, pattern, callable, &text, count)?;
+            alloc_value(
+                vm,
+                StringObject::from_string(result),
+                "regex substitution string",
+            )
+        }
+        (
+            RegexPatternKind::Bytes(pattern),
+            ReplacementValue::Callable(callable),
+            SubjectValue::Bytes(bytes),
+        ) => {
+            let (result, _) = substitute_bytes_callable(vm, pattern, callable, &bytes, count)?;
+            alloc_value(
+                vm,
+                BytesObject::from_slice(&result),
+                "regex substitution bytes",
+            )
+        }
         _ => Err(BuiltinError::TypeError(
             "pattern and replacement must be the same type as the search text".to_string(),
         )),
@@ -1736,6 +1892,38 @@ fn subn_result_to_value(
                 replacements,
             )
         }
+        (
+            RegexPatternKind::Text(pattern),
+            ReplacementValue::Callable(callable),
+            SubjectValue::Text(text),
+        ) => {
+            let (result, replacements) =
+                substitute_text_callable(vm, pattern, callable, &text, count)?;
+            (
+                alloc_value(
+                    vm,
+                    StringObject::from_string(result),
+                    "regex substitution string",
+                )?,
+                replacements,
+            )
+        }
+        (
+            RegexPatternKind::Bytes(pattern),
+            ReplacementValue::Callable(callable),
+            SubjectValue::Bytes(bytes),
+        ) => {
+            let (result, replacements) =
+                substitute_bytes_callable(vm, pattern, callable, &bytes, count)?;
+            (
+                alloc_value(
+                    vm,
+                    BytesObject::from_slice(&result),
+                    "regex substitution bytes",
+                )?,
+                replacements,
+            )
+        }
         _ => {
             return Err(BuiltinError::TypeError(
                 "pattern and replacement must be the same type as the search text".to_string(),
@@ -1751,6 +1939,92 @@ fn subn_result_to_value(
         ]),
         "regex substitution tuple",
     )
+}
+
+fn substitute_text_callable(
+    vm: &mut VirtualMachine,
+    pattern: &CompiledPattern,
+    callable: Value,
+    text: &str,
+    count: usize,
+) -> Result<(String, usize), BuiltinError> {
+    let limit = if count == 0 { usize::MAX } else { count };
+    let matches = pattern.findall(text);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0usize;
+    let mut replacements = 0usize;
+
+    for match_value in matches.into_iter().take(limit) {
+        let start = match_value.start();
+        let end = match_value.end();
+        result.push_str(&text[last_end..start]);
+
+        let match_object = alloc_value(
+            vm,
+            RegexMatchObject::new(RegexMatchKind::Text(match_value)),
+            "regex match",
+        )?;
+        let replacement = invoke_callable_value(vm, callable, &[match_object])
+            .map_err(runtime_error_to_builtin_error)?;
+        match parse_text_or_bytes(replacement, "repl")? {
+            SubjectValue::Text(text) => result.push_str(&text),
+            SubjectValue::Bytes(_) => {
+                return Err(BuiltinError::TypeError(
+                    "sequence item 0: expected str instance, bytes found".to_string(),
+                ));
+            }
+        }
+
+        last_end = end;
+        replacements += 1;
+    }
+
+    result.push_str(&text[last_end..]);
+    Ok((result, replacements))
+}
+
+fn substitute_bytes_callable(
+    vm: &mut VirtualMachine,
+    pattern: &CompiledBytesPattern,
+    callable: Value,
+    bytes: &[u8],
+    count: usize,
+) -> Result<(Vec<u8>, usize), BuiltinError> {
+    let limit = if count == 0 { usize::MAX } else { count };
+    let matches = pattern.findall(bytes);
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut last_end = 0usize;
+    let mut replacements = 0usize;
+
+    for match_value in matches.into_iter().take(limit) {
+        let start = usize::try_from(match_value.start(0)?)
+            .expect("matched byte start should be non-negative");
+        let end =
+            usize::try_from(match_value.end(0)?).expect("matched byte end should be non-negative");
+        result.extend_from_slice(&bytes[last_end..start]);
+
+        let match_object = alloc_value(
+            vm,
+            RegexMatchObject::new(RegexMatchKind::Bytes(match_value)),
+            "regex match",
+        )?;
+        let replacement = invoke_callable_value(vm, callable, &[match_object])
+            .map_err(runtime_error_to_builtin_error)?;
+        match parse_text_or_bytes(replacement, "repl")? {
+            SubjectValue::Bytes(bytes) => result.extend_from_slice(&bytes),
+            SubjectValue::Text(_) => {
+                return Err(BuiltinError::TypeError(
+                    "sequence item 0: expected a bytes-like object, str found".to_string(),
+                ));
+            }
+        }
+
+        last_end = end;
+        replacements += 1;
+    }
+
+    result.extend_from_slice(&bytes[last_end..]);
+    Ok((result, replacements))
 }
 
 fn split_result_to_value(
@@ -2277,6 +2551,113 @@ mod tests {
     }
 
     #[test]
+    fn test_match_lastindex_and_lastgroup_attributes_follow_cpython() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(
+            &mut vm,
+            &[Value::string(intern(r"(?P<word>\w+)(?:-(\d+))?"))],
+        )
+        .expect("compile should succeed");
+
+        let matched = builtin_pattern_search(&mut vm, &[pattern, Value::string(intern("abc"))])
+            .expect("search should succeed");
+
+        let lastindex = match_attr_value(&mut vm, matched, &intern("lastindex"))
+            .expect("lastindex lookup should succeed")
+            .expect("lastindex attribute should exist");
+        let lastgroup = match_attr_value(&mut vm, matched, &intern("lastgroup"))
+            .expect("lastgroup lookup should succeed")
+            .expect("lastgroup attribute should exist");
+
+        assert_eq!(lastindex.as_int(), Some(1));
+        assert_eq!(string_value(lastgroup), "word");
+
+        let pattern = builtin_compile(&mut vm, &[Value::string(intern(r"\w+"))])
+            .expect("compile should succeed");
+        let matched = builtin_pattern_search(&mut vm, &[pattern, Value::string(intern("abc"))])
+            .expect("search should succeed");
+
+        let lastindex = match_attr_value(&mut vm, matched, &intern("lastindex"))
+            .expect("lastindex lookup should succeed")
+            .expect("lastindex attribute should exist");
+        let lastgroup = match_attr_value(&mut vm, matched, &intern("lastgroup"))
+            .expect("lastgroup lookup should succeed")
+            .expect("lastgroup attribute should exist");
+
+        assert!(lastindex.is_none());
+        assert!(lastgroup.is_none());
+    }
+
+    #[test]
+    fn test_match_getitem_indexes_capture_groups_like_group() {
+        let mut vm = VirtualMachine::new();
+        let pattern = builtin_compile(
+            &mut vm,
+            &[Value::string(intern(r"(?P<word>\w+)-(?P<num>\d+)"))],
+        )
+        .expect("compile should succeed");
+        let matched = builtin_pattern_search(&mut vm, &[pattern, Value::string(intern("abc-123"))])
+            .expect("search should succeed");
+
+        let whole = builtin_match_getitem(
+            &mut vm,
+            &[
+                matched,
+                Value::int(0).expect("index should fit in Value::int"),
+            ],
+        )
+        .expect("getitem should return whole match");
+        let first = builtin_match_getitem(
+            &mut vm,
+            &[
+                matched,
+                Value::int(1).expect("index should fit in Value::int"),
+            ],
+        )
+        .expect("getitem should return numeric group");
+        let named = builtin_match_getitem(&mut vm, &[matched, Value::string(intern("num"))])
+            .expect("getitem should return named group");
+
+        assert_eq!(string_value(whole), "abc-123");
+        assert_eq!(string_value(first), "abc");
+        assert_eq!(string_value(named), "123");
+
+        let pattern = builtin_compile(
+            &mut vm,
+            &[Value::object_ptr(
+                Box::into_raw(Box::new(BytesObject::from_slice(
+                    br"(?P<word>\w+)-(?P<num>\d+)",
+                ))) as *const (),
+            )],
+        )
+        .expect("bytes compile should succeed");
+        let matched = builtin_pattern_search(
+            &mut vm,
+            &[
+                pattern,
+                Value::object_ptr(
+                    Box::into_raw(Box::new(BytesObject::from_slice(b"abc-123"))) as *const ()
+                ),
+            ],
+        )
+        .expect("bytes search should succeed");
+
+        let whole = builtin_match_getitem(
+            &mut vm,
+            &[
+                matched,
+                Value::int(0).expect("index should fit in Value::int"),
+            ],
+        )
+        .expect("bytes getitem should return whole match");
+        let named = builtin_match_getitem(&mut vm, &[matched, Value::string(intern("num"))])
+            .expect("bytes getitem should return named group");
+
+        assert_eq!(bytes_value(whole), b"abc-123");
+        assert_eq!(bytes_value(named), b"123");
+    }
+
+    #[test]
     fn test_pattern_match_accepts_pos_and_rebases_span() {
         let mut vm = VirtualMachine::new();
         let pattern = builtin_compile(&mut vm, &[Value::string(intern(r"\d+"))])
@@ -2377,6 +2758,16 @@ mod tests {
             .expect("rhs entry should exist");
         assert_eq!(bytes_value(lhs), b"left");
         assert_eq!(bytes_value(rhs), b"right");
+
+        let lastindex = match_attr_value(&mut vm, matched, &intern("lastindex"))
+            .expect("lastindex lookup should succeed")
+            .expect("lastindex attribute should exist");
+        let lastgroup = match_attr_value(&mut vm, matched, &intern("lastgroup"))
+            .expect("lastgroup lookup should succeed")
+            .expect("lastgroup attribute should exist");
+
+        assert_eq!(lastindex.as_int(), Some(2));
+        assert_eq!(string_value(lastgroup), "rhs");
     }
 
     #[test]

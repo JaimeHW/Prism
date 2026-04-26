@@ -259,12 +259,12 @@ fn export_names_value() -> Value {
     names.extend(FACTORY_EXPORTS.iter().copied());
     names.extend(CLASS_EXPORTS.iter().copied());
 
-    Value::object_ptr(Box::into_raw(Box::new(TupleObject::from_vec(
+    crate::alloc_managed_value(TupleObject::from_vec(
         names
             .into_iter()
             .map(|name| Value::string(intern(name)))
             .collect(),
-    ))) as *const ())
+    ))
 }
 
 fn build_typing_form_class() -> Arc<PyClassObject> {
@@ -320,7 +320,7 @@ fn new_marker_value(name: &str) -> Value {
         Value::string(intern("typing")),
         registry,
     );
-    Value::object_ptr(Box::into_raw(Box::new(object)) as *const ())
+    crate::alloc_managed_value(object)
 }
 
 fn marker_name(value: Value) -> Result<InternedString, BuiltinError> {
@@ -365,12 +365,10 @@ fn typing_form_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let name = marker_name(args[0])?;
-    Ok(Value::object_ptr(
-        Box::into_raw(Box::new(TupleObject::from_vec(vec![
-            Value::string(name),
-            args[1],
-        ]))) as *const (),
-    ))
+    Ok(crate::alloc_managed_value(TupleObject::from_vec(vec![
+        Value::string(name),
+        args[1],
+    ])))
 }
 
 fn typing_identity_decorator(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -486,7 +484,7 @@ fn empty_tuple_value() -> Value {
 }
 
 fn tuple_value(items: Vec<Value>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(TupleObject::from_vec(items))) as *const ())
+    crate::alloc_managed_value(TupleObject::from_vec(items))
 }
 
 fn interned_marker_name(name: &InternedString) -> Option<&'static str> {

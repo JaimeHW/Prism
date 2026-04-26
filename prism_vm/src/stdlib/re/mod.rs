@@ -46,12 +46,12 @@ pub use match_obj::Match;
 pub use pattern::CompiledPattern;
 pub use python_api::{
     RegexMatchObject, RegexPatternObject, builtin_compile, builtin_escape, builtin_findall,
-    builtin_finditer, builtin_fullmatch, builtin_match, builtin_match_end, builtin_match_group,
-    builtin_match_groupdict, builtin_match_groups, builtin_match_span, builtin_match_start,
-    builtin_pattern_findall, builtin_pattern_finditer, builtin_pattern_fullmatch,
-    builtin_pattern_match, builtin_pattern_search, builtin_pattern_split, builtin_pattern_sub,
-    builtin_pattern_subn, builtin_purge, builtin_search, builtin_split, builtin_sub, builtin_subn,
-    match_attr_value, pattern_attr_value,
+    builtin_finditer, builtin_fullmatch, builtin_match, builtin_match_end, builtin_match_getitem,
+    builtin_match_group, builtin_match_groupdict, builtin_match_groups, builtin_match_span,
+    builtin_match_start, builtin_pattern_findall, builtin_pattern_finditer,
+    builtin_pattern_fullmatch, builtin_pattern_match, builtin_pattern_search,
+    builtin_pattern_split, builtin_pattern_sub, builtin_pattern_subn, builtin_purge,
+    builtin_search, builtin_split, builtin_sub, builtin_subn, match_attr_value, pattern_attr_value,
 };
 
 use super::{Module, ModuleError, ModuleResult};

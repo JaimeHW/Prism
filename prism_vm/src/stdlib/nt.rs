@@ -39,6 +39,12 @@ static NT_OPEN_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.open"), nt_open));
 static NT_CLOSE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.close"), nt_close));
+static NT_PIPE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.pipe"), nt_pipe));
+static NT_READ_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.read"), nt_read));
+static NT_WRITE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.write"), nt_write));
 static NT_STAT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("nt.stat"), nt_stat));
 static NT_LSTAT_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -130,6 +136,9 @@ impl NtModule {
                 Arc::from("access"),
                 Arc::from("open"),
                 Arc::from("close"),
+                Arc::from("pipe"),
+                Arc::from("read"),
+                Arc::from("write"),
                 Arc::from("stat"),
                 Arc::from("lstat"),
                 Arc::from("listdir"),
@@ -195,6 +204,9 @@ impl Module for NtModule {
             "access" => Ok(builtin_value(&NT_ACCESS_FUNCTION)),
             "open" => Ok(builtin_value(&NT_OPEN_FUNCTION)),
             "close" => Ok(builtin_value(&NT_CLOSE_FUNCTION)),
+            "pipe" => Ok(builtin_value(&NT_PIPE_FUNCTION)),
+            "read" => Ok(builtin_value(&NT_READ_FUNCTION)),
+            "write" => Ok(builtin_value(&NT_WRITE_FUNCTION)),
             "stat" => Ok(builtin_value(&NT_STAT_FUNCTION)),
             "lstat" => Ok(builtin_value(&NT_LSTAT_FUNCTION)),
             "listdir" => Ok(builtin_value(&NT_LISTDIR_FUNCTION)),
@@ -253,9 +265,8 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
-fn leak_object_value<T>(object: T) -> Value {
-    let ptr = Box::into_raw(Box::new(object)) as *const ();
-    Value::object_ptr(ptr)
+fn leak_object_value<T: prism_runtime::Trace>(object: T) -> Value {
+    crate::alloc_managed_value(object)
 }
 
 fn export_names_value() -> Value {
@@ -263,6 +274,9 @@ fn export_names_value() -> Value {
         "access",
         "open",
         "close",
+        "pipe",
+        "read",
+        "write",
         "stat",
         "lstat",
         "listdir",
@@ -859,6 +873,12 @@ unsafe extern "C" {
     fn crt_open_osfhandle(osfhandle: isize, flags: i32) -> i32;
     #[link_name = "_close"]
     fn crt_close(fd: i32) -> i32;
+    #[link_name = "_pipe"]
+    fn crt_pipe(fds: *mut i32, size: u32, flags: i32) -> i32;
+    #[link_name = "_read"]
+    fn crt_read(fd: i32, buffer: *mut core::ffi::c_void, count: u32) -> i32;
+    #[link_name = "_write"]
+    fn crt_write(fd: i32, buffer: *const core::ffi::c_void, count: u32) -> i32;
 }
 
 #[cfg(windows)]
@@ -905,6 +925,90 @@ fn close_fd(fd: i32) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn pipe_fds() -> Result<(i32, i32), std::io::Error> {
+    #[cfg(windows)]
+    {
+        let mut fds = [0_i32; 2];
+        if unsafe { crt_pipe(fds.as_mut_ptr(), 0, O_BINARY as i32) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok((fds[0], fds[1]));
+    }
+
+    #[cfg(unix)]
+    {
+        let mut fds = [0_i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok((fds[0], fds[1]));
+    }
+
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "pipe is not supported on this platform",
+    ))
+}
+
+fn read_fd(fd: i32, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+    let count = u32::try_from(buffer.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "read too large"))?;
+
+    #[cfg(windows)]
+    {
+        let read = unsafe { crt_read(fd, buffer.as_mut_ptr().cast(), count) };
+        if read == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(read as usize);
+    }
+
+    #[cfg(unix)]
+    {
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), count as usize) };
+        if read == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(read as usize);
+    }
+
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "read is not supported on this platform",
+    ))
+}
+
+fn write_fd(fd: i32, buffer: &[u8]) -> Result<usize, std::io::Error> {
+    let count = u32::try_from(buffer.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "write too large"))?;
+
+    #[cfg(windows)]
+    {
+        let written = unsafe { crt_write(fd, buffer.as_ptr().cast(), count) };
+        if written == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(written as usize);
+    }
+
+    #[cfg(unix)]
+    {
+        let written = unsafe { libc::write(fd, buffer.as_ptr().cast(), count as usize) };
+        if written == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(written as usize);
+    }
+
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "write is not supported on this platform",
+    ))
+}
+
 fn nt_open(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -949,6 +1053,72 @@ fn nt_close(args: &[Value]) -> Result<Value, BuiltinError> {
         .map_err(|_| BuiltinError::OverflowError("close() file descriptor out of range".into()))?;
     close_fd(fd).map_err(|err| BuiltinError::OSError(format!("close() failed for {fd}: {err}")))?;
     Ok(Value::none())
+}
+
+fn nt_pipe(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "pipe() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let (read_fd, write_fd) =
+        pipe_fds().map_err(|err| BuiltinError::OSError(format!("pipe() failed: {err}")))?;
+    Ok(leak_object_value(TupleObject::from_slice(&[
+        Value::int(i64::from(read_fd)).expect("read fd should fit in Prism int"),
+        Value::int(i64::from(write_fd)).expect("write fd should fit in Prism int"),
+    ])))
+}
+
+fn nt_read(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "read() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let fd = i32::try_from(integer_arg(args[0], "read", "fd")?)
+        .map_err(|_| BuiltinError::OverflowError("read() file descriptor out of range".into()))?;
+    let size = integer_arg(args[1], "read", "length")?;
+    if size < 0 {
+        return Err(BuiltinError::ValueError(
+            "read length must be non-negative".to_string(),
+        ));
+    }
+    let size = usize::try_from(size)
+        .map_err(|_| BuiltinError::OverflowError("read length out of range".into()))?;
+
+    let mut buffer = vec![0_u8; size];
+    let bytes_read = crate::threading_runtime::blocking_operation(|| read_fd(fd, &mut buffer))
+        .map_err(|err| BuiltinError::OSError(format!("read() failed for {fd}: {err}")))?;
+    buffer.truncate(bytes_read);
+    Ok(leak_object_value(BytesObject::from_slice(&buffer)))
+}
+
+fn nt_write(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "write() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let fd = i32::try_from(integer_arg(args[0], "write", "fd")?)
+        .map_err(|_| BuiltinError::OverflowError("write() file descriptor out of range".into()))?;
+    let buffer = value_to_bytes(args[1]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "write() argument 2 must be bytes-like, not {}",
+            args[1].type_name()
+        ))
+    })?;
+    let bytes_written = crate::threading_runtime::blocking_operation(|| write_fd(fd, &buffer))
+        .map_err(|err| BuiltinError::OSError(format!("write() failed for {fd}: {err}")))?;
+    Ok(
+        Value::int(i64::try_from(bytes_written).expect("written byte count should fit"))
+            .expect("written byte count should fit in Prism int"),
+    )
 }
 
 fn nt_access(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -1338,6 +1508,9 @@ mod tests {
         assert!(module.get_attr("access").is_ok());
         assert!(module.get_attr("open").is_ok());
         assert!(module.get_attr("close").is_ok());
+        assert!(module.get_attr("pipe").is_ok());
+        assert!(module.get_attr("read").is_ok());
+        assert!(module.get_attr("write").is_ok());
         assert!(module.get_attr("stat").is_ok());
         assert!(module.get_attr("lstat").is_ok());
         assert!(module.get_attr("listdir").is_ok());
@@ -1395,6 +1568,21 @@ mod tests {
             tuple
                 .iter()
                 .any(|value| value == &Value::string(intern("close")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("pipe")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("read")))
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|value| value == &Value::string(intern("write")))
         );
         assert!(
             tuple
@@ -1481,6 +1669,48 @@ mod tests {
                 .iter()
                 .any(|value| value == &Value::string(intern("unsetenv")))
         );
+    }
+
+    #[test]
+    fn test_nt_pipe_read_write_round_trips_bytes() {
+        let pipe = nt_pipe(&[]).expect("nt.pipe should create a pipe");
+        let pipe_ptr = pipe
+            .as_object_ptr()
+            .expect("nt.pipe should return a tuple object");
+        let pipe = unsafe { &*(pipe_ptr as *const TupleObject) };
+        assert_eq!(pipe.len(), 2);
+
+        let read_fd = pipe
+            .get(0)
+            .expect("read fd should exist")
+            .as_int()
+            .expect("read fd should be an int");
+        let write_fd = pipe
+            .get(1)
+            .expect("write fd should exist")
+            .as_int()
+            .expect("write fd should be an int");
+
+        let payload = leak_object_value(BytesObject::from_slice(b"x"));
+        let written = nt_write(&[Value::int(write_fd).expect("write fd should fit"), payload])
+            .expect("nt.write should succeed")
+            .as_int()
+            .expect("nt.write should return an integer");
+        assert_eq!(written, 1);
+
+        let result = nt_read(&[
+            Value::int(read_fd).expect("read fd should fit"),
+            Value::int(1).expect("read length should fit"),
+        ])
+        .expect("nt.read should succeed");
+        let result_ptr = result
+            .as_object_ptr()
+            .expect("nt.read should return a bytes object");
+        let result = unsafe { &*(result_ptr as *const BytesObject) };
+        assert_eq!(result.as_bytes(), b"x");
+
+        let _ = nt_close(&[Value::int(read_fd).expect("read fd should fit")]);
+        let _ = nt_close(&[Value::int(write_fd).expect("write fd should fit")]);
     }
 
     #[test]

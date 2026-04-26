@@ -745,7 +745,7 @@ pub(crate) fn exception_type_value_for_id(type_id: u16) -> Option<Value> {
 
 #[inline]
 fn boxed_tuple_value(items: Vec<Value>) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(TupleObject::from_vec(items))) as *const ())
+    crate::alloc_managed_value(TupleObject::from_vec(items))
 }
 
 #[inline]

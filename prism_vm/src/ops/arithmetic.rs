@@ -661,8 +661,7 @@ pub(crate) fn repeat_string_value_in_vm(
 
 #[inline]
 fn boxed_complex_value(real: f64, imag: f64) -> Value {
-    let ptr = Box::into_raw(Box::new(ComplexObject::new(real, imag)));
-    Value::object_ptr(ptr as *const ())
+    crate::alloc_managed_value(ComplexObject::new(real, imag))
 }
 
 #[inline]
@@ -1057,17 +1056,17 @@ fn ensure_repeated_sequence_len(len: usize, repeat: usize) -> Result<(), Runtime
 
 #[inline]
 fn boxed_list_value(list: ListObject) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(list)) as *const ())
+    crate::alloc_managed_value(list)
 }
 
 #[inline]
 fn boxed_tuple_value(tuple: TupleObject) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(tuple)) as *const ())
+    crate::alloc_managed_value(tuple)
 }
 
 #[inline]
 fn boxed_bytes_value(bytes: BytesObject) -> Value {
-    Value::object_ptr(Box::into_raw(Box::new(bytes)) as *const ())
+    crate::alloc_managed_value(bytes)
 }
 
 /// TrueDiv: dst = src1 / src2 (always returns float, with speculative fast-path)

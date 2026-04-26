@@ -389,8 +389,7 @@ pub fn builtin_complex(args: &[Value]) -> Result<Value, BuiltinError> {
 
 #[inline]
 fn boxed_complex_value(real: f64, imag: f64) -> Value {
-    let ptr = Box::into_raw(Box::new(ComplexObject::new(real, imag)));
-    Value::object_ptr(ptr as *const ())
+    crate::alloc_managed_value(ComplexObject::new(real, imag))
 }
 
 #[inline]

@@ -224,18 +224,12 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
     }
 
     let exact_type_id = get_type_id(value);
-    let has_builtin_sequence_layout =
-        exact_type_id.is_some_and(|type_id| type_id.raw() < TypeId::FIRST_USER_TYPE);
 
-    if has_builtin_sequence_layout
-        && prism_runtime::types::list::value_as_list_ref(*value).is_some()
-    {
+    if prism_runtime::types::list::value_as_list_ref(*value).is_some() {
         return Ok(IteratorObject::from_list(*value));
     }
 
-    if has_builtin_sequence_layout
-        && let Some(tuple) = prism_runtime::types::tuple::value_as_tuple_ref(*value)
-    {
+    if let Some(tuple) = prism_runtime::types::tuple::value_as_tuple_ref(*value) {
         return Ok(IteratorObject::from_values(tuple.as_slice().to_vec()));
     }
 
@@ -554,6 +548,31 @@ mod tests {
         assert_eq!(iter.next().unwrap().as_int(), Some(2));
         assert_eq!(iter.next().unwrap().as_int(), Some(3));
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_iter_heap_list_subclass_uses_native_backing() {
+        let object = Box::into_raw(Box::new(
+            prism_runtime::object::shaped_object::ShapedObject::new_list_backed(
+                TypeId::from_raw(512),
+                prism_runtime::object::shape::Shape::empty(),
+            ),
+        ));
+        unsafe { &mut *object }
+            .list_backing_mut()
+            .expect("list backing should exist")
+            .extend([Value::int(5).unwrap(), Value::int(8).unwrap()]);
+        let value = Value::object_ptr(object as *const ());
+
+        let mut iter = value_to_iterator(&value).expect("list subclass should be iterable");
+
+        assert_eq!(iter.next().unwrap().as_int(), Some(5));
+        assert_eq!(iter.next().unwrap().as_int(), Some(8));
+        assert!(iter.next().is_none());
+
+        unsafe {
+            drop(Box::from_raw(object));
+        }
     }
 
     #[test]
