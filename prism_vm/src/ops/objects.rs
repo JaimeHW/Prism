@@ -22,7 +22,7 @@ use crate::ops::method_dispatch::method_cache::method_cache;
 use crate::ops::method_dispatch::resolve_builtin_instance_method;
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
-use prism_code::{Constant, Instruction};
+use prism_code::{Constant, Instruction, Opcode};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
@@ -2218,6 +2218,48 @@ pub(crate) fn delete_attribute_value(
     ))
 }
 
+const EXTENDED_ATTR_NAME_SENTINEL: u8 = u8::MAX;
+
+#[inline]
+fn read_attr_name(vm: &mut VirtualMachine, inline_name: u8) -> Result<Arc<str>, RuntimeError> {
+    let name_idx = if inline_name != EXTENDED_ATTR_NAME_SENTINEL {
+        inline_name as u16
+    } else {
+        let frame = vm.current_frame_mut();
+        let ip = frame.ip as usize;
+        let ext_inst = frame
+            .code
+            .instructions
+            .get(ip)
+            .copied()
+            .ok_or_else(|| RuntimeError::internal("missing AttrName extension"))?;
+
+        if ext_inst.opcode() != Opcode::AttrName as u8 {
+            return Err(RuntimeError::internal(
+                "extended attribute opcode missing AttrName extension",
+            ));
+        }
+
+        frame.ip = (ip + 1) as u32;
+        ext_inst.imm16()
+    };
+
+    vm.current_frame()
+        .code
+        .names
+        .get(name_idx as usize)
+        .cloned()
+        .ok_or_else(|| RuntimeError::internal("attribute name index out of bounds"))
+}
+
+/// AttrName is metadata consumed by the preceding attribute opcode.
+#[inline(always)]
+pub fn attr_name(_vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
+    ControlFlow::Error(RuntimeError::internal(
+        "AttrName executed without a preceding attribute opcode",
+    ))
+}
+
 /// GetAttr: dst = src.attr[name_idx]
 ///
 /// Attribute lookup follows Python's descriptor protocol with Shape optimization:
@@ -2231,12 +2273,13 @@ pub(crate) fn delete_attribute_value(
 /// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn get_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let (obj, name) = {
+    let obj = {
         let frame = vm.current_frame();
-        let obj = frame.get_reg(inst.src1().0);
-        let name_idx = inst.src2().0 as u16;
-        let name = frame.get_name(name_idx).clone();
-        (obj, name)
+        frame.get_reg(inst.src1().0)
+    };
+    let name = match read_attr_name(vm, inst.src2().0) {
+        Ok(name) => name,
+        Err(err) => return ControlFlow::Error(err),
     };
     match get_attribute_value(vm, obj, &intern(&*name)) {
         Ok(value) => {
@@ -2257,13 +2300,15 @@ pub fn get_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn set_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let (obj, value, name) = {
+    let (obj, value) = {
         let frame = vm.current_frame();
         let obj = frame.get_reg(inst.dst().0);
         let value = frame.get_reg(inst.src2().0);
-        let name_idx = inst.src1().0 as u16;
-        let name = frame.get_name(name_idx).clone();
-        (obj, value, name)
+        (obj, value)
+    };
+    let name = match read_attr_name(vm, inst.src1().0) {
+        Ok(name) => name,
+        Err(err) => return ControlFlow::Error(err),
     };
     match set_attribute_value(vm, obj, &intern(&*name), value) {
         Ok(()) => ControlFlow::Continue,
@@ -2284,12 +2329,13 @@ pub fn set_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn del_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let (obj, name) = {
+    let obj = {
         let frame = vm.current_frame();
-        let obj = frame.get_reg(inst.src1().0);
-        let name_idx = inst.src2().0 as u16;
-        let name = frame.get_name(name_idx).clone();
-        (obj, name)
+        frame.get_reg(inst.src1().0)
+    };
+    let name = match read_attr_name(vm, inst.src2().0) {
+        Ok(name) => name,
+        Err(err) => return ControlFlow::Error(err),
     };
     match delete_attribute_value(vm, obj, &intern(&*name)) {
         Ok(()) => ControlFlow::Continue,
@@ -2691,17 +2737,29 @@ mod tests {
         drop(unsafe { Box::from_raw(ptr) });
     }
 
-    fn vm_with_names(names: &[&str]) -> VirtualMachine {
+    fn vm_with_name_arcs(names: Vec<Arc<str>>) -> VirtualMachine {
         let mut code = CodeObject::new("test_attrs", "<test>");
-        code.names = names
-            .iter()
-            .map(|name| Arc::<str>::from(*name))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        code.names = names.into_boxed_slice();
 
         let mut vm = VirtualMachine::new();
         vm.push_frame(Arc::new(code), 0).expect("frame push failed");
         vm
+    }
+
+    fn vm_with_names(names: &[&str]) -> VirtualMachine {
+        vm_with_name_arcs(names.iter().map(|name| Arc::<str>::from(*name)).collect())
+    }
+
+    fn names_with_extended_attr() -> Vec<Arc<str>> {
+        (0..=0x0123)
+            .map(|index| {
+                if index == 0x0123 {
+                    Arc::from("extended")
+                } else {
+                    Arc::from(format!("unused_{index}"))
+                }
+            })
+            .collect()
     }
 
     fn class_value(class: PyClassObject) -> (Value, *const PyClassObject) {
@@ -3021,6 +3079,41 @@ mod tests {
         assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(99));
 
         unsafe { drop_class(class_ptr) };
+    }
+
+    #[test]
+    fn test_get_attr_consumes_extended_name_index() {
+        let primary = Instruction::new(Opcode::GetAttr, 2, 1, EXTENDED_ATTR_NAME_SENTINEL);
+        let extension = Instruction::op_di(Opcode::AttrName, Register::new(0), 0x0123);
+        let mut code = CodeObject::new("test_attrs", "<test>");
+        code.names = names_with_extended_attr().into_boxed_slice();
+        code.instructions = vec![primary, extension].into_boxed_slice();
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(code), 0).expect("frame push failed");
+        vm.current_frame_mut().ip = 1;
+
+        let class = PyClassObject::new_simple(intern("Example"));
+        class.set_attr(intern("extended"), Value::int(123).unwrap());
+        let (class_value, class_ptr) = class_value(class);
+        vm.current_frame_mut().set_reg(1, class_value);
+
+        assert!(matches!(get_attr(&mut vm, primary), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().get_reg(2).as_int(), Some(123));
+        assert_eq!(vm.current_frame().ip, 2);
+
+        unsafe { drop_class(class_ptr) };
+    }
+
+    #[test]
+    fn test_get_attr_rejects_missing_extended_name_metadata() {
+        let primary = Instruction::new(Opcode::GetAttr, 2, 1, EXTENDED_ATTR_NAME_SENTINEL);
+        let mut vm = vm_with_names(&["field"]);
+
+        assert!(matches!(
+            get_attr(&mut vm, primary),
+            ControlFlow::Error(RuntimeError { .. })
+        ));
     }
 
     #[test]
@@ -4871,6 +4964,46 @@ mod tests {
         );
         assert!(matches!(del_attr(&mut vm, del_inst), ControlFlow::Continue));
         assert!(matches!(get_attr(&mut vm, get_inst), ControlFlow::Error(_)));
+
+        unsafe { drop_class(class_ptr) };
+    }
+
+    #[test]
+    fn test_set_and_del_attr_consume_extended_name_index() {
+        let set_inst = Instruction::new(Opcode::SetAttr, 1, EXTENDED_ATTR_NAME_SENTINEL, 2);
+        let del_inst = Instruction::new(Opcode::DelAttr, 0, 1, EXTENDED_ATTR_NAME_SENTINEL);
+        let extension = Instruction::op_di(Opcode::AttrName, Register::new(0), 0x0123);
+
+        let mut code = CodeObject::new("test_attrs", "<test>");
+        code.names = names_with_extended_attr().into_boxed_slice();
+        code.instructions = vec![set_inst, extension, del_inst, extension].into_boxed_slice();
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(code), 0).expect("frame push failed");
+        let (class_value, class_ptr) = class_value(PyClassObject::new_simple(intern("Example")));
+        vm.current_frame_mut().set_reg(1, class_value);
+        vm.current_frame_mut().set_reg(2, Value::int(7).unwrap());
+
+        vm.current_frame_mut().ip = 1;
+        assert!(matches!(set_attr(&mut vm, set_inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().ip, 2);
+        assert_eq!(
+            get_attribute_value(&mut vm, class_value, &intern("extended"))
+                .expect("extended attribute should resolve")
+                .as_int(),
+            Some(7)
+        );
+
+        vm.current_frame_mut().ip = 3;
+        assert!(matches!(del_attr(&mut vm, del_inst), ControlFlow::Continue));
+        assert_eq!(vm.current_frame().ip, 4);
+        assert!(matches!(
+            get_attribute_value(&mut vm, class_value, &intern("extended")),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::AttributeError { .. },
+                ..
+            })
+        ));
 
         unsafe { drop_class(class_ptr) };
     }

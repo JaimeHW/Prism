@@ -310,6 +310,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::EnterExcept as usize] = exception::enter_except;
     table[Opcode::ExitExcept as usize] = exception::exit_except;
     table[Opcode::AbortExcept as usize] = exception::abort_except;
+    table[Opcode::AttrName as usize] = objects::attr_name;
 
     table
 }

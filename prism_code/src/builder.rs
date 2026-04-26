@@ -200,6 +200,9 @@ impl ConstantKey {
 }
 
 impl FunctionBuilder {
+    /// Inline attribute-name operand value that signals a trailing AttrName extension.
+    const EXTENDED_ATTR_NAME_SENTINEL: u8 = u8::MAX;
+
     /// Create a new function builder.
     pub fn new(name: impl Into<Arc<str>>) -> Self {
         let name = name.into();
@@ -936,38 +939,48 @@ impl FunctionBuilder {
 
     /// Get attribute: dst = obj.attr.
     pub fn emit_get_attr(&mut self, dst: Register, obj: Register, name_idx: u16) {
-        self.emit(Instruction::new(
-            Opcode::GetAttr,
-            dst.0,
-            obj.0,
-            (name_idx & 0xFF) as u8,
-        ));
-        // Note: GetAttr currently uses compact 8-bit name encoding.
-        // Full 16-bit name indices require an extended instruction format.
+        let inline_name = self.emit_attr_name_operand(name_idx);
+        self.emit(Instruction::new(Opcode::GetAttr, dst.0, obj.0, inline_name));
+        self.emit_attr_name_extension_if_needed(inline_name, name_idx);
     }
 
     /// Set attribute: obj.attr = value.
     pub fn emit_set_attr(&mut self, obj: Register, name_idx: u16, value: Register) {
+        let inline_name = self.emit_attr_name_operand(name_idx);
         self.emit(Instruction::new(
             Opcode::SetAttr,
             obj.0,
-            (name_idx & 0xFF) as u8,
+            inline_name,
             value.0,
         ));
-        // Note: SetAttr currently uses compact 8-bit name encoding.
-        // Full 16-bit name indices require an extended instruction format.
+        self.emit_attr_name_extension_if_needed(inline_name, name_idx);
     }
 
     /// Delete attribute: del obj.attr.
     pub fn emit_del_attr(&mut self, obj: Register, name_idx: u16) {
-        self.emit(Instruction::new(
-            Opcode::DelAttr,
-            0,
-            obj.0,
-            (name_idx & 0xFF) as u8,
-        ));
-        // Note: DelAttr currently uses compact 8-bit name encoding.
-        // Full 16-bit name indices require an extended instruction format.
+        let inline_name = self.emit_attr_name_operand(name_idx);
+        self.emit(Instruction::new(Opcode::DelAttr, 0, obj.0, inline_name));
+        self.emit_attr_name_extension_if_needed(inline_name, name_idx);
+    }
+
+    #[inline]
+    fn emit_attr_name_operand(&self, name_idx: u16) -> u8 {
+        if name_idx < Self::EXTENDED_ATTR_NAME_SENTINEL as u16 {
+            name_idx as u8
+        } else {
+            Self::EXTENDED_ATTR_NAME_SENTINEL
+        }
+    }
+
+    #[inline]
+    fn emit_attr_name_extension_if_needed(&mut self, inline_name: u8, name_idx: u16) {
+        if inline_name == Self::EXTENDED_ATTR_NAME_SENTINEL {
+            self.emit(Instruction::op_di(
+                Opcode::AttrName,
+                Register::new(0),
+                name_idx,
+            ));
+        }
     }
 
     /// Get item: dst = obj[key].
@@ -1612,7 +1625,22 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_get_attr_uses_low_byte_of_name_index() {
+    fn test_emit_get_attr_uses_compact_name_index() {
+        let mut builder = FunctionBuilder::new("attr");
+        let dst = builder.alloc_register();
+        let obj = builder.alloc_register();
+
+        builder.emit_get_attr(dst, obj, 42);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(code.instructions.len(), 1);
+        assert_eq!(inst.opcode(), Opcode::GetAttr as u8);
+        assert_eq!(inst.src2().0, 42);
+    }
+
+    #[test]
+    fn test_emit_get_attr_uses_full_name_index_extension() {
         let mut builder = FunctionBuilder::new("attr");
         let dst = builder.alloc_register();
         let obj = builder.alloc_register();
@@ -1620,13 +1648,16 @@ mod tests {
         builder.emit_get_attr(dst, obj, 0x0123);
         let code = builder.finish();
         let inst = code.instructions[0];
+        let ext = code.instructions[1];
 
         assert_eq!(inst.opcode(), Opcode::GetAttr as u8);
-        assert_eq!(inst.src2().0, 0x23);
+        assert_eq!(inst.src2().0, u8::MAX);
+        assert_eq!(ext.opcode(), Opcode::AttrName as u8);
+        assert_eq!(ext.imm16(), 0x0123);
     }
 
     #[test]
-    fn test_emit_set_attr_uses_low_byte_of_name_index() {
+    fn test_emit_set_attr_uses_full_name_index_extension() {
         let mut builder = FunctionBuilder::new("set_attr");
         let obj = builder.alloc_register();
         let value = builder.alloc_register();
@@ -1637,8 +1668,10 @@ mod tests {
 
         assert_eq!(inst.opcode(), Opcode::SetAttr as u8);
         assert_eq!(inst.dst().0, obj.0);
-        assert_eq!(inst.src1().0, 0x23);
+        assert_eq!(inst.src1().0, u8::MAX);
         assert_eq!(inst.src2().0, value.0);
+        assert_eq!(code.instructions[1].opcode(), Opcode::AttrName as u8);
+        assert_eq!(code.instructions[1].imm16(), 0x0123);
     }
 
     #[test]
@@ -1659,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_del_attr_uses_object_register_and_low_byte_of_name_index() {
+    fn test_emit_del_attr_uses_full_name_index_extension() {
         let mut builder = FunctionBuilder::new("del_attr");
         let obj = builder.alloc_register();
 
@@ -1670,7 +1703,9 @@ mod tests {
         assert_eq!(inst.opcode(), Opcode::DelAttr as u8);
         assert_eq!(inst.dst().0, 0);
         assert_eq!(inst.src1().0, obj.0);
-        assert_eq!(inst.src2().0, 0x23);
+        assert_eq!(inst.src2().0, u8::MAX);
+        assert_eq!(code.instructions[1].opcode(), Opcode::AttrName as u8);
+        assert_eq!(code.instructions[1].imm16(), 0x0123);
     }
 
     #[test]

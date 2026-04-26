@@ -623,6 +623,17 @@ pub enum Opcode {
     ExitExcept = 0xA6,
     /// Abort the current except handler while an exception escapes.
     AbortExcept = 0xA7,
+
+    // =========================================================================
+    // Metadata Extensions (0xAC-0xAF)
+    // =========================================================================
+    /// Full 16-bit attribute name index for a preceding attribute opcode.
+    ///
+    /// `GetAttr`, `SetAttr`, and `DelAttr` keep an 8-bit inline name index for
+    /// the hot path. When that inline byte is `0xFF`, the VM consumes the
+    /// immediately following `AttrName` instruction and reads its `imm16`.
+    /// Executing this opcode directly is bytecode corruption.
+    AttrName = 0xAC,
 }
 
 impl Opcode {
@@ -782,6 +793,7 @@ impl Opcode {
             0xA5 => Some(Opcode::EnterExcept),
             0xA6 => Some(Opcode::ExitExcept),
             0xA7 => Some(Opcode::AbortExcept),
+            0xAC => Some(Opcode::AttrName),
 
             _ => None,
         }
@@ -873,6 +885,9 @@ impl Opcode {
             EndAsyncFor => DstImm16,                      // dst = value, imm16 = jump offset
             Send => DstSrcSrc,                            // dst = result, src1 = gen, src2 = value
             EnterExcept | ExitExcept | AbortExcept => NoOp,
+
+            // Metadata extensions
+            AttrName => Imm16,
         }
     }
 }
