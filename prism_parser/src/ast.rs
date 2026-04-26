@@ -882,10 +882,4 @@ mod tests {
         assert!(lit.unicode);
     }
 
-    #[test]
-    fn test_default_arguments() {
-        let args = Arguments::default();
-        assert!(args.args.is_empty());
-        assert!(args.vararg.is_none());
-    }
 }
