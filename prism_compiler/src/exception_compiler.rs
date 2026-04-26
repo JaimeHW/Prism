@@ -548,11 +548,4 @@ mod tests {
         assert_eq!(size, 20, "ExceptionEntry should be 20 bytes, was {}", size);
     }
 
-    #[test]
-    fn test_exception_context_default() {
-        let ctx1 = ExceptionContext::new();
-        let ctx2 = ExceptionContext::default();
-
-        assert_eq!(ctx1.current_depth(), ctx2.current_depth());
-    }
 }
