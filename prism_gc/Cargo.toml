@@ -10,10 +10,10 @@ license.workspace = true
 prism_core.workspace = true
 
 # Fast atomic operations
-crossbeam-utils = "0.8"
+crossbeam-utils.workspace = true
 
 # Work-stealing deque for concurrent marking
-crossbeam-deque = "0.8"
+crossbeam-deque.workspace = true
 
 # Fast hash maps for object tracking
 rustc-hash.workspace = true
@@ -25,7 +25,7 @@ parking_lot.workspace = true
 bitflags.workspace = true
 
 [dev-dependencies]
-criterion = "0.5"
+criterion.workspace = true
 
 [features]
 # Enable concurrent marking (Phase 2)

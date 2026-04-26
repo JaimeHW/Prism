@@ -14,14 +14,14 @@ prism_core.workspace = true
 prism_code.workspace = true
 prism_runtime.workspace = true
 memmap2.workspace = true
-bitflags = "2.6"
-smallvec = "1.13"
-parking_lot = "0.12"
-rustc-hash = "2.0"
-dashmap = "6.1"
+bitflags.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+dashmap.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Diagnostics_Debug", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Kernel"] }
+windows-sys = { workspace = true, features = ["Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Diagnostics_Debug", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Kernel"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true

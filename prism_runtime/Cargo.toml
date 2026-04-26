@@ -13,13 +13,13 @@ arc-swap.workspace = true
 smallvec.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
-bitflags = "2.4"
-rustc-hash = "2.0"
-memchr = "2.7"
+bitflags.workspace = true
+rustc-hash.workspace = true
+memchr.workspace = true
 
 [dev-dependencies]
-criterion = "0.5"
-tempfile = "3.10"
+criterion.workspace = true
+tempfile.workspace = true
 
 
 [[bench]]

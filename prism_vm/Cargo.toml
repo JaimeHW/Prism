@@ -19,28 +19,28 @@ unicode-xid.workspace = true
 parking_lot.workspace = true
 
 # High-performance collections
-rustc-hash = "2.0"
-smallvec = "1.13"
-getrandom = "0.2"
+rustc-hash.workspace = true
+smallvec.workspace = true
+getrandom.workspace = true
 
 # Math functions (gamma, erf, etc.)
-libm = "0.2"
+libm.workspace = true
 
 # Regex engine - guaranteed O(m*n) performance
-regex = "1.10"
+regex.workspace = true
 # Extended regex with backreferences/lookaround
-fancy-regex = "0.13"
-sha2 = "0.10"
+fancy-regex.workspace = true
+sha2.workspace = true
 
 # Platform-specific time APIs
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Time", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Time", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-criterion = "0.5"
+criterion.workspace = true
 
 [[bench]]
 name = "speculation"
