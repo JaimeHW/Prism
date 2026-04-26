@@ -164,11 +164,14 @@ pub struct ReturnTemplate {
 impl OpcodeTemplate for ReturnTemplate {
     fn emit(&self, ctx: &mut TemplateContext) {
         let value_slot = ctx.frame.register_slot(self.value_reg as u16);
+        let return_slot = ctx.frame.register_slot(0);
 
-        // Load return value into RAX (calling convention)
+        // Encoded-exit Tier 1 returns publish the Python return value through
+        // register 0; the common epilogue writes the mirror back to the VM.
         ctx.asm.mov_rm(Gpr::Rax, &value_slot);
+        ctx.asm.mov_mr(&return_slot, Gpr::Rax);
 
-        // Epilogue handled by caller
+        // Epilogue handled by caller.
     }
 
     #[inline]
@@ -182,9 +185,11 @@ pub struct ReturnNoneTemplate;
 
 impl OpcodeTemplate for ReturnNoneTemplate {
     fn emit(&self, ctx: &mut TemplateContext) {
-        // Load None into RAX
+        // Publish None through register 0 for the encoded-exit return ABI.
         let none_val = value_tags::none_value() as i64;
         ctx.asm.mov_ri64(Gpr::Rax, none_val);
+        let return_slot = ctx.frame.register_slot(0);
+        ctx.asm.mov_mr(&return_slot, Gpr::Rax);
     }
 
     #[inline]

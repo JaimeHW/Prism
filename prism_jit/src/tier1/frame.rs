@@ -25,7 +25,16 @@
 //! └───────────────────────────────┘ ← RSP (16-byte aligned)
 //! ```
 
-use crate::backend::x64::{CallingConvention, Gpr, GprSet, MemOperand, Xmm};
+use crate::backend::x64::{Assembler, CallingConvention, Gpr, GprSet, MemOperand, Xmm};
+
+/// Offset of `JitFrameState.frame_base`.
+pub(crate) const JIT_FRAME_STATE_FRAME_BASE_OFFSET: i32 = 0;
+/// Offset of `JitFrameState.const_pool`.
+pub(crate) const JIT_FRAME_STATE_CONST_POOL_OFFSET: i32 = 16;
+/// Offset of `JitFrameState.closure_env`.
+pub(crate) const JIT_FRAME_STATE_CLOSURE_ENV_OFFSET: i32 = 24;
+/// Offset of `JitFrameState.global_scope`.
+pub(crate) const JIT_FRAME_STATE_GLOBAL_SCOPE_OFFSET: i32 = 32;
 
 /// Offsets within the JIT stack frame.
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +43,12 @@ pub struct FrameOffsets {
     pub registers_base: i32,
     /// Offset from RBP to context pointer.
     pub context: i32,
+    /// Offset from RBP to constant pool pointer.
+    pub const_pool: i32,
+    /// Offset from RBP to global scope pointer.
+    pub global_scope: i32,
+    /// Offset from RBP to closure environment pointer.
+    pub closure_env: i32,
     /// Offset from RBP to first spill slot.
     pub spills_base: i32,
     /// Total frame size (including alignment).
@@ -77,36 +92,38 @@ impl FrameLayout {
     pub fn new(num_registers: u16, num_spills: u16, saved_regs: GprSet) -> Self {
         let cc = CallingConvention::host();
 
-        // Calculate sizes
+        // Calculate sizes. Callee-saved registers are pushed explicitly after
+        // RBP, so they affect offsets and alignment but are not part of the
+        // local frame allocation.
         let saved_regs_size = (saved_regs.count() as i32) * 8;
+        let metadata_size = 4 * Self::SLOT_SIZE;
         let registers_size = (num_registers as i32) * Self::SLOT_SIZE;
         let spills_size = (num_spills as i32) * Self::SLOT_SIZE;
 
         // Frame layout from RBP:
         // RBP+0: saved RBP
-        // RBP-8 to RBP-(8+saved_regs_size): callee-saved registers
-        // RBP-(8+saved_regs_size+8): context pointer
-        // RBP-(8+saved_regs_size+8+registers_size): bytecode registers
-        // RBP-(8+saved_regs_size+8+registers_size+spills_size): spill slots
+        // RBP-8..: callee-saved registers (if any)
+        // next slots: context, const pool, global scope, closure env
+        // next slots: bytecode registers
+        // next slots: spill slots
 
-        let base_offset = Self::SAVED_RBP_SIZE + saved_regs_size;
-        let context_offset = -(base_offset + Self::CONTEXT_SIZE);
-        let registers_base = context_offset - registers_size;
+        let metadata_base = saved_regs_size;
+        let context_offset = -(metadata_base + Self::CONTEXT_SIZE);
+        let const_pool_offset = context_offset - Self::SLOT_SIZE;
+        let global_scope_offset = const_pool_offset - Self::SLOT_SIZE;
+        let closure_env_offset = global_scope_offset - Self::SLOT_SIZE;
+        let registers_base = -(metadata_base + metadata_size + registers_size);
         let spills_base = registers_base - spills_size;
 
-        // Calculate total frame size (align to 16 bytes)
-        // Stack already has return address, so we need frame size to make it aligned
-        let frame_content = saved_regs_size + Self::CONTEXT_SIZE + registers_size + spills_size;
-        let total_size = (frame_content + 15) & !15;
-
-        // Adjust if total would leave stack misaligned
-        // After CALL: RSP points to return address (8 bytes)
-        // After PUSH RBP: RSP is at 16-byte alignment - 16
-        // So total_size should be (16k) to restore alignment
-        let total_size = if (total_size + 16) % 16 != 0 {
-            total_size + 8
+        // After CALL and PUSH RBP the stack is 16-byte aligned. Pushed
+        // callee-saved registers and the local allocation together must keep
+        // it aligned before any future runtime call.
+        let frame_content = metadata_size + registers_size + spills_size;
+        let alignment_remainder = (saved_regs_size + frame_content) & 15;
+        let total_size = if alignment_remainder == 0 {
+            frame_content
         } else {
-            total_size
+            frame_content + (16 - alignment_remainder)
         };
 
         FrameLayout {
@@ -115,6 +132,9 @@ impl FrameLayout {
             saved_regs,
             offsets: FrameOffsets {
                 context: context_offset,
+                const_pool: const_pool_offset,
+                global_scope: global_scope_offset,
+                closure_env: closure_env_offset,
                 registers_base,
                 spills_base,
                 total_size,
@@ -181,19 +201,84 @@ impl FrameLayout {
     /// Get memory operand for the constant pool pointer.
     #[inline]
     pub fn const_pool_slot(&self) -> MemOperand {
-        MemOperand::base_disp(Gpr::Rbp, self.offsets.context - Self::SLOT_SIZE)
+        MemOperand::base_disp(Gpr::Rbp, self.offsets.const_pool)
     }
 
     /// Get memory operand for the global scope pointer.
     #[inline]
     pub fn global_scope_slot(&self) -> MemOperand {
-        MemOperand::base_disp(Gpr::Rbp, self.offsets.context - 2 * Self::SLOT_SIZE)
+        MemOperand::base_disp(Gpr::Rbp, self.offsets.global_scope)
     }
 
     /// Get memory operand for the closure environment pointer.
     #[inline]
     pub fn closure_env_slot(&self) -> MemOperand {
-        MemOperand::base_disp(Gpr::Rbp, self.offsets.context - 3 * Self::SLOT_SIZE)
+        MemOperand::base_disp(Gpr::Rbp, self.offsets.closure_env)
+    }
+}
+
+/// Initialize a Tier 1 stack mirror from the VM-owned `JitFrameState`.
+pub(crate) fn emit_frame_state_initialization(
+    asm: &mut Assembler,
+    frame: &FrameLayout,
+    state_arg: Gpr,
+    frame_base_scratch: Gpr,
+    value_scratch: Gpr,
+) {
+    asm.mov_mr(&frame.context_slot(), state_arg);
+
+    asm.mov_rm(
+        value_scratch,
+        &MemOperand::base_disp(state_arg, JIT_FRAME_STATE_CONST_POOL_OFFSET),
+    );
+    asm.mov_mr(&frame.const_pool_slot(), value_scratch);
+
+    asm.mov_rm(
+        value_scratch,
+        &MemOperand::base_disp(state_arg, JIT_FRAME_STATE_GLOBAL_SCOPE_OFFSET),
+    );
+    asm.mov_mr(&frame.global_scope_slot(), value_scratch);
+
+    asm.mov_rm(
+        value_scratch,
+        &MemOperand::base_disp(state_arg, JIT_FRAME_STATE_CLOSURE_ENV_OFFSET),
+    );
+    asm.mov_mr(&frame.closure_env_slot(), value_scratch);
+
+    asm.mov_rm(
+        frame_base_scratch,
+        &MemOperand::base_disp(state_arg, JIT_FRAME_STATE_FRAME_BASE_OFFSET),
+    );
+    for reg_idx in 0..frame.num_registers {
+        let source = MemOperand::base_disp(
+            frame_base_scratch,
+            i32::from(reg_idx) * FrameLayout::SLOT_SIZE,
+        );
+        asm.mov_rm(value_scratch, &source);
+        asm.mov_mr(&frame.register_slot(reg_idx), value_scratch);
+    }
+}
+
+/// Write the Tier 1 stack mirror back into the interpreter register array.
+pub(crate) fn emit_frame_state_writeback(
+    asm: &mut Assembler,
+    frame: &FrameLayout,
+    frame_base_scratch: Gpr,
+    value_scratch: Gpr,
+) {
+    asm.mov_rm(frame_base_scratch, &frame.context_slot());
+    asm.mov_rm(
+        frame_base_scratch,
+        &MemOperand::base_disp(frame_base_scratch, JIT_FRAME_STATE_FRAME_BASE_OFFSET),
+    );
+
+    for reg_idx in 0..frame.num_registers {
+        let destination = MemOperand::base_disp(
+            frame_base_scratch,
+            i32::from(reg_idx) * FrameLayout::SLOT_SIZE,
+        );
+        asm.mov_rm(value_scratch, &frame.register_slot(reg_idx));
+        asm.mov_mr(&destination, value_scratch);
     }
 }
 

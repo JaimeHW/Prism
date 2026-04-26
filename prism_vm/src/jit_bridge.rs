@@ -440,7 +440,11 @@ pub(crate) fn compile_tier1_entry(
     let code_id = code_id_from_arc(code);
     let instructions = lower_code_to_templates(code)?;
     let compiled = compiler.compile(code.register_count, &instructions)?;
-    Ok(CompiledEntry::from_executable_buffer(code_id, compiled.code).with_tier(1))
+    Ok(
+        CompiledEntry::from_executable_buffer(code_id, compiled.code)
+            .with_tier(1)
+            .with_return_abi(ReturnAbi::EncodedExitReason),
+    )
 }
 
 /// Compile a code object into a Tier 2 cache entry.

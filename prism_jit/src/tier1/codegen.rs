@@ -12,7 +12,9 @@
 //! 7. Finalize and return executable code
 
 use super::deopt::{DeoptInfo, DeoptReason, DeoptStubGenerator, encode_deopt_exit};
-use super::frame::{FrameLayout, JitCallingConvention};
+use super::frame::{
+    FrameLayout, JitCallingConvention, emit_frame_state_initialization, emit_frame_state_writeback,
+};
 use super::template::*;
 use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label};
 
@@ -176,14 +178,14 @@ impl TemplateCompiler {
 
     /// Emit function prologue.
     fn emit_prologue(&self, asm: &mut Assembler, frame: &FrameLayout, cc: &JitCallingConvention) {
-        // Push callee-saved registers
-        for reg in frame.saved_regs.iter() {
-            asm.push(reg);
-        }
-
         // Set up frame pointer
         asm.push(Gpr::Rbp);
         asm.mov_rr(Gpr::Rbp, Gpr::Rsp);
+
+        // Preserve callee-saved registers inside the frame-pointer chain.
+        for reg in frame.saved_regs.iter() {
+            asm.push(reg);
+        }
 
         // Allocate stack space
         let frame_size = frame.frame_size();
@@ -191,27 +193,32 @@ impl TemplateCompiler {
             asm.sub_ri(Gpr::Rsp, frame_size);
         }
 
-        // Store context pointer (first argument)
-        let ctx_slot = frame.context_slot();
-        asm.mov_mr(&ctx_slot, cc.arg0);
+        emit_frame_state_initialization(asm, frame, cc.arg0, Gpr::R10, Gpr::R11);
     }
 
     /// Emit function epilogue.
     fn emit_epilogue(&self, asm: &mut Assembler, frame: &FrameLayout) {
+        emit_frame_state_writeback(asm, frame, Gpr::R10, Gpr::R11);
+        asm.mov_ri64(Gpr::Rax, 0);
+        self.emit_native_epilogue(asm, frame);
+    }
+
+    /// Emit native stack teardown without changing RAX.
+    fn emit_native_epilogue(&self, asm: &mut Assembler, frame: &FrameLayout) {
         // Deallocate stack
         let frame_size = frame.frame_size();
         if frame_size > 0 {
             asm.add_ri(Gpr::Rsp, frame_size);
         }
 
-        // Restore frame pointer
-        asm.pop(Gpr::Rbp);
-
         // Pop callee-saved registers in reverse
         let saved_regs: Vec<Gpr> = frame.saved_regs.iter().collect();
         for reg in saved_regs.into_iter().rev() {
             asm.pop(reg);
         }
+
+        // Restore frame pointer
+        asm.pop(Gpr::Rbp);
 
         // Return
         asm.ret();
@@ -225,7 +232,8 @@ impl TemplateCompiler {
     fn emit_inline_deopt(&self, ctx: &mut TemplateContext, bc_offset: u32, reason: DeoptReason) {
         let encoded = encode_deopt_exit(bc_offset, reason);
         ctx.asm.mov_ri64(Gpr::Rax, encoded as i64);
-        self.emit_epilogue(ctx.asm, ctx.frame);
+        emit_frame_state_writeback(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
+        self.emit_native_epilogue(ctx.asm, ctx.frame);
     }
 
     /// Emit code for a single instruction.
@@ -890,16 +898,14 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
-            // Generic (polymorphic) comparisons - runtime dispatch (NOP in tier1)
+            // Generic (polymorphic) comparisons require interpreter fallback.
             TemplateInstruction::GenericLt { .. }
             | TemplateInstruction::GenericLe { .. }
             | TemplateInstruction::GenericGt { .. }
             | TemplateInstruction::GenericGe { .. }
             | TemplateInstruction::GenericEq { .. }
             | TemplateInstruction::GenericNe { .. } => {
-                // Generic comparisons require runtime dispatch for polymorphic behavior
-                // For tier1, these emit nothing and rely on interpreter fallback
-                // TODO: Add type-specialized fast paths with guards
+                unreachable!("generic comparisons are handled by inline deopt")
             }
             // Bitwise operations
             TemplateInstruction::IntAnd { dst, lhs, rhs, .. } => {
@@ -980,11 +986,9 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
-            // Membership operations - runtime dispatch (NOP in tier1, handled by interpreter fallback)
+            // Membership operations require interpreter fallback.
             TemplateInstruction::In { .. } | TemplateInstruction::NotIn { .. } => {
-                // Membership tests require complex runtime logic (__contains__ or iteration)
-                // For tier1, these emit nothing and rely on interpreter fallback
-                // TODO: Add specialized templates for common container types
+                unreachable!("membership operations are handled by inline deopt")
             }
             // Type guards
             TemplateInstruction::GuardInt { reg, .. } => {
@@ -1014,6 +1018,9 @@ impl TemplateCompiler {
                     deopt_idx,
                 }
                 .emit(ctx);
+            }
+            TemplateInstruction::InterpreterFallback { .. } => {
+                unreachable!("interpreter fallback is handled by inline deopt")
             }
             TemplateInstruction::Nop { .. } => {
                 // No-op: emit nothing
@@ -1716,7 +1723,12 @@ pub enum TemplateInstruction {
         bc_offset: u32,
     },
 
-    // No-op
+    // Interpreter fallback and no-op
+    /// Resume in the interpreter at this bytecode offset.
+    InterpreterFallback {
+        bc_offset: u32,
+    },
+    /// No-op.
     Nop {
         bc_offset: u32,
     },
@@ -2100,6 +2112,7 @@ impl TemplateInstruction {
             | TemplateInstruction::BranchIfNotNone { bc_offset, .. }
             | TemplateInstruction::Return { bc_offset, .. }
             | TemplateInstruction::ReturnNone { bc_offset }
+            | TemplateInstruction::InterpreterFallback { bc_offset }
             | TemplateInstruction::Nop { bc_offset } => *bc_offset,
         }
     }
@@ -2122,7 +2135,8 @@ impl TemplateInstruction {
     pub fn requires_interpreter_in_tier1(&self) -> bool {
         matches!(
             self,
-            TemplateInstruction::LoadGlobal { .. }
+            TemplateInstruction::InterpreterFallback { .. }
+                | TemplateInstruction::LoadGlobal { .. }
                 | TemplateInstruction::StoreGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
                 | TemplateInstruction::LoadClosure { .. }
@@ -2188,6 +2202,14 @@ impl TemplateInstruction {
                 | TemplateInstruction::GetANext { .. }
                 | TemplateInstruction::EndAsyncFor { .. }
                 | TemplateInstruction::Send { .. }
+                | TemplateInstruction::GenericLt { .. }
+                | TemplateInstruction::GenericLe { .. }
+                | TemplateInstruction::GenericGt { .. }
+                | TemplateInstruction::GenericGe { .. }
+                | TemplateInstruction::GenericEq { .. }
+                | TemplateInstruction::GenericNe { .. }
+                | TemplateInstruction::In { .. }
+                | TemplateInstruction::NotIn { .. }
         )
     }
 

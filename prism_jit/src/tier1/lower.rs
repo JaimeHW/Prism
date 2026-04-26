@@ -1244,13 +1244,19 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
             }
 
             // =================================================================
-            // Unhandled opcodes - emit Nop for now
+            // Unhandled opcodes resume in the interpreter. Tier 1 must never
+            // silently skip bytecode semantics.
             // =================================================================
             _ => {
-                // TODO: Implement remaining opcodes
-                self.output.push(TemplateInstruction::Nop { bc_offset });
+                self.emit_interpreter_fallback(bc_offset);
             }
         }
+    }
+
+    #[inline]
+    fn emit_interpreter_fallback(&mut self, bc_offset: u32) {
+        self.output
+            .push(TemplateInstruction::InterpreterFallback { bc_offset });
     }
 
     /// Calculate absolute jump target from pc-relative offset.
@@ -1294,19 +1300,10 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
             }
             TypeHint::StrStr => {
                 // String concatenation - not yet implemented
-                // Fall back to generic (would emit runtime call)
-                self.output.push(TemplateInstruction::Nop { bc_offset });
+                self.emit_interpreter_fallback(bc_offset);
             }
             TypeHint::None | TypeHint::StrInt | TypeHint::IntStr | TypeHint::ListList => {
-                // No speculation or invalid type combo - emit generic
-                // For now, fall back to IntAdd as placeholder
-                // A real implementation would emit a runtime call
-                self.output.push(TemplateInstruction::IntAdd {
-                    bc_offset,
-                    dst,
-                    lhs,
-                    rhs,
-                });
+                self.emit_interpreter_fallback(bc_offset);
             }
         }
     }
@@ -1333,13 +1330,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                 });
             }
             _ => {
-                // Fall back to int sub
-                self.output.push(TemplateInstruction::IntSub {
-                    bc_offset,
-                    dst,
-                    lhs,
-                    rhs,
-                });
+                self.emit_interpreter_fallback(bc_offset);
             }
         }
     }
@@ -1367,15 +1358,10 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
             }
             TypeHint::StrInt | TypeHint::IntStr => {
                 // String repetition - not yet implemented
-                self.output.push(TemplateInstruction::Nop { bc_offset });
+                self.emit_interpreter_fallback(bc_offset);
             }
             _ => {
-                self.output.push(TemplateInstruction::IntMul {
-                    bc_offset,
-                    dst,
-                    lhs,
-                    rhs,
-                });
+                self.emit_interpreter_fallback(bc_offset);
             }
         }
     }
@@ -1394,10 +1380,58 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                 self.emit_float_comparison(bc_offset, dst, lhs, rhs, op);
             }
             _ => {
-                // No speculation or unsupported type - fall back to int comparison
-                self.emit_int_comparison(bc_offset, dst, lhs, rhs, op);
+                self.emit_generic_comparison(bc_offset, dst, lhs, rhs, op);
             }
         }
+    }
+
+    fn emit_generic_comparison(
+        &mut self,
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+        op: ComparisonOp,
+    ) {
+        let instr = match op {
+            ComparisonOp::Lt => TemplateInstruction::GenericLt {
+                bc_offset,
+                dst,
+                lhs,
+                rhs,
+            },
+            ComparisonOp::Le => TemplateInstruction::GenericLe {
+                bc_offset,
+                dst,
+                lhs,
+                rhs,
+            },
+            ComparisonOp::Gt => TemplateInstruction::GenericGt {
+                bc_offset,
+                dst,
+                lhs,
+                rhs,
+            },
+            ComparisonOp::Ge => TemplateInstruction::GenericGe {
+                bc_offset,
+                dst,
+                lhs,
+                rhs,
+            },
+            ComparisonOp::Eq => TemplateInstruction::GenericEq {
+                bc_offset,
+                dst,
+                lhs,
+                rhs,
+            },
+            ComparisonOp::Ne => TemplateInstruction::GenericNe {
+                bc_offset,
+                dst,
+                lhs,
+                rhs,
+            },
+        };
+        self.output.push(instr);
     }
 
     /// Emit specialized integer comparison.

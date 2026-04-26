@@ -13,7 +13,7 @@
 //! 4. Reconstruct interpreter frame
 //! 5. Resume interpreter execution
 
-use super::frame::FrameLayout;
+use super::frame::{FrameLayout, emit_frame_state_writeback};
 use crate::backend::x64::{Assembler, Gpr, Label};
 use crate::runtime::ExitReason;
 
@@ -159,18 +159,19 @@ impl DeoptStubGenerator {
             // 3. Return to VM dispatcher.
             let encoded = encode_deopt_exit(deopt.bc_offset, deopt.reason);
             asm.mov_ri64(Gpr::Rax, encoded as i64);
+            emit_frame_state_writeback(asm, frame, Gpr::R10, Gpr::R11);
 
             let frame_size = frame.frame_size();
             if frame_size > 0 {
                 asm.add_ri(Gpr::Rsp, frame_size);
             }
-            asm.pop(Gpr::Rbp);
 
             let saved_regs: Vec<Gpr> = frame.saved_regs.iter().collect();
             for reg in saved_regs.into_iter().rev() {
                 asm.pop(reg);
             }
 
+            asm.pop(Gpr::Rbp);
             asm.ret();
         }
 
