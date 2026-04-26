@@ -30,6 +30,7 @@ use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -41,8 +42,24 @@ static WARN_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static WARN_EXPLICIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("_warnings.warn_explicit"), warn_explicit)
 });
+static BEGIN_CAPTURE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_warnings._prism_begin_capture"), begin_capture)
+});
+static END_CAPTURE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_warnings._prism_end_capture"), end_capture)
+});
 
 static FILTERS_VERSION: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    static CAPTURE_STACK: RefCell<Vec<WarningCapture>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WarningCapture {
+    expected: Option<Value>,
+    matched: usize,
+}
 
 pub(crate) const BOOL_INVERT_DEPRECATION_MESSAGE: &str = "Bitwise inversion '~' on bool is deprecated and will be removed in Python 3.16. This returns the bitwise inversion of the underlying int object and is usually not what you expect from negating a bool. Use the 'not' operator for boolean negation or ~int(x) if you really want the bitwise inversion of the underlying int.";
 
@@ -67,6 +84,8 @@ impl WarningsModule {
                 Arc::from("_filters_mutated"),
                 Arc::from("_onceregistry"),
                 Arc::from("filters"),
+                Arc::from("_prism_begin_capture"),
+                Arc::from("_prism_end_capture"),
                 Arc::from("warn"),
                 Arc::from("warn_explicit"),
             ],
@@ -91,6 +110,8 @@ impl Module for WarningsModule {
             "_defaultaction" => Ok(self.defaultaction_value),
             "_onceregistry" => Ok(self.onceregistry_value),
             "_filters_mutated" => Ok(builtin_value(&FILTERS_MUTATED_FUNCTION)),
+            "_prism_begin_capture" => Ok(builtin_value(&BEGIN_CAPTURE_FUNCTION)),
+            "_prism_end_capture" => Ok(builtin_value(&END_CAPTURE_FUNCTION)),
             "warn" => Ok(builtin_value(&WARN_FUNCTION)),
             "warn_explicit" => Ok(builtin_value(&WARN_EXPLICIT_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
@@ -118,6 +139,45 @@ fn leak_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
 fn filters_mutated(_args: &[Value]) -> Result<Value, BuiltinError> {
     FILTERS_VERSION.fetch_add(1, Ordering::Relaxed);
     Ok(Value::none())
+}
+
+fn begin_capture(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "_prism_begin_capture() takes at most 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let expected = args.first().copied().filter(|value| !value.is_none());
+    if let Some(expected) = expected {
+        warning_category_from_value(Some(expected)).map_err(BuiltinError::TypeError)?;
+    }
+
+    CAPTURE_STACK.with(|stack| {
+        stack.borrow_mut().push(WarningCapture {
+            expected,
+            matched: 0,
+        });
+    });
+    Ok(Value::none())
+}
+
+fn end_capture(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "_prism_end_capture() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let matched = CAPTURE_STACK
+        .with(|stack| stack.borrow_mut().pop())
+        .ok_or_else(|| {
+            BuiltinError::Raised(RuntimeError::internal("warning capture stack is empty"))
+        })?
+        .matched;
+    Ok(Value::int(matched as i64).expect("warning capture count should fit"))
 }
 
 pub(crate) fn emit_bool_invert_deprecation_warning(
@@ -320,6 +380,8 @@ fn emit_warning(
     message: &str,
     context: &WarningContext,
 ) -> Result<(), RuntimeError> {
+    record_captured_warning(category);
+
     let warnings = match vm.import_module_named("warnings") {
         Ok(module) => module,
         Err(_) => return Ok(()),
@@ -423,6 +485,23 @@ fn emit_warning(
         .ok_or_else(|| RuntimeError::attribute_error("module", "_showwarnmsg"))?;
     invoke_callable_value(vm, showwarnmsg, &[warning_message])?;
     Ok(())
+}
+
+fn record_captured_warning(category: WarningCategory) {
+    CAPTURE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(capture) = stack.last_mut() else {
+            return;
+        };
+
+        let matched = capture
+            .expected
+            .map(|expected| warning_category_matches(category, expected).unwrap_or(false))
+            .unwrap_or(true);
+        if matched {
+            capture.matched += 1;
+        }
+    });
 }
 
 fn resolve_warning_action(

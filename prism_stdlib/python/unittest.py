@@ -1,5 +1,10 @@
 """Small unittest compatibility layer for Prism's CPython regression harness."""
 
+try:
+    import _warnings as _prism_warnings
+except Exception:
+    _prism_warnings = None
+
 
 class SkipTest(Exception):
     pass
@@ -58,14 +63,22 @@ class _AssertWarnsContext:
     def __init__(self, expected, test_case):
         self.expected = expected
         self.test_case = test_case
+        self.warning = None
 
     def __enter__(self):
+        if _prism_warnings is not None:
+            _prism_warnings._prism_begin_capture(self.expected)
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        matched = 0
+        if _prism_warnings is not None:
+            matched = _prism_warnings._prism_end_capture()
         if exc_type is not None:
             return False
-        self.test_case.fail("expected warning was not triggered")
+        if matched <= 0:
+            self.test_case.fail("expected warning was not triggered")
+        return False
 
 
 class TestCase:
@@ -264,4 +277,3 @@ def main(module=None):
     result = TextTestRunner().run(defaultTestLoader.loadTestsFromModule(module))
     if not result.wasSuccessful():
         raise SystemExit(1)
-
