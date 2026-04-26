@@ -367,20 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_reuse() {
-        let mut pool = BufferPool::new();
-
-        // Acquire and release a buffer
-        let buf = pool.acquire(BufferSizeClass::Medium);
-        let ptr = buf.as_ptr();
-        drop(buf);
-
-        // The buffer should be returned to the pool - but since we're
-        // using a separate pool instance, we need to manually return it
-        // In the real implementation, the thread-local pool is used
-    }
-
-    #[test]
     fn test_pool_clear() {
         let mut pool = BufferPool::new();
 
