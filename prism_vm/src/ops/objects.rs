@@ -2221,7 +2221,10 @@ pub(crate) fn delete_attribute_value(
 const EXTENDED_ATTR_NAME_SENTINEL: u8 = u8::MAX;
 
 #[inline]
-fn read_attr_name(vm: &mut VirtualMachine, inline_name: u8) -> Result<Arc<str>, RuntimeError> {
+pub(crate) fn read_attr_name(
+    vm: &mut VirtualMachine,
+    inline_name: u8,
+) -> Result<Arc<str>, RuntimeError> {
     let name_idx = if inline_name != EXTENDED_ATTR_NAME_SENTINEL {
         inline_name as u16
     } else {

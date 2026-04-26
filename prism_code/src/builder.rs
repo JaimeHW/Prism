@@ -1026,14 +1026,14 @@ impl FunctionBuilder {
     /// * `name_idx` - Index into names table for the method name
     #[inline]
     pub fn emit_load_method(&mut self, dst: Register, obj: Register, name_idx: u16) {
-        // LoadMethod uses DstSrcSrc format: dst, obj, name_idx (8-bit truncated)
-        // For larger name indices, we'd need an extended encoding
+        let inline_name = self.emit_attr_name_operand(name_idx);
         self.emit(Instruction::new(
             Opcode::LoadMethod,
             dst.0,
             obj.0,
-            (name_idx & 0xFF) as u8,
+            inline_name,
         ));
+        self.emit_attr_name_extension_if_needed(inline_name, name_idx);
     }
 
     /// Call method using result from LoadMethod: dst = method(self, args...).
@@ -1672,6 +1672,25 @@ mod tests {
         assert_eq!(inst.src2().0, value.0);
         assert_eq!(code.instructions[1].opcode(), Opcode::AttrName as u8);
         assert_eq!(code.instructions[1].imm16(), 0x0123);
+    }
+
+    #[test]
+    fn test_emit_load_method_uses_full_name_index_extension() {
+        let mut builder = FunctionBuilder::new("load_method");
+        let dst = builder.alloc_register();
+        let obj = builder.alloc_register();
+
+        builder.emit_load_method(dst, obj, 0x0123);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+        let ext = code.instructions[1];
+
+        assert_eq!(inst.opcode(), Opcode::LoadMethod as u8);
+        assert_eq!(inst.dst().0, dst.0);
+        assert_eq!(inst.src1().0, obj.0);
+        assert_eq!(inst.src2().0, u8::MAX);
+        assert_eq!(ext.opcode(), Opcode::AttrName as u8);
+        assert_eq!(ext.imm16(), 0x0123);
     }
 
     #[test]

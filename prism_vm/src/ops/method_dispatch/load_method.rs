@@ -26,7 +26,7 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::objects::{
-    get_attribute_value, lookup_class_metaclass_attr, super_attribute_value_static,
+    get_attribute_value, lookup_class_metaclass_attr, read_attr_name, super_attribute_value_static,
 };
 use prism_code::Instruction;
 use prism_core::Value;
@@ -69,12 +69,14 @@ pub(crate) struct BoundMethodTarget {
 pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let dst = inst.dst().0;
     let obj_reg = inst.src1().0;
-    let name_idx = inst.src2().0 as u16;
 
     let obj = vm.current_frame().get_reg(obj_reg);
 
     // Get the name string for error messages and slow path
-    let name = vm.current_frame().get_name(name_idx).clone();
+    let name = match read_attr_name(vm, inst.src2().0) {
+        Ok(name) => name,
+        Err(err) => return ControlFlow::Error(err),
+    };
 
     // Check if object is heap-allocated
     if let Some(ptr) = obj.as_object_ptr() {
@@ -943,6 +945,18 @@ mod tests {
         vm
     }
 
+    fn names_with_extended_method() -> Vec<Arc<str>> {
+        (0..=0x0123)
+            .map(|index| {
+                if index == 0x0123 {
+                    Arc::from("extended")
+                } else {
+                    Arc::from(format!("unused_{index}"))
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn test_get_primitive_type_id() {
         assert_eq!(get_primitive_type_id(Value::none()), TypeId::NONE);
@@ -1056,6 +1070,35 @@ mod tests {
         assert!(matches!(load_method(&mut vm, inst), ControlFlow::Continue));
         assert_eq!(vm.current_frame().get_reg(2), builtin_len);
         assert!(vm.current_frame().get_reg(3).is_none());
+    }
+
+    #[test]
+    fn test_load_method_consumes_extended_name_index() {
+        let primary = Instruction::new(Opcode::LoadMethod, 2, 1, u8::MAX);
+        let extension = Instruction::op_di(Opcode::AttrName, Register::new(0), 0x0123);
+        let mut code = CodeObject::new("test_load_method", "<test>");
+        code.names = names_with_extended_method().into_boxed_slice();
+        code.instructions = vec![primary, extension].into_boxed_slice();
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::new(code), 0).expect("frame push failed");
+        vm.current_frame_mut().ip = 1;
+
+        let module = Arc::new(ModuleObject::new("method_ext"));
+        let builtin_len = vm.builtins.get("len").expect("len builtin should exist");
+        module.set_attr("extended", builtin_len);
+        vm.import_resolver
+            .insert_module("method_ext", module.clone());
+        vm.current_frame_mut()
+            .set_reg(1, Value::object_ptr(Arc::as_ptr(&module) as *const ()));
+
+        assert!(matches!(
+            load_method(&mut vm, primary),
+            ControlFlow::Continue
+        ));
+        assert_eq!(vm.current_frame().get_reg(2), builtin_len);
+        assert!(vm.current_frame().get_reg(3).is_none());
+        assert_eq!(vm.current_frame().ip, 2);
     }
 
     #[test]
