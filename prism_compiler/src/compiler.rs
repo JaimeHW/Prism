@@ -3127,7 +3127,6 @@ impl Compiler {
         self.builder
             .emit(Instruction::op_ds(Opcode::YieldFrom, dst, iterable_reg));
     }
-
 }
 
 #[cfg(test)]

@@ -44,8 +44,7 @@ fn large_call_then_class_definition_source() -> String {
 
 fn compile_with_optimization(source: &str, optimize: OptimizationLevel) -> CodeObject {
     let module = prism_parser::parse(source).expect("parse error");
-    Compiler::compile_module_with_optimization(&module, "<test>", optimize)
-        .expect("compile error")
+    Compiler::compile_module_with_optimization(&module, "<test>", optimize).expect("compile error")
 }
 
 fn try_compile(source: &str) -> Result<CodeObject, CompileError> {

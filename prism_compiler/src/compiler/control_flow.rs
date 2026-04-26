@@ -1122,5 +1122,4 @@ impl Compiler {
         self.builder.free_register(class_reg);
         Ok(())
     }
-
 }
