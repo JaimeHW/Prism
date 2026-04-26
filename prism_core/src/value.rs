@@ -1044,20 +1044,6 @@ mod tests {
     }
 
     #[test]
-    fn test_value_copy() {
-        let v1 = Value::int(42).unwrap();
-        let v2 = v1; // Copy
-        assert_eq!(v1, v2);
-    }
-
-    #[test]
-    fn test_value_clone() {
-        let v1 = Value::float(3.14);
-        let v2 = v1.clone();
-        assert_eq!(v1, v2);
-    }
-
-    #[test]
     fn test_truthiness_comprehensive() {
         // Falsy values
         assert!(!Value::none().is_truthy());

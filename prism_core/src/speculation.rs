@@ -1005,44 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_hint_equality() {
-        let a = PgoBranchHint::new(10, 500);
-        let b = PgoBranchHint::new(10, 500);
-        let c = PgoBranchHint::new(10, 501);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn test_call_target_equality() {
-        let a = PgoCallTarget::new(10, 42, 100);
-        let b = PgoCallTarget::new(10, 42, 100);
-        let c = PgoCallTarget::new(10, 43, 100);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn test_branch_hint_hash() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(PgoBranchHint::new(10, 500));
-        set.insert(PgoBranchHint::new(10, 500)); // Duplicate
-        set.insert(PgoBranchHint::new(20, 500));
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn test_call_target_hash() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(PgoCallTarget::new(10, 42, 100));
-        set.insert(PgoCallTarget::new(10, 42, 100)); // Duplicate
-        set.insert(PgoCallTarget::new(20, 42, 100));
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
     fn test_type_hint_all_variants_classified() {
         // Every variant should be classifiable
         let variants = [

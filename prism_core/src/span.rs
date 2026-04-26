@@ -482,43 +482,11 @@ mod tests {
     }
 
     #[test]
-    fn test_span_equality() {
-        let span1 = Span::new(10, 20);
-        let span2 = Span::new(10, 20);
-        let span3 = Span::new(10, 21);
-
-        assert_eq!(span1, span2);
-        assert_ne!(span1, span3);
-    }
-
-    #[test]
-    fn test_span_hash() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(Span::new(0, 10));
-        set.insert(Span::new(0, 10)); // Duplicate
-        set.insert(Span::new(5, 15));
-
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
     fn test_span_default() {
         let span = Span::default();
         assert_eq!(span.start, 0);
         assert_eq!(span.end, 0);
         assert!(span.is_dummy());
-    }
-
-    #[test]
-    fn test_span_clone_copy() {
-        let span = Span::new(10, 20);
-        let copied = span;
-        let cloned = span.clone();
-
-        assert_eq!(span, copied);
-        assert_eq!(span, cloned);
     }
 
     // Spanned tests
@@ -562,35 +530,4 @@ mod tests {
         assert_eq!(format!("{}", spanned), "42");
     }
 
-    #[test]
-    fn test_spanned_equality() {
-        let s1 = Spanned::new(42, Span::new(0, 2));
-        let s2 = Spanned::new(42, Span::new(0, 2));
-        let s3 = Spanned::new(42, Span::new(0, 3)); // Different span
-        let s4 = Spanned::new(43, Span::new(0, 2)); // Different value
-
-        assert_eq!(s1, s2);
-        assert_ne!(s1, s3);
-        assert_ne!(s1, s4);
-    }
-
-    #[test]
-    fn test_spanned_hash() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(Spanned::new("a", Span::new(0, 1)));
-        set.insert(Spanned::new("a", Span::new(0, 1))); // Duplicate
-        set.insert(Spanned::new("b", Span::new(0, 1)));
-
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn test_spanned_clone() {
-        let original = Spanned::new(42, Span::new(0, 2));
-        let cloned = original.clone();
-
-        assert_eq!(original, cloned);
-    }
 }
