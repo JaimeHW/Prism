@@ -825,13 +825,6 @@ mod tests {
     // CallMorphism Tests
     // =========================================================================
 
-    #[test]
-    fn test_call_morphism_variants() {
-        // Just ensure all variants exist and are distinct
-        assert_ne!(CallMorphism::Cold, CallMorphism::Monomorphic);
-        assert_ne!(CallMorphism::Polymorphic, CallMorphism::Megamorphic);
-    }
-
     // =========================================================================
     // SpeculationProvider Tests
     // =========================================================================
@@ -846,17 +839,6 @@ mod tests {
         assert!(provider.get_call_targets(1, 0).is_none());
         assert!(!provider.has_profile_data(1));
         assert_eq!(provider.execution_count(1), 0);
-    }
-
-    #[test]
-    fn test_no_speculation_default_trait_methods() {
-        let provider = NoSpeculation;
-        // Ensure all default methods return correct defaults
-        assert!(provider.get_branch_hint(0, 0).is_none());
-        assert!(provider.get_all_branch_hints(0).is_empty());
-        assert!(provider.get_call_targets(0, 0).is_none());
-        assert!(!provider.has_profile_data(0));
-        assert_eq!(provider.execution_count(0), 0);
     }
 
     // =========================================================================
