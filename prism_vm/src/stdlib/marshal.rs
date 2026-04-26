@@ -704,8 +704,8 @@ fn decode_code_constant(
             for _ in 0..len {
                 names.push(reader.read_string()?);
             }
-            Ok(Constant::Value(crate::alloc_managed_value(
-                KwNamesTuple::new(names),
+            Ok(Constant::Value(Value::object_ptr(
+                Box::into_raw(Box::new(KwNamesTuple::new(names))) as *const (),
             )))
         }
         _ => {
