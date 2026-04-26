@@ -27,6 +27,7 @@ pub use native::{
     NativeOperand, native_init_symbol,
 };
 pub use planner::{
-    BuildEntry, BuildOptions, BuildPlan, BuildPlanner, ModuleKind, PlannedEntry, PlannedModule,
+    BuildEntry, BuildOptions, BuildPlan, BuildPlanner, ModuleKind, NativePolicy, PlannedEntry,
+    PlannedModule,
 };
 pub use runtime::{RuntimeFrozenBundle, RuntimeFrozenEntry, RuntimeFrozenModule};

@@ -44,6 +44,19 @@ pub enum AotError {
     #[error("target '{target}' does not support {feature} yet")]
     UnsupportedTarget { target: String, feature: String },
 
+    /// A module could not satisfy the selected native lowering policy.
+    #[error("module '{module}' does not satisfy native policy '{policy}': {message}")]
+    NativeLowering {
+        /// Module that failed native lowering.
+        module: String,
+        /// Source path for diagnostics.
+        path: PathBuf,
+        /// Selected native policy.
+        policy: String,
+        /// Lowering diagnostic.
+        message: String,
+    },
+
     /// A native object or linker-facing artifact could not be emitted.
     #[error("failed to emit {artifact}: {message}")]
     EmitArtifact { artifact: String, message: String },

@@ -15,6 +15,8 @@ pub struct BuildManifest {
     pub target: String,
     /// Optimization level selected for compilation.
     pub optimization: String,
+    /// Native lowering policy selected for the build.
+    pub native_policy: String,
     /// Entry module and bootstrap metadata.
     pub entry: EntryManifest,
     /// All compiled source and stdlib modules in deterministic order.
@@ -77,6 +79,8 @@ pub struct ModuleManifest {
     pub from_import_candidates: Vec<String>,
     /// Concrete backend path used for this module today.
     pub compilation_mode: String,
+    /// Whether this module still executes from the frozen bytecode image.
+    pub requires_frozen_bytecode: bool,
     /// Whether the current native lowering subset can emit a module-init stub.
     pub native_init_supported: bool,
     /// Stable symbol name for the native init stub when available.
@@ -118,6 +122,7 @@ impl From<&BuildPlan> for BuildManifest {
             format_version: plan.format_version,
             target: plan.target.clone(),
             optimization: plan.optimization_label(),
+            native_policy: plan.native_policy_label().to_string(),
             entry: EntryManifest {
                 invocation: InvocationManifest {
                     kind: plan.entry.invocation_kind.clone(),
@@ -148,11 +153,8 @@ impl From<&BuildPlan> for BuildManifest {
                     nested_code_object_count: module.nested_code_object_count,
                     static_imports: module.static_imports.clone(),
                     from_import_candidates: module.from_import_candidates.clone(),
-                    compilation_mode: if module.native_init.is_some() {
-                        "frozen-bytecode-plus-native-init".to_string()
-                    } else {
-                        "frozen-bytecode".to_string()
-                    },
+                    compilation_mode: module_compilation_mode(module),
+                    requires_frozen_bytecode: module.requires_frozen_bytecode,
                     native_init_supported: module.native_init.is_some(),
                     native_init_symbol: module
                         .native_init
@@ -162,5 +164,19 @@ impl From<&BuildPlan> for BuildManifest {
                 })
                 .collect(),
         }
+    }
+}
+
+fn module_compilation_mode(module: &crate::planner::PlannedModule) -> String {
+    match (
+        module.kind,
+        module.native_init.is_some(),
+        module.requires_frozen_bytecode,
+    ) {
+        (ModuleKind::Stdlib, _, false) => "runtime-native-stdlib".to_string(),
+        (ModuleKind::Source, true, true) => "hybrid-native-init-frozen-bytecode".to_string(),
+        (ModuleKind::Source, false, true) => "frozen-bytecode".to_string(),
+        (ModuleKind::Source, true, false) => "native-init".to_string(),
+        _ => "native".to_string(),
     }
 }

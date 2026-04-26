@@ -26,6 +26,8 @@ pub struct BuildOptions {
     pub optimize: OptimizationLevel,
     /// Target identifier for downstream native code generation.
     pub target: String,
+    /// Required native lowering coverage for source modules.
+    pub native_policy: NativePolicy,
 }
 
 impl Default for BuildOptions {
@@ -34,6 +36,27 @@ impl Default for BuildOptions {
             search_paths: default_search_paths(),
             optimize: OptimizationLevel::None,
             target: default_target_triple(),
+            native_policy: NativePolicy::Hybrid,
+        }
+    }
+}
+
+/// Native lowering policy for AOT planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePolicy {
+    /// Allow a hybrid artifact: native module-init stubs when available, with
+    /// frozen bytecode as the executable fallback.
+    Hybrid,
+    /// Every source module must lower to a native module-init stub.
+    RequireNativeInit,
+}
+
+impl NativePolicy {
+    /// Stable manifest/error label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::RequireNativeInit => "require-native-init",
         }
     }
 }
@@ -93,6 +116,8 @@ pub struct PlannedModule {
     pub native_init: Option<NativeModuleInitPlan>,
     /// Lowering diagnostic when native init emission is not yet supported.
     pub native_init_diagnostic: Option<String>,
+    /// Whether this module still needs frozen bytecode execution.
+    pub requires_frozen_bytecode: bool,
 }
 
 /// Entire build plan for a standalone native executable.
@@ -107,6 +132,7 @@ pub struct BuildPlan {
     /// Deterministic module list.
     pub modules: Vec<PlannedModule>,
     optimize: OptimizationLevel,
+    native_policy: NativePolicy,
 }
 
 impl BuildPlan {
@@ -118,6 +144,11 @@ impl BuildPlan {
             OptimizationLevel::Full => "full",
         }
         .to_string()
+    }
+
+    /// Stable label for the selected native lowering policy.
+    pub fn native_policy_label(&self) -> &'static str {
+        self.native_policy.label()
     }
 }
 
@@ -192,6 +223,7 @@ impl BuildPlanner {
                         code_image: None,
                         native_init: None,
                         native_init_diagnostic: None,
+                        requires_frozen_bytecode: false,
                     },
                 );
                 continue;
@@ -224,6 +256,7 @@ impl BuildPlanner {
             },
             modules: planned_modules.into_values().collect(),
             optimize: self.options.optimize,
+            native_policy: self.options.native_policy,
         })
     }
 
@@ -421,6 +454,16 @@ impl BuildPlanner {
                 Ok(plan) => (Some(plan), None),
                 Err(err) => (None, Some(err.to_string())),
             };
+        if self.options.native_policy == NativePolicy::RequireNativeInit
+            && let Some(message) = &native_init_diagnostic
+        {
+            return Err(AotError::NativeLowering {
+                module: resolved.module_name.clone(),
+                path: resolved.path.clone(),
+                policy: self.options.native_policy.label().to_string(),
+                message: message.clone(),
+            });
+        }
 
         Ok(PlannedModule {
             name: resolved.module_name.clone(),
@@ -436,6 +479,7 @@ impl BuildPlanner {
             code_image: Some(code_image),
             native_init,
             native_init_diagnostic,
+            requires_frozen_bytecode: true,
         })
     }
 
@@ -545,4 +589,74 @@ fn is_valid_module_segment(segment: &str) -> bool {
     }
 
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "prism_aot_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn strict_native_init_rejects_unsupported_module_body() {
+        let dir = unique_temp_dir("strict_native");
+        let script = dir.join("main.py");
+        std::fs::write(&script, "def f():\n    return 1\n").unwrap();
+
+        let options = BuildOptions {
+            search_paths: vec![dir.clone()],
+            native_policy: NativePolicy::RequireNativeInit,
+            ..BuildOptions::default()
+        };
+        let err = BuildPlanner::new(options)
+            .plan(BuildEntry::Script(script))
+            .unwrap_err();
+
+        match err {
+            AotError::NativeLowering { module, policy, .. } => {
+                assert_eq!(module, "__main__");
+                assert_eq!(policy, NativePolicy::RequireNativeInit.label());
+            }
+            other => panic!("expected native lowering error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hybrid_plan_records_frozen_bytecode_requirement() {
+        let dir = unique_temp_dir("hybrid");
+        let script = dir.join("main.py");
+        std::fs::write(&script, "answer = 40 + 2\n").unwrap();
+
+        let options = BuildOptions {
+            search_paths: vec![dir.clone()],
+            ..BuildOptions::default()
+        };
+        let plan = BuildPlanner::new(options)
+            .plan(BuildEntry::Script(script))
+            .unwrap();
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.name == "__main__")
+            .unwrap();
+
+        assert!(module.native_init.is_some());
+        assert!(module.requires_frozen_bytecode);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
