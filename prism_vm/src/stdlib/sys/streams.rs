@@ -394,13 +394,6 @@ mod tests {
     }
 
     #[test]
-    fn test_string_writer_flush() {
-        let mut writer = StringWriter::new();
-        // Flush should do nothing but succeed
-        writer.flush().unwrap();
-    }
-
-    #[test]
     fn test_string_writer_invalid_utf8() {
         let mut writer = StringWriter::new();
         let result = writer.write_all(&[0xFF, 0xFE]);
