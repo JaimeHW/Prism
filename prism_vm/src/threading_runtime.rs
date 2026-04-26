@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread::{self, ThreadId};
+use std::time::Duration;
 
 const CHECKPOINT_INTERVAL_OPCODES: u32 = 64;
 
@@ -23,6 +24,7 @@ thread_local! {
 struct ExecutionLockState {
     owner: Option<ThreadId>,
     depth: usize,
+    waiters: usize,
 }
 
 #[must_use = "dropping the guard leaves the Python execution region"]
@@ -84,8 +86,12 @@ pub(crate) fn checkpoint() {
     });
 
     if should_yield {
-        let _released = release_for_blocking_operation();
-        thread::yield_now();
+        if let Some(_released) = release_for_checkpoint_handoff() {
+            thread::yield_now();
+        } else {
+            let _released = release_for_blocking_operation();
+            thread::yield_now();
+        }
     }
 }
 
@@ -116,6 +122,9 @@ fn acquire_execution_lock_at_depth(depth: usize) {
             None => {
                 state.owner = Some(current);
                 state.depth = depth;
+                if state.waiters > 0 {
+                    available.notify_all();
+                }
                 return;
             }
             Some(owner) if owner == current => {
@@ -126,9 +135,14 @@ fn acquire_execution_lock_at_depth(depth: usize) {
                 return;
             }
             Some(_) => {
+                state.waiters = state
+                    .waiters
+                    .checked_add(1)
+                    .expect("Python execution lock waiter count overflowed");
                 state = available
                     .wait(state)
                     .expect("Python execution lock wait should not be poisoned");
+                state.waiters -= 1;
             }
         }
     }
@@ -176,11 +190,49 @@ fn release_for_blocking_operation() -> BlockingReleaseGuard {
     BlockingReleaseGuard { depth }
 }
 
+fn release_for_checkpoint_handoff() -> Option<BlockingReleaseGuard> {
+    let current = thread::current().id();
+    let (state_lock, available) = &*EXECUTION_LOCK;
+    let mut state = state_lock
+        .lock()
+        .expect("Python execution lock should not be poisoned");
+
+    if state.owner != Some(current) || state.waiters == 0 {
+        return None;
+    }
+
+    let depth = state.depth;
+    state.owner = None;
+    state.depth = 0;
+    available.notify_one();
+
+    while state.owner.is_none() && state.waiters > 0 {
+        let (next_state, timeout) = available
+            .wait_timeout(state, Duration::from_millis(1))
+            .expect("Python execution lock handoff wait should not be poisoned");
+        state = next_state;
+        if timeout.timed_out() {
+            break;
+        }
+    }
+
+    Some(BlockingReleaseGuard { depth })
+}
+
+#[cfg(test)]
+fn waiting_thread_count_for_test() -> usize {
+    let (state_lock, _) = &*EXECUTION_LOCK;
+    state_lock
+        .lock()
+        .expect("Python execution lock should not be poisoned")
+        .waiters
+}
+
 #[cfg(test)]
 mod tests {
     use super::{blocking_operation, checkpoint, enter_execution_region};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_execution_regions_serialize_python_threads() {
@@ -255,6 +307,15 @@ mod tests {
             let _region = enter_execution_region();
             entered_tx.send(()).expect("receiver should be alive");
         });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while super::waiting_thread_count_for_test() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "second thread should block on the execution gate"
+            );
+            std::thread::yield_now();
+        }
 
         for _ in 0..(super::CHECKPOINT_INTERVAL_OPCODES * 4) {
             checkpoint();
