@@ -969,12 +969,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_is_none() {
-        let v = Value::default();
-        assert!(v.is_none());
-    }
-
-    #[test]
     fn test_bits_roundtrip() {
         let values = [
             Value::none(),

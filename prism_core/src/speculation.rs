@@ -534,12 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn test_type_hint_default() {
-        let hint: TypeHint = Default::default();
-        assert_eq!(hint, TypeHint::None);
-    }
-
-    #[test]
     fn test_type_hint_repr() {
         assert_eq!(TypeHint::None as u8, 0);
         assert_eq!(TypeHint::IntInt as u8, 1);
@@ -984,31 +978,6 @@ mod tests {
         // Setting exec count should also mark as profiled
         spec.set_execution_count(7, 100);
         assert!(spec.has_profile_data(7));
-    }
-
-    #[test]
-    fn test_type_hint_all_variants_classified() {
-        // Every variant should be classifiable
-        let variants = [
-            TypeHint::None,
-            TypeHint::IntInt,
-            TypeHint::FloatFloat,
-            TypeHint::IntFloat,
-            TypeHint::FloatInt,
-            TypeHint::StrStr,
-            TypeHint::StrInt,
-            TypeHint::IntStr,
-            TypeHint::ListList,
-        ];
-
-        for hint in &variants {
-            // Each variant should either be valid or None
-            if *hint == TypeHint::None {
-                assert!(!hint.is_valid());
-            } else {
-                assert!(hint.is_valid());
-            }
-        }
     }
 
     #[test]

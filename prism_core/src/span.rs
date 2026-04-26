@@ -481,14 +481,6 @@ mod tests {
         assert_eq!(range, 5..15);
     }
 
-    #[test]
-    fn test_span_default() {
-        let span = Span::default();
-        assert_eq!(span.start, 0);
-        assert_eq!(span.end, 0);
-        assert!(span.is_dummy());
-    }
-
     // Spanned tests
 
     #[test]

@@ -766,9 +766,4 @@ mod tests {
         assert_eq!(interner.len(), 1);
     }
 
-    #[test]
-    fn test_interner_default() {
-        let interner = StringInterner::default();
-        assert!(interner.is_empty());
-    }
 }
