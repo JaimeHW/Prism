@@ -41,6 +41,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{
     CellViewObject, CodeObjectView, FrameViewObject, TracebackViewObject,
 };
+use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::int::bigint_to_value;
@@ -1626,6 +1627,14 @@ pub(crate) fn get_attribute_value(
                 .ok_or_else(|| RuntimeError::attribute_error("Pattern", name.as_str())),
             TypeId::REGEX_MATCH => crate::stdlib::re::match_attr_value(vm, obj, name)?
                 .ok_or_else(|| RuntimeError::attribute_error("Match", name.as_str())),
+            TypeId::COMPLEX => {
+                let complex = unsafe { &*(ptr as *const ComplexObject) };
+                match name.as_str() {
+                    "real" => Ok(Value::float(complex.real())),
+                    "imag" => Ok(Value::float(complex.imag())),
+                    _ => Err(RuntimeError::attribute_error("complex", name.as_str())),
+                }
+            }
             TypeId::DICT => Err(RuntimeError::attribute_error("dict", name.as_str())),
             TypeId::LIST => Err(RuntimeError::attribute_error("list", name.as_str())),
             TypeId::TUPLE => Err(RuntimeError::attribute_error("tuple", name.as_str())),

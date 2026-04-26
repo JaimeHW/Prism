@@ -88,6 +88,18 @@ static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(||
         crate::builtins::builtin_int_new_vm,
     )
 });
+static FLOAT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("float.__new__"),
+        crate::builtins::builtin_float_new,
+    )
+});
+static STR_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("str.__new__"), crate::builtins::builtin_str_new)
+});
+static BOOL_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bool.__new__"), crate::builtins::builtin_bool_new)
+});
 static BYTES_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("bytes.__new__"),
@@ -485,6 +497,9 @@ fn builtin_instantiation_slot_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::TYPE, "__init__") => Some(builtin_slot_value(&TYPE_INIT_SLOT_FUNCTION)),
         (TypeId::TUPLE, "__new__") => Some(builtin_slot_value(&TUPLE_NEW_SLOT_FUNCTION)),
         (TypeId::INT, "__new__") => Some(builtin_slot_value(&INT_NEW_SLOT_FUNCTION)),
+        (TypeId::FLOAT, "__new__") => Some(builtin_slot_value(&FLOAT_NEW_SLOT_FUNCTION)),
+        (TypeId::STR, "__new__") => Some(builtin_slot_value(&STR_NEW_SLOT_FUNCTION)),
+        (TypeId::BOOL, "__new__") => Some(builtin_slot_value(&BOOL_NEW_SLOT_FUNCTION)),
         (TypeId::BYTES, "__new__") => Some(builtin_slot_value(&BYTES_NEW_SLOT_FUNCTION)),
         (TypeId::BYTEARRAY, "__new__") => Some(builtin_slot_value(&BYTEARRAY_NEW_SLOT_FUNCTION)),
         _ => None,

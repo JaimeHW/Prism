@@ -561,17 +561,18 @@ pub(crate) fn compare_order_result(
         return Ok(result);
     }
 
-    Err(RuntimeError::unsupported_operand(
-        match op {
-            RichCompareOp::Lt => "<",
-            RichCompareOp::Le => "<=",
-            RichCompareOp::Gt => ">",
-            RichCompareOp::Ge => ">=",
-            RichCompareOp::Eq | RichCompareOp::Ne => unreachable!(),
-        },
+    let op = match op {
+        RichCompareOp::Lt => "<",
+        RichCompareOp::Le => "<=",
+        RichCompareOp::Gt => ">",
+        RichCompareOp::Ge => ">=",
+        RichCompareOp::Eq | RichCompareOp::Ne => unreachable!(),
+    };
+    Err(RuntimeError::type_error(format!(
+        "'{op}' not supported between instances of '{}' and '{}'",
         a.type_name(),
-        b.type_name(),
-    ))
+        b.type_name()
+    )))
 }
 
 #[inline]
