@@ -5861,7 +5861,7 @@ fn collect_iterable_values_with_vm(
 #[inline]
 fn runtime_error_to_builtin_error(err: crate::error::RuntimeError) -> BuiltinError {
     let display = err.to_string();
-    match err.kind {
+    match err.into_kind() {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
             format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
@@ -6762,10 +6762,13 @@ mod tests {
 
     fn assert_unicode_encode_error(err: BuiltinError, expected_message: &str) {
         match err {
-            BuiltinError::Raised(runtime_err) => match runtime_err.kind {
+            BuiltinError::Raised(runtime_err) => match runtime_err.kind() {
                 RuntimeErrorKind::Exception { type_id, message } => {
-                    assert_eq!(type_id, ExceptionTypeId::UnicodeEncodeError.as_u8() as u16);
-                    assert_eq!(&*message, expected_message);
+                    assert_eq!(
+                        *type_id,
+                        ExceptionTypeId::UnicodeEncodeError.as_u8() as u16
+                    );
+                    assert_eq!(message.as_ref(), expected_message);
                 }
                 kind => panic!("expected UnicodeEncodeError, got {kind:?}"),
             },

@@ -6,11 +6,23 @@
 use crate::builtins::BuiltinError;
 use prism_core::{PrismError, Span, Value};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 /// Runtime error during bytecode execution.
+///
+/// The detailed payload is boxed so `VmResult<T>` and dispatch-level
+/// `ControlFlow` stay small on the success path. Runtime errors are cold in
+/// optimized execution, while `Result` and `ControlFlow` are moved through hot
+/// opcode handlers constantly.
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
+    inner: Box<RuntimeErrorData>,
+}
+
+/// Runtime error payload.
+#[derive(Debug, Clone)]
+pub struct RuntimeErrorData {
     /// Error kind
     pub kind: RuntimeErrorKind,
     /// Preserved Python exception instance for exact-object propagation.
@@ -122,10 +134,12 @@ impl RuntimeError {
     #[inline]
     pub fn new(kind: RuntimeErrorKind) -> Self {
         Self {
-            kind,
-            raised_value: None,
-            span: None,
-            traceback: Vec::new(),
+            inner: Box::new(RuntimeErrorData {
+                kind,
+                raised_value: None,
+                span: None,
+                traceback: Vec::new(),
+            }),
         }
     }
 
@@ -133,11 +147,43 @@ impl RuntimeError {
     #[inline]
     pub fn with_span(kind: RuntimeErrorKind, span: Span) -> Self {
         Self {
-            kind,
-            raised_value: None,
-            span: Some(span),
-            traceback: Vec::new(),
+            inner: Box::new(RuntimeErrorData {
+                kind,
+                raised_value: None,
+                span: Some(span),
+                traceback: Vec::new(),
+            }),
         }
+    }
+
+    /// Borrow the error kind without exposing the boxed representation.
+    #[inline]
+    pub fn kind(&self) -> &RuntimeErrorKind {
+        &self.inner.kind
+    }
+
+    /// Mutably borrow the error kind without exposing the boxed representation.
+    #[inline]
+    pub fn kind_mut(&mut self) -> &mut RuntimeErrorKind {
+        &mut self.inner.kind
+    }
+
+    /// Consume the error and return its payload.
+    #[inline]
+    pub fn into_inner(self) -> RuntimeErrorData {
+        *self.inner
+    }
+
+    /// Consume the error and return its kind.
+    #[inline]
+    pub fn into_kind(self) -> RuntimeErrorKind {
+        self.into_inner().kind
+    }
+
+    /// Remove the preserved Python exception object, if one exists.
+    #[inline]
+    pub fn take_raised_value(&mut self) -> Option<Value> {
+        self.inner.raised_value.take()
     }
 
     /// Add a traceback entry.
@@ -305,12 +351,12 @@ impl RuntimeError {
 
     #[inline]
     pub fn is_control_transferred(&self) -> bool {
-        matches!(self.kind, RuntimeErrorKind::ControlTransferred)
+        matches!(self.kind(), RuntimeErrorKind::ControlTransferred)
     }
 
     #[inline]
     pub fn is_attribute_error(&self) -> bool {
-        self.kind.is_attribute_error()
+        self.kind().is_attribute_error()
     }
 
     /// Return the payload text that should populate a Python exception instance.
@@ -320,7 +366,23 @@ impl RuntimeError {
     /// construction semantics.
     #[inline]
     pub fn python_exception_message(&self) -> Option<Arc<str>> {
-        self.kind.python_exception_message()
+        self.kind().python_exception_message()
+    }
+}
+
+impl Deref for RuntimeError {
+    type Target = RuntimeErrorData;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for RuntimeError {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -410,7 +472,7 @@ impl RuntimeErrorKind {
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
+        match self.kind() {
             RuntimeErrorKind::TypeError { message } => write!(f, "TypeError: {}", message),
             RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => {
                 write!(
@@ -626,7 +688,7 @@ impl From<PrismError> for RuntimeError {
 
 impl From<RuntimeError> for PrismError {
     fn from(err: RuntimeError) -> Self {
-        match &err.kind {
+        match err.kind() {
             RuntimeErrorKind::TypeError { message } => PrismError::type_error(&**message),
             RuntimeErrorKind::UnsupportedOperandTypes { .. } => {
                 PrismError::type_error(err.to_string())
@@ -719,7 +781,7 @@ mod tests {
     #[test]
     fn test_builtin_stop_iteration_maps_to_runtime_stop_iteration() {
         let err = RuntimeError::from(crate::builtins::BuiltinError::StopIteration);
-        assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
+        assert!(matches!(err.kind(), RuntimeErrorKind::StopIteration));
         assert_eq!(err.to_string(), "StopIteration");
     }
 

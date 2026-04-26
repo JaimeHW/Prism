@@ -853,6 +853,7 @@ fn remap_unknown_error_handler(err: BuiltinError) -> BuiltinError {
 mod tests {
     use super::*;
     use prism_core::python_unicode::encode_python_code_point;
+    use prism_runtime::types::string::value_as_string_ref;
 
     fn builtin_from_value(value: Value) -> &'static BuiltinFunctionObject {
         let ptr = value.as_object_ptr().expect("expected builtin");
@@ -1035,12 +1036,8 @@ mod tests {
 
         let ptr = value.as_object_ptr().expect("tuple should be object");
         let tuple = unsafe { &*(ptr as *const TupleObject) };
-        let string_ptr = tuple
-            .get(0)
-            .unwrap()
-            .as_object_ptr()
-            .expect("decoded text should be object");
-        let decoded = unsafe { &*(string_ptr as *const StringObject) };
+        let decoded =
+            value_as_string_ref(tuple.get(0).unwrap()).expect("decoded text should be string");
         let escaped = encode_python_code_point(0xDCFF).expect("surrogate carrier should encode");
         assert_eq!(decoded.as_str(), format!("A{escaped}B"));
         assert_eq!(tuple.get(1).unwrap().as_int(), Some(3));
@@ -1062,12 +1059,8 @@ mod tests {
         let tuple = unsafe { &*(ptr as *const TupleObject) };
         assert_eq!(tuple.get(1).unwrap().as_int(), Some(3));
 
-        let string_ptr = tuple
-            .get(0)
-            .unwrap()
-            .as_object_ptr()
-            .expect("decoded text should be object");
-        let decoded = unsafe { &*(string_ptr as *const StringObject) };
+        let decoded =
+            value_as_string_ref(tuple.get(0).unwrap()).expect("decoded text should be string");
         assert_eq!(decoded.as_str(), r"A\xffB");
     }
 }

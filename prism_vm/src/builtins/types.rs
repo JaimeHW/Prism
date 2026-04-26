@@ -4509,21 +4509,6 @@ mod tests {
             builtin_int_to_bytes(&[Value::int(0).unwrap(), Value::int(0).unwrap()], &[])
                 .expect("0.to_bytes(0) should succeed");
         assert_eq!(value_to_bytes(empty_bytes), Vec::<u8>::new());
-
-        unsafe {
-            drop_boxed(
-                default_bytes
-                    .as_object_ptr()
-                    .expect("bytes result should be heap allocated")
-                    as *mut BytesObject,
-            );
-            drop_boxed(
-                empty_bytes
-                    .as_object_ptr()
-                    .expect("bytes result should be heap allocated")
-                    as *mut BytesObject,
-            );
-        }
     }
 
     #[test]
@@ -4553,27 +4538,6 @@ mod tests {
         let boolean = builtin_int_to_bytes(&[Value::bool(true)], &[])
             .expect("bool should inherit int.to_bytes()");
         assert_eq!(value_to_bytes(boolean), vec![1]);
-
-        unsafe {
-            drop_boxed(
-                little_endian
-                    .as_object_ptr()
-                    .expect("bytes result should be heap allocated")
-                    as *mut BytesObject,
-            );
-            drop_boxed(
-                signed_negative
-                    .as_object_ptr()
-                    .expect("bytes result should be heap allocated")
-                    as *mut BytesObject,
-            );
-            drop_boxed(
-                boolean
-                    .as_object_ptr()
-                    .expect("bytes result should be heap allocated")
-                    as *mut BytesObject,
-            );
-        }
     }
 
     #[test]

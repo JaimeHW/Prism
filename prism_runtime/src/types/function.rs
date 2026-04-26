@@ -4,6 +4,7 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::Cell;
 use crate::types::dict::DictObject;
 use prism_code::CodeObject;
 use prism_core::Value;
@@ -19,40 +20,138 @@ use std::sync::RwLock;
 
 /// Captured variable environment for closures.
 ///
-/// Forms a chain of captured values from enclosing scopes.
-/// Uses Arc for shared ownership between closure instances.
-#[repr(C)]
+/// Python closures capture cells, not plain values: sibling closures must see
+/// mutations through the same cell object. The first four cells are stored
+/// inline because small closures dominate Python code; larger environments use
+/// a single shared overflow slice.
+#[derive(Clone)]
 pub struct ClosureEnv {
-    /// Captured values from enclosing scope.
-    values: Box<[Value]>,
+    /// Inline storage for small closure environments.
+    inline_cells: [Option<Arc<Cell>>; 4],
+    /// Number of cells in this environment.
+    cell_count: usize,
+    /// Overflow storage for environments with more than four cells.
+    overflow: Option<Arc<[Arc<Cell>]>>,
     /// Parent closure environment (for nested closures).
     parent: Option<Arc<ClosureEnv>>,
 }
 
 impl ClosureEnv {
-    /// Create a new closure environment.
-    pub fn new(values: Box<[Value]>, parent: Option<Arc<ClosureEnv>>) -> Self {
-        Self { values, parent }
+    /// Maximum number of cells stored inline.
+    pub const INLINE_LIMIT: usize = 4;
+
+    /// Create a new closure environment with captured cells.
+    pub fn new(cells: Vec<Arc<Cell>>) -> Self {
+        Self::with_parent(cells, None)
+    }
+
+    /// Create a closure environment with an explicit parent chain.
+    pub fn with_parent(cells: Vec<Arc<Cell>>, parent: Option<Arc<ClosureEnv>>) -> Self {
+        let cell_count = cells.len();
+
+        if cells.len() <= Self::INLINE_LIMIT {
+            let mut inline_cells: [Option<Arc<Cell>>; 4] = Default::default();
+            for (idx, cell) in cells.into_iter().enumerate() {
+                inline_cells[idx] = Some(cell);
+            }
+            Self {
+                inline_cells,
+                cell_count,
+                overflow: None,
+                parent,
+            }
+        } else {
+            Self {
+                inline_cells: Default::default(),
+                cell_count,
+                overflow: Some(cells.into()),
+                parent,
+            }
+        }
+    }
+
+    /// Build an environment from values by wrapping each value in a cell.
+    pub fn from_values(values: Box<[Value]>, parent: Option<Arc<ClosureEnv>>) -> Self {
+        let cells = values
+            .into_vec()
+            .into_iter()
+            .map(|value| Arc::new(Cell::new(value)))
+            .collect();
+        Self::with_parent(cells, parent)
     }
 
     /// Create an empty closure environment.
     pub fn empty() -> Self {
         Self {
-            values: Box::new([]),
+            inline_cells: Default::default(),
+            cell_count: 0,
+            overflow: None,
             parent: None,
         }
     }
 
+    /// Create an environment with pre-initialized unbound cells.
+    pub fn with_unbound_cells(count: usize) -> Self {
+        let cells = (0..count).map(|_| Arc::new(Cell::unbound())).collect();
+        Self::new(cells)
+    }
+
+    /// Get a captured cell by index.
+    #[inline]
+    pub fn get_cell(&self, index: usize) -> &Arc<Cell> {
+        self.try_get_cell(index).unwrap_or_else(|| {
+            panic!(
+                "closure cell index {index} out of bounds for {} cells",
+                self.cell_count
+            )
+        })
+    }
+
+    #[inline]
+    unsafe fn cell_at_unchecked(&self, index: usize) -> &Arc<Cell> {
+        debug_assert!(index < self.cell_count);
+        if self.overflow.is_none() {
+            unsafe {
+                self.inline_cells
+                    .get_unchecked(index)
+                    .as_ref()
+                    .unwrap_unchecked()
+            }
+        } else {
+            unsafe {
+                self.overflow
+                    .as_ref()
+                    .unwrap_unchecked()
+                    .get_unchecked(index)
+            }
+        }
+    }
+
+    /// Try to get a captured cell by index.
+    #[inline]
+    pub fn try_get_cell(&self, index: usize) -> Option<&Arc<Cell>> {
+        if index >= self.len() {
+            return None;
+        }
+        Some(unsafe { self.cell_at_unchecked(index) })
+    }
+
     /// Get a captured value by index.
     #[inline]
-    pub fn get(&self, index: usize) -> Option<Value> {
-        self.values.get(index).copied()
+    pub fn get(&self, index: usize) -> Value {
+        self.get_cell(index).get_or_none()
+    }
+
+    /// Try to get a captured value by index.
+    #[inline]
+    pub fn try_get(&self, index: usize) -> Option<Value> {
+        self.try_get_cell(index).map(|cell| cell.get_or_none())
     }
 
     /// Get a captured value by index, searching parent scopes.
     pub fn get_chain(&self, depth: usize, index: usize) -> Option<Value> {
         if depth == 0 {
-            self.get(index)
+            self.try_get(index)
         } else {
             self.parent.as_ref()?.get_chain(depth - 1, index)
         }
@@ -60,31 +159,46 @@ impl ClosureEnv {
 
     /// Set a captured value by index.
     #[inline]
-    pub fn set(&mut self, index: usize, value: Value) -> bool {
-        if index < self.values.len() {
-            self.values[index] = value;
-            true
-        } else {
-            false
-        }
+    pub fn set(&self, index: usize, value: Value) -> bool {
+        let Some(cell) = self.try_get_cell(index) else {
+            return false;
+        };
+        cell.set(value);
+        true
     }
 
     /// Get the number of captured values.
     #[inline]
     pub fn len(&self) -> usize {
-        self.values.len()
+        self.cell_count
     }
 
     /// Check if empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.cell_count == 0
+    }
+
+    /// Whether all cells are stored inline.
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        self.overflow.is_none()
     }
 
     /// Get parent environment.
     #[inline]
     pub fn parent(&self) -> Option<&Arc<ClosureEnv>> {
         self.parent.as_ref()
+    }
+}
+
+impl std::fmt::Debug for ClosureEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClosureEnv")
+            .field("cell_count", &self.cell_count)
+            .field("is_inline", &self.is_inline())
+            .field("has_parent", &self.parent.is_some())
+            .finish()
     }
 }
 
@@ -301,7 +415,7 @@ impl FunctionObject {
     /// Get a captured value from the closure.
     #[inline]
     pub fn get_closure_value(&self, index: usize) -> Option<Value> {
-        self.closure.as_ref()?.get(index)
+        self.closure.as_ref()?.try_get(index)
     }
 
     /// Get the raw module globals pointer captured when the function was defined.
@@ -441,22 +555,44 @@ mod tests {
     #[test]
     fn test_closure_env() {
         let values: Box<[Value]> = vec![Value::int(42).unwrap(), Value::int(100).unwrap()].into();
-        let env = ClosureEnv::new(values, None);
+        let env = ClosureEnv::from_values(values, None);
         assert_eq!(env.len(), 2);
-        assert_eq!(env.get(0).unwrap().as_int(), Some(42));
-        assert_eq!(env.get(1).unwrap().as_int(), Some(100));
+        assert_eq!(env.get(0).as_int(), Some(42));
+        assert_eq!(env.get(1).as_int(), Some(100));
     }
 
     #[test]
     fn test_closure_chain() {
         let outer: Box<[Value]> = vec![Value::int(1).unwrap()].into();
-        let outer_env = Arc::new(ClosureEnv::new(outer, None));
+        let outer_env = Arc::new(ClosureEnv::from_values(outer, None));
 
         let inner: Box<[Value]> = vec![Value::int(2).unwrap()].into();
-        let inner_env = ClosureEnv::new(inner, Some(outer_env));
+        let inner_env = ClosureEnv::from_values(inner, Some(outer_env));
 
         assert_eq!(inner_env.get_chain(0, 0).unwrap().as_int(), Some(2));
         assert_eq!(inner_env.get_chain(1, 0).unwrap().as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_closure_env_shares_cells_across_clones() {
+        let cell = Arc::new(Cell::new(Value::int(41).unwrap()));
+        let env = ClosureEnv::new(vec![Arc::clone(&cell)]);
+        let cloned = env.clone();
+
+        cloned.set(0, Value::int(42).unwrap());
+
+        assert_eq!(env.get(0).as_int(), Some(42));
+        assert_eq!(cell.get().unwrap().as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_closure_env_overflow_supports_large_cell_counts() {
+        let env = ClosureEnv::with_unbound_cells(300);
+
+        assert_eq!(env.len(), 300);
+        assert!(!env.is_inline());
+        env.set(299, Value::int(299).unwrap());
+        assert_eq!(env.get(299).as_int(), Some(299));
     }
 
     #[test]

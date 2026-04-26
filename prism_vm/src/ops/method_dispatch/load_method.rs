@@ -975,14 +975,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_list_method_unimplemented_known_method() {
-        let result = resolve_list_method("sort");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("sort"));
-    }
-
-    #[test]
     fn test_resolve_list_method_unknown() {
         // Unknown methods should return plain attribute error
         let result = resolve_list_method("foobar");
@@ -1000,7 +992,7 @@ mod tests {
     #[test]
     fn test_resolve_dict_method_known() {
         let result = resolve_dict_method("keys");
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1386,7 +1378,7 @@ mod tests {
             .expect("object.__ne__ should be heap allocated");
         let header = unsafe { &*(method_ptr as *const ObjectHeader) };
         assert_eq!(header.type_id, TypeId::BUILTIN_FUNCTION);
-        assert!(!cached.is_descriptor);
+        assert!(cached.is_descriptor);
     }
 
     #[test]

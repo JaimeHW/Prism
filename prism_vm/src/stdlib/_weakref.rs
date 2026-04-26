@@ -407,7 +407,7 @@ impl ReachabilityMarker {
                 }
                 if let Some(closure) = function.closure() {
                     for index in 0..closure.len() {
-                        if let Some(value) = closure.get(index) {
+                        if let Some(value) = closure.try_get(index) {
                             self.push(value);
                         }
                     }

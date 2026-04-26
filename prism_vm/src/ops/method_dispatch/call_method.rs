@@ -266,7 +266,7 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 mod tests {
     use super::*;
     use crate::builtins::{BuiltinError, BuiltinFunctionObject};
-    use prism_code::{CodeObject, Instruction, Opcode};
+    use prism_code::{CodeObject, Instruction, Opcode, Register};
     use prism_runtime::types::function::FunctionObject;
     use prism_runtime::types::list::ListObject;
     use std::sync::Arc;
@@ -278,9 +278,15 @@ mod tests {
             .expect("failed to push test frame");
     }
 
-    fn make_test_function_value(name: &str) -> (*mut FunctionObject, Value) {
+    fn make_test_function_value(
+        name: &str,
+        arg_count: u16,
+        return_reg: Register,
+    ) -> (*mut FunctionObject, Value) {
         let mut code = CodeObject::new(name, "<test>");
         code.register_count = 16;
+        code.arg_count = arg_count;
+        code.instructions = vec![Instruction::op_d(Opcode::Return, return_reg)].into_boxed_slice();
         let func = Box::new(FunctionObject::new(
             Arc::new(code),
             Arc::from(name),
@@ -330,7 +336,8 @@ mod tests {
         let mut vm = VirtualMachine::new();
         push_test_frame(&mut vm, "caller");
 
-        let (func_ptr, func_value) = make_test_function_value("callee");
+        let (func_ptr, func_value) =
+            make_test_function_value("callee", 1, Register::new(0));
         vm.current_frame_mut().set_reg(1, func_value);
         vm.current_frame_mut().set_reg(2, Value::none()); // None marker => no implicit self
         vm.current_frame_mut().set_reg(3, Value::int(42).unwrap());
@@ -353,7 +360,8 @@ mod tests {
         let mut vm = VirtualMachine::new();
         push_test_frame(&mut vm, "caller");
 
-        let (func_ptr, func_value) = make_test_function_value("callee");
+        let (func_ptr, func_value) =
+            make_test_function_value("callee", 2, Register::new(0));
         vm.current_frame_mut().set_reg(1, func_value);
         vm.current_frame_mut().set_reg(2, Value::int(7).unwrap());
         vm.current_frame_mut().set_reg(3, Value::int(42).unwrap());

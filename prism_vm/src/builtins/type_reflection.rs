@@ -1204,6 +1204,8 @@ pub(crate) fn builtin_bound_type_attribute_value(
 
     if let Some(method) = builtin_type_method_value(owner, name.as_str()) {
         return Ok(Some(bind_builtin_type_method_if_needed(
+            owner,
+            name.as_str(),
             method,
             owner_value,
         )));
@@ -1256,6 +1258,8 @@ pub(crate) fn builtin_bound_type_attribute_value_static(
 
     if let Some(method) = builtin_type_method_value(owner, name.as_str()) {
         return Ok(Some(bind_builtin_type_method_if_needed(
+            owner,
+            name.as_str(),
             method,
             owner_value,
         )));
@@ -1301,8 +1305,15 @@ fn builtin_type_class_or_static_attribute_value(
 }
 
 #[inline]
-fn bind_builtin_type_method_if_needed(method: Value, owner_value: Value) -> Value {
-    if should_bind_builtin_type_callable(owner_value) {
+fn bind_builtin_type_method_if_needed(
+    owner: TypeId,
+    name: &str,
+    method: Value,
+    owner_value: Value,
+) -> Value {
+    if builtin_type_static_method_value(owner, name).is_some() {
+        method
+    } else if should_bind_builtin_type_callable(owner_value) {
         crate::ops::objects::bind_cached_builtin_method(method, owner_value)
     } else {
         method
@@ -2163,7 +2174,6 @@ mod tests {
         );
 
         unsafe {
-            drop(Box::from_raw(result_ptr as *mut DictObject));
             drop(Box::from_raw(bases_ptr));
         }
     }
@@ -2373,7 +2383,12 @@ mod tests {
         )
         .expect("lookup should succeed");
 
-        assert_eq!(doc, Some(Value::none()));
+        assert_eq!(
+            doc,
+            Some(Value::string(intern(
+                "Create a new type, or return the type of an object."
+            )))
+        );
     }
 
     #[test]

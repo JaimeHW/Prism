@@ -328,9 +328,12 @@ mod tests {
             .call(&[Value::int(SIGINT).unwrap(), Value::none()])
             .expect_err("default SIGINT handler should raise KeyboardInterrupt");
         match err {
-            BuiltinError::Raised(runtime) => match runtime.kind {
+            BuiltinError::Raised(runtime) => match runtime.kind() {
                 crate::error::RuntimeErrorKind::Exception { type_id, .. } => {
-                    assert_eq!(type_id, ExceptionTypeId::KeyboardInterrupt.as_u8() as u16);
+                    assert_eq!(
+                        *type_id,
+                        ExceptionTypeId::KeyboardInterrupt.as_u8() as u16
+                    );
                 }
                 other => panic!("expected KeyboardInterrupt exception, got {other:?}"),
             },

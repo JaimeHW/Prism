@@ -562,10 +562,8 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             let tuple = unsafe {
                 (&*(a_ptr as *const TupleObject)).concat(&*(b_ptr as *const TupleObject))
             };
-            let boxed = Box::new(tuple);
-            let ptr = Box::into_raw(boxed) as *const ();
             vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::object_ptr(ptr));
+                .set_reg(inst.dst().0, boxed_tuple_value(tuple));
             return ControlFlow::Continue;
         }
     }
@@ -1773,7 +1771,6 @@ mod tests {
         unsafe {
             drop(Box::from_raw(left_ptr));
             drop(Box::from_raw(right_ptr));
-            drop(Box::from_raw(result_ptr as *mut TupleObject));
         }
     }
 
@@ -1983,12 +1980,6 @@ mod tests {
         unsafe {
             drop(Box::from_raw(left_ptr));
             drop(Box::from_raw(right_ptr));
-            drop(Box::from_raw(
-                result
-                    .as_object_ptr()
-                    .expect("bytes concat result should be heap allocated")
-                    as *mut BytesObject,
-            ));
         }
     }
 
@@ -2033,18 +2024,6 @@ mod tests {
             drop(Box::from_raw(right_ptr));
             drop(Box::from_raw(second_left_ptr));
             drop(Box::from_raw(second_right_ptr));
-            drop(Box::from_raw(
-                first_result
-                    .as_object_ptr()
-                    .expect("mixed bytes concat should allocate a result")
-                    as *mut BytesObject,
-            ));
-            drop(Box::from_raw(
-                second_result
-                    .as_object_ptr()
-                    .expect("mixed bytearray concat should allocate a result")
-                    as *mut BytesObject,
-            ));
         }
     }
 
@@ -2135,7 +2114,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(tuple_ptr));
-            drop(Box::from_raw(result_ptr as *mut TupleObject));
         }
     }
 
@@ -2169,7 +2147,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(tuple_ptr));
-            drop(Box::from_raw(result_ptr as *mut TupleObject));
         }
     }
 
@@ -2213,7 +2190,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(list_ptr));
-            drop(Box::from_raw(result_ptr as *mut ListObject));
         }
     }
 
@@ -2237,12 +2213,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(bytes_ptr));
-            drop(Box::from_raw(
-                result
-                    .as_object_ptr()
-                    .expect("bytes repeat should allocate a result")
-                    as *mut BytesObject,
-            ));
         }
     }
 
@@ -2266,12 +2236,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(bytearray_ptr));
-            drop(Box::from_raw(
-                result
-                    .as_object_ptr()
-                    .expect("bytearray repeat should allocate a result")
-                    as *mut BytesObject,
-            ));
         }
     }
 
@@ -2295,12 +2259,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(bytearray_ptr));
-            drop(Box::from_raw(
-                result
-                    .as_object_ptr()
-                    .expect("bytearray repeat should allocate a result")
-                    as *mut BytesObject,
-            ));
         }
     }
 
@@ -2351,11 +2309,6 @@ mod tests {
 
         unsafe {
             drop(Box::from_raw(tuple_ptr));
-            if let Some(result_ptr) = vm.current_frame().get_reg(0).as_object_ptr() {
-                drop(Box::from_raw(
-                    result_ptr as *mut prism_runtime::types::string::StringObject,
-                ));
-            }
         }
     }
 
@@ -2381,12 +2334,6 @@ mod tests {
         unsafe {
             drop(Box::from_raw(template_ptr));
             drop(Box::from_raw(argument_ptr));
-            drop(Box::from_raw(
-                result
-                    .as_object_ptr()
-                    .expect("bytes format result should be boxed")
-                    as *mut BytesObject,
-            ));
         }
     }
 

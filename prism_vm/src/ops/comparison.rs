@@ -2139,7 +2139,6 @@ assert b"abd" > b"abc"
 
         unsafe { drop_boxed(left_ptr) };
         unsafe { drop_boxed(right_ptr) };
-        unsafe { drop_boxed(result_ptr as *mut SetObject) };
     }
 
     #[test]
@@ -2175,7 +2174,6 @@ assert b"abd" > b"abc"
 
         unsafe { drop_boxed(left_ptr) };
         unsafe { drop_boxed(right_ptr) };
-        unsafe { drop_boxed(result_ptr as *mut SetObject) };
     }
 
     #[test]
@@ -2217,7 +2215,6 @@ assert b"abd" > b"abc"
 
         unsafe { drop_boxed(left_ptr) };
         unsafe { drop_boxed(right_ptr) };
-        unsafe { drop_boxed(result_ptr as *mut DictObject) };
     }
 
     #[test]
@@ -2252,7 +2249,6 @@ assert b"abd" > b"abc"
 
         unsafe { drop_boxed(left_ptr) };
         unsafe { drop_boxed(right_ptr) };
-        unsafe { drop_boxed(result_ptr as *mut SetObject) };
     }
 
     #[test]

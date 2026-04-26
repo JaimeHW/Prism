@@ -359,7 +359,7 @@ fn formatter_field_name_split_builtin(args: &[Value]) -> Result<Value, BuiltinEr
 #[inline]
 fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
     let display = err.to_string();
-    match err.kind {
+    match err.into_kind() {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
             format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),

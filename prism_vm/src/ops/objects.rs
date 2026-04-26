@@ -690,7 +690,7 @@ fn function_attr_value_in_vm(
             }
         }
         "__closure__" => {
-            let Some(closure) = vm.lookup_function_closure(func_ptr) else {
+            let Some(closure) = func.closure() else {
                 return Ok(Some(Value::none()));
             };
 
@@ -2789,13 +2789,20 @@ mod tests {
     }
 
     fn make_test_function_value(name: &str) -> (*mut FunctionObject, Value) {
+        make_test_function_value_with_closure(name, None)
+    }
+
+    fn make_test_function_value_with_closure(
+        name: &str,
+        closure: Option<Arc<ClosureEnv>>,
+    ) -> (*mut FunctionObject, Value) {
         let mut code = CodeObject::new(name, "<test>");
         code.register_count = 8;
         let func = Box::new(FunctionObject::new(
             Arc::new(code),
             Arc::from(name),
             None,
-            None,
+            closure,
         ));
         let ptr = Box::into_raw(func);
         (ptr, Value::object_ptr(ptr as *const ()))
@@ -3051,12 +3058,11 @@ mod tests {
 
         delete_attribute_value(&mut vm, module_value, &intern("token"))
             .expect("delattr should remove standalone module attributes");
+        let err = get_attribute_value(&mut vm, module_value, &intern("token"))
+            .expect_err("deleted module attribute should be missing");
         assert!(matches!(
-            get_attribute_value(&mut vm, module_value, &intern("token")),
-            Err(RuntimeError {
-                kind: RuntimeErrorKind::AttributeError { .. },
-                ..
-            })
+            err.kind(),
+            RuntimeErrorKind::AttributeError { .. }
         ));
 
         unsafe {
@@ -3806,12 +3812,11 @@ mod tests {
 
         delete_attribute_value(&mut vm, instance, &intern("alpha"))
             .expect("delattr should remove attributes from materialized __dict__");
+        let err = get_attribute_value(&mut vm, instance, &intern("alpha"))
+            .expect_err("deleted instance attribute should be missing");
         assert!(matches!(
-            get_attribute_value(&mut vm, instance, &intern("alpha")),
-            Err(RuntimeError {
-                kind: RuntimeErrorKind::AttributeError { .. },
-                ..
-            })
+            err.kind(),
+            RuntimeErrorKind::AttributeError { .. }
         ));
 
         unsafe {
@@ -3854,12 +3859,11 @@ mod tests {
 
         delete_attribute_value(&mut vm, instance, &intern("__dict__"))
             .expect("deleting __dict__ should reset the instance dictionary");
+        let err = get_attribute_value(&mut vm, instance, &intern("external"))
+            .expect_err("reset instance dictionary should drop external attribute");
         assert!(matches!(
-            get_attribute_value(&mut vm, instance, &intern("external")),
-            Err(RuntimeError {
-                kind: RuntimeErrorKind::AttributeError { .. },
-                ..
-            })
+            err.kind(),
+            RuntimeErrorKind::AttributeError { .. }
         ));
         let reset_dict = get_attribute_value(&mut vm, instance, &intern("__dict__"))
             .expect("__dict__ should rematerialize after deletion");
@@ -4545,12 +4549,11 @@ mod tests {
 
     #[test]
     fn test_get_attr_reads_closure_and_cell_contents() {
-        let (func_ptr, func_value) = make_test_function_value("inner");
-        let mut vm = vm_with_names(&["__closure__", "cell_contents"]);
         let closure = Arc::new(ClosureEnv::new(vec![Arc::new(Cell::new(
             Value::int(41).unwrap(),
         ))]));
-        vm.register_function_closure(func_ptr as *const (), closure);
+        let (func_ptr, func_value) = make_test_function_value_with_closure("inner", Some(closure));
+        let mut vm = vm_with_names(&["__closure__", "cell_contents"]);
         vm.current_frame_mut().set_reg(1, func_value);
 
         let closure_inst = Instruction::op_dss(
@@ -5058,12 +5061,11 @@ mod tests {
         vm.current_frame_mut().ip = 3;
         assert!(matches!(del_attr(&mut vm, del_inst), ControlFlow::Continue));
         assert_eq!(vm.current_frame().ip, 4);
+        let err = get_attribute_value(&mut vm, class_value, &intern("extended"))
+            .expect_err("deleted class attribute should be missing");
         assert!(matches!(
-            get_attribute_value(&mut vm, class_value, &intern("extended")),
-            Err(RuntimeError {
-                kind: RuntimeErrorKind::AttributeError { .. },
-                ..
-            })
+            err.kind(),
+            RuntimeErrorKind::AttributeError { .. }
         ));
 
         unsafe { drop_class(class_ptr) };

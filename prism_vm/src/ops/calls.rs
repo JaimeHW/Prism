@@ -443,12 +443,16 @@ fn current_function_globals_ptr(vm: &VirtualMachine) -> *const () {
         .unwrap_or(std::ptr::null())
 }
 
-fn new_function_object(vm: &VirtualMachine, code: Arc<CodeObject>) -> FunctionObject {
+fn new_function_object(
+    vm: &VirtualMachine,
+    code: Arc<CodeObject>,
+    closure: Option<Arc<ClosureEnv>>,
+) -> FunctionObject {
     let function_name = Arc::clone(&code.name);
     let qualname_value = Value::string(intern(code.qualname.as_ref()));
     let module_name_value = Value::string(current_function_module_name(vm));
 
-    let mut func = FunctionObject::new(code, function_name, None, None);
+    let mut func = FunctionObject::new(code, function_name, None, closure);
     unsafe {
         func.set_globals_ptr(current_function_globals_ptr(vm));
     }
@@ -1218,7 +1222,7 @@ fn invoke_user_function_with_implicit_self(
 ) -> Result<Value, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
+    let closure = materialize_function_invocation_closure(func, &code)?;
     let module = resolve_function_module(vm, func);
 
     let mut bound = {
@@ -1453,7 +1457,7 @@ pub(crate) fn call_user_function_from_values(
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
     let module_ptr = function_module_ptr(vm, func);
-    let closure = match materialize_function_invocation_closure(vm, func_ptr, &code) {
+    let closure = match materialize_function_invocation_closure(func, &code) {
         Ok(closure) => closure,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -1570,7 +1574,7 @@ fn invoke_user_function_direct_impl(
 ) -> Result<InvokeCallableOutcome, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
+    let closure = materialize_function_invocation_closure(func, &code)?;
     let module = resolve_function_module(vm, func);
 
     let mut bound = ArgumentBinder::bind(func, args.iter().copied(), std::iter::empty())
@@ -1669,7 +1673,7 @@ fn invoke_user_function_direct_with_keywords(
 ) -> Result<Value, RuntimeError> {
     let func = unsafe { &*(func_ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = materialize_function_invocation_closure(vm, func_ptr, &code)?;
+    let closure = materialize_function_invocation_closure(func, &code)?;
     let module = resolve_function_module(vm, func);
 
     let mut bound = ArgumentBinder::bind(func, args.iter().copied(), keywords.iter().copied())
@@ -2407,7 +2411,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             TypeId::FUNCTION | TypeId::CLOSURE => {
                 let func = unsafe { &*(ptr as *const FunctionObject) };
                 let code = &func.code;
-                let closure = match materialize_function_invocation_closure(vm, ptr, code) {
+                let closure = match materialize_function_invocation_closure(func, code) {
                     Ok(closure) => closure,
                     Err(err) => return ControlFlow::Error(err),
                 };
@@ -2765,7 +2769,7 @@ fn call_kw_user_function(
 ) -> ControlFlow {
     let func = unsafe { &*(ptr as *const FunctionObject) };
     let code = Arc::clone(&func.code);
-    let closure = match materialize_function_invocation_closure(vm, ptr, &code) {
+    let closure = match materialize_function_invocation_closure(func, &code) {
         Ok(closure) => closure,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -3375,7 +3379,7 @@ pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     };
 
     // Create FunctionObject
-    let func = new_function_object(vm, code_clone);
+    let func = new_function_object(vm, code_clone, None);
 
     let func_value = alloc_value_in_current_heap_or_box(func);
     vm.current_frame_mut().set_reg(dst, func_value);
@@ -3405,29 +3409,20 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     };
 
     // Create FunctionObject
-    let func = new_function_object(vm, code_clone);
+    let func = new_function_object(vm, code_clone, captured_closure);
 
     let func_value = alloc_value_in_current_heap_or_box(func);
-    let Some(func_ptr) = func_value.as_object_ptr() else {
-        return ControlFlow::Error(RuntimeError::internal(
-            "function allocation produced a non-object value",
-        ));
-    };
-
-    if let Some(captured_closure) = captured_closure {
-        vm.register_function_closure(func_ptr, captured_closure);
-    }
     vm.current_frame_mut().set_reg(dst, func_value);
     ControlFlow::Continue
 }
 
 #[inline]
 fn materialize_function_invocation_closure(
-    vm: &VirtualMachine,
-    func_ptr: *const (),
+    func: &FunctionObject,
     code: &Arc<CodeObject>,
 ) -> Result<Option<Arc<ClosureEnv>>, RuntimeError> {
-    materialize_invocation_closure(code, vm.lookup_function_closure(func_ptr))
+    let captured_freevars = func.closure().map(Arc::clone);
+    materialize_invocation_closure(code, captured_freevars)
 }
 
 #[inline]

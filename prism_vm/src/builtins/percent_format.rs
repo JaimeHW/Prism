@@ -895,16 +895,10 @@ mod tests {
     fn render_bytes(format: &[u8], arguments: Value) -> Vec<u8> {
         let template = BytesObject::from_slice(format);
         let value = percent_format_bytes(&template, arguments).expect("format should succeed");
-        let rendered = value_as_bytes_ref(value)
+        value_as_bytes_ref(value)
             .expect("result should be bytes")
             .as_bytes()
-            .to_vec();
-        unsafe {
-            drop(Box::from_raw(
-                value.as_object_ptr().expect("bytes result should be boxed") as *mut BytesObject,
-            ));
-        }
-        rendered
+            .to_vec()
     }
 
     fn boxed_value<T>(object: T) -> (Value, *mut T) {
@@ -1023,9 +1017,6 @@ mod tests {
         );
 
         unsafe {
-            drop(Box::from_raw(
-                result.as_object_ptr().expect("result should be boxed") as *mut BytesObject,
-            ));
             drop_boxed(tuple_ptr);
             drop_boxed(argument_ptr);
         }

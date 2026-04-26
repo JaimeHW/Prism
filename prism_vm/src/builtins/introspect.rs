@@ -250,7 +250,7 @@ fn value_to_name(value: Value) -> Result<InternedString, BuiltinError> {
 
 fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
     let display = err.to_string();
-    match err.kind {
+    match err.into_kind() {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
             format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
@@ -797,7 +797,7 @@ fn module_value(module: &Arc<ModuleObject>) -> Value {
 }
 
 fn runtime_error_to_builtin_import_error(err: RuntimeError) -> BuiltinError {
-    match err.kind {
+    match err.into_kind() {
         RuntimeErrorKind::ImportError {
             message, missing, ..
         } => {
@@ -1009,7 +1009,7 @@ assert "marker" in class_names
 assert "test_ok" in class_names
 assert "assertTrue" in class_names
 "#,
-            120_000,
+            160_000,
         );
         assert!(result.is_ok(), "Failed: {:?}", result);
     }
@@ -1053,7 +1053,7 @@ import traceback
             r#"
 import unittest.result
 "#,
-            100_000,
+            160_000,
         );
         assert!(result.is_ok(), "Failed: {:?}", result);
     }

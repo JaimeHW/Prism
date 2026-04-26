@@ -1501,8 +1501,8 @@ mod tests {
             Register::new(2),
         );
         match store_subscr(&mut vm, inst) {
-            ControlFlow::Error(error) => match error.kind {
-                crate::error::RuntimeErrorKind::ValueError { ref message } => {
+            ControlFlow::Error(error) => match error.kind() {
+                crate::error::RuntimeErrorKind::ValueError { message } => {
                     assert!(message.contains("extended slice"));
                 }
                 other => panic!("expected ValueError, got {:?}", other),
@@ -1574,8 +1574,8 @@ mod tests {
             Register::new(2),
         );
         match store_subscr(&mut vm, inst) {
-            ControlFlow::Error(error) => match error.kind {
-                crate::error::RuntimeErrorKind::ValueError { ref message } => {
+            ControlFlow::Error(error) => match error.kind() {
+                crate::error::RuntimeErrorKind::ValueError { message } => {
                     assert!(message.contains("extended slice"));
                 }
                 other => panic!("expected ValueError, got {:?}", other),

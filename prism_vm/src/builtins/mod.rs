@@ -119,7 +119,8 @@ impl std::error::Error for BuiltinError {}
 #[inline]
 pub(crate) fn runtime_error_to_builtin_error(err: RuntimeError) -> BuiltinError {
     let is_attribute_error = err.is_attribute_error();
-    match err.kind {
+    let kind = err.kind().clone();
+    match kind {
         RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
         RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
             format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
@@ -813,25 +814,22 @@ mod tests {
     fn test_builtin_function_as_object_ptr() {
         let registry = BuiltinRegistry::with_standard_builtins();
 
-        // Get the range function value
-        let range_val = registry.get("range").expect("range should be registered");
+        let abs_val = registry.get("abs").expect("abs should be registered");
 
-        // Verify it's an object_ptr
         assert!(
-            range_val.as_object_ptr().is_some(),
-            "range should be stored as object_ptr, got value: {:?}",
-            range_val
+            abs_val.as_object_ptr().is_some(),
+            "abs should be stored as object_ptr, got value: {:?}",
+            abs_val
         );
 
-        // Verify the type is BUILTIN_FUNCTION
-        let ptr = range_val.as_object_ptr().unwrap();
+        let ptr = abs_val.as_object_ptr().unwrap();
         let header_ptr = ptr as *const prism_runtime::object::ObjectHeader;
         let type_id = unsafe { (*header_ptr).type_id };
 
         assert_eq!(
             type_id,
             prism_runtime::object::type_obj::TypeId::BUILTIN_FUNCTION,
-            "range should have TypeId::BUILTIN_FUNCTION, got {:?}",
+            "abs should have TypeId::BUILTIN_FUNCTION, got {:?}",
             type_id
         );
     }

@@ -38,10 +38,7 @@ use prism_runtime::object::class::ClassDict;
 use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
 use prism_runtime::types::dict::DictObject;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, Weak};
-
-static SHARED_FUNCTION_CLOSURES: LazyLock<RwLock<HashMap<usize, Weak<crate::frame::ClosureEnv>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(crate) type SharedManagedHeap = Arc<Mutex<ManagedHeap>>;
 
@@ -212,13 +209,6 @@ pub struct VirtualMachine {
     jit: Option<JitContext>,
     /// Temporary storage for JIT return value when root frame executes via JIT.
     jit_return_value: Option<Value>,
-    /// VM-owned captured closure environments keyed by function object pointer.
-    ///
-    /// Ordinary same-VM function calls hit this table directly. A weak process-wide
-    /// index mirrors these entries so Python threads, which execute in a fresh VM,
-    /// can recover the exact same closure cells without copying or widening the
-    /// hot-path function object layout.
-    function_closures: HashMap<*const (), Arc<crate::frame::ClosureEnv>>,
     /// Code objects that have passed bytecode validation for this VM.
     ///
     /// The cache holds an `Arc` to each validated object so pointer identities
@@ -1374,7 +1364,6 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
-            function_closures: HashMap::new(),
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
@@ -1434,7 +1423,6 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
-            function_closures: HashMap::new(),
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
@@ -1480,7 +1468,6 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
-            function_closures: HashMap::new(),
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
@@ -1522,7 +1509,6 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit,
             jit_return_value: None,
-            function_closures: HashMap::new(),
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
@@ -1559,7 +1545,6 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
-            function_closures: HashMap::new(),
             validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
@@ -1818,15 +1803,15 @@ impl VirtualMachine {
     }
 
     #[inline]
-    fn current_traceback_entry(&self) -> TracebackEntry {
-        let frame = &self.frames[self.current_frame_idx];
+    fn current_traceback_entry(&self) -> Option<TracebackEntry> {
+        let frame = self.frames.get(self.current_frame_idx)?;
         let pc = frame.ip.saturating_sub(1);
         let line = Self::traceback_line_for_pc(&frame.code, pc);
-        TracebackEntry {
+        Some(TracebackEntry {
             func_name: Arc::clone(&frame.code.name),
             filename: Arc::clone(&frame.code.filename),
             line,
-        }
+        })
     }
 
     fn traceback_line_for_pc(code: &CodeObject, pc: u32) -> u32 {
@@ -1855,7 +1840,9 @@ impl VirtualMachine {
 
     #[inline]
     fn prepend_current_traceback_entry(&self, traceback: &mut Vec<TracebackEntry>) {
-        Self::prepend_traceback_entry(traceback, self.current_traceback_entry());
+        if let Some(entry) = self.current_traceback_entry() {
+            Self::prepend_traceback_entry(traceback, entry);
+        }
     }
 
     #[inline]
@@ -2980,7 +2967,6 @@ impl VirtualMachine {
     pub fn reset(&mut self) {
         self.recycle_all_frames();
         self.set_current_frame_idx(0);
-        self.function_closures.clear();
         self.globals = GlobalScope::new();
         self.inline_caches = InlineCacheStore::default();
         self.exc_state = ExceptionState::default();
@@ -2995,45 +2981,12 @@ impl VirtualMachine {
     pub fn clear_frames(&mut self) {
         self.recycle_all_frames();
         self.set_current_frame_idx(0);
-        self.function_closures.clear();
         self.handler_stack.clear();
         self.active_exception = None;
         self.active_exception_type_id = None;
         self.exc_info_stack.clear();
         self.active_except_handlers.clear();
         self.exc_state = ExceptionState::Normal;
-    }
-
-    /// Register captured closure environment for a function object.
-    #[inline]
-    pub fn register_function_closure(
-        &mut self,
-        func_ptr: *const (),
-        closure: Arc<crate::frame::ClosureEnv>,
-    ) {
-        let weak_closure = Arc::downgrade(&closure);
-        self.function_closures.insert(func_ptr, closure);
-        SHARED_FUNCTION_CLOSURES
-            .write()
-            .expect("shared function closure registry lock poisoned")
-            .insert(func_ptr as usize, weak_closure);
-    }
-
-    /// Look up captured closure environment for a function object.
-    #[inline]
-    pub fn lookup_function_closure(
-        &self,
-        func_ptr: *const (),
-    ) -> Option<Arc<crate::frame::ClosureEnv>> {
-        if let Some(closure) = self.function_closures.get(&func_ptr) {
-            return Some(Arc::clone(closure));
-        }
-
-        SHARED_FUNCTION_CLOSURES
-            .read()
-            .expect("shared function closure registry lock poisoned")
-            .get(&(func_ptr as usize))
-            .and_then(Weak::upgrade)
     }
 
     // =========================================================================
@@ -3510,9 +3463,8 @@ mod tests {
     use crate::exception::HandlerFrame;
     use crate::import::FrozenModuleSource;
     use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Register};
-    use prism_compiler::{Compiler, OptimizationLevel};
+    use prism_compiler::OptimizationLevel;
     use prism_core::intern::intern;
-    use prism_parser::parse;
     use prism_runtime::object::class::PyClassObject;
     use prism_runtime::object::type_obj::TypeId;
     use std::path::PathBuf;
@@ -3585,13 +3537,26 @@ mod tests {
         name: &str,
         exception_table: Vec<ExceptionEntry>,
     ) -> Arc<CodeObject> {
+        let instruction_count = exception_table
+            .iter()
+            .fold(1_u32, |count, entry| {
+                let finally_limit = if entry.finally_pc == u32::MAX {
+                    0
+                } else {
+                    entry.finally_pc.saturating_add(1)
+                };
+                count
+                    .max(entry.end_pc)
+                    .max(entry.handler_pc.saturating_add(1))
+                    .max(finally_limit)
+            }) as usize;
         Arc::new(CodeObject {
             name: Arc::from(name),
             register_count: 1,
             arg_count: 0,
             posonlyarg_count: 0,
             kwonlyarg_count: 0,
-            instructions: Box::new([]),
+            instructions: vec![Instruction::op(Opcode::Nop); instruction_count].into_boxed_slice(),
             constants: Box::new([]),
             names: Box::new([]),
             locals: Box::new([]),
@@ -3619,11 +3584,8 @@ mod tests {
     }
 
     fn compile_module(source: &str, filename: &str) -> Arc<CodeObject> {
-        let parsed = parse(source).expect("source should parse");
-        Arc::new(
-            Compiler::compile_module_with_optimization(&parsed, filename, OptimizationLevel::Basic)
-                .expect("source should compile"),
-        )
+        compile_source_code(source, filename, OptimizationLevel::Basic)
+            .expect("source should compile")
     }
 
     fn compile_source_module_for_test(source: &str, filename: &str) -> Arc<CodeObject> {
@@ -3650,7 +3612,7 @@ mod tests {
             .execute_runtime(Arc::new(code))
             .expect_err("invalid bytecode should be rejected before dispatch");
 
-        match err.kind {
+        match err.kind() {
             RuntimeErrorKind::InternalError { message } => {
                 assert!(message.contains("invalid bytecode in bad_bytecode (<test>)"));
                 assert!(message.contains("constant index 0 out of bounds"));
@@ -4142,6 +4104,29 @@ mod tests {
     }
 
     #[test]
+    fn test_function_closure_cells_are_owned_by_function_objects_across_vm_instances() {
+        let source = concat!(
+            "def outer():\n",
+            "    x = 41\n",
+            "    def inner():\n",
+            "        return x\n",
+            "    return inner\n",
+            "fn = outer()\n",
+            "assert fn() == 41\n",
+            "assert fn.__closure__[0].cell_contents == 41\n",
+        );
+
+        for _ in 0..8 {
+            let mut vm = VirtualMachine::new();
+            vm.execute_in_module(
+                compile_module(source, "<closure-owner>"),
+                Arc::new(ModuleObject::new("__main__")),
+            )
+            .expect("function-owned closure cells should not depend on VM pointer registries");
+        }
+    }
+
+    #[test]
     fn test_prepared_user_function_calls_tier_up_and_execute_jit() {
         let mut vm = VirtualMachine::with_jit_config(JitConfig::for_testing());
         let module = Arc::new(ModuleObject::new("__main__"));
@@ -4552,19 +4537,25 @@ mod tests {
         let err = vm
             .import_from_with_context("pkg", "child", None)
             .expect_err("nested import failure should propagate");
-        match err.kind {
+        match err.kind() {
             RuntimeErrorKind::ImportError {
                 name,
                 missing,
                 module,
                 ..
             } => {
-                assert!(missing);
+                assert!(*missing);
                 assert_eq!(name.as_deref(), Some("missing_dependency"));
                 assert_eq!(module.as_ref(), "missing_dependency");
             }
             other => panic!("expected missing nested import error, got {other:?}"),
         }
+        assert!(
+            err.traceback.iter().any(|entry| {
+                entry.filename.as_ref().ends_with("child.py") && entry.line == 1
+            }),
+            "nested import failure should retain the child module traceback"
+        );
     }
 
     #[test]
@@ -4583,13 +4574,13 @@ mod tests {
             crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16,
         );
 
-        match err.kind {
+        match err.kind() {
             crate::error::RuntimeErrorKind::Exception { type_id, message } => {
                 assert_eq!(
-                    type_id,
+                    *type_id,
                     crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16
                 );
-                assert_eq!(&*message, "real uncaught message");
+                assert_eq!(message.as_ref(), "real uncaught message");
             }
             other => panic!("expected exception runtime error, got {other:?}"),
         }
@@ -4602,13 +4593,13 @@ mod tests {
             crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16,
         );
 
-        match err.kind {
+        match err.kind() {
             crate::error::RuntimeErrorKind::Exception { type_id, message } => {
                 assert_eq!(
-                    type_id,
+                    *type_id,
                     crate::stdlib::exceptions::ExceptionTypeId::TypeError.as_u8() as u16
                 );
-                assert_eq!(&*message, "Uncaught exception (type_id=52)");
+                assert_eq!(message.as_ref(), "Uncaught exception (type_id=52)");
             }
             other => panic!("expected exception runtime error, got {other:?}"),
         }

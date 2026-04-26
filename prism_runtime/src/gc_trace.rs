@@ -218,7 +218,7 @@ unsafe impl Trace for ClosureEnv {
     fn trace(&self, tracer: &mut dyn Tracer) {
         // Trace all captured values in this scope
         for i in 0..self.len() {
-            if let Some(value) = self.get(i) {
+            if let Some(value) = self.try_get(i) {
                 tracer.trace_value(value);
             }
         }
@@ -231,7 +231,12 @@ unsafe impl Trace for ClosureEnv {
     }
 
     fn size_of(&self) -> usize {
-        std::mem::size_of::<Self>() + self.len() * std::mem::size_of::<prism_core::Value>()
+        let overflow_size = if self.is_inline() {
+            0
+        } else {
+            self.len() * std::mem::size_of::<std::sync::Arc<crate::types::Cell>>()
+        };
+        std::mem::size_of::<Self>() + overflow_size
     }
 }
 
@@ -596,7 +601,7 @@ mod tests {
     #[test]
     fn test_closure_env_trace() {
         let mut tracer = CountingTracer::new();
-        let env = ClosureEnv::new(
+        let env = ClosureEnv::from_values(
             vec![Value::int(1).unwrap(), Value::int(2).unwrap()].into_boxed_slice(),
             None,
         );
@@ -612,12 +617,12 @@ mod tests {
 
         let mut tracer = CountingTracer::new();
 
-        let parent = Arc::new(ClosureEnv::new(
+        let parent = Arc::new(ClosureEnv::from_values(
             vec![Value::int(10).unwrap()].into_boxed_slice(),
             None,
         ));
 
-        let child = ClosureEnv::new(
+        let child = ClosureEnv::from_values(
             vec![Value::int(1).unwrap(), Value::int(2).unwrap()].into_boxed_slice(),
             Some(parent),
         );
@@ -626,6 +631,19 @@ mod tests {
 
         // Should trace 2 child values + 1 parent value = 3
         assert_eq!(tracer.value_count, 3);
+    }
+
+    #[test]
+    fn test_closure_env_size_accounts_for_overflow_storage() {
+        let inline = ClosureEnv::with_unbound_cells(ClosureEnv::INLINE_LIMIT);
+        let overflow = ClosureEnv::with_unbound_cells(ClosureEnv::INLINE_LIMIT + 1);
+
+        assert_eq!(inline.size_of(), std::mem::size_of::<ClosureEnv>());
+        assert_eq!(
+            overflow.size_of(),
+            std::mem::size_of::<ClosureEnv>()
+                + overflow.len() * std::mem::size_of::<std::sync::Arc<crate::types::Cell>>()
+        );
     }
 
     #[test]
