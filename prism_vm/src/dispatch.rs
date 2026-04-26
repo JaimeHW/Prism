@@ -176,6 +176,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::DeleteGlobal as usize] = load_store::delete_global;
     table[Opcode::Move as usize] = load_store::move_reg;
     table[Opcode::DeleteClosure as usize] = load_store::delete_closure;
+    table[Opcode::SetupAnnotations as usize] = load_store::setup_annotations;
 
     // Integer Arithmetic (0x20-0x2F)
     table[Opcode::AddInt as usize] = arithmetic::add_int;
@@ -270,6 +271,8 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::UnpackSequence as usize] = containers::unpack_sequence;
     table[Opcode::UnpackEx as usize] = containers::unpack_ex;
     table[Opcode::BuildSlice as usize] = containers::build_slice;
+    table[Opcode::BuildListUnpack as usize] = unpack::build_list_unpack;
+    table[Opcode::BuildSetUnpack as usize] = unpack::build_set_unpack;
 
     // Import (0x90-0x92)
     table[Opcode::ImportName as usize] = containers::import_name;

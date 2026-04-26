@@ -6,7 +6,7 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::objects::{extract_type_id, get_attribute_value};
+use crate::ops::objects::{alloc_heap_value, extract_type_id, get_attribute_value};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_code::{CodeFlags, Instruction};
 use prism_core::Value;
@@ -51,6 +51,15 @@ pub fn load_false(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
+/// SetupAnnotations: ensure the active module/class namespace has __annotations__.
+#[inline]
+pub fn setup_annotations(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
+    match ensure_annotations_namespace(vm) {
+        Ok(()) => ControlFlow::Continue,
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
 // =============================================================================
 // Locals
 // =============================================================================
@@ -88,9 +97,13 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     }
 
-    let frame = vm.current_frame_mut();
+    let frame = vm.current_frame();
+    if !frame.reg_is_written(slot) {
+        return ControlFlow::Error(RuntimeError::unbound_local(mapped_local_name(frame, slot)));
+    }
+
     let value = frame.get_reg(slot);
-    frame.set_reg(dst, value);
+    vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
 }
 
@@ -129,6 +142,7 @@ pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return match delete_mapped_local(vm, mapping, &name) {
             Ok(true) => {
                 vm.current_frame_mut().clear_reg(slot);
+                crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
                 ControlFlow::Continue
             }
             Ok(false) => ControlFlow::Error(RuntimeError::name_error(name)),
@@ -138,6 +152,7 @@ pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     let frame = vm.current_frame_mut();
     frame.clear_reg(slot);
+    crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
     ControlFlow::Continue
 }
 
@@ -149,6 +164,47 @@ fn mapped_local_name(frame: &crate::frame::Frame, slot: u8) -> Arc<str> {
 #[inline]
 fn mapped_local_key(name: &Arc<str>) -> Value {
     Value::string(intern(name.as_ref()))
+}
+
+fn ensure_annotations_namespace(vm: &mut VirtualMachine) -> Result<(), RuntimeError> {
+    let name = Arc::<str>::from("__annotations__");
+
+    if let Some(mapping) = vm.current_frame().locals_mapping() {
+        if lookup_mapped_local(vm, mapping, &name)?.is_none() {
+            let value = alloc_heap_value(vm, DictObject::new(), "__annotations__ dict")?;
+            store_mapped_local(vm, mapping, &name, value)?;
+        }
+        return Ok(());
+    }
+
+    let class_local_slot = {
+        let frame = vm.current_frame();
+        if frame.code.flags.contains(CodeFlags::CLASS) {
+            frame
+                .code
+                .locals
+                .iter()
+                .position(|local| local.as_ref() == "__annotations__")
+                .map(|slot| slot as u8)
+        } else {
+            None
+        }
+    };
+
+    if let Some(slot) = class_local_slot {
+        if !vm.current_frame().reg_is_written(slot) {
+            let value = alloc_heap_value(vm, DictObject::new(), "__annotations__ dict")?;
+            vm.current_frame_mut().set_reg(slot, value);
+        }
+        return Ok(());
+    }
+
+    if vm.module_scope_value(&name).is_none() {
+        let value = alloc_heap_value(vm, DictObject::new(), "__annotations__ dict")?;
+        vm.set_module_scope_value(name, value);
+    }
+
+    Ok(())
 }
 
 fn load_mapped_local(
@@ -352,7 +408,10 @@ pub fn delete_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
     let name = frame.get_name(inst.imm16()).clone();
 
     match vm.delete_module_scope_value(&name) {
-        Some(_) => ControlFlow::Continue,
+        Some(_) => {
+            crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
+            ControlFlow::Continue
+        }
         None => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
     }
 }
@@ -433,6 +492,7 @@ pub fn delete_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow
     match &frame.closure {
         Some(env) => {
             env.get_cell(idx).clear();
+            crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
             ControlFlow::Continue
         }
         None => ControlFlow::Error(crate::error::RuntimeError::internal(
@@ -664,6 +724,24 @@ mod tests {
         let inst = Instruction::op_di(Opcode::StoreGlobal, Register::new(4), 1);
         assert!(matches!(store_global(&mut vm, inst), ControlFlow::Continue));
         assert_eq!(vm.globals.get("answer").and_then(|v| v.as_int()), Some(42));
+    }
+
+    #[test]
+    fn test_load_local_raises_unbound_local_for_unwritten_slot() {
+        let mut code = CodeObject::new("test_load_unbound_local", "<test>");
+        code.locals = vec!["value".into()].into_boxed_slice();
+
+        let mut vm = vm_with_frame(code);
+        let inst = Instruction::op_di(Opcode::LoadLocal, Register::new(1), 0);
+
+        match load_local(&mut vm, inst) {
+            ControlFlow::Error(err) => {
+                let message = err.to_string();
+                assert!(message.contains("UnboundLocalError"));
+                assert!(message.contains("'value'"));
+            }
+            other => panic!("expected unbound local error, got {other:?}"),
+        }
     }
 
     #[test]

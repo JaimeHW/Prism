@@ -303,6 +303,8 @@ pub enum Opcode {
     DeleteClosure = 0x1D,
     /// Load builtin directly from the builtin registry: dst = builtins[names[imm16]].
     LoadBuiltin = 0x1E,
+    /// Ensure the current module/class namespace has a __annotations__ dict.
+    SetupAnnotations = 0x1F,
 
     // =========================================================================
     // Integer Arithmetic (0x20-0x2F)
@@ -507,6 +509,14 @@ pub enum Opcode {
     UnpackEx = 0x89,
     /// Build slice: dst = slice(src1, src2).
     BuildSlice = 0x8A,
+    /// Build list from values and starred iterables.
+    /// dst = [src1_or_items..., ...] for count sources starting at src1.
+    /// Extension byte has unpack flags.
+    BuildListUnpack = 0x8B,
+    /// Build set from values and starred iterables.
+    /// dst = {src1_or_items..., ...} for count sources starting at src1.
+    /// Extension byte has unpack flags.
+    BuildSetUnpack = 0x8C,
 
     // =========================================================================
     // Import (0x90-0x9F)
@@ -653,6 +663,7 @@ impl Opcode {
             0x1C => Some(Opcode::Move),
             0x1D => Some(Opcode::DeleteClosure),
             0x1E => Some(Opcode::LoadBuiltin),
+            0x1F => Some(Opcode::SetupAnnotations),
 
             0x20 => Some(Opcode::AddInt),
             0x21 => Some(Opcode::SubInt),
@@ -739,6 +750,8 @@ impl Opcode {
             0x88 => Some(Opcode::UnpackSequence),
             0x89 => Some(Opcode::UnpackEx),
             0x8A => Some(Opcode::BuildSlice),
+            0x8B => Some(Opcode::BuildListUnpack),
+            0x8C => Some(Opcode::BuildSetUnpack),
 
             0x90 => Some(Opcode::ImportName),
             0x91 => Some(Opcode::ImportFrom),
@@ -782,7 +795,7 @@ impl Opcode {
 
         match self {
             // No operands
-            Nop | ReturnNone | Reraise | EndFinally => NoOp,
+            Nop | ReturnNone | Reraise | EndFinally | SetupAnnotations => NoOp,
 
             // Destination only
             LoadNone | LoadTrue | LoadFalse => Dst,
@@ -833,7 +846,7 @@ impl Opcode {
 
             // Container ops
             BuildList | BuildTuple | BuildSet | BuildDict | BuildString | UnpackSequence
-            | UnpackEx => DstSrcSrc,
+            | UnpackEx | BuildListUnpack | BuildSetUnpack => DstSrcSrc,
             ListAppend | SetAdd | DictSet => DstSrcSrc,
 
             // Import

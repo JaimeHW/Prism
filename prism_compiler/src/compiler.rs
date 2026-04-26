@@ -13,6 +13,7 @@ use crate::function_compiler::{VarLocation, VariableEmitter};
 use crate::scope::{ClosureAnalyzer, ScopeAnalyzer, ScopeKind, SymbolFlags, SymbolTable};
 
 use num_bigint::BigInt;
+use prism_core::Span;
 use prism_parser::ast::{
     AugOp, BinOp, BoolOp, CmpOp, ExceptHandler, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
 };
@@ -22,10 +23,118 @@ use std::sync::Arc;
 /// Stack-allocated loop context stack for typical loop nesting depths.
 /// Most code has ≤4 nested loops, so we avoid heap allocation in the common case.
 type LoopStack = SmallVec<[LoopContext; 4]>;
+/// Stack-allocated finally context stack for typical nesting depths.
+type FinallyStack = SmallVec<[FinallyContext; 4]>;
 /// BuildSlice step-extension marker byte 1 (`CallKwEx.dst = step register`).
 const SLICE_STEP_EXT_TAG_A: u8 = b'S';
 /// BuildSlice step-extension marker byte 2.
 const SLICE_STEP_EXT_TAG_B: u8 = b'L';
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceLiteralKind {
+    List,
+    Tuple,
+    Set,
+}
+
+fn stmt_kind_name(kind: &StmtKind) -> &'static str {
+    match kind {
+        StmtKind::Expr(_) => "Expr",
+        StmtKind::Assign { .. } => "Assign",
+        StmtKind::AugAssign { .. } => "AugAssign",
+        StmtKind::AnnAssign { .. } => "AnnAssign",
+        StmtKind::Return(_) => "Return",
+        StmtKind::Delete(_) => "Delete",
+        StmtKind::Pass => "Pass",
+        StmtKind::Break => "Break",
+        StmtKind::Continue => "Continue",
+        StmtKind::Raise { .. } => "Raise",
+        StmtKind::Assert { .. } => "Assert",
+        StmtKind::Global(_) => "Global",
+        StmtKind::Nonlocal(_) => "Nonlocal",
+        StmtKind::Import(_) => "Import",
+        StmtKind::ImportFrom { .. } => "ImportFrom",
+        StmtKind::If { .. } => "If",
+        StmtKind::For { .. } => "For",
+        StmtKind::AsyncFor { .. } => "AsyncFor",
+        StmtKind::While { .. } => "While",
+        StmtKind::With { .. } => "With",
+        StmtKind::AsyncWith { .. } => "AsyncWith",
+        StmtKind::Try { .. } => "Try",
+        StmtKind::TryStar { .. } => "TryStar",
+        StmtKind::Match { .. } => "Match",
+        StmtKind::FunctionDef { .. } => "FunctionDef",
+        StmtKind::AsyncFunctionDef { .. } => "AsyncFunctionDef",
+        StmtKind::ClassDef { .. } => "ClassDef",
+        StmtKind::TypeAlias { .. } => "TypeAlias",
+    }
+}
+
+fn expr_kind_name(kind: &ExprKind) -> &'static str {
+    match kind {
+        ExprKind::Int(_) => "Int",
+        ExprKind::BigInt(_) => "BigInt",
+        ExprKind::Float(_) => "Float",
+        ExprKind::Complex { .. } => "Complex",
+        ExprKind::String(_) => "String",
+        ExprKind::Bytes(_) => "Bytes",
+        ExprKind::Bool(_) => "Bool",
+        ExprKind::None => "None",
+        ExprKind::Ellipsis => "Ellipsis",
+        ExprKind::Name(_) => "Name",
+        ExprKind::NamedExpr { .. } => "NamedExpr",
+        ExprKind::List(_) => "List",
+        ExprKind::Tuple(_) => "Tuple",
+        ExprKind::Set(_) => "Set",
+        ExprKind::Dict { .. } => "Dict",
+        ExprKind::ListComp { .. } => "ListComp",
+        ExprKind::SetComp { .. } => "SetComp",
+        ExprKind::DictComp { .. } => "DictComp",
+        ExprKind::GeneratorExp { .. } => "GeneratorExp",
+        ExprKind::BinOp { .. } => "BinOp",
+        ExprKind::UnaryOp { .. } => "UnaryOp",
+        ExprKind::BoolOp { .. } => "BoolOp",
+        ExprKind::Compare { .. } => "Compare",
+        ExprKind::Attribute { .. } => "Attribute",
+        ExprKind::Subscript { .. } => "Subscript",
+        ExprKind::Slice { .. } => "Slice",
+        ExprKind::Starred(_) => "Starred",
+        ExprKind::Call { .. } => "Call",
+        ExprKind::Lambda { .. } => "Lambda",
+        ExprKind::IfExp { .. } => "IfExp",
+        ExprKind::Await(_) => "Await",
+        ExprKind::Yield(_) => "Yield",
+        ExprKind::YieldFrom(_) => "YieldFrom",
+        ExprKind::JoinedStr(_) => "JoinedStr",
+        ExprKind::FormattedValue { .. } => "FormattedValue",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceLineMap {
+    line_starts: Arc<[u32]>,
+}
+
+impl SourceLineMap {
+    fn new(source: &str) -> Self {
+        let mut line_starts =
+            Vec::with_capacity(source.bytes().filter(|byte| *byte == b'\n').count() + 1);
+        line_starts.push(0);
+        for (index, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                let next = index.saturating_add(1).min(u32::MAX as usize) as u32;
+                line_starts.push(next);
+            }
+        }
+        Self {
+            line_starts: line_starts.into_boxed_slice().into(),
+        }
+    }
+
+    fn line_for_offset(&self, offset: u32) -> u32 {
+        self.line_starts.partition_point(|start| *start <= offset) as u32
+    }
+}
 
 /// Compilation error.
 #[derive(Debug, Clone)]
@@ -97,6 +206,34 @@ struct LoopContext {
     break_label: Label,
     /// Label to jump to for `continue` (back to loop condition/iterator).
     continue_label: Label,
+    /// Number of active cleanup scopes at loop entry.
+    ///
+    /// `break` and `continue` targets stay inside any cleanup scopes that
+    /// already enclosed the loop, but must unwind cleanup scopes entered within
+    /// the loop body.
+    finally_depth: usize,
+}
+
+/// Deferred jump that must run a finally body before continuing.
+#[derive(Debug, Clone, Copy)]
+struct FinallyJumpContinuation {
+    /// Cleanup block label.
+    cleanup_label: Label,
+    /// Original jump target after cleanup.
+    target_label: Label,
+    /// Cleanup stack depth that should remain active for the jump target.
+    preserve_finally_depth: usize,
+}
+
+/// Context for routing control flow through an active finally block.
+#[derive(Debug)]
+struct FinallyContext {
+    /// Shared cleanup block for returns from the protected body.
+    return_label: Label,
+    /// Register that carries the pending return value into `return_label`.
+    return_value_reg: Register,
+    /// Break/continue continuations that need this finally body before jumping.
+    jump_continuations: SmallVec<[FinallyJumpContinuation; 4]>,
 }
 
 // =============================================================================
@@ -112,10 +249,14 @@ pub struct Compiler {
     /// Source filename.
     #[allow(dead_code)]
     filename: Arc<str>,
+    /// Optional source map for converting parser byte offsets to source lines.
+    line_map: Option<SourceLineMap>,
     /// Stack of active loop contexts for break/continue.
     /// Innermost loop is at the end (top) of the stack.
     /// Uses SmallVec to avoid heap allocation for typical nesting depths (≤4).
     loop_stack: LoopStack,
+    /// Stack of active finally contexts for non-exceptional control flow.
+    finally_stack: FinallyStack,
     /// Whether we are inside an async function.
     /// This is used to validate `await` expressions and `async for`/`async with` statements.
     in_async_context: bool,
@@ -150,7 +291,9 @@ impl Compiler {
             builder: FunctionBuilder::new("<module>"),
             symbol_table: SymbolTable::new("<module>"),
             filename,
+            line_map: None,
             loop_stack: LoopStack::new(),
+            finally_stack: FinallyStack::new(),
             in_async_context: false,
             in_function_context: false,
             optimize,
@@ -158,6 +301,17 @@ impl Compiler {
             scope_path: Vec::new(),
             scope_child_offsets: vec![0],
         }
+    }
+
+    /// Create a new compiler with source-backed line mapping.
+    pub fn new_with_source(
+        filename: impl Into<Arc<str>>,
+        source: &str,
+        optimize: OptimizationLevel,
+    ) -> Self {
+        let mut compiler = Self::new_with_optimization(filename, optimize);
+        compiler.line_map = Some(SourceLineMap::new(source));
+        compiler
     }
 
     /// Compile a module to bytecode.
@@ -172,6 +326,34 @@ impl Compiler {
         optimize: OptimizationLevel,
         module_namespace_mode: ModuleNamespaceMode,
     ) -> CompileResult<CodeObject> {
+        Self::compile_module_with_line_map(module, filename, optimize, module_namespace_mode, None)
+    }
+
+    /// Compile a source-backed module to bytecode with explicit namespace
+    /// lowering semantics and precise parser-offset to source-line mapping.
+    pub fn compile_module_with_source_and_namespace_mode(
+        module: &Module,
+        source: &str,
+        filename: &str,
+        optimize: OptimizationLevel,
+        module_namespace_mode: ModuleNamespaceMode,
+    ) -> CompileResult<CodeObject> {
+        Self::compile_module_with_line_map(
+            module,
+            filename,
+            optimize,
+            module_namespace_mode,
+            Some(SourceLineMap::new(source)),
+        )
+    }
+
+    fn compile_module_with_line_map(
+        module: &Module,
+        filename: &str,
+        optimize: OptimizationLevel,
+        module_namespace_mode: ModuleNamespaceMode,
+        line_map: Option<SourceLineMap>,
+    ) -> CompileResult<CodeObject> {
         // Phase 1: Scope analysis
         let mut symbol_table = ScopeAnalyzer::new().analyze(module, "<module>");
         ClosureAnalyzer::new().analyze(&mut symbol_table.root);
@@ -181,7 +363,9 @@ impl Compiler {
             builder: FunctionBuilder::new("<module>"),
             symbol_table,
             filename: filename.into(),
+            line_map,
             loop_stack: LoopStack::new(),
+            finally_stack: FinallyStack::new(),
             in_async_context: false,
             in_function_context: false,
             optimize,
@@ -192,6 +376,9 @@ impl Compiler {
 
         compiler.builder.set_filename(filename);
         compiler.builder.add_flags(CodeFlags::MODULE);
+        if Self::body_needs_runtime_annotations(&module.body) {
+            compiler.builder.emit_setup_annotations();
+        }
 
         for (index, stmt) in module.body.iter().enumerate() {
             if compiler.should_strip_docstring_stmt(index, stmt) {
@@ -230,6 +417,137 @@ impl Compiler {
     #[inline]
     fn should_strip_docstring_stmt(&self, index: usize, stmt: &Stmt) -> bool {
         self.optimize >= OptimizationLevel::Full && index == 0 && Self::is_docstring_stmt(stmt)
+    }
+
+    fn body_needs_runtime_annotations(body: &[Stmt]) -> bool {
+        body.iter().any(Self::stmt_needs_runtime_annotations)
+    }
+
+    fn stmt_needs_runtime_annotations(stmt: &Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::AnnAssign { target, simple, .. } => {
+                *simple && matches!(&target.kind, ExprKind::Name(_))
+            }
+            StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                Self::body_needs_runtime_annotations(body)
+                    || Self::body_needs_runtime_annotations(orelse)
+            }
+            StmtKind::For { body, orelse, .. } | StmtKind::AsyncFor { body, orelse, .. } => {
+                Self::body_needs_runtime_annotations(body)
+                    || Self::body_needs_runtime_annotations(orelse)
+            }
+            StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+                Self::body_needs_runtime_annotations(body)
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            }
+            | StmtKind::TryStar {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                Self::body_needs_runtime_annotations(body)
+                    || handlers
+                        .iter()
+                        .any(|handler| Self::body_needs_runtime_annotations(&handler.body))
+                    || Self::body_needs_runtime_annotations(orelse)
+                    || Self::body_needs_runtime_annotations(finalbody)
+            }
+            StmtKind::Match { cases, .. } => cases
+                .iter()
+                .any(|case| Self::body_needs_runtime_annotations(&case.body)),
+            StmtKind::FunctionDef { .. }
+            | StmtKind::AsyncFunctionDef { .. }
+            | StmtKind::ClassDef { .. } => false,
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn line_for_span(&self, span: Span) -> u32 {
+        self.line_map
+            .as_ref()
+            .map(|line_map| line_map.line_for_offset(span.start))
+            .unwrap_or_else(|| span.start.max(1))
+    }
+
+    /// Emit a return, routing it through active finally blocks when needed.
+    fn emit_return_value(&mut self, value_reg: Register) {
+        if let Some(finally_ctx) = self.finally_stack.last() {
+            self.builder
+                .emit_move(finally_ctx.return_value_reg, value_reg);
+            self.builder.emit_jump(finally_ctx.return_label);
+        } else {
+            self.builder.emit_return(value_reg);
+        }
+    }
+
+    /// Emit `return None`, routing it through active finally blocks when needed.
+    fn emit_return_none_value(&mut self) {
+        if let Some(finally_ctx) = self.finally_stack.last() {
+            self.builder.emit_load_none(finally_ctx.return_value_reg);
+            self.builder.emit_jump(finally_ctx.return_label);
+        } else {
+            self.builder.emit_return_none();
+        }
+    }
+
+    /// Emit a jump, routing it through active cleanup blocks when needed.
+    fn emit_jump_through_finally_until(
+        &mut self,
+        target_label: Label,
+        preserve_finally_depth: usize,
+    ) {
+        if self.finally_stack.len() <= preserve_finally_depth {
+            self.builder.emit_jump(target_label);
+            return;
+        }
+
+        let cleanup_label = self.builder.create_label();
+        self.finally_stack
+            .last_mut()
+            .expect("finally stack checked above")
+            .jump_continuations
+            .push(FinallyJumpContinuation {
+                cleanup_label,
+                target_label,
+                preserve_finally_depth,
+            });
+        self.builder.emit_jump(cleanup_label);
+    }
+
+    /// Compile finally cleanup for a deferred control-flow path.
+    fn compile_finally_cleanup_body(&mut self, finalbody: &[Stmt]) -> CompileResult<()> {
+        for stmt in finalbody {
+            self.compile_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    /// Emit a non-exceptional context-manager exit call.
+    fn emit_context_exit_none(&mut self, exit_method_reg: Register) {
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(exit_method_reg.0 + 2),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(exit_method_reg.0 + 3),
+        ));
+        self.builder.emit(Instruction::op_d(
+            Opcode::LoadNone,
+            Register::new(exit_method_reg.0 + 4),
+        ));
+
+        let exit_result_reg = self.builder.alloc_register();
+        self.builder
+            .emit_call_method(exit_result_reg, exit_method_reg, 3);
+        self.builder.free_register(exit_result_reg);
     }
 
     /// Resolve a variable name to its location.
@@ -391,8 +709,8 @@ impl Compiler {
 
     /// Compile a statement.
     fn compile_stmt(&mut self, stmt: &Stmt) -> CompileResult<()> {
-        // Use span start as a line approximation (byte offset for now)
-        self.builder.set_line(stmt.span.start);
+        let stmt_line = self.line_for_span(stmt.span);
+        self.builder.set_line(stmt_line);
 
         match &stmt.kind {
             StmtKind::Expr(value) => {
@@ -409,6 +727,21 @@ impl Compiler {
                 }
 
                 self.builder.free_register(value_reg);
+            }
+
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                simple,
+            } => {
+                self.compile_annotated_assignment(
+                    stmt,
+                    target,
+                    annotation,
+                    value.as_deref(),
+                    *simple,
+                )?;
             }
 
             StmtKind::AugAssign { target, op, value } => {
@@ -429,10 +762,10 @@ impl Compiler {
             StmtKind::Return(value) => {
                 if let Some(val) = value {
                     let reg = self.compile_expr(val)?;
-                    self.builder.emit_return(reg);
+                    self.emit_return_value(reg);
                     self.builder.free_register(reg);
                 } else {
-                    self.builder.emit_return_none();
+                    self.emit_return_none_value();
                 }
             }
 
@@ -442,12 +775,12 @@ impl Compiler {
 
             StmtKind::Break => {
                 // Jump to the break label of the innermost loop
-                if let Some(ctx) = self.loop_stack.last() {
-                    self.builder.emit_jump(ctx.break_label);
+                if let Some(ctx) = self.loop_stack.last().copied() {
+                    self.emit_jump_through_finally_until(ctx.break_label, ctx.finally_depth);
                 } else {
                     return Err(CompileError {
                         message: "'break' outside loop".to_string(),
-                        line: stmt.span.start,
+                        line: stmt_line,
                         column: 0,
                     });
                 }
@@ -455,12 +788,12 @@ impl Compiler {
 
             StmtKind::Continue => {
                 // Jump to the continue label of the innermost loop
-                if let Some(ctx) = self.loop_stack.last() {
-                    self.builder.emit_jump(ctx.continue_label);
+                if let Some(ctx) = self.loop_stack.last().copied() {
+                    self.emit_jump_through_finally_until(ctx.continue_label, ctx.finally_depth);
                 } else {
                     return Err(CompileError {
                         message: "'continue' outside loop".to_string(),
-                        line: stmt.span.start,
+                        line: stmt_line,
                         column: 0,
                     });
                 }
@@ -505,6 +838,7 @@ impl Compiler {
                 self.loop_stack.push(LoopContext {
                     break_label: loop_end,
                     continue_label: loop_start,
+                    finally_depth: self.finally_stack.len(),
                 });
 
                 self.builder.bind_label(loop_start);
@@ -554,6 +888,7 @@ impl Compiler {
                 self.loop_stack.push(LoopContext {
                     break_label: loop_end,
                     continue_label: loop_start,
+                    finally_depth: self.finally_stack.len(),
                 });
 
                 self.builder.bind_label(loop_start);
@@ -615,7 +950,7 @@ impl Compiler {
                 if !self.in_async_context {
                     return Err(CompileError {
                         message: "'async for' outside async function".to_string(),
-                        line: stmt.span.start,
+                        line: stmt_line,
                         column: 0,
                     });
                 }
@@ -636,6 +971,7 @@ impl Compiler {
                 self.loop_stack.push(LoopContext {
                     break_label: loop_end,
                     continue_label: loop_start,
+                    finally_depth: self.finally_stack.len(),
                 });
 
                 self.builder.bind_label(loop_start);
@@ -718,7 +1054,7 @@ impl Compiler {
                     .collect();
                 let base_count_u8 = u8::try_from(base_count).map_err(|_| CompileError {
                     message: "class definition supports at most 255 base classes".to_string(),
-                    line: stmt.span.start,
+                    line: stmt_line,
                     column: 0,
                 })?;
                 let class_block_size = u8::try_from(
@@ -730,7 +1066,7 @@ impl Compiler {
                 .map_err(|_| CompileError {
                     message: "class definition requires more registers than the VM can encode"
                         .to_string(),
-                    line: stmt.span.start,
+                    line: stmt_line,
                     column: 0,
                 })?;
                 // Reserve the BUILD_CLASS register block up front and compile bases
@@ -777,6 +1113,7 @@ impl Compiler {
                 let class_qualname = self.qualified_name_for_nested_definition(name.as_ref());
                 let mut class_builder = FunctionBuilder::new(name.clone());
                 class_builder.set_filename(self.builder.get_filename());
+                class_builder.set_first_lineno(stmt_line);
                 class_builder.set_qualname(Arc::clone(&class_qualname));
                 class_builder.add_flag(CodeFlags::CLASS);
 
@@ -801,6 +1138,7 @@ impl Compiler {
 
                 // Swap builders to compile class body
                 let parent_builder = std::mem::replace(&mut self.builder, class_builder);
+                let parent_finally_stack = std::mem::take(&mut self.finally_stack);
 
                 if let Some(scope_idx) = class_scope_idx {
                     self.enter_child_scope(scope_idx);
@@ -809,6 +1147,9 @@ impl Compiler {
                 // CPython seeds every class body namespace with __module__ and
                 // __qualname__ before user statements execute.
                 self.emit_implicit_class_metadata_bindings(class_qualname.as_ref());
+                if Self::body_needs_runtime_annotations(body) {
+                    self.builder.emit_setup_annotations();
+                }
 
                 // Compile class body statements (method definitions, class variables, etc.)
                 for (index, stmt) in body.iter().enumerate() {
@@ -824,6 +1165,7 @@ impl Compiler {
 
                 // Class body returns the namespace dict (implicit)
                 self.builder.emit_return_none();
+                self.finally_stack = parent_finally_stack;
 
                 // Swap back and get finished class body code
                 let class_builder = std::mem::replace(&mut self.builder, parent_builder);
@@ -853,7 +1195,7 @@ impl Compiler {
                                     message:
                                         "class definition does not support unpacked keyword arguments"
                                             .to_string(),
-                                    line: stmt.span.start,
+                                    line: stmt_line,
                                     column: 0,
                                 })
                                 .map(Arc::from)
@@ -1132,7 +1474,7 @@ impl Compiler {
                 decorator_list,
                 ..
             } => {
-                self.compile_function_def(name, args, body, decorator_list, false)?;
+                self.compile_function_def(name, args, body, decorator_list, false, stmt_line)?;
             }
 
             StmtKind::AsyncFunctionDef {
@@ -1142,7 +1484,7 @@ impl Compiler {
                 decorator_list,
                 ..
             } => {
-                self.compile_function_def(name, args, body, decorator_list, true)?;
+                self.compile_function_def(name, args, body, decorator_list, true, stmt_line)?;
             }
 
             StmtKind::Try {
@@ -1154,15 +1496,11 @@ impl Compiler {
                 self.compile_try(body, handlers, orelse, finalbody)?;
             }
 
-            StmtKind::TryStar {
-                body,
-                handlers,
-                orelse,
-                finalbody,
-            } => {
-                // TryStar is Python 3.11+ except* syntax
-                // For now, treat it like regular Try (except* semantics require ExceptionGroup)
-                self.compile_try(body, handlers, orelse, finalbody)?;
+            StmtKind::TryStar { .. } => {
+                return Err(self.unsupported_stmt_error(
+                    stmt,
+                    "try/except* requires ExceptionGroup splitting semantics",
+                ));
             }
 
             StmtKind::With { items, body } => {
@@ -1174,7 +1512,7 @@ impl Compiler {
                 if !self.in_async_context {
                     return Err(CompileError {
                         message: "'async with' outside async function".to_string(),
-                        line: stmt.span.start,
+                        line: stmt_line,
                         column: 0,
                     });
                 }
@@ -1189,13 +1527,97 @@ impl Compiler {
                 self.compile_match(subject, cases)?;
             }
 
-            // Remaining unimplemented statements
-            _ => {
-                // Placeholder for unimplemented statements
+            StmtKind::TypeAlias { .. } => {
+                return Err(self.unsupported_stmt_error(
+                    stmt,
+                    "type alias statements require Python 3.12 TypeAliasType semantics",
+                ));
             }
         }
 
         Ok(())
+    }
+
+    fn compile_annotated_assignment(
+        &mut self,
+        stmt: &Stmt,
+        target: &Expr,
+        annotation: &Expr,
+        value: Option<&Expr>,
+        simple: bool,
+    ) -> CompileResult<()> {
+        if let Some(value) = value {
+            let value_reg = self.compile_expr(value)?;
+            self.compile_store(target, value_reg)?;
+            self.builder.free_register(value_reg);
+        }
+
+        if simple && self.current_scope_records_runtime_annotations() {
+            let ExprKind::Name(name) = &target.kind else {
+                return Err(self.unsupported_stmt_error(
+                    stmt,
+                    "simple annotated assignments must target a name",
+                ));
+            };
+
+            let annotations_location = self.resolve_variable("__annotations__");
+            let annotations_reg = self.builder.alloc_register();
+            let key_reg = self.builder.alloc_register();
+            let value_reg = self.compile_expr(annotation)?;
+
+            self.builder.emit_load_var(
+                annotations_reg,
+                annotations_location,
+                Some("__annotations__"),
+            );
+            let key_idx = self.builder.add_string(name.as_str());
+            self.builder.emit_load_const(key_reg, key_idx);
+            self.builder
+                .emit_set_item(annotations_reg, key_reg, value_reg);
+
+            self.builder.free_register(annotations_reg);
+            self.builder.free_register(key_reg);
+            self.builder.free_register(value_reg);
+        } else if value.is_none() && !simple {
+            return Err(self.unsupported_stmt_error(
+                stmt,
+                "annotated attribute and subscript declarations without a value need target evaluation semantics",
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn current_scope_records_runtime_annotations(&self) -> bool {
+        matches!(
+            self.current_scope().kind,
+            ScopeKind::Module | ScopeKind::Class
+        )
+    }
+
+    #[inline]
+    fn unsupported_stmt_error(&self, stmt: &Stmt, reason: &'static str) -> CompileError {
+        CompileError {
+            message: format!(
+                "unsupported statement {}: {reason}",
+                stmt_kind_name(&stmt.kind)
+            ),
+            line: self.line_for_span(stmt.span),
+            column: 0,
+        }
+    }
+
+    #[inline]
+    fn unsupported_expr_error(&self, expr: &Expr, reason: &'static str) -> CompileError {
+        CompileError {
+            message: format!(
+                "unsupported expression {}: {reason}",
+                expr_kind_name(&expr.kind)
+            ),
+            line: self.line_for_span(expr.span),
+            column: 0,
+        }
     }
 
     /// Compile an expression and return the register containing the result.
@@ -1203,6 +1625,60 @@ impl Compiler {
         let reg = self.builder.alloc_register();
         self.compile_expr_into(expr, reg)?;
         Ok(reg)
+    }
+
+    fn compile_unpacking_sequence_literal(
+        &mut self,
+        elts: &[Expr],
+        reg: Register,
+        line: u32,
+        kind: SequenceLiteralKind,
+    ) -> CompileResult<()> {
+        if elts.len() > 24 {
+            return Err(CompileError {
+                message: "starred sequence literal supports at most 24 source entries".to_string(),
+                line,
+                column: 0,
+            });
+        }
+
+        let count = elts.len() as u8;
+        let base_reg = self.builder.alloc_register_block(count);
+        let mut unpack_flags = 0_u32;
+
+        for (i, elt) in elts.iter().enumerate() {
+            let item_reg = Register::new(base_reg.0 + i as u8);
+            let temp = match &elt.kind {
+                ExprKind::Starred(inner) => {
+                    unpack_flags |= 1 << i;
+                    self.compile_expr(inner)?
+                }
+                _ => self.compile_expr(elt)?,
+            };
+
+            if temp != item_reg {
+                self.builder.emit_move(item_reg, temp);
+                self.builder.free_register(temp);
+            }
+        }
+
+        match kind {
+            SequenceLiteralKind::List => {
+                self.builder
+                    .emit_build_list_unpack(reg, base_reg, count, unpack_flags);
+            }
+            SequenceLiteralKind::Tuple => {
+                self.builder
+                    .emit_build_tuple_unpack(reg, base_reg, count, unpack_flags);
+            }
+            SequenceLiteralKind::Set => {
+                self.builder
+                    .emit_build_set_unpack(reg, base_reg, count, unpack_flags);
+            }
+        }
+
+        self.builder.free_register_block(base_reg, count);
+        Ok(())
     }
 
     fn parse_bigint_literal(literal: &str) -> Option<BigInt> {
@@ -1266,6 +1742,7 @@ impl Compiler {
 
     /// Compile an expression into a specific destination register.
     fn compile_expr_into(&mut self, expr: &Expr, reg: Register) -> CompileResult<()> {
+        let expr_line = self.line_for_span(expr.span);
         match &expr.kind {
             ExprKind::Int(n) => {
                 let idx = self.builder.add_int(*n);
@@ -1275,7 +1752,7 @@ impl Compiler {
             ExprKind::BigInt(literal) => {
                 let value = Self::parse_bigint_literal(literal).ok_or_else(|| CompileError {
                     message: format!("invalid integer literal: {literal}"),
-                    line: expr.span.start,
+                    line: expr_line,
                     column: 0,
                 })?;
                 let idx = self.builder.add_bigint(value);
@@ -1304,6 +1781,10 @@ impl Compiler {
                 self.builder.emit_load_none(reg);
             }
 
+            ExprKind::Ellipsis => {
+                self.emit_load_builtin_name(reg, "Ellipsis");
+            }
+
             ExprKind::String(s) => {
                 // Add string to constant pool with automatic interning and deduplication
                 let str_idx = self.builder.add_string(s.value.as_str());
@@ -1315,7 +1796,7 @@ impl Compiler {
             }
 
             ExprKind::JoinedStr(parts) => {
-                self.compile_joined_str(parts, reg, expr.span.start)?;
+                self.compile_joined_str(parts, reg, expr_line)?;
                 return Ok(());
             }
 
@@ -1441,7 +1922,7 @@ impl Compiler {
 
                 if has_star_unpack || has_dstar_unpack {
                     // Dynamic call path: build tuple/dict and call with unpacking
-                    self.compile_dynamic_call(func, args, keywords, reg, expr.span.start as u32)?;
+                    self.compile_dynamic_call(func, args, keywords, reg, expr_line)?;
                     return Ok(());
                 }
 
@@ -1614,6 +2095,19 @@ impl Compiler {
             }
 
             ExprKind::List(elts) => {
+                if elts
+                    .iter()
+                    .any(|elt| matches!(&elt.kind, ExprKind::Starred(_)))
+                {
+                    self.compile_unpacking_sequence_literal(
+                        elts,
+                        reg,
+                        expr_line,
+                        SequenceLiteralKind::List,
+                    )?;
+                    return Ok(());
+                }
+
                 // BuildList expects a consecutive register block.
                 if elts.is_empty() {
                     self.builder.emit_build_list(reg, reg, 0);
@@ -1621,7 +2115,7 @@ impl Compiler {
                     if elts.len() > u8::MAX as usize {
                         return Err(CompileError {
                             message: "list literal has too many elements".to_string(),
-                            line: expr.span.start,
+                            line: expr_line,
                             column: 0,
                         });
                     }
@@ -1644,6 +2138,19 @@ impl Compiler {
             }
 
             ExprKind::Set(elts) => {
+                if elts
+                    .iter()
+                    .any(|elt| matches!(&elt.kind, ExprKind::Starred(_)))
+                {
+                    self.compile_unpacking_sequence_literal(
+                        elts,
+                        reg,
+                        expr_line,
+                        SequenceLiteralKind::Set,
+                    )?;
+                    return Ok(());
+                }
+
                 // BuildSet also reads a consecutive register range [start, start+count).
                 if elts.is_empty() {
                     self.builder
@@ -1652,7 +2159,7 @@ impl Compiler {
                     if elts.len() > u8::MAX as usize {
                         return Err(CompileError {
                             message: "set literal has too many elements".to_string(),
-                            line: expr.span.start,
+                            line: expr_line,
                             column: 0,
                         });
                     }
@@ -1682,7 +2189,7 @@ impl Compiler {
                 if keys.len() != values.len() {
                     return Err(CompileError {
                         message: "dict literal has mismatched keys/values".to_string(),
-                        line: expr.span.start,
+                        line: expr_line,
                         column: 0,
                     });
                 }
@@ -1735,7 +2242,7 @@ impl Compiler {
                         if entry_count > 24 {
                             return Err(CompileError {
                                 message: "dict unpack supports at most 24 entries".to_string(),
-                                line: expr.span.start,
+                                line: expr_line,
                                 column: 0,
                             });
                         }
@@ -1793,6 +2300,19 @@ impl Compiler {
             }
 
             ExprKind::Tuple(elts) => {
+                if elts
+                    .iter()
+                    .any(|elt| matches!(&elt.kind, ExprKind::Starred(_)))
+                {
+                    self.compile_unpacking_sequence_literal(
+                        elts,
+                        reg,
+                        expr_line,
+                        SequenceLiteralKind::Tuple,
+                    )?;
+                    return Ok(());
+                }
+
                 // CRITICAL: BuildTuple expects consecutive registers [first, first+1, ...].
                 // Using alloc_register() individually can allocate non-contiguous registers
                 // from the free list, breaking this invariant.
@@ -1849,7 +2369,7 @@ impl Compiler {
                 if !self.in_async_context {
                     return Err(CompileError {
                         message: "'await' outside async function".to_string(),
-                        line: expr.span.start,
+                        line: expr_line,
                         column: 0,
                     });
                 }
@@ -1878,7 +2398,7 @@ impl Compiler {
                 if !self.in_function_context {
                     return Err(CompileError {
                         message: "'yield' outside function".into(),
-                        line: expr.span.start,
+                        line: expr_line,
                         column: 0,
                     });
                 }
@@ -1904,7 +2424,7 @@ impl Compiler {
                 if !self.in_function_context {
                     return Err(CompileError {
                         message: "'yield from' outside function".into(),
-                        line: expr.span.start,
+                        line: expr_line,
                         column: 0,
                     });
                 }
@@ -1923,20 +2443,20 @@ impl Compiler {
                 // 1. Body is a single expression (not statements)
                 // 2. Result is implicitly returned
                 // 3. Lambda inherits async context from enclosing scope
-                self.compile_lambda(args, body, reg)?;
+                self.compile_lambda(args, body, reg, expr_line)?;
                 return Ok(());
             }
 
             ExprKind::ListComp { elt, generators } => {
                 // List comprehensions create nested code objects for proper scoping.
                 // This prevents loop variables from leaking into enclosing scope.
-                self.compile_listcomp(elt, generators, reg)?;
+                self.compile_listcomp(elt, generators, reg, expr_line)?;
                 return Ok(());
             }
 
             ExprKind::SetComp { elt, generators } => {
                 // Set comprehensions follow same pattern as list comprehensions
-                self.compile_setcomp(elt, generators, reg)?;
+                self.compile_setcomp(elt, generators, reg, expr_line)?;
                 return Ok(());
             }
 
@@ -1946,13 +2466,13 @@ impl Compiler {
                 generators,
             } => {
                 // Dict comprehensions create nested code for proper scoping
-                self.compile_dictcomp(key, value, generators, reg)?;
+                self.compile_dictcomp(key, value, generators, reg, expr_line)?;
                 return Ok(());
             }
 
             ExprKind::GeneratorExp { elt, generators } => {
                 // Generator expressions are lazy - create generator function
-                self.compile_genexp(elt, generators, reg)?;
+                self.compile_genexp(elt, generators, reg, expr_line)?;
                 return Ok(());
             }
 
@@ -1964,17 +2484,18 @@ impl Compiler {
                         return Err(CompileError {
                             message: "assignment expression target must be an identifier"
                                 .to_string(),
-                            line: target.span.start,
+                            line: self.line_for_span(target.span),
                             column: 0,
                         });
                     }
                 }
             }
 
-            // TODO: Implement remaining expressions
-            _ => {
-                // Placeholder: load None for unimplemented expressions
-                self.builder.emit_load_none(reg);
+            ExprKind::Starred(_) => {
+                return Err(self.unsupported_expr_error(
+                    expr,
+                    "starred expressions are only valid in calls, literals, and assignment targets",
+                ));
             }
         }
 
@@ -2117,7 +2638,7 @@ impl Compiler {
                 other => {
                     return Err(CompileError {
                         message: format!("unsupported f-string conversion '!{other}'"),
-                        line: value.span.start,
+                        line: self.line_for_span(value.span),
                         column: 0,
                     });
                 }
@@ -2316,7 +2837,7 @@ impl Compiler {
                 if starred_indices.len() > 1 {
                     return Err(CompileError {
                         message: "multiple starred expressions in assignment".to_string(),
-                        line: target.span.start,
+                        line: self.line_for_span(target.span),
                         column: 0,
                     });
                 }
@@ -2325,7 +2846,7 @@ impl Compiler {
                     if elts.len() > u8::MAX as usize {
                         return Err(CompileError {
                             message: "too many assignment targets to unpack".to_string(),
-                            line: target.span.start,
+                            line: self.line_for_span(target.span),
                             column: 0,
                         });
                     }
@@ -2337,7 +2858,7 @@ impl Compiler {
                         return Err(CompileError {
                             message: "starred unpacking supports at most 15 items before/after '*'"
                                 .to_string(),
-                            line: target.span.start,
+                            line: self.line_for_span(target.span),
                             column: 0,
                         });
                     }
@@ -2364,7 +2885,7 @@ impl Compiler {
                     if elts.len() > u8::MAX as usize {
                         return Err(CompileError {
                             message: "too many assignment targets to unpack".to_string(),
-                            line: target.span.start,
+                            line: self.line_for_span(target.span),
                             column: 0,
                         });
                     }
@@ -2389,7 +2910,7 @@ impl Compiler {
             _ => {
                 return Err(CompileError {
                     message: format!("cannot assign to {:?}", target.kind),
-                    line: target.span.start,
+                    line: self.line_for_span(target.span),
                     column: 0,
                 });
             }
@@ -2402,7 +2923,7 @@ impl Compiler {
         match &target.kind {
             ExprKind::Tuple(_) | ExprKind::List(_) => Err(CompileError {
                 message: "illegal expression for augmented assignment".to_string(),
-                line: target.span.start,
+                line: self.line_for_span(target.span),
                 column: 0,
             }),
             _ => Ok(()),
@@ -2440,7 +2961,7 @@ impl Compiler {
             _ => {
                 return Err(CompileError {
                     message: format!("cannot delete {:?}", target.kind),
-                    line: target.span.start,
+                    line: self.line_for_span(target.span),
                     column: 0,
                 });
             }
@@ -2776,6 +3297,17 @@ impl Compiler {
             .map(|_| self.builder.create_label())
             .collect();
 
+        let has_finally = !finalbody.is_empty();
+        if has_finally {
+            let return_label = self.builder.create_label();
+            let return_value_reg = self.builder.alloc_register();
+            self.finally_stack.push(FinallyContext {
+                return_label,
+                return_value_reg,
+                jump_continuations: SmallVec::new(),
+            });
+        }
+
         // =================================================================
         // Try Body Compilation
         // =================================================================
@@ -2966,6 +3498,16 @@ impl Compiler {
         // Finally Block Compilation
         // =================================================================
 
+        let cleanup_context = if has_finally {
+            Some(
+                self.finally_stack
+                    .pop()
+                    .expect("try/finally should have an active finally context"),
+            )
+        } else {
+            None
+        };
+
         if let Some(fin_label) = finally_label {
             self.builder.bind_label(fin_label);
             let finally_start_pc = self.builder.current_pc();
@@ -2983,6 +3525,7 @@ impl Compiler {
 
             // EndFinally will reraise if there's a pending exception
             self.builder.emit(Instruction::op(Opcode::EndFinally));
+            self.builder.emit_jump(end_label);
 
             // Add finally exception entry
             self.builder.add_exception_entry(ExceptionEntry {
@@ -2993,6 +3536,21 @@ impl Compiler {
                 depth: stack_depth as u16,
                 exception_type_idx: u16::MAX,
             });
+        }
+
+        if let Some(cleanup_context) = cleanup_context {
+            self.builder.bind_label(cleanup_context.return_label);
+            self.compile_finally_cleanup_body(finalbody)?;
+            self.emit_return_value(cleanup_context.return_value_reg);
+
+            for continuation in cleanup_context.jump_continuations {
+                self.builder.bind_label(continuation.cleanup_label);
+                self.compile_finally_cleanup_body(finalbody)?;
+                self.emit_jump_through_finally_until(
+                    continuation.target_label,
+                    continuation.preserve_finally_depth,
+                );
+            }
         }
 
         // =================================================================
@@ -3103,32 +3661,26 @@ impl Compiler {
         let try_start_pc = self.builder.current_pc();
         let cleanup_label = self.builder.create_label();
         let end_label = self.builder.create_label();
+        let return_label = self.builder.create_label();
+        let return_value_reg = self.builder.alloc_register();
+        self.finally_stack.push(FinallyContext {
+            return_label,
+            return_value_reg,
+            jump_continuations: SmallVec::new(),
+        });
 
         // Step 8: Compile nested items and body
         self.compile_with_items(items, body, depth + 1)?;
 
         // Step 9: Record try block end position (normal exit path)
         let try_end_pc = self.builder.current_pc();
+        let cleanup_context = self
+            .finally_stack
+            .pop()
+            .expect("with statement should have an active cleanup context");
 
         // Step 10: Normal exit - call __exit__(None, None, None)
-        self.builder.emit(Instruction::op_d(
-            Opcode::LoadNone,
-            Register::new(exit_method_reg.0 + 2),
-        ));
-        self.builder.emit(Instruction::op_d(
-            Opcode::LoadNone,
-            Register::new(exit_method_reg.0 + 3),
-        ));
-        self.builder.emit(Instruction::op_d(
-            Opcode::LoadNone,
-            Register::new(exit_method_reg.0 + 4),
-        ));
-
-        // Call exit_method(None, None, None)
-        let exit_result_reg = self.builder.alloc_register();
-        self.builder
-            .emit_call_method(exit_result_reg, exit_method_reg, 3);
-        self.builder.free_register(exit_result_reg);
+        self.emit_context_exit_none(exit_method_reg);
 
         // Jump to end (skip exception path)
         self.builder.emit_jump(end_label);
@@ -3190,6 +3742,20 @@ impl Compiler {
 
         self.builder.bind_label(suppress_label);
         self.builder.emit(Instruction::op(Opcode::ClearException));
+        self.builder.emit_jump(end_label);
+
+        self.builder.bind_label(cleanup_context.return_label);
+        self.emit_context_exit_none(exit_method_reg);
+        self.emit_return_value(cleanup_context.return_value_reg);
+
+        for continuation in cleanup_context.jump_continuations {
+            self.builder.bind_label(continuation.cleanup_label);
+            self.emit_context_exit_none(exit_method_reg);
+            self.emit_jump_through_finally_until(
+                continuation.target_label,
+                continuation.preserve_finally_depth,
+            );
+        }
 
         // Step 12: End label
         self.builder.bind_label(end_label);
@@ -3522,9 +4088,12 @@ impl Compiler {
                     Singleton::None => self.builder.emit_load_none(cmp_reg),
                 }
                 let result_reg = self.builder.alloc_register();
-                // Use IS comparison for singletons
-                // TODO: emit_is for identity comparison; using emit_eq for now
-                self.builder.emit_eq(result_reg, subject_reg, cmp_reg);
+                self.builder.emit(Instruction::op_dss(
+                    Opcode::Is,
+                    result_reg,
+                    subject_reg,
+                    cmp_reg,
+                ));
                 self.builder.emit_jump_if_false(result_reg, fail_label);
                 self.builder.free_register(result_reg);
                 self.builder.free_register(cmp_reg);
@@ -3734,7 +4303,7 @@ impl Compiler {
         if defaults.len() > u8::MAX as usize {
             return Err(CompileError {
                 message: "too many positional defaults".to_string(),
-                line: defaults[0].span.start,
+                line: self.line_for_span(defaults[0].span),
                 column: 0,
             });
         }
@@ -3783,7 +4352,7 @@ impl Compiler {
         if entries.len() > (u8::MAX as usize / 2) {
             return Err(CompileError {
                 message: "too many keyword-only defaults".to_string(),
-                line: entries[0].1.span.start,
+                line: self.line_for_span(entries[0].1.span),
                 column: 0,
             });
         }
@@ -3838,6 +4407,7 @@ impl Compiler {
         body: &[Stmt],
         decorator_list: &[Expr],
         is_async: bool,
+        definition_line: u32,
     ) -> CompileResult<()> {
         // Find the scope for this function from the symbol table
         // We need to look it up by name in the current scope's children
@@ -3860,6 +4430,7 @@ impl Compiler {
         // Create a new FunctionBuilder for the function body
         let mut func_builder = FunctionBuilder::new(name);
         func_builder.set_filename(&*self.filename);
+        func_builder.set_first_lineno(definition_line);
 
         // Set function flags
         if is_async {
@@ -3957,6 +4528,7 @@ impl Compiler {
 
         // Swap builders to compile function body
         let parent_builder = std::mem::replace(&mut self.builder, func_builder);
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
 
         // Save and update context for function body compilation
         let parent_async_context = self.in_async_context;
@@ -3985,6 +4557,7 @@ impl Compiler {
         // Restore contexts
         self.in_async_context = parent_async_context;
         self.in_function_context = parent_function_context;
+        self.finally_stack = parent_finally_stack;
 
         // Swap back and get finished function code
         let func_builder = std::mem::replace(&mut self.builder, parent_builder);
@@ -4151,6 +4724,7 @@ impl Compiler {
         args: &prism_parser::ast::Arguments,
         body: &Expr,
         dst: Register,
+        definition_line: u32,
     ) -> CompileResult<Register> {
         // Find lambda scope from symbol table (lambdas are named "<lambda>" in scope analysis)
         let lambda_scope_idx = self.find_child_scope(ScopeKind::Lambda, "<lambda>");
@@ -4172,6 +4746,7 @@ impl Compiler {
         // Create a new FunctionBuilder for the lambda body
         let mut lambda_builder = FunctionBuilder::new("<lambda>");
         lambda_builder.set_filename(&*self.filename);
+        lambda_builder.set_first_lineno(definition_line);
 
         // Calculate argument counts
         let posonly_count = args.posonlyargs.len() as u16;
@@ -4236,6 +4811,7 @@ impl Compiler {
 
         // Swap builders to compile lambda body
         let parent_builder = std::mem::replace(&mut self.builder, lambda_builder);
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         let parent_async_context = self.in_async_context;
         let parent_function_context = self.in_function_context;
         // Lambda inherits async context from enclosing scope but sets function context
@@ -4257,6 +4833,7 @@ impl Compiler {
         // Restore parent contexts
         self.in_async_context = parent_async_context;
         self.in_function_context = parent_function_context;
+        self.finally_stack = parent_finally_stack;
 
         // Swap back and get finished lambda code
         let lambda_builder = std::mem::replace(&mut self.builder, parent_builder);
@@ -4336,6 +4913,7 @@ impl Compiler {
         elt: &Expr,
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
+        definition_line: u32,
     ) -> CompileResult<Register> {
         self.compile_sequence_comprehension(
             "<listcomp>",
@@ -4344,6 +4922,7 @@ impl Compiler {
             generators,
             dst,
             ComprehensionKind::List,
+            definition_line,
         )
     }
 
@@ -4353,6 +4932,7 @@ impl Compiler {
         elt: &Expr,
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
+        definition_line: u32,
     ) -> CompileResult<Register> {
         self.compile_sequence_comprehension(
             "<setcomp>",
@@ -4361,6 +4941,7 @@ impl Compiler {
             generators,
             dst,
             ComprehensionKind::Set,
+            definition_line,
         )
     }
 
@@ -4371,6 +4952,7 @@ impl Compiler {
         value: &Expr,
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
+        definition_line: u32,
     ) -> CompileResult<Register> {
         let comp_scope_idx = self.next_comprehension_scope("<dictcomp>");
         let (cellvars, freevars, locals) = self.comprehension_scope_layout(comp_scope_idx);
@@ -4378,6 +4960,7 @@ impl Compiler {
 
         let mut comp_builder = FunctionBuilder::new("<dictcomp>");
         comp_builder.set_filename(&*self.filename);
+        comp_builder.set_first_lineno(definition_line);
         comp_builder.set_arg_count(1);
         comp_builder.define_local(".0");
         for name in locals {
@@ -4386,6 +4969,7 @@ impl Compiler {
         Self::configure_closure_layout(&mut comp_builder, cellvars, freevars);
 
         let parent_builder = std::mem::replace(&mut self.builder, comp_builder);
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         if let Some(scope_idx) = comp_scope_idx {
             self.enter_child_scope(scope_idx);
         }
@@ -4406,6 +4990,7 @@ impl Compiler {
             self.exit_child_scope();
         }
 
+        self.finally_stack = parent_finally_stack;
         let comp_builder = std::mem::replace(&mut self.builder, parent_builder);
         let comp_code = comp_builder.finish();
         self.emit_comprehension_call(comp_code, captures_freevars, &generators[0].iter, dst)
@@ -4419,6 +5004,7 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
         kind: ComprehensionKind,
+        definition_line: u32,
     ) -> CompileResult<Register> {
         let comp_scope_idx = self.next_comprehension_scope(scope_name);
         let (cellvars, freevars, locals) = self.comprehension_scope_layout(comp_scope_idx);
@@ -4426,6 +5012,7 @@ impl Compiler {
 
         let mut comp_builder = FunctionBuilder::new(code_name);
         comp_builder.set_filename(&*self.filename);
+        comp_builder.set_first_lineno(definition_line);
         comp_builder.set_arg_count(1);
         comp_builder.define_local(".0");
         for name in locals {
@@ -4434,6 +5021,7 @@ impl Compiler {
         Self::configure_closure_layout(&mut comp_builder, cellvars, freevars);
 
         let parent_builder = std::mem::replace(&mut self.builder, comp_builder);
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         if let Some(scope_idx) = comp_scope_idx {
             self.enter_child_scope(scope_idx);
         }
@@ -4458,6 +5046,7 @@ impl Compiler {
             self.exit_child_scope();
         }
 
+        self.finally_stack = parent_finally_stack;
         let comp_builder = std::mem::replace(&mut self.builder, parent_builder);
         let comp_code = comp_builder.finish();
         self.emit_comprehension_call(comp_code, captures_freevars, &generators[0].iter, dst)
@@ -4556,6 +5145,7 @@ impl Compiler {
         elt: &Expr,
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
+        definition_line: u32,
     ) -> CompileResult<Register> {
         let gen_scope_idx = self.next_comprehension_scope("<comprehension>");
         let (gen_cellvars, gen_freevars, gen_locals) = if let Some(scope_idx) = gen_scope_idx {
@@ -4575,6 +5165,7 @@ impl Compiler {
         // Create a generator function that yields each element
         let mut gen_builder = FunctionBuilder::new("<genexpr>");
         gen_builder.set_filename(&*self.filename);
+        gen_builder.set_first_lineno(definition_line);
         gen_builder.add_flags(CodeFlags::GENERATOR);
 
         // First iterator is passed as argument
@@ -4602,6 +5193,7 @@ impl Compiler {
 
         // Swap builders
         let parent_builder = std::mem::replace(&mut self.builder, gen_builder);
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         if let Some(scope_idx) = gen_scope_idx {
             self.enter_child_scope(scope_idx);
         }
@@ -4622,6 +5214,7 @@ impl Compiler {
             self.exit_child_scope();
         }
 
+        self.finally_stack = parent_finally_stack;
         // Swap back
         let gen_builder = std::mem::replace(&mut self.builder, parent_builder);
         let gen_code = gen_builder.finish();
@@ -5270,6 +5863,86 @@ def value(self, new_value):
         assert_eq!(
             bytes_load_none_count, string_load_none_count,
             "empty bytes literals should compile like ordinary literals instead of the unimplemented-expression fallback"
+        );
+    }
+
+    #[test]
+    fn test_compile_try_star_rejects_instead_of_lowering_as_regular_try() {
+        let module = Module::new(
+            vec![Stmt::new(
+                StmtKind::TryStar {
+                    body: vec![Stmt::new(StmtKind::Pass, Span::new(1, 1))],
+                    handlers: Vec::new(),
+                    orelse: Vec::new(),
+                    finalbody: Vec::new(),
+                },
+                Span::new(1, 1),
+            )],
+            Span::new(1, 1),
+        );
+        let err = Compiler::compile_module(&module, "<test>")
+            .expect_err("try/except* must not compile through the regular try path");
+
+        assert!(err.message.contains("TryStar"));
+        assert!(err.message.contains("ExceptionGroup"));
+    }
+
+    #[test]
+    fn test_compile_type_alias_rejects_unimplemented_semantics() {
+        let err = try_compile("type Alias = int")
+            .expect_err("type alias must not silently compile as a no-op");
+
+        assert!(err.message.contains("TypeAlias"));
+        assert!(err.message.contains("TypeAliasType"));
+    }
+
+    #[test]
+    fn test_compile_match_singleton_uses_identity_opcode() {
+        let code = compile(
+            r#"
+match value:
+    case True:
+        result = 1
+    case _:
+        result = 0
+"#,
+        );
+
+        assert!(
+            code.instructions
+                .iter()
+                .any(|inst| inst.opcode() == Opcode::Is as u8),
+            "singleton patterns must compile to identity checks"
+        );
+    }
+
+    #[test]
+    fn test_compile_module_annotations_emit_runtime_namespace_setup() {
+        let code = compile(
+            r#"
+x: int = 1
+y: str
+"#,
+        );
+
+        let setup_annotations_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::SetupAnnotations as u8)
+            .count();
+        let set_item_count = code
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::SetItem as u8)
+            .count();
+
+        assert_eq!(
+            setup_annotations_count, 1,
+            "module annotations should initialize __annotations__ once"
+        );
+        assert_eq!(
+            set_item_count, 2,
+            "both simple module annotations should be recorded at runtime"
         );
     }
 

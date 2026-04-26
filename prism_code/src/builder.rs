@@ -639,6 +639,11 @@ impl FunctionBuilder {
         self.emit(Instruction::op_di(Opcode::LoadBuiltin, dst, name_idx));
     }
 
+    /// Ensure the current module/class namespace has a `__annotations__` dict.
+    pub fn emit_setup_annotations(&mut self) {
+        self.emit(Instruction::op(Opcode::SetupAnnotations));
+    }
+
     /// Store a register into a global variable.
     pub fn emit_store_global(&mut self, name_idx: u16, src: Register) {
         self.emit(Instruction::op_di(Opcode::StoreGlobal, src, name_idx));
@@ -1183,6 +1188,56 @@ impl FunctionBuilder {
             count,
         ));
         // Extension instruction with unpack flags (lower 24 bits)
+        self.emit(Instruction::new(
+            Opcode::CallKwEx,
+            (unpack_flags & 0xFF) as u8,
+            ((unpack_flags >> 8) & 0xFF) as u8,
+            ((unpack_flags >> 16) & 0xFF) as u8,
+        ));
+    }
+
+    /// Build a list from multiple values/iterables with unpacking.
+    ///
+    /// Values are sourced from consecutive registers starting at `base`.
+    /// The `unpack_flags` bitmap marks registers that should be expanded.
+    pub fn emit_build_list_unpack(
+        &mut self,
+        dst: Register,
+        base: Register,
+        count: u8,
+        unpack_flags: u32,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::BuildListUnpack,
+            dst.0,
+            base.0,
+            count,
+        ));
+        self.emit(Instruction::new(
+            Opcode::CallKwEx,
+            (unpack_flags & 0xFF) as u8,
+            ((unpack_flags >> 8) & 0xFF) as u8,
+            ((unpack_flags >> 16) & 0xFF) as u8,
+        ));
+    }
+
+    /// Build a set from multiple values/iterables with unpacking.
+    ///
+    /// Values are sourced from consecutive registers starting at `base`.
+    /// The `unpack_flags` bitmap marks registers that should be expanded.
+    pub fn emit_build_set_unpack(
+        &mut self,
+        dst: Register,
+        base: Register,
+        count: u8,
+        unpack_flags: u32,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::BuildSetUnpack,
+            dst.0,
+            base.0,
+            count,
+        ));
         self.emit(Instruction::new(
             Opcode::CallKwEx,
             (unpack_flags & 0xFF) as u8,
