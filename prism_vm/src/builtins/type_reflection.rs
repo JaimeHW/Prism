@@ -9,6 +9,7 @@ use prism_runtime::object::type_builtins::{builtin_class_mro, class_id_to_type_i
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DescriptorViewObject, MappingProxyObject, MethodWrapperObject};
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -55,6 +56,8 @@ static TYPE_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 });
 static TYPE_PREPARE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("type.__prepare__"), type_prepare));
+static TYPE_MRO_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("type.mro"), type_mro));
 static TUPLE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("tuple.__new__"), super::types::builtin_tuple_new)
 });
@@ -178,6 +181,10 @@ const TYPE_ATTRS: &[AttrSpec] = &[
     AttrSpec {
         name: "__prepare__",
         kind: ReflectedValueKind::ClassMethodDescriptor,
+    },
+    AttrSpec {
+        name: "mro",
+        kind: ReflectedValueKind::MethodDescriptor,
     },
 ];
 
@@ -636,6 +643,64 @@ fn type_prepare(args: &[Value], _keywords: &[(&str, Value)]) -> Result<Value, Bu
     Ok(leak_object_value(DictObject::new()))
 }
 
+fn type_mro(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "mro() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let class_value = args[0];
+    let class_ptr = class_value
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("descriptor 'mro' requires a type".to_string()))?;
+
+    let mro_values = match crate::ops::objects::extract_type_id(class_ptr) {
+        TypeId::TYPE => {
+            if let Some(owner) = crate::builtins::builtin_type_object_type_id(class_ptr) {
+                builtin_class_mro(owner)
+                    .into_iter()
+                    .map(class_id_to_type_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(super::runtime_error_to_builtin_error)?
+            } else {
+                let class = unsafe { &*(class_ptr as *const PyClassObject) };
+                class
+                    .mro()
+                    .iter()
+                    .copied()
+                    .map(|class_id| class_id_to_type_value_for_owner(class_id, class, class_value))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(super::runtime_error_to_builtin_error)?
+            }
+        }
+        TypeId::EXCEPTION_TYPE => {
+            let class_id = crate::builtins::exception_proxy_class_id_from_ptr(class_ptr)
+                .ok_or_else(|| {
+                    BuiltinError::TypeError("descriptor 'mro' requires a type".to_string())
+                })?;
+            let class = global_class(class_id).ok_or_else(|| {
+                BuiltinError::TypeError("descriptor 'mro' requires a type".to_string())
+            })?;
+            class
+                .mro()
+                .iter()
+                .copied()
+                .map(class_id_to_type_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(super::runtime_error_to_builtin_error)?
+        }
+        _ => {
+            return Err(BuiltinError::TypeError(
+                "descriptor 'mro' requires a type".to_string(),
+            ));
+        }
+    };
+
+    Ok(leak_object_value(ListObject::from_iter(mro_values)))
+}
+
 #[inline]
 fn user_type_doc_value(class: &PyClassObject) -> Value {
     class
@@ -684,6 +749,7 @@ fn builtin_type_static_method_value(owner: TypeId, name: &str) -> Option<Value> 
 #[inline]
 fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
     match (owner, name) {
+        (TypeId::TYPE, "mro") => Some(builtin_method_value(&TYPE_MRO_METHOD)),
         (TypeId::TYPE, "__prepare__") => Some(builtin_method_value(&TYPE_PREPARE_METHOD)),
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
