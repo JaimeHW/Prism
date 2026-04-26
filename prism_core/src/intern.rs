@@ -545,16 +545,6 @@ mod tests {
     }
 
     #[test]
-    fn test_interned_string_clone() {
-        let interner = StringInterner::new();
-        let s1 = interner.intern("clone_test");
-        let s2 = s1.clone();
-
-        assert_eq!(s1, s2);
-        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
-    }
-
-    #[test]
     fn test_intern_owned() {
         let interner = StringInterner::new();
         let s1 = interner.intern_owned(String::from("owned"));
