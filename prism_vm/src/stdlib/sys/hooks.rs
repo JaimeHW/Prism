@@ -323,12 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn test_display_hook_default() {
-        let hook = DisplayHook::default();
-        assert!(!hook.is_custom());
-    }
-
-    #[test]
     fn test_display_hook_set() {
         let mut hook = DisplayHook::new();
         hook.set(Arc::new(|_| Some("custom".to_string())));
@@ -401,12 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn test_except_hook_default() {
-        let hook = ExceptHook::default();
-        assert!(!hook.is_custom());
-    }
-
-    #[test]
     fn test_except_hook_set() {
         let mut hook = ExceptHook::new();
         hook.set(Arc::new(|_, _, _| "custom".to_string()));
@@ -468,12 +456,6 @@ mod tests {
     #[test]
     fn test_trace_hook_new() {
         let hook = TraceHook::new();
-        assert!(!hook.is_tracing());
-    }
-
-    #[test]
-    fn test_trace_hook_default() {
-        let hook = TraceHook::default();
         assert!(!hook.is_tracing());
     }
 

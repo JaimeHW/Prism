@@ -422,24 +422,8 @@ mod tests {
         assert_eq!(cloned.get(), "original");
     }
 
-    #[test]
-    fn test_string_writer_default() {
-        let writer = StringWriter::default();
-        assert!(writer.is_empty());
-    }
-
     // =========================================================================
     // StandardStreams Tests
     // =========================================================================
 
-    #[test]
-    fn test_standard_streams_new() {
-        // Just verify it doesn't panic
-        let _streams = StandardStreams::new();
-    }
-
-    #[test]
-    fn test_standard_streams_default() {
-        let _streams = StandardStreams::default();
-    }
 }

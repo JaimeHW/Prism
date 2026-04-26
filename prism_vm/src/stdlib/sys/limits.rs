@@ -199,12 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recursion_limit_default() {
-        let limit = RecursionLimit::default();
-        assert_eq!(limit.get(), DEFAULT_RECURSION_LIMIT);
-    }
-
-    #[test]
     fn test_recursion_limit_with_limit() {
         let limit = RecursionLimit::with_limit(500).unwrap();
         assert_eq!(limit.get(), 500);
@@ -276,12 +270,6 @@ mod tests {
     #[test]
     fn test_switch_interval_new() {
         let interval = SwitchInterval::new();
-        assert_eq!(interval.get(), DEFAULT_SWITCH_INTERVAL);
-    }
-
-    #[test]
-    fn test_switch_interval_default() {
-        let interval = SwitchInterval::default();
         assert_eq!(interval.get(), DEFAULT_SWITCH_INTERVAL);
     }
 

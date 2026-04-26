@@ -49,12 +49,6 @@ mod tests {
     }
 
     #[test]
-    fn test_getppid() {
-        // Just ensure it doesn't panic
-        let _ = getppid();
-    }
-
-    #[test]
     fn test_getprocessname() {
         let name = getprocessname();
         // Should have some name

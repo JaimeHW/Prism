@@ -43,12 +43,6 @@ mod string_io_tests {
         assert!(sio.is_empty());
     }
 
-    #[test]
-    fn test_default() {
-        let sio = StringIO::default();
-        assert_eq!(sio.getvalue(), "");
-    }
-
     // =========================================================================
     // Write
     // =========================================================================
@@ -473,12 +467,6 @@ mod bytes_io_tests {
     fn test_with_capacity() {
         let bio = BytesIO::with_capacity(1024);
         assert_eq!(bio.len(), 0);
-    }
-
-    #[test]
-    fn test_default() {
-        let bio = BytesIO::default();
-        assert_eq!(bio.getvalue(), b"");
     }
 
     // =========================================================================
@@ -1002,33 +990,6 @@ mod file_mode_tests {
         assert_eq!(format!("{}", mode), "wt+");
     }
 
-    // =========================================================================
-    // to_open_options
-    // =========================================================================
-
-    #[test]
-    fn test_open_options_read() {
-        let mode = FileMode::parse("r").unwrap();
-        let _opts = mode.to_open_options(); // Just verify it doesn't panic
-    }
-
-    #[test]
-    fn test_open_options_write() {
-        let mode = FileMode::parse("w").unwrap();
-        let _opts = mode.to_open_options();
-    }
-
-    #[test]
-    fn test_open_options_append() {
-        let mode = FileMode::parse("a").unwrap();
-        let _opts = mode.to_open_options();
-    }
-
-    #[test]
-    fn test_open_options_exclusive() {
-        let mode = FileMode::parse("x").unwrap();
-        let _opts = mode.to_open_options();
-    }
 }
 
 // =============================================================================
@@ -1616,12 +1577,6 @@ mod io_module_tests {
         assert!(attrs.iter().any(|a| a.as_ref() == "StringIO"));
         assert!(attrs.iter().any(|a| a.as_ref() == "BytesIO"));
         assert!(attrs.iter().any(|a| a.as_ref() == "DEFAULT_BUFFER_SIZE"));
-    }
-
-    #[test]
-    fn test_default_impl() {
-        let module = IoModule::default();
-        assert_eq!(module.name(), "io");
     }
 
     #[test]

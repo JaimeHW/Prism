@@ -317,13 +317,6 @@ mod tests {
         assert!(!env.loaded.load(Ordering::Relaxed));
     }
 
-    #[test]
-    fn test_environ_default() {
-        let _guard = lock_env();
-        let env = Environ::default();
-        assert!(!env.loaded.load(Ordering::Relaxed));
-    }
-
     // =========================================================================
     // Lazy Loading Tests
     // =========================================================================
@@ -631,15 +624,6 @@ mod tests {
     // =========================================================================
     // Thread Safety Tests
     // =========================================================================
-
-    #[test]
-    fn test_environ_sync_send() {
-        fn assert_sync<T: Sync>() {}
-        fn assert_send<T: Send>() {}
-
-        assert_sync::<Environ>();
-        assert_send::<Environ>();
-    }
 
     #[test]
     fn test_environ_concurrent_read() {

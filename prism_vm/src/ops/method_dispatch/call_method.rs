@@ -319,21 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn test_type_id_dispatch_coverage() {
-        // Verify all handled types compile correctly
-        let types = [
-            TypeId::FUNCTION,
-            TypeId::CLOSURE,
-            TypeId::BUILTIN_FUNCTION,
-            TypeId::METHOD,
-        ];
-
-        for _t in types {
-            // Just verify these are valid TypeId values
-        }
-    }
-
-    #[test]
     fn test_implicit_self_from_slot_none_marker() {
         assert!(implicit_self_from_slot(Value::none()).is_none());
         let self_value = Value::int(7).unwrap();

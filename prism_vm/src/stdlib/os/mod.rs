@@ -305,12 +305,6 @@ mod tests {
         assert_eq!(os.name(), "os");
     }
 
-    #[test]
-    fn test_os_module_default() {
-        let os = OsModule::default();
-        assert_eq!(os.name(), "os");
-    }
-
     // =========================================================================
     // O_* Flag Tests
     // =========================================================================

@@ -329,25 +329,6 @@ pub fn get_handler(opcode: u8) -> OpHandler {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_dispatch_table_built() {
-        // Verify table is populated
-        assert!(DISPATCH_TABLE.len() == 256);
-
-        // Verify some known opcodes are not invalid
-        let nop_handler = DISPATCH_TABLE[Opcode::Nop as usize];
-        let add_handler = DISPATCH_TABLE[Opcode::Add as usize];
-
-        // Handlers should be different from op_invalid for valid opcodes
-        // (We can't easily compare function pointers, but we can verify non-panic)
-    }
-
-    #[test]
-    fn test_get_handler() {
-        let handler = get_handler(Opcode::LoadConst as u8);
-        // Just verify it doesn't panic
-    }
-
     // =========================================================================
     // ControlFlow Tests
     // =========================================================================

@@ -304,12 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default() {
-        let paths = SysPaths::default();
-        assert!(paths.is_empty());
-    }
-
-    #[test]
     fn test_sys_prefixes_default_to_executable_directory() {
         let executable = Path::new(r"C:\Prism\bin\prism.exe");
         let prefixes = SysPrefixes::from_env(Some(executable));

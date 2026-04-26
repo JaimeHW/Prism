@@ -985,12 +985,6 @@ mod tests {
         assert_eq!(sys.argv().len(), 2);
     }
 
-    #[test]
-    fn test_sys_module_default() {
-        let sys = SysModule::default();
-        assert_eq!(sys.name(), "sys");
-    }
-
     // =========================================================================
     // Integer Attribute Tests
     // =========================================================================

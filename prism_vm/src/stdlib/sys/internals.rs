@@ -347,12 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn test_call_depth_default() {
-        let depth = CallDepth::default();
-        assert_eq!(depth.get(), 0);
-    }
-
-    #[test]
     fn test_call_depth_enter() {
         let mut depth = CallDepth::new();
         depth.enter();

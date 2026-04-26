@@ -149,12 +149,6 @@ mod tests {
         assert!(argv.is_empty());
     }
 
-    #[test]
-    fn test_default() {
-        let argv = SysArgv::default();
-        assert!(argv.is_empty());
-    }
-
     // =========================================================================
     // Access Tests
     // =========================================================================

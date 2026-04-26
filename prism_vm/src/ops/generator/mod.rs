@@ -123,14 +123,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_module_exports() {
-        // Verify all public types are accessible
-        let _: fn() -> GeneratorFramePool = GeneratorFramePool::new;
-        let _: fn() -> ResumeTableCache = ResumeTableCache::new;
-        let _: fn() -> GeneratorContext = GeneratorContext::new;
-    }
-
-    #[test]
     fn test_constants() {
         assert!(MAX_INLINE_YIELD_POINTS > 0);
         assert!(INLINE_CACHE_SIZE >= 2);
