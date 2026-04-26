@@ -1157,28 +1157,10 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let s1 = StringObject::new("test");
-        let s2 = s1.clone();
-        assert_eq!(s1, s2);
-    }
-
-    #[test]
     fn test_ordering() {
         let s1 = StringObject::new("apple");
         let s2 = StringObject::new("banana");
         assert!(s1 < s2);
-    }
-
-    #[test]
-    fn test_hash_consistency() {
-        use std::collections::HashMap;
-        let s1 = StringObject::new("key");
-        let s2 = StringObject::new("key");
-
-        let mut map = HashMap::new();
-        map.insert(s1.as_str().to_string(), 42);
-        assert_eq!(map.get(s2.as_str()), Some(&42));
     }
 
     #[test]

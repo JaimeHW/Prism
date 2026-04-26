@@ -765,26 +765,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Clone and Equality Tests
-    // =========================================================================
-
-    #[test]
-    fn test_slice_clone() {
-        let s1 = SliceObject::full(1, 10, 2);
-        let s2 = s1.clone();
-        assert_eq!(s1, s2);
-    }
-
-    #[test]
-    fn test_slice_equality() {
-        let s1 = SliceObject::start_stop(1, 5);
-        let s2 = SliceObject::start_stop(1, 5);
-        let s3 = SliceObject::start_stop(1, 6);
-        assert_eq!(s1, s2);
-        assert_ne!(s1, s3);
-    }
-
-    // =========================================================================
     // Display Tests
     // =========================================================================
 

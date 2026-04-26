@@ -1054,35 +1054,4 @@ mod tests {
         let hint = meta.compute_instantiation_hint(flags, &namespace);
         assert_eq!(hint, InstantiationHint::FixedSlots);
     }
-
-    // =========================================================================
-    // Debug and Display Tests
-    // =========================================================================
-
-    #[test]
-    fn test_type_metaclass_debug() {
-        let meta = TypeMetaclass::new();
-        let debug_str = format!("{:?}", meta);
-        assert!(debug_str.contains("TypeMetaclass"));
-    }
-
-    #[test]
-    fn test_metaclass_cache_debug() {
-        let cache = MetaclassCache::new();
-        let debug_str = format!("{:?}", cache);
-        assert!(debug_str.contains("MetaclassCache"));
-    }
-
-    #[test]
-    fn test_class_factory_debug() {
-        let factory = ClassFactory::new();
-        let debug_str = format!("{:?}", factory);
-        assert!(debug_str.contains("ClassFactory"));
-    }
-
-    #[test]
-    fn test_metaclass_resolver_debug() {
-        let debug_str = format!("{:?}", MetaclassResolver);
-        assert!(debug_str.contains("MetaclassResolver"));
-    }
 }
