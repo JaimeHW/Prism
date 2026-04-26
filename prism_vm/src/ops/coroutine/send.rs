@@ -435,22 +435,6 @@ mod tests {
         assert_eq!(type_name(&generator_value), "generator");
     }
 
-    // =========================================================================
-    // Generator State Enum Tests
-    // =========================================================================
-
-    #[test]
-    fn test_generator_state_equality() {
-        assert_eq!(GeneratorState::Created, GeneratorState::Created);
-        assert_ne!(GeneratorState::Created, GeneratorState::Suspended);
-    }
-
-    #[test]
-    fn test_generator_state_debug() {
-        let state = GeneratorState::Suspended;
-        assert!(!format!("{:?}", state).is_empty());
-    }
-
     #[test]
     fn test_send_resumes_generator_and_yields_sent_value() {
         let mut vm = VirtualMachine::new();

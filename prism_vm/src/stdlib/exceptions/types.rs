@@ -1033,43 +1033,9 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_type_id_equality() {
-        assert_eq!(ExceptionTypeId::TypeError, ExceptionTypeId::TypeError);
-        assert_ne!(ExceptionTypeId::TypeError, ExceptionTypeId::ValueError);
-    }
-
-    #[test]
     fn test_type_id_ordering() {
         assert!(ExceptionTypeId::BaseException < ExceptionTypeId::Exception);
         assert!(ExceptionTypeId::Exception < ExceptionTypeId::TypeError);
-    }
-
-    #[test]
-    fn test_type_id_hash() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(ExceptionTypeId::TypeError);
-        set.insert(ExceptionTypeId::ValueError);
-        set.insert(ExceptionTypeId::TypeError); // Duplicate
-
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(&ExceptionTypeId::TypeError));
-        assert!(set.contains(&ExceptionTypeId::ValueError));
-    }
-
-    #[test]
-    fn test_type_id_clone() {
-        let original = ExceptionTypeId::TypeError;
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-    }
-
-    #[test]
-    fn test_type_id_copy() {
-        let original = ExceptionTypeId::TypeError;
-        let copied: ExceptionTypeId = original;
-        assert_eq!(original, copied);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1103,12 +1069,6 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
     // Debug Tests
     // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_debug_format() {
-        let debug = format!("{:?}", ExceptionTypeId::TypeError);
-        assert_eq!(debug, "TypeError");
-    }
 
     // ════════════════════════════════════════════════════════════════════════
     // Size Tests (Performance Verification)

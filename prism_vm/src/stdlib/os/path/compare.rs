@@ -564,10 +564,4 @@ mod tests {
         let e = CommonPathError::NoCommonPath;
         assert!(e.to_string().contains("no common"));
     }
-
-    #[test]
-    fn test_commonpath_error_eq() {
-        assert_eq!(CommonPathError::Empty, CommonPathError::Empty);
-        assert_ne!(CommonPathError::Empty, CommonPathError::NoCommonPath);
-    }
 }

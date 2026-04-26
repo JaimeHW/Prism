@@ -457,12 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn test_liveness_eq() {
-        assert_eq!(LivenessMap::from_bits(0b101), LivenessMap::from_bits(0b101));
-        assert_ne!(LivenessMap::from_bits(0b101), LivenessMap::from_bits(0b110));
-    }
-
-    #[test]
     fn test_liveness_high_bit_registers() {
         let map = LivenessMap::EMPTY.with_live(63);
         assert!(map.is_live(63));

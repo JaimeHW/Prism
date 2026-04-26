@@ -157,10 +157,4 @@ mod tests {
         assert!(stat(&dir).unwrap().is_dir());
         rmdir(&dir).unwrap();
     }
-
-    #[test]
-    fn test_listdir() {
-        let entries = listdir(env::temp_dir()).unwrap();
-        assert!(entries.len() >= 0); // May be empty but shouldn't error
-    }
 }

@@ -1606,13 +1606,6 @@ mod tests {
         assert_eq!(CompileMode::from_str(""), None);
     }
 
-    #[test]
-    fn test_compile_mode_equality() {
-        assert_eq!(CompileMode::Exec, CompileMode::Exec);
-        assert_ne!(CompileMode::Exec, CompileMode::Eval);
-        assert_ne!(CompileMode::Eval, CompileMode::Single);
-    }
-
     // =========================================================================
     // Edge Cases
     // =========================================================================

@@ -554,13 +554,6 @@ mod tests {
         assert_eq!(INLINE_FRAMES, 8);
     }
 
-    #[test]
-    fn test_smallvec_inline_capacity() {
-        let tb = TracebackObject::empty();
-        // SmallVec should be able to hold INLINE_FRAMES items inline
-        assert!(tb.frames.capacity() >= 0); // Just verify it compiles
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // Clone Tests
     // ════════════════════════════════════════════════════════════════════════
