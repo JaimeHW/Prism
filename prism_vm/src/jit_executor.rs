@@ -151,6 +151,24 @@ fn decode_jit_result(result: u64) -> (ExitReason, u32) {
     (reason, data)
 }
 
+/// Convert JIT bytecode offset metadata into the interpreter's instruction index.
+#[inline]
+fn deopt_bytecode_offset_to_ip(bc_offset: u32, instruction_count: u32) -> Option<u32> {
+    if instruction_count == 0 || bc_offset % 4 != 0 {
+        return None;
+    }
+
+    let ip = bc_offset / 4;
+    (ip <= instruction_count).then_some(ip)
+}
+
+/// Normalize an encoded deopt resume point for `Frame.ip`.
+#[inline]
+fn normalize_deopt_resume_ip(encoded: u32, instruction_count: u32) -> Option<u32> {
+    deopt_bytecode_offset_to_ip(encoded, instruction_count)
+        .or_else(|| (instruction_count != 0 && encoded <= instruction_count).then_some(encoded))
+}
+
 // =============================================================================
 // JIT Executor
 // =============================================================================
@@ -390,12 +408,18 @@ impl JitExecutor {
     #[inline]
     fn decode_deopt_offset(&self, entry: &CompiledEntry, frame: &Frame, data: u32) -> u32 {
         let encoded = (data >> 8) & 0xFFFFFF;
-        if encoded < frame.code.instructions.len() as u32 {
-            return encoded;
+        let instruction_count = frame.code.instructions.len() as u32;
+
+        if let Some(ip) = deopt_bytecode_offset_to_ip(encoded, instruction_count) {
+            return ip;
         }
-        entry
-            .lookup_deopt_bc_offset_by_index(encoded)
-            .unwrap_or(encoded)
+
+        if let Some(site_bc_offset) = entry.lookup_deopt_bc_offset_by_index(encoded) {
+            return normalize_deopt_resume_ip(site_bc_offset, instruction_count)
+                .unwrap_or(site_bc_offset);
+        }
+
+        normalize_deopt_resume_ip(encoded, instruction_count).unwrap_or(encoded)
     }
 
     /// Get code cache reference.
@@ -542,6 +566,20 @@ mod tests {
         let recovery = DeoptRecovery::from_result(&result).unwrap();
         assert_eq!(recovery.bc_offset, 42);
         assert_eq!(recovery.reason, DeoptReason::TypeGuard);
+    }
+
+    #[test]
+    fn test_deopt_bytecode_offsets_resume_at_instruction_index() {
+        assert_eq!(normalize_deopt_resume_ip(0, 4), Some(0));
+        assert_eq!(normalize_deopt_resume_ip(4, 4), Some(1));
+        assert_eq!(normalize_deopt_resume_ip(12, 4), Some(3));
+    }
+
+    #[test]
+    fn test_deopt_resume_preserves_legacy_instruction_index_payloads() {
+        assert_eq!(normalize_deopt_resume_ip(3, 8), Some(3));
+        assert_eq!(normalize_deopt_resume_ip(9, 8), None);
+        assert_eq!(normalize_deopt_resume_ip(4, 0), None);
     }
 
     #[test]
