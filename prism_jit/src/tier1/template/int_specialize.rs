@@ -130,7 +130,7 @@ impl OpcodeTemplate for IntPowerTemplate {
         emit_int_check_and_extract(ctx, scratch2, scratch2, scratch1, self.deopt_idx);
 
         // Negative exponent → deopt (result is float)
-        ctx.asm.test_rr(scratch2, scratch2);
+        ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.js(ctx.deopt_label(self.deopt_idx));
 
         // acc = base, scratch2 = exp
@@ -145,11 +145,11 @@ impl OpcodeTemplate for IntPowerTemplate {
         ctx.asm.bind_label(loop_top);
 
         // if exp == 0, done
-        ctx.asm.test_rr(scratch2, scratch2);
+        ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.jz(loop_end);
 
         // if exp & 1 == 0, skip result *= base
-        ctx.asm.test_ri(scratch2, 1);
+        ctx.asm.and_flags_ri(scratch2, 1);
         ctx.asm.jz(skip_mul);
 
         // result *= base (with overflow check)
@@ -224,7 +224,7 @@ impl OpcodeTemplate for IntAbsTemplate {
 
         // If already non-negative, skip negation
         let skip_neg = ctx.asm.create_label();
-        ctx.asm.test_rr(acc, acc);
+        ctx.asm.and_flags_rr(acc, acc);
         ctx.asm.jns(skip_neg);
 
         // Negate (can overflow for MIN_VALUE)
@@ -293,7 +293,7 @@ impl OpcodeTemplate for IntBitLengthTemplate {
         let do_bsr = ctx.asm.create_label();
 
         // If zero, result is 0
-        ctx.asm.test_rr(acc, acc);
+        ctx.asm.and_flags_rr(acc, acc);
         ctx.asm.jne(do_bsr);
 
         // result = 0 → box and store
@@ -306,7 +306,7 @@ impl OpcodeTemplate for IntBitLengthTemplate {
 
         // If negative, compute ~x (bitwise NOT)
         let skip_not = ctx.asm.create_label();
-        ctx.asm.test_rr(acc, acc);
+        ctx.asm.and_flags_rr(acc, acc);
         ctx.asm.jns(skip_not);
         ctx.asm.not(acc);
         ctx.asm.bind_label(skip_not);
@@ -386,7 +386,7 @@ impl OpcodeTemplate for IntLShiftTemplate {
         emit_int_check_and_extract(ctx, scratch2, scratch2, scratch1, self.deopt_idx);
 
         // Negative shift amount → deopt
-        ctx.asm.test_rr(scratch2, scratch2);
+        ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.js(ctx.deopt_label(self.deopt_idx));
 
         // Shift amount >= 48 → deopt (exceeds NaN-box payload width)
@@ -462,7 +462,7 @@ impl OpcodeTemplate for IntRShiftTemplate {
         emit_int_check_and_extract(ctx, scratch2, scratch2, scratch1, self.deopt_idx);
 
         // Negative shift → deopt
-        ctx.asm.test_rr(scratch2, scratch2);
+        ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.js(ctx.deopt_label(self.deopt_idx));
 
         // Clamp shift to 63 (x >> 64+ is well-defined as sign-fill in Python

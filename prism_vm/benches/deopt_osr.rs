@@ -206,7 +206,7 @@ fn bench_guard_speculation(c: &mut Criterion) {
 
     // Type-stable path (guards always pass)
     group.bench_function("stable_guards", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_type_stable_code();
 
@@ -223,7 +223,7 @@ fn bench_guard_speculation(c: &mut Criterion) {
         let code = create_type_stable_code();
 
         b.iter(|| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
             black_box(vm.execute(Arc::clone(&code)).unwrap())
         });
@@ -240,7 +240,7 @@ fn bench_osr_entry(c: &mut Criterion) {
         let code = create_osr_candidate_loop(10000);
 
         b.iter(|| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
             black_box(vm.execute(Arc::clone(&code)).unwrap())
         });
@@ -248,7 +248,7 @@ fn bench_osr_entry(c: &mut Criterion) {
 
     // Warm OSR entry (JIT already compiled)
     group.bench_function("warm_entry", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_osr_candidate_loop(10000);
 
@@ -272,7 +272,7 @@ fn bench_osr_varying_sizes(c: &mut Criterion) {
         // Cold (new VM each time)
         group.bench_with_input(BenchmarkId::new("cold", n), n, |b, _| {
             b.iter(|| {
-                let config = JitConfig::for_testing();
+                let config = JitConfig::benchmark();
                 let mut vm = VirtualMachine::with_jit_config(config);
                 black_box(vm.execute(Arc::clone(&code)).unwrap())
             });
@@ -280,7 +280,7 @@ fn bench_osr_varying_sizes(c: &mut Criterion) {
 
         // Warm (reuse VM)
         group.bench_with_input(BenchmarkId::new("warm", n), n, |b, _| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
 
             // Warm up
@@ -302,7 +302,7 @@ fn bench_speculation_vs_interpreter(c: &mut Criterion) {
 
     // With JIT and speculation
     group.bench_function("jit_speculated", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
 
         // Warm up
@@ -337,7 +337,7 @@ fn bench_warmup_iterations(c: &mut Criterion) {
             warmup_count,
             |b, &n| {
                 b.iter(|| {
-                    let config = JitConfig::for_testing();
+                    let config = JitConfig::benchmark();
                     let mut vm = VirtualMachine::with_jit_config(config);
 
                     // Run warmup iterations

@@ -507,16 +507,16 @@ impl Assembler {
         self.emit_encoded(&encode_cmp_rm(left, mem));
     }
 
-    /// TEST r64, r64
+    /// Bitwise AND into flags, r64, r64
     #[inline]
-    pub fn test_rr(&mut self, left: Gpr, right: Gpr) {
-        self.emit_encoded(&encode_test_rr(left, right));
+    pub fn and_flags_rr(&mut self, left: Gpr, right: Gpr) {
+        self.emit_encoded(&encode_and_flags_rr(left, right));
     }
 
-    /// TEST r64, imm32
+    /// Bitwise AND into flags, r64, imm32
     #[inline]
-    pub fn test_ri(&mut self, dst: Gpr, imm: i32) {
-        self.emit_encoded(&encode_test_ri32(dst, imm));
+    pub fn and_flags_ri(&mut self, dst: Gpr, imm: i32) {
+        self.emit_encoded(&encode_and_flags_ri32(dst, imm));
     }
 
     // =========================================================================

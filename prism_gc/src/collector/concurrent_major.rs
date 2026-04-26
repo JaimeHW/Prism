@@ -76,18 +76,6 @@ impl Default for ConcurrentMajorConfig {
     }
 }
 
-impl ConcurrentMajorConfig {
-    /// Create a config for testing with a single thread and small bitmap.
-    #[inline]
-    pub fn for_testing() -> Self {
-        Self {
-            marker_threads: 1,
-            work_chunk_size: 16,
-            bitmap_coverage: 64 * 1024 * 1024, // 64 MB
-        }
-    }
-}
-
 // =============================================================================
 // Phase tracking
 // =============================================================================
@@ -174,12 +162,6 @@ impl ConcurrentMajorCollector {
             satb_queue: Arc::new(SatbQueue::new()),
             phase: ConcurrentGcPhase::Idle,
         }
-    }
-
-    /// Create a collector configured for testing.
-    #[inline]
-    pub fn for_testing() -> Self {
-        Self::with_config(ConcurrentMajorConfig::for_testing())
     }
 
     // =========================================================================

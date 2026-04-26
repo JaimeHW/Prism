@@ -196,7 +196,7 @@ fn bench_integer_arithmetic(c: &mut Criterion) {
 
     // Benchmark integer addition
     group.bench_function("add", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_int_add_code(100, 200);
 
@@ -205,7 +205,7 @@ fn bench_integer_arithmetic(c: &mut Criterion) {
 
     // Benchmark integer multiplication
     group.bench_function("mul", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_mul_code(7, 8);
 
@@ -219,7 +219,7 @@ fn bench_float_arithmetic(c: &mut Criterion) {
     let mut group = c.benchmark_group("float_arithmetic");
 
     group.bench_function("add", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_float_add_code(3.14159, 2.71828);
 
@@ -237,7 +237,7 @@ fn bench_hot_loops(c: &mut Criterion) {
             BenchmarkId::from_parameter(iterations),
             iterations,
             |b, &n| {
-                let config = JitConfig::for_testing();
+                let config = JitConfig::benchmark();
                 let mut vm = VirtualMachine::with_jit_config(config);
                 let code = create_hot_loop_code(n);
 
@@ -257,14 +257,14 @@ fn bench_speculation_warmup(c: &mut Criterion) {
         let code = create_int_add_code(1, 2);
 
         b.iter(|| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
             black_box(vm.execute(Arc::clone(&code)).unwrap())
         });
     });
 
     group.bench_function("warm_repeated_execution", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_int_add_code(1, 2);
 
@@ -311,7 +311,7 @@ fn bench_vm_overhead(c: &mut Criterion) {
             first_lineno: 1,
         });
 
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
 
         b.iter(|| black_box(vm.execute(Arc::clone(&code)).unwrap()));

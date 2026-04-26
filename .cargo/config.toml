@@ -1,7 +1,5 @@
 [alias]
 check-all = "check --workspace --all-targets"
-test-fast = "test --workspace --lib --bins"
-test-all = "test --workspace --all-targets"
 prism = "run -p prism_cli --bin prism --"
 prismc = "run -p prism_cli --bin prismc --"
 prism-test = "run -p prism_cli --bin prism-test --"

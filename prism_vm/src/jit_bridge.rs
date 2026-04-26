@@ -75,19 +75,6 @@ impl Default for BridgeConfig {
 }
 
 impl BridgeConfig {
-    /// Create configuration for testing.
-    pub fn for_testing() -> Self {
-        Self {
-            enabled: true,
-            tier1_threshold: 10,
-            tier2_threshold: 100,
-            background_compilation: false,
-            enable_osr: false,
-            max_queue_size: 4,
-            max_code_size: 1024 * 1024,
-        }
-    }
-
     /// Create disabled configuration.
     pub fn disabled() -> Self {
         Self {

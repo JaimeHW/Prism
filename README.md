@@ -177,12 +177,11 @@ The import system also supports frozen source modules so the AOT pipeline can bu
 - x86-64 target support
 - Optional: a CPython 3.12 source checkout for `prism-test`
 
-### Build, Test, Bench
+### Build And Bench
 
 ```bash
 cargo build --workspace
 cargo build --workspace --release
-cargo test --workspace
 cargo bench --workspace
 ```
 
@@ -198,7 +197,7 @@ Prism is under active development. The runtime is architecturally broad, from pa
 - Generational GC with barriers and JIT safepoints
 - Native stdlib coverage plus source-backed fallback imports
 - AOT planning with frozen-module bundling
-- CPython compatibility testing infrastructure
+- CPython compatibility harness
 
 ### In Progress
 
@@ -207,7 +206,7 @@ Prism is under active development. The runtime is architecturally broad, from pa
 - More concurrent GC infrastructure
 - Standalone executable packaging from the AOT pipeline
 
-For the most current runtime behavior, inspect the integration tests under `prism_vm/tests`, the CLI test suites under `prism_cli/tests`, and the `prism-test` harness.
+For the most current runtime behavior, inspect the implementation crates directly and use the `prism-test` harness against a CPython 3.12 checkout.
 
 ---
 

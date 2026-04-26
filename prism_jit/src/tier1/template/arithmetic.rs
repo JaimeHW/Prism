@@ -213,7 +213,7 @@ impl OpcodeTemplate for IntFloorDivTemplate {
         emit_int_check_and_extract(ctx, scratch2, scratch2, scratch1, self.deopt_idx);
 
         // Check for division by zero
-        ctx.asm.test_rr(scratch2, scratch2);
+        ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.jz(ctx.deopt_label(self.deopt_idx));
 
         // Sign-extend RAX into RDX:RAX
@@ -270,7 +270,7 @@ impl OpcodeTemplate for IntModTemplate {
         emit_int_check_and_extract(ctx, scratch2, scratch2, scratch1, self.deopt_idx);
 
         // Check for division by zero
-        ctx.asm.test_rr(scratch2, scratch2);
+        ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.jz(ctx.deopt_label(self.deopt_idx));
 
         // Sign-extend RAX into RDX:RAX

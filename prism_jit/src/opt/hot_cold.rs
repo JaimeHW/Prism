@@ -71,16 +71,6 @@ impl HotColdConfig {
         }
     }
 
-    /// Test configuration.
-    pub fn for_testing() -> Self {
-        Self {
-            hot_threshold: 1.0,
-            cold_threshold: 0.01,
-            min_execution_count: 0,
-            max_cold_regions: 64,
-            cold_branch_probability: 0.05,
-        }
-    }
 }
 
 // =============================================================================

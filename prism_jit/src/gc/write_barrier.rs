@@ -371,7 +371,7 @@ impl WriteBarrier {
 
         // Check if value looks like an object pointer (simplified)
         // In real NaN-boxing, we'd check the tag bits
-        asm.test_ri(value_reg, 0x7); // Check alignment
+        asm.and_flags_ri(value_reg, 0x7); // Check alignment
         asm.jne(skip_barrier); // Skip if not 8-byte aligned
 
         // Emit the barrier

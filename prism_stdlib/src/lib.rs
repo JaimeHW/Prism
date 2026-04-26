@@ -152,7 +152,7 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
     match name {
         "builtins" | "_abc" | "_ast" | "_codecs" | "_contextvars" | "_functools" | "_imp"
         | "_random" | "_sha2" | "_socket" | "_ssl" | "_sre" | "_io" | "_string" | "_struct"
-        | "_testcapi" | "_thread" | "_tokenize" | "_tracemalloc" | "_warnings" | "_weakref"
+        | "_thread" | "_tokenize" | "_tracemalloc" | "_warnings" | "_weakref"
         | "array" | "atexit" | "math" | "errno" | "gc" | "sys" | "time" | "typing" | "signal"
         | "select" | "weakref" | "collections" | "ctypes" | "fnmatch" | "inspect" | "itertools"
         | "io" | "marshal" | "binascii" => Some(StdlibResolutionPolicy::PreferNative),

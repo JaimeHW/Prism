@@ -457,25 +457,6 @@ fn close_parent_pipe_sources_for_startup(startup: StartupInfoConfig) {
     }
 }
 
-#[cfg(all(windows, test))]
-fn pipe_duplicate_source_for_test(duplicate_handle: i64) -> Option<i64> {
-    PIPE_HANDLE_STATE
-        .lock()
-        .expect("_winapi pipe handle state mutex poisoned")
-        .duplicate_sources
-        .get(&duplicate_handle)
-        .copied()
-}
-
-#[cfg(all(windows, test))]
-fn pipe_handle_is_tracked_for_test(handle: i64) -> bool {
-    PIPE_HANDLE_STATE
-        .lock()
-        .expect("_winapi pipe handle state mutex poisoned")
-        .handles
-        .contains(&handle)
-}
-
 #[inline]
 fn tuple_value(items: Vec<Value>) -> Value {
     crate::alloc_managed_value(TupleObject::from_vec(items))

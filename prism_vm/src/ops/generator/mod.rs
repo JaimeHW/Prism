@@ -109,7 +109,3 @@ pub const INITIAL_POOL_CAPACITY: usize = 16;
 
 /// Maximum frames to keep in pool (prevents unbounded growth).
 pub const MAX_POOL_SIZE: usize = 64;
-
-// =============================================================================
-// Integration Tests
-// =============================================================================

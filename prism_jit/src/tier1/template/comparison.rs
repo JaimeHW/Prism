@@ -414,7 +414,7 @@ fn emit_float_compare(
     }
 
     // Convert 0/1 to False/True boxed boolean
-    ctx.asm.test_rr(scratch1, scratch1);
+    ctx.asm.and_flags_rr(scratch1, scratch1);
     ctx.asm.mov_ri64(acc, false_val);
     let done_label = ctx.asm.create_label();
     ctx.asm.jz(done_label);

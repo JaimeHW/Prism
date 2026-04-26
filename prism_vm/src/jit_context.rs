@@ -76,8 +76,8 @@ impl JitConfig {
         }
     }
 
-    /// Create a configuration for testing (low thresholds, sync compilation).
-    pub fn for_testing() -> Self {
+    /// Create a configuration tuned for deterministic benchmarks.
+    pub fn benchmark() -> Self {
         Self {
             enabled: true,
             background_compilation: false,
@@ -194,11 +194,6 @@ impl JitContext {
     /// Create with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(JitConfig::default())
-    }
-
-    /// Create for testing (low thresholds, synchronous compilation).
-    pub fn for_testing() -> Self {
-        Self::new(JitConfig::for_testing())
     }
 
     /// Check if JIT is enabled.

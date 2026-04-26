@@ -244,7 +244,7 @@ fn bench_string_concat(c: &mut Criterion) {
 
     // SSO strings (short, fits in inline storage)
     group.bench_function("sso_short", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_string_concat_code("hello", "world");
 
@@ -253,7 +253,7 @@ fn bench_string_concat(c: &mut Criterion) {
 
     // SSO boundary (near 23 bytes)
     group.bench_function("sso_boundary", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         // 12 + 12 = 24 bytes (just over SSO threshold)
         let code = create_string_concat_code("0123456789ab", "0123456789ab");
@@ -263,7 +263,7 @@ fn bench_string_concat(c: &mut Criterion) {
 
     // Heap strings (longer than SSO)
     group.bench_function("heap_medium", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let s = "x".repeat(50);
         let code = create_string_concat_code(&s, &s);
@@ -273,7 +273,7 @@ fn bench_string_concat(c: &mut Criterion) {
 
     // Large heap strings
     group.bench_function("heap_large", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let s = "x".repeat(1000);
         let code = create_string_concat_code(&s, &s);
@@ -289,7 +289,7 @@ fn bench_string_repeat(c: &mut Criterion) {
 
     // Small repetitions (stays in SSO)
     group.bench_function("sso_small", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_string_repeat_code("abc", 5); // 15 bytes
 
@@ -300,7 +300,7 @@ fn bench_string_repeat(c: &mut Criterion) {
     for count in [10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
         group.bench_with_input(BenchmarkId::new("repeat_x", count), count, |b, &n| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
             let code = create_string_repeat_code("x", n as i64);
 
@@ -316,7 +316,7 @@ fn bench_string_compare(c: &mut Criterion) {
 
     // Identity comparison (same interned string)
     group.bench_function("identity_match", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         // Same string literal → should be identity-comparable
         let code = create_string_compare_code("hello", "hello");
@@ -326,7 +326,7 @@ fn bench_string_compare(c: &mut Criterion) {
 
     // Content comparison (different strings, same content)
     group.bench_function("content_match_short", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_string_compare_code("hello", "hello");
 
@@ -340,7 +340,7 @@ fn bench_string_compare(c: &mut Criterion) {
 
     // Mismatch (early exit)
     group.bench_function("mismatch_early", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_string_compare_code("hello", "world");
 
@@ -349,7 +349,7 @@ fn bench_string_compare(c: &mut Criterion) {
 
     // Long string comparison
     group.bench_function("content_match_long", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let s = "x".repeat(1000);
         let code = create_string_compare_code(&s, &s);
@@ -370,7 +370,7 @@ fn bench_string_build_loop(c: &mut Criterion) {
             BenchmarkId::from_parameter(iterations),
             iterations,
             |b, &n| {
-                let config = JitConfig::for_testing();
+                let config = JitConfig::benchmark();
                 let mut vm = VirtualMachine::with_jit_config(config);
                 let code = create_string_build_loop(n as i64);
 

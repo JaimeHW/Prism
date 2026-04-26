@@ -393,7 +393,7 @@ fn create_nested_loop(n: i64) -> Arc<CodeObject> {
 
 fn run_with_jit(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, code: Arc<CodeObject>) {
     group.bench_function(BenchmarkId::new("jit", name), |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
 
         // Warm up to trigger JIT compilation
@@ -474,7 +474,7 @@ fn bench_cold_vs_warm(c: &mut Criterion) {
         let code = create_loop_sum(1000);
 
         b.iter(|| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
             black_box(vm.execute(Arc::clone(&code)).unwrap())
         });
@@ -482,7 +482,7 @@ fn bench_cold_vs_warm(c: &mut Criterion) {
 
     // Warm: reuse VM with JIT-compiled code
     group.bench_function("warm_jit", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_loop_sum(1000);
 

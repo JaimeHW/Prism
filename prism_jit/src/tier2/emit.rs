@@ -408,10 +408,10 @@ impl<'a> CodeEmitter<'a> {
             MachineOp::Test => {
                 let lhs = self.resolve_gpr(&inst.src1)?;
                 if let MachineOperand::Imm(imm) = &inst.src2 {
-                    self.asm.test_ri(lhs, *imm as i32);
+                    self.asm.and_flags_ri(lhs, *imm as i32);
                 } else {
                     let rhs = self.resolve_gpr(&inst.src2)?;
-                    self.asm.test_rr(lhs, rhs);
+                    self.asm.and_flags_rr(lhs, rhs);
                 }
             }
 

@@ -78,11 +78,6 @@ impl TemplateCompiler {
         Self::new(0)
     }
 
-    /// Create a compiler for testing.
-    pub fn new_for_testing() -> Self {
-        Self::new_runtime()
-    }
-
     /// Compile a function.
     ///
     /// This is a simplified API that takes just the essential info.

@@ -58,7 +58,3 @@ pub use traceback::{
     build_frame_info, build_frame_info_with_line, capture_traceback, extend_traceback,
     extract_traceback, has_traceback, traceback_to_value, value_to_traceback,
 };
-
-// =============================================================================
-// Integration Tests
-// =============================================================================

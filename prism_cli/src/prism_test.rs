@@ -1,6 +1,6 @@
 //! Dedicated CPython compatibility test runner for Prism.
 
-use prism_cli::cpython_tests::{
+use prism_cli::cpython_harness::{
     CliAction, SubprocessPrismExecutor, execute_cli_with_executor, help_text, parse_cli_action,
     version_text,
 };

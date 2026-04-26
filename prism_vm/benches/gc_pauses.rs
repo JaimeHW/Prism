@@ -326,7 +326,7 @@ fn bench_allocation_rate(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(*n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), n, |b, _| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
 
             // Warm up
@@ -351,7 +351,7 @@ fn bench_high_churn(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(ops));
         group.bench_with_input(BenchmarkId::from_parameter(n), n, |b, _| {
-            let config = JitConfig::for_testing();
+            let config = JitConfig::benchmark();
             let mut vm = VirtualMachine::with_jit_config(config);
 
             b.iter(|| black_box(vm.execute(Arc::clone(&code)).unwrap()));
@@ -367,7 +367,7 @@ fn bench_pause_latency(c: &mut Criterion) {
 
     // Test pause distribution under allocation load
     group.bench_function("allocation_pauses", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_allocation_loop(1000);
 
@@ -383,7 +383,7 @@ fn bench_pause_latency(c: &mut Criterion) {
     });
 
     group.bench_function("churn_pauses", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_high_churn_code(100);
 
@@ -408,7 +408,7 @@ fn bench_sustained_throughput(c: &mut Criterion) {
 
     // Measure sustained throughput over longer period
     group.bench_function("sustained_1s", |b| {
-        let config = JitConfig::for_testing();
+        let config = JitConfig::benchmark();
         let mut vm = VirtualMachine::with_jit_config(config);
         let code = create_allocation_loop(100);
 

@@ -78,17 +78,6 @@ impl CollectorConfig {
         }
     }
 
-    /// Minimal configuration for testing.
-    pub fn for_testing() -> Self {
-        Self {
-            hot_method_threshold: 10,
-            hot_loop_threshold: 100,
-            sampling_rate: 1,
-            max_tracked_units: 256,
-            track_calls: true,
-            track_types: true,
-        }
-    }
 }
 
 // =============================================================================

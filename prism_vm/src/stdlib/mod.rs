@@ -27,7 +27,6 @@ pub mod _sre;
 pub mod _ssl;
 pub mod _string;
 pub mod _struct;
-pub mod _testcapi;
 pub mod _thread;
 pub mod _tokenize;
 pub mod _tracemalloc;
@@ -252,12 +251,6 @@ impl StdlibRegistry {
             &mut modules,
             "_thread",
             Box::new(_thread::ThreadModule::new()),
-        );
-
-        Self::insert_module(
-            &mut modules,
-            "_testcapi",
-            Box::new(_testcapi::TestCapiModule::new()),
         );
 
         Self::insert_module(

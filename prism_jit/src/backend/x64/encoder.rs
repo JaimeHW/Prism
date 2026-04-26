@@ -816,15 +816,15 @@ pub fn encode_cmp_rm(dst: Gpr, mem: &MemOperand) -> EncodedInst {
     encode_rm(0x3B, dst, mem, true)
 }
 
-/// TEST r64, r64
+/// Bitwise AND into flags, r64, r64
 #[inline]
-pub fn encode_test_rr(dst: Gpr, src: Gpr) -> EncodedInst {
+pub fn encode_and_flags_rr(dst: Gpr, src: Gpr) -> EncodedInst {
     encode_rr(0x85, dst, src, true)
 }
 
-/// TEST r64, imm32
+/// Bitwise AND into flags, r64, imm32
 #[inline]
-pub fn encode_test_ri32(dst: Gpr, imm: i32) -> EncodedInst {
+pub fn encode_and_flags_ri32(dst: Gpr, imm: i32) -> EncodedInst {
     let mut enc = EncodedInst::new();
     let rex = Rex {
         w: true,

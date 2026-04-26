@@ -53,16 +53,3 @@ impl Default for RuntimeConfig {
         }
     }
 }
-
-impl RuntimeConfig {
-    /// Create a config for testing (smaller limits, synchronous compilation).
-    pub fn for_testing() -> Self {
-        Self {
-            max_code_size: 1024 * 1024, // 1MB
-            compiler_threads: 0,
-            tier_up_threshold: 10,
-            enable_osr: false,
-            enable_speculation: false,
-        }
-    }
-}

@@ -19,7 +19,6 @@ pub mod evex;
 pub mod memory;
 pub mod registers;
 pub mod simd;
-pub mod simd_integration;
 pub mod vector_spill;
 
 // Re-export commonly used types
