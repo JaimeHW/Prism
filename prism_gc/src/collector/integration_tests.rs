@@ -325,13 +325,6 @@ mod tests {
         // After collection, the SATB queue should be drained
         assert!(collector.satb_queue().is_empty());
         assert_eq!(collector.phase(), ConcurrentGcPhase::Idle);
-        // Pre-injected SATB entries are processed during remark.
-        // The count depends on whether the entries fall within bitmap
-        // coverage — simulated addresses at 0x1000/0x2000 are within
-        // the testing config's 64MB coverage, so they are processed.
-        // However, since they are not real old-gen objects, they won't
-        // result in any actual tracing work.
-        assert!(result.satb_entries_processed >= 0);
     }
 
     #[test]

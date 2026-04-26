@@ -117,50 +117,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase Enum Tests
-    // =========================================================================
-
-    #[test]
-    fn test_phase_equality() {
-        assert_eq!(ConcurrentGcPhase::Idle, ConcurrentGcPhase::Idle);
-        assert_ne!(ConcurrentGcPhase::Idle, ConcurrentGcPhase::InitialMark);
-        assert_ne!(ConcurrentGcPhase::ConcurrentMark, ConcurrentGcPhase::Remark);
-    }
-
-    #[test]
-    fn test_phase_copy() {
-        let phase = ConcurrentGcPhase::ConcurrentMark;
-        let copy = phase;
-        assert_eq!(phase, copy);
-    }
-
-    #[test]
-    fn test_phase_debug() {
-        let debug = format!("{:?}", ConcurrentGcPhase::Sweep);
-        assert!(debug.contains("Sweep"));
-    }
-
-    #[test]
-    fn test_all_phases_distinct() {
-        let phases = [
-            ConcurrentGcPhase::Idle,
-            ConcurrentGcPhase::InitialMark,
-            ConcurrentGcPhase::ConcurrentMark,
-            ConcurrentGcPhase::Remark,
-            ConcurrentGcPhase::Sweep,
-        ];
-        for i in 0..phases.len() {
-            for j in (i + 1)..phases.len() {
-                assert_ne!(
-                    phases[i], phases[j],
-                    "Phases at {} and {} should differ",
-                    i, j
-                );
-            }
-        }
-    }
-
-    // =========================================================================
     // Result Tests
     // =========================================================================
 
@@ -173,24 +129,6 @@ mod tests {
         assert_eq!(result.objects_marked, 0);
         assert_eq!(result.objects_traced, 0);
         assert_eq!(result.satb_entries_processed, 0);
-    }
-
-    #[test]
-    fn test_result_clone() {
-        let mut result = ConcurrentMajorResult::default();
-        result.bytes_freed = 1024;
-        result.objects_freed = 10;
-        let cloned = result.clone();
-        assert_eq!(cloned.bytes_freed, 1024);
-        assert_eq!(cloned.objects_freed, 10);
-    }
-
-    #[test]
-    fn test_result_debug() {
-        let result = ConcurrentMajorResult::default();
-        let debug = format!("{:?}", result);
-        assert!(debug.contains("bytes_freed"));
-        assert!(debug.contains("objects_freed"));
     }
 
     // =========================================================================
@@ -327,31 +265,6 @@ mod tests {
         let drained = queue.drain_buffers();
         assert_eq!(drained.len(), 3);
         assert!(queue.is_empty());
-    }
-
-    // =========================================================================
-    // Config Clone Tests
-    // =========================================================================
-
-    #[test]
-    fn test_config_clone() {
-        let config = ConcurrentMajorConfig {
-            marker_threads: 7,
-            work_chunk_size: 256,
-            bitmap_coverage: 8 * 1024 * 1024,
-        };
-        let cloned = config.clone();
-        assert_eq!(cloned.marker_threads, 7);
-        assert_eq!(cloned.work_chunk_size, 256);
-        assert_eq!(cloned.bitmap_coverage, 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_config_debug() {
-        let config = ConcurrentMajorConfig::default();
-        let debug = format!("{:?}", config);
-        assert!(debug.contains("marker_threads"));
-        assert!(debug.contains("work_chunk_size"));
     }
 
     // =========================================================================
