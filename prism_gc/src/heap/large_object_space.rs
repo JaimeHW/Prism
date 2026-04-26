@@ -5,6 +5,7 @@
 //! expensive copying during minor GC.
 
 use parking_lot::Mutex;
+use std::alloc::Layout;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
@@ -12,10 +13,17 @@ use std::ptr::NonNull;
 struct LargeObject {
     /// Pointer to the allocated memory.
     ptr: NonNull<u8>,
-    /// Size of the allocation.
-    size: usize,
+    /// Exact allocation layout required by the system allocator.
+    layout: Layout,
     /// GC mark flag.
     marked: bool,
+}
+
+impl LargeObject {
+    #[inline]
+    fn size(&self) -> usize {
+        self.layout.size()
+    }
 }
 
 /// Large Object Space for objects > threshold.
@@ -37,14 +45,13 @@ impl LargeObjectSpace {
 
     /// Allocate a large object.
     pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
-        let layout = std::alloc::Layout::from_size_align(size, 8).ok()?;
+        let layout = Layout::from_size_align(size, 8).ok()?;
         self.alloc_layout(layout)
     }
 
     /// Allocate a large object with an explicit layout.
-    pub fn alloc_layout(&self, layout: std::alloc::Layout) -> Option<NonNull<u8>> {
-        let size = layout.size().max(8);
-        let layout = std::alloc::Layout::from_size_align(size, layout.align()).ok()?;
+    pub fn alloc_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+        let layout = normalize_layout(layout)?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
 
         if ptr.is_null() {
@@ -60,7 +67,7 @@ impl LargeObjectSpace {
             addr,
             LargeObject {
                 ptr,
-                size: layout.size(),
+                layout,
                 marked: false,
             },
         );
@@ -76,14 +83,14 @@ impl LargeObjectSpace {
         let objects = self.objects.lock();
         let addr = ptr as usize;
         objects.values().any(|obj| {
-            addr >= obj.ptr.as_ptr() as usize && addr < obj.ptr.as_ptr() as usize + obj.size
+            addr >= obj.ptr.as_ptr() as usize && addr < obj.ptr.as_ptr() as usize + obj.size()
         })
     }
 
     /// Get the size of a large object.
     pub fn size_of(&self, ptr: *const ()) -> Option<usize> {
         let objects = self.objects.lock();
-        objects.get(&(ptr as usize)).map(|obj| obj.size)
+        objects.get(&(ptr as usize)).map(LargeObject::size)
     }
 
     /// Mark a large object as live.
@@ -124,14 +131,10 @@ impl LargeObjectSpace {
         // Free unmarked objects
         for addr in to_free {
             if let Some(obj) = objects.remove(&addr) {
-                bytes_freed += obj.size;
+                bytes_freed += obj.size();
                 objects_freed += 1;
-
-                // Deallocate
-                if let Ok(layout) = std::alloc::Layout::from_size_align(obj.size, 8) {
-                    unsafe {
-                        std::alloc::dealloc(obj.ptr.as_ptr(), layout);
-                    }
+                unsafe {
+                    std::alloc::dealloc(obj.ptr.as_ptr(), obj.layout);
                 }
             }
         }
@@ -159,9 +162,13 @@ impl LargeObjectSpace {
     {
         let objects = self.objects.lock();
         for (addr, obj) in objects.iter() {
-            f(*addr as *const (), obj.size);
+            f(*addr as *const (), obj.size());
         }
     }
+}
+
+fn normalize_layout(layout: Layout) -> Option<Layout> {
+    Layout::from_size_align(layout.size().max(8), layout.align().max(8)).ok()
 }
 
 impl Default for LargeObjectSpace {
@@ -175,10 +182,8 @@ impl Drop for LargeObjectSpace {
         // Free all remaining large objects
         let objects = self.objects.get_mut();
         for (_, obj) in objects.drain() {
-            if let Ok(layout) = std::alloc::Layout::from_size_align(obj.size, 8) {
-                unsafe {
-                    std::alloc::dealloc(obj.ptr.as_ptr(), layout);
-                }
+            unsafe {
+                std::alloc::dealloc(obj.ptr.as_ptr(), obj.layout);
             }
         }
     }
@@ -240,5 +245,50 @@ mod tests {
         assert_eq!(bytes_freed, 1024 + 2048);
         assert_eq!(objects_freed, 2);
         assert_eq!(los.count(), 0);
+    }
+
+    #[test]
+    fn test_large_object_layout_preserves_alignment() {
+        let los = LargeObjectSpace::new();
+        let layout = Layout::from_size_align(17 * 1024, 64).expect("valid layout");
+
+        let ptr = los.alloc_layout(layout).expect("Alloc failed");
+
+        assert_eq!(ptr.as_ptr() as usize % 64, 0);
+        assert_eq!(los.size_of(ptr.as_ptr() as *const ()), Some(17 * 1024));
+        assert_eq!(
+            los.objects
+                .lock()
+                .get(&(ptr.as_ptr() as usize))
+                .map(|obj| obj.layout.align()),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn test_large_object_sweep_uses_original_layout() {
+        let los = LargeObjectSpace::new();
+        let layout = Layout::from_size_align(17 * 1024, 64).expect("valid layout");
+        let ptr = los.alloc_layout(layout).expect("Alloc failed");
+
+        let (bytes_freed, objects_freed) = los.sweep();
+
+        assert_eq!(bytes_freed, 17 * 1024);
+        assert_eq!(objects_freed, 1);
+        assert_eq!(los.count(), 0);
+        assert!(!los.contains(ptr.as_ptr() as *const ()));
+    }
+
+    #[test]
+    fn test_large_object_drop_uses_original_layout() {
+        let layout = Layout::from_size_align(17 * 1024, 64).expect("valid layout");
+        let ptr_addr = {
+            let los = LargeObjectSpace::new();
+            let ptr = los.alloc_layout(layout).expect("Alloc failed");
+            assert_eq!(ptr.as_ptr() as usize % 64, 0);
+            ptr.as_ptr() as usize
+        };
+
+        assert_ne!(ptr_addr, 0);
     }
 }

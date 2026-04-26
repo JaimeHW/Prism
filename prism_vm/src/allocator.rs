@@ -194,9 +194,7 @@ impl<'h> GcAllocator<'h> {
     #[inline]
     pub fn alloc_tenured<T: Trace>(&self, value: T) -> Option<*mut T> {
         let layout = Layout::new::<T>();
-        let size = layout.size().max(8);
-
-        let ptr = self.heap.alloc_tenured(size)?;
+        let ptr = self.heap.alloc_tenured_layout(layout)?;
 
         let typed_ptr = ptr.as_ptr() as *mut T;
         unsafe {
@@ -348,23 +346,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // GcAllocator Construction Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_allocator_new() {
-        let heap = GcHeap::new(GcConfig::default());
-        let _allocator = GcAllocator::new(&heap);
-        // Just verify it compiles and doesn't panic
-    }
-
-    #[test]
-    fn test_allocator_from_heap_ext() {
-        let heap = GcHeap::new(GcConfig::default());
-        let _allocator = heap.allocator();
-    }
-
-    // -------------------------------------------------------------------------
     // Basic Allocation Tests
     // -------------------------------------------------------------------------
 
@@ -490,6 +471,29 @@ mod tests {
 
         let ptr = allocator.alloc_tenured(TestObject::new(42)).unwrap();
         // Tenured allocations go to old space
+        assert!(heap.is_old(ptr as *const ()));
+    }
+
+    #[test]
+    fn test_alloc_tenured_preserves_type_alignment() {
+        #[repr(align(64))]
+        struct AlignedObject {
+            value: u64,
+        }
+
+        unsafe impl Trace for AlignedObject {
+            fn trace(&self, _tracer: &mut dyn Tracer) {}
+        }
+
+        let heap = GcHeap::new(GcConfig::default());
+        let allocator = GcAllocator::new(&heap);
+
+        let ptr = allocator
+            .alloc_tenured(AlignedObject { value: 42 })
+            .unwrap();
+
+        assert_eq!(ptr as usize % 64, 0);
+        assert_eq!(unsafe { (*ptr).value }, 42);
         assert!(heap.is_old(ptr as *const ()));
     }
 
