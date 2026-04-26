@@ -1,0 +1,691 @@
+use super::*;
+use crate::backend::x64::Assembler;
+use crate::tier1::frame::FrameLayout;
+use crate::tier1::template::list_specialize::list_layout;
+
+// =========================================================================
+// Test Helper
+// =========================================================================
+
+/// Emit a template into an assembler, bind all deopt labels, and finalize.
+fn emit_and_finalize(template: &dyn OpcodeTemplate) -> Vec<u8> {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    {
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+        let _deopt = ctx.create_deopt_label();
+        template.emit(&mut ctx);
+        // Bind all deopt labels to current position
+        for label in &ctx.deopt_labels {
+            ctx.asm.bind_label(*label);
+        }
+    }
+    asm.finalize()
+        .expect("assembler finalization should succeed")
+}
+
+/// Create a template context with a single deopt label for testing.
+fn make_ctx<'a>(asm: &'a mut Assembler, frame: &'a FrameLayout) -> TemplateContext<'a> {
+    let mut ctx = TemplateContext::new(asm, frame);
+    ctx.create_deopt_label();
+    ctx
+}
+
+// =========================================================================
+// ListPopLastTemplate Tests
+// =========================================================================
+
+#[test]
+fn test_pop_last_creates() {
+    let tmpl = ListPopLastTemplate::new(1, 0, 0);
+    assert_eq!(tmpl.dst_reg, 1);
+    assert_eq!(tmpl.list_reg, 0);
+    assert_eq!(tmpl.deopt_idx, 0);
+}
+
+#[test]
+fn test_pop_last_estimated_size() {
+    let tmpl = ListPopLastTemplate::new(1, 0, 0);
+    assert_eq!(tmpl.estimated_size(), 160);
+}
+
+#[test]
+fn test_pop_last_emits_code() {
+    let code = emit_and_finalize(&ListPopLastTemplate::new(1, 0, 0));
+    assert!(code.len() > 30, "pop_last too short: {}", code.len());
+}
+
+#[test]
+fn test_pop_last_code_size_within_estimate() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListPopLastTemplate::new(1, 0, 0);
+    tmpl.emit(&mut ctx);
+    assert!(
+        ctx.asm.offset() <= tmpl.estimated_size(),
+        "pop_last code ({}) exceeds estimate ({})",
+        ctx.asm.offset(),
+        tmpl.estimated_size()
+    );
+}
+
+#[test]
+fn test_pop_last_different_registers() {
+    let code1 = emit_and_finalize(&ListPopLastTemplate::new(0, 1, 0));
+    let code2 = emit_and_finalize(&ListPopLastTemplate::new(2, 3, 0));
+    // Different register slots produce different code (different frame offsets)
+    assert_ne!(code1, code2);
+}
+
+#[test]
+fn test_pop_last_self_alias() {
+    // dst_reg == list_reg should still compile (overwrite is fine after loading)
+    let code = emit_and_finalize(&ListPopLastTemplate::new(0, 0, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_pop_last_high_registers() {
+    let code = emit_and_finalize(&ListPopLastTemplate::new(15, 14, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_pop_last_contains_dec_instruction() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListPopLastTemplate::new(1, 0, 0);
+    tmpl.emit(&mut ctx);
+
+    // DEC r64 encodes as REX.W FF /1 — look for 0xFF with mod=11, reg=1
+    let code = ctx.asm.code();
+    let has_dec = code.windows(2).any(|w| {
+        // FF byte with next byte's reg field = 1 (DEC) and mod=11
+        w[0] == 0xFF && (w[1] & 0xC8) == 0xC8
+    });
+    // DEC might be encoded differently depending on REX prefix presence
+    // Also accept the REX.W prefix variant
+    let has_dec_with_rex = code
+        .windows(3)
+        .any(|w| (w[0] & 0xF0) == 0x40 && w[1] == 0xFF && (w[2] & 0xC8) == 0xC8);
+    assert!(
+        has_dec || has_dec_with_rex,
+        "DEC instruction not found in pop_last emitted code"
+    );
+}
+
+#[test]
+fn test_pop_last_contains_je_for_empty_guard() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListPopLastTemplate::new(1, 0, 0);
+    tmpl.emit(&mut ctx);
+
+    // JE near is 0F 84 rel32 or JE short is 74 rel8
+    let code = ctx.asm.code();
+    let has_je_short = code.iter().any(|&b| b == 0x74);
+    let has_je_near = code.windows(2).any(|w| w[0] == 0x0F && w[1] == 0x84);
+    assert!(
+        has_je_short || has_je_near,
+        "JE (empty guard) not found in pop_last code"
+    );
+}
+
+#[test]
+fn test_pop_last_larger_than_clear() {
+    let pop_code = emit_and_finalize(&ListPopLastTemplate::new(1, 0, 0));
+    let clear_code = emit_and_finalize(&ListClearTemplate::new(0, 0));
+    assert!(
+        pop_code.len() > clear_code.len(),
+        "pop_last ({}) should be larger than clear ({})",
+        pop_code.len(),
+        clear_code.len()
+    );
+}
+
+// =========================================================================
+// ListLenTemplate Tests
+// =========================================================================
+
+#[test]
+fn test_len_creates() {
+    let tmpl = ListLenTemplate::new(1, 0, 0);
+    assert_eq!(tmpl.dst_reg, 1);
+    assert_eq!(tmpl.list_reg, 0);
+    assert_eq!(tmpl.deopt_idx, 0);
+}
+
+#[test]
+fn test_len_estimated_size() {
+    let tmpl = ListLenTemplate::new(1, 0, 0);
+    assert_eq!(tmpl.estimated_size(), 120);
+}
+
+#[test]
+fn test_len_emits_code() {
+    let code = emit_and_finalize(&ListLenTemplate::new(1, 0, 0));
+    assert!(code.len() > 20, "len too short: {}", code.len());
+}
+
+#[test]
+fn test_len_code_size_within_estimate() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListLenTemplate::new(1, 0, 0);
+    tmpl.emit(&mut ctx);
+    assert!(
+        ctx.asm.offset() <= tmpl.estimated_size(),
+        "len code ({}) exceeds estimate ({})",
+        ctx.asm.offset(),
+        tmpl.estimated_size()
+    );
+}
+
+#[test]
+fn test_len_different_registers() {
+    let code1 = emit_and_finalize(&ListLenTemplate::new(0, 1, 0));
+    let code2 = emit_and_finalize(&ListLenTemplate::new(3, 4, 0));
+    assert_ne!(code1, code2);
+}
+
+#[test]
+fn test_len_self_alias() {
+    let code = emit_and_finalize(&ListLenTemplate::new(0, 0, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_len_high_registers() {
+    let code = emit_and_finalize(&ListLenTemplate::new(15, 14, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_len_contains_int_tag_boxing() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListLenTemplate::new(1, 0, 0);
+    tmpl.emit(&mut ctx);
+
+    // The INT_TAG constant should appear in the code as a movabs immediate
+    let code = ctx.asm.code();
+    let tag_bytes = ((value_tags::QNAN_BITS | value_tags::INT_TAG) as i64).to_le_bytes();
+    let has_tag = code.windows(8).any(|w| w == tag_bytes);
+    assert!(has_tag, "INT_TAG constant not found in len emitted code");
+}
+
+#[test]
+fn test_len_generates_substantial_code() {
+    // Len produces substantial code due to int boxing (movabs for tag)
+    let len_code = emit_and_finalize(&ListLenTemplate::new(1, 0, 0));
+    assert!(
+        len_code.len() > 50,
+        "len should produce substantial code for type guard + int boxing, got {}",
+        len_code.len()
+    );
+}
+
+// =========================================================================
+// ListClearTemplate Tests
+// =========================================================================
+
+#[test]
+fn test_clear_creates() {
+    let tmpl = ListClearTemplate::new(0, 0);
+    assert_eq!(tmpl.list_reg, 0);
+    assert_eq!(tmpl.deopt_idx, 0);
+}
+
+#[test]
+fn test_clear_estimated_size() {
+    let tmpl = ListClearTemplate::new(0, 0);
+    assert_eq!(tmpl.estimated_size(), 100);
+}
+
+#[test]
+fn test_clear_emits_code() {
+    let code = emit_and_finalize(&ListClearTemplate::new(0, 0));
+    assert!(code.len() > 15, "clear too short: {}", code.len());
+}
+
+#[test]
+fn test_clear_code_size_within_estimate() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListClearTemplate::new(0, 0);
+    tmpl.emit(&mut ctx);
+    assert!(
+        ctx.asm.offset() <= tmpl.estimated_size(),
+        "clear code ({}) exceeds estimate ({})",
+        ctx.asm.offset(),
+        tmpl.estimated_size()
+    );
+}
+
+#[test]
+fn test_clear_different_registers() {
+    let code1 = emit_and_finalize(&ListClearTemplate::new(0, 0));
+    let code2 = emit_and_finalize(&ListClearTemplate::new(5, 0));
+    assert_ne!(code1, code2);
+}
+
+#[test]
+fn test_clear_high_registers() {
+    let code = emit_and_finalize(&ListClearTemplate::new(15, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_clear_contains_xor_for_zero() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListClearTemplate::new(0, 0);
+    tmpl.emit(&mut ctx);
+
+    // XOR r64, r64 can encode as:
+    //   0x33 /r (XOR r64, r/m64) with mod=11
+    //   0x31 /r (XOR r/m64, r64) with mod=11
+    // Either form with same reg in both fields zeros the register
+    let code = ctx.asm.code();
+    let has_xor = code.windows(2).any(|w| {
+        (w[0] == 0x33 || w[0] == 0x31) && (w[1] & 0xC0) == 0xC0 && ((w[1] >> 3) & 7) == (w[1] & 7)
+    });
+    let has_xor_with_rex = code
+        .windows(3)
+        .any(|w| (w[0] & 0xF0) == 0x40 && (w[1] == 0x33 || w[1] == 0x31) && (w[2] & 0xC0) == 0xC0);
+    assert!(
+        has_xor || has_xor_with_rex,
+        "XOR (zero-out) instruction not found in clear emitted code"
+    );
+}
+
+#[test]
+fn test_clear_is_compact() {
+    // Clear should produce relatively compact code: type guard + xor + store
+    let clear_code = emit_and_finalize(&ListClearTemplate::new(0, 0));
+    assert!(
+        clear_code.len() <= 100,
+        "clear code ({}) should be within estimated size (100)",
+        clear_code.len()
+    );
+}
+
+// =========================================================================
+// ListContainsTemplate Tests
+// =========================================================================
+
+#[test]
+fn test_contains_creates() {
+    let tmpl = ListContainsTemplate::new(2, 0, 1, 0);
+    assert_eq!(tmpl.dst_reg, 2);
+    assert_eq!(tmpl.list_reg, 0);
+    assert_eq!(tmpl.value_reg, 1);
+    assert_eq!(tmpl.deopt_idx, 0);
+}
+
+#[test]
+fn test_contains_estimated_size() {
+    let tmpl = ListContainsTemplate::new(2, 0, 1, 0);
+    assert_eq!(tmpl.estimated_size(), 80);
+}
+
+#[test]
+fn test_contains_emits_code() {
+    let code = emit_and_finalize(&ListContainsTemplate::new(2, 0, 1, 0));
+    assert!(code.len() > 10, "contains too short: {}", code.len());
+}
+
+#[test]
+fn test_contains_code_size_within_estimate() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListContainsTemplate::new(2, 0, 1, 0);
+    tmpl.emit(&mut ctx);
+    assert!(
+        ctx.asm.offset() <= tmpl.estimated_size(),
+        "contains code ({}) exceeds estimate ({})",
+        ctx.asm.offset(),
+        tmpl.estimated_size()
+    );
+}
+
+#[test]
+fn test_contains_different_registers() {
+    let code1 = emit_and_finalize(&ListContainsTemplate::new(2, 0, 1, 0));
+    let code2 = emit_and_finalize(&ListContainsTemplate::new(5, 3, 4, 0));
+    assert_ne!(code1, code2);
+}
+
+#[test]
+fn test_contains_high_registers() {
+    let code = emit_and_finalize(&ListContainsTemplate::new(15, 13, 14, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_contains_ends_with_jmp_deopt() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListContainsTemplate::new(2, 0, 1, 0);
+    tmpl.emit(&mut ctx);
+
+    // The last instruction should be a JMP (E9 or EB)
+    let code = ctx.asm.code();
+    let len = code.len();
+    // JMP near is E9 rel32 (5 bytes), JMP short is EB rel8 (2 bytes)
+    let ends_with_jmp = (len >= 5 && code[len - 5] == 0xE9) || (len >= 2 && code[len - 2] == 0xEB);
+    assert!(
+        ends_with_jmp,
+        "contains template should end with JMP to deopt"
+    );
+}
+
+// =========================================================================
+// ListInsertTemplate Tests
+// =========================================================================
+
+#[test]
+fn test_insert_creates() {
+    let tmpl = ListInsertTemplate::new(0, 1, 2, 0);
+    assert_eq!(tmpl.list_reg, 0);
+    assert_eq!(tmpl.index_reg, 1);
+    assert_eq!(tmpl.value_reg, 2);
+    assert_eq!(tmpl.deopt_idx, 0);
+}
+
+#[test]
+fn test_insert_estimated_size() {
+    let tmpl = ListInsertTemplate::new(0, 1, 2, 0);
+    assert_eq!(tmpl.estimated_size(), 120);
+}
+
+#[test]
+fn test_insert_emits_code() {
+    let code = emit_and_finalize(&ListInsertTemplate::new(0, 1, 2, 0));
+    assert!(code.len() > 20, "insert too short: {}", code.len());
+}
+
+#[test]
+fn test_insert_code_size_within_estimate() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListInsertTemplate::new(0, 1, 2, 0);
+    tmpl.emit(&mut ctx);
+    assert!(
+        ctx.asm.offset() <= tmpl.estimated_size(),
+        "insert code ({}) exceeds estimate ({})",
+        ctx.asm.offset(),
+        tmpl.estimated_size()
+    );
+}
+
+#[test]
+fn test_insert_different_registers() {
+    let code1 = emit_and_finalize(&ListInsertTemplate::new(0, 1, 2, 0));
+    let code2 = emit_and_finalize(&ListInsertTemplate::new(3, 4, 5, 0));
+    assert_ne!(code1, code2);
+}
+
+#[test]
+fn test_insert_high_registers() {
+    let code = emit_and_finalize(&ListInsertTemplate::new(13, 14, 15, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_insert_ends_with_jmp_deopt() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListInsertTemplate::new(0, 1, 2, 0);
+    tmpl.emit(&mut ctx);
+
+    let code = ctx.asm.code();
+    let len = code.len();
+    let ends_with_jmp = (len >= 5 && code[len - 5] == 0xE9) || (len >= 2 && code[len - 2] == 0xEB);
+    assert!(
+        ends_with_jmp,
+        "insert template should end with JMP to deopt"
+    );
+}
+
+#[test]
+fn test_insert_larger_than_contains() {
+    let insert_code = emit_and_finalize(&ListInsertTemplate::new(0, 1, 2, 0));
+    let contains_code = emit_and_finalize(&ListContainsTemplate::new(2, 0, 1, 0));
+    assert!(
+        insert_code.len() > contains_code.len(),
+        "insert ({}) should be larger than contains ({}) due to 2 type checks",
+        insert_code.len(),
+        contains_code.len()
+    );
+}
+
+// =========================================================================
+// ListRemoveTemplate Tests
+// =========================================================================
+
+#[test]
+fn test_remove_creates() {
+    let tmpl = ListRemoveTemplate::new(2, 0, 1, 0);
+    assert_eq!(tmpl.dst_reg, 2);
+    assert_eq!(tmpl.list_reg, 0);
+    assert_eq!(tmpl.index_reg, 1);
+    assert_eq!(tmpl.deopt_idx, 0);
+}
+
+#[test]
+fn test_remove_estimated_size() {
+    let tmpl = ListRemoveTemplate::new(2, 0, 1, 0);
+    assert_eq!(tmpl.estimated_size(), 120);
+}
+
+#[test]
+fn test_remove_emits_code() {
+    let code = emit_and_finalize(&ListRemoveTemplate::new(2, 0, 1, 0));
+    assert!(code.len() > 20, "remove too short: {}", code.len());
+}
+
+#[test]
+fn test_remove_code_size_within_estimate() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListRemoveTemplate::new(2, 0, 1, 0);
+    tmpl.emit(&mut ctx);
+    assert!(
+        ctx.asm.offset() <= tmpl.estimated_size(),
+        "remove code ({}) exceeds estimate ({})",
+        ctx.asm.offset(),
+        tmpl.estimated_size()
+    );
+}
+
+#[test]
+fn test_remove_different_registers() {
+    let code1 = emit_and_finalize(&ListRemoveTemplate::new(2, 0, 1, 0));
+    let code2 = emit_and_finalize(&ListRemoveTemplate::new(5, 3, 4, 0));
+    assert_ne!(code1, code2);
+}
+
+#[test]
+fn test_remove_high_registers() {
+    let code = emit_and_finalize(&ListRemoveTemplate::new(15, 13, 14, 0));
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_remove_ends_with_jmp_deopt() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    let mut ctx = make_ctx(&mut asm, &frame);
+    let tmpl = ListRemoveTemplate::new(2, 0, 1, 0);
+    tmpl.emit(&mut ctx);
+
+    let code = ctx.asm.code();
+    let len = code.len();
+    let ends_with_jmp = (len >= 5 && code[len - 5] == 0xE9) || (len >= 2 && code[len - 2] == 0xEB);
+    assert!(
+        ends_with_jmp,
+        "remove template should end with JMP to deopt"
+    );
+}
+
+#[test]
+fn test_remove_same_size_as_insert() {
+    let insert_code = emit_and_finalize(&ListInsertTemplate::new(0, 1, 2, 0));
+    let remove_code = emit_and_finalize(&ListRemoveTemplate::new(2, 0, 1, 0));
+    // Both do list type check + int type check + deopt, so they should be
+    // approximately the same size (±a few bytes for different register encoding)
+    let diff = (insert_code.len() as i64 - remove_code.len() as i64).unsigned_abs();
+    assert!(
+        diff <= 20,
+        "insert ({}) and remove ({}) should be within 20 bytes of each other",
+        insert_code.len(),
+        remove_code.len()
+    );
+}
+
+// =========================================================================
+// Cross-Template Tests
+// =========================================================================
+
+#[test]
+fn test_sequential_emission() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    {
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+        let _deopt = ctx.create_deopt_label();
+
+        let pop = ListPopLastTemplate::new(1, 0, 0);
+        let len = ListLenTemplate::new(1, 0, 0);
+        let clear = ListClearTemplate::new(0, 0);
+
+        let pos0 = ctx.asm.offset();
+        pop.emit(&mut ctx);
+        let pos1 = ctx.asm.offset();
+        len.emit(&mut ctx);
+        let pos2 = ctx.asm.offset();
+        clear.emit(&mut ctx);
+        let pos3 = ctx.asm.offset();
+
+        // Each template produces non-zero code
+        assert!(pos1 > pos0, "pop should produce code");
+        assert!(pos2 > pos1, "len should produce code");
+        assert!(pos3 > pos2, "clear should produce code");
+
+        // Bind deopt labels
+        for label in &ctx.deopt_labels {
+            ctx.asm.bind_label(*label);
+        }
+    }
+    let code = asm.finalize().expect("finalization should succeed");
+    assert!(!code.is_empty());
+}
+
+#[test]
+fn test_guard_only_templates_are_compact() {
+    // Guard-only templates (contains, insert, remove) should be compact
+    // since they just type-guard and immediately deopt.
+    let contains = emit_and_finalize(&ListContainsTemplate::new(2, 0, 1, 0)).len();
+    let insert = emit_and_finalize(&ListInsertTemplate::new(0, 1, 2, 0)).len();
+    let remove = emit_and_finalize(&ListRemoveTemplate::new(2, 0, 1, 0)).len();
+
+    // All guard-only templates should produce code
+    assert!(
+        contains > 30,
+        "contains ({}) should be non-trivial",
+        contains
+    );
+    assert!(insert > 30, "insert ({}) should be non-trivial", insert);
+    assert!(remove > 30, "remove ({}) should be non-trivial", remove);
+
+    // Insert and remove do 2 type checks; they should be larger than contains (1 check)
+    assert!(
+        insert > contains,
+        "insert ({}) should be > contains ({}) due to extra int type check",
+        insert,
+        contains
+    );
+    assert!(
+        remove > contains,
+        "remove ({}) should be > contains ({}) due to extra int type check",
+        remove,
+        contains
+    );
+}
+
+#[test]
+fn test_all_estimates_are_conservative() {
+    let templates: Vec<Box<dyn OpcodeTemplate>> = vec![
+        Box::new(ListPopLastTemplate::new(1, 0, 0)),
+        Box::new(ListLenTemplate::new(1, 0, 0)),
+        Box::new(ListClearTemplate::new(0, 0)),
+        Box::new(ListContainsTemplate::new(2, 0, 1, 0)),
+        Box::new(ListInsertTemplate::new(0, 1, 2, 0)),
+        Box::new(ListRemoveTemplate::new(2, 0, 1, 0)),
+    ];
+
+    for (i, tmpl) in templates.iter().enumerate() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(16);
+        let mut ctx = make_ctx(&mut asm, &frame);
+        tmpl.emit(&mut ctx);
+        assert!(
+            ctx.asm.offset() <= tmpl.estimated_size(),
+            "Template {} actual size ({}) exceeds estimate ({})",
+            i,
+            ctx.asm.offset(),
+            tmpl.estimated_size()
+        );
+    }
+}
+
+#[test]
+fn test_multiple_deopt_labels() {
+    let mut asm = Assembler::new();
+    let frame = FrameLayout::minimal(16);
+    {
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+        // Create multiple deopt labels
+        let _d0 = ctx.create_deopt_label();
+        let _d1 = ctx.create_deopt_label();
+        let _d2 = ctx.create_deopt_label();
+
+        ListPopLastTemplate::new(0, 1, 0).emit(&mut ctx);
+        ListLenTemplate::new(2, 3, 1).emit(&mut ctx);
+        ListClearTemplate::new(4, 2).emit(&mut ctx);
+
+        for label in &ctx.deopt_labels {
+            ctx.asm.bind_label(*label);
+        }
+    }
+    let code = asm.finalize().expect("finalization should succeed");
+    assert!(!code.is_empty());
+}
+
+// =========================================================================
+// Layout constant verification
+// =========================================================================
+
+#[test]
+fn test_reused_layout_constants_match() {
+    // Verify that the layout constants we import are consistent
+    assert_eq!(list_layout::TYPE_ID_OFFSET, 0);
+    assert_eq!(list_layout::ITEMS_PTR_OFFSET, 16);
+    assert_eq!(list_layout::ITEMS_LEN_OFFSET, 24);
+    assert_eq!(list_layout::ITEMS_CAP_OFFSET, 32);
+    assert_eq!(list_layout::VALUE_SIZE, 8);
+    assert_eq!(list_layout::LIST_TYPE_ID, 6);
+}
