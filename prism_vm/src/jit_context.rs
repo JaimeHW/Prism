@@ -13,11 +13,11 @@
 //!
 //! The context is designed for minimal overhead on the hot path:
 //! - Single Option check when JIT is disabled
-//! - Lock-free code cache lookup
+//! - VM-local quick-entry cache before the shared code cache
 //! - Stack-allocated frame state (no heap allocation)
 //! - Cold path separation for tier-up logic
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use prism_code::CodeObject;
@@ -170,6 +170,12 @@ pub struct JitContext {
     config: JitConfig,
     /// Execution statistics.
     stats: JitStats,
+    /// VM-local compiled entry cache keyed by `CodeObject` pointer.
+    ///
+    /// The shared code cache remains the source of truth for compilation and
+    /// background publishing. This per-VM mirror keeps steady-state dispatch off
+    /// the shared cache lock.
+    quick_entries: HashMap<u64, Arc<CompiledEntry>>,
     /// Reusable frame state (avoid allocation on hot path).
     #[allow(dead_code)]
     frame_state: JitFrameState,
@@ -186,6 +192,7 @@ impl JitContext {
             bridge,
             config,
             stats: JitStats::default(),
+            quick_entries: HashMap::with_capacity(64),
             frame_state: JitFrameState::default(),
             failed_tier2: HashSet::new(),
         }
@@ -206,13 +213,20 @@ impl JitContext {
     // Entry Point Dispatch (Hot Path)
     // =========================================================================
 
-    /// Look up compiled code for a function.
-    ///
-    /// This is the hot path - optimized for speed.
-    /// Returns None if no compiled code exists.
+    /// Look up compiled code for a function through the VM-local quick cache.
     #[inline]
-    pub fn lookup(&self, code_id: u64) -> Option<Arc<CompiledEntry>> {
-        self.bridge.lookup(code_id)
+    pub fn lookup(&mut self, code_id: u64) -> Option<Arc<CompiledEntry>> {
+        if !self.config.enabled {
+            return None;
+        }
+
+        if let Some(entry) = self.quick_entries.get(&code_id) {
+            return Some(Arc::clone(entry));
+        }
+
+        let entry = self.bridge.lookup(code_id)?;
+        self.quick_entries.insert(code_id, Arc::clone(&entry));
+        Some(entry)
     }
 
     /// Try to execute compiled code for a function.
@@ -361,6 +375,7 @@ impl JitContext {
                     if tier >= 2 {
                         self.failed_tier2.remove(&code_id);
                     }
+                    self.quick_entries.insert(code_id, Arc::clone(&entry));
                     self.stats.compilations_completed += 1;
                     self.stats.compiled_bytes += entry.code_size() as u64;
                     true
@@ -383,10 +398,48 @@ impl JitContext {
         }
     }
 
-    /// Query tier-up policy using the active bridge configuration.
+    /// Query tier-up policy using the VM-local quick cache before the shared cache.
     #[inline]
-    pub fn check_tier_up(&self, profiler: &Profiler, code_id: CodeId) -> TierUpDecision {
-        self.bridge.check_tier_up(profiler, code_id)
+    pub fn check_tier_up(&mut self, profiler: &Profiler, code_id: CodeId) -> TierUpDecision {
+        if !self.config.enabled {
+            return TierUpDecision::None;
+        }
+
+        let raw_code_id = code_id.0 as u64;
+        let count = profiler.call_count(code_id);
+
+        if count >= self.config.tier2_threshold {
+            if let Some(entry) = self.quick_entries.get(&raw_code_id) {
+                if entry.tier() >= 2 {
+                    return TierUpDecision::None;
+                }
+            }
+
+            if let Some(entry) = self.bridge.lookup(raw_code_id) {
+                let tier = entry.tier();
+                self.quick_entries.insert(raw_code_id, entry);
+                if tier >= 2 {
+                    return TierUpDecision::None;
+                }
+            }
+
+            return TierUpDecision::Tier2;
+        }
+
+        if count >= self.config.tier1_threshold {
+            if self.quick_entries.contains_key(&raw_code_id) {
+                return TierUpDecision::None;
+            }
+
+            if let Some(entry) = self.bridge.lookup(raw_code_id) {
+                self.quick_entries.insert(raw_code_id, entry);
+                return TierUpDecision::None;
+            }
+
+            return TierUpDecision::Tier1;
+        }
+
+        TierUpDecision::None
     }
 
     // =========================================================================
@@ -405,6 +458,7 @@ impl JitContext {
 
         // Delegate to bridge for invalidation decisions
         self.bridge.handle_deopt(code_id, reason);
+        self.quick_entries.remove(&code_id);
     }
 
     /// Handle an execution result, updating statistics as needed.
@@ -466,7 +520,8 @@ impl JitContext {
     }
 
     /// Invalidate all compiled code.
-    pub fn invalidate_all(&self) {
+    pub fn invalidate_all(&mut self) {
+        self.quick_entries.clear();
         self.bridge.invalidate_all()
     }
 }

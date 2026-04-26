@@ -12,7 +12,7 @@
 //!
 //! # Performance
 //!
-//! - Lock-free hot path for compiled code lookup
+//! - Shared compiled-code publication behind VM-local quick-entry caches
 //! - Background compilation to avoid blocking interpreter
 //! - Batched compilation requests to reduce overhead
 
@@ -174,9 +174,10 @@ impl JitBridge {
     // Compiled Code Lookup
     // =========================================================================
 
-    /// Look up compiled code for a function.
+    /// Look up compiled code in the shared cache.
     ///
-    /// This is the hot path - must be as fast as possible.
+    /// VM dispatch should normally go through `JitContext::lookup`, which keeps
+    /// a local quick-entry mirror and only calls here on cache fills.
     #[inline]
     pub fn lookup(&self, code_id: u64) -> Option<Arc<CompiledEntry>> {
         if !self.config.enabled {
