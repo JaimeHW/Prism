@@ -209,8 +209,18 @@ impl JitExecutor {
     /// The caller must ensure the compiled code is valid and the frame
     /// is properly initialized.
     pub fn execute(&mut self, entry: &CompiledEntry, frame: &mut Frame) -> ExecutionResult {
+        self.execute_with_global_scope(entry, frame, std::ptr::null())
+    }
+
+    /// Execute compiled code with an explicit global-scope pointer.
+    pub fn execute_with_global_scope(
+        &mut self,
+        entry: &CompiledEntry,
+        frame: &mut Frame,
+        global_scope: *const u64,
+    ) -> ExecutionResult {
         // Setup JIT frame state from interpreter frame
-        self.setup_frame_state(frame);
+        self.setup_frame_state(frame, global_scope);
 
         // Get the entry point
         let entry_fn: JitEntryFn = unsafe { std::mem::transmute(entry.entry_point()) };
@@ -298,7 +308,7 @@ impl JitExecutor {
         let osr_offset = osr_entry.jit_offset;
 
         // Setup frame state
-        self.setup_frame_state(frame);
+        self.setup_frame_state(frame, std::ptr::null());
         self.frame_state.bc_offset = osr_bc_offset;
 
         // Calculate OSR entry point
@@ -344,7 +354,7 @@ impl JitExecutor {
 
     /// Setup JIT frame state from interpreter frame.
     #[inline]
-    fn setup_frame_state(&mut self, frame: &Frame) {
+    fn setup_frame_state(&mut self, frame: &Frame, global_scope: *const u64) {
         self.frame_state.frame_base = frame.registers.as_ptr() as *mut u64;
         self.frame_state.num_registers = frame.code.register_count;
         self.frame_state.bc_offset = frame.ip;
@@ -352,8 +362,7 @@ impl JitExecutor {
         self.frame_state.closure_env = frame.closure.as_ref().map_or(std::ptr::null(), |closure| {
             Arc::as_ptr(closure) as *const u64
         });
-        // Global scope would be passed via VM reference
-        self.frame_state.global_scope = std::ptr::null();
+        self.frame_state.global_scope = global_scope;
     }
 
     /// Restore interpreter frame state from JIT frame.
@@ -588,7 +597,7 @@ mod tests {
         let closure = Arc::new(crate::frame::ClosureEnv::with_unbound_cells(2));
         let frame = Frame::with_closure(code, None, 0, Arc::clone(&closure));
 
-        executor.setup_frame_state(&frame);
+        executor.setup_frame_state(&frame, std::ptr::null());
         assert_eq!(
             executor.frame_state.closure_env,
             Arc::as_ptr(&closure) as *const u64
@@ -606,7 +615,23 @@ mod tests {
         ));
         let frame = Frame::new(code, None, 0);
 
-        executor.setup_frame_state(&frame);
+        executor.setup_frame_state(&frame, std::ptr::null());
         assert!(executor.frame_state.closure_env.is_null());
+    }
+
+    #[test]
+    fn test_setup_frame_state_wires_global_scope_pointer() {
+        let cache = Arc::new(CodeCache::new(1024 * 1024));
+        let mut executor = JitExecutor::new(cache);
+
+        let code = Arc::new(prism_code::CodeObject::new(
+            "jit_global_pointer_test",
+            "<test>",
+        ));
+        let frame = Frame::new(code, None, 0);
+        let global_scope = 0x1000usize as *const u64;
+
+        executor.setup_frame_state(&frame, global_scope);
+        assert_eq!(executor.frame_state.global_scope, global_scope);
     }
 }

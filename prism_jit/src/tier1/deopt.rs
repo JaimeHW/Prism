@@ -185,7 +185,7 @@ impl Default for DeoptStubGenerator {
 }
 
 #[inline]
-fn encode_deopt_exit(bc_offset: u32, reason: DeoptReason) -> u64 {
+pub(crate) fn encode_deopt_exit(bc_offset: u32, reason: DeoptReason) -> u64 {
     // VM decodes:
     // - low 8 bits: ExitReason
     // - next 8 bits: DeoptReason

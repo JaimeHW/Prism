@@ -11,7 +11,7 @@
 //! 6. Emit epilogue
 //! 7. Finalize and return executable code
 
-use super::deopt::{DeoptInfo, DeoptReason, DeoptStubGenerator};
+use super::deopt::{DeoptInfo, DeoptReason, DeoptStubGenerator, encode_deopt_exit};
 use super::frame::{FrameLayout, JitCallingConvention};
 use super::template::*;
 use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label};
@@ -222,6 +222,17 @@ impl TemplateCompiler {
         asm.ret();
     }
 
+    /// Emit an immediate exit to the interpreter for Tier 1 unsupported paths.
+    ///
+    /// Returning a deopt payload is deliberately preferable to placeholder code:
+    /// compiled execution either performs the exact fast path or resumes the
+    /// interpreter at the original bytecode offset.
+    fn emit_inline_deopt(&self, ctx: &mut TemplateContext, bc_offset: u32, reason: DeoptReason) {
+        let encoded = encode_deopt_exit(bc_offset, reason);
+        ctx.asm.mov_ri64(Gpr::Rax, encoded as i64);
+        self.emit_epilogue(ctx.asm, ctx.frame);
+    }
+
     /// Emit code for a single instruction.
     fn emit_instruction(
         &self,
@@ -232,6 +243,11 @@ impl TemplateCompiler {
         epilogue_label: Label,
         is_last_instruction: bool,
     ) {
+        if instr.requires_interpreter_in_tier1() {
+            self.emit_inline_deopt(ctx, instr.bc_offset(), DeoptReason::UncommonTrap);
+            return;
+        }
+
         match instr {
             TemplateInstruction::LoadInt { dst, value, .. } => {
                 LoadIntTemplate {
@@ -333,7 +349,7 @@ impl TemplateCompiler {
                     dst_reg: *dst,
                     obj_reg: *obj,
                     name_idx: *name_idx as u16,
-                    deopt_idx: ctx.create_deopt_label(),
+                    deopt_idx,
                     ic_site_offset: ic_offset,
                 }
                 .emit(ctx);
@@ -352,7 +368,7 @@ impl TemplateCompiler {
                     obj_reg: *obj,
                     name_idx: *name_idx as u16,
                     value_reg: *value,
-                    deopt_idx: ctx.create_deopt_label(),
+                    deopt_idx,
                     ic_site_offset: ic_offset,
                 }
                 .emit(ctx);
@@ -2106,6 +2122,80 @@ impl TemplateInstruction {
         }
     }
 
+    /// Return true for instructions whose Tier 1 template is intentionally not
+    /// implemented yet and must immediately resume in the interpreter.
+    pub fn requires_interpreter_in_tier1(&self) -> bool {
+        matches!(
+            self,
+            TemplateInstruction::LoadGlobal { .. }
+                | TemplateInstruction::StoreGlobal { .. }
+                | TemplateInstruction::DeleteGlobal { .. }
+                | TemplateInstruction::LoadClosure { .. }
+                | TemplateInstruction::StoreClosure { .. }
+                | TemplateInstruction::DeleteClosure { .. }
+                | TemplateInstruction::DelAttr { .. }
+                | TemplateInstruction::LoadMethod { .. }
+                | TemplateInstruction::GetItem { .. }
+                | TemplateInstruction::SetItem { .. }
+                | TemplateInstruction::DelItem { .. }
+                | TemplateInstruction::GetIter { .. }
+                | TemplateInstruction::ForIter { .. }
+                | TemplateInstruction::Len { .. }
+                | TemplateInstruction::IsCallable { .. }
+                | TemplateInstruction::BuildList { .. }
+                | TemplateInstruction::BuildTuple { .. }
+                | TemplateInstruction::BuildSet { .. }
+                | TemplateInstruction::BuildDict { .. }
+                | TemplateInstruction::BuildString { .. }
+                | TemplateInstruction::BuildSlice { .. }
+                | TemplateInstruction::ListAppend { .. }
+                | TemplateInstruction::SetAdd { .. }
+                | TemplateInstruction::DictSet { .. }
+                | TemplateInstruction::UnpackSequence { .. }
+                | TemplateInstruction::UnpackEx { .. }
+                | TemplateInstruction::Call { .. }
+                | TemplateInstruction::CallKw { .. }
+                | TemplateInstruction::CallMethod { .. }
+                | TemplateInstruction::TailCall { .. }
+                | TemplateInstruction::MakeFunction { .. }
+                | TemplateInstruction::MakeClosure { .. }
+                | TemplateInstruction::CallKwEx { .. }
+                | TemplateInstruction::CallEx { .. }
+                | TemplateInstruction::BuildTupleUnpack { .. }
+                | TemplateInstruction::BuildDictUnpack { .. }
+                | TemplateInstruction::Raise { .. }
+                | TemplateInstruction::Reraise { .. }
+                | TemplateInstruction::RaiseFrom { .. }
+                | TemplateInstruction::PopExceptHandler { .. }
+                | TemplateInstruction::ExceptionMatch { .. }
+                | TemplateInstruction::LoadException { .. }
+                | TemplateInstruction::PushExcInfo { .. }
+                | TemplateInstruction::PopExcInfo { .. }
+                | TemplateInstruction::HasExcInfo { .. }
+                | TemplateInstruction::ClearException { .. }
+                | TemplateInstruction::EndFinally { .. }
+                | TemplateInstruction::Yield { .. }
+                | TemplateInstruction::YieldFrom { .. }
+                | TemplateInstruction::BeforeWith { .. }
+                | TemplateInstruction::ExitWith { .. }
+                | TemplateInstruction::WithCleanup { .. }
+                | TemplateInstruction::ImportName { .. }
+                | TemplateInstruction::ImportFrom { .. }
+                | TemplateInstruction::ImportStar { .. }
+                | TemplateInstruction::MatchClass { .. }
+                | TemplateInstruction::MatchMapping { .. }
+                | TemplateInstruction::MatchSequence { .. }
+                | TemplateInstruction::MatchKeys { .. }
+                | TemplateInstruction::CopyDictWithoutKeys { .. }
+                | TemplateInstruction::GetMatchArgs { .. }
+                | TemplateInstruction::GetAwaitable { .. }
+                | TemplateInstruction::GetAIter { .. }
+                | TemplateInstruction::GetANext { .. }
+                | TemplateInstruction::EndAsyncFor { .. }
+                | TemplateInstruction::Send { .. }
+        )
+    }
+
     /// Check if this instruction can trigger deoptimization.
     pub fn can_deopt(&self) -> bool {
         matches!(
@@ -2133,6 +2223,8 @@ impl TemplateInstruction {
                 | TemplateInstruction::FloatMod { .. }
                 | TemplateInstruction::LoadGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
+                | TemplateInstruction::GetAttr { .. }
+                | TemplateInstruction::SetAttr { .. }
                 | TemplateInstruction::BranchIfTrue { .. }
                 | TemplateInstruction::BranchIfFalse { .. }
                 | TemplateInstruction::GuardInt { .. }
@@ -2250,6 +2342,36 @@ mod tests {
         let func = result.unwrap();
         // Should have deopt info for IntAdd
         assert!(!func.deopt_info.is_empty());
+    }
+
+    #[test]
+    fn test_unsupported_tier1_instruction_is_explicit_deopt() {
+        let compiler = TemplateCompiler::new_for_testing();
+        let instr = TemplateInstruction::BuildList {
+            bc_offset: 12,
+            dst: 0,
+            start: 1,
+            count: 2,
+        };
+
+        assert!(instr.requires_interpreter_in_tier1());
+        assert!(!instr.can_deopt(), "inline deopt does not need a side stub");
+        assert!(compiler.compile(4, &[instr]).is_ok());
+    }
+
+    #[test]
+    fn test_attribute_templates_register_deopt_stubs() {
+        let instr = TemplateInstruction::GetAttr {
+            bc_offset: 8,
+            dst: 0,
+            obj: 1,
+            name_idx: 2,
+            ic_site_idx: None,
+        };
+
+        assert!(!instr.requires_interpreter_in_tier1());
+        assert!(instr.can_deopt());
+        assert_eq!(instr.deopt_reason(), DeoptReason::UncommonTrap);
     }
 
     #[test]

@@ -340,7 +340,18 @@ impl JitBridge {
         entry: &CompiledEntry,
         frame: &mut crate::frame::Frame,
     ) -> ExecutionResult {
-        self.executor.execute(entry, frame)
+        self.execute_with_global_scope(entry, frame, std::ptr::null())
+    }
+
+    /// Execute compiled code with the VM global scope wired into frame state.
+    pub fn execute_with_global_scope(
+        &mut self,
+        entry: &CompiledEntry,
+        frame: &mut crate::frame::Frame,
+        global_scope: *const u64,
+    ) -> ExecutionResult {
+        self.executor
+            .execute_with_global_scope(entry, frame, global_scope)
     }
 
     /// Execute at an OSR entry point.

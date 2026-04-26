@@ -237,6 +237,17 @@ impl JitContext {
     /// is stack-allocated (no heap allocation).
     #[inline]
     pub fn try_execute(&mut self, code_id: u64, frame: &mut Frame) -> Option<ExecutionResult> {
+        self.try_execute_with_global_scope(code_id, frame, std::ptr::null())
+    }
+
+    /// Try to execute compiled code with an explicit global-scope pointer.
+    #[inline]
+    pub fn try_execute_with_global_scope(
+        &mut self,
+        code_id: u64,
+        frame: &mut Frame,
+        global_scope: *const u64,
+    ) -> Option<ExecutionResult> {
         // Fast path: lookup compiled code
         let entry = self.lookup(code_id)?;
 
@@ -244,12 +255,18 @@ impl JitContext {
         self.stats.cache_hits += 1;
 
         // Execute compiled code
-        Some(self.execute_entry(&entry, frame))
+        Some(self.execute_entry(&entry, frame, global_scope))
     }
 
     /// Execute compiled code from a cached entry.
-    fn execute_entry(&mut self, entry: &CompiledEntry, frame: &mut Frame) -> ExecutionResult {
-        self.bridge.execute(entry, frame)
+    fn execute_entry(
+        &mut self,
+        entry: &CompiledEntry,
+        frame: &mut Frame,
+        global_scope: *const u64,
+    ) -> ExecutionResult {
+        self.bridge
+            .execute_with_global_scope(entry, frame, global_scope)
     }
 
     /// Record a cache miss for statistics.

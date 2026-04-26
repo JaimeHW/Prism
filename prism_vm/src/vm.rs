@@ -1853,7 +1853,7 @@ impl VirtualMachine {
 
     fn alloc_traceback_view<T>(&self, object: T) -> Value
     where
-        T: prism_runtime::Trace,
+        T: prism_runtime::Trace + 'static,
     {
         alloc_value_in_current_heap_or_box(object)
     }
@@ -2660,6 +2660,7 @@ impl VirtualMachine {
                 Some(self.current_frame_idx as u32)
             };
 
+            let global_scope = &self.globals as *const GlobalScope as *const u64;
             let jit_outcome = {
                 let profiler = &self.profiler;
                 let (frame_pool, jit_slot) = (&mut self.frame_pool, &mut self.jit);
@@ -2682,32 +2683,38 @@ impl VirtualMachine {
                             module.clone(),
                         );
 
-                        Some(match jit.try_execute(code_ptr_id, &mut jit_frame) {
-                            Some(ExecutionResult::Return(value)) => {
-                                frame_pool.release(jit_frame);
-                                JitDispatchOutcome::Returned(value)
-                            }
-                            Some(ExecutionResult::Deopt { bc_offset, reason }) => {
-                                jit.handle_deopt(code_ptr_id, reason);
-                                jit_frame.ip = bc_offset;
-                                JitDispatchOutcome::Deopt(jit_frame)
-                            }
-                            Some(ExecutionResult::Exception(err)) => {
-                                frame_pool.release(jit_frame);
-                                JitDispatchOutcome::Exception(err)
-                            }
-                            Some(ExecutionResult::TailCall { .. }) => {
-                                // TODO: Implement tail call optimization.
-                                frame_pool.release(jit_frame);
-                                jit.record_miss();
-                                JitDispatchOutcome::Continue
-                            }
-                            None => {
-                                frame_pool.release(jit_frame);
-                                jit.record_miss();
-                                JitDispatchOutcome::Continue
-                            }
-                        })
+                        Some(
+                            match jit.try_execute_with_global_scope(
+                                code_ptr_id,
+                                &mut jit_frame,
+                                global_scope,
+                            ) {
+                                Some(ExecutionResult::Return(value)) => {
+                                    frame_pool.release(jit_frame);
+                                    JitDispatchOutcome::Returned(value)
+                                }
+                                Some(ExecutionResult::Deopt { bc_offset, reason }) => {
+                                    jit.handle_deopt(code_ptr_id, reason);
+                                    jit_frame.ip = bc_offset;
+                                    JitDispatchOutcome::Deopt(jit_frame)
+                                }
+                                Some(ExecutionResult::Exception(err)) => {
+                                    frame_pool.release(jit_frame);
+                                    JitDispatchOutcome::Exception(err)
+                                }
+                                Some(ExecutionResult::TailCall { .. }) => {
+                                    // TODO: Implement tail call optimization.
+                                    frame_pool.release(jit_frame);
+                                    jit.record_miss();
+                                    JitDispatchOutcome::Continue
+                                }
+                                None => {
+                                    frame_pool.release(jit_frame);
+                                    jit.record_miss();
+                                    JitDispatchOutcome::Continue
+                                }
+                            },
+                        )
                     } else {
                         jit.record_miss();
                         Some(JitDispatchOutcome::Continue)
@@ -2778,6 +2785,7 @@ impl VirtualMachine {
 
         let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
         let code_ptr_id = Arc::as_ptr(&code) as u64;
+        let global_scope = &self.globals as *const GlobalScope as *const u64;
         let execution_result = {
             let Some(jit) = self.jit.as_mut() else {
                 return Ok(false);
@@ -2793,7 +2801,11 @@ impl VirtualMachine {
                 return Ok(false);
             }
 
-            jit.try_execute(code_ptr_id, &mut self.frames[frame_idx])
+            jit.try_execute_with_global_scope(
+                code_ptr_id,
+                &mut self.frames[frame_idx],
+                global_scope,
+            )
         };
 
         match execution_result {
