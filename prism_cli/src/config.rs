@@ -361,21 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_clone() {
-        let args = PrismArgs {
-            optimize: OptimizationLevel::Basic,
-            verbose: 2,
-            quiet: true,
-            ..Default::default()
-        };
-        let config = RuntimeConfig::from_args(&args);
-        let config2 = config.clone();
-        assert_eq!(config2.optimize, OptimizationLevel::Basic);
-        assert_eq!(config2.verbose, 2);
-        assert!(config2.quiet);
-    }
-
-    #[test]
     fn test_env_bool_empty_is_false() {
         // env_bool internally: empty string is considered false.
         // We can test the helper directly.

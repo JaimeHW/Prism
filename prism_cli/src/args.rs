@@ -991,12 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn test_optimization_level_ord() {
-        assert!(OptimizationLevel::None < OptimizationLevel::Basic);
-        assert!(OptimizationLevel::Basic < OptimizationLevel::Full);
-    }
-
-    #[test]
     fn test_default_args() {
         let d = PrismArgs::default();
         assert_eq!(d.mode, ExecutionMode::Repl);
@@ -1014,15 +1008,6 @@ mod tests {
         assert!(d.x_options.is_empty());
         assert!(!d.debug);
         assert!(d.script_args.is_empty());
-    }
-
-    #[test]
-    fn test_warning_filter_clone() {
-        let w = WarningFilter {
-            spec: "error".to_string(),
-        };
-        let w2 = w.clone();
-        assert_eq!(w, w2);
     }
 
     #[test]

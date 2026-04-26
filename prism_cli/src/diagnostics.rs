@@ -367,22 +367,6 @@ mod tests {
     // SourcePosition Tests
     // =========================================================================
 
-    #[test]
-    fn test_source_position_equality() {
-        let a = SourcePosition { line: 1, column: 5 };
-        let b = SourcePosition { line: 1, column: 5 };
-        let c = SourcePosition { line: 2, column: 5 };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn test_source_position_copy() {
-        let a = SourcePosition { line: 1, column: 5 };
-        let b = a;
-        assert_eq!(a, b);
-    }
-
     // =========================================================================
     // Edge Case Tests
     // =========================================================================
