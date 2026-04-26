@@ -28,17 +28,21 @@ enum RangeRepr {
 
 #[inline]
 fn small_len(start: i64, stop: i64, step: i64) -> usize {
-    if step > 0 {
+    let len = if step > 0 {
         if stop <= start {
-            0
-        } else {
-            ((stop - start - 1) / step + 1) as usize
+            return 0;
         }
-    } else if stop >= start {
-        0
+        let distance = i128::from(stop) - i128::from(start) - 1;
+        distance / i128::from(step) + 1
     } else {
-        ((start - stop - 1) / (-step) + 1) as usize
-    }
+        if stop >= start {
+            return 0;
+        }
+        let distance = i128::from(start) - i128::from(stop) - 1;
+        distance / -i128::from(step) + 1
+    };
+
+    usize::try_from(len).unwrap_or(usize::MAX)
 }
 
 #[inline]
@@ -222,7 +226,7 @@ impl RangeObject {
                 } else if value > *start || value <= *stop {
                     return false;
                 }
-                (value - *start) % *step == 0
+                (i128::from(value) - i128::from(*start)) % i128::from(*step) == 0
             }
             RangeRepr::Big { start, stop, step } => {
                 let value = BigInt::from(value);
@@ -286,7 +290,11 @@ impl RangeObject {
             } => {
                 let len = small_len(*start, self.stop_i64().unwrap(), *step);
                 let last = self.get((len - 1) as i64).unwrap();
-                RangeObject::new(last, start - step, -step)
+                RangeObject::from_bigints(
+                    BigInt::from(last),
+                    BigInt::from(*start) - BigInt::from(*step),
+                    -BigInt::from(*step),
+                )
             }
             RangeRepr::Big {
                 start,
@@ -435,7 +443,10 @@ impl Iterator for RangeIterator {
                     return None;
                 }
                 let value = *current;
-                *current += *step;
+                match current.checked_add(*step) {
+                    Some(next) => *current = next,
+                    None => *current = *stop,
+                }
                 Some(bigint_to_value(BigInt::from(value)))
             }
             Self::Big {
