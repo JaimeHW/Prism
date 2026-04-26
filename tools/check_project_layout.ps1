@@ -10,13 +10,7 @@ $requiredFiles = @(
 
 $maxNewRustFileLines = 3000
 $knownLargeRustFiles = @{
-    "prism_compiler/src/compiler.rs" = $true
     "prism_jit/src/tier1/lower.rs" = $true
-    "prism_vm/src/builtins/types.rs" = $true
-    "prism_vm/src/ops/calls.rs" = $true
-    "prism_vm/src/ops/objects.rs" = $true
-    "prism_vm/src/vm.rs" = $true
-    "prism_vm/tests/integration.rs" = $true
 }
 
 $errors = New-Object System.Collections.Generic.List[string]
