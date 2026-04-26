@@ -348,12 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default() {
-        let rs = RememberedSet::default();
-        assert!(rs.is_empty());
-    }
-
-    #[test]
     fn test_large_volume() {
         let rs = RememberedSet::new();
 

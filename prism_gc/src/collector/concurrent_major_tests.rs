@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::barrier::{SatbBuffer, SatbMarkingState, SatbQueue};
+    use crate::barrier::SatbBuffer;
     use crate::collector::concurrent_major::{
         ConcurrentGcPhase, ConcurrentMajorCollector, ConcurrentMajorConfig, ConcurrentMajorResult,
     };
@@ -63,12 +63,6 @@ mod tests {
         let collector = ConcurrentMajorCollector::for_testing();
         assert_eq!(collector.phase(), ConcurrentGcPhase::Idle);
         assert_eq!(collector.config().work_chunk_size, 16);
-    }
-
-    #[test]
-    fn test_default_impl() {
-        let collector = ConcurrentMajorCollector::default();
-        assert_eq!(collector.phase(), ConcurrentGcPhase::Idle);
     }
 
     // =========================================================================

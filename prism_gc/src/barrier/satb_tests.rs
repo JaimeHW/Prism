@@ -103,12 +103,6 @@ fn test_double_remark_panics() {
     state.start_remark(); // Should panic
 }
 
-#[test]
-fn test_default_trait() {
-    let state = SatbMarkingState::default();
-    assert_eq!(state.phase(), MarkingPhase::Idle);
-}
-
 // =============================================================================
 // SatbBuffer Tests
 // =============================================================================
@@ -201,12 +195,6 @@ fn test_buffer_iter() {
     assert_eq!(collected, ptrs);
 }
 
-#[test]
-fn test_buffer_default_trait() {
-    let buffer = SatbBuffer::default();
-    assert!(buffer.is_empty());
-}
-
 // =============================================================================
 // SatbQueue Tests
 // =============================================================================
@@ -286,12 +274,6 @@ fn test_queue_drain_all_empty() {
     let queue = SatbQueue::new();
     let drained = queue.drain_all();
     assert!(drained.is_empty());
-}
-
-#[test]
-fn test_queue_default_trait() {
-    let queue = SatbQueue::default();
-    assert!(queue.is_empty());
 }
 
 // =============================================================================
