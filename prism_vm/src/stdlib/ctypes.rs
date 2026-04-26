@@ -9,6 +9,7 @@ use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::allocation_context::alloc_static_value;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
@@ -105,18 +106,13 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
 }
 
-#[inline]
-fn leak_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
-    crate::alloc_managed_value(object)
-}
-
 fn build_pythonapi() -> Value {
     let registry = shape_registry();
     let mut api = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
     for (name, callable) in pythonapi_symbols() {
         api.set_property(intern(name), api_function_value(name, callable), registry);
     }
-    leak_object_value(api)
+    alloc_static_value(api)
 }
 
 fn pythonapi_symbols() -> FxHashMap<&'static str, &'static BuiltinFunctionObject> {
@@ -137,7 +133,7 @@ fn api_function_value(name: &str, callable: &'static BuiltinFunctionObject) -> V
     function.set_property(intern("__call__"), builtin_value(callable), registry);
     function.set_property(intern("argtypes"), Value::none(), registry);
     function.set_property(intern("restype"), Value::none(), registry);
-    leak_object_value(function)
+    alloc_static_value(function)
 }
 
 fn py_object(args: &[Value]) -> Result<Value, BuiltinError> {

@@ -10,6 +10,7 @@ use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use crate::ops::calls::value_supports_call_protocol;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
+use prism_runtime::allocation_context::alloc_static_value;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -320,7 +321,7 @@ fn new_marker_value(name: &str) -> Value {
         Value::string(intern("typing")),
         registry,
     );
-    crate::alloc_managed_value(object)
+    alloc_static_value(object)
 }
 
 fn marker_name(value: Value) -> Result<InternedString, BuiltinError> {
@@ -530,6 +531,7 @@ fn typing_named_factory(factory_name: &str, args: &[Value]) -> Result<Value, Bui
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_runtime::types::string::value_as_string_ref;
 
     #[test]
     fn test_typing_module_exposes_bootstrap_surface() {
@@ -566,7 +568,12 @@ mod tests {
         let tuple = unsafe { &*(ptr as *const TupleObject) };
 
         assert_eq!(tuple.len(), 2);
-        assert_eq!(tuple.as_slice()[0], Value::string(intern("Union")));
+        assert_eq!(
+            value_as_string_ref(tuple.as_slice()[0])
+                .expect("typing placeholder name should be a string")
+                .as_str(),
+            "Union"
+        );
         assert_eq!(tuple.as_slice()[1].as_int(), Some(7));
     }
 

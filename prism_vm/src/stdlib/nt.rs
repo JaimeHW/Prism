@@ -15,6 +15,7 @@ use crate::stdlib::secure_random::urandom_value_from_args;
 use num_bigint::BigInt;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
+use prism_runtime::allocation_context::alloc_static_value;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -353,7 +354,7 @@ fn build_stat_result_class() -> Arc<PyClassObject> {
     class.set_attr(intern("__qualname__"), Value::string(intern("stat_result")));
     class.set_attr(
         intern("__match_args__"),
-        leak_object_value(TupleObject::from_vec(
+        alloc_static_value(TupleObject::from_vec(
             STAT_RESULT_MATCH_ARGS
                 .into_iter()
                 .map(|name| Value::string(intern(name)))
@@ -1488,7 +1489,7 @@ mod tests {
     use prism_runtime::types::dict::DictObject;
     use prism_runtime::types::int::value_to_bigint;
     use prism_runtime::types::set::SetObject;
-    use prism_runtime::types::tuple::TupleObject;
+    use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2189,10 +2190,7 @@ mod tests {
         let match_args = class
             .get_attr(&intern("__match_args__"))
             .expect("__match_args__ should exist");
-        let tuple_ptr = match_args
-            .as_object_ptr()
-            .expect("__match_args__ should be a tuple");
-        let tuple = unsafe { &*(tuple_ptr as *const TupleObject) };
+        let tuple = value_as_tuple_ref(match_args).expect("__match_args__ should be a tuple");
         assert_eq!(tuple.len(), STAT_RESULT_MATCH_ARGS.len());
     }
 

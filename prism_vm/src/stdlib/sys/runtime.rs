@@ -8,6 +8,7 @@ use crate::python_numeric::int_like_value;
 use num_bigint::BigInt;
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::allocation_context::alloc_static_value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -198,7 +199,7 @@ pub const fn byte_order() -> &'static str {
 /// Returns (major, minor, micro, releaselevel, serial)
 pub fn version_info_tuple() -> Value {
     static VALUE: LazyLock<Value> = LazyLock::new(|| {
-        leak_object_value(TupleObject::from_vec(vec![
+        static_object_value(TupleObject::from_vec(vec![
             Value::int(VERSION_MAJOR as i64).expect("version major fits"),
             Value::int(VERSION_MINOR as i64).expect("version minor fits"),
             Value::int(VERSION_MICRO as i64).expect("version micro fits"),
@@ -263,7 +264,7 @@ pub fn windows_version_info() -> Value {
         ] {
             version.set_property(
                 intern(name),
-                bound_builtin_attr_value(method, receiver),
+                static_bound_builtin_attr_value(method, receiver),
                 registry,
             );
         }
@@ -288,7 +289,7 @@ struct WindowsVersionData {
 
 fn windows_version_fields() -> [(&'static str, Value); 10] {
     let data = windows_version_data();
-    let platform_version = tuple_value(&[
+    let platform_version = static_tuple_value(&[
         int_value(data.platform_version[0] as i64),
         int_value(data.platform_version[1] as i64),
         int_value(data.platform_version[2] as i64),
@@ -468,13 +469,20 @@ fn int_value(value: i64) -> Value {
 }
 
 #[inline]
-fn tuple_value(values: &[Value]) -> Value {
-    leak_object_value(TupleObject::from_slice(values))
+fn static_tuple_value(values: &[Value]) -> Value {
+    static_object_value(TupleObject::from_slice(values))
 }
 
-fn bound_builtin_attr_value(function: &'static BuiltinFunctionObject, receiver: Value) -> Value {
-    let bound = function.bind(receiver);
-    crate::alloc_managed_value(bound)
+fn static_bound_builtin_attr_value(
+    function: &'static BuiltinFunctionObject,
+    receiver: Value,
+) -> Value {
+    alloc_static_value(function.bind(receiver))
+}
+
+#[inline]
+fn static_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
+    alloc_static_value(object)
 }
 
 fn windows_version_tuple(value: Value) -> Result<&'static TupleObject, BuiltinError> {
@@ -746,7 +754,7 @@ fn leak_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
 mod tests {
     use super::*;
     use prism_runtime::object::shaped_object::ShapedObject;
-    use prism_runtime::types::tuple::TupleObject;
+    use prism_runtime::types::tuple::value_as_tuple_ref;
 
     // =========================================================================
     // Version Constants Tests
@@ -914,10 +922,7 @@ mod tests {
     #[test]
     fn test_version_info_tuple_is_real_sequence() {
         let value = version_info_tuple();
-        let ptr = value
-            .as_object_ptr()
-            .expect("version_info should be a heap tuple");
-        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        let tuple = value_as_tuple_ref(value).expect("version_info should expose tuple storage");
         assert_eq!(tuple.len(), 5);
         assert_eq!(tuple.get(0).and_then(|value| value.as_int()), Some(3));
         assert_eq!(tuple.get(1).and_then(|value| value.as_int()), Some(12));
@@ -985,10 +990,8 @@ mod tests {
         let platform_version = object
             .get_property("platform_version")
             .expect("platform_version should be exposed");
-        let platform_tuple = platform_version
-            .as_object_ptr()
-            .map(|ptr| unsafe { &*(ptr as *const TupleObject) })
-            .expect("platform_version should be a tuple");
+        let platform_tuple =
+            value_as_tuple_ref(platform_version).expect("platform_version should be a tuple");
         assert_eq!(platform_tuple.len(), 3);
 
         if cfg!(windows) {
@@ -1052,11 +1055,7 @@ mod tests {
         let sliced = getitem_method
             .call(&[slice_value])
             .expect("__getitem__ should slice");
-        let tuple = unsafe {
-            &*(sliced
-                .as_object_ptr()
-                .expect("slice result should be a tuple") as *const TupleObject)
-        };
+        let tuple = value_as_tuple_ref(sliced).expect("slice result should be a tuple");
         assert_eq!(tuple.len(), 3);
         assert_eq!(tuple.get(0), object.get_property("major"));
         assert_eq!(tuple.get(1), object.get_property("minor"));

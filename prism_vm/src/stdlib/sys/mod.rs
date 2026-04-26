@@ -964,7 +964,7 @@ mod tests {
     use prism_runtime::object::shaped_object::ShapedObject;
     use prism_runtime::object::views::FrameViewObject;
     use prism_runtime::types::list::ListObject;
-    use prism_runtime::types::tuple::TupleObject;
+    use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
     use std::sync::{Arc, LazyLock, Mutex};
 
     static HOOK_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -1175,10 +1175,11 @@ mod tests {
     }
 
     #[test]
-    fn test_exit_placeholder() {
+    fn test_exit_is_callable() {
         let sys = SysModule::new();
         let exit = sys.get_attr("exit").unwrap();
-        assert!(exit.is_none()); // Placeholder for callable
+        assert!(exit.as_object_ptr().is_some());
+        assert!(value_supports_call_protocol(exit));
     }
 
     #[test]
@@ -1391,15 +1392,12 @@ mod tests {
     }
 
     #[test]
-    fn test_version_info_attribute_is_real_tuple() {
+    fn test_version_info_attribute_exposes_tuple_storage() {
         let sys = SysModule::new();
         let value = sys
             .get_attr("version_info")
             .expect("version_info should exist");
-        let ptr = value
-            .as_object_ptr()
-            .expect("version_info should be a tuple object");
-        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        let tuple = value_as_tuple_ref(value).expect("version_info should expose tuple storage");
         assert_eq!(tuple.len(), 5);
         assert_eq!(tuple.get(0).and_then(|value| value.as_int()), Some(3));
     }

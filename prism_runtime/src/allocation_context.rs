@@ -108,6 +108,18 @@ pub fn alloc_value_in_current_heap_or_box<T: Trace + 'static>(value: T) -> Value
     panic!("managed heap allocation failed after nursery and tenured allocation attempts")
 }
 
+/// Allocate an object that is intentionally owned for the lifetime of the
+/// process.
+///
+/// Use this only for process-global runtime singletons. Static caches must not
+/// allocate through the current VM heap, because that heap can disappear before
+/// the process-global value does.
+#[inline]
+pub fn alloc_static_value<T: Trace + 'static>(value: T) -> Value {
+    let ptr = Box::leak(Box::new(value)) as *mut T as *const ();
+    Value::object_ptr(ptr)
+}
+
 #[inline]
 fn alloc_value_in_heap_or_value<T: Trace>(heap: &GcHeap, value: T) -> Result<Value, T> {
     let layout = Layout::new::<T>();
@@ -206,6 +218,19 @@ mod tests {
 
         assert!(!ptr.is_null());
         assert_eq!(standalone_allocation_count(), before + 1);
+    }
+
+    #[test]
+    fn alloc_static_value_ignores_bound_heap() {
+        let heap = GcHeap::with_defaults();
+        let _binding = RuntimeHeapBinding::register(&heap);
+
+        let value = alloc_static_value(DictObject::new());
+        let ptr = value
+            .as_object_ptr()
+            .expect("static allocation should return an object pointer");
+
+        assert!(!heap.contains(ptr));
     }
 
     #[test]
