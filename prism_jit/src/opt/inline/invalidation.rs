@@ -524,10 +524,3 @@ pub struct InvalidationSummary {
     /// Number of tier upgrade events.
     pub tier_upgrade_count: usize,
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

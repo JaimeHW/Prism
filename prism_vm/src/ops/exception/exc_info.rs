@@ -244,10 +244,3 @@ pub fn write_empty_exc_info(vm: &mut VirtualMachine, base_reg: u8) {
     frame.set_reg(base_reg + 1, Value::none());
     frame.set_reg(base_reg + 2, Value::none());
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

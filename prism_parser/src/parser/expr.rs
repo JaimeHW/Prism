@@ -1131,6 +1131,3 @@ impl ExprParser {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

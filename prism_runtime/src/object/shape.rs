@@ -555,10 +555,3 @@ pub fn shape_registry() -> &'static ShapeRegistry {
 pub fn init_shape_registry() {
     let _ = shape_registry();
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

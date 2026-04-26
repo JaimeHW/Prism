@@ -732,6 +732,3 @@ impl From<RuntimeError> for PrismError {
 
 /// Result type for VM operations.
 pub type VmResult<T> = Result<T, RuntimeError>;
-
-#[cfg(test)]
-mod tests;

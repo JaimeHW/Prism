@@ -35,12 +35,4 @@ impl<T> PinnedObjectStore<T> {
             .push(pinned);
         ptr
     }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.objects
-            .lock()
-            .expect("pinned object store mutex poisoned")
-            .len()
-    }
 }

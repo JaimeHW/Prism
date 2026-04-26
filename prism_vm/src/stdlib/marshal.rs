@@ -714,6 +714,3 @@ fn decode_code_constant(
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

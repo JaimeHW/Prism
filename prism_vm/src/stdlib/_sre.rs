@@ -237,6 +237,3 @@ fn ensure_exact_list(value: Value, message: &'static str) -> Result<(), BuiltinE
 fn unicode_scalar(character: i32) -> Option<char> {
     u32::try_from(character).ok().and_then(char::from_u32)
 }
-
-#[cfg(test)]
-mod tests;

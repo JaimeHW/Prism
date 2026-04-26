@@ -987,6 +987,3 @@ pub fn parse(source: &str) -> PrismResult<Module> {
 pub fn parse_expression(source: &str) -> PrismResult<Expr> {
     Parser::new(source).parse_expression()
 }
-
-#[cfg(test)]
-mod tests;

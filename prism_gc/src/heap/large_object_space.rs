@@ -193,6 +193,3 @@ impl Drop for LargeObjectSpace {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

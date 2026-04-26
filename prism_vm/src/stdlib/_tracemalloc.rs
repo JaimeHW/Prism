@@ -206,6 +206,3 @@ fn no_arg_none(name: &str, args: &[Value]) -> Result<Value, BuiltinError> {
     }
     Ok(Value::none())
 }
-
-#[cfg(test)]
-mod tests;

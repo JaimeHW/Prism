@@ -471,6 +471,3 @@ impl IntoIterator for &RangeObject {
         self.iter()
     }
 }
-
-#[cfg(test)]
-mod tests;

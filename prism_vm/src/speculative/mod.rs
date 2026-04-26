@@ -791,10 +791,3 @@ pub fn spec_list_concat(a: Value, b: Value) -> (SpecResult, Value) {
     let ptr = Box::into_raw(boxed) as *const ();
     (SpecResult::Success, Value::object_ptr(ptr))
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

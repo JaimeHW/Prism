@@ -1610,6 +1610,3 @@ impl StmtParser {
         Ok(stmts)
     }
 }
-
-#[cfg(test)]
-mod tests;

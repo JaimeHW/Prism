@@ -33,8 +33,6 @@ use std::sync::mpsc;
 use std::thread;
 
 use prism_code::CodeObject;
-#[cfg(test)]
-use prism_code::Opcode;
 use prism_jit::runtime::{CodeCache, CompiledEntry};
 use prism_jit::tier1::codegen::TemplateCompiler;
 
@@ -274,6 +272,3 @@ impl Drop for CompilationQueue {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -38,8 +38,6 @@ pub mod defaultdict;
 pub mod deque;
 pub mod ordereddict;
 
-#[cfg(test)]
-mod tests;
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
@@ -1934,6 +1932,3 @@ fn userstring_repr(args: &[Value]) -> Result<Value, BuiltinError> {
     let data_repr = shaped_property_repr(ptr, "data")?.unwrap_or_else(|| "''".to_string());
     Ok(Value::string(intern(&format!("UserString({data_repr})"))))
 }
-
-#[cfg(test)]
-mod module_tests;

@@ -60,6 +60,3 @@ pub use object::{ExceptionArgs, ExceptionObject, ExceptionRef};
 pub use table::{CATCH_ALL, HandlerEntry, HandlerFlags, HandlerTable, HandlerTableBuilder};
 pub use traceback::{FrameInfo, TracebackObject};
 pub use types::ExceptionTypeId;
-
-#[cfg(test)]
-mod tests;

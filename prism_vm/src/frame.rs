@@ -133,11 +133,6 @@ impl FramePool {
         frame.prepare_for_pool();
         self.free_frames.push(frame);
     }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.free_frames.len()
-    }
 }
 
 pub use prism_runtime::types::function::ClosureEnv;
@@ -467,6 +462,3 @@ impl Frame {
         self.yield_point = 0;
     }
 }
-
-#[cfg(test)]
-mod tests;

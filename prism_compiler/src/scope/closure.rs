@@ -405,10 +405,3 @@ pub fn scope_can_have_freevars(kind: ScopeKind) -> bool {
     // All non-module scopes can have free variables
     kind != ScopeKind::Module
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

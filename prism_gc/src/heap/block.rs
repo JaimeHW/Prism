@@ -233,6 +233,3 @@ impl Drop for Block {
 
 // Safety: Block can be sent between threads.
 unsafe impl Send for Block {}
-
-#[cfg(test)]
-mod tests;

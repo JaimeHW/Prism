@@ -463,10 +463,3 @@ impl std::fmt::Display for CompilationError {
 }
 
 impl std::error::Error for CompilationError {}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

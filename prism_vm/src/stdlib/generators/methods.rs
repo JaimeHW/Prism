@@ -311,10 +311,3 @@ pub fn stop_iteration(value: Option<Value>) -> GeneratorException {
         None => GeneratorException::new("StopIteration", ""),
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests;

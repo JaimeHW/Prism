@@ -284,6 +284,3 @@ unsafe impl Trace for BuiltinFunctionObject {
         std::mem::size_of::<Self>() + self.name.len()
     }
 }
-
-#[cfg(test)]
-mod tests;

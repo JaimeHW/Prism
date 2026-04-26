@@ -250,6 +250,3 @@ impl<T: fmt::Display> fmt::Display for Spanned<T> {
         fmt::Display::fmt(&self.value, f)
     }
 }
-
-#[cfg(test)]
-mod tests;

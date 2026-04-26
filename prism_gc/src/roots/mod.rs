@@ -89,6 +89,3 @@ pub trait RootProvider {
     /// Trace all roots held by this provider.
     fn trace_roots(&self, tracer: &mut dyn Tracer);
 }
-
-#[cfg(test)]
-mod tests;

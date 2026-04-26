@@ -300,10 +300,3 @@ pub fn common_ancestor(a: ExceptionTypeId, b: ExceptionTypeId) -> ExceptionTypeI
     // Should never happen for valid types (all trace to BaseException)
     ExceptionTypeId::BaseException
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -474,6 +474,3 @@ fn siphash13(k0: u64, k1: u64, source: &[u8]) -> u64 {
 
     (v0 ^ v1) ^ (v2 ^ v3)
 }
-
-#[cfg(test)]
-mod tests;

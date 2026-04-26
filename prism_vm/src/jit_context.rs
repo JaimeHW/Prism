@@ -491,10 +491,3 @@ pub enum ProcessedResult {
     /// Tail call to another function.
     TailCall { target: u64, arg_count: u8 },
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

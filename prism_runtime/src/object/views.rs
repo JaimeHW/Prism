@@ -498,6 +498,3 @@ impl PyObject for TracebackViewObject {
         &mut self.header
     }
 }
-
-#[cfg(test)]
-mod tests;

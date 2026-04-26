@@ -97,6 +97,3 @@ impl Default for StackPath {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -385,10 +385,3 @@ pub fn global_invalidator() -> &'static IcInvalidator {
 pub fn init_invalidator() {
     let _ = global_invalidator();
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

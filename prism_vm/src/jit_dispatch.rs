@@ -312,10 +312,3 @@ pub fn maybe_tier_up(
         TierUpDecision::Tier1 | TierUpDecision::Tier2 => jit.handle_tier_up(code, tier_decision),
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -989,6 +989,3 @@ fn crc_hqx_update(data: &[u8], crc: u32) -> u32 {
     }
     crc
 }
-
-#[cfg(test)]
-mod tests;

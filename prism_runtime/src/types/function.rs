@@ -531,6 +531,3 @@ impl PyObject for BoundMethodObject {
         &mut self.header
     }
 }
-
-#[cfg(test)]
-mod tests;

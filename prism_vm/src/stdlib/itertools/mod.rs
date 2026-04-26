@@ -24,8 +24,6 @@ pub mod infinite;
 pub mod recipes;
 pub mod terminating;
 
-#[cfg(test)]
-mod tests;
 
 // Re-export all public types for convenience
 pub use combinatoric::{Combinations, CombinationsWithReplacement, Permutations, Product};
@@ -390,6 +388,3 @@ fn builtin_permutations(args: &[Value]) -> Result<Value, BuiltinError> {
         .collect::<Vec<_>>();
     Ok(iterator_value(IteratorObject::from_values(tuples)))
 }
-
-#[cfg(test)]
-mod mod_tests;

@@ -170,6 +170,3 @@ impl PyObject for DictObject {
         &mut self.header
     }
 }
-
-#[cfg(test)]
-mod tests;

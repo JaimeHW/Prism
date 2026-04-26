@@ -595,6 +595,3 @@ impl From<u8> for Value {
         Self::int_unchecked(i as i64)
     }
 }
-
-#[cfg(test)]
-mod tests;

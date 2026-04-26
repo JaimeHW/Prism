@@ -924,10 +924,3 @@ unsafe fn finalize_iterator(ptr: *mut ()) {
     // SAFETY: Caller guarantees ptr points to valid IteratorObject
     unsafe { std::ptr::drop_in_place(ptr as *mut IteratorObject) };
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

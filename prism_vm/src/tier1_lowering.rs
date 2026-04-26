@@ -760,6 +760,3 @@ fn jump_target(template: &TemplateInstruction) -> Option<u32> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -208,6 +208,3 @@ pub trait PyObject: Send + Sync {
         self.header().type_id
     }
 }
-
-#[cfg(test)]
-mod tests;

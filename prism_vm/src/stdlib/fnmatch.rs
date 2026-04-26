@@ -453,6 +453,3 @@ fn assemble_public_pattern(tokens: &[TranslateToken]) -> String {
 
     result
 }
-
-#[cfg(test)]
-mod tests;

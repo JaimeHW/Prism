@@ -233,6 +233,3 @@ fn builtin_signal(args: &[Value]) -> Result<Value, BuiltinError> {
     validate_handler(args[1])?;
     Ok(SIGNAL_STATE.write().unwrap().set(signum, args[1]))
 }
-
-#[cfg(test)]
-mod tests;

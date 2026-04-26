@@ -300,6 +300,3 @@ fn unsupported(module_name: &str, stmt: &Stmt, message: &str) -> NativeLoweringE
         stmt.span.start, stmt.span.end
     ))
 }
-
-#[cfg(test)]
-mod tests;

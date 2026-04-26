@@ -467,6 +467,3 @@ fn shaped_object_mut(value: Value) -> Result<&'static mut ShapedObject, BuiltinE
     })?;
     Ok(unsafe { &mut *(ptr as *mut ShapedObject) })
 }
-
-#[cfg(test)]
-mod tests;

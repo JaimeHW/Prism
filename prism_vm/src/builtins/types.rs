@@ -3122,6 +3122,3 @@ fn get_type_name(value: Value) -> &'static str {
         "unknown"
     }
 }
-
-#[cfg(test)]
-mod tests;

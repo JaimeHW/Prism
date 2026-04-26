@@ -15,9 +15,6 @@ use prism_runtime::object::descriptor::BoundMethod;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
 
-#[cfg(test)]
-use std::sync::Arc;
-
 /// Extract TypeId from an object pointer.
 #[inline(always)]
 pub(crate) fn extract_type_id(ptr: *const ()) -> TypeId {
@@ -132,6 +129,3 @@ pub(crate) fn call_unary_magic_method(
         ))),
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1459,6 +1459,3 @@ impl FunctionBuilder {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

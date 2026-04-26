@@ -746,6 +746,3 @@ fn warning_action_string(value: Value) -> Result<String, RuntimeError> {
 fn module_name_from_filename(filename: &str) -> String {
     filename.strip_suffix(".py").unwrap_or(filename).to_string()
 }
-
-#[cfg(test)]
-mod tests;

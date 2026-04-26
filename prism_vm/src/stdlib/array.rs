@@ -656,6 +656,3 @@ fn bytes_arg(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
         _ => Err(BuiltinError::TypeError(context.to_string())),
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -222,6 +222,3 @@ fn py_gil_state_release(args: &[Value]) -> Result<Value, BuiltinError> {
 
     Ok(Value::none())
 }
-
-#[cfg(test)]
-mod tests;

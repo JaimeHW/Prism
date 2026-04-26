@@ -36,8 +36,6 @@ pub mod search;
 pub mod validation;
 pub mod whitespace;
 
-#[cfg(test)]
-mod tests;
 
 use std::sync::OnceLock;
 

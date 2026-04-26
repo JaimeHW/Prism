@@ -317,10 +317,3 @@ impl CalleeProvider for CompositeProvider {
         self.providers.iter().any(|p| p.is_intrinsic(func_id))
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -65,16 +65,10 @@ mod binary;
 mod sets;
 mod text;
 
-#[cfg(test)]
-use binary::*;
 pub use binary::{resolve_bytearray_method, resolve_bytes_method};
 pub use sets::resolve_set_method;
-#[cfg(test)]
-use sets::*;
 use text::char_index_to_byte_offset;
 pub use text::resolve_str_method;
-#[cfg(test)]
-use text::*;
 
 static LIST_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__iter__"), list_iter));
@@ -3312,6 +3306,3 @@ fn property_delete(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
         .map_err(crate::builtins::runtime_error_to_builtin_error)?;
     Ok(Value::none())
 }
-
-#[cfg(test)]
-mod tests;

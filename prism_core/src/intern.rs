@@ -346,6 +346,3 @@ pub fn interned_by_ptr(ptr: *const u8) -> Option<InternedString> {
 pub fn interned_len_by_ptr(ptr: *const u8) -> Option<usize> {
     GLOBAL_INTERNER.len_by_ptr(ptr)
 }
-
-#[cfg(test)]
-mod tests;

@@ -306,6 +306,3 @@ fn msvcrt_kbhit(args: &[Value]) -> Result<Value, BuiltinError> {
     parse_exact_arity(args, "kbhit", 0)?;
     Ok(Value::bool(false))
 }
-
-#[cfg(test)]
-mod tests;

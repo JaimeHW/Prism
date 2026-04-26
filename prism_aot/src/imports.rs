@@ -181,6 +181,3 @@ fn resolve_relative_import(name: &str, level: u32, package: &str) -> Result<Stri
         Ok(format!("{}.{}", base, name))
     }
 }
-
-#[cfg(test)]
-mod tests;

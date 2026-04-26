@@ -61,7 +61,6 @@ libm = "0.2"
 memchr = "2.7"
 regex = "1.10"
 sha2 = "0.10"
-tempfile = "3.10"
 windows-sys = "0.59"
 
 [profile.release]

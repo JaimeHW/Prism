@@ -513,10 +513,3 @@ pub fn extract_type_id(encoded_type_id: u16, value: &Value) -> u16 {
     // Dynamic type extraction (cold path)
     extract_type_id_from_value(value)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

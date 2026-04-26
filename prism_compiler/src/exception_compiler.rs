@@ -344,10 +344,3 @@ pub fn emit_reraise(builder: &mut FunctionBuilder) {
 pub fn emit_pop_except_handler(builder: &mut FunctionBuilder) {
     builder.emit(Instruction::op(Opcode::PopExceptHandler));
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

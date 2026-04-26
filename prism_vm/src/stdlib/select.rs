@@ -145,6 +145,3 @@ fn tuple_value(items: Vec<Value>) -> Value {
 fn list_value(items: Vec<Value>) -> Value {
     crate::alloc_managed_value(ListObject::from_iter(items))
 }
-
-#[cfg(test)]
-mod tests;

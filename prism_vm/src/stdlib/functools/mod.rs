@@ -29,8 +29,6 @@ pub mod partial;
 pub mod reduce;
 pub mod wraps;
 
-#[cfg(test)]
-mod tests;
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
@@ -203,6 +201,3 @@ fn builtin_identity_decorator(args: &[Value]) -> Result<Value, BuiltinError> {
 
     Ok(args[0])
 }
-
-#[cfg(test)]
-mod module_tests;

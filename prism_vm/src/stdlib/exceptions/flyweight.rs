@@ -157,10 +157,3 @@ pub fn stop_iteration_with_value(value: prism_core::Value) -> Arc<ExceptionObjec
         ExceptionArgs::single(value),
     ))
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests;

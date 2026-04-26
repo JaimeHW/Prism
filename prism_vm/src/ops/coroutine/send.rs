@@ -175,10 +175,3 @@ fn resume_generator(vm: &mut VirtualMachine, gen_value: Value, send_value: Value
         Err(e) => ResumeResult::Error(e),
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

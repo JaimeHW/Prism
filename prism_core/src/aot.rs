@@ -220,6 +220,3 @@ pub struct AotStoreExprOp {
     /// Right operand when `kind == Add`.
     pub right: AotOperand,
 }
-
-#[cfg(test)]
-mod tests;

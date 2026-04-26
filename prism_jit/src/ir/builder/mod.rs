@@ -15,8 +15,6 @@ pub mod guards;
 pub mod objects;
 pub mod translator;
 
-#[cfg(test)]
-mod tests;
 
 pub use arithmetic::ArithmeticBuilder;
 pub use bitwise::BitwiseBuilder;

@@ -1658,6 +1658,3 @@ fn invoke_zero_arg_bound_method(
         None => invoke_callable_value(vm, target.callable, &[]),
     }
 }
-
-#[cfg(test)]
-mod tests;

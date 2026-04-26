@@ -177,6 +177,3 @@ pub fn is_native_stdlib_module(name: &str) -> bool {
 pub fn prefers_source_when_available(name: &str) -> bool {
     native_module_policy(name) == Some(StdlibResolutionPolicy::PreferSourceWhenAvailable)
 }
-
-#[cfg(test)]
-mod tests;

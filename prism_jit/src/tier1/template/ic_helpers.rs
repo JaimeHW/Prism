@@ -363,10 +363,3 @@ pub fn emit_set_attr_ic_fast_path(
     // Fast path: store to cached slot
     emit_slot_store_ic(asm, obj, ic_base, ic_offset, src, scratch1);
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

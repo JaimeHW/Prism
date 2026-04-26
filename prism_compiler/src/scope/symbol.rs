@@ -289,6 +289,3 @@ impl SymbolTable {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

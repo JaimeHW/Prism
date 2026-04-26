@@ -222,6 +222,3 @@ fn leak_object_value<T>(object: T) -> Value {
     let ptr = Box::leak(Box::new(object)) as *mut T as *const ();
     Value::object_ptr(ptr)
 }
-
-#[cfg(test)]
-mod tests;

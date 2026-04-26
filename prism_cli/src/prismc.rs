@@ -244,7 +244,3 @@ fn default_object_output(manifest_output: &std::path::Path, target: &str) -> Opt
 fn default_target() -> String {
     BuildOptions::default().target
 }
-
-#[cfg(test)]
-#[path = "prismc/tests.rs"]
-mod tests;

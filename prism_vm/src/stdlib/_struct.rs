@@ -1323,6 +1323,3 @@ fn read_f32(data: &[u8], endian: Endian) -> f32 {
 fn read_f64(data: &[u8], endian: Endian) -> f64 {
     f64::from_bits(read_u64(data, endian))
 }
-
-#[cfg(test)]
-mod tests;

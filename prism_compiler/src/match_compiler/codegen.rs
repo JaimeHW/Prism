@@ -806,10 +806,3 @@ pub fn emit_copy_dict_without_keys(
 fn emit_get_match_args(builder: &mut FunctionBuilder, dst: Register, subject: Register) {
     builder.emit(Instruction::op_ds(Opcode::GetMatchArgs, dst, subject));
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

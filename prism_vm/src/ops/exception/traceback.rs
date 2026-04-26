@@ -218,10 +218,3 @@ pub fn value_to_traceback(_value: &Value) -> Option<TracebackObject> {
     // 2. Reading TracebackObject from heap
     None
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

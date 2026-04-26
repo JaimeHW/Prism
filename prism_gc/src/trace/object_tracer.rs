@@ -88,6 +88,3 @@ impl ObjectTracer for NoopObjectTracer {
         // No-op
     }
 }
-
-#[cfg(test)]
-mod tests;

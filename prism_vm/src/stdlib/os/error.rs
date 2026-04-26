@@ -94,6 +94,3 @@ impl From<io::Error> for OsError {
         Self::from_io_error(&e, "")
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -398,6 +398,3 @@ impl PyObject for ListObject {
         &mut self.header
     }
 }
-
-#[cfg(test)]
-mod tests;

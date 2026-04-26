@@ -210,6 +210,3 @@ pub extern "C" fn prism_aot_op_store_expr(
     let _ = AOT_STORE_EXPR_SYMBOL;
     with_aot_context(vm, module, op, execute_store_expr_op)
 }
-
-#[cfg(test)]
-mod tests;

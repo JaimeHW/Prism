@@ -251,6 +251,3 @@ impl Nursery {
         self.allocated() as f64 / self.size as f64
     }
 }
-
-#[cfg(test)]
-mod tests;

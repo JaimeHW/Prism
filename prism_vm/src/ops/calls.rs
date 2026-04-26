@@ -3255,6 +3255,3 @@ pub fn tail_call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // TODO: Implement true tail call optimization
     call(vm, inst)
 }
-
-#[cfg(test)]
-mod tests;

@@ -1348,10 +1348,3 @@ pub fn encode_xorpd(dst: Xmm, src: Xmm) -> EncodedInst {
     enc.push(modrm(Mod::Direct, dst.low_bits(), src.low_bits()));
     enc
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

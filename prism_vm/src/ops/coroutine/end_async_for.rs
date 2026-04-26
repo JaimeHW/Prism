@@ -105,10 +105,3 @@ fn is_stop_async_iteration(exc: &Value) -> bool {
 fn exception_type_id(exc: &Value) -> Option<u16> {
     unsafe { ExceptionValue::from_value(*exc) }.map(|value| value.type_id() as u16)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

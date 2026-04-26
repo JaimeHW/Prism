@@ -199,6 +199,3 @@ fn parse_int_radix(digits: &str, radix: u32) -> Result<i64, ()> {
 pub fn is_number_start(c: char, next: char) -> bool {
     c.is_ascii_digit() || (c == '.' && next.is_ascii_digit())
 }
-
-#[cfg(test)]
-mod tests;

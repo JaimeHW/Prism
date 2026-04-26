@@ -271,6 +271,3 @@ fn num_cpus() -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
 }
-
-#[cfg(test)]
-mod tests;

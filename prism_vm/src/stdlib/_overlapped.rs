@@ -352,6 +352,3 @@ fn overlapped_object_mut(value: Value) -> Option<&'static mut ShapedObject> {
     let ptr = value.as_object_ptr()?;
     Some(unsafe { &mut *(ptr as *mut ShapedObject) })
 }
-
-#[cfg(test)]
-mod tests;

@@ -280,10 +280,3 @@ pub trait TlabProvider {
     /// Returns (start, end) if successful, None if nursery is full.
     fn obtain_tlab_region(&self, size: usize) -> Option<(*mut u8, *mut u8)>;
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

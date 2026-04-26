@@ -2402,11 +2402,6 @@ impl VirtualMachine {
         }
     }
 
-    #[cfg(test)]
-    fn pooled_frame_count(&self) -> usize {
-        self.frame_pool.len()
-    }
-
     /// Push a new frame for calling a function.
     ///
     /// This method implements a JIT-first dispatch strategy:
@@ -3298,6 +3293,3 @@ fn module_package_name(name: &str, is_package: bool) -> Arc<str> {
         Arc::from("")
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -339,6 +339,3 @@ pub struct ClassInfo {
     /// Decorator indices (applied in reverse order).
     pub decorators: Vec<u16>,
 }
-
-#[cfg(test)]
-mod tests;

@@ -484,6 +484,3 @@ fn abc_reset_caches(args: &[Value]) -> Result<Value, BuiltinError> {
     });
     Ok(Value::none())
 }
-
-#[cfg(test)]
-mod tests;

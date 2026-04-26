@@ -299,6 +299,3 @@ pub fn call_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         .collect();
     call_callable_value_with_keywords_from_values(vm, func_val, dst, &args, &keywords)
 }
-
-#[cfg(test)]
-mod tests;

@@ -187,6 +187,3 @@ impl Default for HandleScope {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;

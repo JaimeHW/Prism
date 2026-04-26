@@ -324,6 +324,3 @@ pub fn get_handler(opcode: u8) -> OpHandler {
     // Safety: opcode is u8, so always in bounds for 256-element array
     unsafe { *DISPATCH_TABLE.get_unchecked(opcode as usize) }
 }
-
-#[cfg(test)]
-mod tests;

@@ -96,6 +96,3 @@ impl PyObject for ComplexObject {
         &mut self.header
     }
 }
-
-#[cfg(test)]
-mod tests;

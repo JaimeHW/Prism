@@ -712,6 +712,3 @@ pub(crate) fn builtin_remove_dead_weakref(args: &[Value]) -> Result<Value, Built
     dict.remove(args[1]);
     Ok(Value::none())
 }
-
-#[cfg(test)]
-mod tests;

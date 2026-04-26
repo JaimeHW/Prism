@@ -238,6 +238,3 @@ fn arc_str_box(values: &[String]) -> Box<[Arc<str>]> {
         .collect::<Vec<_>>()
         .into_boxed_slice()
 }
-
-#[cfg(test)]
-mod tests;

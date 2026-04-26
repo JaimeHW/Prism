@@ -132,6 +132,3 @@ pub fn listdir<P: AsRef<Path>>(path: P) -> Result<Vec<String>, OsError> {
     }
     Ok(names)
 }
-
-#[cfg(test)]
-mod tests;

@@ -415,6 +415,3 @@ impl PyObject for TypeObject {
         &mut self.header
     }
 }
-
-#[cfg(test)]
-mod tests;

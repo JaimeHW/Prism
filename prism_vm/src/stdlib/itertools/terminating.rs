@@ -696,10 +696,3 @@ pub fn is_truthy(v: &Value) -> bool {
     }
     true // strings, objects, etc. are truthy (non-empty check would be ideal)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

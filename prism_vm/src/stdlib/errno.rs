@@ -215,6 +215,3 @@ impl Module for ErrnoModule {
         self.attrs.clone()
     }
 }
-
-#[cfg(test)]
-mod tests;

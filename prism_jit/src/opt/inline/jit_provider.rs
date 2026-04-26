@@ -707,10 +707,3 @@ pub struct ProviderSummary {
     /// Invalidation statistics.
     pub invalidation: InvalidationSummary,
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

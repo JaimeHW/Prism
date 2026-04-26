@@ -1481,6 +1481,3 @@ fn nt_get_terminal_size(args: &[Value]) -> Result<Value, BuiltinError> {
 fn nt_exit(args: &[Value]) -> Result<Value, BuiltinError> {
     not_implemented("nt._exit()", args)
 }
-
-#[cfg(test)]
-mod tests;

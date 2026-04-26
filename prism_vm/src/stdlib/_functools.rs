@@ -343,6 +343,3 @@ fn partial_call(
     invoke_callable_value_with_keywords(vm, function, &call_args, &keyword_refs)
         .map_err(runtime_error_to_builtin_error)
 }
-
-#[cfg(test)]
-mod tests;

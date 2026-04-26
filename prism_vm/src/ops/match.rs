@@ -364,10 +364,3 @@ pub fn copy_dict_without_keys(vm: &mut VirtualMachine, inst: Instruction) -> Con
     frame.set_reg(dst, mapping);
     ControlFlow::Continue
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

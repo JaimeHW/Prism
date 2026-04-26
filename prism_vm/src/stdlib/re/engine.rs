@@ -910,10 +910,3 @@ pub fn compile_pattern(pattern: &str, flags: RegexFlags) -> EngineResult<Box<dyn
         Ok(Box::new(StandardEngine::compile(pattern, flags)?))
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

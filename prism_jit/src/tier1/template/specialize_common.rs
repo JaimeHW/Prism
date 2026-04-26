@@ -260,10 +260,3 @@ pub fn emit_bool_box_true(ctx: &mut TemplateContext, dst: Gpr) {
 pub fn emit_bool_box_false(ctx: &mut TemplateContext, dst: Gpr) {
     ctx.asm.mov_ri64(dst, value_tags::false_value() as i64);
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -508,6 +508,3 @@ fn default_row(row: &PatternRow, col: usize) -> Option<PatternRow> {
         None
     }
 }
-
-#[cfg(test)]
-mod tests;

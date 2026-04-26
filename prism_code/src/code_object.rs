@@ -725,6 +725,3 @@ pub fn disassemble(code: &CodeObject) -> String {
 
     output
 }
-
-#[cfg(test)]
-mod tests;

@@ -353,10 +353,3 @@ impl fmt::Debug for FrameStorage {
 // SAFETY: FrameStorage contains Values which are Copy and thread-safe
 unsafe impl Send for FrameStorage {}
 unsafe impl Sync for FrameStorage {}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests;

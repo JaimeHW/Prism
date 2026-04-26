@@ -430,6 +430,3 @@ pub fn value_as_memoryview_mut(value: Value) -> Option<&'static mut MemoryViewOb
 fn shape_element_count(shape: &[usize]) -> usize {
     shape.iter().copied().product()
 }
-
-#[cfg(test)]
-mod tests;

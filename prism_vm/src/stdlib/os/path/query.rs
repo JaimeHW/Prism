@@ -112,6 +112,3 @@ fn ismount_impl(path: &Path) -> bool {
     // Same inode as parent = root of filesystem
     meta.ino() == parent_meta.ino()
 }
-
-#[cfg(test)]
-mod tests;

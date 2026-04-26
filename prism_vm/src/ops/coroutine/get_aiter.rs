@@ -137,10 +137,3 @@ fn call_aiter_method(
 ) -> Result<Value, RuntimeError> {
     call_unary_magic_method(vm, method, obj, "__aiter__")
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

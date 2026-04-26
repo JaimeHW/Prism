@@ -35,8 +35,6 @@ mod match_obj;
 mod pattern;
 mod python_api;
 
-#[cfg(test)]
-mod tests;
 
 pub use cache::PatternCache;
 pub use engine::{Engine, EngineKind};
@@ -214,6 +212,3 @@ impl Module for ReModule {
         self.attrs.clone()
     }
 }
-
-#[cfg(test)]
-mod module_tests;

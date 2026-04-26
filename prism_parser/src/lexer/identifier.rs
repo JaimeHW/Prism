@@ -181,6 +181,3 @@ impl ReservedIdent {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

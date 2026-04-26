@@ -37,8 +37,6 @@ mod mega_ic;
 mod poly_ic;
 mod property_ic;
 
-#[cfg(test)]
-mod integration_tests;
 
 pub use call_ic::{CallIc, CallIcData, CallIcState};
 pub use hooks::{
@@ -555,10 +553,3 @@ impl IcManager {
         self.sites.iter_mut()
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

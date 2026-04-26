@@ -949,10 +949,3 @@ fn sys_getwindowsversion(args: &[Value]) -> Result<Value, BuiltinError> {
 
     Ok(windows_version_info())
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

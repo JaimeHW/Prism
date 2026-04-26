@@ -153,16 +153,3 @@ fn alloc_standalone_value<T: Trace + 'static>(value: T) -> Value {
 pub fn has_current_heap_binding() -> bool {
     CURRENT_HEAP_BINDINGS.with(|bindings| !bindings.borrow().is_empty())
 }
-
-#[cfg(test)]
-pub fn current_heap_binding_depth() -> usize {
-    CURRENT_HEAP_BINDINGS.with(|bindings| bindings.borrow().len())
-}
-
-#[cfg(test)]
-pub fn standalone_allocation_count() -> usize {
-    STANDALONE_ALLOCATIONS.with(|allocations| allocations.borrow().len())
-}
-
-#[cfg(test)]
-mod tests;

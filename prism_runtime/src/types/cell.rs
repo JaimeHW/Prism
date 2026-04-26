@@ -307,10 +307,3 @@ impl Default for Cell {
 // Safety: Cell uses atomic operations for all value access
 unsafe impl Send for Cell {}
 unsafe impl Sync for Cell {}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

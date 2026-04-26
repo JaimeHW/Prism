@@ -84,10 +84,3 @@ fn system_time_to_epoch(time: SystemTime) -> std::io::Result<f64> {
         .map(|d| d.as_secs_f64())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

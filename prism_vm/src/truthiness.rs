@@ -137,6 +137,3 @@ fn is_missing_len_type_error(err: &RuntimeError) -> bool {
             if message.starts_with("object of type '") && message.ends_with("' has no len()")
     )
 }
-
-#[cfg(test)]
-mod tests;

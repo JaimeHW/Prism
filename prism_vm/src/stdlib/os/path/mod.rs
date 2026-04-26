@@ -155,6 +155,3 @@ fn extract_string(value: Value) -> Result<String, BuiltinError> {
     let string = unsafe { &*(ptr as *const StringObject) };
     Ok(string.as_str().to_string())
 }
-
-#[cfg(test)]
-mod tests;

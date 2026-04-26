@@ -178,6 +178,3 @@ impl Default for RememberedSet {
 // All fields are Send + Sync.
 unsafe impl Send for RememberedSet {}
 unsafe impl Sync for RememberedSet {}
-
-#[cfg(test)]
-mod tests;

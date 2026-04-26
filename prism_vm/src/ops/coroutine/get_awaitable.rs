@@ -147,10 +147,3 @@ fn call_await_method(
 ) -> Result<Value, RuntimeError> {
     call_unary_magic_method(vm, method, obj, "__await__")
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

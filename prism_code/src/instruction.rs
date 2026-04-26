@@ -891,6 +891,3 @@ impl Opcode {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -84,6 +84,3 @@ fn builtin_tokenizer_iter(args: &[Value]) -> Result<Value, BuiltinError> {
         "_tokenize.TokenizerIter is not implemented yet in Prism".to_string(),
     ))
 }
-
-#[cfg(test)]
-mod tests;

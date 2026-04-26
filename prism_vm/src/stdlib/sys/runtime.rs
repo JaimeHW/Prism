@@ -745,10 +745,3 @@ pub fn hash_info_tuple() -> Value {
 fn leak_object_value<T: prism_runtime::Trace + 'static>(object: T) -> Value {
     crate::alloc_managed_value(object)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

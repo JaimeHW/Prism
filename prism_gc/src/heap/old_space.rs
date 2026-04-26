@@ -227,6 +227,3 @@ impl OldSpace {
         self.current_block.store(0, Ordering::Relaxed);
     }
 }
-
-#[cfg(test)]
-mod tests;

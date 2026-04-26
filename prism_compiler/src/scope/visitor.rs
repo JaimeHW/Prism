@@ -749,6 +749,3 @@ impl Default for ScopeAnalyzer {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;

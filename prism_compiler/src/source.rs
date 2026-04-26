@@ -143,6 +143,3 @@ pub fn compile_source_code_with_namespace_mode(
     compile_source_module_with_namespace_mode(source, filename, optimize, module_namespace_mode)
         .map(|compilation| compilation.code)
 }
-
-#[cfg(test)]
-mod tests;

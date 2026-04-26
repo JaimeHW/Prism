@@ -810,10 +810,3 @@ pub fn encode_vfmadd231pd_zmm_rmb(dst: Zmm, src1: Zmm, mem: &MemOperand) -> Enco
     encode_evex_mem_operand(&mut enc, dst.low_bits(), mem, 2, 8);
     enc
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

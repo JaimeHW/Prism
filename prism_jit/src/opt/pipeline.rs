@@ -658,10 +658,3 @@ pub fn optimize_with_profile(
     let mut pipeline = OptPipeline::with_profile(PipelineConfig::full(), profile);
     pipeline.run(graph)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

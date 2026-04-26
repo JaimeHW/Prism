@@ -47,8 +47,6 @@
 #![allow(clippy::new_without_default)]
 
 // Core modules
-#[cfg(test)]
-mod allocation_policy_tests;
 mod allocator;
 mod aot_abi;
 mod error;

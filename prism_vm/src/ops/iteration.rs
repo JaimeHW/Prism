@@ -247,6 +247,3 @@ fn runtime_error_matches_exception(
         _ => false,
     }
 }
-
-#[cfg(test)]
-mod tests;

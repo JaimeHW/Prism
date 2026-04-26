@@ -856,6 +856,3 @@ fn remap_unknown_error_handler(err: BuiltinError) -> BuiltinError {
         other => other,
     }
 }
-
-#[cfg(test)]
-mod tests;

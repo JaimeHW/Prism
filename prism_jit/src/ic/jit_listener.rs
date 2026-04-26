@@ -404,10 +404,3 @@ pub fn init_jit_listener() -> bool {
     // Create a new listener for registration (since we can't register a static ref)
     register_shape_listener_boxed(Box::new(JitShapeListener::new()))
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

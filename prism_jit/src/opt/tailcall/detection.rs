@@ -315,10 +315,3 @@ pub fn find_self_tail_calls(graph: &Graph) -> Vec<TailCallInfo> {
         .filter(|info| info.is_self_tail_call())
         .collect()
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

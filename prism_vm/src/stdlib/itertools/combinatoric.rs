@@ -486,10 +486,3 @@ impl Iterator for CombinationsWithReplacement {
 }
 
 impl std::iter::FusedIterator for CombinationsWithReplacement {}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

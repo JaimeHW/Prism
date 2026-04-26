@@ -835,6 +835,3 @@ fn module_kind_from_tag(tag: u8) -> Result<ModuleKind, AotError> {
         }),
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -206,10 +206,3 @@ pub fn filter_eligible(calls: &[TailCallInfo], caller_frame: &FrameInfo) -> Vec<
         .cloned()
         .collect()
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

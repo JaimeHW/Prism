@@ -271,10 +271,3 @@ pub struct LicmStats {
     /// Number of invariant nodes found (but not all hoisted).
     pub invariant_nodes: usize,
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

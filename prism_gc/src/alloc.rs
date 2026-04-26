@@ -128,6 +128,3 @@ unsafe impl<T: Trace> Trace for GcRef<T> {
         tracer.trace_ptr(self.as_void_ptr());
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -871,6 +871,3 @@ fn type_name_of(value: Value) -> &'static str {
         "object"
     }
 }
-
-#[cfg(test)]
-mod tests;

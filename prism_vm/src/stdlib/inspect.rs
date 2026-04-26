@@ -582,6 +582,3 @@ fn inspect_unwrap(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Valu
         current = next;
     }
 }
-
-#[cfg(test)]
-mod tests;

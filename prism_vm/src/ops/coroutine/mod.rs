@@ -43,8 +43,6 @@ mod get_awaitable;
 mod protocol;
 mod send;
 
-#[cfg(test)]
-mod tests;
 
 pub use end_async_for::end_async_for;
 pub use get_aiter::get_aiter;

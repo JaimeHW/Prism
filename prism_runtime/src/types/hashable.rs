@@ -201,6 +201,3 @@ fn type_id_of(ptr: *const ()) -> TypeId {
     let header = ptr as *const ObjectHeader;
     unsafe { (*header).type_id }
 }
-
-#[cfg(test)]
-mod tests;

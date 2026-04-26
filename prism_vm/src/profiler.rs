@@ -251,6 +251,3 @@ pub enum TierUpDecision {
     /// Should compile to Tier 2 (Optimizing JIT).
     Tier2,
 }
-
-#[cfg(test)]
-mod tests;

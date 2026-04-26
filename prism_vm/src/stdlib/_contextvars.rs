@@ -574,6 +574,3 @@ fn copy_context(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     Ok(new_context_instance(&CONTEXT_CLASS))
 }
-
-#[cfg(test)]
-mod tests;

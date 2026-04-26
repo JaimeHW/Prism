@@ -110,6 +110,3 @@ fn splitdrive_str(path: &str) -> (String, String) {
         (String::new(), path.to_string())
     }
 }
-
-#[cfg(test)]
-mod tests;

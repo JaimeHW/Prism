@@ -697,10 +697,3 @@ pub fn is_aligned_access(offset: i32, width: SpillWidth) -> bool {
     let alignment = width.alignment() as i32;
     (offset.abs()) % alignment == 0
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -289,10 +289,3 @@ impl StubGenerator {
         self.entry.code_size() + self.deopt.code_size() + self.exception.code_size()
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

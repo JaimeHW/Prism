@@ -1068,10 +1068,3 @@ pub struct SpeculativeInlineInfo {
     /// Information about the primary guard.
     pub guard_info: TypeGuardInfo,
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

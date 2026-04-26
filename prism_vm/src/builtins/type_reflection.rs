@@ -1617,6 +1617,3 @@ fn usize_attr_value(value: usize) -> Result<Value, RuntimeError> {
         })
     })
 }
-
-#[cfg(test)]
-mod tests;

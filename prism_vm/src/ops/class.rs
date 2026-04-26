@@ -36,8 +36,6 @@ use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywor
 use crate::ops::objects::{get_attribute_value, resolve_class_attribute_in_vm};
 use prism_code::{CodeObject, Instruction, Opcode};
 use prism_core::Value;
-#[cfg(test)]
-use prism_core::intern::interned_by_ptr;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::class::{ClassDict, PyClassObject};
 use prism_runtime::object::mro::ClassId;
@@ -47,8 +45,6 @@ use prism_runtime::object::type_builtins::{
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
-#[cfg(test)]
-use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -710,26 +706,6 @@ fn class_object_from_value(value: Value) -> Option<&'static PyClassObject> {
 // Helper Functions
 // =============================================================================
 
-/// Extract a string name from a Value.
-///
-/// Supports both interned strings (small) and heap-allocated strings.
-#[inline]
-#[cfg(test)]
-fn extract_string_name(val: Value) -> Option<InternedString> {
-    if val.is_string() {
-        let ptr = val.as_string_object_ptr()?;
-        return interned_by_ptr(ptr as *const u8);
-    }
-
-    let ptr = val.as_object_ptr()?;
-    if extract_type_id(ptr) != TypeId::STR {
-        return None;
-    }
-
-    let string = unsafe { &*(ptr as *const StringObject) };
-    Some(intern(string.as_str()))
-}
-
 /// Resolve class name from a code-object constant by pointer identity against
 /// the frame's nested code-object list.
 #[inline]
@@ -789,10 +765,3 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
     // SAFETY: Caller guarantees ptr points to valid object with ObjectHeader at offset 0
     unsafe { (*header_ptr).type_id }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

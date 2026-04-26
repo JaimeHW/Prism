@@ -192,10 +192,3 @@ pub fn count_self_tail_calls(tail_calls: &[TailCallInfo]) -> usize {
 pub fn has_self_tail_calls(tail_calls: &[TailCallInfo]) -> bool {
     tail_calls.iter().any(|tc| tc.is_self_tail_call())
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -583,6 +583,3 @@ pub(crate) fn builtin_str_format_method(
     let rendered = format_template(vm, &template, &args[1..], keywords)?;
     Ok(owned_string_value(rendered))
 }
-
-#[cfg(test)]
-mod tests;

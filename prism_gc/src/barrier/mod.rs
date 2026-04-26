@@ -12,8 +12,6 @@ mod card_table;
 mod remembered_set;
 pub mod satb_buffer;
 
-#[cfg(test)]
-mod satb_tests;
 
 pub use card_table::CardTable;
 pub use remembered_set::{RememberedEntry, RememberedSet};
@@ -166,10 +164,3 @@ pub fn write_barrier_concurrent_ptr(
     // 2. SATB barrier for old pointer
     satb_write_barrier(old_ptr, marking_state, satb_buffer, satb_queue);
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

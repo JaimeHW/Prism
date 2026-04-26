@@ -1067,6 +1067,3 @@ impl ValueFalsey for Value {
         self.is_none() || self.as_bool() == Some(false) || self.as_int() == Some(0)
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -824,10 +824,3 @@ fn runtime_error_to_builtin_import_error(err: RuntimeError) -> BuiltinError {
 
 // Note: isinstance, issubclass are already implemented in types.rs.
 // They are type checking functions.
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

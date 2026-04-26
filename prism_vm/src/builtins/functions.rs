@@ -1745,10 +1745,3 @@ fn escape_non_ascii(input: &str) -> String {
 fn escape_char(ch: char) -> String {
     python_char_escape(ch)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

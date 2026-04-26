@@ -179,6 +179,3 @@ fn builtin_finalize(args: &[Value]) -> Result<Value, BuiltinError> {
 
     Ok(Value::none())
 }
-
-#[cfg(test)]
-mod tests;

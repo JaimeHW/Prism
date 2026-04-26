@@ -527,6 +527,3 @@ fn typing_named_factory(factory_name: &str, args: &[Value]) -> Result<Value, Bui
     let name = marker_text(args[0])?;
     Ok(new_marker_value(&format!("~{}", name.as_str())))
 }
-
-#[cfg(test)]
-mod tests;

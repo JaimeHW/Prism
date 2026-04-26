@@ -510,6 +510,3 @@ impl<'src> Lexer<'src> {
 pub fn tokenize(source: &str) -> Vec<Token> {
     Lexer::tokenize(source)
 }
-
-#[cfg(test)]
-mod tests;

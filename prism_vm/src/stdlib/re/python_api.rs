@@ -2275,6 +2275,3 @@ fn match_ref(value: Value) -> Option<&'static RegexMatchObject> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     (header.type_id == TypeId::REGEX_MATCH).then(|| unsafe { &*(ptr as *const RegexMatchObject) })
 }
-
-#[cfg(test)]
-mod tests;

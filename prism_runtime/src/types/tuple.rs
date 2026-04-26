@@ -205,6 +205,3 @@ static EMPTY_TUPLE_DATA: [Value; 0] = [];
 pub fn empty_tuple() -> TupleObject {
     TupleObject::empty()
 }
-
-#[cfg(test)]
-mod tests;

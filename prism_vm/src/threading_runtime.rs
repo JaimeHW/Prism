@@ -218,15 +218,3 @@ fn release_for_checkpoint_handoff() -> Option<BlockingReleaseGuard> {
 
     Some(BlockingReleaseGuard { depth })
 }
-
-#[cfg(test)]
-fn waiting_thread_count_for_test() -> usize {
-    let (state_lock, _) = &*EXECUTION_LOCK;
-    state_lock
-        .lock()
-        .expect("Python execution lock should not be poisoned")
-        .waiters
-}
-
-#[cfg(test)]
-mod tests;

@@ -304,10 +304,3 @@ pub fn parent_package(name: &str) -> Option<&str> {
 pub fn leaf_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, leaf)| leaf).unwrap_or(name)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

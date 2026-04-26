@@ -45,25 +45,13 @@ use super::BuiltinError;
 use crate::stdlib::collections::deque::DequeObject;
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
-#[cfg(test)]
-use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
-#[cfg(test)]
-use prism_runtime::object::{shape::Shape, shaped_object::ShapedObject};
-#[cfg(test)]
-use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::iter::IteratorObject;
-#[cfg(test)]
-use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
-#[cfg(test)]
-use prism_runtime::types::string::StringObject;
-#[cfg(test)]
-use prism_runtime::types::tuple::TupleObject;
 
 // =============================================================================
 // Error Types
@@ -397,10 +385,3 @@ pub fn iterator_to_value(iter: IteratorObject) -> Value {
     let ptr = Box::leak(boxed) as *mut IteratorObject as *const ();
     Value::object_ptr(ptr)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

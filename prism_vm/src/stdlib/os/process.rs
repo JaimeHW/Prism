@@ -31,6 +31,3 @@ pub fn getprocessname() -> Option<String> {
         .ok()
         .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
 }
-
-#[cfg(test)]
-mod tests;

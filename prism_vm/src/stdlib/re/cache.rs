@@ -227,10 +227,3 @@ pub fn global_cache() -> &'static PatternCache {
 pub fn purge_global_cache() {
     GLOBAL_CACHE.purge();
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

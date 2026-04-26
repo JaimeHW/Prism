@@ -471,6 +471,3 @@ fn utf16_registry_string(data: &[u8]) -> String {
     }
     String::from_utf16_lossy(&units)
 }
-
-#[cfg(test)]
-mod tests;

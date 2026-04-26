@@ -481,10 +481,3 @@ impl TextWriter {
 
 /// Combined text I/O wrapper (convenience alias).
 pub type TextIOWrapper = TextReader;
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

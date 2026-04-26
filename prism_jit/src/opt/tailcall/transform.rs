@@ -207,10 +207,3 @@ pub fn extract_call_args(graph: &Graph, call_node: NodeId) -> Vec<NodeId> {
 pub fn count_call_args(graph: &Graph, call_node: NodeId) -> usize {
     graph.get(call_node).map(|n| n.inputs.len()).unwrap_or(0)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

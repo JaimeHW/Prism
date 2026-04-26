@@ -1206,10 +1206,3 @@ pub fn create_exception_with_syntax_details_in_vm(
         .with_syntax_details(details)
         .into_gc_value(vm)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

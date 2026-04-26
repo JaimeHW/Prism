@@ -1164,10 +1164,3 @@ pub fn refresh_global_class_layouts(type_id: TypeId) {
         global_class_registry().refresh_layouts_for_hierarchy(type_id);
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

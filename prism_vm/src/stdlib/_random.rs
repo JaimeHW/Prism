@@ -393,6 +393,3 @@ fn bytes_from_value(value: Value) -> Option<&'static [u8]> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests;

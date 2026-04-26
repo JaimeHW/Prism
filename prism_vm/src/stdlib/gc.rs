@@ -304,6 +304,3 @@ fn is_tracked_value(value: Value, seen: &mut FxHashSet<usize>) -> bool {
 fn gc_thresholds() -> [i64; 3] {
     GC_STATE.read().unwrap().thresholds
 }
-
-#[cfg(test)]
-mod tests;

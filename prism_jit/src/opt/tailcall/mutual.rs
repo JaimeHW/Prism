@@ -403,10 +403,3 @@ pub fn find_mutual_recursion(call_graph: &CallGraph) -> Vec<SccInfo> {
     let transformer = MutualRecursionTransformer::new();
     transformer.analyze(call_graph)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

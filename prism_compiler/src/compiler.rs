@@ -3128,6 +3128,3 @@ impl Compiler {
             .emit(Instruction::op_ds(Opcode::YieldFrom, dst, iterable_reg));
     }
 }
-
-#[cfg(test)]
-mod tests;

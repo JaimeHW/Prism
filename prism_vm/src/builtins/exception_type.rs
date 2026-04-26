@@ -1018,19 +1018,3 @@ pub static SUPPLEMENTAL_EXCEPTION_CLASS_TABLE: &[(&str, &LazyLock<Arc<PyClassObj
     ("UnicodeWarning", &UNICODE_WARNING_CLASS),
     ("EncodingWarning", &ENCODING_WARNING_CLASS),
 ];
-
-#[inline]
-#[cfg(test)]
-pub(crate) fn supplemental_exception_class(name: &str) -> Option<&'static Arc<PyClassObject>> {
-    SUPPLEMENTAL_EXCEPTION_CLASS_TABLE
-        .iter()
-        .find(|(registered_name, _)| *registered_name == name)
-        .map(|(_, class)| &***class)
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

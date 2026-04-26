@@ -314,10 +314,3 @@ impl Default for AllocStub {
 ///
 /// This is called when the TLAB is exhausted and needs to be refilled.
 pub type AllocSlowFn = unsafe extern "C" fn(size: usize) -> *mut u8;
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

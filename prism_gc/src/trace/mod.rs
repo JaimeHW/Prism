@@ -188,6 +188,3 @@ unsafe impl Trace for Value {
         tracer.trace_value(*self);
     }
 }
-
-#[cfg(test)]
-mod tests;

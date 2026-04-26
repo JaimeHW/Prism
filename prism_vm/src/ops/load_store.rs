@@ -513,6 +513,3 @@ pub fn move_reg(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     frame.set_reg(inst.dst().0, value);
     ControlFlow::Continue
 }
-
-#[cfg(test)]
-mod tests;

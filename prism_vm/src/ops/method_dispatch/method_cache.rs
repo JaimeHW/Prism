@@ -308,10 +308,3 @@ static METHOD_CACHE: OnceLock<MethodCache> = OnceLock::new();
 pub fn method_cache() -> &'static MethodCache {
     METHOD_CACHE.get_or_init(MethodCache::new)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

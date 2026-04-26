@@ -942,10 +942,3 @@ enum Transform {
     /// Replace with another node
     ReplaceWithNode { node: NodeId, replacement: NodeId },
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

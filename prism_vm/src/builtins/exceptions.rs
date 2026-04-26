@@ -317,10 +317,3 @@ pub const EXCEPTION_CONSTRUCTORS: &[(&str, BuiltinFn)] = &[
 
 /// Total number of exception constructors.
 pub const EXCEPTION_CONSTRUCTOR_COUNT: usize = EXCEPTION_CONSTRUCTORS.len();
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

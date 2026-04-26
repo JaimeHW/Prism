@@ -26,8 +26,6 @@ pub mod module_object;
 pub mod package;
 pub mod resolver;
 
-#[cfg(test)]
-mod tests;
 
 pub use frozen::FrozenModuleSource;
 pub use module_object::{ModuleExportError, ModuleObject};

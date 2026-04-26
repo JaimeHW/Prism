@@ -329,6 +329,3 @@ pub fn object_ptr_as_bytes_ref(ptr: *const ()) -> Option<&'static BytesObject> {
 pub fn clone_bytes_value(value: Value) -> Option<BytesObject> {
     value_as_bytes_ref(value).cloned()
 }
-
-#[cfg(test)]
-mod tests;

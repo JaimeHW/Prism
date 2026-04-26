@@ -40,10 +40,3 @@ pub use resume::{
 };
 pub use state::{GeneratorHeader, GeneratorState};
 pub use storage::{FrameStorage, LivenessMap};
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests;

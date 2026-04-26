@@ -449,25 +449,6 @@ fn local_type_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&LOCAL_CLASS) as *const ())
 }
 
-#[cfg(test)]
-pub(crate) fn active_thread_count() -> u64 {
-    ACTIVE_THREAD_COUNT.load(Ordering::SeqCst)
-}
-
-#[cfg(test)]
-pub(crate) fn wait_for_active_thread_count_at_most(target: u64, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if active_thread_count() <= target {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
 fn thread_interrupt_main(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() > 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -1632,6 +1613,3 @@ fn rlock_exit(args: &[Value]) -> Result<Value, BuiltinError> {
     release_native_rlock(&lock)?;
     Ok(Value::bool(false))
 }
-
-#[cfg(test)]
-mod tests;

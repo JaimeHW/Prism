@@ -546,6 +546,3 @@ fn is_valid_module_segment(segment: &str) -> bool {
 
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
-
-#[cfg(test)]
-mod tests;

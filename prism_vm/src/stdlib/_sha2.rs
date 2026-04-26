@@ -479,6 +479,3 @@ fn compute_digest(kind: Sha2Kind, data: &[u8]) -> Vec<u8> {
         Sha2Kind::Sha512 => Sha512::digest(data).to_vec(),
     }
 }
-
-#[cfg(test)]
-mod tests;

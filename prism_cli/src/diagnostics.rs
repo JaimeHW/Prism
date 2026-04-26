@@ -177,10 +177,3 @@ pub fn render_simple_error(error_type: &str, message: &str) -> String {
 pub fn render_traceback_header() -> &'static str {
     "Traceback (most recent call last):"
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

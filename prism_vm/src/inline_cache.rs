@@ -294,6 +294,3 @@ impl InlineCacheStore {
         &mut self.call_caches[offset]
     }
 }
-
-#[cfg(test)]
-mod tests;

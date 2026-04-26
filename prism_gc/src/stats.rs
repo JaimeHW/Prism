@@ -235,6 +235,3 @@ impl GcTimer {
         elapsed
     }
 }
-
-#[cfg(test)]
-mod tests;

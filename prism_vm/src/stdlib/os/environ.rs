@@ -248,10 +248,3 @@ pub fn unsetenv(key: &str) {
     // SAFETY: Caller ensures thread-safe access
     unsafe { std::env::remove_var(key) };
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -882,10 +882,3 @@ pub fn exception_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
         .set_reg(dst_reg, Value::bool(matches));
     ControlFlow::Continue
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

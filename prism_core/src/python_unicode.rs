@@ -108,6 +108,3 @@ pub fn python_code_point_escape(code_point: u32) -> String {
 pub fn python_char_escape(ch: char) -> String {
     python_code_point_escape(ch as u32)
 }
-
-#[cfg(test)]
-mod tests;

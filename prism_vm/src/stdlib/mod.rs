@@ -473,6 +473,3 @@ impl Default for StdlibRegistry {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;

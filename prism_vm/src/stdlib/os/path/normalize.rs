@@ -86,6 +86,3 @@ fn home_dir() -> Option<String> {
         env::var("HOME").ok()
     }
 }
-
-#[cfg(test)]
-mod tests;

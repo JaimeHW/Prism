@@ -135,6 +135,3 @@ impl<'src> Cursor<'src> {
         &self.source[self.pos..]
     }
 }
-
-#[cfg(test)]
-mod tests;

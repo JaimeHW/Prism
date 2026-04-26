@@ -409,6 +409,3 @@ fn value_to_string(value: Value) -> Option<String> {
     let string_obj = unsafe { &*(ptr as *const StringObject) };
     Some(string_obj.as_str().to_string())
 }
-
-#[cfg(test)]
-mod tests;

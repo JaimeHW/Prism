@@ -159,6 +159,3 @@ impl Default for IndentStack {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;

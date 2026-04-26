@@ -23,6 +23,3 @@ prism_compiler.workspace = true
 prism_vm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-object.workspace = true

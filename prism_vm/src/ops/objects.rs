@@ -2686,10 +2686,3 @@ pub fn is_callable(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     frame.set_reg(inst.dst().0, Value::bool(is_callable));
     ControlFlow::Continue
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

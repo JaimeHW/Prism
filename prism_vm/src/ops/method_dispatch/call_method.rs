@@ -257,10 +257,3 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
     let header = ptr as *const ObjectHeader;
     unsafe { (*header).type_id }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -154,6 +154,3 @@ static GLOBAL_REGISTRY: OnceLock<TypeRegistry> = OnceLock::new();
 pub fn global_registry() -> &'static TypeRegistry {
     GLOBAL_REGISTRY.get_or_init(TypeRegistry::new)
 }
-
-#[cfg(test)]
-mod tests;

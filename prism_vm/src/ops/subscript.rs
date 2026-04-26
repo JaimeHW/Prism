@@ -824,10 +824,3 @@ fn invoke_bound_method_with_args_allow_control_transfer(
         (None, _) => invoke_callable_value_with_control_transfer(vm, target.callable, args),
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

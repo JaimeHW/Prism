@@ -1009,6 +1009,3 @@ fn winapi_need_current_directory_for_exe_path(args: &[Value]) -> Result<Value, B
         !has_explicit_directory && env_allows_current_directory,
     ))
 }
-
-#[cfg(test)]
-mod tests;

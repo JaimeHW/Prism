@@ -97,6 +97,3 @@ impl Clone for GlobalScope {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -520,6 +520,4 @@ impl<'a> BytecodeTranslator<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests;
 use prism_code::Constant;

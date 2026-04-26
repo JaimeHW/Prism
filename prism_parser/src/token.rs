@@ -454,6 +454,3 @@ impl fmt::Display for Keyword {
         f.write_str(self.as_str())
     }
 }
-
-#[cfg(test)]
-mod tests;

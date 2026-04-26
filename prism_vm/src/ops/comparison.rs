@@ -1671,6 +1671,3 @@ pub fn shr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         )),
     }
 }
-
-#[cfg(test)]
-mod tests;

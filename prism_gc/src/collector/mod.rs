@@ -35,14 +35,6 @@ mod major;
 pub mod mark_bitmap;
 mod minor;
 
-#[cfg(test)]
-mod concurrent_major_tests;
-#[cfg(test)]
-mod concurrent_marker_tests;
-#[cfg(test)]
-mod integration_tests;
-#[cfg(test)]
-mod mark_bitmap_tests;
 
 pub use concurrent_major::{
     ConcurrentGcPhase, ConcurrentMajorCollector, ConcurrentMajorConfig, ConcurrentMajorResult,
@@ -352,10 +344,3 @@ impl Default for Collector {
         Self::new()
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

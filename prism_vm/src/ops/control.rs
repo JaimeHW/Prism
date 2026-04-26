@@ -305,6 +305,3 @@ fn rewind_current_instruction(vm: &mut VirtualMachine) {
     let frame = vm.current_frame_mut();
     frame.ip = frame.ip.saturating_sub(1);
 }
-
-#[cfg(test)]
-mod tests;

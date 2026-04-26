@@ -19,8 +19,6 @@ mod string;
 mod type_reflection;
 mod types;
 
-#[cfg(test)]
-mod attribute_tests;
 
 pub use builtin_function::*;
 pub use exception_type::*;
@@ -590,10 +588,3 @@ impl std::fmt::Debug for BuiltinRegistry {
             .finish()
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

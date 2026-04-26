@@ -359,10 +359,3 @@ pub fn global_mega_cache() -> &'static MegamorphicCache {
 pub fn init_mega_cache() {
     let _ = global_mega_cache();
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

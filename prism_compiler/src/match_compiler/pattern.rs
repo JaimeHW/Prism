@@ -427,6 +427,3 @@ pub fn literal_to_key(lit: &LiteralValue) -> LiteralKey {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

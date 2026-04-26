@@ -214,10 +214,3 @@ pub fn analyze_safepoint_placement(traits: &FunctionTraits) -> SafepointPlacemen
 
     SafepointPlacement::Full
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

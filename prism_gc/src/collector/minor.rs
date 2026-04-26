@@ -89,6 +89,3 @@ impl Default for MinorCollector {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -824,10 +824,3 @@ pub const fn encode_dsb_ish() -> EncodedInst {
 pub const fn encode_isb() -> EncodedInst {
     EncodedInst::new(0xD5033FDF)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

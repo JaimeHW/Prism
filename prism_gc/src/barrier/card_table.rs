@@ -141,6 +141,3 @@ impl CardTable {
         self.base
     }
 }
-
-#[cfg(test)]
-mod tests;

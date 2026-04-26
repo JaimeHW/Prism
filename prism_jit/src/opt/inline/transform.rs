@@ -382,10 +382,3 @@ pub struct InlineInfo {
     /// The control flow exit point of the inlined code.
     pub exit_control: NodeId,
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

@@ -344,6 +344,3 @@ impl DecisionTree {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

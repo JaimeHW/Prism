@@ -546,6 +546,3 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         Err(err) => ControlFlow::Error(err),
     }
 }
-
-#[cfg(test)]
-mod tests;

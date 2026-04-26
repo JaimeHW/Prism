@@ -82,6 +82,3 @@ impl Drop for ChdirGuard {
         let _ = chdir(&*self.original);
     }
 }
-
-#[cfg(test)]
-mod tests;

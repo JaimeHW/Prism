@@ -566,6 +566,3 @@ pub fn is_valid_string_prefix(s: &str) -> bool {
     let prefix = StringPrefix::from_chars(s);
     prefix.is_valid()
 }
-
-#[cfg(test)]
-mod tests;

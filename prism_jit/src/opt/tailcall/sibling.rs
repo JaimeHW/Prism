@@ -228,10 +228,3 @@ pub fn optimize_sibling_calls(
     let optimizer = SiblingCallOptimizer::new(caller_frame);
     optimizer.optimize(graph, tail_calls)
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

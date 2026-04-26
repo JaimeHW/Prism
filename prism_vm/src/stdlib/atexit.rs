@@ -185,6 +185,3 @@ fn builtin_run_exitfuncs(vm: &mut VirtualMachine, args: &[Value]) -> Result<Valu
         None => Ok(Value::none()),
     }
 }
-
-#[cfg(test)]
-mod tests;

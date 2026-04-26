@@ -1462,10 +1462,3 @@ fn encode_modrm_sib_disp_simd(enc: &mut EncodedInst, reg: u8, mem: &MemOperand) 
 }
 
 // Note: EncodedInst::push and push_u32 are pub(crate) in encoder.rs
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

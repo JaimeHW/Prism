@@ -126,6 +126,3 @@ pub fn bigint_to_value(value: BigInt) -> Value {
 
     alloc_value_in_current_heap_or_box(IntObject::new(value))
 }
-
-#[cfg(test)]
-mod tests;

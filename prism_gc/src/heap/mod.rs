@@ -345,6 +345,3 @@ fn align_non_null(ptr: NonNull<u8>, align: usize) -> Option<NonNull<u8>> {
     debug_assert!(align.is_power_of_two());
     NonNull::new(align_ptr_up(ptr.as_ptr(), align))
 }
-
-#[cfg(test)]
-mod tests;

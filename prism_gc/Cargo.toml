@@ -24,9 +24,6 @@ parking_lot.workspace = true
 # Bit manipulation for card tables
 bitflags.workspace = true
 
-[dev-dependencies]
-criterion.workspace = true
-
 [features]
 # Enable concurrent marking (Phase 2)
 concurrent = []

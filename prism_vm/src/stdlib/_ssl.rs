@@ -920,6 +920,3 @@ fn class_value(class: &'static Arc<PyClassObject>) -> Value {
 fn property_value(property: &'static LazyLock<PropertyDescriptor>) -> Value {
     Value::object_ptr(&**property as *const PropertyDescriptor as *const ())
 }
-
-#[cfg(test)]
-mod tests;

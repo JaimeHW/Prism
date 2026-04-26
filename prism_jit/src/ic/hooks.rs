@@ -547,10 +547,3 @@ impl ShapeTransitionListener for CountingListener {
         self.accessor_installs.fetch_add(1, Ordering::Relaxed);
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

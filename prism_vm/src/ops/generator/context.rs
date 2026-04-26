@@ -327,10 +327,3 @@ impl Default for GeneratorContext {
 // and the NonNull pointer is just a marker for the active generator.
 // Actual synchronization must be handled by the VM.
 unsafe impl Send for GeneratorContext {}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

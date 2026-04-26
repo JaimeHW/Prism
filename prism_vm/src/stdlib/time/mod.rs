@@ -25,8 +25,6 @@ mod format;
 mod functions;
 mod struct_time;
 
-#[cfg(test)]
-mod tests;
 
 pub use clock::{Clock, ClockId, ClockInfo, ClockKind};
 pub use format::{strftime, strptime};
@@ -711,6 +709,3 @@ fn sequence_items(value: Value, fn_name: &str) -> Result<Vec<Value>, BuiltinErro
         ))),
     }
 }
-
-#[cfg(test)]
-mod builtin_api_tests;

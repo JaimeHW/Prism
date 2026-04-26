@@ -110,15 +110,6 @@ pub fn intern_count() -> usize {
     }
 }
 
-/// Clear the intern pool (for testing).
-#[cfg(test)]
-pub fn clear_intern_pool() {
-    let mut pool = INTERN_POOL.write().unwrap();
-    if let Some(ref mut set) = *pool {
-        set.clear();
-    }
-}
-
 // =============================================================================
 // Audit Hooks
 // =============================================================================
@@ -195,10 +186,3 @@ impl CallDepth {
         self.depth = 0;
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests;

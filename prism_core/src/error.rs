@@ -318,6 +318,3 @@ impl fmt::Display for RuntimeErrorKind {
         f.write_str(self.as_str())
     }
 }
-
-#[cfg(test)]
-mod tests;

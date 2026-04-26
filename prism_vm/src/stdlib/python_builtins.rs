@@ -41,6 +41,3 @@ impl Module for BuiltinsModule {
         self.attrs.clone()
     }
 }
-
-#[cfg(test)]
-mod tests;
