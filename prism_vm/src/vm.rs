@@ -219,6 +219,13 @@ pub struct VirtualMachine {
     /// can recover the exact same closure cells without copying or widening the
     /// hot-path function object layout.
     function_closures: HashMap<*const (), Arc<crate::frame::ClosureEnv>>,
+    /// Code objects that have passed bytecode validation for this VM.
+    ///
+    /// The cache holds an `Arc` to each validated object so pointer identities
+    /// cannot be reused for different bytecode during the VM lifetime. This
+    /// keeps validation off the hot call path after the first entry while still
+    /// preserving the safety contract required by unchecked opcode handlers.
+    validated_code_objects: HashMap<usize, Arc<CodeObject>>,
     /// Per-interpreter target used by worker threads to route `_thread.interrupt_main()`.
     thread_interrupt_target: u64,
 
@@ -1368,6 +1375,7 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
@@ -1427,6 +1435,7 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
@@ -1472,6 +1481,7 @@ impl VirtualMachine {
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
             function_closures: HashMap::new(),
+            validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
@@ -1513,6 +1523,7 @@ impl VirtualMachine {
             jit,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
@@ -1549,6 +1560,7 @@ impl VirtualMachine {
             jit: None,
             jit_return_value: None,
             function_closures: HashMap::new(),
+            validated_code_objects: HashMap::new(),
             thread_interrupt_target,
             heap,
             _runtime_heap_binding: runtime_heap_binding,
@@ -2636,6 +2648,8 @@ impl VirtualMachine {
         module: Option<Arc<ModuleObject>>,
         allow_jit: bool,
     ) -> VmResult<()> {
+        self.validate_code_object_for_execution(&code)?;
+
         // Check recursion limit
         if self.frames.len() >= MAX_RECURSION_DEPTH {
             return Err(RuntimeError::recursion_error(self.frames.len()));
@@ -2756,6 +2770,23 @@ impl VirtualMachine {
         self.frames.push(frame);
         self.set_current_frame_idx(self.frames.len() - 1);
 
+        Ok(())
+    }
+
+    fn validate_code_object_for_execution(&mut self, code: &Arc<CodeObject>) -> VmResult<()> {
+        let key = Arc::as_ptr(code) as usize;
+        if self.validated_code_objects.contains_key(&key) {
+            return Ok(());
+        }
+
+        code.validate().map_err(|err| {
+            RuntimeError::internal(format!(
+                "invalid bytecode in {} ({}): {}",
+                code.qualname, code.filename, err
+            ))
+        })?;
+
+        self.validated_code_objects.insert(key, Arc::clone(code));
         Ok(())
     }
 
@@ -3476,7 +3507,7 @@ mod tests {
     use crate::builtins::builtin_getattr;
     use crate::exception::HandlerFrame;
     use crate::import::FrozenModuleSource;
-    use prism_code::{CodeFlags, CodeObject, ExceptionEntry};
+    use prism_code::{CodeFlags, CodeObject, ExceptionEntry, Register};
     use prism_compiler::{Compiler, OptimizationLevel};
     use prism_core::intern::intern;
     use prism_parser::parse;
@@ -3603,6 +3634,48 @@ mod tests {
         let vm = VirtualMachine::new();
         assert!(vm.is_idle());
         assert_eq!(vm.call_depth(), 0);
+    }
+
+    #[test]
+    fn test_execute_rejects_invalid_bytecode_before_dispatch() {
+        let mut code = CodeObject::new("bad_bytecode", "<test>");
+        code.register_count = 1;
+        code.instructions =
+            vec![Instruction::op_di(Opcode::LoadConst, Register::new(0), 0)].into_boxed_slice();
+
+        let mut vm = VirtualMachine::new();
+        let err = vm
+            .execute_runtime(Arc::new(code))
+            .expect_err("invalid bytecode should be rejected before dispatch");
+
+        match err.kind {
+            RuntimeErrorKind::InternalError { message } => {
+                assert!(message.contains("invalid bytecode in bad_bytecode (<test>)"));
+                assert!(message.contains("constant index 0 out of bounds"));
+            }
+            other => panic!("expected internal bytecode validation error, got {other:?}"),
+        }
+        assert!(vm.is_idle());
+    }
+
+    #[test]
+    fn test_push_frame_caches_bytecode_validation_by_code_identity() {
+        let code = empty_code("cached");
+        let mut vm = VirtualMachine::new();
+
+        vm.push_frame(Arc::clone(&code), 0)
+            .expect("valid bytecode should push");
+        assert_eq!(vm.validated_code_objects.len(), 1);
+        vm.pop_frame(Value::none())
+            .expect("valid frame should pop cleanly");
+
+        vm.push_frame(Arc::clone(&code), 0)
+            .expect("validated bytecode should push again");
+        assert_eq!(
+            vm.validated_code_objects.len(),
+            1,
+            "validation cache should reuse the original code-object identity"
+        );
     }
 
     #[test]

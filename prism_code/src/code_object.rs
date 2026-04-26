@@ -3,10 +3,14 @@
 //! A `CodeObject` contains all the compiled bytecode and metadata needed
 //! to execute a Python function. This is the fundamental unit of compilation.
 
-use super::instruction::Instruction;
+use super::instruction::{Instruction, Opcode};
 use num_bigint::BigInt;
 use prism_core::Value;
+use std::fmt;
 use std::sync::Arc;
+
+const REGISTER_FILE_SIZE: u16 = 256;
+const EXTENDED_NAME_SENTINEL: u8 = u8::MAX;
 
 /// Constant pool entry stored in compiled bytecode.
 #[derive(Debug, Clone)]
@@ -204,6 +208,137 @@ pub struct ExceptionEntry {
     pub exception_type_idx: u16,
 }
 
+/// Error produced by bytecode validation.
+///
+/// The VM deliberately uses unchecked indexing in hot opcode handlers. A code
+/// object must therefore pass this verifier before execution so malformed or
+/// stale bytecode cannot reach those fast paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeValidationError {
+    /// Instruction index where validation failed.
+    pub pc: usize,
+    /// Specific validation failure.
+    pub kind: CodeValidationErrorKind,
+}
+
+/// Specific bytecode validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeValidationErrorKind {
+    /// Opcode byte is not assigned to a known instruction.
+    InvalidOpcode {
+        /// Raw opcode byte.
+        opcode: u8,
+    },
+    /// A constant/name/local/closure index points outside its table.
+    PoolIndexOutOfBounds {
+        /// Pool/table name.
+        pool: &'static str,
+        /// Referenced index.
+        index: u16,
+        /// Pool/table length.
+        len: usize,
+    },
+    /// A local register slot would be truncated by the current register VM.
+    LocalSlotTooWide {
+        /// Referenced local slot.
+        slot: u16,
+    },
+    /// A jump target leaves the instruction stream.
+    JumpTargetOutOfBounds {
+        /// Computed absolute target pc.
+        target: isize,
+        /// Instruction stream length.
+        len: usize,
+    },
+    /// A metadata extension is missing after an opcode that requires it.
+    MissingExtension {
+        /// Opcode that requires metadata.
+        opcode: Opcode,
+        /// Required extension opcode.
+        extension: Opcode,
+    },
+    /// A metadata extension would execute as a standalone opcode.
+    UnexpectedExtension {
+        /// Detached extension opcode.
+        extension: Opcode,
+    },
+    /// A line-table range is malformed or outside the instruction stream.
+    InvalidLineRange {
+        /// Inclusive start pc.
+        start_pc: u32,
+        /// Exclusive end pc.
+        end_pc: u32,
+    },
+    /// An exception-table range or handler target is malformed.
+    InvalidExceptionRange {
+        /// Inclusive protected-range start pc.
+        start_pc: u32,
+        /// Exclusive protected-range end pc.
+        end_pc: u32,
+        /// Exception handler pc.
+        handler_pc: u32,
+        /// Finally handler pc, or `u32::MAX` when absent.
+        finally_pc: u32,
+    },
+    /// The code object requires more registers than the frame layout supports.
+    RegisterCountTooLarge {
+        /// Requested register count.
+        count: u16,
+        /// Maximum register count supported by the frame layout.
+        max: u16,
+    },
+}
+
+impl CodeValidationError {
+    #[inline]
+    fn new(pc: usize, kind: CodeValidationErrorKind) -> Self {
+        Self { pc, kind }
+    }
+}
+
+impl fmt::Display for CodeValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use CodeValidationErrorKind::*;
+
+        write!(f, "invalid bytecode at pc {}: ", self.pc)?;
+        match &self.kind {
+            InvalidOpcode { opcode } => write!(f, "unknown opcode 0x{opcode:02x}"),
+            PoolIndexOutOfBounds { pool, index, len } => {
+                write!(f, "{pool} index {index} out of bounds for length {len}")
+            }
+            LocalSlotTooWide { slot } => {
+                write!(f, "local slot {slot} exceeds the 256-register frame limit")
+            }
+            JumpTargetOutOfBounds { target, len } => {
+                write!(f, "jump target {target} out of bounds for length {len}")
+            }
+            MissingExtension { opcode, extension } => {
+                write!(f, "{opcode:?} missing required {extension:?} extension")
+            }
+            UnexpectedExtension { extension } => {
+                write!(f, "{extension:?} extension is not attached to a consumer")
+            }
+            InvalidLineRange { start_pc, end_pc } => {
+                write!(f, "invalid line-table range {start_pc}..{end_pc}")
+            }
+            InvalidExceptionRange {
+                start_pc,
+                end_pc,
+                handler_pc,
+                finally_pc,
+            } => write!(
+                f,
+                "invalid exception-table range {start_pc}..{end_pc}, handler={handler_pc}, finally={finally_pc}"
+            ),
+            RegisterCountTooLarge { count, max } => {
+                write!(f, "register count {count} exceeds frame limit {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CodeValidationError {}
+
 impl CodeObject {
     /// Create a new empty code object.
     pub fn new(name: impl Into<Arc<str>>, filename: impl Into<Arc<str>>) -> Self {
@@ -292,6 +427,250 @@ impl CodeObject {
     pub fn closure_size(&self) -> usize {
         self.freevars.len() + self.cellvars.len()
     }
+
+    /// Validate bytecode operands and metadata before execution.
+    ///
+    /// This is intentionally conservative around table indices and extension
+    /// opcodes. It keeps the VM's hot opcode handlers free to use unchecked
+    /// array access after the code object has crossed the execution boundary.
+    pub fn validate(&self) -> Result<(), CodeValidationError> {
+        if self.register_count > REGISTER_FILE_SIZE {
+            return Err(CodeValidationError::new(
+                0,
+                CodeValidationErrorKind::RegisterCountTooLarge {
+                    count: self.register_count,
+                    max: REGISTER_FILE_SIZE,
+                },
+            ));
+        }
+
+        self.validate_line_table()?;
+        self.validate_exception_table()?;
+
+        let mut pc = 0usize;
+        while pc < self.instructions.len() {
+            let inst = self.instructions[pc];
+            let opcode = Opcode::from_u8(inst.opcode()).ok_or_else(|| {
+                CodeValidationError::new(
+                    pc,
+                    CodeValidationErrorKind::InvalidOpcode {
+                        opcode: inst.opcode(),
+                    },
+                )
+            })?;
+
+            match opcode {
+                Opcode::LoadConst
+                | Opcode::MakeFunction
+                | Opcode::MakeClosure
+                | Opcode::BuildClass
+                | Opcode::BuildClassWithMeta => {
+                    self.validate_pool_index(pc, "constant", inst.imm16(), self.constants.len())?;
+                    pc = self.skip_class_metadata(pc, opcode)?;
+                }
+                Opcode::LoadGlobal
+                | Opcode::StoreGlobal
+                | Opcode::DeleteGlobal
+                | Opcode::LoadBuiltin
+                | Opcode::ImportName => {
+                    self.validate_pool_index(pc, "name", inst.imm16(), self.names.len())?;
+                    pc += 1;
+                }
+                Opcode::GetAttr
+                | Opcode::SetAttr
+                | Opcode::DelAttr
+                | Opcode::LoadMethod
+                | Opcode::ImportFrom => {
+                    pc = self.validate_extended_name_operand(pc, opcode, inst)?;
+                }
+                Opcode::LoadLocal | Opcode::StoreLocal | Opcode::DeleteLocal => {
+                    self.validate_local_slot(pc, inst.imm16())?;
+                    pc += 1;
+                }
+                Opcode::LoadClosure | Opcode::StoreClosure | Opcode::DeleteClosure => {
+                    self.validate_pool_index(pc, "closure", inst.imm16(), self.closure_size())?;
+                    pc += 1;
+                }
+                Opcode::Jump
+                | Opcode::JumpIfFalse
+                | Opcode::JumpIfTrue
+                | Opcode::JumpIfNone
+                | Opcode::JumpIfNotNone
+                | Opcode::ForIter
+                | Opcode::EndAsyncFor => {
+                    self.validate_jump_target(pc, inst.imm16() as i16)?;
+                    pc += 1;
+                }
+                Opcode::AttrName => {
+                    return Err(CodeValidationError::new(
+                        pc,
+                        CodeValidationErrorKind::UnexpectedExtension {
+                            extension: Opcode::AttrName,
+                        },
+                    ));
+                }
+                _ => pc += 1,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_line_table(&self) -> Result<(), CodeValidationError> {
+        let len = self.instructions.len() as u32;
+        for entry in self.line_table.iter() {
+            if entry.start_pc > entry.end_pc || entry.end_pc > len {
+                return Err(CodeValidationError::new(
+                    entry.start_pc as usize,
+                    CodeValidationErrorKind::InvalidLineRange {
+                        start_pc: entry.start_pc,
+                        end_pc: entry.end_pc,
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_exception_table(&self) -> Result<(), CodeValidationError> {
+        let len = self.instructions.len() as u32;
+        for entry in self.exception_table.iter() {
+            let finally_ok = entry.finally_pc == u32::MAX || entry.finally_pc < len;
+            if entry.start_pc > entry.end_pc
+                || entry.end_pc > len
+                || entry.handler_pc >= len
+                || !finally_ok
+            {
+                return Err(CodeValidationError::new(
+                    entry.start_pc as usize,
+                    CodeValidationErrorKind::InvalidExceptionRange {
+                        start_pc: entry.start_pc,
+                        end_pc: entry.end_pc,
+                        handler_pc: entry.handler_pc,
+                        finally_pc: entry.finally_pc,
+                    },
+                ));
+            }
+
+            if entry.exception_type_idx != u16::MAX {
+                self.validate_pool_index(
+                    entry.start_pc as usize,
+                    "constant",
+                    entry.exception_type_idx,
+                    self.constants.len(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_pool_index(
+        &self,
+        pc: usize,
+        pool: &'static str,
+        index: u16,
+        len: usize,
+    ) -> Result<(), CodeValidationError> {
+        if usize::from(index) < len {
+            Ok(())
+        } else {
+            Err(CodeValidationError::new(
+                pc,
+                CodeValidationErrorKind::PoolIndexOutOfBounds { pool, index, len },
+            ))
+        }
+    }
+
+    fn validate_local_slot(&self, pc: usize, slot: u16) -> Result<(), CodeValidationError> {
+        if slot >= REGISTER_FILE_SIZE {
+            return Err(CodeValidationError::new(
+                pc,
+                CodeValidationErrorKind::LocalSlotTooWide { slot },
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_jump_target(&self, pc: usize, offset: i16) -> Result<(), CodeValidationError> {
+        let target = pc as isize + 1 + offset as isize;
+        let len = self.instructions.len();
+        if (0..=len as isize).contains(&target) {
+            Ok(())
+        } else {
+            Err(CodeValidationError::new(
+                pc,
+                CodeValidationErrorKind::JumpTargetOutOfBounds { target, len },
+            ))
+        }
+    }
+
+    fn validate_extended_name_operand(
+        &self,
+        pc: usize,
+        opcode: Opcode,
+        inst: Instruction,
+    ) -> Result<usize, CodeValidationError> {
+        let inline = match opcode {
+            Opcode::GetAttr | Opcode::DelAttr | Opcode::LoadMethod | Opcode::ImportFrom => {
+                inst.src2().0
+            }
+            Opcode::SetAttr => inst.src1().0,
+            _ => unreachable!("non-name opcode passed to validate_extended_name_operand"),
+        };
+
+        if inline != EXTENDED_NAME_SENTINEL {
+            self.validate_pool_index(pc, "name", inline as u16, self.names.len())?;
+            return Ok(pc + 1);
+        }
+
+        let extension_pc = pc + 1;
+        let Some(extension) = self.instructions.get(extension_pc).copied() else {
+            return Err(CodeValidationError::new(
+                pc,
+                CodeValidationErrorKind::MissingExtension {
+                    opcode,
+                    extension: Opcode::AttrName,
+                },
+            ));
+        };
+
+        if Opcode::from_u8(extension.opcode()) != Some(Opcode::AttrName) {
+            return Err(CodeValidationError::new(
+                pc,
+                CodeValidationErrorKind::MissingExtension {
+                    opcode,
+                    extension: Opcode::AttrName,
+                },
+            ));
+        }
+
+        self.validate_pool_index(extension_pc, "name", extension.imm16(), self.names.len())?;
+        Ok(pc + 2)
+    }
+
+    fn skip_class_metadata(&self, pc: usize, opcode: Opcode) -> Result<usize, CodeValidationError> {
+        if !matches!(opcode, Opcode::BuildClass | Opcode::BuildClassWithMeta) {
+            return Ok(pc + 1);
+        }
+
+        let mut next_pc = pc + 1;
+        if self
+            .instructions
+            .get(next_pc)
+            .is_some_and(|inst| Opcode::from_u8(inst.opcode()) == Some(Opcode::ClassMeta))
+        {
+            next_pc += 1;
+        }
+        if self
+            .instructions
+            .get(next_pc)
+            .is_some_and(|inst| Opcode::from_u8(inst.opcode()) == Some(Opcode::CallKwEx))
+        {
+            next_pc += 1;
+        }
+        Ok(next_pc)
+    }
 }
 
 /// Disassemble a code object to a string.
@@ -346,7 +725,7 @@ pub fn disassemble(code: &CodeObject) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instruction::Opcode;
+    use crate::instruction::{Opcode, Register};
 
     #[test]
     fn test_code_flags() {
@@ -375,6 +754,88 @@ mod tests {
         assert_eq!(&*code.name, "test_func");
         assert_eq!(&*code.filename, "test.py");
         assert_eq!(code.instructions.len(), 0);
+    }
+
+    #[test]
+    fn test_validate_accepts_well_formed_extended_name_operand() {
+        let mut code = CodeObject::new("attr", "test.py");
+        code.names = (0..=0x0123)
+            .map(|index| Arc::<str>::from(format!("name_{index}")))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        code.instructions = vec![
+            Instruction::new(Opcode::GetAttr, 0, 1, u8::MAX),
+            Instruction::op_di(Opcode::AttrName, Register::new(0), 0x0123),
+        ]
+        .into_boxed_slice();
+
+        assert!(code.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_opcode() {
+        let mut code = CodeObject::new("bad", "test.py");
+        code.instructions = vec![Instruction::from_raw(0xFF00_0000)].into_boxed_slice();
+
+        assert!(matches!(
+            code.validate(),
+            Err(CodeValidationError {
+                kind: CodeValidationErrorKind::InvalidOpcode { opcode: 0xFF },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_constant_index_out_of_bounds() {
+        let mut code = CodeObject::new("bad_const", "test.py");
+        code.instructions =
+            vec![Instruction::op_di(Opcode::LoadConst, Register::new(0), 7)].into_boxed_slice();
+
+        assert!(matches!(
+            code.validate(),
+            Err(CodeValidationError {
+                kind: CodeValidationErrorKind::PoolIndexOutOfBounds {
+                    pool: "constant",
+                    index: 7,
+                    len: 0,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_attr_name_extension() {
+        let mut code = CodeObject::new("bad_attr", "test.py");
+        code.instructions =
+            vec![Instruction::new(Opcode::GetAttr, 0, 1, u8::MAX)].into_boxed_slice();
+
+        assert!(matches!(
+            code.validate(),
+            Err(CodeValidationError {
+                kind: CodeValidationErrorKind::MissingExtension {
+                    opcode: Opcode::GetAttr,
+                    extension: Opcode::AttrName,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_jump_out_of_bounds() {
+        let mut code = CodeObject::new("bad_jump", "test.py");
+        code.instructions =
+            vec![Instruction::op_di(Opcode::Jump, Register::new(0), 10u16)].into_boxed_slice();
+
+        assert!(matches!(
+            code.validate(),
+            Err(CodeValidationError {
+                kind: CodeValidationErrorKind::JumpTargetOutOfBounds { .. },
+                ..
+            })
+        ));
     }
 
     #[test]
