@@ -14,4 +14,7 @@ pub use builder::{FunctionBuilder, KwNamesTuple, Label};
 pub use code_object::{
     CodeFlags, CodeObject, Constant, ExceptionEntry, LineTableEntry, disassemble,
 };
-pub use instruction::{ConstIndex, Instruction, InstructionFormat, LocalSlot, Opcode, Register};
+pub use instruction::{
+    CLASS_META_DYNAMIC_BASES_FLAG, CLASS_META_DYNAMIC_KEYWORDS_FLAG, ConstIndex, Instruction,
+    InstructionFormat, LocalSlot, Opcode, Register,
+};

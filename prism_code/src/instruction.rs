@@ -84,6 +84,18 @@ impl LocalSlot {
 #[repr(transparent)]
 pub struct Instruction(u32);
 
+/// `ClassMeta.src2` flag for class definitions whose bases live in a tuple register.
+///
+/// When present, `ClassMeta.src1` stores the register containing the runtime-built
+/// bases tuple and `ClassMeta.dst` remains the static base-count slot.
+pub const CLASS_META_DYNAMIC_BASES_FLAG: u8 = 0b0000_0001;
+
+/// `ClassMeta.src2` flag for class definitions whose keywords live in a mapping register.
+///
+/// When present, the following `CallKwEx.dst` stores the register containing the
+/// merged keyword mapping instead of a static keyword count and names index.
+pub const CLASS_META_DYNAMIC_KEYWORDS_FLAG: u8 = 0b0000_0010;
+
 impl Instruction {
     /// Create an instruction from raw opcode and operands.
     #[inline]
@@ -436,16 +448,20 @@ pub enum Opcode {
     /// Check if callable: dst = callable(src).
     IsCallable = 0x69,
     /// Build class: dst = class object, imm16 = class-body code constant index.
-    /// The following `ClassMeta` instruction carries the base-count metadata.
+    /// The following `ClassMeta` instruction carries base metadata.
     BuildClass = 0x6A,
     /// Load method for super(): dst = super().method lookup.
     LoadMethod = 0x6B,
     /// Build class with an explicit metaclass value.
     /// Bases are in registers starting at dst+1, the metaclass value is stored
-    /// immediately after the final base register, and the following
-    /// `ClassMeta` instruction carries the base-count metadata.
+    /// immediately after the final base register for static-base forms, and
+    /// the following `ClassMeta` instruction carries base metadata.
     BuildClassWithMeta = 0x6C,
-    /// Build class metadata extension: dst = base count.
+    /// Build class metadata extension.
+    ///
+    /// Static form: dst = base count.
+    /// Dynamic forms: dst = static base count, src1 = bases tuple register when
+    /// [`CLASS_META_DYNAMIC_BASES_FLAG`] is set, src2 = class metadata flags.
     /// Always follows `BuildClass` / `BuildClassWithMeta` in newly emitted code.
     ClassMeta = 0x6D,
 
@@ -905,7 +921,7 @@ impl Opcode {
             BuildClass => DstImm16, // dst = class, imm16 = class-body code const index
             LoadMethod => DstSrcSrc, // dst = method, src1 = object, src2 = name_idx
             BuildClassWithMeta => DstImm16, // dst = class, imm16 = class-body code const index
-            ClassMeta => Dst,       // dst = base count for the preceding BuildClass opcode
+            ClassMeta => DstSrcSrc, // dst = base count, optional dynamic-bases metadata
 
             // Container ops
             BuildList | BuildTuple | BuildSet | BuildDict | BuildString | UnpackSequence

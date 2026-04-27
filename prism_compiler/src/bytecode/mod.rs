@@ -16,7 +16,7 @@ pub mod instruction {
 }
 
 pub use prism_code::{
-    CodeFlags, CodeObject, ConstIndex, Constant, ExceptionEntry, FunctionBuilder, Instruction,
-    InstructionFormat, KwNamesTuple, Label, LineTableEntry, LocalSlot, Opcode, Register,
-    disassemble,
+    CLASS_META_DYNAMIC_BASES_FLAG, CLASS_META_DYNAMIC_KEYWORDS_FLAG, CodeFlags, CodeObject,
+    ConstIndex, Constant, ExceptionEntry, FunctionBuilder, Instruction, InstructionFormat,
+    KwNamesTuple, Label, LineTableEntry, LocalSlot, Opcode, Register, disassemble,
 };

@@ -4,7 +4,10 @@
 //! with automatic register allocation and label resolution.
 
 use super::code_object::{CodeFlags, CodeObject, Constant, ExceptionEntry, LineTableEntry};
-use super::instruction::{ConstIndex, Instruction, LocalSlot, Opcode, Register};
+use super::instruction::{
+    CLASS_META_DYNAMIC_BASES_FLAG, CLASS_META_DYNAMIC_KEYWORDS_FLAG, ConstIndex, Instruction,
+    LocalSlot, Opcode, Register,
+};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
@@ -755,10 +758,59 @@ impl FunctionBuilder {
     /// count, keeping class construction resilient to large constant pools in
     /// real stdlib modules.
     pub fn emit_build_class(&mut self, dst: Register, code_idx: u16, base_count: u8) {
+        self.emit_build_class_ext(dst, code_idx, base_count, None, false);
+    }
+
+    /// Emit BUILD_CLASS with extended class metadata.
+    ///
+    /// This supports starred base expressions and unpacked keyword mappings
+    /// while keeping the compact static metadata for the common case.
+    pub fn emit_build_class_ext(
+        &mut self,
+        dst: Register,
+        code_idx: u16,
+        base_count: u8,
+        dynamic_bases: Option<Register>,
+        has_dynamic_keywords: bool,
+    ) {
         self.emit(Instruction::op_di(Opcode::BuildClass, dst, code_idx));
-        self.emit(Instruction::op_d(
+        self.emit_class_meta(base_count, dynamic_bases, has_dynamic_keywords);
+    }
+
+    /// Emit BUILD_CLASS with bases provided by a runtime-built tuple register.
+    ///
+    /// This is used for class statements containing starred base expressions,
+    /// while keeping the compact static-base encoding for the common case.
+    pub fn emit_build_class_dynamic_bases(
+        &mut self,
+        dst: Register,
+        code_idx: u16,
+        bases_tuple: Register,
+    ) {
+        self.emit_build_class_ext(dst, code_idx, 0, Some(bases_tuple), false);
+    }
+
+    fn emit_class_meta(
+        &mut self,
+        base_count: u8,
+        dynamic_bases: Option<Register>,
+        has_dynamic_keywords: bool,
+    ) {
+        let mut flags = 0;
+        let bases_reg = if let Some(reg) = dynamic_bases {
+            flags |= CLASS_META_DYNAMIC_BASES_FLAG;
+            reg.0
+        } else {
+            0
+        };
+        if has_dynamic_keywords {
+            flags |= CLASS_META_DYNAMIC_KEYWORDS_FLAG;
+        }
+        self.emit(Instruction::new(
             Opcode::ClassMeta,
-            Register::new(base_count),
+            base_count,
+            bases_reg,
+            flags,
         ));
     }
 
@@ -769,15 +821,41 @@ impl FunctionBuilder {
     /// - `dst+1..dst+base_count` = base classes
     /// - `dst+1+base_count` = explicit metaclass value
     pub fn emit_build_class_with_meta(&mut self, dst: Register, code_idx: u16, base_count: u8) {
+        self.emit_build_class_with_meta_ext(dst, code_idx, base_count, None, false);
+    }
+
+    /// Emit BUILD_CLASS_WITH_META with extended class metadata.
+    ///
+    /// Dynamic-base forms keep the explicit metaclass value at `dst+1` because
+    /// bases are supplied by the metadata tuple register instead of the contiguous
+    /// class-construction block.
+    pub fn emit_build_class_with_meta_ext(
+        &mut self,
+        dst: Register,
+        code_idx: u16,
+        base_count: u8,
+        dynamic_bases: Option<Register>,
+        has_dynamic_keywords: bool,
+    ) {
         self.emit(Instruction::op_di(
             Opcode::BuildClassWithMeta,
             dst,
             code_idx,
         ));
-        self.emit(Instruction::op_d(
-            Opcode::ClassMeta,
-            Register::new(base_count),
-        ));
+        self.emit_class_meta(base_count, dynamic_bases, has_dynamic_keywords);
+    }
+
+    /// Emit BUILD_CLASS_WITH_META with bases provided by a runtime-built tuple register.
+    ///
+    /// The explicit metaclass value still lives at `dst+1` because dynamic bases
+    /// do not occupy the contiguous class-construction block.
+    pub fn emit_build_class_with_meta_dynamic_bases(
+        &mut self,
+        dst: Register,
+        code_idx: u16,
+        bases_tuple: Register,
+    ) {
+        self.emit_build_class_with_meta_ext(dst, code_idx, 0, Some(bases_tuple), false);
     }
 
     /// Move value between registers.
