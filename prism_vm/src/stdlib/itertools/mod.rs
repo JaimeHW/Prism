@@ -113,8 +113,9 @@ itertools_stub!(
     "itertools.zip_longest",
     "zip_longest"
 );
-static PRODUCT_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("itertools.product"), builtin_product));
+static PRODUCT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("itertools.product"), builtin_product)
+});
 static PERMUTATIONS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("itertools.permutations"), builtin_permutations)
 });
@@ -362,10 +363,33 @@ fn builtin_islice(args: &[Value]) -> Result<Value, BuiltinError> {
     )))
 }
 
-fn builtin_product(args: &[Value]) -> Result<Value, BuiltinError> {
-    let pools: Result<Vec<Vec<Value>>, BuiltinError> =
+fn builtin_product(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    let mut repeat = 1usize;
+    for (name, value) in keywords {
+        match *name {
+            "repeat" => repeat = parse_non_negative_usize(*value, "repeat")?,
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "product() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    let base_pools: Result<Vec<Vec<Value>>, BuiltinError> =
         args.iter().copied().map(collect_iterable_values).collect();
-    let tuples = Product::new(pools?).map(tuple_value).collect::<Vec<_>>();
+    let base_pools = base_pools?;
+    let pool_count = base_pools
+        .len()
+        .checked_mul(repeat)
+        .ok_or_else(|| BuiltinError::OverflowError("product repeat is too large".to_string()))?;
+    let mut pools = Vec::with_capacity(pool_count);
+    for _ in 0..repeat {
+        pools.extend(base_pools.iter().cloned());
+    }
+
+    let tuples = Product::new(pools).map(tuple_value).collect::<Vec<_>>();
     Ok(iterator_value(IteratorObject::from_values(tuples)))
 }
 
