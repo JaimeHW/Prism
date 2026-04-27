@@ -315,6 +315,13 @@ fn dict_binary_operands(
 }
 
 #[inline]
+fn exact_dict_operand(value: Value) -> Option<(*const (), &'static DictObject)> {
+    let ptr = value.as_object_ptr()?;
+    (unsafe { (*(ptr as *const ObjectHeader)).type_id } == TypeId::DICT)
+        .then(|| (ptr, unsafe { &*(ptr as *const DictObject) }))
+}
+
+#[inline]
 pub(crate) fn boxed_set_result(mut set: SetObject, result_type: TypeId) -> Value {
     set.header.type_id = result_type;
     crate::alloc_managed_value(set)
@@ -552,6 +559,16 @@ fn eq_result_inner(
         return Ok(equal);
     }
 
+    if let (Some((left_ptr, left)), Some((right_ptr, right))) =
+        (exact_dict_operand(a), exact_dict_operand(b))
+    {
+        let pair = ordered_object_pair(left_ptr, right_ptr);
+        if !seen_pairs.insert(pair) {
+            return Ok(true);
+        }
+        return dict_eq_result(vm, left, right, seen_pairs);
+    }
+
     if let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Eq)? {
         return Ok(result);
     }
@@ -622,6 +639,16 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         return Ok(!equal);
     }
 
+    if let (Some((left_ptr, left)), Some((right_ptr, right))) =
+        (exact_dict_operand(a), exact_dict_operand(b))
+    {
+        let pair = ordered_object_pair(left_ptr, right_ptr);
+        if !seen_pairs.insert(pair) {
+            return Ok(false);
+        }
+        return dict_eq_result(vm, left, right, &mut seen_pairs).map(|equal| !equal);
+    }
+
     if let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Ne)? {
         return Ok(result);
     }
@@ -631,6 +658,29 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
     }
 
     Ok(!values_equal(a, b))
+}
+
+fn dict_eq_result(
+    vm: &mut VirtualMachine,
+    left: &DictObject,
+    right: &DictObject,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<bool, RuntimeError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+
+    let entries = left.iter().collect::<Vec<_>>();
+    for (key, left_value) in entries {
+        let Some(right_value) = crate::ops::dict_access::dict_get_item(vm, right, key)? else {
+            return Ok(false);
+        };
+        if !eq_result_inner(vm, left_value, right_value, seen_pairs)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn native_sequence_eq_result(
