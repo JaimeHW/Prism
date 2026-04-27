@@ -765,7 +765,7 @@ fn eq_result_inner(
         return Ok(equal);
     }
 
-    if let Some(equal) = mapping_proxy_eq_result(vm, a, b, seen_pairs)? {
+    if let Some(equal) = mapping_eq_result(vm, a, b, seen_pairs)? {
         return Ok(equal);
     }
 
@@ -853,7 +853,7 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         return Ok(!equal);
     }
 
-    if let Some(equal) = mapping_proxy_eq_result(vm, a, b, &mut seen_pairs)? {
+    if let Some(equal) = mapping_eq_result(vm, a, b, &mut seen_pairs)? {
         return Ok(!equal);
     }
 
@@ -1023,13 +1023,13 @@ fn is_dict_subclass_instance(ptr: *const ()) -> bool {
             .is_some_and(|bitmap| bitmap.is_subclass_of(TypeId::DICT))
 }
 
-fn mapping_proxy_eq_result(
+fn mapping_eq_result(
     vm: &mut VirtualMachine,
     left: Value,
     right: Value,
     seen_pairs: &mut FxHashSet<(usize, usize)>,
 ) -> Result<Option<bool>, RuntimeError> {
-    if exact_mapping_proxy_operand(left).is_none() && exact_mapping_proxy_operand(right).is_none() {
+    if !is_mapping_compare_candidate(left) && !is_mapping_compare_candidate(right) {
         return Ok(None);
     }
 
@@ -1046,6 +1046,16 @@ fn mapping_proxy_eq_result(
     }
 
     dict_eq_result(vm, left.dict(), right.dict(), seen_pairs).map(Some)
+}
+
+#[inline]
+fn is_mapping_compare_candidate(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    type_id == TypeId::DICT || type_id == TypeId::MAPPING_PROXY || is_dict_subclass_instance(ptr)
 }
 
 fn native_sequence_eq_result(
