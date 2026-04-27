@@ -31,7 +31,7 @@ use prism_runtime::object::descriptor::{BoundMethod, StaticMethodDescriptor};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::{class_id_to_type_id, global_class};
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::object::views::DescriptorViewObject;
+use prism_runtime::object::views::{DescriptorViewObject, MethodWrapperObject};
 use prism_runtime::types::Cell;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
@@ -254,6 +254,7 @@ pub(crate) fn value_supports_call_protocol(value: Value) -> bool {
         TypeId::WRAPPER_DESCRIPTOR | TypeId::METHOD_DESCRIPTOR | TypeId::CLASSMETHOD_DESCRIPTOR => {
             reflected_descriptor_callable_target(value).is_some()
         }
+        TypeId::METHOD_WRAPPER => method_wrapper_call_target(value).is_some(),
         _ => matches!(resolve_dunder_call_target(value), Ok(Some(_))),
     }
 }
@@ -275,6 +276,26 @@ fn reflected_descriptor_callable_target(value: Value) -> Option<Value> {
         descriptor.owner(),
         descriptor.name(),
     )
+}
+
+#[inline]
+fn method_wrapper_call_target(value: Value) -> Option<BoundMethodTarget> {
+    let ptr = value.as_object_ptr()?;
+    if extract_type_id(ptr) != TypeId::METHOD_WRAPPER {
+        return None;
+    }
+
+    let wrapper = unsafe { &*(ptr as *const MethodWrapperObject) };
+    let callable = crate::builtins::reflected_descriptor_callable_value(
+        TypeId::WRAPPER_DESCRIPTOR,
+        wrapper.owner(),
+        wrapper.name(),
+    )?;
+
+    Some(BoundMethodTarget {
+        callable,
+        implicit_self: Some(wrapper.receiver()),
+    })
 }
 
 fn invoke_resolved_callable(
@@ -2003,6 +2024,14 @@ fn invoke_callable_value_impl(
             };
             invoke_callable_value_impl(vm, target, args, allow_control_transfer)
         }
+        TypeId::METHOD_WRAPPER => {
+            let Some(resolved) = method_wrapper_call_target(callable) else {
+                return Err(RuntimeError::type_error(
+                    "'method-wrapper' object is not callable",
+                ));
+            };
+            invoke_bound_callable_value_impl(vm, resolved, args, allow_control_transfer)
+        }
         _ => {
             let Some(resolved) = resolve_dunder_call_target(callable)? else {
                 return Err(RuntimeError::type_error(format!(
@@ -2112,6 +2141,14 @@ pub(crate) fn invoke_callable_value_with_keywords(
                 )));
             };
             invoke_callable_value_with_keywords(vm, target, args, keywords)
+        }
+        TypeId::METHOD_WRAPPER => {
+            let Some(resolved) = method_wrapper_call_target(callable) else {
+                return Err(RuntimeError::type_error(
+                    "'method-wrapper' object is not callable",
+                ));
+            };
+            invoke_bound_callable_value_with_keywords(vm, resolved, args, keywords)
         }
         _ => {
             let Some(resolved) = resolve_dunder_call_target(callable)? else {
@@ -2830,6 +2867,20 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     Err(e) => ControlFlow::Error(e),
                 }
             }
+            TypeId::METHOD_WRAPPER => {
+                let Some(resolved) = method_wrapper_call_target(func_val) else {
+                    return ControlFlow::Error(RuntimeError::type_error(
+                        "'method-wrapper' object is not callable",
+                    ));
+                };
+                match invoke_resolved_callable(vm, resolved, dst_reg, argc, 0, 0) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(e) => ControlFlow::Error(e),
+                }
+            }
             _ => match resolve_dunder_call_target(func_val) {
                 Ok(Some(resolved)) => {
                     match invoke_resolved_callable(vm, resolved, dst_reg, argc, 0, 0) {
@@ -3030,6 +3081,21 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     .collect();
 
                 match invoke_callable_value_with_keywords(vm, target, &args, &keyword_refs) {
+                    Ok(result) => {
+                        vm.current_frame_mut().set_reg(dst_reg, result);
+                        ControlFlow::Continue
+                    }
+                    Err(e) => ControlFlow::Error(e),
+                }
+            }
+            TypeId::METHOD_WRAPPER => {
+                let Some(resolved) = method_wrapper_call_target(func_val) else {
+                    return ControlFlow::Error(RuntimeError::type_error(
+                        "'method-wrapper' object is not callable",
+                    ));
+                };
+                match invoke_resolved_callable(vm, resolved, dst_reg, posargc, kwargc, kwnames_idx)
+                {
                     Ok(result) => {
                         vm.current_frame_mut().set_reg(dst_reg, result);
                         ControlFlow::Continue

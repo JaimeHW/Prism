@@ -328,6 +328,21 @@ static OBJECT_EQ_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__eq__"), object_eq));
 static OBJECT_NE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("object.__ne__"), object_ne));
+static OBJECT_LT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__lt__"), object_not_ordered));
+static OBJECT_LE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__le__"), object_not_ordered));
+static OBJECT_GT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__gt__"), object_not_ordered));
+static OBJECT_GE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__ge__"), object_not_ordered));
+static OBJECT_HASH_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__hash__"), object_hash));
+static OBJECT_DIR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("object.__dir__"), object_dir));
+static OBJECT_GETSTATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("object.__getstate__"), object_getstate)
+});
 static OBJECT_GETATTRIBUTE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("object.__getattribute__"), object_getattribute)
 });
@@ -343,8 +358,33 @@ static OBJECT_STR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__str__"), value_str));
 static OBJECT_FORMAT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__format__"), value_format));
+static OBJECT_SIZEOF_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("object.__sizeof__"), object_sizeof));
+static OBJECT_REDUCE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("object.__reduce__"), value_reduce));
 static OBJECT_REDUCE_EX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("object.__reduce_ex__"), value_reduce_ex)
+});
+static OBJECT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("object.__new__"),
+        crate::builtins::builtin_object_new,
+    )
+});
+static OBJECT_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("object.__init__"),
+        crate::builtins::builtin_object_init,
+    )
+});
+static OBJECT_INIT_SUBCLASS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(
+        Arc::from("object.__init_subclass__"),
+        crate::builtins::builtin_object_init_subclass,
+    )
+});
+static OBJECT_SUBCLASSHOOK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("object.__subclasshook__"), object_subclasshook)
 });
 static TYPE_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("type.__repr__"), type_repr));
@@ -737,6 +777,27 @@ pub fn resolve_object_method(name: &str) -> Option<CachedMethod> {
         "__ne__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_NE_METHOD,
         ))),
+        "__lt__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_LT_METHOD,
+        ))),
+        "__le__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_LE_METHOD,
+        ))),
+        "__gt__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_GT_METHOD,
+        ))),
+        "__ge__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_GE_METHOD,
+        ))),
+        "__hash__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_HASH_METHOD,
+        ))),
+        "__dir__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_DIR_METHOD,
+        ))),
+        "__getstate__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_GETSTATE_METHOD,
+        ))),
         "__getattribute__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_GETATTRIBUTE_METHOD,
         ))),
@@ -754,6 +815,27 @@ pub fn resolve_object_method(name: &str) -> Option<CachedMethod> {
         ))),
         "__format__" => Some(CachedMethod::simple(builtin_method_value(
             &OBJECT_FORMAT_METHOD,
+        ))),
+        "__sizeof__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_SIZEOF_METHOD,
+        ))),
+        "__reduce__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_REDUCE_METHOD,
+        ))),
+        "__reduce_ex__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_REDUCE_EX_METHOD,
+        ))),
+        "__new__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_NEW_METHOD,
+        ))),
+        "__init__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_INIT_METHOD,
+        ))),
+        "__init_subclass__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_INIT_SUBCLASS_METHOD,
+        ))),
+        "__subclasshook__" => Some(CachedMethod::simple(builtin_method_value(
+            &OBJECT_SUBCLASSHOOK_METHOD,
         ))),
         _ => None,
     }
@@ -2335,6 +2417,38 @@ fn object_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinEr
     Ok(builtin_not_implemented_value())
 }
 
+#[inline]
+fn object_not_ordered(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "object rich comparison takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(builtin_not_implemented_value())
+}
+
+#[inline]
+fn object_hash(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__hash__", args, 0)?;
+    crate::builtins::builtin_hash(args)
+}
+
+#[inline]
+fn object_dir(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__dir__", args, 0)?;
+    crate::builtins::builtin_dir_vm(vm, args)
+}
+
+fn object_getstate(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__getstate__", args, 0)?;
+    match get_attribute_value(vm, args[0], &intern("__dict__")) {
+        Ok(dict) => Ok(dict),
+        Err(err) if err.is_attribute_error() => Ok(Value::none()),
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
+    }
+}
+
 fn object_getattribute(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("object", "__getattribute__", args, 1)?;
     let Some(name) = value_as_string_ref(args[1]) else {
@@ -2432,6 +2546,27 @@ fn value_str(args: &[Value]) -> Result<Value, BuiltinError> {
 #[inline]
 fn value_format(args: &[Value]) -> Result<Value, BuiltinError> {
     crate::builtins::builtin_format(args)
+}
+
+#[inline]
+fn object_sizeof(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__sizeof__", args, 0)?;
+    Ok(Value::int(crate::stdlib::sys::getsizeof(&args[0]) as i64)
+        .expect("object size should fit in tagged int"))
+}
+
+#[inline]
+fn object_subclasshook(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__subclasshook__", args, 1)?;
+    Ok(builtin_not_implemented_value())
+}
+
+#[inline]
+fn value_reduce(_vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("object", "__reduce__", args, 0)?;
+    Err(BuiltinError::NotImplemented(
+        "pickle protocol support is not implemented yet".to_string(),
+    ))
 }
 
 fn value_reduce_ex(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {

@@ -101,6 +101,14 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         if type_id == TypeId::OBJECT {
             return match resolve_object_instance_method(obj, &name) {
                 Ok(cached) => apply_cached_method(vm, dst, obj, cached),
+                Err(err)
+                    if matches!(
+                        err.kind,
+                        crate::error::RuntimeErrorKind::AttributeError { .. }
+                    ) =>
+                {
+                    load_runtime_attribute(vm, dst, obj, &name)
+                }
                 Err(e) => ControlFlow::Error(e),
             };
         }
@@ -430,6 +438,10 @@ fn resolve_object_instance_method(obj: Value, name: &str) -> Result<CachedMethod
 
     if let Some(value) = shaped.get_property(name) {
         return Ok(cached_method_from_instance_value(value));
+    }
+
+    if let Some(cached) = super::resolve_builtin_instance_method(TypeId::OBJECT, name) {
+        return Ok(cached);
     }
 
     Err(RuntimeError::attribute_error("object", name))

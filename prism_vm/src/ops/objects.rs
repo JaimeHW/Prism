@@ -1981,6 +1981,10 @@ pub(crate) fn object_getattribute_default(
                 return Ok(value);
             }
 
+            if let Some(value) = builtin_instance_method_attr_value(obj, TypeId::OBJECT, name) {
+                return Ok(value);
+            }
+
             return Err(RuntimeError::attribute_error("object", name.as_str()));
         }
 
@@ -2018,16 +2022,18 @@ pub(crate) fn get_attribute_value(
             );
         }
 
-        if type_id == TypeId::TYPE
-            && name.as_str() == "__class__"
-            && let Some(class) = class_object_from_type_ptr(ptr)
-        {
-            let metaclass = class.metaclass();
-            return Ok(if metaclass.is_none() {
-                crate::builtins::builtin_type_object_for_type_id(TypeId::TYPE)
-            } else {
-                metaclass
-            });
+        if type_id == TypeId::TYPE && name.as_str() == "__class__" {
+            if let Some(class) = class_object_from_type_ptr(ptr) {
+                let metaclass = class.metaclass();
+                return Ok(if metaclass.is_none() {
+                    crate::builtins::builtin_type_object_for_type_id(TypeId::TYPE)
+                } else {
+                    metaclass
+                });
+            }
+            return Ok(crate::builtins::builtin_type_object_for_type_id(
+                TypeId::TYPE,
+            ));
         }
 
         if !matches!(type_id, TypeId::EXCEPTION_TYPE | TypeId::TYPE)
@@ -2060,6 +2066,10 @@ pub(crate) fn get_attribute_value(
                 if let Some(value) =
                     builtin_instance_attribute_value(vm, TypeId::OBJECT, obj, name)?
                 {
+                    return Ok(value);
+                }
+
+                if let Some(value) = builtin_instance_method_attr_value(obj, TypeId::OBJECT, name) {
                     return Ok(value);
                 }
 
