@@ -144,9 +144,9 @@ static SET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("set.__init__"), super::types::builtin_set_init_vm)
 });
 static FROZENSET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("frozenset.__new__"),
-        super::types::builtin_frozenset_new,
+        super::types::builtin_frozenset_new_vm,
     )
 });
 static FROZENSET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {

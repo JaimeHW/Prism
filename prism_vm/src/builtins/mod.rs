@@ -336,15 +336,15 @@ impl BuiltinRegistry {
             prism_runtime::object::type_obj::TypeId::DICT,
             types::builtin_dict_vm,
         );
-        registry.register_callable_type(
+        registry.register_callable_type_vm(
             "set",
             prism_runtime::object::type_obj::TypeId::SET,
-            types::builtin_set,
+            types::builtin_set_vm,
         );
-        registry.register_callable_type(
+        registry.register_callable_type_vm(
             "frozenset",
             prism_runtime::object::type_obj::TypeId::FROZENSET,
-            types::builtin_frozenset,
+            types::builtin_frozenset_vm,
         );
         registry.register_callable_type(
             "range",

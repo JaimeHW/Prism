@@ -74,14 +74,15 @@ pub fn build_set(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let dst = inst.dst().0;
 
     // Collect values and build set (borrow frame, then release)
-    let set = {
+    let values = {
         let frame = vm.current_frame();
-        let mut set = SetObject::new();
-        for i in 0..count {
-            let value = frame.get_reg(start_reg + i as u8);
-            set.add(value);
-        }
-        set
+        (0..count)
+            .map(|i| frame.get_reg(start_reg + i as u8))
+            .collect::<Vec<_>>()
+    };
+    let set = match crate::ops::set_access::set_from_values(vm, values) {
+        Ok(set) => set,
+        Err(err) => return ControlFlow::Error(err),
     };
 
     let value = alloc_value_in_current_heap_or_box(set);
@@ -219,8 +220,10 @@ pub fn set_add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = set_val.as_object_ptr() {
         // SAFETY: We know this is a SetObject because BuildSet created it
         let set = unsafe { &mut *(ptr as *mut SetObject) };
-        set.add(value);
-        ControlFlow::Continue
+        match crate::ops::set_access::set_add_item(vm, set, value) {
+            Ok(_) => ControlFlow::Continue,
+            Err(err) => ControlFlow::Error(err),
+        }
     } else {
         ControlFlow::Error(RuntimeError::type_error("expected set object"))
     }

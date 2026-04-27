@@ -111,9 +111,9 @@ static SET_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
     )
 });
 static FROZENSET_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("frozenset.__new__"),
-        crate::builtins::builtin_frozenset_new,
+        crate::builtins::builtin_frozenset_new_vm,
     )
 });
 static FROZENSET_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {

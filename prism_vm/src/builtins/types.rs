@@ -1515,7 +1515,9 @@ pub(crate) fn call_builtin_type_with_vm(
             }
 
             let values = iter_values_with_vm(vm, args[0])?;
-            Ok(to_object_value(build_validated_set(values)?))
+            let set = crate::ops::set_access::set_from_values(vm, values)
+                .map_err(runtime_error_to_builtin_error)?;
+            Ok(to_object_value(set))
         }
         TypeId::FROZENSET => {
             if args.len() > 1 {
@@ -1540,7 +1542,9 @@ pub(crate) fn call_builtin_type_with_vm(
             }
 
             let values = iter_values_with_vm(vm, args[0])?;
-            Ok(to_frozenset_value(build_validated_set(values)?))
+            let set = crate::ops::set_access::set_from_values(vm, values)
+                .map_err(runtime_error_to_builtin_error)?;
+            Ok(to_frozenset_value(set))
         }
         _ => call_builtin_type(type_id, args),
     }
@@ -2530,6 +2534,13 @@ pub fn builtin_set(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(to_object_value(build_validated_set(values)?))
 }
 
+pub(crate) fn builtin_set_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    call_builtin_type_with_vm(vm, TypeId::SET, args)
+}
+
 /// Builtin frozenset constructor.
 pub fn builtin_frozenset(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() > 1 {
@@ -2556,6 +2567,13 @@ pub fn builtin_frozenset(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let values = iter_values(args[0])?;
     Ok(to_frozenset_value(build_validated_set(values)?))
+}
+
+pub(crate) fn builtin_frozenset_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    call_builtin_type_with_vm(vm, TypeId::FROZENSET, args)
 }
 
 /// Builtin slice constructor.
@@ -3387,6 +3405,83 @@ pub(crate) fn builtin_frozenset_new(args: &[Value]) -> Result<Value, BuiltinErro
     Ok(to_object_value(instance))
 }
 
+pub(crate) fn builtin_frozenset_new_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "frozenset.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "frozenset expected at most 1 argument, got {}",
+            args.len() - 1
+        )));
+    }
+
+    let class_type = class_value_to_type_id(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("frozenset.__new__(X): X must be a type".to_string())
+    })?;
+
+    let set = match args.get(1).copied() {
+        Some(value) => {
+            if class_type == TypeId::FROZENSET
+                && value.as_object_ptr().is_some_and(|ptr| {
+                    crate::ops::objects::extract_type_id(ptr) == TypeId::FROZENSET
+                })
+            {
+                return Ok(value);
+            }
+
+            if let Some(ptr) = value.as_object_ptr()
+                && crate::ops::objects::extract_type_id(ptr) == TypeId::SET
+            {
+                unsafe { &*(ptr as *const SetObject) }.clone()
+            } else {
+                let values = iter_values_with_vm(vm, value)?;
+                crate::ops::set_access::set_from_values(vm, values)
+                    .map_err(runtime_error_to_builtin_error)?
+            }
+        }
+        None => SetObject::new(),
+    };
+
+    if class_type == TypeId::FROZENSET {
+        return Ok(to_frozenset_value(set));
+    }
+    if !class_value_is_subtype(args[0], TypeId::FROZENSET) {
+        return Err(BuiltinError::TypeError(
+            "frozenset.__new__(X): X is not a subtype of frozenset".to_string(),
+        ));
+    }
+
+    let class_ptr = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("frozenset.__new__(X): X must be a type".to_string())
+    })?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "frozenset.__new__() for builtin frozenset subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    let mut instance = ShapedObject::new_set_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+        TypeId::FROZENSET,
+    );
+    *instance
+        .set_backing_mut()
+        .expect("frozenset subclass instance should carry native set storage") = set;
+    instance
+        .set_backing_mut()
+        .expect("frozenset subclass instance should carry native set storage")
+        .header
+        .type_id = TypeId::FROZENSET;
+    Ok(to_object_value(instance))
+}
+
 pub(crate) fn builtin_set_init_vm(
     vm: &mut VirtualMachine,
     args: &[Value],
@@ -3413,8 +3508,8 @@ pub(crate) fn builtin_set_init_vm(
     set.clear();
     if let Some(iterable) = args.get(1).copied() {
         for value in iter_values_with_vm(vm, iterable)? {
-            validate_hashable_value(value)?;
-            set.add(value);
+            crate::ops::set_access::set_add_item(vm, set, value)
+                .map_err(runtime_error_to_builtin_error)?;
         }
     }
 

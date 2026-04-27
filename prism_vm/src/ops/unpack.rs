@@ -13,7 +13,6 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::list::ListObject;
-use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
@@ -191,10 +190,10 @@ pub fn build_set_unpack(vm: &mut VirtualMachine, inst: Instruction) -> ControlFl
         Err(err) => return ControlFlow::Error(err),
     };
 
-    let mut set = SetObject::new();
-    for value in values {
-        set.add(value);
-    }
+    let set = match crate::ops::set_access::set_from_values(vm, values) {
+        Ok(set) => set,
+        Err(err) => return ControlFlow::Error(err),
+    };
     let ptr = match vm.allocator().alloc(set) {
         Some(ptr) => ptr as *const (),
         None => {

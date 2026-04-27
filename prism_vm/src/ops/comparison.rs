@@ -1869,7 +1869,7 @@ pub(crate) fn contains_value(
             // Set/Frozenset: O(1) hash-based lookup
             TypeId::SET | TypeId::FROZENSET => {
                 let set = unsafe { &*(ptr as *const SetObject) };
-                return Ok(set.contains(needle));
+                return crate::ops::set_access::set_contains_item(vm, set, needle);
             }
 
             // Dict: O(1) hash-based key lookup

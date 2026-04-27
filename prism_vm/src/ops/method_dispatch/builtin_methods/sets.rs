@@ -3,11 +3,11 @@
 use super::*;
 
 static SET_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.add"), set_add));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("set.add"), set_add_with_vm));
 static SET_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.remove"), set_remove));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("set.remove"), set_remove_with_vm));
 static SET_DISCARD_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.discard"), set_discard));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("set.discard"), set_discard_with_vm));
 static SET_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.pop"), set_pop));
 static SET_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -64,10 +64,14 @@ static SET_ISSUBSET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static SET_ISSUPERSET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("set.issuperset"), set_issuperset_with_vm)
 });
-static SET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.__contains__"), set_contains));
+static SET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.__contains__"), set_contains_with_vm)
+});
 static FROZENSET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("frozenset.__contains__"), frozenset_contains)
+    BuiltinFunctionObject::new_vm(
+        Arc::from("frozenset.__contains__"),
+        frozenset_contains_with_vm,
+    )
 });
 static FROZENSET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_kw(
@@ -215,6 +219,18 @@ pub(super) fn set_add(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+pub(super) fn set_add_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "add", args, 1)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "add")?;
+    crate::ops::set_access::set_add_item(vm, set, args[1])
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
+}
+
+#[inline]
 pub(super) fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "remove", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "remove")?;
@@ -226,10 +242,38 @@ pub(super) fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+pub(super) fn set_remove_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "remove", args, 1)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "remove")?;
+    if crate::ops::set_access::set_remove_item(vm, set, args[1])
+        .map_err(runtime_error_to_builtin_error)?
+    {
+        Ok(Value::none())
+    } else {
+        Err(key_error_for_value(args[1]))
+    }
+}
+
+#[inline]
 pub(super) fn set_discard(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "discard", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "discard")?;
     let _ = remove_set_probe(set, args[1])?;
+    Ok(Value::none())
+}
+
+#[inline]
+pub(super) fn set_discard_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("set", "discard", args, 1)?;
+    let set = expect_set_mut_receiver(args[0], TypeId::SET, "discard")?;
+    crate::ops::set_access::set_discard_item(vm, set, args[1])
+        .map_err(runtime_error_to_builtin_error)?;
     Ok(Value::none())
 }
 
@@ -260,6 +304,22 @@ pub(super) fn frozenset_contains(args: &[Value]) -> Result<Value, BuiltinError> 
 }
 
 #[inline]
+pub(super) fn set_contains_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    contains_for_set_type_with_vm(vm, args, TypeId::SET, "set", "__contains__")
+}
+
+#[inline]
+pub(super) fn frozenset_contains_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    contains_for_set_type_with_vm(vm, args, TypeId::FROZENSET, "frozenset", "__contains__")
+}
+
+#[inline]
 pub(super) fn set_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "copy", args, 0)?;
     let set = expect_set_receiver(args[0], TypeId::SET, "copy")?;
@@ -277,11 +337,7 @@ fn hashable_iterable_values_with_vm(
     vm: &mut VirtualMachine,
     iterable: Value,
 ) -> Result<Vec<Value>, BuiltinError> {
-    let values = collect_iterable_values_with_vm(vm, iterable)?;
-    for value in values.iter().copied() {
-        ensure_hashable(value)?;
-    }
-    Ok(values)
+    collect_iterable_values_with_vm(vm, iterable)
 }
 
 #[inline]
@@ -289,9 +345,8 @@ fn iterable_to_hashable_set_with_vm(
     vm: &mut VirtualMachine,
     iterable: Value,
 ) -> Result<SetObject, BuiltinError> {
-    Ok(SetObject::from_iter(hashable_iterable_values_with_vm(
-        vm, iterable,
-    )?))
+    let values = hashable_iterable_values_with_vm(vm, iterable)?;
+    crate::ops::set_access::set_from_values(vm, values).map_err(runtime_error_to_builtin_error)
 }
 
 #[inline]
@@ -309,7 +364,8 @@ pub(super) fn set_update_with_vm(
 
     for iterable in &args[1..] {
         for value in hashable_iterable_values_with_vm(vm, *iterable)? {
-            set.add(value);
+            crate::ops::set_access::set_add_item(vm, set, value)
+                .map_err(runtime_error_to_builtin_error)?;
         }
     }
 
@@ -331,7 +387,8 @@ pub(super) fn set_difference_update_with_vm(
 
     for iterable in &args[1..] {
         for value in hashable_iterable_values_with_vm(vm, *iterable)? {
-            set.discard(value);
+            crate::ops::set_access::set_discard_item(vm, set, value)
+                .map_err(runtime_error_to_builtin_error)?;
         }
     }
 
@@ -385,7 +442,8 @@ fn set_union_impl(
     let mut result = expect_set_receiver(receiver, expected_type, method_name)?.clone();
     for iterable in &args[1..] {
         for value in hashable_iterable_values_with_vm(vm, *iterable)? {
-            result.add(value);
+            crate::ops::set_access::set_add_item(vm, &mut result, value)
+                .map_err(runtime_error_to_builtin_error)?;
         }
     }
     Ok(set_result_value(result, expected_type))
@@ -645,6 +703,21 @@ fn contains_for_set_type(
     expect_method_arg_count(receiver_name, method_name, args, 1)?;
     let set = expect_set_receiver(args[0], expected_type, method_name)?;
     Ok(Value::bool(contains_set_probe(set, args[1])?))
+}
+
+#[inline]
+fn contains_for_set_type_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    expected_type: TypeId,
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let set = expect_set_receiver(args[0], expected_type, method_name)?;
+    let contains = crate::ops::set_access::set_contains_item(vm, set, args[1])
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::bool(contains))
 }
 
 #[inline]
