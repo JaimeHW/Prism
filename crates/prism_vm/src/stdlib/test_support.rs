@@ -134,6 +134,9 @@ static REFCOUNT_TEST_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
 static BIGMEMTEST_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_kw(Arc::from("test.support.bigmemtest"), bigmemtest)
 });
+static BIGADDRSPACETEST_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("test.support.bigaddrspacetest"), bigaddrspacetest)
+});
 static BIGMEM_SKIP_DECORATOR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("test.support._bigmem_skip_decorator"),
@@ -156,6 +159,12 @@ static REQUIRES_RESOURCE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::n
     BuiltinFunctionObject::new(
         Arc::from("test.support.requires_resource"),
         requires_resource,
+    )
+});
+static REQUIRES_SUBPROCESS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.requires_subprocess"),
+        requires_subprocess,
     )
 });
 static NO_TRACING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -244,6 +253,12 @@ static IMPORT_MODULE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
         import_module,
     )
 });
+static MAKE_LEGACY_PYC_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.import_helper.make_legacy_pyc"),
+        make_legacy_pyc,
+    )
+});
 static REAP_THREADS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("test.support.threading_helper.reap_threads"),
@@ -322,6 +337,7 @@ impl SupportModule {
                 Arc::from("C_RECURSION_LIMIT"),
                 Arc::from("_2G"),
                 Arc::from("_4G"),
+                Arc::from("bigaddrspacetest"),
                 Arc::from("bigmemtest"),
                 Arc::from("check_impl_detail"),
                 Arc::from("check_free_after_iterating"),
@@ -335,6 +351,7 @@ impl SupportModule {
                 Arc::from("cpython_only"),
                 Arc::from("gc_collect"),
                 Arc::from("get_attribute"),
+                Arc::from("has_subprocess_support"),
                 Arc::from("infinite_recursion"),
                 Arc::from("is_emscripten"),
                 Arc::from("is_wasi"),
@@ -345,6 +362,7 @@ impl SupportModule {
                 Arc::from("refcount_test"),
                 Arc::from("os_helper"),
                 Arc::from("requires_resource"),
+                Arc::from("requires_subprocess"),
                 Arc::from("requires_limited_api"),
                 Arc::from("requires_docstrings"),
                 Arc::from("requires_IEEE_754"),
@@ -381,6 +399,7 @@ impl Module for SupportModule {
             }
             "_2G" => Ok(Value::int(BIGMEM_2G).expect("_2G fits in tagged int")),
             "_4G" => Ok(Value::int(BIGMEM_4G).expect("_4G fits in tagged int")),
+            "bigaddrspacetest" => Ok(builtin_value(&BIGADDRSPACETEST_FUNCTION)),
             "bigmemtest" => Ok(builtin_value(&BIGMEMTEST_FUNCTION)),
             "check_impl_detail" => Ok(builtin_value(&CHECK_IMPL_DETAIL_FUNCTION)),
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
@@ -399,6 +418,7 @@ impl Module for SupportModule {
             "cpython_only" => Ok(builtin_value(&CPYTHON_ONLY_FUNCTION)),
             "gc_collect" => Ok(builtin_value(&GC_COLLECT_FUNCTION)),
             "get_attribute" => Ok(builtin_value(&GET_ATTRIBUTE_FUNCTION)),
+            "has_subprocess_support" => Ok(Value::bool(true)),
             "infinite_recursion" => Ok(builtin_value(&INFINITE_RECURSION_FUNCTION)),
             "is_emscripten" => Ok(Value::bool(false)),
             "is_wasi" => Ok(Value::bool(false)),
@@ -408,6 +428,7 @@ impl Module for SupportModule {
             "no_tracing" => Ok(builtin_value(&NO_TRACING_FUNCTION)),
             "refcount_test" => Ok(builtin_value(&REFCOUNT_TEST_FUNCTION)),
             "requires_resource" => Ok(builtin_value(&REQUIRES_RESOURCE_FUNCTION)),
+            "requires_subprocess" => Ok(builtin_value(&REQUIRES_SUBPROCESS_FUNCTION)),
             "requires_limited_api" => Ok(builtin_value(&REQUIRES_LIMITED_API_FUNCTION)),
             "requires_docstrings" => Ok(builtin_value(&REQUIRES_DOCSTRINGS_FUNCTION)),
             "requires_IEEE_754" => Ok(builtin_value(&REQUIRES_IEEE_754_FUNCTION)),
@@ -898,6 +919,20 @@ fn bigmemtest(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, Built
     Ok(builtin_value(&BIGMEM_SKIP_DECORATOR_FUNCTION))
 }
 
+fn bigaddrspacetest(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "bigaddrspacetest() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    mark_unittest_skip(
+        vm,
+        args[0],
+        "large address-space tests require an explicit memory limit",
+    )
+}
+
 fn bigmem_skip_decorator(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -1158,6 +1193,16 @@ fn requires_resource(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
 }
 
+fn requires_subprocess(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "requires_subprocess() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
+}
+
 fn identity_decorator(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -1277,7 +1322,11 @@ impl ImportHelperModule {
     /// Create a new `test.support.import_helper` module descriptor.
     pub fn new() -> Self {
         Self {
-            attrs: vec![Arc::from("forget"), Arc::from("import_module")],
+            attrs: vec![
+                Arc::from("forget"),
+                Arc::from("import_module"),
+                Arc::from("make_legacy_pyc"),
+            ],
         }
     }
 }
@@ -1297,6 +1346,7 @@ impl Module for ImportHelperModule {
         match name {
             "forget" => Ok(builtin_value(&FORGET_FUNCTION)),
             "import_module" => Ok(builtin_value(&IMPORT_MODULE_FUNCTION)),
+            "make_legacy_pyc" => Ok(builtin_value(&MAKE_LEGACY_PYC_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support.import_helper' has no attribute '{}'",
                 name
@@ -1337,6 +1387,20 @@ fn import_module(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
         .import_module_named(name.as_str())
         .map_err(runtime_error_to_builtin_error)?;
     Ok(Value::object_ptr(Arc::as_ptr(&module) as *const ()))
+}
+
+fn make_legacy_pyc(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "make_legacy_pyc() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let source = value_as_string_ref(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("make_legacy_pyc() source must be str".to_string())
+    })?;
+    Ok(Value::string(intern(&format!("{}c", source.as_str()))))
 }
 
 fn unlink(args: &[Value]) -> Result<Value, BuiltinError> {
