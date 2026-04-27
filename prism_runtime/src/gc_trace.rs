@@ -470,18 +470,18 @@ unsafe impl Trace for BoundMethod {
 }
 
 // =============================================================================
-// SliceObject - Leaf type (primitives only)
+// SliceObject
 // =============================================================================
 
 use crate::types::slice::SliceObject;
 
-/// Safety: SliceObject contains no GC-managed references.
-/// Only holds primitive SliceValue (wrapped i64) for start/stop/step.
+/// Safety: SliceObject is immutable but stores three Python values that may
+/// reference GC-managed objects.
 unsafe impl Trace for SliceObject {
     #[inline]
-    fn trace(&self, _tracer: &mut dyn Tracer) {
-        // SliceObject is a leaf type:
-        // - ObjectHeader (traced but empty)
-        // - start, stop, step: SliceValue (i64) - primitives
+    fn trace(&self, tracer: &mut dyn Tracer) {
+        tracer.trace_value(self.start_value());
+        tracer.trace_value(self.stop_value());
+        tracer.trace_value(self.step_value());
     }
 }

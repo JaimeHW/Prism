@@ -1373,25 +1373,6 @@ fn attribute_name(name: Value) -> Result<InternedString, BuiltinError> {
     ))
 }
 
-#[inline]
-fn value_to_slice_index(value: Value) -> Result<Option<i64>, BuiltinError> {
-    if value.is_none() {
-        return Ok(None);
-    }
-
-    if let Some(boolean) = value.as_bool() {
-        return Ok(Some(i64::from(boolean)));
-    }
-
-    if let Some(index) = prism_runtime::types::int::value_to_saturated_i64(value) {
-        return Ok(Some(index));
-    }
-
-    Err(BuiltinError::TypeError(
-        "slice indices must be integers or None".to_string(),
-    ))
-}
-
 /// Call a builtin type object using the same constructors that power the
 /// corresponding Python-visible builtins.
 pub(crate) fn call_builtin_type(type_id: TypeId, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -2519,17 +2500,9 @@ pub fn builtin_slice(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let (start, stop, step) = match args.len() {
-        1 => (None, value_to_slice_index(args[0])?, None),
-        2 => (
-            value_to_slice_index(args[0])?,
-            value_to_slice_index(args[1])?,
-            None,
-        ),
-        3 => (
-            value_to_slice_index(args[0])?,
-            value_to_slice_index(args[1])?,
-            value_to_slice_index(args[2])?,
-        ),
+        1 => (Value::none(), args[0], Value::none()),
+        2 => (args[0], args[1], Value::none()),
+        3 => (args[0], args[1], args[2]),
         _ => unreachable!(),
     };
 

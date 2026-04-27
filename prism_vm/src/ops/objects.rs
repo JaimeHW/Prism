@@ -197,7 +197,7 @@ fn slice_object_from_value(value: Value) -> Option<&'static SliceObject> {
 
 #[inline]
 fn copy_slice_object(slice: &SliceObject) -> SliceObject {
-    SliceObject::new(slice.start(), slice.stop(), slice.step())
+    SliceObject::new(slice.start_value(), slice.stop_value(), slice.step_value())
 }
 
 #[inline]

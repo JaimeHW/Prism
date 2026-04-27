@@ -12,7 +12,6 @@ use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::value_to_saturated_i64;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
@@ -389,7 +388,7 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let dst = inst.dst().0;
 
     // Optional step from extension instruction.
-    let mut step: Option<i64> = None;
+    let mut step = Value::none();
     {
         let frame = vm.current_frame_mut();
         if (frame.ip as usize) < frame.code.instructions.len() {
@@ -399,53 +398,17 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 && next.src2().0 == STEP_EXT_TAG_B
             {
                 let ext = frame.fetch();
-                let step_val = frame.get_reg(ext.dst().0);
-                step = match value_to_slice_index(step_val) {
-                    Ok(v) => v,
-                    Err(cf) => return cf,
-                };
+                step = frame.get_reg(ext.dst().0);
             }
         }
     }
 
-    // Convert Values to Option<i64> with explicit error handling
-    let start = match value_to_slice_index(start_val) {
-        Ok(v) => v,
-        Err(cf) => return cf,
-    };
-    let stop = match value_to_slice_index(stop_val) {
-        Ok(v) => v,
-        Err(cf) => return cf,
-    };
     // Create slice on the active heap
-    let slice = SliceObject::new(start, stop, step);
+    let slice = SliceObject::new(start_val, stop_val, step);
     let value = alloc_value_in_current_heap_or_box(slice);
 
     vm.current_frame_mut().set_reg(dst, value);
     ControlFlow::Continue
-}
-
-/// Helper to convert a Value to an optional slice index.
-///
-/// Returns:
-/// - Ok(None) for None value
-/// - Ok(Some(i)) for integer value
-/// - Err for other types
-#[inline]
-fn value_to_slice_index(val: Value) -> Result<Option<i64>, ControlFlow> {
-    if val.is_none() {
-        Ok(None)
-    } else if let Some(boolean) = val.as_bool() {
-        Ok(Some(i64::from(boolean)))
-    } else if let Some(i) = val.as_int() {
-        Ok(Some(i))
-    } else if let Some(i) = value_to_saturated_i64(val) {
-        Ok(Some(i))
-    } else {
-        Err(ControlFlow::Error(RuntimeError::type_error(
-            "slice indices must be integers or None",
-        )))
-    }
 }
 
 // =============================================================================

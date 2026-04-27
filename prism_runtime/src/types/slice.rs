@@ -28,6 +28,9 @@
 
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
+use crate::types::int::{bigint_to_saturated_i64, bigint_to_value, value_to_bigint};
+use num_bigint::BigInt;
+use prism_core::Value;
 use std::fmt;
 
 // =============================================================================
@@ -243,12 +246,12 @@ impl ExactSizeIterator for SliceIndexIter {}
 pub struct SliceObject {
     /// Object header.
     pub header: ObjectHeader,
-    /// Start index (None = beginning).
-    start: SliceValue,
-    /// Stop index (None = end).
-    stop: SliceValue,
-    /// Step (None = 1; 0 is rejected when the slice is applied).
-    step: SliceValue,
+    /// Original Python start component.
+    start: Value,
+    /// Original Python stop component.
+    stop: Value,
+    /// Original Python step component.
+    step: Value,
 }
 
 impl SliceObject {
@@ -263,64 +266,77 @@ impl SliceObject {
     /// A zero step is a valid slice object state; applying that slice to a
     /// sequence raises `ValueError`, matching CPython.
     #[inline]
-    pub fn new(start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Self {
+    pub fn new(start: Value, stop: Value, step: Value) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::SLICE),
-            start: start.into(),
-            stop: stop.into(),
-            step: step.into(),
+            start,
+            stop,
+            step,
         }
+    }
+
+    /// Create a slice from already-validated integer components.
+    #[inline]
+    pub fn from_indices(start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Self {
+        Self::new(
+            optional_index_to_value(start),
+            optional_index_to_value(stop),
+            optional_index_to_value(step),
+        )
     }
 
     /// Create a slice with only stop: `slice(None, stop, None)` → `[:stop]`.
     #[inline]
     pub fn stop_only(stop: i64) -> Self {
-        Self {
-            header: ObjectHeader::new(TypeId::SLICE),
-            start: SliceValue::none(),
-            stop: SliceValue::some(stop),
-            step: SliceValue::none(),
-        }
+        Self::from_indices(None, Some(stop), None)
     }
 
     /// Create a slice with start and stop: `slice(start, stop, None)` → `[start:stop]`.
     #[inline]
     pub fn start_stop(start: i64, stop: i64) -> Self {
-        Self {
-            header: ObjectHeader::new(TypeId::SLICE),
-            start: SliceValue::some(start),
-            stop: SliceValue::some(stop),
-            step: SliceValue::none(),
-        }
+        Self::from_indices(Some(start), Some(stop), None)
     }
 
     /// Create a full slice: `slice(start, stop, step)` → `[start:stop:step]`.
     #[inline]
     pub fn full(start: i64, stop: i64, step: i64) -> Self {
-        Self {
-            header: ObjectHeader::new(TypeId::SLICE),
-            start: SliceValue::some(start),
-            stop: SliceValue::some(stop),
-            step: SliceValue::some(step),
-        }
+        Self::from_indices(Some(start), Some(stop), Some(step))
     }
 
-    /// Get the start value.
+    /// Return the original Python start component.
+    #[inline(always)]
+    pub fn start_value(&self) -> Value {
+        self.start
+    }
+
+    /// Return the original Python stop component.
+    #[inline(always)]
+    pub fn stop_value(&self) -> Value {
+        self.stop
+    }
+
+    /// Return the original Python step component.
+    #[inline(always)]
+    pub fn step_value(&self) -> Value {
+        self.step
+    }
+
+    /// Get the start value when it is `None` or a native integer.
     #[inline(always)]
     pub fn start(&self) -> Option<i64> {
-        self.start.get()
+        slice_component_to_i64(self.start)
     }
 
-    /// Get the stop value.
+    /// Get the stop value when it is `None` or a native integer.
     #[inline(always)]
     pub fn stop(&self) -> Option<i64> {
-        self.stop.get()
+        slice_component_to_i64(self.stop)
     }
 
-    /// Get the step value.
+    /// Get the step value when it is `None` or a native integer.
     #[inline(always)]
     pub fn step(&self) -> Option<i64> {
-        self.step.get()
+        slice_component_to_i64(self.step)
     }
 
     /// Compute concrete indices for a sequence of given length.
@@ -346,7 +362,7 @@ impl SliceObject {
     #[inline]
     pub fn indices(&self, length: usize) -> SliceIndices {
         let len = length as i64;
-        let step = self.step.unwrap_or(1);
+        let step = self.step().unwrap_or(1);
 
         // Determine defaults based on step direction
         let (default_start, default_stop) = if step > 0 {
@@ -356,7 +372,7 @@ impl SliceObject {
         };
 
         // Resolve and clamp start
-        let mut start = self.start.unwrap_or(default_start);
+        let mut start = self.start().unwrap_or(default_start);
         if start < 0 {
             start += len;
             if start < 0 {
@@ -367,7 +383,7 @@ impl SliceObject {
         }
 
         // Resolve and clamp stop
-        let mut stop = self.stop.unwrap_or(default_stop);
+        let mut stop = self.stop().unwrap_or(default_stop);
         if stop < 0 {
             stop += len;
             if stop < 0 {
@@ -421,7 +437,9 @@ impl Clone for SliceObject {
 
 impl PartialEq for SliceObject {
     fn eq(&self, other: &Self) -> bool {
-        self.start == other.start && self.stop == other.stop && self.step == other.step
+        self.start.raw_bits() == other.start.raw_bits()
+            && self.stop.raw_bits() == other.stop.raw_bits()
+            && self.step.raw_bits() == other.step.raw_bits()
     }
 }
 
@@ -429,14 +447,47 @@ impl Eq for SliceObject {}
 
 impl fmt::Debug for SliceObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "slice({}, {}, {})", self.start, self.stop, self.step)
+        write!(
+            f,
+            "slice({:?}, {:?}, {:?})",
+            self.start.raw_bits(),
+            self.stop.raw_bits(),
+            self.step.raw_bits()
+        )
     }
 }
 
 impl fmt::Display for SliceObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "slice({}, {}, {})", self.start, self.stop, self.step)
+        write!(f, "slice(...)")
     }
+}
+
+#[inline]
+fn optional_index_to_value(value: Option<i64>) -> Value {
+    match value {
+        Some(value) => index_to_value(value),
+        None => Value::none(),
+    }
+}
+
+#[inline]
+fn index_to_value(value: i64) -> Value {
+    Value::int(value).unwrap_or_else(|| bigint_to_value(BigInt::from(value)))
+}
+
+#[inline]
+fn slice_component_to_i64(value: Value) -> Option<i64> {
+    if value.is_none() {
+        return None;
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Some(i64::from(boolean));
+    }
+    if let Some(integer) = value.as_int() {
+        return Some(integer);
+    }
+    value_to_bigint(value).map(|integer| bigint_to_saturated_i64(&integer))
 }
 
 impl PyObject for SliceObject {
