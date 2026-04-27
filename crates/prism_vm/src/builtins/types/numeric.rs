@@ -859,10 +859,11 @@ enum FloatTextArgument {
 
 impl FloatTextArgument {
     #[inline]
-    fn raw_bytes(&self) -> &[u8] {
+    fn ascii_bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Str(text) => text.as_bytes(),
-            Self::Bytes(bytes) => bytes,
+            Self::Str(text) if text.is_ascii() => Some(text.as_bytes()),
+            Self::Str(_) => None,
+            Self::Bytes(bytes) => Some(bytes),
         }
     }
 
@@ -878,6 +879,22 @@ impl FloatTextArgument {
             )),
         }
     }
+}
+
+fn normalize_unicode_float_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            normalized.push(ch);
+        } else if let Some(digit) = prism_core::python_unicode::python_decimal_digit(ch) {
+            normalized.push((b'0' + digit) as char);
+        } else if ch.is_whitespace() {
+            normalized.push(' ');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    normalized
 }
 
 #[inline]
@@ -1016,7 +1033,19 @@ fn normalize_float_literal(bytes: &[u8]) -> Option<String> {
 }
 
 fn parse_float_text_argument(argument: &FloatTextArgument) -> Result<Value, BuiltinError> {
-    let trimmed = trim_ascii_whitespace(argument.raw_bytes());
+    let unicode_normalized;
+    let raw_bytes = match argument.ascii_bytes() {
+        Some(bytes) => bytes,
+        None => {
+            let FloatTextArgument::Str(text) = argument else {
+                unreachable!("bytes-backed float text is always ASCII-normalized directly")
+            };
+            unicode_normalized = normalize_unicode_float_text(text);
+            unicode_normalized.as_bytes()
+        }
+    };
+
+    let trimmed = trim_ascii_whitespace(raw_bytes);
     if trimmed.is_empty() {
         return Err(argument.invalid_literal());
     }
