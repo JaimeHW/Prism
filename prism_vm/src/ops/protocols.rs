@@ -1,7 +1,8 @@
 use crate::VirtualMachine;
-use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::error::RuntimeError;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::objects::{invoke_property_getter, property_descriptor_from_value};
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::mro::ClassId;
@@ -111,6 +112,11 @@ fn try_special_method_call(
 ) -> Result<Option<Value>, RuntimeError> {
     match resolve_special_method(receiver, method_name) {
         Ok(target) => {
+            let target = match materialize_special_method_descriptor(vm, receiver, target) {
+                Ok(target) => target,
+                Err(err) if err.is_attribute_error() => return Ok(None),
+                Err(err) => return Err(err),
+            };
             let result = invoke_bound_method_with_operand(vm, target, operand)?;
             if result == crate::builtins::builtin_not_implemented_value() {
                 Ok(None)
@@ -118,9 +124,25 @@ fn try_special_method_call(
                 Ok(Some(result))
             }
         }
-        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => Ok(None),
+        Err(err) if err.is_attribute_error() => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+fn materialize_special_method_descriptor(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    target: BoundMethodTarget,
+) -> Result<BoundMethodTarget, RuntimeError> {
+    let Some(descriptor) = property_descriptor_from_value(target.callable) else {
+        return Ok(target);
+    };
+
+    let callable = invoke_property_getter(vm, descriptor, receiver)?;
+    Ok(BoundMethodTarget {
+        callable,
+        implicit_self: None,
+    })
 }
 
 #[inline]

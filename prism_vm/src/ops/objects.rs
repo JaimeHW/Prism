@@ -535,7 +535,7 @@ fn code_constant_to_value(constant: &Constant) -> Value {
 }
 
 #[inline]
-fn property_descriptor_from_value(value: Value) -> Option<&'static PropertyDescriptor> {
+pub(crate) fn property_descriptor_from_value(value: Value) -> Option<&'static PropertyDescriptor> {
     let ptr = value.as_object_ptr()?;
     (extract_type_id(ptr) == TypeId::PROPERTY)
         .then(|| unsafe { &*(ptr as *const PropertyDescriptor) })
@@ -555,7 +555,7 @@ fn property_descriptor_error(kind: &'static str) -> RuntimeError {
     )))
 }
 
-fn invoke_property_getter(
+pub(crate) fn invoke_property_getter(
     vm: &mut VirtualMachine,
     descriptor: &PropertyDescriptor,
     instance: Value,
