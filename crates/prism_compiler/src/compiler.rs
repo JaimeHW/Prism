@@ -1940,6 +1940,30 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_subscript_key(
+        &mut self,
+        slice: &Expr,
+        reg: Register,
+        line: u32,
+    ) -> CompileResult<()> {
+        match &slice.kind {
+            ExprKind::Starred(_) => self.compile_unpacking_sequence_literal(
+                std::slice::from_ref(slice),
+                reg,
+                line,
+                SequenceLiteralKind::Tuple,
+            ),
+            ExprKind::Tuple(elts)
+                if elts
+                    .iter()
+                    .any(|elt| matches!(&elt.kind, ExprKind::Starred(_))) =>
+            {
+                self.compile_unpacking_sequence_literal(elts, reg, line, SequenceLiteralKind::Tuple)
+            }
+            _ => self.compile_expr_into(slice, reg),
+        }
+    }
+
     fn compile_class_keyword_mapping(
         &mut self,
         keywords: &[&prism_parser::ast::Keyword],
@@ -2375,7 +2399,8 @@ impl Compiler {
 
             ExprKind::Subscript { value, slice, .. } => {
                 let obj_reg = self.compile_expr(value)?;
-                let key_reg = self.compile_expr(slice)?;
+                let key_reg = self.builder.alloc_register();
+                self.compile_subscript_key(slice, key_reg, expr_line)?;
                 self.builder.emit_get_item(reg, obj_reg, key_reg);
                 self.builder.free_register(obj_reg);
                 self.builder.free_register(key_reg);
