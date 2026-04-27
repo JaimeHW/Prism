@@ -73,10 +73,14 @@ pub fn builtin_len_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
 
 #[inline]
 fn len_to_value(len: usize, type_name: &str) -> Result<Value, BuiltinError> {
-    let len_i64 = i64::try_from(len)
-        .map_err(|_| BuiltinError::OverflowError(format!("{} length overflow", type_name)))?;
-    Value::int(len_i64)
-        .ok_or_else(|| BuiltinError::OverflowError(format!("{} length overflow", type_name)))
+    if len > isize::MAX as usize {
+        return Err(BuiltinError::OverflowError(format!(
+            "{} length overflow",
+            type_name
+        )));
+    }
+
+    Ok(bigint_to_value(BigInt::from(len)))
 }
 
 pub(crate) fn try_len_value(vm: &mut VirtualMachine, value: Value) -> Result<usize, RuntimeError> {
