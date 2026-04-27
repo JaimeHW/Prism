@@ -18,6 +18,7 @@ use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::frame::{ClosureEnv, RegisterSnapshot};
 use crate::ops::kw_binding::{ArgumentBinder, BoundArguments};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::generators::{GeneratorObject, LivenessMap};
 use crate::vm::NestedTargetFrameOutcome;
 use prism_code::{CodeFlags, CodeObject, Instruction};
@@ -28,7 +29,6 @@ use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::{BoundMethod, StaticMethodDescriptor};
 use prism_runtime::object::mro::ClassId;
-use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{class_id_to_type_id, global_class};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::DescriptorViewObject;
@@ -223,38 +223,19 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
     unsafe { (*header_ptr).type_id }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ResolvedCallableTarget {
-    callable: Value,
-    implicit_self: Value,
-}
-
-fn resolve_dunder_call_target(value: Value) -> Option<ResolvedCallableTarget> {
-    let ptr = value.as_object_ptr()?;
-    let type_id = extract_type_id(ptr);
-
-    if type_id == TypeId::OBJECT || type_id.raw() >= TypeId::FIRST_USER_TYPE {
-        let shaped = unsafe { &*(ptr as *const ShapedObject) };
-        if let Some(callable) = shaped.get_property("__call__") {
-            return Some(ResolvedCallableTarget {
-                callable,
-                implicit_self: value,
-            });
+fn resolve_dunder_call_target(value: Value) -> Result<Option<BoundMethodTarget>, RuntimeError> {
+    match resolve_special_method(value, "__call__") {
+        Ok(target) => Ok(Some(target)),
+        Err(err)
+            if matches!(
+                err.kind,
+                crate::error::RuntimeErrorKind::AttributeError { .. }
+            ) =>
+        {
+            Ok(None)
         }
+        Err(err) => Err(err),
     }
-
-    if type_id.raw() >= TypeId::FIRST_USER_TYPE {
-        let class = global_class(ClassId(type_id.raw()))?;
-        let name = intern("__call__");
-        if let Some(slot) = class.lookup_method_published(&name) {
-            return Some(ResolvedCallableTarget {
-                callable: slot.value,
-                implicit_self: value,
-            });
-        }
-    }
-
-    None
 }
 
 pub(crate) fn value_supports_call_protocol(value: Value) -> bool {
@@ -273,7 +254,7 @@ pub(crate) fn value_supports_call_protocol(value: Value) -> bool {
         TypeId::WRAPPER_DESCRIPTOR | TypeId::METHOD_DESCRIPTOR | TypeId::CLASSMETHOD_DESCRIPTOR => {
             reflected_descriptor_callable_target(value).is_some()
         }
-        _ => resolve_dunder_call_target(value).is_some(),
+        _ => matches!(resolve_dunder_call_target(value), Ok(Some(_))),
     }
 }
 
@@ -298,77 +279,58 @@ fn reflected_descriptor_callable_target(value: Value) -> Option<Value> {
 
 fn invoke_resolved_callable(
     vm: &mut VirtualMachine,
-    resolved: ResolvedCallableTarget,
+    resolved: BoundMethodTarget,
     dst_reg: u8,
     posargc: usize,
     kwargc: usize,
     kwnames_idx: u16,
 ) -> Result<Value, RuntimeError> {
-    let Some(callable_ptr) = resolved.callable.as_object_ptr() else {
-        return Err(RuntimeError::type_error(format!(
-            "'{}' object is not callable",
-            resolved.callable.type_name()
-        )));
+    if let Some(implicit_self) = resolved.implicit_self {
+        invoke_callable_with_implicit_self(
+            vm,
+            resolved.callable,
+            implicit_self,
+            dst_reg,
+            posargc,
+            kwargc,
+            kwnames_idx,
+            "__call__",
+        )
+    } else {
+        invoke_callable_from_frame(vm, resolved.callable, dst_reg, posargc, kwargc, kwnames_idx)
+    }
+}
+
+fn invoke_callable_from_frame(
+    vm: &mut VirtualMachine,
+    callable: Value,
+    dst_reg: u8,
+    posargc: usize,
+    kwargc: usize,
+    kwnames_idx: u16,
+) -> Result<Value, RuntimeError> {
+    let (args, keyword_args) = {
+        let caller_frame = &vm.frames[vm.call_depth() - 1];
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(posargc);
+        for i in 0..posargc {
+            args.push(caller_frame.get_reg(dst_reg + 1 + i as u8));
+        }
+        let keyword_args = if kwargc == 0 {
+            SmallVec::new()
+        } else {
+            collect_call_keyword_args(caller_frame, dst_reg, posargc, kwargc, kwnames_idx)?
+        };
+        (args, keyword_args)
     };
 
-    match extract_type_id(callable_ptr) {
-        TypeId::FUNCTION | TypeId::CLOSURE => invoke_user_function_with_implicit_self(
-            vm,
-            callable_ptr,
-            resolved.implicit_self,
-            dst_reg,
-            posargc,
-            kwargc,
-            kwnames_idx,
-        ),
-        TypeId::BUILTIN_FUNCTION => invoke_builtin_with_implicit_self_from_frame(
-            vm,
-            callable_ptr,
-            resolved.implicit_self,
-            dst_reg,
-            posargc,
-            kwargc,
-            kwnames_idx,
-        ),
-        TypeId::METHOD => {
-            let bound = unsafe { &*(callable_ptr as *const BoundMethod) };
-            let bound_callable = bound.function();
-            let bound_self = bound.instance();
-            let Some(bound_ptr) = bound_callable.as_object_ptr() else {
-                return Err(RuntimeError::type_error(
-                    "bound __call__ method has invalid function",
-                ));
-            };
-
-            match extract_type_id(bound_ptr) {
-                TypeId::FUNCTION | TypeId::CLOSURE => invoke_user_function_with_implicit_self(
-                    vm,
-                    bound_ptr,
-                    bound_self,
-                    dst_reg,
-                    posargc,
-                    kwargc,
-                    kwnames_idx,
-                ),
-                TypeId::BUILTIN_FUNCTION => invoke_builtin_with_implicit_self_from_frame(
-                    vm,
-                    bound_ptr,
-                    bound_self,
-                    dst_reg,
-                    posargc,
-                    kwargc,
-                    kwnames_idx,
-                ),
-                type_id => Err(RuntimeError::type_error(format!(
-                    "'{}' object is not callable",
-                    type_id.name()
-                ))),
-            }
-        }
-        type_id => Err(RuntimeError::type_error(format!(
-            "'{}' object is not callable",
-            type_id.name()
-        ))),
+    if keyword_args.is_empty() {
+        invoke_callable_value(vm, callable, &args)
+    } else {
+        let keyword_refs: SmallVec<[(&str, Value); 4]> = keyword_args
+            .iter()
+            .map(|(name, value)| (name.as_ref(), *value))
+            .collect();
+        invoke_callable_value_with_keywords(vm, callable, &args, &keyword_refs)
     }
 }
 
@@ -2042,18 +2004,33 @@ fn invoke_callable_value_impl(
             invoke_callable_value_impl(vm, target, args, allow_control_transfer)
         }
         _ => {
-            let Some(resolved) = resolve_dunder_call_target(callable) else {
+            let Some(resolved) = resolve_dunder_call_target(callable)? else {
                 return Err(RuntimeError::type_error(format!(
                     "'{}' object is not callable",
                     extract_type_id(ptr).name()
                 )));
             };
 
-            let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
-            all_args.push(resolved.implicit_self);
-            all_args.extend_from_slice(args);
-            invoke_callable_value_impl(vm, resolved.callable, &all_args, allow_control_transfer)
+            vm.with_native_recursion_guard(|vm| {
+                invoke_bound_callable_value_impl(vm, resolved, args, allow_control_transfer)
+            })
         }
+    }
+}
+
+fn invoke_bound_callable_value_impl(
+    vm: &mut VirtualMachine,
+    resolved: BoundMethodTarget,
+    args: &[Value],
+    allow_control_transfer: bool,
+) -> Result<InvokeCallableOutcome, RuntimeError> {
+    if let Some(implicit_self) = resolved.implicit_self {
+        let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
+        all_args.push(implicit_self);
+        all_args.extend_from_slice(args);
+        invoke_callable_value_impl(vm, resolved.callable, &all_args, allow_control_transfer)
+    } else {
+        invoke_callable_value_impl(vm, resolved.callable, args, allow_control_transfer)
     }
 }
 
@@ -2137,18 +2114,33 @@ pub(crate) fn invoke_callable_value_with_keywords(
             invoke_callable_value_with_keywords(vm, target, args, keywords)
         }
         _ => {
-            let Some(resolved) = resolve_dunder_call_target(callable) else {
+            let Some(resolved) = resolve_dunder_call_target(callable)? else {
                 return Err(RuntimeError::type_error(format!(
                     "'{}' object is not callable",
                     extract_type_id(ptr).name()
                 )));
             };
 
-            let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
-            all_args.push(resolved.implicit_self);
-            all_args.extend_from_slice(args);
-            invoke_callable_value_with_keywords(vm, resolved.callable, &all_args, keywords)
+            vm.with_native_recursion_guard(|vm| {
+                invoke_bound_callable_value_with_keywords(vm, resolved, args, keywords)
+            })
         }
+    }
+}
+
+fn invoke_bound_callable_value_with_keywords(
+    vm: &mut VirtualMachine,
+    resolved: BoundMethodTarget,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, RuntimeError> {
+    if let Some(implicit_self) = resolved.implicit_self {
+        let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
+        all_args.push(implicit_self);
+        all_args.extend_from_slice(args);
+        invoke_callable_value_with_keywords(vm, resolved.callable, &all_args, keywords)
+    } else {
+        invoke_callable_value_with_keywords(vm, resolved.callable, args, keywords)
     }
 }
 
@@ -2184,17 +2176,19 @@ pub(crate) fn call_callable_value_with_keywords_from_values(
             )
         }
         _ => {
-            if let Some(resolved) = resolve_dunder_call_target(callable) {
-                let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
-                all_args.push(resolved.implicit_self);
-                all_args.extend_from_slice(args);
-                return call_callable_value_with_keywords_from_values(
-                    vm,
-                    resolved.callable,
-                    dst_reg,
-                    &all_args,
-                    keywords,
-                );
+            match resolve_dunder_call_target(callable) {
+                Ok(Some(resolved)) => {
+                    return match vm.with_native_recursion_guard(|vm| {
+                        Ok(call_bound_callable_value_with_keywords_from_values(
+                            vm, resolved, dst_reg, args, keywords,
+                        ))
+                    }) {
+                        Ok(flow) => flow,
+                        Err(err) => ControlFlow::Error(err),
+                    };
+                }
+                Ok(None) => {}
+                Err(err) => return ControlFlow::Error(err),
             }
 
             match invoke_callable_value_with_keywords(vm, callable, args, keywords) {
@@ -2205,6 +2199,35 @@ pub(crate) fn call_callable_value_with_keywords_from_values(
                 Err(err) => ControlFlow::Error(err),
             }
         }
+    }
+}
+
+fn call_bound_callable_value_with_keywords_from_values(
+    vm: &mut VirtualMachine,
+    resolved: BoundMethodTarget,
+    dst_reg: u8,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> ControlFlow {
+    if let Some(implicit_self) = resolved.implicit_self {
+        let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
+        all_args.push(implicit_self);
+        all_args.extend_from_slice(args);
+        call_callable_value_with_keywords_from_values(
+            vm,
+            resolved.callable,
+            dst_reg,
+            &all_args,
+            keywords,
+        )
+    } else {
+        call_callable_value_with_keywords_from_values(
+            vm,
+            resolved.callable,
+            dst_reg,
+            args,
+            keywords,
+        )
     }
 }
 
@@ -2808,18 +2831,20 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
             }
             _ => match resolve_dunder_call_target(func_val) {
-                Some(resolved) => match invoke_resolved_callable(vm, resolved, dst_reg, argc, 0, 0)
-                {
-                    Ok(result) => {
-                        vm.current_frame_mut().set_reg(dst_reg, result);
-                        ControlFlow::Continue
+                Ok(Some(resolved)) => {
+                    match invoke_resolved_callable(vm, resolved, dst_reg, argc, 0, 0) {
+                        Ok(result) => {
+                            vm.current_frame_mut().set_reg(dst_reg, result);
+                            ControlFlow::Continue
+                        }
+                        Err(e) => ControlFlow::Error(e),
                     }
-                    Err(e) => ControlFlow::Error(e),
-                },
-                None => ControlFlow::Error(RuntimeError::type_error(format!(
+                }
+                Ok(None) => ControlFlow::Error(RuntimeError::type_error(format!(
                     "'{}' object is not callable",
                     type_id.name()
                 ))),
+                Err(err) => ControlFlow::Error(err),
             },
         }
     } else {
@@ -3013,7 +3038,7 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
             }
             _ => match resolve_dunder_call_target(func_val) {
-                Some(resolved) => match invoke_resolved_callable(
+                Ok(Some(resolved)) => match invoke_resolved_callable(
                     vm,
                     resolved,
                     dst_reg,
@@ -3027,10 +3052,11 @@ pub fn call_kw(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     }
                     Err(e) => ControlFlow::Error(e),
                 },
-                None => ControlFlow::Error(RuntimeError::type_error(format!(
+                Ok(None) => ControlFlow::Error(RuntimeError::type_error(format!(
                     "'{}' object is not callable",
                     type_id.name()
                 ))),
+                Err(err) => ControlFlow::Error(err),
             },
         }
     } else {
