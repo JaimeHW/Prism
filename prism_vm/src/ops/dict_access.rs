@@ -29,11 +29,14 @@ pub(crate) fn dict_get_item(
     key: Value,
 ) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    if let Some(value) = dict.get(key) {
-        return Ok(Some(value));
-    }
-    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
-        return Ok(None);
+    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    if !key_requires_protocol_lookup {
+        if let Some(value) = dict.get(key) {
+            return Ok(Some(value));
+        }
+        if !dict.has_protocol_keys() {
+            return Ok(None);
+        }
     }
 
     for (candidate, value) in dict.iter() {
@@ -62,7 +65,7 @@ pub(crate) fn dict_set_item(
 ) -> Result<(), RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
-    if dict.contains_key(key) {
+    if !key_requires_protocol_lookup && dict.contains_key(key) {
         dict.set_with_hash_and_protocol_lookup(key, value, key_hash, key_requires_protocol_lookup);
         return Ok(());
     }
@@ -95,11 +98,14 @@ pub(crate) fn dict_remove_item(
     key: Value,
 ) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    if let Some(value) = dict.remove(key) {
-        return Ok(Some(value));
-    }
-    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
-        return Ok(None);
+    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    if !key_requires_protocol_lookup {
+        if let Some(value) = dict.remove(key) {
+            return Ok(Some(value));
+        }
+        if !dict.has_protocol_keys() {
+            return Ok(None);
+        }
     }
 
     let keys = dict.keys().collect::<Vec<_>>();
@@ -121,12 +127,14 @@ pub(crate) fn dict_setdefault(
 ) -> Result<Value, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
-    if let Some(value) = dict.get(key) {
-        return Ok(value);
-    }
-    if !key_requires_protocol_lookup && !dict.has_protocol_keys() {
-        dict.set_with_hash_and_protocol_lookup(key, default, key_hash, false);
-        return Ok(default);
+    if !key_requires_protocol_lookup {
+        if let Some(value) = dict.get(key) {
+            return Ok(value);
+        }
+        if !dict.has_protocol_keys() {
+            dict.set_with_hash_and_protocol_lookup(key, default, key_hash, false);
+            return Ok(default);
+        }
     }
 
     let keys = dict.keys().collect::<Vec<_>>();
