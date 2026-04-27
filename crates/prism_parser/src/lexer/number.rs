@@ -91,11 +91,7 @@ fn parse_binary(cursor: &mut Cursor<'_>) -> TokenKind {
 
 /// Parse a decimal number (integer, float, or complex).
 fn parse_decimal(cursor: &mut Cursor<'_>, first_char: char) -> TokenKind {
-    let start = if first_char == '.' {
-        cursor.pos()
-    } else {
-        cursor.pos().saturating_sub(1)
-    };
+    let start = cursor.pos().saturating_sub(1);
     let mut has_dot = first_char == '.';
     let mut has_exp = false;
 
