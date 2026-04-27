@@ -33,8 +33,13 @@ use crate::builtins::{builtin_type_object_for_type_id, builtin_type_object_type_
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
+use crate::ops::iteration::collect_iterable_values;
 use crate::ops::objects::{get_attribute_value, resolve_class_attribute_in_vm};
-use prism_code::{CodeObject, Instruction, Opcode};
+use crate::ops::unpack::{keyword_key_to_name, mapping_entries_for_unpack};
+use prism_code::{
+    CLASS_META_DYNAMIC_BASES_FLAG, CLASS_META_DYNAMIC_KEYWORDS_FLAG, CodeObject, Instruction,
+    Opcode,
+};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::class::{ClassDict, PyClassObject};
@@ -45,7 +50,7 @@ use prism_runtime::object::type_builtins::{
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::tuple::TupleObject;
+use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -120,9 +125,6 @@ fn build_class_impl(
 ) -> ControlFlow {
     let dst_reg = inst.dst().0;
     let code_idx = metadata.code_idx;
-    let base_count = metadata.base_count;
-    let kwargc = metadata.kwargc;
-    let kwnames_idx = metadata.kwnames_idx;
 
     // Resolve the class body code object and class name from the constant pool.
     let class_body = {
@@ -139,50 +141,34 @@ fn build_class_impl(
     };
     let class_name = intern(class_body.name.as_ref());
 
-    // Collect base classes from registers
-    let frame = vm.current_frame();
-    let mut base_class_ids = Vec::with_capacity(base_count);
-    for i in 0..base_count {
-        let base_val = frame.get_reg(dst_reg + 1 + i as u8);
-        match extract_class_id(base_val) {
-            Some(class_id) => base_class_ids.push(class_id),
-            None => {
-                // If no bases provided, inherit from object
-                if base_count == 0 {
-                    break;
-                }
-                return ControlFlow::Error(RuntimeError::type_error(format!(
-                    "base class {} is not a valid class",
-                    i
-                )));
-            }
-        }
-    }
-    let class_keyword_args = match collect_class_keyword_args(
-        vm.current_frame(),
-        dst_reg,
-        base_count,
-        explicit_metaclass.is_some(),
-        kwargc,
-        kwnames_idx,
-    ) {
-        Ok(keyword_args) => keyword_args,
+    let base_values = match collect_class_base_values(vm, dst_reg, metadata) {
+        Ok(values) => values,
         Err(err) => return ControlFlow::Error(err),
     };
+    let class_keyword_args =
+        match collect_class_keyword_args(vm, dst_reg, metadata, explicit_metaclass.is_some()) {
+            Ok(keyword_args) => keyword_args,
+            Err(err) => return ControlFlow::Error(err),
+        };
+    let (explicit_metaclass, class_keyword_args) =
+        match split_metaclass_keyword(explicit_metaclass, class_keyword_args) {
+            Ok(parts) => parts,
+            Err(err) => return ControlFlow::Error(err),
+        };
+    let (metaclass, base_class_ids) =
+        match resolve_class_metaclass(&base_values, explicit_metaclass) {
+            Ok(resolved) => resolved,
+            Err(err) => return ControlFlow::Error(err),
+        };
     let class_keyword_refs: SmallVec<[(&str, Value); 4]> = class_keyword_args
         .iter()
         .map(|(name, value)| (name.as_ref(), *value))
         .collect();
 
-    let metaclass = match resolve_class_metaclass(&base_class_ids, explicit_metaclass) {
-        Ok(metaclass) => metaclass,
-        Err(err) => return ControlFlow::Error(err),
-    };
-
     let prepared_namespace = match prepare_class_namespace(
         vm,
         class_name.clone(),
-        &base_class_ids,
+        &base_values,
         metaclass,
         &class_keyword_refs,
     ) {
@@ -202,8 +188,8 @@ fn build_class_impl(
     let class_val = match construct_class_value(
         vm,
         class_name,
-        &class_body,
-        &base_class_ids,
+        &base_values,
+        base_class_ids.as_deref(),
         &namespace,
         metaclass,
         &class_keyword_refs,
@@ -228,8 +214,11 @@ fn build_class_impl(
 struct ClassMetadata {
     code_idx: u16,
     base_count: usize,
+    flags: u8,
+    dynamic_bases_reg: Option<u8>,
     kwargc: usize,
     kwnames_idx: u16,
+    kwargs_dict_reg: Option<u8>,
 }
 
 #[inline]
@@ -238,59 +227,101 @@ fn read_class_metadata(
     inst: Instruction,
 ) -> Result<ClassMetadata, RuntimeError> {
     let frame = vm.current_frame_mut();
-    let mut code_idx = inst.src1().0 as u16;
-    let mut base_count = inst.src2().0 as usize;
+    let mut metadata = ClassMetadata {
+        code_idx: inst.src1().0 as u16,
+        base_count: inst.src2().0 as usize,
+        flags: 0,
+        dynamic_bases_reg: None,
+        kwargc: 0,
+        kwnames_idx: 0,
+        kwargs_dict_reg: None,
+    };
     let mut ip = frame.ip as usize;
 
     if let Some(meta_inst) = frame.code.instructions.get(ip).copied()
         && meta_inst.opcode() == Opcode::ClassMeta as u8
     {
-        code_idx = inst.imm16();
-        base_count = meta_inst.dst().0 as usize;
+        metadata.code_idx = inst.imm16();
+        metadata.base_count = meta_inst.dst().0 as usize;
+        metadata.flags = meta_inst.src2().0;
+        if (metadata.flags & CLASS_META_DYNAMIC_BASES_FLAG) != 0 {
+            metadata.dynamic_bases_reg = Some(meta_inst.src1().0);
+        }
         ip += 1;
         frame.ip = ip as u32;
     }
 
     let Some(ext_inst) = frame.code.instructions.get(ip).copied() else {
-        return Ok(ClassMetadata {
-            code_idx,
-            base_count,
-            kwargc: 0,
-            kwnames_idx: 0,
-        });
+        return Ok(metadata);
     };
     if ext_inst.opcode() != Opcode::CallKwEx as u8 {
-        return Ok(ClassMetadata {
-            code_idx,
-            base_count,
-            kwargc: 0,
-            kwnames_idx: 0,
-        });
+        return Ok(metadata);
     }
 
     frame.ip = (ip + 1) as u32;
-    let kwargc = ext_inst.dst().0 as usize;
-    let kwnames_idx = (ext_inst.src1().0 as u16) | ((ext_inst.src2().0 as u16) << 8);
-    Ok(ClassMetadata {
-        code_idx,
-        base_count,
-        kwargc,
-        kwnames_idx,
-    })
+    if metadata_has_dynamic_keywords(metadata) {
+        metadata.kwargs_dict_reg = Some(ext_inst.dst().0);
+    } else {
+        metadata.kwargc = ext_inst.dst().0 as usize;
+        metadata.kwnames_idx = (ext_inst.src1().0 as u16) | ((ext_inst.src2().0 as u16) << 8);
+    }
+    Ok(metadata)
+}
+
+#[inline]
+fn metadata_has_dynamic_keywords(metadata: ClassMetadata) -> bool {
+    // Dynamic keyword metadata is encoded in ClassMeta.src2. If no ClassMeta was
+    // present, this remains false for legacy bytecode.
+    (metadata.flags & CLASS_META_DYNAMIC_KEYWORDS_FLAG) != 0
+}
+
+fn collect_class_base_values(
+    vm: &mut VirtualMachine,
+    dst_reg: u8,
+    metadata: ClassMetadata,
+) -> Result<SmallVec<[Value; 8]>, RuntimeError> {
+    if let Some(bases_reg) = metadata.dynamic_bases_reg {
+        let bases_value = vm.current_frame().get_reg(bases_reg);
+        if let Some(tuple) = value_as_tuple_ref(bases_value) {
+            return Ok(tuple.as_slice().iter().copied().collect());
+        }
+        return collect_iterable_values(vm, bases_value).map(|values| values.into_iter().collect());
+    }
+
+    let frame = vm.current_frame();
+    let mut bases = SmallVec::with_capacity(metadata.base_count);
+    for index in 0..metadata.base_count {
+        bases.push(frame.get_reg(dst_reg + 1 + index as u8));
+    }
+    Ok(bases)
 }
 
 fn collect_class_keyword_args(
-    frame: &crate::frame::Frame,
+    vm: &mut VirtualMachine,
     dst_reg: u8,
-    base_count: usize,
+    metadata: ClassMetadata,
     has_explicit_metaclass: bool,
-    kwargc: usize,
-    kwnames_idx: u16,
 ) -> Result<SmallVec<[(Arc<str>, Value); 4]>, RuntimeError> {
-    if kwargc == 0 {
+    if let Some(kwargs_reg) = metadata.kwargs_dict_reg {
+        let mapping = vm.current_frame().get_reg(kwargs_reg);
+        if mapping.is_none() {
+            return Ok(SmallVec::new());
+        }
+        let entries = mapping_entries_for_unpack(vm, mapping)?;
+        let mut keyword_args: SmallVec<[(Arc<str>, Value); 4]> =
+            SmallVec::with_capacity(entries.len());
+        for (key, value) in entries {
+            keyword_args.push((keyword_key_to_name(key)?, value));
+        }
+        return Ok(keyword_args);
+    }
+
+    if metadata.kwargc == 0 {
         return Ok(SmallVec::new());
     }
 
+    let frame = vm.current_frame();
+    let kwnames_idx = metadata.kwnames_idx;
     let kwnames_val = frame.get_const(kwnames_idx);
     let Some(kwnames_ptr) = kwnames_val.as_object_ptr() else {
         return Err(RuntimeError::internal(
@@ -298,10 +329,11 @@ fn collect_class_keyword_args(
         ));
     };
     let kwnames = unsafe { &*(kwnames_ptr as *const prism_code::KwNamesTuple) };
-    let keyword_base = dst_reg + 1 + base_count as u8 + u8::from(has_explicit_metaclass);
+    let keyword_base = dst_reg + 1 + metadata.base_count as u8 + u8::from(has_explicit_metaclass);
 
-    let mut keyword_args: SmallVec<[(Arc<str>, Value); 4]> = SmallVec::with_capacity(kwargc);
-    for index in 0..kwargc {
+    let mut keyword_args: SmallVec<[(Arc<str>, Value); 4]> =
+        SmallVec::with_capacity(metadata.kwargc);
+    for index in 0..metadata.kwargc {
         let kw_name = kwnames
             .get(index)
             .ok_or_else(|| RuntimeError::internal("Invalid class keyword names tuple"))?;
@@ -310,6 +342,28 @@ fn collect_class_keyword_args(
     }
 
     Ok(keyword_args)
+}
+
+fn split_metaclass_keyword(
+    mut explicit_metaclass: Option<Value>,
+    keyword_args: SmallVec<[(Arc<str>, Value); 4]>,
+) -> Result<(Option<Value>, SmallVec<[(Arc<str>, Value); 4]>), RuntimeError> {
+    let mut class_keywords = SmallVec::with_capacity(keyword_args.len());
+
+    for (name, value) in keyword_args {
+        if name.as_ref() == "metaclass" {
+            if explicit_metaclass.is_some() {
+                return Err(RuntimeError::type_error(
+                    "class got multiple values for keyword argument 'metaclass'",
+                ));
+            }
+            explicit_metaclass = Some(value);
+        } else {
+            class_keywords.push((name, value));
+        }
+    }
+
+    Ok((explicit_metaclass, class_keywords))
 }
 
 #[inline]
@@ -338,17 +392,25 @@ fn populate_class_cell(
 fn construct_class_value(
     vm: &mut VirtualMachine,
     class_name: InternedString,
-    class_body: &Arc<CodeObject>,
-    bases: &[ClassId],
+    bases: &[Value],
+    base_class_ids: Option<&[ClassId]>,
     namespace: &ClassDict,
     metaclass: Value,
     class_keywords: &[(&str, Value)],
     prepared_namespace: Option<Value>,
 ) -> Result<Value, RuntimeError> {
     if class_keywords.is_empty() && should_use_native_type_new_fast_path(metaclass) {
+        let collected_base_class_ids;
+        let base_class_ids = match base_class_ids {
+            Some(ids) => ids,
+            None => {
+                collected_base_class_ids = collect_base_class_ids(bases)?;
+                &collected_base_class_ids
+            }
+        };
         let result = type_new_with_metaclass(
             class_name,
-            bases,
+            base_class_ids,
             namespace,
             metaclass,
             global_class_registry(),
@@ -369,11 +431,7 @@ fn construct_class_value(
         return Ok(Value::object_ptr(Arc::into_raw(result.class) as *const ()));
     }
 
-    let bases_value = alloc_heap_value(
-        vm,
-        TupleObject::from_vec(class_bases_to_values(bases)?),
-        "class bases tuple",
-    )?;
+    let bases_value = alloc_heap_value(vm, TupleObject::from_slice(bases), "class bases tuple")?;
     let namespace_value = match prepared_namespace {
         // Class bodies with a prepared namespace write through the mapping
         // during execution via locals_mapping-aware store/delete opcodes.
@@ -388,22 +446,25 @@ fn construct_class_value(
         )?,
     };
     let class_args = [Value::string(class_name), bases_value, namespace_value];
+    let metaclass_callable = materialize_metaclass_callable(metaclass);
     let class_value = if class_keywords.is_empty() {
-        invoke_callable_value(vm, metaclass, &class_args)?
+        invoke_callable_value(vm, metaclass_callable, &class_args)?
     } else {
-        invoke_callable_value_with_keywords(vm, metaclass, &class_args, class_keywords)?
+        invoke_callable_value_with_keywords(vm, metaclass_callable, &class_args, class_keywords)?
     };
 
-    let Some(class_ptr) = class_value.as_object_ptr() else {
-        return Err(RuntimeError::type_error(
-            "metaclass returned a non-type object",
-        ));
-    };
-    if extract_type_id(class_ptr) != TypeId::TYPE {
-        return Err(RuntimeError::type_error(format!(
-            "metaclass returned non-type '{}'",
-            extract_type_id(class_ptr).name()
-        )));
+    if metaclass_result_must_be_type(metaclass) {
+        let Some(class_ptr) = class_value.as_object_ptr() else {
+            return Err(RuntimeError::type_error(
+                "metaclass returned a non-type object",
+            ));
+        };
+        if extract_type_id(class_ptr) != TypeId::TYPE {
+            return Err(RuntimeError::type_error(format!(
+                "metaclass returned non-type '{}'",
+                extract_type_id(class_ptr).name()
+            )));
+        }
     }
 
     Ok(class_value)
@@ -494,7 +555,7 @@ fn invoke_init_subclass_callable(
 fn prepare_class_namespace(
     vm: &mut VirtualMachine,
     class_name: InternedString,
-    bases: &[ClassId],
+    bases: &[Value],
     metaclass: Value,
     class_keywords: &[(&str, Value)],
 ) -> Result<Option<Value>, RuntimeError> {
@@ -503,7 +564,8 @@ fn prepare_class_namespace(
     }
 
     let prepare_name = intern("__prepare__");
-    let prepare = match get_attribute_value(vm, metaclass, &prepare_name) {
+    let metaclass_callable = materialize_metaclass_callable(metaclass);
+    let prepare = match get_attribute_value(vm, metaclass_callable, &prepare_name) {
         Ok(value) => value,
         Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
             return Ok(None);
@@ -511,11 +573,7 @@ fn prepare_class_namespace(
         Err(err) => return Err(err),
     };
 
-    let bases_value = alloc_heap_value(
-        vm,
-        TupleObject::from_vec(class_bases_to_values(bases)?),
-        "class bases tuple",
-    )?;
+    let bases_value = alloc_heap_value(vm, TupleObject::from_slice(bases), "class bases tuple")?;
     let prepare_args = [Value::string(class_name), bases_value];
     let namespace = if class_keywords.is_empty() {
         invoke_callable_value(vm, prepare, &prepare_args)?
@@ -555,30 +613,6 @@ where
         })
 }
 
-fn class_bases_to_values(bases: &[ClassId]) -> Result<Vec<Value>, RuntimeError> {
-    bases.iter().copied().map(class_id_to_value).collect()
-}
-
-fn class_id_to_value(class_id: ClassId) -> Result<Value, RuntimeError> {
-    if class_id == ClassId::OBJECT {
-        return Ok(builtin_type_object_for_type_id(TypeId::OBJECT));
-    }
-
-    if let Some(value) = crate::builtins::exception_type_value_for_proxy_class_id(class_id) {
-        return Ok(value);
-    }
-
-    if class_id.0 < TypeId::FIRST_USER_TYPE {
-        return Ok(builtin_type_object_for_type_id(TypeId::from_raw(
-            class_id.0,
-        )));
-    }
-
-    global_class(class_id)
-        .map(|class| Value::object_ptr(Arc::as_ptr(&class) as *const ()))
-        .ok_or_else(|| RuntimeError::internal("class base missing from global registry"))
-}
-
 fn class_namespace_to_dict(namespace: &ClassDict) -> DictObject {
     let mut dict = DictObject::new();
     namespace.for_each(|name, value| {
@@ -589,58 +623,97 @@ fn class_namespace_to_dict(namespace: &ClassDict) -> DictObject {
 
 #[inline]
 fn resolve_class_metaclass(
-    base_class_ids: &[ClassId],
+    base_values: &[Value],
     explicit_metaclass: Option<Value>,
-) -> Result<Value, RuntimeError> {
-    let mut winner = validate_metaclass_value(explicit_metaclass.unwrap_or(Value::none()))?;
+) -> Result<(Value, Option<Vec<ClassId>>), RuntimeError> {
+    let explicit_metaclass = explicit_metaclass.map(normalize_explicit_metaclass);
+    if let Some(metaclass) = explicit_metaclass
+        && !metaclass_participates_in_conflict_resolution(metaclass)
+    {
+        return Ok((metaclass, None));
+    }
 
-    for &base_id in base_class_ids {
+    let base_class_ids = collect_base_class_ids(base_values)?;
+    let mut winner = explicit_metaclass.unwrap_or(Value::none());
+
+    for &base_id in base_class_ids.iter() {
         let base_metaclass = base_class_metaclass_value(base_id);
         winner = choose_more_derived_metaclass(winner, base_metaclass)?;
     }
 
-    Ok(winner)
+    Ok((winner, Some(base_class_ids)))
 }
 
 #[inline]
-fn validate_metaclass_value(value: Value) -> Result<Value, RuntimeError> {
+fn normalize_explicit_metaclass(value: Value) -> Value {
     if value.is_none() {
-        return Ok(Value::none());
+        return Value::none();
     }
 
     let Some(ptr) = value.as_object_ptr() else {
-        return Err(RuntimeError::type_error(
-            "metaclass must be a class object derived from type",
-        ));
+        return value;
     };
 
     if let Some(represented) = crate::builtins::builtin_type_object_type_id(ptr) {
-        return if represented == TypeId::TYPE {
-            Ok(Value::none())
+        if represented == TypeId::TYPE {
+            Value::none()
         } else {
-            Err(RuntimeError::type_error(
-                "metaclass must be a class object derived from type",
-            ))
-        };
+            value
+        }
+    } else {
+        value
+    }
+}
+
+fn collect_base_class_ids(bases: &[Value]) -> Result<Vec<ClassId>, RuntimeError> {
+    let mut base_class_ids = Vec::with_capacity(bases.len());
+    for (index, &base) in bases.iter().enumerate() {
+        match extract_class_id(base) {
+            Some(class_id) => base_class_ids.push(class_id),
+            None => {
+                return Err(RuntimeError::type_error(format!(
+                    "base class {} is not a valid class",
+                    index
+                )));
+            }
+        }
+    }
+    Ok(base_class_ids)
+}
+
+#[inline]
+fn metaclass_participates_in_conflict_resolution(value: Value) -> bool {
+    if value.is_none() {
+        return true;
     }
 
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    if crate::builtins::builtin_type_object_type_id(ptr) == Some(TypeId::TYPE) {
+        return true;
+    }
     if extract_type_id(ptr) != TypeId::TYPE {
-        return Err(RuntimeError::type_error(
-            "metaclass must be a class object derived from type",
-        ));
+        return false;
     }
-
     let class = unsafe { &*(ptr as *const PyClassObject) };
-    if !class
+    class
         .flags()
         .contains(prism_runtime::object::class::ClassFlags::METACLASS)
-    {
-        return Err(RuntimeError::type_error(
-            "metaclass must be a class object derived from type",
-        ));
-    }
+}
 
-    Ok(value)
+#[inline]
+fn materialize_metaclass_callable(metaclass: Value) -> Value {
+    if metaclass.is_none() {
+        builtin_type_object_for_type_id(TypeId::TYPE)
+    } else {
+        metaclass
+    }
+}
+
+#[inline]
+fn metaclass_result_must_be_type(metaclass: Value) -> bool {
+    metaclass_participates_in_conflict_resolution(metaclass)
 }
 
 #[inline]

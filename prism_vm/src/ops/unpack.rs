@@ -28,7 +28,7 @@ use crate::ops::calls::{
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::objects::{dict_storage_ref_from_ptr, get_attribute_value};
 
-fn keyword_key_to_name(key: Value) -> Result<Arc<str>, RuntimeError> {
+pub(crate) fn keyword_key_to_name(key: Value) -> Result<Arc<str>, RuntimeError> {
     if let Some(ptr) = key.as_string_object_ptr() {
         if let Some(interned) = interned_by_ptr(ptr as *const u8) {
             return Ok(interned.get_arc());
@@ -85,7 +85,7 @@ fn collect_unpack_sources(
     Ok(result)
 }
 
-fn mapping_entries_for_unpack(
+pub(crate) fn mapping_entries_for_unpack(
     vm: &mut VirtualMachine,
     mapping: Value,
 ) -> Result<Vec<(Value, Value)>, RuntimeError> {
