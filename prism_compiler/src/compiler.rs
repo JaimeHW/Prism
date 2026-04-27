@@ -398,12 +398,19 @@ impl Compiler {
 
         compiler.builder.set_filename(filename);
         compiler.builder.add_flags(CodeFlags::MODULE);
+        if let Some(doc) = Self::body_docstring(&module.body)
+            && compiler.optimize < OptimizationLevel::Full
+        {
+            compiler.emit_namespace_docstring_binding(doc);
+        }
         if Self::body_needs_runtime_annotations(&module.body) {
             compiler.builder.emit_setup_annotations();
         }
 
         for (index, stmt) in module.body.iter().enumerate() {
-            if compiler.should_strip_docstring_stmt(index, stmt) {
+            if compiler.should_strip_docstring_stmt(index, stmt)
+                || compiler.should_skip_emitted_docstring_stmt(index, stmt)
+            {
                 continue;
             }
             compiler.compile_stmt(stmt)?;
@@ -435,10 +442,55 @@ impl Compiler {
         matches!(&stmt.kind, StmtKind::Expr(expr) if matches!(&expr.kind, ExprKind::String(_)))
     }
 
+    /// Return the literal docstring for a Python body, if one is present.
+    #[inline]
+    fn body_docstring(body: &[Stmt]) -> Option<&str> {
+        match body.first().map(|stmt| &stmt.kind) {
+            Some(StmtKind::Expr(expr)) => match &expr.kind {
+                ExprKind::String(literal) => Some(literal.value.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether to strip this statement as a docstring under `-OO`.
     #[inline]
     fn should_strip_docstring_stmt(&self, index: usize, stmt: &Stmt) -> bool {
         self.optimize >= OptimizationLevel::Full && index == 0 && Self::is_docstring_stmt(stmt)
+    }
+
+    /// Whether this docstring statement has already been emitted as `__doc__`.
+    #[inline]
+    fn should_skip_emitted_docstring_stmt(&self, index: usize, stmt: &Stmt) -> bool {
+        index == 0 && Self::is_docstring_stmt(stmt) && self.optimize < OptimizationLevel::Full
+    }
+
+    fn emit_namespace_docstring_binding(&mut self, doc: &str) {
+        let doc_reg = self.builder.alloc_register();
+        let doc_idx = self.builder.add_string(doc);
+        self.builder.emit_load_const(doc_reg, doc_idx);
+
+        if self.current_scope().kind == ScopeKind::Module
+            && self.module_namespace_mode != ModuleNamespaceMode::DynamicLocals
+        {
+            let name_idx = self.builder.add_name("__doc__");
+            self.builder.emit_store_global(name_idx, doc_reg);
+        } else {
+            let slot = self.builder.define_local("__doc__");
+            self.builder.emit_store_local(slot, doc_reg);
+        }
+
+        self.builder.free_register(doc_reg);
+    }
+
+    fn emit_function_docstring_attribute(&mut self, func_reg: Register, doc: &str) {
+        let doc_reg = self.builder.alloc_register();
+        let doc_idx = self.builder.add_string(doc);
+        self.builder.emit_load_const(doc_reg, doc_idx);
+        let name_idx = self.builder.add_name("__doc__");
+        self.builder.emit_set_attr(func_reg, name_idx, doc_reg);
+        self.builder.free_register(doc_reg);
     }
 
     fn body_needs_runtime_annotations(body: &[Stmt]) -> bool {
@@ -1211,13 +1263,20 @@ impl Compiler {
                 // CPython seeds every class body namespace with __module__ and
                 // __qualname__ before user statements execute.
                 self.emit_implicit_class_metadata_bindings(class_qualname.as_ref());
+                if let Some(doc) = Self::body_docstring(body)
+                    && self.optimize < OptimizationLevel::Full
+                {
+                    self.emit_namespace_docstring_binding(doc);
+                }
                 if Self::body_needs_runtime_annotations(body) {
                     self.builder.emit_setup_annotations();
                 }
 
                 // Compile class body statements (method definitions, class variables, etc.)
                 for (index, stmt) in body.iter().enumerate() {
-                    if self.should_strip_docstring_stmt(index, stmt) {
+                    if self.should_strip_docstring_stmt(index, stmt)
+                        || self.should_skip_emitted_docstring_stmt(index, stmt)
+                    {
                         continue;
                     }
                     self.compile_stmt(stmt)?;

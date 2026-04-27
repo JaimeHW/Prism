@@ -122,6 +122,10 @@ impl Compiler {
         is_async: bool,
         definition_line: u32,
     ) -> CompileResult<()> {
+        let docstring = Self::body_docstring(body)
+            .filter(|_| self.optimize < OptimizationLevel::Full)
+            .map(str::to_owned);
+
         // Find the scope for this function from the symbol table
         // We need to look it up by name in the current scope's children
         let func_scope_idx = self.find_child_scope(ScopeKind::Function, name);
@@ -257,7 +261,9 @@ impl Compiler {
 
         // Compile function body
         for (index, stmt) in body.iter().enumerate() {
-            if self.should_strip_docstring_stmt(index, stmt) {
+            if self.should_strip_docstring_stmt(index, stmt)
+                || self.should_skip_emitted_docstring_stmt(index, stmt)
+            {
                 continue;
             }
             self.compile_stmt(stmt)?;
@@ -338,6 +344,10 @@ impl Compiler {
             if let Some(reg) = none_reg {
                 self.builder.free_register(reg);
             }
+        }
+
+        if let Some(doc) = docstring.as_deref() {
+            self.emit_function_docstring_attribute(func_reg, doc);
         }
 
         // Apply decorators in reverse order
