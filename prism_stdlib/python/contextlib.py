@@ -1,6 +1,6 @@
 """Small source-backed subset of CPython's contextlib module."""
 
-__all__ = ["contextmanager"]
+__all__ = ["contextmanager", "suppress"]
 
 
 class _GeneratorContextManager:
@@ -50,3 +50,14 @@ def contextmanager(func):
     helper.__doc__ = getattr(func, "__doc__", None)
     helper.__module__ = getattr(func, "__module__", None)
     return helper
+
+
+class suppress:
+    def __init__(self, *exceptions):
+        self._exceptions = exceptions
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exctype, excinst, exctb):
+        return exctype is not None and issubclass(exctype, self._exceptions)
