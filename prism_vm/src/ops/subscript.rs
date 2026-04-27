@@ -13,6 +13,7 @@ use crate::error::RuntimeError;
 use crate::ops::calls::{
     InvokeCallableOutcome, invoke_callable_value, invoke_callable_value_with_control_transfer,
 };
+use crate::ops::comparison::eq_result;
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
@@ -174,11 +175,14 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         if can_use_dict_storage_fast_path(ptr, "__getitem__")
             && let Some(dict) = dict_storage_ref_from_ptr(ptr)
         {
-            if let Some(value) = dict.get(key) {
-                vm.current_frame_mut().set_reg(dst, value);
-                return ControlFlow::Continue;
+            match dict_get_item_vm(vm, dict, key) {
+                Ok(Some(value)) => {
+                    vm.current_frame_mut().set_reg(dst, value);
+                    return ControlFlow::Continue;
+                }
+                Ok(None) => return ControlFlow::Error(RuntimeError::key_error("key not found")),
+                Err(err) => return ControlFlow::Error(err),
             }
-            return ControlFlow::Error(RuntimeError::key_error("key not found"));
         }
     }
 
@@ -617,7 +621,9 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             TypeId::DICT => {
                 // Dict[key] = value
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
-                dict.set(key, value);
+                if let Err(err) = dict_set_item_vm(vm, dict, key, value) {
+                    return ControlFlow::Error(err);
+                }
                 return ControlFlow::Continue;
             }
             TypeId::TUPLE | TypeId::STR => {
@@ -631,7 +637,9 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         if can_use_dict_storage_fast_path(ptr, "__setitem__")
             && let Some(dict) = dict_storage_mut_from_ptr(ptr)
         {
-            dict.set(key, value);
+            if let Err(err) = dict_set_item_vm(vm, dict, key, value) {
+                return ControlFlow::Error(err);
+            }
             return ControlFlow::Continue;
         }
     }
@@ -677,10 +685,13 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         match header.type_id {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
-                if dict.remove(key).is_some() {
-                    return ControlFlow::Continue;
+                match dict_remove_item_vm(vm, dict, key) {
+                    Ok(Some(_)) => return ControlFlow::Continue,
+                    Ok(None) => {
+                        return ControlFlow::Error(RuntimeError::key_error("key not found"));
+                    }
+                    Err(err) => return ControlFlow::Error(err),
                 }
-                return ControlFlow::Error(RuntimeError::key_error("key not found"));
             }
             TypeId::TUPLE | TypeId::STR => {
                 return ControlFlow::Error(RuntimeError::type_error(
@@ -693,14 +704,75 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         if can_use_dict_storage_fast_path(ptr, "__delitem__")
             && let Some(dict) = dict_storage_mut_from_ptr(ptr)
         {
-            if dict.remove(key).is_some() {
-                return ControlFlow::Continue;
+            match dict_remove_item_vm(vm, dict, key) {
+                Ok(Some(_)) => return ControlFlow::Continue,
+                Ok(None) => return ControlFlow::Error(RuntimeError::key_error("key not found")),
+                Err(err) => return ControlFlow::Error(err),
             }
-            return ControlFlow::Error(RuntimeError::key_error("key not found"));
         }
     }
 
     fallback_delete_subscr(vm, container, key)
+}
+
+fn dict_get_item_vm(
+    vm: &mut VirtualMachine,
+    dict: &DictObject,
+    key: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(value) = dict.get(key) {
+        return Ok(Some(value));
+    }
+
+    let entries = dict.iter().collect::<Vec<_>>();
+    for (candidate, value) in entries {
+        if eq_result(vm, candidate, key)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn dict_set_item_vm(
+    vm: &mut VirtualMachine,
+    dict: &mut DictObject,
+    key: Value,
+    value: Value,
+) -> Result<(), RuntimeError> {
+    if dict.contains_key(key) {
+        dict.set(key, value);
+        return Ok(());
+    }
+
+    let keys = dict.keys().collect::<Vec<_>>();
+    for candidate in keys {
+        if eq_result(vm, candidate, key)? {
+            dict.set(candidate, value);
+            return Ok(());
+        }
+    }
+
+    dict.set(key, value);
+    Ok(())
+}
+
+fn dict_remove_item_vm(
+    vm: &mut VirtualMachine,
+    dict: &mut DictObject,
+    key: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(value) = dict.remove(key) {
+        return Ok(Some(value));
+    }
+
+    let keys = dict.keys().collect::<Vec<_>>();
+    for candidate in keys {
+        if eq_result(vm, candidate, key)? {
+            return Ok(dict.remove(candidate));
+        }
+    }
+
+    Ok(None)
 }
 
 #[inline]

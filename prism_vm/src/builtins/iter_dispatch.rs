@@ -232,6 +232,14 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
 
     let exact_type_id = get_type_id(value);
 
+    if exact_type_id == Some(TypeId::LIST) {
+        return Ok(IteratorObject::from_list(*value));
+    }
+
+    if exact_type_id == Some(TypeId::TUPLE) {
+        return Ok(IteratorObject::from_tuple(*value));
+    }
+
     if prism_runtime::types::list::value_as_list_ref(*value).is_some() {
         return Ok(IteratorObject::from_list(*value));
     }
@@ -381,6 +389,8 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             let values = view.to_values().ok_or(IterError::InvalidObject)?;
             Ok(IteratorObject::from_values(values))
         }
+
+        TypeId::GENERIC_ALIAS => Ok(IteratorObject::from_generic_alias(*value)),
 
         TypeId::GENERATOR => Err(IterError::NotIterable(
             "iter() should receive generators directly".into(),

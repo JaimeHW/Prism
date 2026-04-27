@@ -1,5 +1,6 @@
 use super::BuiltinError;
 use crate::VirtualMachine;
+use crate::ops::calls::value_supports_call_protocol;
 use crate::ops::iteration::{IterStep, collect_iterable_values, ensure_iterator_value, next_step};
 use crate::stdlib::collections::deque::{DequeObject, value_as_deque};
 use num_traits::{One, Zero};
@@ -100,11 +101,17 @@ pub fn builtin_iter(args: &[Value]) -> Result<Value, BuiltinError> {
             Ok(super::iter_dispatch::iterator_to_value(iter))
         }
         2 => {
-            // iter(callable, sentinel) - sentinel form
-            // TODO: Create callable iterator that calls until sentinel
-            Err(BuiltinError::NotImplemented(
-                "iter(callable, sentinel) not yet implemented".to_string(),
-            ))
+            if !value_supports_call_protocol(args[0]) {
+                return Err(BuiltinError::TypeError(format!(
+                    "iter(v, w): v must be callable (got '{}')",
+                    get_type_name(&args[0])
+                )));
+            }
+
+            let iter = prism_runtime::types::iter::IteratorObject::from_call_sentinel(
+                args[0], args[1],
+            );
+            Ok(super::iter_dispatch::iterator_to_value(iter))
         }
         _ => Err(BuiltinError::TypeError(format!(
             "iter() expected 1 or 2 arguments, got {}",
@@ -117,9 +124,19 @@ pub fn builtin_iter(args: &[Value]) -> Result<Value, BuiltinError> {
 pub fn builtin_iter_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     match args.len() {
         1 => ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error),
-        2 => Err(BuiltinError::NotImplemented(
-            "iter(callable, sentinel) not yet implemented".to_string(),
-        )),
+        2 => {
+            if !value_supports_call_protocol(args[0]) {
+                return Err(BuiltinError::TypeError(format!(
+                    "iter(v, w): v must be callable (got '{}')",
+                    get_type_name(&args[0])
+                )));
+            }
+
+            let iter = prism_runtime::types::iter::IteratorObject::from_call_sentinel(
+                args[0], args[1],
+            );
+            Ok(super::iter_dispatch::iterator_to_value(iter))
+        }
         _ => Err(BuiltinError::TypeError(format!(
             "iter() expected 1 or 2 arguments, got {}",
             args.len()
@@ -313,6 +330,20 @@ pub fn builtin_zip(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(super::iter_dispatch::iterator_to_value(zip_iter))
 }
 
+/// VM-aware zip builtin for protocol-based iterables.
+pub fn builtin_zip_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    let mut iterators = Vec::with_capacity(args.len());
+    for &arg in args {
+        let iterator =
+            ensure_iterator_value(vm, arg).map_err(super::runtime_error_to_builtin_error)?;
+        iterators
+            .push(prism_runtime::types::iter::IteratorObject::from_existing_iterator(iterator));
+    }
+
+    let zip_iter = prism_runtime::types::iter::IteratorObject::zip(iterators);
+    Ok(super::iter_dispatch::iterator_to_value(zip_iter))
+}
+
 // =============================================================================
 // map
 // =============================================================================
@@ -346,6 +377,28 @@ pub fn builtin_map(args: &[Value]) -> Result<Value, BuiltinError> {
 
     // Create map iterator (function call handled by VM on iteration)
     let map_iter = prism_runtime::types::iter::IteratorObject::map(func, inner);
+    Ok(super::iter_dispatch::iterator_to_value(map_iter))
+}
+
+/// VM-aware map builtin for protocol-based iterables.
+pub fn builtin_map_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "map expected at least 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    if args.len() > 2 {
+        return Err(BuiltinError::NotImplemented(
+            "map() with multiple iterables not yet implemented".to_string(),
+        ));
+    }
+
+    let iterator =
+        ensure_iterator_value(vm, args[1]).map_err(super::runtime_error_to_builtin_error)?;
+    let inner = prism_runtime::types::iter::IteratorObject::from_existing_iterator(iterator);
+    let map_iter = prism_runtime::types::iter::IteratorObject::map(args[0], inner);
     Ok(super::iter_dispatch::iterator_to_value(map_iter))
 }
 
@@ -383,6 +436,23 @@ pub fn builtin_filter(args: &[Value]) -> Result<Value, BuiltinError> {
     let inner = super::iter_dispatch::value_to_iterator(&args[1])?;
 
     // Create filter iterator
+    let filter_iter = prism_runtime::types::iter::IteratorObject::filter(func, inner);
+    Ok(super::iter_dispatch::iterator_to_value(filter_iter))
+}
+
+/// VM-aware filter builtin for protocol-based iterables.
+pub fn builtin_filter_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "filter expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let func = (!args[0].is_none()).then_some(args[0]);
+    let iterator =
+        ensure_iterator_value(vm, args[1]).map_err(super::runtime_error_to_builtin_error)?;
+    let inner = prism_runtime::types::iter::IteratorObject::from_existing_iterator(iterator);
     let filter_iter = prism_runtime::types::iter::IteratorObject::filter(func, inner);
     Ok(super::iter_dispatch::iterator_to_value(filter_iter))
 }

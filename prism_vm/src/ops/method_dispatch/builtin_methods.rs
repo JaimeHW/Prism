@@ -15,6 +15,7 @@ use crate::builtins::{
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
+use crate::ops::comparison::eq_result;
 use crate::ops::exception::helpers::{
     extract_type_id_from_value, is_exception_class_value, is_exception_instance_value,
 };
@@ -42,7 +43,7 @@ use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObj
 use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
-use prism_runtime::types::iter::{IteratorAdvanceError, IteratorObject};
+use prism_runtime::types::iter::{IteratorEmptyIterable, IteratorObject, IteratorReduction};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::{
     MemoryViewFormat, MemoryViewObject, value_as_memoryview_mut, value_as_memoryview_ref,
@@ -339,9 +340,15 @@ static MEMORYVIEW_EXIT_METHOD: LazyLock<BuiltinFunctionObject> =
 static ITERATOR_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("iterator.__iter__"), iterator_iter));
 static ITERATOR_NEXT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("iterator.__next__"), iterator_next));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("iterator.__next__"), iterator_next));
 static ITERATOR_LENGTH_HINT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("iterator.__length_hint__"), iterator_length_hint)
+});
+static ITERATOR_REDUCE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("iterator.__reduce__"), iterator_reduce)
+});
+static ITERATOR_SETSTATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("iterator.__setstate__"), iterator_setstate)
 });
 static GENERATOR_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("generator.close"), generator_close));
@@ -368,6 +375,9 @@ static PROPERTY_SETTER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("property.setter"), property_setter));
 static PROPERTY_DELETER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("property.deleter"), property_deleter));
+static PROPERTY_SET_NAME_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("property.__set_name__"), property_set_name)
+});
 static GENERIC_DUNDER_METHODS: LazyLock<Mutex<FxHashMap<(u32, &'static str), usize>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
@@ -734,6 +744,12 @@ pub fn resolve_iterator_method(name: &str) -> Option<CachedMethod> {
         "__length_hint__" => Some(CachedMethod::simple(builtin_method_value(
             &ITERATOR_LENGTH_HINT_METHOD,
         ))),
+        "__reduce__" => Some(CachedMethod::simple(builtin_method_value(
+            &ITERATOR_REDUCE_METHOD,
+        ))),
+        "__setstate__" => Some(CachedMethod::simple(builtin_method_value(
+            &ITERATOR_SETSTATE_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -824,6 +840,9 @@ pub fn resolve_property_method(name: &str) -> Option<CachedMethod> {
         ))),
         "deleter" => Some(CachedMethod::simple(builtin_method_value(
             &PROPERTY_DELETER_METHOD,
+        ))),
+        "__set_name__" => Some(CachedMethod::simple(builtin_method_value(
+            &PROPERTY_SET_NAME_METHOD,
         ))),
         _ => None,
     }
@@ -2274,22 +2293,12 @@ fn iterator_iter(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(args[0])
 }
 
-fn iterator_next(args: &[Value]) -> Result<Value, BuiltinError> {
+fn iterator_next(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("iterator", "__next__", args, 0)?;
-    let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
-        BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
-    })?;
-    iter.next_checked()
-        .map_err(iterator_advance_error_to_builtin_error)?
-        .ok_or(BuiltinError::StopIteration)
-}
-
-#[inline]
-fn iterator_advance_error_to_builtin_error(err: IteratorAdvanceError) -> BuiltinError {
-    BuiltinError::Raised(RuntimeError::exception(
-        ExceptionTypeId::RuntimeError.as_u8() as u16,
-        err.message(),
-    ))
+    match next_step(vm, args[0]).map_err(runtime_error_to_builtin_error)? {
+        IterStep::Yielded(value) => Ok(value),
+        IterStep::Exhausted => Err(BuiltinError::StopIteration),
+    }
 }
 
 fn iterator_length_hint(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -2299,6 +2308,155 @@ fn iterator_length_hint(args: &[Value]) -> Result<Value, BuiltinError> {
     })?;
     Ok(Value::int(iter.size_hint().unwrap_or(0) as i64)
         .expect("iterator length hint should fit in tagged int"))
+}
+
+fn iterator_reduce(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("iterator", "__reduce__", args, 0)?;
+    let reducer_builtin_name = {
+        let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
+            BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
+        })?;
+        iter.reduction_builtin_name()
+    };
+    let reducer_builtin = reduce_builtin(vm, reducer_builtin_name)?;
+    let state = {
+        let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
+            BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
+        })?;
+        iter.reduction_state()
+            .map_err(|err| BuiltinError::Raised(RuntimeError::from(err)))?
+    };
+
+    match state {
+        IteratorReduction::Empty => reduce_tuple(vm, reducer_builtin, &[], None),
+        IteratorReduction::EmptyIterable(kind) => {
+            let iterable = empty_reduce_iterable(vm, kind)?;
+            reduce_tuple(vm, reducer_builtin, &[iterable], None)
+        }
+        IteratorReduction::Iterable { iterable, state } => {
+            reduce_tuple(vm, reducer_builtin, &[iterable], state)
+        }
+        IteratorReduction::ReversedIterable { iterable, state } => {
+            reduce_tuple(vm, reducer_builtin, &[iterable], state)
+        }
+        IteratorReduction::CallSentinel { callable, sentinel } => {
+            reduce_tuple(vm, reducer_builtin, &[callable, sentinel], None)
+        }
+        IteratorReduction::RemainingValues(values) => {
+            let list = alloc_heap_value(
+                vm,
+                ListObject::from_iter(values),
+                "iterator reduce remaining values",
+            )
+            .map_err(runtime_error_to_builtin_error)?;
+            reduce_tuple(vm, reducer_builtin, &[list], None)
+        }
+        IteratorReduction::RequiresVm(reason) => Err(BuiltinError::NotImplemented(
+            reason.to_string(),
+        )),
+    }
+}
+
+fn iterator_setstate(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("iterator", "__setstate__", args, 1)?;
+    let state = expect_integer_like_index(args[1])?;
+    let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
+    })?;
+    iter.set_state(state);
+    Ok(Value::none())
+}
+
+fn empty_reduce_iterable(
+    vm: &mut VirtualMachine,
+    kind: IteratorEmptyIterable,
+) -> Result<Value, BuiltinError> {
+    match kind {
+        IteratorEmptyIterable::Tuple => alloc_heap_value(
+            vm,
+            TupleObject::empty(),
+            "iterator reduce empty tuple",
+        )
+        .map_err(runtime_error_to_builtin_error),
+        IteratorEmptyIterable::List => alloc_heap_value(
+            vm,
+            ListObject::new(),
+            "iterator reduce empty list",
+        )
+        .map_err(runtime_error_to_builtin_error),
+        IteratorEmptyIterable::String => Ok(Value::string(intern(""))),
+    }
+}
+
+fn reduce_builtin(vm: &mut VirtualMachine, name: &str) -> Result<Value, BuiltinError> {
+    if let Some(module) = vm.cached_module("builtins") {
+        if let Some(value) = lookup_dict_string_key_vm(vm, module.dict_value(), name)? {
+            return Ok(value);
+        }
+        if let Some(value) = module.get_attr(name) {
+            return Ok(value);
+        }
+    }
+
+    vm.builtin_value(name)
+        .ok_or_else(|| BuiltinError::AttributeError(format!("builtin '{}' is not available", name)))
+}
+
+fn lookup_dict_string_key_vm(
+    vm: &mut VirtualMachine,
+    dict_value: Value,
+    name: &str,
+) -> Result<Option<Value>, BuiltinError> {
+    let target = Value::string(intern(name));
+    let Some(ptr) = dict_value.as_object_ptr() else {
+        return Ok(None);
+    };
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::DICT {
+        return Ok(None);
+    }
+
+    let dict = unsafe { &*(ptr as *const DictObject) };
+    if let Some(value) = dict.get(target) {
+        return Ok(Some(value));
+    }
+
+    let entries = dict.iter().collect::<Vec<_>>();
+    for (key, value) in entries {
+        if eq_result(vm, key, target).map_err(runtime_error_to_builtin_error)? {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
+fn reduce_tuple(
+    vm: &mut VirtualMachine,
+    callable: Value,
+    call_args: &[Value],
+    state: Option<i64>,
+) -> Result<Value, BuiltinError> {
+    let args_tuple = alloc_heap_value(
+        vm,
+        TupleObject::from_slice(call_args),
+        "iterator reduce args tuple",
+    )
+    .map_err(runtime_error_to_builtin_error)?;
+
+    let values = match state {
+        Some(state) => {
+            let state_value = bigint_to_value(state.into());
+            [callable, args_tuple, state_value].to_vec()
+        }
+        None => [callable, args_tuple].to_vec(),
+    };
+
+    alloc_heap_value(
+        vm,
+        TupleObject::from_vec(values),
+        "iterator reduce result tuple",
+    )
+    .map_err(runtime_error_to_builtin_error)
 }
 
 #[inline]
@@ -3109,12 +3267,24 @@ fn property_copy(
     deleter_override: Option<Value>,
 ) -> Result<Value, BuiltinError> {
     let descriptor = expect_property_receiver(receiver, method_name)?;
-    Ok(to_object_value(PropertyDescriptor::new_full(
-        select_property_accessor(descriptor.getter(), getter_override),
-        select_property_accessor(descriptor.setter(), setter_override),
-        select_property_accessor(descriptor.deleter(), deleter_override),
-        descriptor.doc(),
-    )))
+    let getter = select_property_accessor(descriptor.getter(), getter_override);
+    let setter = select_property_accessor(descriptor.setter(), setter_override);
+    let deleter = select_property_accessor(descriptor.deleter(), deleter_override);
+    let refresh_getter_doc = getter_override.is_some() && descriptor.doc_from_getter();
+    let doc = if refresh_getter_doc {
+        getter.and_then(crate::builtins::property_doc_from_accessor)
+    } else {
+        descriptor.doc()
+    };
+    let getter_doc = if refresh_getter_doc {
+        doc.is_some()
+    } else {
+        descriptor.doc_from_getter()
+    };
+
+    Ok(to_object_value(
+        PropertyDescriptor::new_full_with_doc_source(getter, setter, deleter, doc, getter_doc),
+    ))
 }
 
 #[inline]
@@ -3124,7 +3294,8 @@ fn select_property_accessor(
 ) -> Option<Value> {
     match override_value {
         Some(value) if !value.is_none() => Some(value),
-        Some(_) | None => current,
+        Some(_) => None,
+        None => current,
     }
 }
 
@@ -3178,6 +3349,18 @@ fn property_setter(args: &[Value]) -> Result<Value, BuiltinError> {
 fn property_deleter(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("property", "deleter", args, 1)?;
     property_copy(args[0], "deleter", None, None, Some(args[1]))
+}
+
+#[inline]
+fn property_set_name(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "__set_name__() takes 2 positional arguments but {} were given",
+            args.len().saturating_sub(1)
+        )));
+    }
+    expect_property_receiver(args[0], "__set_name__")?;
+    Ok(Value::none())
 }
 
 #[inline]

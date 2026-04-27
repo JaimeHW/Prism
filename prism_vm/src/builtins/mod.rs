@@ -268,9 +268,9 @@ impl BuiltinRegistry {
         registry.register_function_vm("iter", itertools::builtin_iter_vm);
         registry.register_function_vm("next", itertools::builtin_next_vm);
         registry.register_function_vm("enumerate", itertools::builtin_enumerate_vm);
-        registry.register_function("zip", itertools::builtin_zip);
-        registry.register_function("map", itertools::builtin_map);
-        registry.register_function("filter", itertools::builtin_filter);
+        registry.register_function_vm("zip", itertools::builtin_zip_vm);
+        registry.register_function_vm("map", itertools::builtin_map_vm);
+        registry.register_function_vm("filter", itertools::builtin_filter_vm);
         registry.register_function("reversed", itertools::builtin_reversed);
         registry.register_function_vm("sorted", itertools::builtin_sorted_vm);
         registry.register_function_vm("all", itertools::builtin_all_vm);

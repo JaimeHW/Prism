@@ -76,15 +76,22 @@ pub struct GenericAliasObject {
     header: ObjectHeader,
     origin: Value,
     args: Box<[Value]>,
+    starred: bool,
 }
 
 impl GenericAliasObject {
     #[inline]
     pub fn new(origin: Value, args: Vec<Value>) -> Self {
+        Self::new_with_starred(origin, args, false)
+    }
+
+    #[inline]
+    pub fn new_with_starred(origin: Value, args: Vec<Value>, starred: bool) -> Self {
         Self {
             header: ObjectHeader::new(TypeId::GENERIC_ALIAS),
             origin,
             args: args.into_boxed_slice(),
+            starred,
         }
     }
 
@@ -96,6 +103,11 @@ impl GenericAliasObject {
     #[inline]
     pub fn args(&self) -> &[Value] {
         &self.args
+    }
+
+    #[inline]
+    pub fn is_starred(&self) -> bool {
+        self.starred
     }
 }
 

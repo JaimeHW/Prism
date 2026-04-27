@@ -4,8 +4,8 @@ use crate::VirtualMachine;
 use crate::builtins::{iterator_to_value, try_length_hint, value_to_iterator};
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
+use crate::ops::comparison::eq_result;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
-use crate::ops::protocols::invoke_bound_method_with_operand;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::GeneratorObject;
 use prism_core::Value;
@@ -101,6 +101,68 @@ pub(crate) fn next_step(
                             IterStep::Exhausted => Ok(None),
                         }
                     },
+                    &mut |callable, self_arg, index| {
+                        let Some(index_value) = Value::int(index) else {
+                            return Err(RuntimeError::overflow_error(
+                                "sequence iterator index overflow",
+                            ));
+                        };
+
+                        let vm = &mut *vm_cell.borrow_mut();
+                        let caller_exception_context = vm.capture_exception_context();
+                        let result = if let Some(self_arg) = self_arg {
+                            let call_args = [self_arg, index_value];
+                            invoke_callable_value(vm, callable, &call_args)
+                        } else {
+                            let call_args = [index_value];
+                            invoke_callable_value(vm, callable, &call_args)
+                        };
+
+                        match result {
+                            Ok(value) => Ok(Some(value)),
+                            Err(err)
+                                if runtime_error_matches_exception(
+                                    vm,
+                                    &err,
+                                    ExceptionTypeId::IndexError,
+                                ) || runtime_error_matches_exception(
+                                    vm,
+                                    &err,
+                                    ExceptionTypeId::StopIteration,
+                                ) =>
+                            {
+                                vm.restore_exception_context(caller_exception_context);
+                                Ok(None)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    },
+                    &mut |callable, sentinel| {
+                        let vm = &mut *vm_cell.borrow_mut();
+                        let caller_exception_context = vm.capture_exception_context();
+                        let result = invoke_callable_value(vm, callable, &[]);
+
+                        match result {
+                            Ok(value) => {
+                                if eq_result(vm, value, sentinel)? {
+                                    Ok(None)
+                                } else {
+                                    Ok(Some(value))
+                                }
+                            }
+                            Err(err)
+                                if runtime_error_matches_exception(
+                                    vm,
+                                    &err,
+                                    ExceptionTypeId::StopIteration,
+                                ) =>
+                            {
+                                vm.restore_exception_context(caller_exception_context);
+                                Ok(None)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    },
                 )? {
                     Some(value) => IterStep::Yielded(value),
                     None => IterStep::Exhausted,
@@ -194,33 +256,9 @@ fn iterator_from_sequence_getitem(
         return Ok(None);
     }
 
-    let mut values = Vec::new();
-    let mut index = 0_i64;
-    let caller_exception_context = vm.capture_exception_context();
-
-    loop {
-        let index_value = Value::int(index)
-            .ok_or_else(|| RuntimeError::value_error("sequence index overflow"))?;
-        match invoke_bound_method_with_operand(vm, bound, index_value) {
-            Ok(item) => values.push(item),
-            Err(err) if runtime_error_matches_exception(vm, &err, ExceptionTypeId::IndexError) => {
-                vm.restore_exception_context(caller_exception_context);
-                break;
-            }
-            Err(err)
-                if runtime_error_matches_exception(vm, &err, ExceptionTypeId::StopIteration) =>
-            {
-                vm.restore_exception_context(caller_exception_context);
-                break;
-            }
-            Err(err) => return Err(err),
-        }
-        index = index
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::value_error("sequence index overflow"))?;
-    }
-
-    Ok(Some(iterator_to_value(IteratorObject::from_values(values))))
+    Ok(Some(iterator_to_value(
+        IteratorObject::from_sequence_getitem(bound.callable, bound.implicit_self),
+    )))
 }
 
 fn supports_next_protocol(value: Value) -> bool {

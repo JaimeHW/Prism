@@ -4,6 +4,7 @@
 //! and implements the Python iteration protocol.
 
 use crate::object::type_obj::TypeId;
+use crate::object::views::GenericAliasObject;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::bytes::BytesObject;
 use crate::types::list::{ListObject, value_as_list_ref};
@@ -25,6 +26,48 @@ pub type IteratorLenGuard = fn(Value) -> Option<usize>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IteratorAdvanceError {
     message: &'static str,
+}
+
+/// Reducer state for Python iterator pickling.
+///
+/// The VM owns object allocation and builtin lookup, so the runtime exposes a
+/// compact description instead of manufacturing Python tuples directly.
+#[derive(Debug, Clone)]
+pub enum IteratorReduction {
+    /// Reconstruct as `iter()` with no arguments, producing an empty iterator.
+    Empty,
+    /// Reconstruct as `iter(empty_iterable)` for exhausted iterator types whose
+    /// CPython reducers preserve an empty source container.
+    EmptyIterable(IteratorEmptyIterable),
+    /// Reconstruct as `iter(iterable)` and optionally restore an index with
+    /// `__setstate__`.
+    Iterable {
+        iterable: Value,
+        state: Option<i64>,
+    },
+    /// Reconstruct as `reversed(iterable)` and optionally restore a reverse
+    /// iterator index with `__setstate__`.
+    ReversedIterable {
+        iterable: Value,
+        state: Option<i64>,
+    },
+    /// Reconstruct as `iter(callable, sentinel)`.
+    CallSentinel { callable: Value, sentinel: Value },
+    /// Reconstruct from a snapshot list of remaining values.
+    RemainingValues(Vec<Value>),
+    /// This iterator needs VM-side calls to snapshot safely.
+    RequiresVm(&'static str),
+}
+
+/// Empty iterable payloads used by CPython-compatible iterator reducers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IteratorEmptyIterable {
+    /// Empty tuple `()`.
+    Tuple,
+    /// Empty list `[]`.
+    List,
+    /// Empty string `""`.
+    String,
 }
 
 impl IteratorAdvanceError {
@@ -161,6 +204,31 @@ enum IterKind {
     /// directly; generators and protocol-based iterators are advanced through
     /// the VM-aware `next_with` path.
     SharedIterator { iterator: Value },
+
+    /// Lazy iterator over an object that supports the legacy sequence protocol.
+    ///
+    /// This mirrors CPython's `PySeqIterObject`: each advance calls the cached
+    /// `__getitem__` callable with the current non-negative index and treats
+    /// `IndexError` as exhaustion. Keeping this lazy is essential for unbounded
+    /// sequences such as objects whose `__getitem__` returns the index.
+    SequenceGetItem {
+        callable: Value,
+        self_arg: Option<Value>,
+        index: i64,
+    },
+
+    /// Iterator returned by `iter(callable, sentinel)`.
+    ///
+    /// Each step invokes the zero-argument callable and stops when the result
+    /// compares equal to the sentinel. The VM provides the call/equality hook
+    /// so Python exceptions and rich comparison semantics are preserved.
+    CallSentinel { callable: Value, sentinel: Value },
+
+    /// One-shot iterator over a `types.GenericAlias`.
+    ///
+    /// CPython exposes this for starred typing unpacking: `iter(tuple[int])`
+    /// yields a starred alias once, then reduces as `iter(())` after exhaustion.
+    GenericAlias { alias: Value, yielded: bool },
 
     /// Empty iterator.
     Empty,
@@ -355,6 +423,30 @@ fn bytes_from_value(value: Value) -> &'static BytesObject {
 }
 
 #[inline(always)]
+fn generic_alias_from_value(value: Value) -> &'static GenericAliasObject {
+    object_ref(value, TypeId::GENERIC_ALIAS)
+}
+
+#[inline]
+fn create_starred_generic_alias(alias: Value) -> Value {
+    let alias = generic_alias_from_value(alias);
+    let object = GenericAliasObject::new_with_starred(alias.origin(), alias.args().to_vec(), true);
+    let ptr = Box::leak(Box::new(object)) as *mut GenericAliasObject as *const ();
+    Value::object_ptr(ptr)
+}
+
+#[inline]
+fn byte_offset_for_char_index(text: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_offset, _)| byte_offset)
+}
+
+#[inline(always)]
 fn iterator_from_value(value: Value) -> &'static IteratorObject {
     object_ref(value, TypeId::ITERATOR)
 }
@@ -449,12 +541,10 @@ impl IteratorObject {
     /// Create an iterator over a list.
     #[inline]
     pub fn from_list(list: Value) -> Self {
-        let list_ref = list_from_value(list);
-        let exhausted = list_ref.is_empty();
         Self {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::List { list, index: 0 },
-            exhausted,
+            exhausted: false,
         }
     }
 
@@ -542,6 +632,43 @@ impl IteratorObject {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::SharedIterator { iterator },
             exhausted,
+        }
+    }
+
+    /// Create a lazy iterator from a bound `__getitem__` target.
+    #[inline]
+    pub fn from_sequence_getitem(callable: Value, self_arg: Option<Value>) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::SequenceGetItem {
+                callable,
+                self_arg,
+                index: 0,
+            },
+            exhausted: false,
+        }
+    }
+
+    /// Create an iterator for `iter(callable, sentinel)`.
+    #[inline]
+    pub fn from_call_sentinel(callable: Value, sentinel: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::CallSentinel { callable, sentinel },
+            exhausted: false,
+        }
+    }
+
+    /// Create the one-shot iterator returned by `types.GenericAlias.__iter__`.
+    #[inline]
+    pub fn from_generic_alias(alias: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::GenericAlias {
+                alias,
+                yielded: false,
+            },
+            exhausted: false,
         }
     }
 
@@ -750,6 +877,285 @@ impl IteratorObject {
         self.exhausted
     }
 
+    /// Return the builtin constructor name used by this iterator's reducer.
+    #[inline]
+    pub fn reduction_builtin_name(&self) -> &'static str {
+        match self.kind {
+            IterKind::ReversedList { .. } => "reversed",
+            _ => "iter",
+        }
+    }
+
+    /// Restore an iterator position from a Python `__setstate__` index.
+    ///
+    /// Negative states clamp to zero, matching CPython iterator behavior. For
+    /// finite native iterators, states beyond the available length exhaust the
+    /// iterator. For lazy sequence iterators the next `__getitem__` decides
+    /// whether the index is in range.
+    pub fn set_state(&mut self, state: i64) {
+        let raw_state = state;
+        let state = raw_state.max(0);
+        let usize_state = usize::try_from(state).unwrap_or(usize::MAX);
+        self.exhausted = false;
+
+        match &mut self.kind {
+            IterKind::List { list, index } => {
+                let len = list_from_value(*list).len();
+                *index = usize_state.min(len);
+            }
+            IterKind::Tuple { tuple, index } => {
+                let len = tuple_from_value(*tuple).len();
+                *index = usize_state.min(len);
+                self.exhausted = *index >= len;
+            }
+            IterKind::StringChars {
+                string,
+                byte_offset,
+            } => {
+                let string = string_from_value(*string);
+                let text = string.as_str();
+                *byte_offset = byte_offset_for_char_index(text, usize_state);
+                self.exhausted = *byte_offset >= text.len();
+            }
+            IterKind::Bytes { bytes, index } => {
+                let len = bytes_from_value(*bytes).len();
+                *index = usize_state.min(len);
+                self.exhausted = *index >= len;
+            }
+            IterKind::Values { values, index }
+            | IterKind::DictKeys {
+                keys: values,
+                index,
+            }
+            | IterKind::DictValues { values, index }
+            | IterKind::SetIter { values, index } => {
+                *index = usize_state.min(values.len());
+                self.exhausted = *index >= values.len();
+            }
+            IterKind::GuardedValues { values, index, .. } => {
+                *index = usize_state.min(values.len());
+                self.exhausted = *index >= values.len();
+            }
+            IterKind::DictItems { items, index } => {
+                *index = usize_state.min(items.len());
+                self.exhausted = *index >= items.len();
+            }
+            IterKind::SharedIterator { iterator } => {
+                if let Some(iter) = native_iterator_from_value_mut(*iterator) {
+                    iter.set_state(state);
+                    self.exhausted = iter.is_exhausted();
+                }
+            }
+            IterKind::SequenceGetItem { index, .. } => {
+                *index = state;
+            }
+            IterKind::CallSentinel { .. } => {}
+            IterKind::GenericAlias { yielded, .. } => {
+                *yielded = state > 0;
+                self.exhausted = *yielded;
+            }
+            IterKind::ReversedList {
+                list,
+                reverse_index,
+            } => {
+                let len = list_from_value(*list).len();
+                if raw_state < 0 || len == 0 {
+                    *reverse_index = 0;
+                    self.exhausted = true;
+                } else {
+                    let index = usize::try_from(raw_state)
+                        .unwrap_or(usize::MAX)
+                        .min(len - 1);
+                    *reverse_index = index + 1;
+                }
+            }
+            IterKind::Empty => {
+                self.exhausted = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Return reducer state for `iterator.__reduce__`.
+    ///
+    /// This mirrors CPython's approach: live sequence iterators keep the
+    /// original iterable plus an index, callable-sentinel iterators preserve
+    /// their callable/sentinel pair, and snapshot-style iterators fall back to
+    /// a compact list of remaining values without mutating the iterator.
+    pub fn reduction_state(&self) -> Result<IteratorReduction, IteratorAdvanceError> {
+        match &self.kind {
+            IterKind::Range(iter) => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::RemainingValues(Vec::new()));
+                }
+                Ok(IteratorReduction::RemainingValues(
+                    iter.clone().collect::<Vec<_>>(),
+                ))
+            }
+            IterKind::Count { .. } | IterKind::Repeat { remaining: None, .. } => Ok(
+                IteratorReduction::RequiresVm("infinite iterator cannot be snapshotted"),
+            ),
+            IterKind::Repeat {
+                value,
+                remaining: Some(count),
+            } => Ok(IteratorReduction::RemainingValues(vec![*value; *count])),
+            IterKind::List { list, index } => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::List));
+                }
+                Ok(IteratorReduction::Iterable {
+                    iterable: *list,
+                    state: Some(i64::try_from(*index).unwrap_or(i64::MAX)),
+                })
+            }
+            IterKind::Tuple { tuple, index } => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                }
+                Ok(IteratorReduction::Iterable {
+                    iterable: *tuple,
+                    state: Some(i64::try_from(*index).unwrap_or(i64::MAX)),
+                })
+            }
+            IterKind::StringChars {
+                string,
+                byte_offset,
+            } => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::String));
+                }
+                let string_ref = string_from_value(*string);
+                let text = string_ref.as_str();
+                let char_index = text[..(*byte_offset).min(text.len())].chars().count();
+                Ok(IteratorReduction::Iterable {
+                    iterable: *string,
+                    state: Some(i64::try_from(char_index).unwrap_or(i64::MAX)),
+                })
+            }
+            IterKind::Bytes { bytes, index } => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                }
+                Ok(IteratorReduction::Iterable {
+                    iterable: *bytes,
+                    state: Some(i64::try_from(*index).unwrap_or(i64::MAX)),
+                })
+            }
+            IterKind::Values { values, index } => Ok(IteratorReduction::RemainingValues(
+                values.iter().skip(*index).copied().collect(),
+            )),
+            IterKind::GuardedValues {
+                owner,
+                expected_len,
+                len_guard,
+                mutation_message,
+                values,
+                index,
+            } => {
+                if len_guard(*owner) != Some(*expected_len) {
+                    return Err(IteratorAdvanceError::mutated(mutation_message));
+                }
+                Ok(IteratorReduction::RemainingValues(
+                    values.iter().skip(*index).copied().collect(),
+                ))
+            }
+            IterKind::SharedIterator { iterator } => match native_iterator_from_value(*iterator) {
+                Some(iter) => iter.reduction_state(),
+                None => Ok(IteratorReduction::RequiresVm(
+                    "protocol iterator cannot be snapshotted without VM context",
+                )),
+            },
+            IterKind::SequenceGetItem { self_arg, index, .. } => match self_arg {
+                _ if self.exhausted => Ok(IteratorReduction::EmptyIterable(
+                    IteratorEmptyIterable::Tuple,
+                )),
+                Some(iterable) => Ok(IteratorReduction::Iterable {
+                    iterable: *iterable,
+                    state: Some(*index),
+                }),
+                None => Ok(IteratorReduction::RequiresVm(
+                    "unbound sequence iterator cannot be reduced",
+                )),
+            },
+            IterKind::CallSentinel { callable, sentinel } => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                }
+                Ok(IteratorReduction::CallSentinel {
+                    callable: *callable,
+                    sentinel: *sentinel,
+                })
+            }
+            IterKind::GenericAlias { alias, yielded } => {
+                if self.exhausted || *yielded {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                }
+                Ok(IteratorReduction::Iterable {
+                    iterable: *alias,
+                    state: None,
+                })
+            }
+            IterKind::Empty => Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple)),
+            IterKind::Chain { .. }
+            | IterKind::Enumerate { .. }
+            | IterKind::Zip { .. }
+            | IterKind::Map { .. }
+            | IterKind::Filter { .. }
+            | IterKind::ISlice { .. } => Ok(IteratorReduction::RequiresVm(
+                "composite iterator requires VM context to reduce",
+            )),
+            IterKind::Reversed {
+                values,
+                reverse_index,
+            } => Ok(IteratorReduction::RemainingValues(
+                values.iter().take(*reverse_index).rev().copied().collect(),
+            )),
+            IterKind::ReversedList {
+                list,
+                reverse_index,
+            } => {
+                if self.exhausted {
+                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::List));
+                }
+                Ok(IteratorReduction::ReversedIterable {
+                    iterable: *list,
+                    state: Some(i64::try_from(*reverse_index).unwrap_or(i64::MAX) - 1),
+                })
+            }
+            IterKind::GuardedReversedValues {
+                owner,
+                expected_len,
+                len_guard,
+                mutation_message,
+                values,
+                reverse_index,
+            } => {
+                if len_guard(*owner) != Some(*expected_len) {
+                    return Err(IteratorAdvanceError::mutated(mutation_message));
+                }
+                Ok(IteratorReduction::RemainingValues(
+                    values.iter().take(*reverse_index).rev().copied().collect(),
+                ))
+            }
+            IterKind::DictKeys { keys, index } => Ok(IteratorReduction::RemainingValues(
+                keys.iter().skip(*index).copied().collect(),
+            )),
+            IterKind::DictValues { values, index } => Ok(IteratorReduction::RemainingValues(
+                values.iter().skip(*index).copied().collect(),
+            )),
+            IterKind::DictItems { items, index } => Ok(IteratorReduction::RemainingValues(
+                items
+                    .iter()
+                    .skip(*index)
+                    .map(|&(key, value)| create_tuple_pair_values(key, value))
+                    .collect(),
+            )),
+            IterKind::SetIter { values, index } => Ok(IteratorReduction::RemainingValues(
+                values.iter().skip(*index).copied().collect(),
+            )),
+        }
+    }
+
     /// Create a chain iterator over a sequence of iterators.
     #[inline]
     pub fn chain(iterators: Vec<IteratorObject>) -> Self {
@@ -918,6 +1324,28 @@ impl IteratorObject {
                         self.exhausted = true;
                         None
                     }
+                }
+            }
+
+            IterKind::SequenceGetItem { .. } => {
+                return Err(IteratorAdvanceError::mutated(
+                    "sequence iterator requires VM context",
+                ));
+            }
+
+            IterKind::CallSentinel { .. } => {
+                return Err(IteratorAdvanceError::mutated(
+                    "callable iterator requires VM context",
+                ));
+            }
+
+            IterKind::GenericAlias { alias, yielded } => {
+                if *yielded {
+                    self.exhausted = true;
+                    None
+                } else {
+                    *yielded = true;
+                    Some(create_starred_generic_alias(*alias))
                 }
             }
 
@@ -1207,6 +1635,8 @@ impl IteratorObject {
             IterKind::SharedIterator { iterator } => {
                 native_iterator_from_value(*iterator).and_then(IteratorObject::size_hint)
             }
+            IterKind::SequenceGetItem { .. } | IterKind::CallSentinel { .. } => None,
+            IterKind::GenericAlias { yielded, .. } => Some(usize::from(!*yielded)),
             IterKind::Empty => Some(0),
 
             // Composite iterators
@@ -1282,17 +1712,21 @@ impl IteratorObject {
     ///
     /// This is required for iterators such as `map` and `filter` whose
     /// semantics depend on evaluating Python callables while iterating.
-    pub fn next_with<E, F, T, N>(
+    pub fn next_with<E, F, T, N, S, C>(
         &mut self,
         invoke: &mut F,
         is_truthy: &mut T,
         advance_iterator: &mut N,
+        advance_sequence: &mut S,
+        advance_call_sentinel: &mut C,
     ) -> Result<Option<Value>, E>
     where
         E: From<IteratorAdvanceError>,
         F: FnMut(Value, &[Value]) -> Result<Value, E>,
         T: FnMut(Value) -> Result<bool, E>,
         N: FnMut(Value) -> Result<Option<Value>, E>,
+        S: FnMut(Value, Option<Value>, i64) -> Result<Option<Value>, E>,
+        C: FnMut(Value, Value) -> Result<Option<Value>, E>,
     {
         if self.exhausted {
             return Ok(None);
@@ -1301,7 +1735,13 @@ impl IteratorObject {
         match &mut self.kind {
             IterKind::SharedIterator { iterator } => {
                 let next = if let Some(iter) = native_iterator_from_value_mut(*iterator) {
-                    let next = iter.next_with(invoke, is_truthy, advance_iterator)?;
+                    let next = iter.next_with(
+                        invoke,
+                        is_truthy,
+                        advance_iterator,
+                        advance_sequence,
+                        advance_call_sentinel,
+                    )?;
                     self.exhausted = iter.is_exhausted();
                     next
                 } else {
@@ -1311,8 +1751,52 @@ impl IteratorObject {
                 };
                 return Ok(next);
             }
+            IterKind::SequenceGetItem {
+                callable,
+                self_arg,
+                index,
+            } => {
+                return match advance_sequence(*callable, *self_arg, *index)? {
+                    Some(value) => {
+                        if let Some(next_index) = index.checked_add(1) {
+                            *index = next_index;
+                        } else {
+                            self.exhausted = true;
+                        }
+                        Ok(Some(value))
+                    }
+                    None => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                };
+            }
+            IterKind::CallSentinel { callable, sentinel } => {
+                return match advance_call_sentinel(*callable, *sentinel)? {
+                    Some(value) if !self.exhausted => Ok(Some(value)),
+                    Some(_) | None => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                };
+            }
+            IterKind::GenericAlias { alias, yielded } => {
+                return if *yielded {
+                    self.exhausted = true;
+                    Ok(None)
+                } else {
+                    *yielded = true;
+                    Ok(Some(create_starred_generic_alias(*alias)))
+                };
+            }
             IterKind::Map { func, inner } => {
-                return match inner.next_with(invoke, is_truthy, advance_iterator)? {
+                return match inner.next_with(
+                    invoke,
+                    is_truthy,
+                    advance_iterator,
+                    advance_sequence,
+                    advance_call_sentinel,
+                )? {
                     Some(value) => invoke(*func, &[value]).map(Some),
                     None => {
                         self.exhausted = true;
@@ -1321,7 +1805,13 @@ impl IteratorObject {
                 };
             }
             IterKind::Enumerate { inner, index } => {
-                return match inner.next_with(invoke, is_truthy, advance_iterator)? {
+                return match inner.next_with(
+                    invoke,
+                    is_truthy,
+                    advance_iterator,
+                    advance_sequence,
+                    advance_call_sentinel,
+                )? {
                     Some(value) => {
                         let current_index = *index;
                         *index += 1;
@@ -1333,8 +1823,39 @@ impl IteratorObject {
                     }
                 };
             }
+            IterKind::Zip { iterators } => {
+                if iterators.is_empty() {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                let mut values = Vec::with_capacity(iterators.len());
+                for iter in iterators.iter_mut() {
+                    match iter.next_with(
+                        invoke,
+                        is_truthy,
+                        advance_iterator,
+                        advance_sequence,
+                        advance_call_sentinel,
+                    )? {
+                        Some(value) => values.push(value),
+                        None => {
+                            self.exhausted = true;
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                return Ok(Some(create_tuple_from_values(values)));
+            }
             IterKind::Filter { func, inner } => loop {
-                match inner.next_with(invoke, is_truthy, advance_iterator)? {
+                match inner.next_with(
+                    invoke,
+                    is_truthy,
+                    advance_iterator,
+                    advance_sequence,
+                    advance_call_sentinel,
+                )? {
                     Some(value) => {
                         let keep = if let Some(predicate) = *func {
                             let predicate_result = invoke(predicate, &[value])?;
@@ -1355,7 +1876,13 @@ impl IteratorObject {
             },
             IterKind::Chain { iterators, current } => {
                 while *current < iterators.len() {
-                    match iterators[*current].next_with(invoke, is_truthy, advance_iterator)? {
+                    match iterators[*current].next_with(
+                        invoke,
+                        is_truthy,
+                        advance_iterator,
+                        advance_sequence,
+                        advance_call_sentinel,
+                    )? {
                         Some(value) => return Ok(Some(value)),
                         None => *current += 1,
                     }
@@ -1378,7 +1905,13 @@ impl IteratorObject {
 
                 while *pos < *next_yield {
                     if inner
-                        .next_with(invoke, is_truthy, advance_iterator)?
+                        .next_with(
+                            invoke,
+                            is_truthy,
+                            advance_iterator,
+                            advance_sequence,
+                            advance_call_sentinel,
+                        )?
                         .is_none()
                     {
                         self.exhausted = true;
@@ -1387,7 +1920,13 @@ impl IteratorObject {
                     *pos += 1;
                 }
 
-                return match inner.next_with(invoke, is_truthy, advance_iterator)? {
+                return match inner.next_with(
+                    invoke,
+                    is_truthy,
+                    advance_iterator,
+                    advance_sequence,
+                    advance_call_sentinel,
+                )? {
                     Some(value) => {
                         *pos += 1;
                         *next_yield = next_yield.saturating_add(*step);
@@ -1419,6 +1958,9 @@ impl fmt::Debug for IteratorObject {
             IterKind::Values { .. } => "iterator",
             IterKind::GuardedValues { .. } => "iterator",
             IterKind::SharedIterator { .. } => "iterator",
+            IterKind::SequenceGetItem { .. } => "iterator",
+            IterKind::CallSentinel { .. } => "callable_iterator",
+            IterKind::GenericAlias { .. } => "generic_alias_iterator",
             IterKind::Empty => "empty_iterator",
             // Composite iterators
             IterKind::Chain { .. } => "chain",

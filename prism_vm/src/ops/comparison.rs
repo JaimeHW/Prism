@@ -589,7 +589,9 @@ fn contains_match(
         return Ok(true);
     }
 
-    eq_result(vm, needle, candidate)
+    // Membership compares each element against the searched value
+    // (`candidate == needle`), which matters for asymmetric __eq__ methods.
+    eq_result(vm, candidate, needle)
 }
 
 // =============================================================================
