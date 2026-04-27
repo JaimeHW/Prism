@@ -252,6 +252,10 @@ const OBJECT_TYPE_ATTRS: &[AttrSpec] = &[
         name: "__init_subclass__",
         kind: ReflectedValueKind::ClassMethodDescriptor,
     },
+    AttrSpec {
+        name: "__subclasshook__",
+        kind: ReflectedValueKind::ClassMethodDescriptor,
+    },
 ];
 
 const INT_TYPE_ATTRS: &[AttrSpec] = &[
@@ -1049,6 +1053,13 @@ fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
         (TypeId::OBJECT, "__init_subclass__") => {
             Some(builtin_method_value(&OBJECT_INIT_SUBCLASS_METHOD))
         }
+        (TypeId::OBJECT, "__subclasshook__") => {
+            crate::ops::method_dispatch::resolve_builtin_instance_method(
+                TypeId::OBJECT,
+                "__subclasshook__",
+            )
+            .map(|cached| cached.method)
+        }
         _ => None,
     }
 }
@@ -1065,6 +1076,13 @@ fn builtin_type_class_method_value(owner: TypeId, name: &str) -> Option<Value> {
         (TypeId::BOOL, "from_bytes") => Some(builtin_method_value(&BOOL_FROM_BYTES_METHOD)),
         (TypeId::OBJECT, "__init_subclass__") => {
             Some(builtin_method_value(&OBJECT_INIT_SUBCLASS_METHOD))
+        }
+        (TypeId::OBJECT, "__subclasshook__") => {
+            crate::ops::method_dispatch::resolve_builtin_instance_method(
+                TypeId::OBJECT,
+                "__subclasshook__",
+            )
+            .map(|cached| cached.method)
         }
         _ => None,
     }
