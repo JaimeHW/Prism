@@ -11,7 +11,7 @@ use crate::ops::calls::value_supports_call_protocol;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::allocation_context::alloc_static_value;
-use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::class::{ClassFlags, PyClassObject};
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
@@ -287,7 +287,9 @@ fn build_typing_base_class(name: &str) -> Arc<PyClassObject> {
     register_typing_class(class)
 }
 
-fn register_typing_class(class: PyClassObject) -> Arc<PyClassObject> {
+fn register_typing_class(mut class: PyClassObject) -> Arc<PyClassObject> {
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
+
     let mut bitmap = SubclassBitmap::new();
     for &class_id in class.mro() {
         bitmap.set_bit(class_id_to_type_id(class_id));
