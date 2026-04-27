@@ -6,6 +6,7 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::protocols::binary_special_method;
 use crate::python_numeric::int_like_value;
 use crate::stdlib::collections::deque::DequeObject;
 use num_bigint::{BigInt, Sign};
@@ -342,6 +343,52 @@ pub fn builtin_abs(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::TypeError(
         "bad operand type for abs(): expected number".to_string(),
     ))
+}
+
+/// VM-aware abs implementation that honors `__abs__`.
+pub fn builtin_abs_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "abs() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let arg = args[0];
+    if let Some(i) = int_like_value(arg) {
+        return if i >= 0 {
+            Value::int(i).ok_or_else(|| {
+                BuiltinError::OverflowError("integer absolute value overflow".to_string())
+            })
+        } else {
+            i.checked_neg()
+                .and_then(Value::int)
+                .or_else(|| Some(bigint_to_value(BigInt::from(i).abs())))
+                .ok_or_else(|| {
+                    BuiltinError::OverflowError("integer absolute value overflow".to_string())
+                })
+        };
+    }
+
+    if let Some(integer) = value_to_bigint(arg) {
+        return Ok(bigint_to_value(integer.abs()));
+    }
+
+    if let Some(f) = arg.as_float() {
+        return Ok(Value::float(f.abs()));
+    }
+
+    let target = match resolve_special_method(arg, "__abs__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(BuiltinError::TypeError(
+                "bad operand type for abs(): expected number".to_string(),
+            ));
+        }
+        Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
+    };
+
+    invoke_zero_arg_bound_method(vm, target).map_err(super::runtime_error_to_builtin_error)
 }
 
 // =============================================================================
@@ -1365,6 +1412,36 @@ pub fn builtin_divmod(args: &[Value]) -> Result<Value, BuiltinError> {
     let quotient = (a / b).floor();
     let remainder = a - quotient * b;
     return Ok(make_tuple2(Value::float(quotient), Value::float(remainder)));
+}
+
+/// VM-aware divmod implementation that honors `__divmod__` and `__rdivmod__`.
+pub fn builtin_divmod_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "divmod expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let left = args[0];
+    let right = args[1];
+    if !is_native_divmod_operand(left) || !is_native_divmod_operand(right) {
+        match binary_special_method(vm, left, right, "__divmod__", "__rdivmod__") {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => {}
+            Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
+        }
+    }
+
+    builtin_divmod(args)
+}
+
+#[inline]
+fn is_native_divmod_operand(value: Value) -> bool {
+    value.as_float().is_some()
+        || value.as_int().is_some()
+        || value.as_bool().is_some()
+        || value_to_bigint(value).is_some()
 }
 
 #[inline]

@@ -222,13 +222,13 @@ impl BuiltinRegistry {
 
         // Register core functions
         registry.register_function_vm("len", functions::builtin_len_vm);
-        registry.register_function("abs", functions::builtin_abs);
+        registry.register_function_vm("abs", functions::builtin_abs_vm);
         registry.register_function_vm_kw("min", functions::builtin_min_vm_kw);
         registry.register_function_vm_kw("max", functions::builtin_max_vm_kw);
         registry.register_function_vm_kw("sum", functions::builtin_sum_vm_kw);
         registry.register_function_vm("pow", functions::builtin_pow_vm);
         registry.register_function("round", functions::builtin_round);
-        registry.register_function("divmod", functions::builtin_divmod);
+        registry.register_function_vm("divmod", functions::builtin_divmod_vm);
         registry.register_function_vm("hash", functions::builtin_hash_vm);
         registry.register_function("id", functions::builtin_id);
         registry.register_function("callable", functions::builtin_callable);
