@@ -1289,6 +1289,17 @@ fn invoke_bound_method_with_arg(
     .map_err(runtime_error_to_builtin_error)
 }
 
+fn invoke_bound_method_no_args(
+    vm: &mut VirtualMachine,
+    target: &BoundMethodTarget,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(runtime_error_to_builtin_error)
+}
+
 fn mapping_entries_with_vm(
     vm: &mut VirtualMachine,
     source: Value,
@@ -1421,6 +1432,7 @@ pub(crate) fn call_builtin_type_with_vm(
         TypeId::MODULE => builtin_module(args),
         TypeId::BOOL => builtin_bool_vm(vm, args),
         TypeId::FLOAT => builtin_float_vm(vm, args),
+        TypeId::STR => builtin_str_vm(vm, args),
         TypeId::RANGE => super::itertools::builtin_range_vm(vm, args),
         TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm(vm, args),
         TypeId::LIST => {
@@ -1831,7 +1843,7 @@ pub(crate) fn call_builtin_type_kw_with_vm(
         TypeId::TYPE => builtin_type_kw_with_vm(vm, positional, keywords),
         TypeId::PROPERTY => builtin_property_kw(positional, keywords),
         TypeId::DICT => builtin_dict_kw_vm(vm, positional, keywords),
-        TypeId::STR => builtin_str_kw(positional, keywords),
+        TypeId::STR => builtin_str_kw_vm(vm, positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
         TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm_kw(vm, positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
@@ -2019,6 +2031,18 @@ pub(crate) fn property_doc_from_accessor(accessor: Value) -> Option<Value> {
 /// Builtin int constructor.
 /// Builtin str constructor.
 pub fn builtin_str(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_str_impl(None, args)
+}
+
+/// VM-aware str constructor that honors Python-level `__str__` on heap types.
+pub fn builtin_str_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_str_impl(Some(vm), args)
+}
+
+fn builtin_str_impl(
+    vm: Option<&mut VirtualMachine>,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
     if args.is_empty() {
         return Ok(Value::string(intern("")));
     }
@@ -2056,10 +2080,33 @@ pub fn builtin_str(args: &[Value]) -> Result<Value, BuiltinError> {
         }
     }
 
+    if let Some(vm) = vm {
+        if let Some(rendered) = str_protocol_value(vm, value)? {
+            return Ok(rendered);
+        }
+        return super::functions::builtin_repr_vm(vm, &[value]);
+    }
+
     super::functions::builtin_repr(&[value])
 }
 
 fn builtin_str_kw(positional: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    builtin_str_kw_impl(None, positional, keywords)
+}
+
+fn builtin_str_kw_vm(
+    vm: &mut VirtualMachine,
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    builtin_str_kw_impl(Some(vm), positional, keywords)
+}
+
+fn builtin_str_kw_impl(
+    vm: Option<&mut VirtualMachine>,
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
     if positional.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
             "str() takes at most 3 arguments ({} given)",
@@ -2106,7 +2153,61 @@ fn builtin_str_kw(positional: &[Value], keywords: &[(&str, Value)]) -> Result<Va
         );
     }
 
-    builtin_str(&[object])
+    match vm {
+        Some(vm) => builtin_str_vm(vm, &[object]),
+        None => builtin_str(&[object]),
+    }
+}
+
+fn str_protocol_value(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<Value>, BuiltinError> {
+    if !should_use_str_protocol(value) {
+        return Ok(None);
+    }
+
+    let target = match resolve_special_method(value, "__str__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    if bound_method_target_is_builtin(&target, "object.__str__") {
+        return Ok(None);
+    }
+
+    let rendered = invoke_bound_method_no_args(vm, &target)?;
+    if value_as_string_ref(rendered).is_none() {
+        return Err(BuiltinError::TypeError(format!(
+            "__str__ returned non-string (type {})",
+            get_type_name(rendered)
+        )));
+    }
+    Ok(Some(rendered))
+}
+
+#[inline]
+fn should_use_str_protocol(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    crate::ops::objects::extract_type_id(ptr).raw() >= TypeId::FIRST_USER_TYPE
+}
+
+#[inline]
+fn bound_method_target_is_builtin(target: &BoundMethodTarget, name: &str) -> bool {
+    let Some(ptr) = target.callable.as_object_ptr() else {
+        return false;
+    };
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION {
+        return false;
+    }
+
+    let function = unsafe { &*(ptr as *const crate::builtins::BuiltinFunctionObject) };
+    function.name() == name
 }
 
 #[inline]
