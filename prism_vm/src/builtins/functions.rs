@@ -15,7 +15,7 @@ use prism_core::intern::intern;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::object::views::MappingProxyObject;
+use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
@@ -1912,6 +1912,12 @@ impl ReprState {
                 let dict = unsafe { &*(ptr as *const DictObject) };
                 state.repr_dict(dict)
             }),
+            TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => {
+                self.with_container(ptr, "...", |state| {
+                    let view = unsafe { &*(ptr as *const DictViewObject) };
+                    state.repr_dict_view(view)
+                })
+            }
             TypeId::SET => self.with_container(ptr, "{...}", |state| {
                 let set = unsafe { &*(ptr as *const SetObject) };
                 state.repr_set(set)
@@ -2088,6 +2094,48 @@ impl ReprState {
         Ok(out)
     }
 
+    fn repr_dict_view(&mut self, view: &DictViewObject) -> Result<String, BuiltinError> {
+        let (name, entries) = match view.dict().as_object_ptr() {
+            Some(ptr) if crate::ops::objects::extract_type_id(ptr) == TypeId::DICT => {
+                let dict = unsafe { &*(ptr as *const DictObject) };
+                (dict_view_name(view.kind()), dict.iter().collect::<Vec<_>>())
+            }
+            Some(ptr) if crate::ops::objects::extract_type_id(ptr) == TypeId::MAPPING_PROXY => {
+                let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+                let entries = crate::builtins::builtin_mapping_proxy_entries_static(proxy)
+                    .map_err(|err| BuiltinError::Raised(err))?;
+                (dict_view_name(view.kind()), entries)
+            }
+            _ => {
+                return Err(BuiltinError::TypeError(
+                    "invalid dictionary view backing object".to_string(),
+                ));
+            }
+        };
+
+        let mut out = String::with_capacity(name.len() + entries.len().saturating_mul(8) + 3);
+        out.push_str(name);
+        out.push_str("([");
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            match view.kind() {
+                DictViewKind::Keys => out.push_str(&self.repr_value(key)?),
+                DictViewKind::Values => out.push_str(&self.repr_value(value)?),
+                DictViewKind::Items => {
+                    out.push('(');
+                    out.push_str(&self.repr_value(key)?);
+                    out.push_str(", ");
+                    out.push_str(&self.repr_value(value)?);
+                    out.push(')');
+                }
+            }
+        }
+        out.push_str("])");
+        Ok(out)
+    }
+
     fn repr_set(&mut self, set: &SetObject) -> Result<String, BuiltinError> {
         if set.is_empty() {
             return Ok("set()".to_string());
@@ -2104,6 +2152,15 @@ impl ReprState {
         }
         out.push('}');
         Ok(out)
+    }
+}
+
+#[inline]
+fn dict_view_name(kind: DictViewKind) -> &'static str {
+    match kind {
+        DictViewKind::Keys => "dict_keys",
+        DictViewKind::Values => "dict_values",
+        DictViewKind::Items => "dict_items",
     }
 }
 
