@@ -195,6 +195,8 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "select"
         | "weakref"
         | "collections"
+        | "collections.abc"
+        | "copy"
         | "ctypes"
         | "fnmatch"
         | "inspect"
@@ -203,10 +205,13 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "marshal"
         | "binascii"
         | "keyword"
+        | "locale"
         | "operator"
         | "pickle"
         | "test.support"
-        | "test.support.os_helper" => Some(StdlibResolutionPolicy::PreferNative),
+        | "test.support.os_helper"
+        | "textwrap"
+        | "traceback" => Some(StdlibResolutionPolicy::PreferNative),
         "os" | "os.path" | "json" | "functools" | "re" => {
             Some(StdlibResolutionPolicy::PreferSourceWhenAvailable)
         }

@@ -33,6 +33,7 @@
 //! All container types are **not** thread-safe by design (matching Python).
 //! Use external synchronization if concurrent access is needed.
 
+pub mod abc;
 pub mod counter;
 pub mod defaultdict;
 pub mod deque;

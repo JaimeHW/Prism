@@ -38,6 +38,7 @@ pub mod array;
 pub mod atexit;
 pub mod binascii;
 pub mod collections;
+pub mod copy;
 pub mod ctypes;
 pub mod errno;
 pub mod exceptions;
@@ -50,6 +51,7 @@ pub mod io;
 pub mod itertools;
 pub mod json;
 pub mod keyword;
+pub mod locale;
 pub mod marshal;
 pub mod math;
 pub mod msvcrt;
@@ -64,7 +66,9 @@ pub mod select;
 pub mod signal;
 pub mod sys;
 pub mod test_support;
+pub mod textwrap;
 pub mod time;
+pub mod traceback;
 pub mod types;
 pub mod typing;
 pub mod weakref;
@@ -350,6 +354,7 @@ impl StdlibRegistry {
             "ctypes",
             Box::new(ctypes::CtypesModule::new()),
         );
+        Self::insert_module(&mut modules, "copy", Box::new(copy::CopyModule::new()));
 
         Self::insert_module(
             &mut modules,
@@ -432,6 +437,11 @@ impl StdlibRegistry {
             "collections",
             Box::new(collections::CollectionsModule::new()),
         );
+        Self::insert_module(
+            &mut modules,
+            "collections.abc",
+            Box::new(collections::abc::CollectionsAbcModule::new()),
+        );
 
         Self::insert_module(
             &mut modules,
@@ -464,6 +474,11 @@ impl StdlibRegistry {
         );
         Self::insert_module(
             &mut modules,
+            "locale",
+            Box::new(locale::LocaleModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
             "operator",
             Box::new(operator::OperatorModule::new()),
         );
@@ -482,6 +497,16 @@ impl StdlibRegistry {
             &mut modules,
             "test.support.os_helper",
             Box::new(test_support::OsHelperModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "textwrap",
+            Box::new(textwrap::TextwrapModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "traceback",
+            Box::new(traceback::TracebackModule::new()),
         );
 
         Self::insert_module(&mut modules, "io", Box::new(io::IoModule::new()));
