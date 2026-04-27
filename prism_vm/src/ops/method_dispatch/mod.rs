@@ -26,6 +26,7 @@ pub mod method_cache;
 
 use prism_runtime::object::type_obj::TypeId;
 
+pub(crate) use builtin_methods::dict_extend_with_vm_kw;
 pub use call_method::call_method;
 pub use load_method::load_method;
 pub use method_cache::{CachedMethod, MethodCache, method_cache};

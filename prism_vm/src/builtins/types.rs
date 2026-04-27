@@ -3199,7 +3199,69 @@ pub(crate) fn builtin_list_init_vm(
 }
 
 pub(crate) fn builtin_dict_new(args: &[Value]) -> Result<Value, BuiltinError> {
-    builtin_constructor_new(args, TypeId::DICT, "dict", builtin_dict)
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "dict.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+
+    let class_type = class_value_to_type_id(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("dict.__new__(X): X must be a type".to_string()))?;
+
+    if class_type == TypeId::DICT {
+        return Ok(to_object_value(DictObject::new()));
+    }
+
+    if !class_value_is_subtype(args[0], TypeId::DICT) {
+        return Err(BuiltinError::TypeError(
+            "dict.__new__(X): X is not a subtype of dict".to_string(),
+        ));
+    }
+
+    let class_ptr = args[0]
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("dict.__new__(X): X must be a type".to_string()))?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "dict.__new__() for builtin dict subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    Ok(to_object_value(ShapedObject::new_dict_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+    )))
+}
+
+pub(crate) fn builtin_dict_init_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "dict.__init__() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a dict object".to_string())
+    })?;
+    let dict = crate::ops::objects::dict_storage_mut_from_ptr(self_ptr).ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a dict object".to_string())
+    })?;
+
+    dict.clear();
+    crate::ops::method_dispatch::dict_extend_with_vm_kw(
+        vm,
+        args[0],
+        args.get(1).copied(),
+        keywords,
+        "__init__",
+    )?;
+
+    Ok(Value::none())
 }
 
 pub(crate) fn builtin_set_new(args: &[Value]) -> Result<Value, BuiltinError> {

@@ -92,6 +92,15 @@ static LIST_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
         crate::builtins::builtin_list_init_vm,
     )
 });
+static DICT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("dict.__new__"), crate::builtins::builtin_dict_new)
+});
+static DICT_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("dict.__init__"),
+        crate::builtins::builtin_dict_init_vm_kw,
+    )
+});
 static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("int.__new__"),
@@ -520,6 +529,8 @@ fn builtin_instantiation_slot_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::TUPLE, "__new__") => Some(builtin_slot_value(&TUPLE_NEW_SLOT_FUNCTION)),
         (TypeId::LIST, "__new__") => Some(builtin_slot_value(&LIST_NEW_SLOT_FUNCTION)),
         (TypeId::LIST, "__init__") => Some(builtin_slot_value(&LIST_INIT_SLOT_FUNCTION)),
+        (TypeId::DICT, "__new__") => Some(builtin_slot_value(&DICT_NEW_SLOT_FUNCTION)),
+        (TypeId::DICT, "__init__") => Some(builtin_slot_value(&DICT_INIT_SLOT_FUNCTION)),
         (TypeId::INT, "__new__") => Some(builtin_slot_value(&INT_NEW_SLOT_FUNCTION)),
         (TypeId::FLOAT, "__new__") => Some(builtin_slot_value(&FLOAT_NEW_SLOT_FUNCTION)),
         (TypeId::STR, "__new__") => Some(builtin_slot_value(&STR_NEW_SLOT_FUNCTION)),
@@ -894,7 +905,8 @@ fn should_route_keywords_to_init_only(
     has_keywords: bool,
 ) -> bool {
     has_keywords
-        && slot_callable_matches_builtin_name(new_callable, "tuple.__new__")
+        && (slot_callable_matches_builtin_name(new_callable, "tuple.__new__")
+            || slot_callable_matches_builtin_name(new_callable, "dict.__new__"))
         && resolve_instantiation_slot(class, "__init__")
             .is_some_and(|init| !slot_callable_matches_builtin_name(init, "object.__init__"))
 }

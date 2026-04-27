@@ -131,6 +131,12 @@ static LIST_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static DICT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("dict.__new__"), super::types::builtin_dict_new)
 });
+static DICT_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("dict.__init__"),
+        super::types::builtin_dict_init_vm_kw,
+    )
+});
 static SET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("set.__new__"), super::types::builtin_set_new)
 });
@@ -287,6 +293,10 @@ const TUPLE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 const DICT_TYPE_ATTRS: &[AttrSpec] = &[
     NEW_WRAPPER_ATTR,
     AttrSpec {
+        name: "__init__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+    AttrSpec {
         name: "__dict__",
         kind: ReflectedValueKind::DictProxy,
     },
@@ -350,6 +360,7 @@ const LIST_METHOD_NAMES: &[&str] = &[
     "sort",
 ];
 const DICT_METHOD_NAMES: &[&str] = &[
+    "__init__",
     "__len__",
     "__contains__",
     "__getitem__",
@@ -994,6 +1005,7 @@ pub(crate) fn reflected_descriptor_callable_value(
         TypeId::WRAPPER_DESCRIPTOR => match (owner, name.as_str()) {
             (TypeId::OBJECT, "__init__") => Some(builtin_method_value(&OBJECT_INIT_METHOD)),
             (TypeId::TYPE, "__init__") => Some(builtin_method_value(&TYPE_INIT_METHOD)),
+            (TypeId::DICT, "__init__") => Some(builtin_method_value(&DICT_INIT_METHOD)),
             _ => builtin_type_method_value(owner, name.as_str()),
         },
         TypeId::METHOD_DESCRIPTOR => builtin_type_method_value(owner, name.as_str()),

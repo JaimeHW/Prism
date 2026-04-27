@@ -257,6 +257,12 @@ static DICT_ITEMS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.items"), dict_items));
 static DICT_GET_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.get"), dict_get));
+static DICT_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("dict.__init__"),
+        crate::builtins::builtin_dict_init_vm_kw,
+    )
+});
 static DICT_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__len__"), dict_len));
 static DICT_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -627,6 +633,9 @@ pub fn resolve_regex_match_method(name: &str) -> Option<CachedMethod> {
 /// Resolve builtin dict methods backed by static builtin function objects.
 pub fn resolve_dict_method(name: &str) -> Option<CachedMethod> {
     match name {
+        "__init__" => Some(CachedMethod::simple(builtin_method_value(
+            &DICT_INIT_METHOD,
+        ))),
         "__len__" => Some(CachedMethod::simple(builtin_method_value(&DICT_LEN_METHOD))),
         "__contains__" => Some(CachedMethod::simple(builtin_method_value(
             &DICT_CONTAINS_METHOD,
@@ -2117,7 +2126,7 @@ fn dict_update_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
 }
 
 #[inline]
-fn dict_update_with_vm_kw(
+pub(crate) fn dict_update_with_vm_kw(
     vm: &mut VirtualMachine,
     args: &[Value],
     keywords: &[(&str, Value)],
@@ -2134,12 +2143,25 @@ fn dict_update_with_vm_kw(
         return Ok(Value::none());
     }
 
-    let entries = if args.len() == 2 {
-        collect_dict_update_entries(vm, args[1])?
+    dict_extend_with_vm_kw(vm, args[0], args.get(1).copied(), keywords, "update")?;
+
+    Ok(Value::none())
+}
+
+#[inline]
+pub(crate) fn dict_extend_with_vm_kw(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    source: Option<Value>,
+    keywords: &[(&str, Value)],
+    method_name: &'static str,
+) -> Result<(), BuiltinError> {
+    let entries = if let Some(source) = source {
+        collect_dict_update_entries(vm, source)?
     } else {
         Vec::new()
     };
-    let dict = expect_dict_mut(args[0], "update")?;
+    let dict = expect_dict_mut(receiver, method_name)?;
 
     for (key, value) in entries {
         dict_set_item(vm, dict, key, value).map_err(runtime_error_to_builtin_error)?;
@@ -2148,7 +2170,7 @@ fn dict_update_with_vm_kw(
         dict.set(Value::string(intern(name)), value);
     }
 
-    Ok(Value::none())
+    Ok(())
 }
 
 #[inline]
