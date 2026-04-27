@@ -372,11 +372,14 @@ pub fn spec_floor_div_int(a: Value, b: Value) -> (SpecResult, Value) {
         if y == 0 {
             return (SpecResult::Overflow, Value::none()); // Division by zero
         }
+        if x == i64::MIN && y == -1 {
+            return (SpecResult::Deopt, Value::none());
+        }
         let (quotient, _) = i64_floor_divmod(x, y);
         if let Some(v) = Value::int(quotient) {
             return (SpecResult::Success, v);
         }
-        return (SpecResult::Overflow, Value::none());
+        return (SpecResult::Deopt, Value::none());
     }
     (SpecResult::Deopt, Value::none())
 }
@@ -388,11 +391,14 @@ pub fn spec_mod_int(a: Value, b: Value) -> (SpecResult, Value) {
         if y == 0 {
             return (SpecResult::Overflow, Value::none()); // Division by zero
         }
+        if x == i64::MIN && y == -1 {
+            return (SpecResult::Success, Value::int_unchecked(0));
+        }
         let (_, remainder) = i64_floor_divmod(x, y);
         if let Some(v) = Value::int(remainder) {
             return (SpecResult::Success, v);
         }
-        return (SpecResult::Overflow, Value::none());
+        return (SpecResult::Deopt, Value::none());
     }
     (SpecResult::Deopt, Value::none())
 }

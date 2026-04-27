@@ -144,10 +144,7 @@ pub fn floor_div_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
             }
 
             let (quotient, _) = i64_floor_divmod(x, y);
-            frame.set_reg(
-                inst.dst().0,
-                Value::int(quotient).expect("floor division result should fit in i64"),
-            );
+            frame.set_reg(inst.dst().0, python_int_from_i64(quotient));
             ControlFlow::Continue
         }
         _ => match integer_bigint_operands(a, b) {
@@ -178,10 +175,7 @@ pub fn mod_int(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
 
             let (_, remainder) = i64_floor_divmod(x, y);
-            frame.set_reg(
-                inst.dst().0,
-                Value::int(remainder).expect("modulo result should fit in i64"),
-            );
+            frame.set_reg(inst.dst().0, python_int_from_i64(remainder));
             ControlFlow::Continue
         }
         _ => match integer_bigint_operands(a, b) {
@@ -733,6 +727,11 @@ fn i64_floor_divmod(left: i64, right: i64) -> (i64, i64) {
 }
 
 #[inline]
+fn python_int_from_i64(value: i64) -> Value {
+    Value::int(value).unwrap_or_else(|| bigint_to_value(BigInt::from(value)))
+}
+
+#[inline]
 fn try_binary_special_method_result(
     vm: &mut VirtualMachine,
     dst: u8,
@@ -1253,10 +1252,7 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             return ControlFlow::Continue;
         }
         let (quotient, _) = i64_floor_divmod(x, y);
-        frame.set_reg(
-            inst.dst().0,
-            Value::int(quotient).expect("floor division result should fit in i64"),
-        );
+        frame.set_reg(inst.dst().0, python_int_from_i64(quotient));
         return ControlFlow::Continue;
     }
 
@@ -1408,10 +1404,7 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             return ControlFlow::Continue;
         }
         let (_, remainder) = i64_floor_divmod(x, y);
-        frame.set_reg(
-            inst.dst().0,
-            Value::int(remainder).expect("modulo result should fit in i64"),
-        );
+        frame.set_reg(inst.dst().0, python_int_from_i64(remainder));
         return ControlFlow::Continue;
     }
 
