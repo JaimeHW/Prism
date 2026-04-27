@@ -27,7 +27,9 @@ use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::StringObject;
+use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
 use std::cell::RefCell;
 use std::mem;
@@ -90,6 +92,9 @@ pub struct ExceptionValue {
 
     /// Python-visible traceback view attached to the exception.
     pub traceback: Option<Value>,
+
+    /// Lazily allocated instance dictionary for restored/user attributes.
+    dict: Option<Value>,
 
     /// Traceback reference (index into traceback table).
     pub traceback_id: u32,
@@ -162,6 +167,12 @@ static EXCEPTION_WITH_TRACEBACK_METHOD: LazyLock<BuiltinFunctionObject> = LazyLo
     BuiltinFunctionObject::new(
         Arc::from("BaseException.with_traceback"),
         builtin_exception_with_traceback,
+    )
+});
+static EXCEPTION_SETSTATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("BaseException.__setstate__"),
+        builtin_exception_setstate,
     )
 });
 static EXCEPTION_GC_DISPATCH_ONCE: Once = Once::new();
@@ -248,6 +259,7 @@ impl ExceptionValue {
             cause: None,
             context: None,
             traceback: None,
+            dict: None,
             traceback_id: 0,
             _reserved: 0,
         }
@@ -271,6 +283,7 @@ impl ExceptionValue {
             cause: None,
             context: None,
             traceback: None,
+            dict: None,
             traceback_id: 0,
             _reserved: 0,
         }
@@ -451,6 +464,34 @@ impl ExceptionValue {
         Ok(())
     }
 
+    /// Look up an attribute stored in the exception's lazy instance dict.
+    #[inline]
+    pub fn dynamic_attr(&self, name: &InternedString) -> Option<Value> {
+        let dict = dict_ref_from_value(self.dict?)?;
+        dict.get(Value::string(name.clone()))
+    }
+
+    /// Store an attribute in the exception's lazy instance dict.
+    #[inline]
+    pub fn set_dynamic_attr(&mut self, name: InternedString, value: Value) {
+        let dict_value = self.dict_value();
+        if let Some(dict) = dict_mut_from_value(dict_value) {
+            dict.set(Value::string(name), value);
+        }
+    }
+
+    /// Return the exception instance dictionary, allocating it on first write.
+    #[inline]
+    pub fn dict_value(&mut self) -> Value {
+        if let Some(dict) = self.dict {
+            return dict;
+        }
+
+        let dict = crate::alloc_managed_value(DictObject::new());
+        self.dict = Some(dict);
+        dict
+    }
+
     /// Check if this is a subclass of another exception type.
     #[inline]
     pub fn is_subclass_of(&self, base: ExceptionTypeId) -> bool {
@@ -607,6 +648,9 @@ unsafe impl Trace for ExceptionValue {
         if let Some(traceback) = self.traceback {
             tracer.trace_value(traceback);
         }
+        if let Some(dict) = self.dict {
+            tracer.trace_value(dict);
+        }
     }
 
     fn size_of(&self) -> usize {
@@ -714,6 +758,20 @@ fn boxed_tuple_value(items: Vec<Value>) -> Value {
 #[inline]
 fn boxed_string_value(text: &str) -> Value {
     boxed_object_value(StringObject::new(text))
+}
+
+#[inline]
+fn dict_ref_from_value(value: Value) -> Option<&'static DictObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    (header.type_id == TypeId::DICT).then(|| unsafe { &*(ptr as *const DictObject) })
+}
+
+#[inline]
+fn dict_mut_from_value(value: Value) -> Option<&'static mut DictObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    (header.type_id == TypeId::DICT).then(|| unsafe { &mut *(ptr as *mut DictObject) })
 }
 
 fn builtin_exception_new(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -862,6 +920,45 @@ fn builtin_exception_with_traceback(args: &[Value]) -> Result<Value, BuiltinErro
     Ok(receiver)
 }
 
+fn builtin_exception_setstate(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "BaseException.__setstate__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    if unsafe { ExceptionValue::from_value(receiver) }.is_none()
+        && heap_exception_class_from_value(receiver).is_none()
+    {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '__setstate__' for 'BaseException' objects doesn't apply to a '{}' object",
+            exception_receiver_type_name(receiver)
+        )));
+    }
+
+    let state = args[1];
+    if state.is_none() {
+        return Ok(Value::none());
+    }
+
+    let state_dict = dict_ref_from_value(state)
+        .ok_or_else(|| BuiltinError::TypeError("state is not a dictionary".to_string()))?;
+    let entries = state_dict.iter().collect::<Vec<_>>();
+
+    for (key, value) in entries {
+        let name = attr_name_from_state_key(key)?;
+        crate::ops::objects::set_attribute_value(vm, receiver, &name, value)
+            .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+    }
+
+    Ok(Value::none())
+}
+
 #[inline]
 pub(crate) fn exception_method_value(name: &str) -> Option<Value> {
     match name {
@@ -869,9 +966,21 @@ pub(crate) fn exception_method_value(name: &str) -> Option<Value> {
         "__init__" => Some(builtin_method_value(&EXCEPTION_INIT_METHOD)),
         "__str__" => Some(builtin_method_value(&EXCEPTION_STR_METHOD)),
         "__repr__" => Some(builtin_method_value(&EXCEPTION_REPR_METHOD)),
+        "__setstate__" => Some(builtin_method_value(&EXCEPTION_SETSTATE_METHOD)),
         "with_traceback" => Some(builtin_method_value(&EXCEPTION_WITH_TRACEBACK_METHOD)),
         _ => None,
     }
+}
+
+fn attr_name_from_state_key(key: Value) -> Result<InternedString, BuiltinError> {
+    let Some(name) = value_as_string_ref(key) else {
+        return Err(BuiltinError::TypeError(format!(
+            "attribute name must be string, not '{}'",
+            key.type_name()
+        )));
+    };
+
+    Ok(intern(name.as_str()))
 }
 
 pub(crate) fn exception_display_text_for_value(value: Value) -> Option<String> {

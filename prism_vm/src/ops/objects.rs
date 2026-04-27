@@ -2107,10 +2107,9 @@ pub(crate) fn get_attribute_value(
                     "__suppress_context__" => {
                         Ok(Value::bool(exc.flags.has(ExceptionFlags::SUPPRESS_CONTEXT)))
                     }
-                    _ => Err(RuntimeError::attribute_error(
-                        exc.type_name(),
-                        name.as_str(),
-                    )),
+                    _ => exc.dynamic_attr(name).ok_or_else(|| {
+                        RuntimeError::attribute_error(exc.type_name(), name.as_str())
+                    }),
                 }
             }
             TypeId::EXCEPTION_TYPE => {
@@ -2374,10 +2373,10 @@ pub(crate) fn set_attribute_value(
                         };
                         Ok(())
                     }
-                    _ => Err(RuntimeError::attribute_error(
-                        exc.type_name(),
-                        name.as_str(),
-                    )),
+                    _ => {
+                        exc.set_dynamic_attr(name.clone(), value);
+                        Ok(())
+                    }
                 }
             }
             TypeId::TRACEBACK => {
