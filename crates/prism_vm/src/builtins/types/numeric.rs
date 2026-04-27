@@ -1103,10 +1103,34 @@ fn float_from_index_value(value: Value) -> Result<Value, BuiltinError> {
             value.type_name()
         ))
     })?;
-    let float = bigint.to_f64().ok_or_else(|| {
-        BuiltinError::OverflowError("int too large to convert to float".to_string())
-    })?;
+    let float = bigint
+        .to_f64()
+        .filter(|float| float.is_finite())
+        .ok_or_else(|| {
+            BuiltinError::OverflowError("int too large to convert to float".to_string())
+        })?;
     Ok(Value::float(float))
+}
+
+fn runtime_type_name(value: Value) -> String {
+    if let Some(ptr) = value.as_object_ptr() {
+        let type_id = crate::ops::objects::extract_type_id(ptr);
+        if type_id.raw() >= TypeId::FIRST_USER_TYPE
+            && let Some(class) = global_class(ClassId(type_id.raw()))
+        {
+            return class.name().as_str().to_string();
+        }
+    }
+
+    get_type_name(value).to_string()
+}
+
+fn float_subclass_return_warning(receiver: Value, result: Value) -> String {
+    format!(
+        "{}.__float__ returned non-float (type {}).  The ability to return an instance of a strict subclass of float is deprecated, and may be removed in a future version of Python.",
+        runtime_type_name(receiver),
+        runtime_type_name(result)
+    )
 }
 
 /// Builtin float constructor.
@@ -1141,12 +1165,23 @@ pub fn builtin_float_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
 
     if let Some(result) = invoke_zero_arg_special_method(vm, arg, "__float__")? {
         if let Some(float) = prism_runtime::types::float::value_to_f64(result) {
+            if result.as_float().is_none() {
+                crate::stdlib::_warnings::emit_deprecation_warning(
+                    vm,
+                    &float_subclass_return_warning(arg, result),
+                )
+                .map_err(BuiltinError::Raised)?;
+            }
             return Ok(Value::float(float));
         }
         return Err(BuiltinError::TypeError(format!(
             "__float__ returned non-float (type {})",
             result.type_name()
         )));
+    }
+
+    if let Some(text_arg) = float_text_argument(arg)? {
+        return parse_float_text_argument(&text_arg);
     }
 
     if let Some(float) = prism_runtime::types::float::value_to_f64(arg) {
@@ -1162,10 +1197,6 @@ pub fn builtin_float_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
 
 #[inline]
 fn builtin_float_exact_base(arg: Value) -> Result<Option<Value>, BuiltinError> {
-    if let Some(text_arg) = float_text_argument(arg)? {
-        return parse_float_text_argument(&text_arg).map(Some);
-    }
-
     if let Some(f) = arg.as_float() {
         return Ok(Some(Value::float(f)));
     }
@@ -1175,8 +1206,29 @@ fn builtin_float_exact_base(arg: Value) -> Result<Option<Value>, BuiltinError> {
     if let Some(b) = arg.as_bool() {
         return Ok(Some(Value::float(if b { 1.0 } else { 0.0 })));
     }
+    if is_exact_float_text_argument(arg)
+        && let Some(text_arg) = float_text_argument(arg)?
+    {
+        return parse_float_text_argument(&text_arg).map(Some);
+    }
 
     Ok(None)
+}
+
+#[inline]
+fn is_exact_float_text_argument(value: Value) -> bool {
+    if value.is_string() {
+        return true;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+
+    matches!(
+        crate::ops::objects::extract_type_id(ptr),
+        TypeId::BYTES | TypeId::BYTEARRAY | TypeId::MEMORYVIEW
+    )
 }
 
 const F64_FRACTION_BITS: u32 = 52;
