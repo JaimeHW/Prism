@@ -26,6 +26,7 @@ use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObj
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::float::value_to_f64;
 use prism_runtime::types::int::{IntObject, bigint_to_value, int_value_to_string, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::MemoryViewObject;
@@ -333,10 +334,8 @@ pub fn builtin_abs(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let arg = args[0];
 
-    if let Some(i) = int_like_value(arg) {
-        return Value::int(i.abs()).ok_or_else(|| {
-            BuiltinError::OverflowError("integer absolute value overflow".to_string())
-        });
+    if let Some(value) = abs_integer_value(arg) {
+        return Ok(value);
     }
 
     if let Some(f) = arg.as_float() {
@@ -358,23 +357,8 @@ pub fn builtin_abs_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     }
 
     let arg = args[0];
-    if let Some(i) = int_like_value(arg) {
-        return if i >= 0 {
-            Value::int(i).ok_or_else(|| {
-                BuiltinError::OverflowError("integer absolute value overflow".to_string())
-            })
-        } else {
-            i.checked_neg()
-                .and_then(Value::int)
-                .or_else(|| Some(bigint_to_value(BigInt::from(i).abs())))
-                .ok_or_else(|| {
-                    BuiltinError::OverflowError("integer absolute value overflow".to_string())
-                })
-        };
-    }
-
-    if let Some(integer) = value_to_bigint(arg) {
-        return Ok(bigint_to_value(integer.abs()));
+    if let Some(value) = abs_integer_value(arg) {
+        return Ok(value);
     }
 
     if let Some(f) = arg.as_float() {
@@ -392,6 +376,25 @@ pub fn builtin_abs_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     };
 
     invoke_zero_arg_bound_method(vm, target).map_err(super::runtime_error_to_builtin_error)
+}
+
+#[inline]
+fn abs_integer_value(value: Value) -> Option<Value> {
+    if let Some(integer) = int_like_value(value) {
+        if integer >= 0 {
+            return Some(
+                Value::int(integer).unwrap_or_else(|| bigint_to_value(BigInt::from(integer))),
+            );
+        }
+        return Some(
+            integer
+                .checked_neg()
+                .and_then(Value::int)
+                .unwrap_or_else(|| bigint_to_value(BigInt::from(integer).abs())),
+        );
+    }
+
+    value_to_bigint(value).map(|integer| bigint_to_value(integer.abs()))
 }
 
 // =============================================================================
@@ -1698,8 +1701,8 @@ pub(crate) fn hash_value(value: Value) -> Result<i64, BuiltinError> {
         return Ok(normalize_python_hash(integer));
     }
 
-    if let Some(float) = value.as_float() {
-        return Ok(hash_float(float, value.raw_bits() as usize));
+    if let Some(float) = value_to_f64(value) {
+        return Ok(hash_float(float, float_hash_identity(value)));
     }
 
     if let Some(integer) = value_to_bigint(value) {
@@ -1767,8 +1770,8 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
         return Ok(normalize_python_hash(integer));
     }
 
-    if let Some(float) = value.as_float() {
-        return Ok(hash_float(float, value.raw_bits() as usize));
+    if let Some(float) = value_to_f64(value) {
+        return Ok(hash_float(float, float_hash_identity(value)));
     }
 
     if let Some(integer) = value_to_bigint(value) {
@@ -1862,6 +1865,13 @@ fn hash_user_result(result: Value, type_id: TypeId) -> Result<i64, BuiltinError>
         .to_i64()
         .map(normalize_python_hash)
         .unwrap_or_else(|| hash_bigint(&integer)))
+}
+
+#[inline]
+fn float_hash_identity(value: Value) -> usize {
+    value
+        .as_object_ptr()
+        .map_or(value.raw_bits() as usize, |ptr| ptr as usize)
 }
 
 #[inline]
