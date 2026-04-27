@@ -28,6 +28,7 @@ use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
@@ -62,6 +63,7 @@ const TAG_USER_OBJECT: u8 = 14;
 const TAG_REDUCE: u8 = 15;
 const TAG_GENERIC_ALIAS: u8 = 16;
 const TAG_SLICE: u8 = 17;
+const TAG_RANGE: u8 = 18;
 
 const TYPE_KIND_BUILTIN: u8 = 0;
 const TYPE_KIND_USER: u8 = 1;
@@ -219,6 +221,7 @@ impl<'vm> PickleWriter<'vm> {
             TypeId::ITERATOR => self.write_reduce(value, ptr),
             TypeId::GENERIC_ALIAS => self.write_generic_alias(ptr),
             TypeId::SLICE => self.write_slice(ptr),
+            TypeId::RANGE => self.write_range(ptr),
             type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
                 self.write_user_object(ptr, type_id)
             }
@@ -385,6 +388,19 @@ impl<'vm> PickleWriter<'vm> {
         self.write_value(slice.step_value())
     }
 
+    fn write_range(&mut self, ptr: *const ()) -> Result<(), BuiltinError> {
+        let Some(id) = self.begin_memo(ptr)? else {
+            return Ok(());
+        };
+        let range = unsafe { &*(ptr as *const RangeObject) };
+
+        self.write_tag(TAG_RANGE);
+        self.write_u32(id);
+        self.write_value(bigint_to_value(range.start_bigint()))?;
+        self.write_value(bigint_to_value(range.stop_bigint()))?;
+        self.write_value(bigint_to_value(range.step_bigint()))
+    }
+
     fn begin_memo(&mut self, ptr: *const ()) -> Result<Option<u32>, BuiltinError> {
         let key = ptr as usize;
         if let Some(id) = self.memo.get(&key).copied() {
@@ -493,6 +509,7 @@ impl<'bytes> PickleReader<'bytes> {
             TAG_REDUCE => self.read_reduce(vm),
             TAG_GENERIC_ALIAS => self.read_generic_alias(vm),
             TAG_SLICE => self.read_slice(vm),
+            TAG_RANGE => self.read_range(vm),
             _ => Err(invalid_pickle("unknown value tag")),
         }
     }
@@ -634,6 +651,29 @@ impl<'bytes> PickleReader<'bytes> {
         let value = crate::alloc_managed_value(SliceObject::new(start, stop, step));
         self.insert_memo(id, value)?;
         Ok(value)
+    }
+
+    fn read_range(&mut self, vm: &mut VirtualMachine) -> Result<Value, BuiltinError> {
+        let id = self.read_u32()?;
+        let start = self.read_range_component(vm, "start")?;
+        let stop = self.read_range_component(vm, "stop")?;
+        let step = self.read_range_component(vm, "step")?;
+        if step == num_bigint::BigInt::from(0) {
+            return Err(invalid_pickle("range step cannot be zero"));
+        }
+
+        let value = crate::alloc_managed_value(RangeObject::from_bigints(start, stop, step));
+        self.insert_memo(id, value)?;
+        Ok(value)
+    }
+
+    fn read_range_component(
+        &mut self,
+        vm: &mut VirtualMachine,
+        name: &'static str,
+    ) -> Result<num_bigint::BigInt, BuiltinError> {
+        let value = self.read_value(vm)?;
+        value_to_bigint(value).ok_or_else(|| invalid_pickle(format!("range {name} is not an int")))
     }
 
     fn insert_memo(&mut self, id: u32, value: Value) -> Result<(), BuiltinError> {
