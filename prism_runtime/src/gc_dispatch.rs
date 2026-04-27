@@ -31,6 +31,7 @@
 use crate::object::descriptor::{
     BoundMethod, ClassMethodDescriptor, PropertyDescriptor, StaticMethodDescriptor,
 };
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::views::{
     CellViewObject, CodeObjectView, DescriptorViewObject, DictViewObject, GenericAliasObject,
@@ -472,6 +473,14 @@ fn lookup_dispatch_entry(type_id: TypeId) -> DispatchEntry {
         .copied()
     {
         return entry;
+    }
+
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE {
+        return DispatchEntry {
+            trace: trace_shaped_object,
+            size: size_shaped_object,
+            finalize: finalize_shaped_object,
+        };
     }
 
     *dispatch_table().get(type_id)
@@ -923,4 +932,22 @@ unsafe fn size_iterator(_ptr: *const ()) -> usize {
 unsafe fn finalize_iterator(ptr: *mut ()) {
     // SAFETY: Caller guarantees ptr points to valid IteratorObject
     unsafe { std::ptr::drop_in_place(ptr as *mut IteratorObject) };
+}
+
+// =============================================================================
+// ShapedObject Dispatch (user-defined heap instances)
+// =============================================================================
+
+unsafe fn trace_shaped_object(ptr: *const (), tracer: &mut dyn Tracer) {
+    let obj = unsafe { &*(ptr as *const ShapedObject) };
+    obj.trace(tracer);
+}
+
+unsafe fn size_shaped_object(ptr: *const ()) -> usize {
+    let obj = unsafe { &*(ptr as *const ShapedObject) };
+    obj.size_of()
+}
+
+unsafe fn finalize_shaped_object(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut ShapedObject) };
 }

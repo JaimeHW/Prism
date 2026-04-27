@@ -50,6 +50,7 @@
 mod allocator;
 mod aot_abi;
 mod error;
+mod finalizers;
 mod frame;
 mod gc_integration;
 mod globals;

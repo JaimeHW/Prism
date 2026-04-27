@@ -8,6 +8,7 @@ use crate::builtins::{BuiltinRegistry, set_exception_traceback_for_value};
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, RuntimeErrorKind, TracebackEntry, VmResult};
 use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
+use crate::finalizers::{FinalizerRegistry, ReachabilityTracer};
 use crate::frame::{ClosureEnv, Frame, FramePool, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
@@ -345,6 +346,8 @@ pub struct VirtualMachine {
     native_recursion_depth: usize,
     /// Most recent runtime error reported by a native AOT helper call.
     last_aot_error: Option<RuntimeError>,
+    /// Instances with Python finalizers awaiting an explicit collection pass.
+    finalizers: FinalizerRegistry,
     /// Interpreter-local codec registry shared by native Python threads.
     codec_registry: SharedCodecRegistry,
     /// Heap-type publications whose class dictionaries may reference this VM heap.
@@ -1530,6 +1533,7 @@ impl VirtualMachine {
             execution_budget: ExecutionBudget::default(),
             native_recursion_depth: 0,
             last_aot_error: None,
+            finalizers: FinalizerRegistry::default(),
         }
     }
 
@@ -1602,6 +1606,7 @@ impl VirtualMachine {
             execution_budget: ExecutionBudget::default(),
             native_recursion_depth: 0,
             last_aot_error: None,
+            finalizers: FinalizerRegistry::default(),
         }
     }
 
@@ -1682,6 +1687,7 @@ impl VirtualMachine {
             execution_budget: ExecutionBudget::default(),
             native_recursion_depth: 0,
             last_aot_error: None,
+            finalizers: FinalizerRegistry::default(),
         }
     }
 
@@ -1731,6 +1737,7 @@ impl VirtualMachine {
             execution_budget: ExecutionBudget::default(),
             native_recursion_depth: 0,
             last_aot_error: None,
+            finalizers: FinalizerRegistry::default(),
         }
     }
 
@@ -1775,6 +1782,7 @@ impl VirtualMachine {
             execution_budget: ExecutionBudget::default(),
             native_recursion_depth: 0,
             last_aot_error: None,
+            finalizers: FinalizerRegistry::default(),
         }
     }
 
@@ -2904,6 +2912,76 @@ impl VirtualMachine {
     // =========================================================================
     // GC Integration
     // =========================================================================
+
+    #[inline]
+    pub(crate) fn register_finalizer_candidate(&mut self, value: Value) {
+        self.finalizers.register(value);
+    }
+
+    pub(crate) fn drain_unreachable_finalizers(&mut self) -> usize {
+        if self.finalizers.is_empty() || !self.finalizers.begin_drain() {
+            return 0;
+        }
+
+        let values = {
+            let mut reachability = ReachabilityTracer::new();
+            self.trace_finalizer_roots(&mut reachability);
+            reachability.drain_object_graph();
+            self.finalizers.take_unreachable(reachability.reachable())
+        };
+
+        let mut finalized = 0;
+        for value in values {
+            self.invoke_python_finalizer(value);
+            finalized += 1;
+        }
+
+        self.finalizers.finish_drain();
+        finalized
+    }
+
+    fn trace_finalizer_roots(&self, tracer: &mut dyn Tracer) {
+        self.active_exception.trace(tracer);
+        self.jit_return_value.trace(tracer);
+
+        for entry in self.exc_info_stack.iter_bottom_up() {
+            if let Some(value) = entry.value() {
+                value.trace(tracer);
+            }
+        }
+        for handler in &self.active_except_handlers {
+            handler.value.trace(tracer);
+        }
+
+        for (_, value) in self.globals.iter() {
+            tracer.trace_value(*value);
+        }
+        for value in self.builtins.values() {
+            tracer.trace_value(value);
+        }
+        for module in self.import_resolver.cached_modules_snapshot() {
+            for (_, value) in module.all_attrs() {
+                tracer.trace_value(value);
+            }
+        }
+        for frame in &self.frames {
+            frame.trace_semantic_roots(tracer);
+        }
+    }
+
+    fn invoke_python_finalizer(&mut self, value: Value) {
+        let finalizer_name = intern("__del__");
+        let finalizer = match crate::ops::objects::get_attribute_value(self, value, &finalizer_name)
+        {
+            Ok(finalizer) => finalizer,
+            Err(err) if err.is_attribute_error() => return,
+            Err(_) => return,
+        };
+
+        if crate::ops::calls::invoke_callable_value(self, finalizer, &[]).is_err() {
+            self.clear_active_exception();
+        }
+    }
 
     /// Get read-only access to the managed heap.
     ///

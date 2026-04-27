@@ -161,10 +161,13 @@ fn builtin_collect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
     }
 
     super::_weakref::clear_unreachable_weakrefs(vm);
+    let finalized = vm.drain_unreachable_finalizers();
 
     // The heap collector is currently conservative at the Python boundary:
-    // weakrefs are finalized above, while live VM objects are left untouched.
-    Ok(Value::int(0).expect("gc.collect result should fit"))
+    // weakrefs and Python-level finalizers are drained above, while live VM
+    // objects are left untouched until exact heap reclamation can update every
+    // register and container reference.
+    Ok(Value::int(finalized as i64).expect("gc.collect result should fit"))
 }
 
 fn builtin_disable(args: &[Value]) -> Result<Value, BuiltinError> {

@@ -616,6 +616,7 @@ fn instantiate_user_defined_class(
     } else {
         allocate_default_instance(vm, class)?
     };
+    register_finalizer_candidate_if_needed(vm, new_result);
 
     let should_run_init = should_run_init_for_new_result(class, new_result);
     let Some(init_callable) =
@@ -674,6 +675,7 @@ fn instantiate_user_defined_class_from_values(
     } else {
         allocate_default_instance(vm, class)?
     };
+    register_finalizer_candidate_if_needed(vm, new_result);
 
     let should_run_init = should_run_init_for_new_result(class, new_result);
     let Some(init_callable) =
@@ -726,6 +728,7 @@ fn instantiate_user_defined_class_from_values_with_keywords(
     } else {
         allocate_default_instance(vm, class)?
     };
+    register_finalizer_candidate_if_needed(vm, new_result);
 
     let should_run_init = should_run_init_for_new_result(class, new_result);
     let Some(init_callable) =
@@ -779,6 +782,36 @@ fn rejects_default_object_constructor_args(
         && slot_callable_matches_builtin_name(init_callable, "object.__init__")
         && resolve_instantiation_slot(class, "__new__")
             .is_some_and(|new| slot_callable_matches_builtin_name(new, "object.__new__"))
+}
+
+#[inline]
+fn register_finalizer_candidate_if_needed(vm: &mut VirtualMachine, value: Value) {
+    if user_instance_type_has_finalizer(value) {
+        vm.register_finalizer_candidate(value);
+    }
+}
+
+#[inline]
+fn user_instance_type_has_finalizer(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let type_id = extract_type_id(ptr);
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return false;
+    }
+
+    global_class(ClassId(type_id.raw()))
+        .as_deref()
+        .is_some_and(class_mro_has_finalizer)
+}
+
+fn class_mro_has_finalizer(class: &PyClassObject) -> bool {
+    let name = intern("__del__");
+    class.mro().iter().copied().any(|class_id| {
+        class_id.0 >= TypeId::FIRST_USER_TYPE
+            && global_class(class_id).is_some_and(|base| base.get_attr(&name).is_some())
+    })
 }
 
 fn reject_abstract_class_instantiation(class: &PyClassObject) -> Result<(), RuntimeError> {

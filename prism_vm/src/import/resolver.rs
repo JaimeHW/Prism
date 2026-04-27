@@ -645,6 +645,11 @@ impl ImportResolver {
         self.lookup_public_sys_modules(name)
     }
 
+    /// Snapshot currently cached modules for VM root tracing.
+    pub(crate) fn cached_modules_snapshot(&self) -> Vec<Arc<ModuleObject>> {
+        self.sys_modules.read().unwrap().values().cloned().collect()
+    }
+
     /// Insert a module directly into sys.modules.
     ///
     /// This is useful for injecting modules programmatically.

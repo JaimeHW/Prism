@@ -7,6 +7,7 @@ use crate::exception::InlineHandlerCache;
 use crate::import::ModuleObject;
 use prism_code::{CodeFlags, CodeObject, Constant};
 use prism_core::Value;
+use prism_gc::trace::{Trace, Tracer};
 use prism_runtime::types::int::bigint_to_value;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -437,6 +438,56 @@ impl Frame {
     #[inline(always)]
     pub fn set_locals_mapping(&mut self, mapping: Option<Value>) {
         self.locals_mapping = mapping;
+    }
+
+    /// Trace Python-semantic frame roots.
+    ///
+    /// Temporary registers may retain stale values after an expression has
+    /// completed. For explicit finalizer reachability we trace live Python
+    /// locals, closure cells, frame namespace mappings, and module globals.
+    pub(crate) fn trace_semantic_roots(&self, tracer: &mut dyn Tracer) {
+        if self.uses_separate_locals() {
+            for slot in 0..self.separate_locals.len() {
+                if self.separate_local_is_written(slot) {
+                    tracer.trace_value(self.separate_locals[slot]);
+                }
+            }
+        } else {
+            let local_count = self
+                .code
+                .locals
+                .len()
+                .min(self.active_register_count as usize);
+            for slot in 0..local_count {
+                let reg = slot as u8;
+                if self.reg_is_written(reg) {
+                    tracer.trace_value(self.get_reg(reg));
+                }
+            }
+        }
+
+        if let Some(mapping) = self.locals_mapping {
+            tracer.trace_value(mapping);
+        }
+
+        if let Some(module) = &self.module {
+            for (_, value) in module.all_attrs() {
+                tracer.trace_value(value);
+            }
+        }
+
+        if let Some(closure) = &self.closure {
+            closure.trace(tracer);
+        }
+    }
+
+    #[inline(always)]
+    fn separate_local_is_written(&self, slot: usize) -> bool {
+        let word = slot / 64;
+        let bit = slot % 64;
+        self.written_separate_locals
+            .get(word)
+            .is_some_and(|bits| (bits & (1u64 << bit)) != 0)
     }
 
     /// Get two register values (common for binary ops).

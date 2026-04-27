@@ -502,6 +502,11 @@ impl BuiltinRegistry {
         self.entries.get(name).copied()
     }
 
+    #[inline]
+    pub(crate) fn values(&self) -> impl Iterator<Item = Value> + '_ {
+        self.entries.values().copied()
+    }
+
     /// Get a builtin function by name.
     #[inline]
     pub fn get_function(&self, name: &str) -> Option<BuiltinFn> {
