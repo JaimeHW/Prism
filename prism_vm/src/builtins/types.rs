@@ -1379,7 +1379,11 @@ fn value_to_slice_index(value: Value) -> Result<Option<i64>, BuiltinError> {
         return Ok(None);
     }
 
-    if let Some(index) = prism_runtime::types::int::value_to_i64(value) {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(Some(i64::from(boolean)));
+    }
+
+    if let Some(index) = prism_runtime::types::int::value_to_saturated_i64(value) {
         return Ok(Some(index));
     }
 

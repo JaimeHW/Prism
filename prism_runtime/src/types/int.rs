@@ -9,7 +9,7 @@ use crate::allocation_context::alloc_value_in_current_heap_or_box;
 use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use prism_core::Value;
 
@@ -101,6 +101,24 @@ pub fn value_to_i64(value: Value) -> Option<i64> {
         return Some(i);
     }
     value_as_int_ref(value).and_then(ToPrimitive::to_i64)
+}
+
+/// Convert a bigint to `i64`, clamping out-of-range values.
+#[inline]
+pub fn bigint_to_saturated_i64(value: &BigInt) -> i64 {
+    value.to_i64().unwrap_or_else(|| match value.sign() {
+        Sign::Minus => i64::MIN,
+        _ => i64::MAX,
+    })
+}
+
+/// Convert a Python integer value into `i64`, clamping heap-backed bigints.
+#[inline]
+pub fn value_to_saturated_i64(value: Value) -> Option<i64> {
+    if let Some(i) = value.as_int() {
+        return Some(i);
+    }
+    value_as_int_ref(value).map(bigint_to_saturated_i64)
 }
 
 /// Format a Python integer value using Python `int.__repr__` semantics.

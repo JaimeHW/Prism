@@ -152,7 +152,11 @@ impl TupleObject {
     // Internal: normalize index for negative indexing
     fn normalize_index(&self, index: i64) -> Option<usize> {
         let len = self.len() as i64;
-        let normalized = if index < 0 { len + index } else { index };
+        let normalized = if index < 0 {
+            len.checked_add(index)?
+        } else {
+            index
+        };
         if normalized >= 0 && normalized < len {
             Some(normalized as usize)
         } else {
@@ -163,7 +167,11 @@ impl TupleObject {
     // Internal: clamp index to valid range
     fn clamp_index(&self, index: i64) -> usize {
         let len = self.len() as i64;
-        let normalized = if index < 0 { len + index } else { index };
+        let normalized = if index < 0 {
+            len.saturating_add(index)
+        } else {
+            index
+        };
         normalized.clamp(0, len) as usize
     }
 }

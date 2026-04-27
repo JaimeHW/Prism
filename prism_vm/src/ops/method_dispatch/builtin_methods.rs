@@ -42,7 +42,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
 use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint, value_to_saturated_i64};
 use prism_runtime::types::iter::{IteratorEmptyIterable, IteratorObject, IteratorReduction};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::{
@@ -903,7 +903,7 @@ fn list_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
         return Ok(to_object_value(ListObject::from_iter(values)));
     }
 
-    let index = expect_integer_like_index(args[1])?;
+    let index = expect_sequence_index(args[1], "list")?;
     list.get(index)
         .ok_or_else(|| BuiltinError::IndexError("list index out of range".to_string()))
 }
@@ -1103,12 +1103,12 @@ fn list_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinE
     let ptr = expect_list_ptr(args[0], "index")?;
     let len = i64::try_from(list_len_from_ptr(ptr)).unwrap_or(i64::MAX);
     let start = if args.len() >= 3 {
-        normalize_search_bound(expect_integer_like_index(args[2])?, len)
+        normalize_search_bound(expect_search_bound(args[2])?, len)
     } else {
         0
     };
     let stop = if args.len() >= 4 {
-        normalize_search_bound(expect_integer_like_index(args[3])?, len)
+        normalize_search_bound(expect_search_bound(args[3])?, len)
     } else {
         len
     };
@@ -1167,7 +1167,7 @@ fn tuple_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
         return Ok(to_object_value(TupleObject::from_vec(values)));
     }
 
-    let index = expect_integer_like_index(args[1])?;
+    let index = expect_sequence_index(args[1], "tuple")?;
     tuple
         .get(index)
         .ok_or_else(|| BuiltinError::IndexError("tuple index out of range".to_string()))
@@ -1199,12 +1199,12 @@ fn tuple_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
     let tuple = expect_tuple_ref(args[0], "index")?;
     let len = i64::try_from(tuple.len()).unwrap_or(i64::MAX);
     let start = if args.len() >= 3 {
-        normalize_search_bound(expect_integer_like_index(args[2])?, len)
+        normalize_search_bound(expect_search_bound(args[2])?, len)
     } else {
         0
     };
     let stop = if args.len() >= 4 {
-        normalize_search_bound(expect_integer_like_index(args[3])?, len)
+        normalize_search_bound(expect_search_bound(args[3])?, len)
     } else {
         len
     };
@@ -2991,6 +2991,35 @@ fn expect_integer_like_index(value: Value) -> Result<i64, BuiltinError> {
     Err(BuiltinError::TypeError(format!(
         "'{}' object cannot be interpreted as an integer",
         value.type_name()
+    )))
+}
+
+#[inline]
+fn expect_search_bound(value: Value) -> Result<i64, BuiltinError> {
+    if let Some(index) = value.as_bool().map(i64::from) {
+        return Ok(index);
+    }
+    if let Some(index) = value_to_saturated_i64(value) {
+        return Ok(index);
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        value.type_name()
+    )))
+}
+
+#[inline]
+fn expect_sequence_index(value: Value, sequence_type: &'static str) -> Result<i64, BuiltinError> {
+    if let Some(index) = value.as_bool().map(i64::from) {
+        return Ok(index);
+    }
+    if let Some(index) = value_to_saturated_i64(value) {
+        return Ok(index);
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "{sequence_type} indices must be integers or slices"
     )))
 }
 

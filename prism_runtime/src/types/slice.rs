@@ -205,8 +205,10 @@ impl Iterator for SliceIndexIter {
             return None;
         }
         let index = self.current as usize;
-        self.current += self.step;
         self.remaining -= 1;
+        if self.remaining != 0 {
+            self.current = self.current.saturating_add(self.step);
+        }
         Some(index)
     }
 

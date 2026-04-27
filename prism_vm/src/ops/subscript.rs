@@ -266,6 +266,16 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
                 let string = unsafe { &*(ptr as *const StringObject) };
                 return subscr_str_integer(string.as_str(), index).map(Some);
             }
+            TypeId::RANGE => {
+                let range = unsafe { &*(ptr as *const RangeObject) };
+                if let Some(value) = range.get_value(index) {
+                    return Ok(Some(SubscriptResult::Value(value)));
+                }
+                return Err(ControlFlow::Error(RuntimeError::index_error(
+                    index,
+                    range.len(),
+                )));
+            }
             _ => {}
         }
 

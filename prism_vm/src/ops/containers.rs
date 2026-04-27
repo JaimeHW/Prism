@@ -12,6 +12,7 @@ use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::value_to_saturated_i64;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
@@ -434,7 +435,11 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 fn value_to_slice_index(val: Value) -> Result<Option<i64>, ControlFlow> {
     if val.is_none() {
         Ok(None)
+    } else if let Some(boolean) = val.as_bool() {
+        Ok(Some(i64::from(boolean)))
     } else if let Some(i) = val.as_int() {
+        Ok(Some(i))
+    } else if let Some(i) = value_to_saturated_i64(val) {
         Ok(Some(i))
     } else {
         Err(ControlFlow::Error(RuntimeError::type_error(
