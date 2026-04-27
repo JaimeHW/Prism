@@ -1731,7 +1731,7 @@ pub(crate) fn hash_value(value: Value) -> Result<i64, BuiltinError> {
         };
     }
     match type_id {
-        TypeId::LIST | TypeId::DICT => Err(BuiltinError::TypeError(format!(
+        TypeId::LIST | TypeId::DICT | TypeId::BYTEARRAY => Err(BuiltinError::TypeError(format!(
             "unhashable type: '{}'",
             type_id.name()
         ))),
@@ -1791,10 +1791,9 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
         .ok_or_else(|| BuiltinError::TypeError("unhashable type".to_string()))?;
     let type_id = crate::ops::objects::extract_type_id(ptr);
     match type_id {
-        TypeId::LIST | TypeId::DICT | TypeId::SET => Err(BuiltinError::TypeError(format!(
-            "unhashable type: '{}'",
-            type_id.name()
-        ))),
+        TypeId::LIST | TypeId::DICT | TypeId::SET | TypeId::BYTEARRAY => Err(
+            BuiltinError::TypeError(format!("unhashable type: '{}'", type_id.name())),
+        ),
         TypeId::FROZENSET => {
             let set = unsafe { &*(ptr as *const SetObject) };
             hash_frozenset_vm(vm, set)

@@ -112,8 +112,32 @@ static BYTES_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> =
 
 static BYTEARRAY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.copy"), bytearray_copy));
+static BYTEARRAY_APPEND_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("bytearray.append"), bytearray_append_with_vm)
+});
+static BYTEARRAY_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.clear"), bytearray_clear));
 static BYTEARRAY_EXTEND_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("bytearray.extend"), bytearray_extend_with_vm)
+});
+static BYTEARRAY_INSERT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("bytearray.insert"), bytearray_insert_with_vm)
+});
+static BYTEARRAY_POP_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("bytearray.pop"), bytearray_pop_with_vm)
+});
+static BYTEARRAY_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("bytearray.remove"), bytearray_remove_with_vm)
+});
+static BYTEARRAY_REVERSE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.reverse"), bytearray_reverse));
+static BYTEARRAY_ALLOC_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.__alloc__"), bytearray_alloc));
+static BYTEARRAY_IADD_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("bytearray.__iadd__"), bytearray_iadd_with_vm)
+});
+static BYTEARRAY_IMUL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("bytearray.__imul__"), bytearray_imul_with_vm)
 });
 static BYTEARRAY_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.decode"), bytearray_decode));
@@ -339,8 +363,35 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_COPY_METHOD,
         ))),
+        "append" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_APPEND_METHOD,
+        ))),
+        "clear" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_CLEAR_METHOD,
+        ))),
         "extend" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_EXTEND_METHOD,
+        ))),
+        "insert" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_INSERT_METHOD,
+        ))),
+        "pop" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_POP_METHOD,
+        ))),
+        "remove" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_REMOVE_METHOD,
+        ))),
+        "reverse" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_REVERSE_METHOD,
+        ))),
+        "__alloc__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ALLOC_METHOD,
+        ))),
+        "__iadd__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_IADD_METHOD,
+        ))),
+        "__imul__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_IMUL_METHOD,
         ))),
         "decode" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_DECODE_METHOD,
@@ -2804,6 +2855,24 @@ pub(super) fn bytearray_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(to_object_value(bytearray.clone()))
 }
 
+pub(super) fn bytearray_append_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "append", args, 1)?;
+    let byte = bytearray_element_byte_vm(vm, args[1])?;
+    let bytearray = expect_bytearray_mut(args[0], "append")?;
+    bytearray.push(byte);
+    Ok(Value::none())
+}
+
+pub(super) fn bytearray_clear(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "clear", args, 0)?;
+    let bytearray = expect_bytearray_mut(args[0], "clear")?;
+    bytearray.clear();
+    Ok(Value::none())
+}
+
 pub(super) fn bytearray_extend_with_vm(
     vm: &mut VirtualMachine,
     args: &[Value],
@@ -2813,6 +2882,87 @@ pub(super) fn bytearray_extend_with_vm(
     let bytearray = expect_bytearray_mut(args[0], "extend")?;
     bytearray.extend_from_slice(&incoming);
     Ok(Value::none())
+}
+
+pub(super) fn bytearray_insert_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "insert", args, 2)?;
+    let index = bytearray_index_value_vm(vm, args[1])?;
+    let byte = bytearray_element_byte_vm(vm, args[2])?;
+    let bytearray = expect_bytearray_mut(args[0], "insert")?;
+    bytearray.insert(index, byte);
+    Ok(Value::none())
+}
+
+pub(super) fn bytearray_pop_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("bytearray", "pop", args, 0, 1)?;
+    let index = match args.get(1).copied() {
+        Some(value) => bytearray_index_value_vm(vm, value)?,
+        None => -1,
+    };
+    let bytearray = expect_bytearray_mut(args[0], "pop")?;
+    let byte = bytearray
+        .pop(index)
+        .ok_or_else(|| BuiltinError::IndexError("pop index out of range".to_string()))?;
+    Ok(Value::int(i64::from(byte)).expect("byte value should fit int"))
+}
+
+pub(super) fn bytearray_remove_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "remove", args, 1)?;
+    let byte = bytearray_element_byte_vm(vm, args[1])?;
+    let bytearray = expect_bytearray_mut(args[0], "remove")?;
+    if !bytearray.remove(byte) {
+        return Err(BuiltinError::ValueError(
+            "value not found in bytearray".to_string(),
+        ));
+    }
+    Ok(Value::none())
+}
+
+pub(super) fn bytearray_reverse(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "reverse", args, 0)?;
+    let bytearray = expect_bytearray_mut(args[0], "reverse")?;
+    bytearray.reverse();
+    Ok(Value::none())
+}
+
+pub(super) fn bytearray_alloc(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "__alloc__", args, 0)?;
+    let bytearray = expect_bytearray_ref(args[0], "__alloc__")?;
+    let alloc = bytearray.capacity().saturating_add(1);
+    Ok(bigint_to_value(BigInt::from(alloc)))
+}
+
+pub(super) fn bytearray_iadd_with_vm(
+    _vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "__iadd__", args, 1)?;
+    let incoming = bytes_like_argument_bytes(args[1])?;
+    let bytearray = expect_bytearray_mut(args[0], "__iadd__")?;
+    bytearray.extend_from_slice(&incoming);
+    Ok(args[0])
+}
+
+pub(super) fn bytearray_imul_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "__imul__", args, 1)?;
+    let repeat = bytearray_repeat_count(bytearray_index_value_vm(vm, args[1])?)?;
+    let bytearray = expect_bytearray_mut(args[0], "__imul__")?;
+    bytearray.repeat_in_place(repeat).ok_or_else(|| {
+        BuiltinError::Raised(RuntimeError::memory_error("repeated sequence is too long"))
+    })?;
+    Ok(args[0])
 }
 
 fn collect_bytearray_extend_data(
@@ -2825,13 +2975,53 @@ fn collect_bytearray_extend_data(
 
     collect_iterable_values_with_vm(vm, iterable)?
         .into_iter()
-        .map(bytearray_extend_byte)
+        .map(|value| bytearray_element_byte_vm(vm, value))
         .collect()
 }
 
-#[inline]
-fn bytearray_extend_byte(value: Value) -> Result<u8, BuiltinError> {
-    let byte = expect_integer_like_index(value)?;
+fn bytearray_element_byte_vm(vm: &mut VirtualMachine, value: Value) -> Result<u8, BuiltinError> {
+    let byte = bytearray_index_value_vm(vm, value)?;
     u8::try_from(byte)
         .map_err(|_| BuiltinError::ValueError("byte must be in range(0, 256)".to_string()))
+}
+
+fn bytearray_index_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+    if let Some(index) = value_to_saturated_i64(value) {
+        return Ok(index);
+    }
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(BuiltinError::TypeError(format!(
+                "'{}' object cannot be interpreted as an integer",
+                value.type_name()
+            )));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, &target)?;
+    if let Some(boolean) = indexed.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+    value_to_saturated_i64(indexed).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        ))
+    })
+}
+
+#[inline]
+fn bytearray_repeat_count(count: i64) -> Result<usize, BuiltinError> {
+    if count <= 0 {
+        return Ok(0);
+    }
+    usize::try_from(count).map_err(|_| {
+        BuiltinError::Raised(RuntimeError::memory_error("repeated sequence is too long"))
+    })
 }

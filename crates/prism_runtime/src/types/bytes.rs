@@ -162,6 +162,103 @@ impl BytesObject {
         true
     }
 
+    /// Remove all bytes for mutable instances.
+    ///
+    /// Returns false for immutable `bytes`.
+    #[inline]
+    pub fn clear(&mut self) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+        self.data.clear();
+        true
+    }
+
+    /// Return the underlying vector capacity.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Insert one byte at a CPython-normalized index for mutable instances.
+    ///
+    /// Negative indices insert relative to the end; out-of-range indices clamp
+    /// to the start or end.
+    #[inline]
+    pub fn insert(&mut self, index: i64, byte: u8) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+        let len = self.data.len() as i64;
+        let normalized = if index < 0 { len + index } else { index };
+        let index = normalized.clamp(0, len) as usize;
+        self.data.insert(index, byte);
+        true
+    }
+
+    /// Pop one byte at a Python index for mutable instances.
+    ///
+    /// Returns `None` for immutable receivers or out-of-range indices.
+    #[inline]
+    pub fn pop(&mut self, index: i64) -> Option<u8> {
+        if !self.is_bytearray() {
+            return None;
+        }
+        let index = self.normalize_index(index)?;
+        Some(self.data.remove(index))
+    }
+
+    /// Remove the first matching byte for mutable instances.
+    #[inline]
+    pub fn remove(&mut self, byte: u8) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+        let Some(index) = self.data.iter().position(|&candidate| candidate == byte) else {
+            return false;
+        };
+        self.data.remove(index);
+        true
+    }
+
+    /// Reverse bytes in place for mutable instances.
+    #[inline]
+    pub fn reverse(&mut self) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+        self.data.reverse();
+        true
+    }
+
+    /// Repeat bytes in place for mutable instances.
+    ///
+    /// Returns `None` when the repeated length would overflow `usize`.
+    #[inline]
+    pub fn repeat_in_place(&mut self, n: usize) -> Option<bool> {
+        if !self.is_bytearray() {
+            return Some(false);
+        }
+        let total_len = self.data.len().checked_mul(n)?;
+        if total_len == 0 {
+            self.data.clear();
+            return Some(true);
+        }
+        if n == 1 {
+            return Some(true);
+        }
+
+        self.data
+            .try_reserve_exact(total_len - self.data.len())
+            .ok()?;
+        while self.data.len() < total_len {
+            let remaining = total_len - self.data.len();
+            let copy_len = self.data.len().min(remaining);
+            self.data.extend_from_within(..copy_len);
+        }
+        Some(true)
+    }
+
     /// Set one byte by index for mutable instances.
     ///
     /// Returns false for immutable `bytes` or out-of-bounds index.

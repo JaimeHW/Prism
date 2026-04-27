@@ -28,7 +28,7 @@ use prism_core::Value;
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_mut, value_as_bytes_ref};
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::{ListObject, object_ptr_as_list_mut};
@@ -1636,6 +1636,12 @@ pub fn matmul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// InPlaceAdd: dst = src1; dst += src2.
 #[inline(always)]
 pub fn inplace_add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    match inplace_bytearray_extend(vm, inst) {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
     match inplace_list_extend(vm, inst) {
         Ok(true) => return ControlFlow::Continue,
         Ok(false) => {}
@@ -1654,6 +1660,12 @@ pub fn inplace_sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// InPlaceMul: dst = src1; dst *= src2.
 #[inline(always)]
 pub fn inplace_mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    match inplace_bytearray_repeat(vm, inst) {
+        Ok(true) => return ControlFlow::Continue,
+        Ok(false) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
+
     match inplace_list_repeat(vm, inst) {
         Ok(true) => return ControlFlow::Continue,
         Ok(false) => {}
@@ -1717,6 +1729,57 @@ pub(crate) fn inplace_binary_with_fallback(
 }
 
 #[inline]
+fn inplace_bytearray_extend(
+    vm: &mut VirtualMachine,
+    inst: Instruction,
+) -> Result<bool, RuntimeError> {
+    let (left, right, dst) = {
+        let frame = vm.current_frame();
+        let (left, right) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (left, right, inst.dst().0)
+    };
+
+    if !is_exact_bytearray(left) {
+        return Ok(false);
+    }
+
+    let Some(incoming) = value_as_bytes_ref(right).map(BytesObject::to_vec) else {
+        return Ok(false);
+    };
+    let bytearray = value_as_bytes_mut(left).expect("exact bytearray must have native storage");
+    bytearray.extend_from_slice(&incoming);
+    vm.current_frame_mut().set_reg(dst, left);
+    Ok(true)
+}
+
+#[inline]
+fn inplace_bytearray_repeat(
+    vm: &mut VirtualMachine,
+    inst: Instruction,
+) -> Result<bool, RuntimeError> {
+    let (left, right, dst) = {
+        let frame = vm.current_frame();
+        let (left, right) = frame.get_regs2(inst.src1().0, inst.src2().0);
+        (left, right, inst.dst().0)
+    };
+
+    if !is_exact_bytearray(left) {
+        return Ok(false);
+    }
+
+    let Some(count) = int_like_value(right) else {
+        return Ok(false);
+    };
+    let repeat = repeat_count(count)?;
+    let bytearray = value_as_bytes_mut(left).expect("exact bytearray must have native storage");
+    bytearray
+        .repeat_in_place(repeat)
+        .ok_or_else(sequence_repeat_memory_error)?;
+    vm.current_frame_mut().set_reg(dst, left);
+    Ok(true)
+}
+
+#[inline]
 fn inplace_list_extend(vm: &mut VirtualMachine, inst: Instruction) -> Result<bool, RuntimeError> {
     let (left, right, dst) = {
         let frame = vm.current_frame();
@@ -1774,6 +1837,15 @@ fn is_exact_list(value: Value) -> bool {
     };
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     header.type_id == TypeId::LIST
+}
+
+#[inline]
+fn is_exact_bytearray(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    header.type_id == TypeId::BYTEARRAY
 }
 
 /// Neg: dst = -src1 (generic)
