@@ -855,16 +855,15 @@ fn float_text_argument(value: Value) -> Result<Option<FloatTextArgument>, Builti
         return Ok(Some(FloatTextArgument::Bytes(view.as_bytes().to_vec())));
     }
 
-    let Some(ptr) = value.as_object_ptr() else {
-        return Ok(None);
-    };
-    match crate::ops::objects::extract_type_id(ptr) {
-        TypeId::BYTES | TypeId::BYTEARRAY => {
-            let bytes = unsafe { &*(ptr as *const BytesObject) };
-            Ok(Some(FloatTextArgument::Bytes(bytes.as_bytes().to_vec())))
-        }
-        _ => Ok(None),
+    if let Some(bytes) = value_as_bytes_ref(value) {
+        return Ok(Some(FloatTextArgument::Bytes(bytes.as_bytes().to_vec())));
     }
+
+    if let Some(bytes) = crate::stdlib::array::value_as_array_bytes(value)? {
+        return Ok(Some(FloatTextArgument::Bytes(bytes)));
+    }
+
+    Ok(None)
 }
 
 #[inline]

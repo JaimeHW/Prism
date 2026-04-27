@@ -113,18 +113,7 @@ fn build_validated_set(values: Vec<Value>) -> Result<SetObject, BuiltinError> {
 
 #[inline]
 fn value_to_owned_string(value: Value) -> Option<String> {
-    if value.is_string() {
-        let ptr = value.as_string_object_ptr()?;
-        return Some(interned_by_ptr(ptr as *const u8)?.as_str().to_string());
-    }
-
-    let ptr = value.as_object_ptr()?;
-    if crate::ops::objects::extract_type_id(ptr) != TypeId::STR {
-        return None;
-    }
-
-    let string = unsafe { &*(ptr as *const StringObject) };
-    Some(string.as_str().to_string())
+    value_as_string_ref(value).map(|string| string.as_str().to_string())
 }
 
 #[inline]
