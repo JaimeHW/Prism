@@ -274,6 +274,34 @@ pub(crate) fn lookup_class_metaclass_attr(
 }
 
 #[inline]
+fn attribute_error_with_message(message: impl Into<Arc<str>>) -> RuntimeError {
+    RuntimeError::exception(
+        ExceptionTypeId::AttributeError.as_u8() as u16,
+        message.into(),
+    )
+}
+
+#[inline]
+fn type_object_name_from_ptr(ptr: *const ()) -> Arc<str> {
+    if let Some(represented) = crate::builtins::builtin_type_object_type_id(ptr) {
+        return Arc::from(represented.name());
+    }
+
+    class_object_from_type_ptr(ptr)
+        .map(|class| Arc::<str>::from(class.name().as_str()))
+        .unwrap_or_else(|| Arc::from("type"))
+}
+
+#[inline]
+fn type_object_attribute_error(ptr: *const (), name: &InternedString) -> RuntimeError {
+    let type_name = type_object_name_from_ptr(ptr);
+    attribute_error_with_message(format!(
+        "type object '{}' has no attribute '{}'",
+        type_name, name
+    ))
+}
+
+#[inline]
 fn lookup_instance_class_attr(type_id: TypeId, name: &InternedString) -> Option<Value> {
     lookup_instance_class_slot(type_id, name).map(|slot| slot.value)
 }
@@ -1719,6 +1747,38 @@ fn user_defined_attribute_error(type_id: TypeId, name: &InternedString) -> Runti
     RuntimeError::attribute_error(user_defined_instance_type_name(type_id), name.as_str())
 }
 
+#[inline]
+fn class_declares_instance_dict(class: &PyClassObject) -> bool {
+    class.slot_names().map_or(true, |slots| {
+        slots.iter().any(|slot| slot.as_str() == "__dict__")
+    })
+}
+
+#[inline]
+fn user_defined_instance_has_dict(type_id: TypeId) -> bool {
+    let Some(class) = global_class(ClassId(type_id.raw())) else {
+        return true;
+    };
+
+    class.mro().iter().copied().any(|class_id| {
+        class_id.0 >= TypeId::FIRST_USER_TYPE
+            && global_class(class_id).is_some_and(|base| class_declares_instance_dict(&base))
+    })
+}
+
+#[inline]
+fn user_defined_setattr_error(type_id: TypeId, name: &InternedString) -> RuntimeError {
+    let type_name = user_defined_instance_type_name(type_id);
+    if lookup_instance_class_slot(type_id, name).is_some() {
+        return attribute_error_with_message(format!(
+            "'{}' object attribute '{}' is read-only",
+            type_name, name
+        ));
+    }
+
+    RuntimeError::attribute_error(type_name, name.as_str())
+}
+
 fn ensure_user_defined_instance_dict_value(ptr: *const ()) -> Value {
     let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
     shaped.ensure_instance_dict_value()
@@ -1748,6 +1808,14 @@ fn lookup_user_defined_instance_attribute_default(
     type_id: TypeId,
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
+    if name.as_str() == "__dict__" {
+        return if user_defined_instance_has_dict(type_id) {
+            Ok(Some(ensure_user_defined_instance_dict_value(ptr)))
+        } else {
+            Ok(None)
+        };
+    }
+
     let class_slot = lookup_instance_class_slot(type_id, name);
     if let Some(descriptor) = class_slot
         .as_ref()
@@ -1791,10 +1859,6 @@ fn lookup_user_defined_instance_attribute_default(
         }
 
         return Ok(None);
-    }
-
-    if name.as_str() == "__dict__" {
-        return Ok(Some(ensure_user_defined_instance_dict_value(ptr)));
     }
 
     let shaped = unsafe { &*(ptr as *const ShapedObject) };
@@ -2223,7 +2287,7 @@ pub(crate) fn get_attribute_value(
                     return Ok(value);
                 }
 
-                Err(RuntimeError::attribute_error("type", name.as_str()))
+                Err(type_object_attribute_error(ptr, name))
             }
             _ => {
                 if let Some(value) = descriptor_attr_value_in_vm(vm, obj, name)? {
@@ -2408,10 +2472,7 @@ pub(crate) fn set_attribute_value_default(
             }
             TypeId::TYPE => {
                 let Some(class) = class_object_from_type_ptr(ptr) else {
-                    return Err(RuntimeError::attribute_error(
-                        "type",
-                        format!("'type' object has no attribute '{}'", name),
-                    ));
+                    return Err(type_object_attribute_error(ptr, name));
                 };
                 class.set_attr(name.clone(), value);
                 method_cache().invalidate_type_hierarchy(class.class_type_id());
@@ -2457,16 +2518,18 @@ pub(crate) fn set_attribute_value_default(
                         return Ok(());
                     }
 
-                    if !uses_shaped_user_instance_layout(type_id) {
-                        let type_name = user_defined_instance_type_name(type_id);
-                        return Err(RuntimeError::attribute_error(
-                            Arc::clone(&type_name),
-                            format!("'{}' object has no attribute '{}'", type_name, name),
-                        ));
+                    if name.as_str() == "__dict__" {
+                        return if user_defined_instance_has_dict(type_id) {
+                            set_user_defined_instance_dict_value(ptr, value)
+                        } else {
+                            Err(user_defined_setattr_error(type_id, name))
+                        };
                     }
 
-                    if name.as_str() == "__dict__" {
-                        return set_user_defined_instance_dict_value(ptr, value);
+                    if !uses_shaped_user_instance_layout(type_id)
+                        || !user_defined_instance_has_dict(type_id)
+                    {
+                        return Err(user_defined_setattr_error(type_id, name));
                     }
 
                     let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
@@ -2483,19 +2546,13 @@ pub(crate) fn set_attribute_value_default(
                     return Ok(());
                 }
 
-                Err(RuntimeError::attribute_error(
-                    type_id.name(),
-                    format!("'{}' object has no attribute '{}'", type_id.name(), name),
-                ))
+                Err(RuntimeError::attribute_error(type_id.name(), name.as_str()))
             }
         };
     }
 
     let type_name = primitive_attribute_type_name(obj);
-    Err(RuntimeError::attribute_error(
-        type_name,
-        format!("'{}' object has no attribute '{}'", type_name, name),
-    ))
+    Err(RuntimeError::attribute_error(type_name, name.as_str()))
 }
 
 fn invoke_user_defined_setattr(
@@ -2633,13 +2690,13 @@ pub(crate) fn delete_attribute_value_default(
             }
             TypeId::TYPE => {
                 let Some(class) = class_object_from_type_ptr(ptr) else {
-                    return Err(RuntimeError::attribute_error("type", name.as_str()));
+                    return Err(type_object_attribute_error(ptr, name));
                 };
                 if class.del_attr(name).is_some() {
                     method_cache().invalidate_type_hierarchy(class.class_type_id());
                     Ok(())
                 } else {
-                    Err(RuntimeError::attribute_error("type", name.as_str()))
+                    Err(type_object_attribute_error(ptr, name))
                 }
             }
             _ => {
@@ -2675,17 +2732,18 @@ pub(crate) fn delete_attribute_value_default(
                         return Ok(());
                     }
 
-                    if !uses_shaped_user_instance_layout(type_id) {
-                        let type_name = user_defined_instance_type_name(type_id);
-                        return Err(RuntimeError::attribute_error(
-                            Arc::clone(&type_name),
-                            format!("'{}' object has no attribute '{}'", type_name, name),
-                        ));
+                    if name.as_str() == "__dict__" {
+                        if user_defined_instance_has_dict(type_id) {
+                            reset_user_defined_instance_dict_value(ptr);
+                            return Ok(());
+                        }
+                        return Err(user_defined_setattr_error(type_id, name));
                     }
 
-                    if name.as_str() == "__dict__" {
-                        reset_user_defined_instance_dict_value(ptr);
-                        return Ok(());
+                    if !uses_shaped_user_instance_layout(type_id)
+                        || !user_defined_instance_has_dict(type_id)
+                    {
+                        return Err(user_defined_setattr_error(type_id, name));
                     }
 
                     let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
@@ -2705,19 +2763,17 @@ pub(crate) fn delete_attribute_value_default(
                     }
                 }
 
-                Err(RuntimeError::attribute_error(
-                    type_id.name(),
-                    format!("'{}' object has no attribute '{}'", type_id.name(), name),
-                ))
+                if is_user_defined_type(type_id) {
+                    Err(user_defined_attribute_error(type_id, name))
+                } else {
+                    Err(RuntimeError::attribute_error(type_id.name(), name.as_str()))
+                }
             }
         };
     }
 
     let type_name = primitive_attribute_type_name(obj);
-    Err(RuntimeError::attribute_error(
-        type_name,
-        format!("'{}' object has no attribute '{}'", type_name, name),
-    ))
+    Err(RuntimeError::attribute_error(type_name, name.as_str()))
 }
 
 fn invoke_user_defined_delattr(
