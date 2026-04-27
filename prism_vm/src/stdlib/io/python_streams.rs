@@ -1,10 +1,12 @@
 use super::{BytesIO, DEFAULT_BUFFER_SIZE, IoError, SEEK_CUR, StringIO};
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class,
-    builtin_type_object_type_id,
+    builtin_type_object_type_id, runtime_error_to_builtin_error,
 };
+use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::objects::extract_type_id;
 use crate::stdlib::sys::standard_streams;
+use crate::VirtualMachine;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
@@ -73,10 +75,17 @@ static STREAM_READLINE_METHOD: LazyLock<BuiltinFunctionObject> =
 static STREAM_READLINES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("io._stream.readlines"), stream_readlines)
 });
+static STREAM_WRITELINES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("io._stream.writelines"), stream_writelines)
+});
 static STREAM_ENTER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.__enter__"), stream_enter));
 static STREAM_EXIT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.__exit__"), stream_exit));
+static STREAM_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.__iter__"), stream_iter));
+static STREAM_NEXT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io._stream.__next__"), stream_next));
 static STRING_IO_GETVALUE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("io.StringIO.getvalue"), string_io_getvalue)
 });
@@ -300,8 +309,11 @@ fn set_common_stream_methods(class: &PyClassObject) {
     class.set_attr(intern("close"), builtin_value(&STREAM_CLOSE_METHOD));
     class.set_attr(intern("readline"), builtin_value(&STREAM_READLINE_METHOD));
     class.set_attr(intern("readlines"), builtin_value(&STREAM_READLINES_METHOD));
+    class.set_attr(intern("writelines"), builtin_value(&STREAM_WRITELINES_METHOD));
     class.set_attr(intern("__enter__"), builtin_value(&STREAM_ENTER_METHOD));
     class.set_attr(intern("__exit__"), builtin_value(&STREAM_EXIT_METHOD));
+    class.set_attr(intern("__iter__"), builtin_value(&STREAM_ITER_METHOD));
+    class.set_attr(intern("__next__"), builtin_value(&STREAM_NEXT_METHOD));
 }
 
 fn set_file_stream_methods(class: &PyClassObject) {
@@ -947,6 +959,215 @@ fn stream_readlines(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(list_value(lines))
 }
 
+fn stream_writelines(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "writelines() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let iterator = ensure_iterator_value(vm, args[1]).map_err(runtime_error_to_builtin_error)?;
+
+    match StreamKind::from_receiver(receiver)? {
+        StreamKind::StringIo => {
+            let mut stream = load_string_io(receiver)?;
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = match string_from_value(item, "writelines() argument") {
+                            Ok(data) => data,
+                            Err(err) => {
+                                store_string_io(receiver, stream)?;
+                                return Err(err);
+                            }
+                        };
+                        if let Err(err) = stream.write(&data).map_err(map_io_error) {
+                            store_string_io(receiver, stream)?;
+                            return Err(err);
+                        }
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+            store_string_io(receiver, stream)?;
+        }
+        StreamKind::BytesIo => {
+            let mut stream = load_bytes_io(receiver)?;
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = match bytes_from_value(item, "writelines() argument") {
+                            Ok(data) => data,
+                            Err(err) => {
+                                store_bytes_io(receiver, stream)?;
+                                return Err(err);
+                            }
+                        };
+                        if let Err(err) = stream.write(&data).map_err(map_io_error) {
+                            store_bytes_io(receiver, stream)?;
+                            return Err(err);
+                        }
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+            store_bytes_io(receiver, stream)?;
+        }
+        StreamKind::TextFile => {
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = string_from_value(item, "writelines() argument")?;
+                        write_text_file(receiver, &data)?;
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+        }
+        StreamKind::BinaryFile => {
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = bytes_from_value(item, "writelines() argument")?;
+                        write_binary_file(receiver, &data)?;
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+        }
+        StreamKind::StdOut => {
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = string_from_value(item, "writelines() argument")?;
+                        standard_streams()
+                            .write_stdout(&data)
+                            .map_err(host_stream_error)?;
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+        }
+        StreamKind::StdErr => {
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = string_from_value(item, "writelines() argument")?;
+                        standard_streams()
+                            .write_stderr(&data)
+                            .map_err(host_stream_error)?;
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+        }
+        StreamKind::StdOutBuffer => {
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = bytes_from_value(item, "writelines() argument")?;
+                        standard_streams()
+                            .write_stdout_bytes(&data)
+                            .map_err(host_stream_error)?;
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+        }
+        StreamKind::StdErrBuffer => {
+            loop {
+                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                    IterStep::Yielded(item) => {
+                        let data = bytes_from_value(item, "writelines() argument")?;
+                        standard_streams()
+                            .write_stderr_bytes(&data)
+                            .map_err(host_stream_error)?;
+                    }
+                    IterStep::Exhausted => break,
+                }
+            }
+        }
+        StreamKind::StdIn | StreamKind::StdInBuffer => {
+            return Err(BuiltinError::OSError("stdin is not writable".to_string()));
+        }
+    }
+
+    Ok(Value::none())
+}
+
+fn stream_iter(args: &[Value]) -> Result<Value, BuiltinError> {
+    let receiver = expect_no_method_args(args, "__iter__")?;
+    Ok(receiver)
+}
+
+fn stream_next(args: &[Value]) -> Result<Value, BuiltinError> {
+    let receiver = expect_no_method_args(args, "__next__")?;
+    match StreamKind::from_receiver(receiver)? {
+        StreamKind::StringIo => {
+            let mut stream = load_string_io(receiver)?;
+            let line = stream.readline().map_err(map_io_error)?.to_string();
+            store_string_io(receiver, stream)?;
+            if line.is_empty() {
+                Err(BuiltinError::StopIteration)
+            } else {
+                Ok(string_value(&line))
+            }
+        }
+        StreamKind::BytesIo => {
+            let mut stream = load_bytes_io(receiver)?;
+            let line = stream.readline().map_err(map_io_error)?.to_vec();
+            store_bytes_io(receiver, stream)?;
+            if line.is_empty() {
+                Err(BuiltinError::StopIteration)
+            } else {
+                Ok(bytes_value(&line))
+            }
+        }
+        StreamKind::TextFile => {
+            let line = read_text_file_line(receiver)?;
+            if line.is_empty() {
+                Err(BuiltinError::StopIteration)
+            } else {
+                Ok(string_value(&line))
+            }
+        }
+        StreamKind::BinaryFile => {
+            let line = read_binary_file_line(receiver)?;
+            if line.is_empty() {
+                Err(BuiltinError::StopIteration)
+            } else {
+                Ok(bytes_value(&line))
+            }
+        }
+        StreamKind::StdIn => {
+            let line = standard_streams().read_line().map_err(host_stream_error)?;
+            if line.is_empty() {
+                Err(BuiltinError::StopIteration)
+            } else {
+                Ok(string_value(&line))
+            }
+        }
+        StreamKind::StdInBuffer => {
+            let line = standard_streams()
+                .read_line_bytes()
+                .map_err(host_stream_error)?;
+            if line.is_empty() {
+                Err(BuiltinError::StopIteration)
+            } else {
+                Ok(bytes_value(&line))
+            }
+        }
+        StreamKind::StdOut
+        | StreamKind::StdErr
+        | StreamKind::StdOutBuffer
+        | StreamKind::StdErrBuffer => {
+            Err(BuiltinError::OSError("stream is not readable".to_string()))
+        }
+    }
+}
+
 fn string_io_getvalue(args: &[Value]) -> Result<Value, BuiltinError> {
     let stream = load_string_io(expect_no_method_args(args, "getvalue")?)?;
     Ok(string_value(stream.getvalue()))
@@ -1332,7 +1553,7 @@ fn new_file_stream_object(
     binary: bool,
     initial_position: u64,
 ) -> Value {
-    let mut object = ShapedObject::with_empty_shape(shape_registry().empty_shape());
+    let mut object = allocate_heap_instance_for_class(text_io_wrapper_class().as_ref());
     object.set_property(
         intern(STREAM_KIND_ATTR),
         Value::string(intern(if binary { "binaryfile" } else { "textfile" })),
@@ -1364,7 +1585,7 @@ fn new_fd_stream_object(
     binary: bool,
     closefd: bool,
 ) -> Value {
-    let mut object = ShapedObject::with_empty_shape(shape_registry().empty_shape());
+    let mut object = allocate_heap_instance_for_class(text_io_wrapper_class().as_ref());
     object.set_property(
         intern(STREAM_KIND_ATTR),
         Value::string(intern(if binary { "binaryfile" } else { "textfile" })),
@@ -1436,6 +1657,11 @@ fn install_file_stream_methods(object: &mut ShapedObject) {
         shape_registry(),
     );
     object.set_property(
+        intern("writelines"),
+        bound_builtin_value(&STREAM_WRITELINES_METHOD, Value::none()),
+        shape_registry(),
+    );
+    object.set_property(
         intern("read"),
         bound_builtin_value(&FILE_STREAM_READ_METHOD, Value::none()),
         shape_registry(),
@@ -1468,6 +1694,16 @@ fn install_file_stream_methods(object: &mut ShapedObject) {
     object.set_property(
         intern("__exit__"),
         bound_builtin_value(&STREAM_EXIT_METHOD, Value::none()),
+        shape_registry(),
+    );
+    object.set_property(
+        intern("__iter__"),
+        bound_builtin_value(&STREAM_ITER_METHOD, Value::none()),
+        shape_registry(),
+    );
+    object.set_property(
+        intern("__next__"),
+        bound_builtin_value(&STREAM_NEXT_METHOD, Value::none()),
         shape_registry(),
     );
 }
@@ -1608,6 +1844,7 @@ fn finalize_stream_object(mut object: ShapedObject) -> Value {
                 | "close"
                 | "readline"
                 | "readlines"
+                | "writelines"
                 | "getvalue"
                 | "getbuffer"
                 | "read"
@@ -1617,6 +1854,8 @@ fn finalize_stream_object(mut object: ShapedObject) -> Value {
                 | "fileno"
                 | "__enter__"
                 | "__exit__"
+                | "__iter__"
+                | "__next__"
         ) {
             continue;
         }
