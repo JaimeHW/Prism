@@ -45,6 +45,7 @@ pub(crate) fn resolve_builtin_instance_method(type_id: TypeId, name: &str) -> Op
         TypeId::EXCEPTION => builtin_methods::resolve_exception_method(name),
         TypeId::LIST => builtin_methods::resolve_list_method(name),
         TypeId::TUPLE => builtin_methods::resolve_tuple_method(name),
+        TypeId::SLICE => builtin_methods::resolve_slice_method(name),
         TypeId::DICT => builtin_methods::resolve_dict_method(name),
         TypeId::MAPPING_PROXY => builtin_methods::resolve_mapping_proxy_method(name),
         TypeId::BYTES => builtin_methods::resolve_bytes_method(name),

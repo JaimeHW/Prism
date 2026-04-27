@@ -13,6 +13,7 @@ use prism_runtime::object::views::{DescriptorViewObject, MappingProxyObject, Met
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
@@ -421,6 +422,7 @@ const TUPLE_METHOD_NAMES: &[&str] = &[
     "count",
     "index",
 ];
+const SLICE_METHOD_NAMES: &[&str] = &["__hash__", "indices"];
 const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
 const PROPERTY_METHOD_NAMES: &[&str] = &[
@@ -497,6 +499,7 @@ fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
         TypeId::BYTEARRAY => BYTEARRAY_METHOD_NAMES,
         TypeId::MEMORYVIEW => MEMORYVIEW_METHOD_NAMES,
         TypeId::TUPLE => TUPLE_METHOD_NAMES,
+        TypeId::SLICE => SLICE_METHOD_NAMES,
         TypeId::ITERATOR => ITERATOR_METHOD_NAMES,
         TypeId::GENERATOR => GENERATOR_METHOD_NAMES,
         TypeId::PROPERTY => PROPERTY_METHOD_NAMES,
@@ -1784,6 +1787,7 @@ pub(crate) fn builtin_instance_attribute_value(
         )),
         (TypeId::BOOL, "imag") => Ok(Some(Value::int(0).expect("zero should fit"))),
         (TypeId::BOOL, "denominator") => Ok(Some(Value::int(1).expect("one should fit"))),
+        (TypeId::SLICE, attr) => slice_instance_attr_value(receiver, attr),
         (TypeId::MEMORYVIEW, attr) => memoryview_instance_attr_value(vm, receiver, attr),
         (TypeId::OBJECT, "__str__") => alloc_view(
             vm,
@@ -1810,6 +1814,7 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
         (TypeId::OBJECT, "__str__")
             | (TypeId::INT, "real" | "imag" | "numerator" | "denominator")
             | (TypeId::BOOL, "real" | "imag" | "numerator" | "denominator")
+            | (TypeId::SLICE, "start" | "stop" | "step")
             | (
                 TypeId::MEMORYVIEW,
                 "format"
@@ -1822,6 +1827,22 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
                     | "obj",
             )
     )
+}
+
+fn slice_instance_attr_value(
+    receiver: Value,
+    attr: &str,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(ptr) = receiver.as_object_ptr() else {
+        return Ok(None);
+    };
+    let slice = unsafe { &*(ptr as *const SliceObject) };
+    Ok(match attr {
+        "start" => Some(slice.start_value()),
+        "stop" => Some(slice.stop_value()),
+        "step" => Some(slice.step_value()),
+        _ => None,
+    })
 }
 
 fn memoryview_instance_attr_value(

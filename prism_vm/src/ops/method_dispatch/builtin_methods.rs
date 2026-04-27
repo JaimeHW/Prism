@@ -33,7 +33,8 @@ use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{CloseResult, GeneratorObject, prepare_close};
 use crate::vm::GeneratorResumeOutcome;
-use num_traits::ToPrimitive;
+use num_bigint::BigInt;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
@@ -134,6 +135,10 @@ static TUPLE_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("tuple.count"), tuple_count));
 static TUPLE_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("tuple.index"), tuple_index));
+static SLICE_INDICES_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("slice.indices"), slice_indices));
+static SLICE_HASH_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("slice.__hash__"), slice_hash));
 static DEQUE_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.append"), deque_append));
 static DEQUE_APPENDLEFT_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -482,6 +487,19 @@ pub fn resolve_tuple_method(name: &str) -> Option<CachedMethod> {
         ))),
         "index" => Some(CachedMethod::simple(builtin_method_value(
             &TUPLE_INDEX_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+/// Resolve builtin slice methods backed by native slice storage.
+pub fn resolve_slice_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "indices" => Some(CachedMethod::simple(builtin_method_value(
+            &SLICE_INDICES_METHOD,
+        ))),
+        "__hash__" => Some(CachedMethod::simple(builtin_method_value(
+            &SLICE_HASH_METHOD,
         ))),
         _ => None,
     }
@@ -1258,6 +1276,126 @@ fn tuple_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
 }
 
 #[inline]
+fn slice_hash(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("slice", "__hash__", args, 0)?;
+    expect_slice_ref(args[0], "__hash__")?;
+    builtin_hash(&[args[0]])
+}
+
+fn slice_indices(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("slice", "indices", args, 1)?;
+    let slice = expect_slice_ref(args[0], "indices")?;
+    let length = slice_index_bigint(vm, args[1])?;
+    if length.is_negative() {
+        return Err(BuiltinError::ValueError(
+            "length should not be negative".to_string(),
+        ));
+    }
+
+    let step = if slice.step_value().is_none() {
+        BigInt::one()
+    } else {
+        slice_index_bigint(vm, slice.step_value())?
+    };
+    if step.is_zero() {
+        return Err(BuiltinError::ValueError(
+            "slice step cannot be zero".to_string(),
+        ));
+    }
+
+    let (lower, upper) = if step.is_negative() {
+        (-BigInt::one(), &length - BigInt::one())
+    } else {
+        (BigInt::zero(), length.clone())
+    };
+
+    let start = if slice.start_value().is_none() {
+        if step.is_negative() {
+            upper.clone()
+        } else {
+            lower.clone()
+        }
+    } else {
+        clamp_slice_component(slice_index_bigint(vm, slice.start_value())?, &length, &lower, &upper)
+    };
+
+    let stop = if slice.stop_value().is_none() {
+        if step.is_negative() {
+            lower.clone()
+        } else {
+            upper.clone()
+        }
+    } else {
+        clamp_slice_component(slice_index_bigint(vm, slice.stop_value())?, &length, &lower, &upper)
+    };
+
+    Ok(to_object_value(TupleObject::from_slice(&[
+        bigint_to_value(start),
+        bigint_to_value(stop),
+        bigint_to_value(step),
+    ])))
+}
+
+fn clamp_slice_component(
+    mut value: BigInt,
+    length: &BigInt,
+    lower: &BigInt,
+    upper: &BigInt,
+) -> BigInt {
+    if value.is_negative() {
+        value += length;
+        if value < *lower {
+            lower.clone()
+        } else {
+            value
+        }
+    } else if value > *upper {
+        upper.clone()
+    } else {
+        value
+    }
+}
+
+fn slice_index_bigint(vm: &mut VirtualMachine, value: Value) -> Result<BigInt, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(BigInt::from(u8::from(flag)));
+    }
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(integer);
+    }
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(BuiltinError::TypeError(
+                "slice indices must be integers or None or have an __index__ method".to_string(),
+            ));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, &target)?;
+    value_to_bigint(indexed).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        ))
+    })
+}
+
+fn invoke_bound_method_no_args(
+    vm: &mut VirtualMachine,
+    target: &BoundMethodTarget,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self])
+            .map_err(runtime_error_to_builtin_error),
+        None => invoke_callable_value(vm, target.callable, &[])
+            .map_err(runtime_error_to_builtin_error),
+    }
+}
+
+#[inline]
 fn sequence_contains_slice(
     vm: &mut VirtualMachine,
     items: &[Value],
@@ -1296,6 +1434,25 @@ fn sequence_contains_indexed(
 fn slice_object_from_value_ptr(ptr: *const ()) -> Option<&'static SliceObject> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     (header.type_id == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
+}
+
+#[inline]
+fn expect_slice_ref(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static SliceObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'slice.{method_name}' requires a 'slice' object but received '{}'",
+            value.type_name()
+        )));
+    };
+    slice_object_from_value_ptr(ptr).ok_or_else(|| {
+        let type_name = unsafe { (*(ptr as *const ObjectHeader)).type_id.name() };
+        BuiltinError::TypeError(format!(
+            "descriptor 'slice.{method_name}' requires a 'slice' object but received '{type_name}'"
+        ))
+    })
 }
 
 #[inline]

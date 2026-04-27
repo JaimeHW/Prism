@@ -27,6 +27,7 @@ use prism_runtime::object::views::UnionTypeObject;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::value_as_list_ref;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::simd::search::{bytes_contains, str_contains};
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::value_as_tuple_ref;
@@ -426,6 +427,13 @@ fn native_sequence_ref(value: Value) -> Option<NativeSequenceRef> {
 }
 
 #[inline]
+fn exact_slice_ref(value: Value) -> Option<&'static SliceObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    (header.type_id == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
+}
+
+#[inline]
 fn exact_native_sequence_kind(value: Value) -> Option<NativeSequenceKind> {
     let ptr = value.as_object_ptr()?;
     match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
@@ -503,6 +511,10 @@ fn eq_result_inner(
         return Ok(equal);
     }
 
+    if exact_slice_ref(a).is_some() || exact_slice_ref(b).is_some() {
+        return slice_eq_result(vm, a, b, seen_pairs);
+    }
+
     if exact_native_sequence_kind(a).is_some()
         && exact_native_sequence_kind(a) == exact_native_sequence_kind(b)
         && let Some(equal) = native_sequence_eq_result(vm, a, b, seen_pairs)?
@@ -519,6 +531,39 @@ fn eq_result_inner(
     }
 
     Ok(values_equal(a, b))
+}
+
+fn slice_eq_result(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<bool, RuntimeError> {
+    if left.raw_bits() == right.raw_bits() {
+        return Ok(true);
+    }
+
+    let Some(left_slice) = exact_slice_ref(left) else {
+        return Ok(false);
+    };
+    let Some(right_slice) = exact_slice_ref(right) else {
+        return Ok(false);
+    };
+
+    for (left_value, right_value) in [
+        (left_slice.start_value(), right_slice.start_value()),
+        (left_slice.stop_value(), right_slice.stop_value()),
+        (left_slice.step_value(), right_slice.step_value()),
+    ] {
+        if left_value.raw_bits() == right_value.raw_bits() {
+            continue;
+        }
+        if !eq_result_inner(vm, left_value, right_value, seen_pairs)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 #[inline]
@@ -1552,6 +1597,13 @@ fn values_equal_inner(a: Value, b: Value, seen_pairs: &mut FxHashSet<(usize, usi
         }
 
         match (left_type, right_type) {
+            (TypeId::SLICE, TypeId::SLICE) => {
+                let left = unsafe { &*(pa as *const SliceObject) };
+                let right = unsafe { &*(pb as *const SliceObject) };
+                return values_equal_inner(left.start_value(), right.start_value(), seen_pairs)
+                    && values_equal_inner(left.stop_value(), right.stop_value(), seen_pairs)
+                    && values_equal_inner(left.step_value(), right.step_value(), seen_pairs);
+            }
             (TypeId::LIST, TypeId::LIST) => {
                 let pair = ordered_object_pair(pa, pb);
                 if !seen_pairs.insert(pair) {

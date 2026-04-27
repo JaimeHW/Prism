@@ -474,6 +474,8 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
             .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
         TypeId::EXCEPTION => resolve_exception_method(obj, name),
         TypeId::TUPLE => resolve_tuple_method(name),
+        TypeId::SLICE => builtin_methods::resolve_slice_method(name)
+            .ok_or_else(|| RuntimeError::attribute_error("slice", name)),
         TypeId::STR => resolve_str_method(name),
         TypeId::SET | TypeId::FROZENSET => resolve_set_method(type_id, name),
         TypeId::INT => resolve_int_method(name),

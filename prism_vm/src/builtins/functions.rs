@@ -24,6 +24,7 @@ use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::MemoryViewObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::{object_ptr_as_string_ref, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
@@ -1420,6 +1421,12 @@ fn hash_value(value: Value) -> Result<i64, BuiltinError> {
             let tuple = unsafe { &*(ptr as *const TupleObject) };
             hash_tuple(tuple)
         }
+        TypeId::SLICE => {
+            let slice = unsafe { &*(ptr as *const SliceObject) };
+            let components =
+                TupleObject::from_slice(&[slice.start_value(), slice.stop_value(), slice.step_value()]);
+            hash_tuple(&components)
+        }
         _ => Ok(hash_with_default_hasher(&(ptr as usize))),
     }
 }
@@ -1768,6 +1775,15 @@ impl ReprState {
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
                 Ok(range.to_string())
+            }
+            TypeId::SLICE => {
+                let slice = unsafe { &*(ptr as *const SliceObject) };
+                Ok(format!(
+                    "slice({}, {}, {})",
+                    self.repr_value(slice.start_value())?,
+                    self.repr_value(slice.stop_value())?,
+                    self.repr_value(slice.step_value())?
+                ))
             }
             TypeId::COMPLEX => {
                 let complex = unsafe { &*(ptr as *const ComplexObject) };
