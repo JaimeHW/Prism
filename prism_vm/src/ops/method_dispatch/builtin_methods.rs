@@ -29,6 +29,7 @@ use crate::ops::objects::{
     list_storage_ref_from_ptr, object_getattribute_default, set_attribute_value,
     set_list_item_value, tuple_storage_ref_from_ptr,
 };
+use crate::python_numeric::complex_like_parts;
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{CloseResult, GeneratorObject, prepare_close};
@@ -52,6 +53,7 @@ use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::{
     MemoryViewFormat, MemoryViewObject, value_as_memoryview_mut, value_as_memoryview_ref,
 };
+use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::simd::search::{
     bytes_count as simd_bytes_count, bytes_find as simd_bytes_find,
@@ -135,6 +137,10 @@ static TUPLE_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("tuple.count"), tuple_count));
 static TUPLE_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("tuple.index"), tuple_index));
+static RANGE_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("range.count"), range_count));
+static RANGE_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("range.index"), range_index));
 static SLICE_INDICES_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("slice.indices"), slice_indices));
 static SLICE_HASH_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -489,6 +495,19 @@ pub fn resolve_tuple_method(name: &str) -> Option<CachedMethod> {
         ))),
         "index" => Some(CachedMethod::simple(builtin_method_value(
             &TUPLE_INDEX_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+/// Resolve builtin range methods backed by native range arithmetic.
+pub fn resolve_range_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "count" => Some(CachedMethod::simple(builtin_method_value(
+            &RANGE_COUNT_METHOD,
+        ))),
+        "index" => Some(CachedMethod::simple(builtin_method_value(
+            &RANGE_INDEX_METHOD,
         ))),
         _ => None,
     }
@@ -1275,6 +1294,83 @@ fn tuple_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
     Err(BuiltinError::ValueError(
         "tuple.index(x): x not in tuple".to_string(),
     ))
+}
+
+#[inline]
+fn range_count(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("range", "count", args, 1)?;
+    let range = expect_range_ref(args[0], "count")?;
+    let needle = args[1];
+
+    if let Some(value) = range_integral_search_value(needle) {
+        return Ok(Value::int_unchecked(if range.contains_bigint(&value) {
+            1
+        } else {
+            0
+        }));
+    }
+
+    let mut count = BigInt::zero();
+    for item in range.iter() {
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            count += BigInt::one();
+        }
+    }
+
+    Ok(bigint_to_value(count))
+}
+
+#[inline]
+fn range_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("range", "index", args, 1)?;
+    let range = expect_range_ref(args[0], "index")?;
+    let needle = args[1];
+
+    if let Some(value) = range_integral_search_value(needle) {
+        if let Some(index) = range.index_of_bigint(&value) {
+            return Ok(bigint_to_value(index));
+        }
+
+        return Err(BuiltinError::ValueError(format!(
+            "{} is not in range",
+            needle
+        )));
+    }
+
+    let mut index = BigInt::zero();
+    for item in range.iter() {
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            return Ok(bigint_to_value(index));
+        }
+        index += BigInt::one();
+    }
+
+    Err(BuiltinError::ValueError(format!(
+        "{} is not in range",
+        needle
+    )))
+}
+
+#[inline]
+fn range_integral_search_value(value: Value) -> Option<BigInt> {
+    if let Some(boolean) = value.as_bool() {
+        return Some(BigInt::from(u8::from(boolean)));
+    }
+    if let Some(integer) = value_to_bigint(value) {
+        return Some(integer);
+    }
+
+    let parts = complex_like_parts(value)?;
+    if parts.imag == 0.0
+        && parts.real.is_finite()
+        && parts.real.fract() == 0.0
+        && parts.real >= i64::MIN as f64
+        && parts.real <= i64::MAX as f64
+    {
+        return Some(BigInt::from(parts.real as i64));
+    }
+
+    None
 }
 
 #[inline]
@@ -3189,6 +3285,29 @@ fn expect_tuple_ref(
     };
 
     Ok(tuple)
+}
+
+#[inline]
+fn expect_range_ref(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static RangeObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'range.{method_name}' requires a 'range' object but received '{}'",
+            value.type_name()
+        )));
+    };
+
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::RANGE {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'range.{method_name}' requires a 'range' object but received '{}'",
+            header.type_id.name()
+        )));
+    }
+
+    Ok(unsafe { &*(ptr as *const RangeObject) })
 }
 
 #[inline]
