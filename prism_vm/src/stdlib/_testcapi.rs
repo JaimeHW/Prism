@@ -12,7 +12,7 @@ use crate::builtins::{
 };
 use crate::import::ModuleObject;
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
-use crate::ops::objects::dict_storage_ref_from_ptr;
+use crate::ops::objects::{dict_storage_ref_from_ptr, get_attribute_value};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
@@ -28,6 +28,7 @@ use prism_runtime::object::type_builtins::{
     register_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::value_as_bytes_ref;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::string::value_as_string_ref;
@@ -108,6 +109,12 @@ static HAS_VECTORCALL_FLAG: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("_testcapi.has_vectorcall_flag"),
         has_vectorcall_flag,
+    )
+});
+static OBJECT_HASATTRSTRING: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("_testcapi.object_hasattrstring"),
+        object_hasattrstring,
     )
 });
 
@@ -223,6 +230,7 @@ impl TestCapiModule {
                 "function_setvectorcall",
                 "make_vectorcall_class",
                 "has_vectorcall_flag",
+                "object_hasattrstring",
                 "MethodDescriptorBase",
                 "MethodDescriptorDerived",
                 "MethodDescriptorNopGet",
@@ -261,6 +269,7 @@ impl Module for TestCapiModule {
             "function_setvectorcall" => Ok(builtin_value(&FUNCTION_SETVECTORCALL)),
             "make_vectorcall_class" => Ok(builtin_value(&MAKE_VECTORCALL_CLASS)),
             "has_vectorcall_flag" => Ok(builtin_value(&HAS_VECTORCALL_FLAG)),
+            "object_hasattrstring" => Ok(builtin_value(&OBJECT_HASATTRSTRING)),
             "MethodDescriptorBase" => Ok(class_value(&METHOD_DESCRIPTOR_BASE_CLASS)),
             "MethodDescriptorDerived" => Ok(class_value(&METHOD_DESCRIPTOR_DERIVED_CLASS)),
             "MethodDescriptorNopGet" => Ok(class_value(&METHOD_DESCRIPTOR_NOP_GET_CLASS)),
@@ -321,6 +330,7 @@ impl Module for TestCapiModule {
             builtin_value(&MAKE_VECTORCALL_CLASS),
         );
         module.set_attr("has_vectorcall_flag", builtin_value(&HAS_VECTORCALL_FLAG));
+        module.set_attr("object_hasattrstring", builtin_value(&OBJECT_HASATTRSTRING));
         module.set_attr(
             "MethodDescriptorBase",
             class_value(&METHOD_DESCRIPTOR_BASE_CLASS),
@@ -836,6 +846,28 @@ fn has_vectorcall_flag(args: &[Value]) -> Result<Value, BuiltinError> {
         BuiltinError::TypeError("has_vectorcall_flag() argument must be a type".to_string())
     })?;
     Ok(Value::bool(flag))
+}
+
+fn object_hasattrstring(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "object_hasattrstring() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let name_bytes = value_as_bytes_ref(args[1]).ok_or_else(|| {
+        BuiltinError::TypeError("object_hasattrstring() name must be bytes".to_string())
+    })?;
+    let name = std::str::from_utf8(name_bytes.as_bytes()).map_err(|_| {
+        BuiltinError::ValueError("object_hasattrstring() name must be valid UTF-8".to_string())
+    })?;
+
+    match get_attribute_value(vm, args[0], &intern(name)) {
+        Ok(_) => Ok(Value::int(1).expect("1 fits in tagged int")),
+        Err(err) if err.is_attribute_error() => Ok(Value::int(0).expect("0 fits in tagged int")),
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
+    }
 }
 
 fn make_vectorcall_class(args: &[Value]) -> Result<Value, BuiltinError> {
