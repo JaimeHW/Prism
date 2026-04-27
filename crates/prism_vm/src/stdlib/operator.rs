@@ -65,6 +65,9 @@ static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
 static ADD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.add"), operator_add));
+static FLOOR_DIV_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("operator.floordiv"), operator_floordiv)
+});
 static MOD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.mod"), operator_mod));
 static POW_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -75,6 +78,7 @@ const EXPORTS: &[&str] = &[
     "contains",
     "countOf",
     "eq",
+    "floordiv",
     "ge",
     "gt",
     "index",
@@ -105,7 +109,7 @@ impl OperatorModule {
             attrs: EXPORTS
                 .iter()
                 .copied()
-                .chain(["__add__", "__mod__", "__pow__", "__all__"])
+                .chain(["__add__", "__floordiv__", "__mod__", "__pow__", "__all__"])
                 .map(Arc::from)
                 .collect(),
             all: string_list_value(EXPORTS),
@@ -143,6 +147,7 @@ impl Module for OperatorModule {
             "is_" => Ok(builtin_value(&IS_FUNCTION)),
             "is_not" => Ok(builtin_value(&IS_NOT_FUNCTION)),
             "add" | "__add__" => Ok(builtin_value(&ADD_FUNCTION)),
+            "floordiv" | "__floordiv__" => Ok(builtin_value(&FLOOR_DIV_FUNCTION)),
             "mod" | "__mod__" => Ok(builtin_value(&MOD_FUNCTION)),
             "pow" | "__pow__" => Ok(builtin_value(&POW_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
@@ -478,6 +483,15 @@ fn operator_add(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builti
     add_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
 }
 
+fn operator_floordiv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("floordiv", args, 2)?;
+    if let Some(result) = numeric_floor_div_values(args[0], args[1])? {
+        return Ok(result);
+    }
+
+    invoke_binary_operator_method(vm, args[0], args[1], "__floordiv__", "__rfloordiv__", "//")
+}
+
 fn operator_mod(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("mod", args, 2)?;
     if let Some(result) = numeric_mod_values(args[0], args[1])? {
@@ -490,6 +504,38 @@ fn operator_mod(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builti
 fn operator_pow(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("pow", args, 2)?;
     crate::builtins::builtin_pow_vm(vm, args)
+}
+
+fn numeric_floor_div_values(left: Value, right: Value) -> Result<Option<Value>, BuiltinError> {
+    let left_is_float = prism_runtime::types::float::value_to_f64(left).is_some();
+    let right_is_float = prism_runtime::types::float::value_to_f64(right).is_some();
+
+    if left_is_float || right_is_float {
+        let Some(x) = float_like_value(left) else {
+            return Ok(None);
+        };
+        let Some(y) = float_like_value(right) else {
+            return Ok(None);
+        };
+        if y == 0.0 {
+            return Err(runtime_error_to_builtin_error(
+                RuntimeError::zero_division_with_message("float floor division"),
+            ));
+        }
+        return Ok(Some(Value::float((x / y).floor())));
+    }
+
+    let Some(x) = integer_value(left) else {
+        return Ok(None);
+    };
+    let Some(y) = integer_value(right) else {
+        return Ok(None);
+    };
+    if y == BigInt::from(0) {
+        return Err(runtime_error_to_builtin_error(RuntimeError::zero_division()));
+    }
+
+    Ok(Some(bigint_to_value(python_int_floor_div(x, y))))
 }
 
 fn numeric_mod_values(left: Value, right: Value) -> Result<Option<Value>, BuiltinError> {
@@ -524,6 +570,11 @@ fn integer_value(value: Value) -> Option<BigInt> {
         .as_bool()
         .map(|flag| BigInt::from(u8::from(flag)))
         .or_else(|| value_to_bigint(value))
+}
+
+fn python_int_floor_div(left: BigInt, right: BigInt) -> BigInt {
+    let remainder = python_int_mod(left.clone(), right.clone());
+    (left - remainder) / right
 }
 
 fn python_int_mod(left: BigInt, right: BigInt) -> BigInt {

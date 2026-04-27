@@ -412,6 +412,8 @@ static INT_TO_BYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
         crate::builtins::builtin_int_to_bytes,
     )
 });
+static INT_CONJUGATE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.conjugate"), int_conjugate));
 static BOOL_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bool.__repr__"), value_repr));
 static BOOL_STR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -428,6 +430,8 @@ static FLOAT_HEX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.hex"), float_hex));
 static FLOAT_IS_INTEGER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.is_integer"), float_is_integer));
+static FLOAT_CONJUGATE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.conjugate"), float_conjugate));
 static FLOAT_AS_INTEGER_RATIO_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("float.as_integer_ratio"), float_as_integer_ratio)
 });
@@ -891,6 +895,9 @@ pub fn resolve_int_method(name: &str) -> Option<CachedMethod> {
         "to_bytes" => Some(CachedMethod::simple(builtin_method_value(
             &INT_TO_BYTES_METHOD,
         ))),
+        "conjugate" => Some(CachedMethod::simple(builtin_method_value(
+            &INT_CONJUGATE_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -928,6 +935,9 @@ pub fn resolve_float_method(name: &str) -> Option<CachedMethod> {
         ))),
         "is_integer" => Some(CachedMethod::simple(builtin_method_value(
             &FLOAT_IS_INTEGER_METHOD,
+        ))),
+        "conjugate" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_CONJUGATE_METHOD,
         ))),
         "as_integer_ratio" => Some(CachedMethod::simple(builtin_method_value(
             &FLOAT_AS_INTEGER_RATIO_METHOD,
@@ -1002,6 +1012,12 @@ fn float_is_integer(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("float", "is_integer", args, 0)?;
     let value = expect_float_receiver(args, "is_integer")?;
     Ok(Value::bool(value.is_finite() && value.fract() == 0.0))
+}
+
+fn float_conjugate(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "conjugate", args, 0)?;
+    let value = expect_float_receiver(args, "conjugate")?;
+    Ok(Value::float(value))
 }
 
 fn float_as_integer_ratio(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -1990,6 +2006,16 @@ fn int_index(args: &[Value]) -> Result<Value, BuiltinError> {
         "descriptor 'int.__index__' requires an 'int' object but received '{}'",
         args[0].type_name()
     )))
+}
+
+#[inline]
+fn int_conjugate(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("int", "conjugate", args, 0)?;
+    if let Some(value) = args[0].as_bool() {
+        return Ok(Value::int(i64::from(value)).expect("bool conjugate result should fit"));
+    }
+    let value = int_receiver_bigint(args[0], "conjugate")?;
+    Ok(bigint_to_value(value))
 }
 
 #[inline]

@@ -1415,6 +1415,7 @@ pub(crate) fn call_builtin_type_with_vm(
         TypeId::INT => builtin_int_vm(vm, args),
         TypeId::TYPE => builtin_type_with_vm(vm, args),
         TypeId::SUPER => builtin_super(vm, args),
+        TypeId::COMPLEX => super::numeric::builtin_complex_vm(vm, args),
         TypeId::MAPPING_PROXY => builtin_mappingproxy(args),
         TypeId::DEQUE => builtin_deque_with_vm(vm, args),
         TypeId::METHOD => builtin_methodtype(args),

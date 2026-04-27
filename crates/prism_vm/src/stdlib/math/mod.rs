@@ -42,15 +42,19 @@ pub use special::*;
 pub use trig::*;
 
 use super::{Module, ModuleError, ModuleResult};
-use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use prism_core::Value;
-use prism_runtime::types::int::value_to_saturated_i64;
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint, value_to_saturated_i64};
 use std::sync::{Arc, LazyLock};
 
 static CEIL_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.ceil"), math_ceil_builtin));
 static FLOOR_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.floor"), math_floor_builtin));
+static TRUNC_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.trunc"), math_trunc_builtin));
 static FABS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.fabs"), math_fabs_builtin));
 static COPYSIGN_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -122,6 +126,7 @@ impl Module for MathModule {
             "nan" => Ok(Value::float(NAN)),
             "ceil" => Ok(builtin_value(&CEIL_FUNCTION)),
             "floor" => Ok(builtin_value(&FLOOR_FUNCTION)),
+            "trunc" => Ok(builtin_value(&TRUNC_FUNCTION)),
             "fabs" => Ok(builtin_value(&FABS_FUNCTION)),
             "copysign" => Ok(builtin_value(&COPYSIGN_FUNCTION)),
             "sin" => Ok(builtin_value(&SIN_FUNCTION)),
@@ -144,10 +149,9 @@ impl Module for MathModule {
 
             // Functions are returned as None for now
             // Full implementation would return callable objects
-            "trunc" | "fmod" | "modf" | "remainder" | "tan" | "asin" | "atan" | "atan2"
-            | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "exp2" | "expm1"
-            | "log1p" | "pow" | "isqrt" | "hypot" | "factorial" | "comb" | "perm" | "lcm"
-            | "degrees" | "radians" => {
+            "fmod" | "modf" | "remainder" | "tan" | "asin" | "atan" | "atan2" | "sinh" | "cosh"
+            | "tanh" | "asinh" | "acosh" | "atanh" | "exp2" | "expm1" | "log1p" | "pow"
+            | "isqrt" | "hypot" | "factorial" | "comb" | "perm" | "lcm" | "degrees" | "radians" => {
                 // TODO: Return actual function objects when callable system is ready
                 Err(ModuleError::AttributeError(format!(
                     "math.{} is not yet callable as an object",
@@ -341,6 +345,48 @@ fn math_ceil_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
 fn math_floor_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "floor", 1)?;
     float_to_integral_value(floor(extract_float_builtin(&args[0])?))
+}
+
+fn math_trunc_builtin(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_math_arg_count(args, "trunc", 1)?;
+    let value = args[0];
+
+    if let Some(boolean) = value.as_bool() {
+        return Ok(Value::int(i64::from(boolean)).expect("bool trunc result should fit"));
+    }
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(bigint_to_value(integer));
+    }
+    if value.as_float().is_some() {
+        return crate::builtins::builtin_int_vm(vm, &[value]);
+    }
+
+    let target = match resolve_special_method(value, "__trunc__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => {
+            return Err(BuiltinError::TypeError(format!(
+                "type {} doesn't define __trunc__ method",
+                value.type_name()
+            )));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    invoke_bound_method_no_args(vm, target)
+}
+
+fn invoke_bound_method_no_args(
+    vm: &mut crate::VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(runtime_error_to_builtin_error)
 }
 
 #[inline]

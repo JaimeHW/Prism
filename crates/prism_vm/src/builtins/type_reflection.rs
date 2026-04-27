@@ -1906,6 +1906,12 @@ pub(crate) fn builtin_instance_attribute_value(
         )),
         (TypeId::BOOL, "imag") => Ok(Some(Value::int(0).expect("zero should fit"))),
         (TypeId::BOOL, "denominator") => Ok(Some(Value::int(1).expect("one should fit"))),
+        (TypeId::FLOAT, "real") => Ok(Some(Value::float(
+            receiver
+                .as_float()
+                .expect("float receiver should expose float payload"),
+        ))),
+        (TypeId::FLOAT, "imag") => Ok(Some(Value::float(0.0))),
         (TypeId::RANGE, attr) => range_instance_attr_value(receiver, attr),
         (TypeId::SLICE, attr) => slice_instance_attr_value(receiver, attr),
         (TypeId::MEMORYVIEW, attr) => memoryview_instance_attr_value(vm, receiver, attr),
@@ -1934,6 +1940,7 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
         (TypeId::OBJECT, "__str__")
             | (TypeId::INT, "real" | "imag" | "numerator" | "denominator")
             | (TypeId::BOOL, "real" | "imag" | "numerator" | "denominator")
+            | (TypeId::FLOAT, "real" | "imag")
             | (TypeId::RANGE, "start" | "stop" | "step")
             | (TypeId::SLICE, "start" | "stop" | "step")
             | (

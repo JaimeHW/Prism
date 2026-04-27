@@ -495,6 +495,36 @@ pub fn builtin_complex(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 }
 
+pub fn builtin_complex_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "complex() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    match args.len() {
+        0 => Ok(boxed_complex_value(0.0, 0.0)),
+        1 => {
+            if is_complex_value(args[0]) {
+                return Ok(args[0]);
+            }
+
+            let parts = extract_complex_parts_vm(vm, args[0], "real")?;
+            Ok(boxed_complex_value(parts.real, parts.imag))
+        }
+        2 => {
+            let real = extract_complex_parts_vm(vm, args[0], "real")?;
+            let imag = extract_complex_parts_vm(vm, args[1], "imag")?;
+            Ok(boxed_complex_value(
+                real.real - imag.imag,
+                real.imag + imag.real,
+            ))
+        }
+        _ => unreachable!(),
+    }
+}
+
 #[inline]
 fn boxed_complex_value(real: f64, imag: f64) -> Value {
     crate::alloc_managed_value(ComplexObject::new(real, imag))
@@ -510,6 +540,70 @@ fn extract_complex_parts(value: Value, part_name: &str) -> Result<ComplexParts, 
         "complex() {} part must be a number, not '{}'",
         part_name,
         type_name_of(&value)
+    )))
+}
+
+fn extract_complex_parts_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    part_name: &str,
+) -> Result<ComplexParts, BuiltinError> {
+    if let Some(parts) = complex_like_parts(value) {
+        return Ok(parts);
+    }
+
+    if let Some(result) = invoke_zero_arg_special_method(vm, value, "__complex__")? {
+        return exact_complex_result_parts(result, "__complex__");
+    }
+
+    let float_value = super::types::builtin_float_vm(vm, &[value])?;
+    let Some(float) = float_value.as_float() else {
+        return Err(BuiltinError::TypeError(format!(
+            "complex() {} part must be a real number, not '{}'",
+            part_name,
+            type_name_of(&value)
+        )));
+    };
+
+    Ok(ComplexParts {
+        real: float,
+        imag: 0.0,
+    })
+}
+
+fn invoke_zero_arg_special_method(
+    vm: &mut VirtualMachine,
+    value: Value,
+    name: &'static str,
+) -> Result<Option<Value>, BuiltinError> {
+    let target = match resolve_special_method(value, name) {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => return Ok(None),
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    invoke_bound_method_no_args(vm, target).map(Some)
+}
+
+fn exact_complex_result_parts(
+    result: Value,
+    method_name: &'static str,
+) -> Result<ComplexParts, BuiltinError> {
+    let is_exact_complex = result
+        .as_object_ptr()
+        .is_some_and(|ptr| crate::ops::objects::extract_type_id(ptr) == TypeId::COMPLEX);
+    if is_exact_complex {
+        return complex_like_parts(result).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{method_name} returned non-complex (type {})",
+                type_name_of(&result)
+            ))
+        });
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "{method_name} returned non-complex (type {})",
+        type_name_of(&result)
     )))
 }
 
