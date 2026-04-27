@@ -2,6 +2,18 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum SplitDirection {
+    Forward,
+    Reverse,
+}
+
+#[derive(Clone, Copy)]
+enum ReturnIdentity {
+    WhenUnchanged,
+    Never,
+}
+
 static BYTES_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.decode"), bytes_decode));
 static BYTES_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -32,6 +44,16 @@ static BYTES_RINDEX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.rindex"), bytes_rindex_method));
 static BYTES_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.count"), bytes_count_method));
+static BYTES_REPLACE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("bytes.replace"), bytes_replace_kw));
+static BYTES_SPLIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("bytes.split"), bytes_split_kw));
+static BYTES_RSPLIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("bytes.rsplit"), bytes_rsplit_kw));
+static BYTES_PARTITION_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.partition"), bytes_partition));
+static BYTES_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.rpartition"), bytes_rpartition));
 
 static BYTEARRAY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.copy"), bytearray_copy));
@@ -72,6 +94,21 @@ static BYTEARRAY_RINDEX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.rindex"), bytearray_rindex));
 static BYTEARRAY_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.count"), bytearray_count));
+static BYTEARRAY_REPLACE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytearray.replace"), bytearray_replace_kw)
+});
+static BYTEARRAY_SPLIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytearray.split"), bytearray_split_kw)
+});
+static BYTEARRAY_RSPLIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytearray.rsplit"), bytearray_rsplit_kw)
+});
+static BYTEARRAY_PARTITION_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.partition"), bytearray_partition)
+});
+static BYTEARRAY_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.rpartition"), bytearray_rpartition)
+});
 
 /// Resolve builtin bytes methods backed by static builtin function objects.
 pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
@@ -120,6 +157,21 @@ pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
         ))),
         "count" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_COUNT_METHOD,
+        ))),
+        "replace" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_REPLACE_METHOD,
+        ))),
+        "split" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_SPLIT_METHOD,
+        ))),
+        "rsplit" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_RSPLIT_METHOD,
+        ))),
+        "partition" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_PARTITION_METHOD,
+        ))),
+        "rpartition" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_RPARTITION_METHOD,
         ))),
         _ => None,
     }
@@ -178,6 +230,21 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
         ))),
         "count" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_COUNT_METHOD,
+        ))),
+        "replace" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_REPLACE_METHOD,
+        ))),
+        "split" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_SPLIT_METHOD,
+        ))),
+        "rsplit" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_RSPLIT_METHOD,
+        ))),
+        "partition" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_PARTITION_METHOD,
+        ))),
+        "rpartition" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_RPARTITION_METHOD,
         ))),
         _ => None,
     }
@@ -443,6 +510,92 @@ pub(super) fn bytes_count_method(args: &[Value]) -> Result<Value, BuiltinError> 
 }
 
 #[inline]
+pub(super) fn bytes_replace(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytes_replace_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_replace_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_replace_kw(
+        args,
+        keywords,
+        "bytes",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        ReturnIdentity::WhenUnchanged,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_split(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytes_split_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_split_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_split_kw(
+        args,
+        keywords,
+        "bytes",
+        "split",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        SplitDirection::Forward,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_rsplit(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytes_rsplit_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_rsplit_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_split_kw(
+        args,
+        keywords,
+        "bytes",
+        "rsplit",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        SplitDirection::Reverse,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_partition(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_partition(
+        args,
+        "bytes",
+        "partition",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        SearchDirection::Forward,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_rpartition(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_partition(
+        args,
+        "bytes",
+        "rpartition",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        SearchDirection::Reverse,
+    )
+}
+
+#[inline]
 pub(super) fn bytearray_find(args: &[Value]) -> Result<Value, BuiltinError> {
     byte_sequence_find_like(
         args,
@@ -493,6 +646,92 @@ pub(super) fn bytearray_rindex(args: &[Value]) -> Result<Value, BuiltinError> {
 #[inline]
 pub(super) fn bytearray_count(args: &[Value]) -> Result<Value, BuiltinError> {
     byte_sequence_count(args, "bytearray", expect_bytearray_ref)
+}
+
+#[inline]
+pub(super) fn bytearray_replace(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytearray_replace_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_replace_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_replace_kw(
+        args,
+        keywords,
+        "bytearray",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        ReturnIdentity::Never,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_split(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytearray_split_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_split_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_split_kw(
+        args,
+        keywords,
+        "bytearray",
+        "split",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        SplitDirection::Forward,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_rsplit(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytearray_rsplit_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_rsplit_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_split_kw(
+        args,
+        keywords,
+        "bytearray",
+        "rsplit",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        SplitDirection::Reverse,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_partition(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_partition(
+        args,
+        "bytearray",
+        "partition",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        SearchDirection::Forward,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_rpartition(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_partition(
+        args,
+        "bytearray",
+        "rpartition",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        SearchDirection::Reverse,
+    )
 }
 
 #[inline]
@@ -682,6 +921,156 @@ fn byte_sequence_search_needle(value: Value) -> Result<Vec<u8>, BuiltinError> {
     })
 }
 
+fn byte_sequence_replace_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+    identity: ReturnIdentity,
+) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.replace() takes from 2 to 3 arguments ({given} given)"
+        )));
+    }
+
+    let (old_arg, new_arg, count_arg) =
+        bind_byte_replace_keyword_args(args, keywords, receiver_name)?;
+    let old = old_arg
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{receiver_name}.replace() missing required argument 'old'"
+            ))
+        })
+        .and_then(bytes_like_argument_bytes)?;
+    let new = new_arg
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{receiver_name}.replace() missing required argument 'new'"
+            ))
+        })
+        .and_then(bytes_like_argument_bytes)?;
+    let count = parse_byte_count(count_arg, receiver_name, "replace", 3)?;
+    let bytes = receiver(args[0], "replace")?;
+    let data = bytes.as_bytes();
+
+    if count == Some(0) || old == new {
+        return unchanged_byte_sequence(args[0], data, result_type, identity);
+    }
+
+    if old.is_empty() {
+        let replaced = replace_empty_byte_pattern(data, &new, count)?;
+        return if replaced == data {
+            unchanged_byte_sequence(args[0], data, result_type, identity)
+        } else {
+            Ok(to_object_value(BytesObject::from_vec_with_type(
+                replaced,
+                result_type,
+            )))
+        };
+    }
+
+    let replacements = count_non_overlapping_limited(data, &old, count.unwrap_or(usize::MAX));
+    if replacements == 0 {
+        return unchanged_byte_sequence(args[0], data, result_type, identity);
+    }
+
+    let replaced = replace_non_empty_byte_pattern(data, &old, &new, replacements)?;
+    Ok(to_object_value(BytesObject::from_vec_with_type(
+        replaced,
+        result_type,
+    )))
+}
+
+fn byte_sequence_split_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+    direction: SplitDirection,
+) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.{method_name}() takes at most 2 arguments ({given} given)"
+        )));
+    }
+
+    let (separator_arg, maxsplit_arg) =
+        bind_byte_split_keyword_args(args, keywords, receiver_name, method_name)?;
+    let separator = match separator_arg {
+        None => None,
+        Some(value) if value.is_none() => None,
+        Some(value) => Some(bytes_like_argument_bytes(value)?),
+    };
+    let maxsplit = parse_byte_count(maxsplit_arg, receiver_name, method_name, 2)?;
+    let bytes = receiver(args[0], method_name)?;
+    let data = bytes.as_bytes();
+
+    let parts = match (separator.as_deref(), direction) {
+        (Some(separator), SplitDirection::Forward) => {
+            split_byte_sequence(data, separator, maxsplit, result_type)?
+        }
+        (Some(separator), SplitDirection::Reverse) => {
+            rsplit_byte_sequence(data, separator, maxsplit, result_type)?
+        }
+        (None, SplitDirection::Forward) => {
+            split_byte_sequence_whitespace(data, maxsplit, result_type)
+        }
+        (None, SplitDirection::Reverse) => {
+            rsplit_byte_sequence_whitespace(data, maxsplit, result_type)
+        }
+    };
+
+    Ok(to_object_value(ListObject::from_slice(parts.as_slice())))
+}
+
+fn byte_sequence_partition(
+    args: &[Value],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+    direction: SearchDirection,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let bytes = receiver(args[0], method_name)?;
+    let separator = bytes_like_argument_bytes(args[1])?;
+    if separator.is_empty() {
+        return Err(BuiltinError::ValueError("empty separator".to_string()));
+    }
+
+    let data = bytes.as_bytes();
+    let found = match direction {
+        SearchDirection::Forward => simd_bytes_find(data, &separator),
+        SearchDirection::Reverse => simd_bytes_rfind(data, &separator),
+    };
+
+    let values = match (direction, found) {
+        (SearchDirection::Forward, Some(index)) | (SearchDirection::Reverse, Some(index)) => [
+            byte_sequence_slice_value(&data[..index], result_type),
+            byte_sequence_slice_value(&data[index..index + separator.len()], result_type),
+            byte_sequence_slice_value(&data[index + separator.len()..], result_type),
+        ],
+        (SearchDirection::Forward, None) => [
+            byte_sequence_slice_value(data, result_type),
+            byte_sequence_slice_value(&[], result_type),
+            byte_sequence_slice_value(&[], result_type),
+        ],
+        (SearchDirection::Reverse, None) => [
+            byte_sequence_slice_value(&[], result_type),
+            byte_sequence_slice_value(&[], result_type),
+            byte_sequence_slice_value(data, result_type),
+        ],
+    };
+
+    Ok(to_object_value(TupleObject::from_slice(&values)))
+}
+
 #[inline]
 fn normalize_byte_search_bounds(
     args: &[Value],
@@ -733,7 +1122,11 @@ fn byte_sequence_strip(
     let data = bytes.as_bytes();
     let (start, end) = strip_byte_bounds(data, &strip_set, direction);
 
-    if result_type == TypeId::BYTES && start == 0 && end == data.len() {
+    if result_type == TypeId::BYTES
+        && start == 0
+        && end == data.len()
+        && value_has_exact_type(args[0], TypeId::BYTES)
+    {
         return Ok(args[0]);
     }
 
@@ -830,7 +1223,7 @@ fn byte_sequence_translate(
         translated.push(mapped);
     }
 
-    if result_type == TypeId::BYTES && !changed {
+    if result_type == TypeId::BYTES && !changed && value_has_exact_type(args[0], TypeId::BYTES) {
         return Ok(args[0]);
     }
 
@@ -864,6 +1257,419 @@ fn parse_byte_delete_set(delete: Option<Value>) -> Result<ByteSet, BuiltinError>
         || Ok(ByteSet::empty()),
         |value| bytes_like_argument_bytes(value).map(|bytes| ByteSet::from_bytes(&bytes)),
     )
+}
+
+fn bind_byte_replace_keyword_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+) -> Result<(Option<Value>, Option<Value>, Option<Value>), BuiltinError> {
+    let mut old = args.get(1).copied();
+    let mut new = args.get(2).copied();
+    let mut count = args.get(3).copied();
+
+    for (name, value) in keywords {
+        match *name {
+            "old" => {
+                if old.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "replace() got multiple values for argument 'old'".to_string(),
+                    ));
+                }
+                old = Some(*value);
+            }
+            "new" => {
+                if new.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "replace() got multiple values for argument 'new'".to_string(),
+                    ));
+                }
+                new = Some(*value);
+            }
+            "count" => {
+                if count.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "replace() got multiple values for argument 'count'".to_string(),
+                    ));
+                }
+                count = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{receiver_name}.replace() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok((old, new, count))
+}
+
+fn bind_byte_split_keyword_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<(Option<Value>, Option<Value>), BuiltinError> {
+    let mut separator = args.get(1).copied();
+    let mut maxsplit = args.get(2).copied();
+
+    for (name, value) in keywords {
+        match *name {
+            "sep" => {
+                if separator.is_some() {
+                    return Err(BuiltinError::TypeError(format!(
+                        "{method_name}() got multiple values for argument 'sep'"
+                    )));
+                }
+                separator = Some(*value);
+            }
+            "maxsplit" => {
+                if maxsplit.is_some() {
+                    return Err(BuiltinError::TypeError(format!(
+                        "{method_name}() got multiple values for argument 'maxsplit'"
+                    )));
+                }
+                maxsplit = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{receiver_name}.{method_name}() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok((separator, maxsplit))
+}
+
+#[inline]
+fn parse_byte_count(
+    count: Option<Value>,
+    receiver_name: &'static str,
+    method_name: &'static str,
+    position: usize,
+) -> Result<Option<usize>, BuiltinError> {
+    let Some(count) = count else {
+        return Ok(None);
+    };
+
+    if let Some(value) = count.as_bool() {
+        return Ok(Some(if value { 1 } else { 0 }));
+    }
+
+    if let Some(value) = value_to_saturated_i64(count) {
+        if value < 0 {
+            return Ok(None);
+        }
+        return Ok(Some(usize::try_from(value).unwrap_or(usize::MAX)));
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "{receiver_name}.{method_name}() argument {position} must be int, not {}",
+        count.type_name()
+    )))
+}
+
+fn unchanged_byte_sequence(
+    receiver: Value,
+    data: &[u8],
+    result_type: TypeId,
+    identity: ReturnIdentity,
+) -> Result<Value, BuiltinError> {
+    if result_type == TypeId::BYTES
+        && matches!(identity, ReturnIdentity::WhenUnchanged)
+        && value_has_exact_type(receiver, TypeId::BYTES)
+    {
+        return Ok(receiver);
+    }
+
+    Ok(to_object_value(BytesObject::from_vec_with_type(
+        data.to_vec(),
+        result_type,
+    )))
+}
+
+fn replace_empty_byte_pattern(
+    data: &[u8],
+    replacement: &[u8],
+    count: Option<usize>,
+) -> Result<Vec<u8>, BuiltinError> {
+    let insertions = count.unwrap_or(data.len().saturating_add(1)).min(
+        data.len()
+            .checked_add(1)
+            .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?,
+    );
+    if insertions == 0 {
+        return Ok(data.to_vec());
+    }
+
+    let replacement_bytes = replacement
+        .len()
+        .checked_mul(insertions)
+        .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?;
+    let capacity = data
+        .len()
+        .checked_add(replacement_bytes)
+        .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?;
+    let mut result = Vec::with_capacity(capacity);
+    let mut remaining = insertions;
+
+    result.extend_from_slice(replacement);
+    remaining -= 1;
+    for &byte in data {
+        result.push(byte);
+        if remaining > 0 {
+            result.extend_from_slice(replacement);
+            remaining -= 1;
+        }
+    }
+
+    Ok(result)
+}
+
+fn count_non_overlapping_limited(data: &[u8], needle: &[u8], limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut start = 0usize;
+    while count < limit {
+        let Some(offset) = simd_bytes_find(&data[start..], needle) else {
+            break;
+        };
+        count += 1;
+        start += offset + needle.len();
+    }
+    count
+}
+
+fn replace_non_empty_byte_pattern(
+    data: &[u8],
+    old: &[u8],
+    new: &[u8],
+    replacements: usize,
+) -> Result<Vec<u8>, BuiltinError> {
+    let capacity = if new.len() >= old.len() {
+        data.len()
+            .checked_add(
+                new.len()
+                    .checked_sub(old.len())
+                    .and_then(|delta| delta.checked_mul(replacements))
+                    .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?,
+            )
+            .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?
+    } else {
+        data.len() - (old.len() - new.len()) * replacements
+    };
+    let mut result = Vec::with_capacity(capacity);
+    let mut start = 0usize;
+    let mut remaining = replacements;
+
+    while remaining > 0 {
+        let offset = simd_bytes_find(&data[start..], old)
+            .expect("pre-counted replacements must be discoverable");
+        let index = start + offset;
+        result.extend_from_slice(&data[start..index]);
+        result.extend_from_slice(new);
+        start = index + old.len();
+        remaining -= 1;
+    }
+    result.extend_from_slice(&data[start..]);
+    Ok(result)
+}
+
+fn split_byte_sequence(
+    data: &[u8],
+    separator: &[u8],
+    maxsplit: Option<usize>,
+    result_type: TypeId,
+) -> Result<Vec<Value>, BuiltinError> {
+    if separator.is_empty() {
+        return Err(BuiltinError::ValueError("empty separator".to_string()));
+    }
+
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut splits = 0usize;
+    while splits < limit {
+        let Some(offset) = simd_bytes_find(&data[start..], separator) else {
+            break;
+        };
+        let index = start + offset;
+        parts.push(byte_sequence_slice_value(&data[start..index], result_type));
+        start = index + separator.len();
+        splits += 1;
+    }
+    parts.push(byte_sequence_slice_value(&data[start..], result_type));
+    Ok(parts)
+}
+
+fn rsplit_byte_sequence(
+    data: &[u8],
+    separator: &[u8],
+    maxsplit: Option<usize>,
+    result_type: TypeId,
+) -> Result<Vec<Value>, BuiltinError> {
+    if separator.is_empty() {
+        return Err(BuiltinError::ValueError("empty separator".to_string()));
+    }
+
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok(vec![byte_sequence_slice_value(data, result_type)]);
+    }
+
+    let mut parts = Vec::new();
+    let mut end = data.len();
+    let mut splits = 0usize;
+    while splits < limit {
+        let Some(index) = simd_bytes_rfind(&data[..end], separator) else {
+            break;
+        };
+        parts.push(byte_sequence_slice_value(
+            &data[index + separator.len()..end],
+            result_type,
+        ));
+        end = index;
+        splits += 1;
+    }
+    parts.push(byte_sequence_slice_value(&data[..end], result_type));
+    parts.reverse();
+    Ok(parts)
+}
+
+fn split_byte_sequence_whitespace(
+    data: &[u8],
+    maxsplit: Option<usize>,
+    result_type: TypeId,
+) -> Vec<Value> {
+    let mut start = trim_ascii_whitespace_start(data, 0);
+    if start == data.len() {
+        return Vec::new();
+    }
+
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return vec![byte_sequence_slice_value(&data[start..], result_type)];
+    }
+
+    let mut parts = Vec::new();
+    let mut splits = 0usize;
+    while start < data.len() {
+        if splits == limit {
+            parts.push(byte_sequence_slice_value(&data[start..], result_type));
+            break;
+        }
+
+        let end = next_ascii_whitespace(data, start);
+        parts.push(byte_sequence_slice_value(&data[start..end], result_type));
+        start = trim_ascii_whitespace_start(data, end);
+        splits += 1;
+    }
+    parts
+}
+
+fn rsplit_byte_sequence_whitespace(
+    data: &[u8],
+    maxsplit: Option<usize>,
+    result_type: TypeId,
+) -> Vec<Value> {
+    let mut end = trim_ascii_whitespace_end(data, data.len());
+    if end == 0 {
+        return Vec::new();
+    }
+
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return vec![byte_sequence_slice_value(&data[..end], result_type)];
+    }
+
+    let mut parts = Vec::new();
+    let mut splits = 0usize;
+    while end > 0 && splits < limit {
+        let mut word_start = end;
+        while word_start > 0 && !is_ascii_byte_whitespace(data[word_start - 1]) {
+            word_start -= 1;
+        }
+
+        parts.push(byte_sequence_slice_value(
+            &data[word_start..end],
+            result_type,
+        ));
+
+        end = trim_ascii_whitespace_end(data, word_start);
+        splits += 1;
+    }
+
+    if end > 0 {
+        let start = if splits == limit {
+            0
+        } else {
+            trim_ascii_whitespace_start(data, 0)
+        };
+        if start < end {
+            parts.push(byte_sequence_slice_value(&data[start..end], result_type));
+        }
+    }
+    parts.reverse();
+    parts
+}
+
+#[inline]
+fn byte_sequence_slice_value(data: &[u8], result_type: TypeId) -> Value {
+    to_object_value(BytesObject::from_vec_with_type(data.to_vec(), result_type))
+}
+
+#[inline]
+fn value_has_exact_type(value: Value, expected: TypeId) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    header.type_id == expected
+}
+
+#[inline]
+fn trim_ascii_whitespace_start(data: &[u8], mut index: usize) -> usize {
+    while index < data.len() && is_ascii_byte_whitespace(data[index]) {
+        index += 1;
+    }
+    index
+}
+
+#[inline]
+fn trim_ascii_whitespace_end(data: &[u8], mut end: usize) -> usize {
+    while end > 0 && is_ascii_byte_whitespace(data[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
+#[inline]
+fn next_ascii_whitespace(data: &[u8], mut index: usize) -> usize {
+    while index < data.len() && !is_ascii_byte_whitespace(data[index]) {
+        index += 1;
+    }
+    index
+}
+
+#[inline]
+fn previous_ascii_whitespace(data: &[u8], start: usize, mut end: usize) -> Option<usize> {
+    while end > start {
+        end -= 1;
+        if is_ascii_byte_whitespace(data[end]) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+#[inline]
+fn is_ascii_byte_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
 #[inline]
