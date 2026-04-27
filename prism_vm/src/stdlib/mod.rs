@@ -49,6 +49,7 @@ pub mod fnmatch;
 pub mod functools;
 pub mod gc;
 pub mod generators;
+pub mod http;
 pub mod importlib;
 pub mod inspect;
 pub mod io;
@@ -63,16 +64,19 @@ pub mod nt;
 pub mod operator;
 pub mod os;
 pub mod pickle;
+pub mod pickletools;
 pub mod python_builtins;
 pub mod random;
 pub mod re;
 pub(crate) mod secure_random;
 pub mod select;
+pub mod shutil;
 pub mod signal;
 pub mod string;
 pub mod sys;
 pub mod test_support;
 pub mod textwrap;
+pub mod threading;
 pub mod time;
 pub mod traceback;
 pub mod types;
@@ -434,6 +438,11 @@ impl StdlibRegistry {
             "select",
             Box::new(select::SelectModule::new()),
         );
+        Self::insert_module(
+            &mut modules,
+            "shutil",
+            Box::new(shutil::ShutilModule::new()),
+        );
 
         // Register pure-Python stdlib fallbacks.
         Self::insert_module(&mut modules, "re", Box::new(re::ReModule::new()));
@@ -479,6 +488,12 @@ impl StdlibRegistry {
             "inspect",
             Box::new(inspect::InspectModule::new()),
         );
+        Self::insert_module(&mut modules, "http", Box::new(http::HttpModule::new()));
+        Self::insert_module(
+            &mut modules,
+            "http.cookies",
+            Box::new(http::cookies::CookiesModule::new()),
+        );
         Self::insert_module(
             &mut modules,
             "importlib",
@@ -516,6 +531,11 @@ impl StdlibRegistry {
             "pickle",
             Box::new(pickle::PickleModule::new()),
         );
+        Self::insert_module(
+            &mut modules,
+            "pickletools",
+            Box::new(pickletools::PickleToolsModule::new()),
+        );
 
         Self::insert_module(
             &mut modules,
@@ -541,6 +561,11 @@ impl StdlibRegistry {
             &mut modules,
             "textwrap",
             Box::new(textwrap::TextwrapModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "threading",
+            Box::new(threading::ThreadingModule::new()),
         );
         Self::insert_module(
             &mut modules,

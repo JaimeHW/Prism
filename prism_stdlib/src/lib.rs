@@ -194,6 +194,7 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "typing"
         | "signal"
         | "select"
+        | "shutil"
         | "weakref"
         | "collections"
         | "collections.abc"
@@ -202,6 +203,8 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "ctypes"
         | "dbm"
         | "fnmatch"
+        | "http"
+        | "http.cookies"
         | "inspect"
         | "importlib"
         | "importlib.util"
@@ -213,12 +216,14 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "locale"
         | "operator"
         | "pickle"
+        | "pickletools"
         | "random"
         | "string"
         | "test.support"
         | "test.support.import_helper"
         | "test.support.os_helper"
         | "textwrap"
+        | "threading"
         | "traceback" => Some(StdlibResolutionPolicy::PreferNative),
         "os" | "os.path" | "json" | "functools" | "re" => {
             Some(StdlibResolutionPolicy::PreferSourceWhenAvailable)
