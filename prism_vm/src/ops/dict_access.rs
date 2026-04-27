@@ -20,7 +20,6 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::string::value_as_string_ref;
-use prism_runtime::types::tuple::TupleObject;
 
 #[inline]
 pub(crate) fn dict_get_item(
@@ -230,10 +229,7 @@ fn requires_protocol_scan(value: Value) -> bool {
     };
     let type_id = extract_type_id(ptr);
     match type_id {
-        TypeId::TUPLE => {
-            let tuple = unsafe { &*(ptr as *const TupleObject) };
-            tuple.iter().copied().any(requires_protocol_scan)
-        }
+        TypeId::TUPLE => true,
         _ => true,
     }
 }
