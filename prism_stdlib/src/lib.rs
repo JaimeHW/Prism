@@ -200,6 +200,7 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "copy"
         | "copyreg"
         | "ctypes"
+        | "dbm"
         | "fnmatch"
         | "inspect"
         | "importlib"

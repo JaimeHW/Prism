@@ -42,6 +42,7 @@ pub mod collections;
 pub mod copy;
 pub mod copyreg;
 pub mod ctypes;
+pub mod dbm;
 pub mod errno;
 pub mod exceptions;
 pub mod fnmatch;
@@ -366,6 +367,7 @@ impl StdlibRegistry {
             "copyreg",
             Box::new(copyreg::CopyRegModule::new()),
         );
+        Self::insert_module(&mut modules, "dbm", Box::new(dbm::DbmModule::new()));
 
         Self::insert_module(
             &mut modules,
