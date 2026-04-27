@@ -558,6 +558,21 @@ fn ordered_object_pair(left: *const (), right: *const ()) -> (usize, usize) {
     }
 }
 
+#[inline]
+fn with_active_compare_pair<T>(
+    active_pairs: &mut FxHashSet<(usize, usize)>,
+    pair: (usize, usize),
+    f: impl FnOnce(&mut FxHashSet<(usize, usize)>) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    if !active_pairs.insert(pair) {
+        return Err(RuntimeError::recursion_error(active_pairs.len() + 1));
+    }
+
+    let result = f(active_pairs);
+    active_pairs.remove(&pair);
+    result
+}
+
 fn sequence_values_equal(
     left: &[Value],
     right: &[Value],
@@ -770,10 +785,9 @@ fn eq_result_inner(
         (exact_dict_operand(a), exact_dict_operand(b))
     {
         let pair = ordered_object_pair(left_ptr, right_ptr);
-        if !seen_pairs.insert(pair) {
-            return Ok(true);
-        }
-        return dict_eq_result(vm, left, right, seen_pairs);
+        return with_active_compare_pair(seen_pairs, pair, |seen_pairs| {
+            dict_eq_result(vm, left, right, seen_pairs)
+        });
     }
 
     if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
@@ -862,10 +876,10 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         (exact_dict_operand(a), exact_dict_operand(b))
     {
         let pair = ordered_object_pair(left_ptr, right_ptr);
-        if !seen_pairs.insert(pair) {
-            return Ok(false);
-        }
-        return dict_eq_result(vm, left, right, &mut seen_pairs).map(|equal| !equal);
+        return with_active_compare_pair(&mut seen_pairs, pair, |seen_pairs| {
+            dict_eq_result(vm, left, right, seen_pairs)
+        })
+        .map(|equal| !equal);
     }
 
     if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
@@ -893,10 +907,10 @@ fn dict_view_eq_result(
         (exact_dict_items_view(left), exact_dict_items_view(right))
     {
         let pair = ordered_object_pair(left_ptr, right_ptr);
-        if !seen_pairs.insert(pair) {
-            return Ok(Some(true));
-        }
-        return dict_eq_result(vm, left_dict, right_dict, seen_pairs).map(Some);
+        return with_active_compare_pair(seen_pairs, pair, |seen_pairs| {
+            dict_eq_result(vm, left_dict, right_dict, seen_pairs)
+        })
+        .map(Some);
     }
 
     if !is_dict_view_set_operand(left) && !is_dict_view_set_operand(right) {
@@ -1046,11 +1060,10 @@ fn mapping_eq_result(
     };
 
     let pair = ordered_object_pair(left.identity(), right.identity());
-    if !seen_pairs.insert(pair) {
-        return Ok(Some(true));
-    }
-
-    dict_eq_result(vm, left.dict(), right.dict(), seen_pairs).map(Some)
+    with_active_compare_pair(seen_pairs, pair, |seen_pairs| {
+        dict_eq_result(vm, left.dict(), right.dict(), seen_pairs)
+    })
+    .map(Some)
 }
 
 #[inline]
@@ -1083,11 +1096,11 @@ fn native_sequence_eq_result(
         return Ok(None);
     };
     let pair = ordered_object_pair(left_ptr, right_ptr);
-    if !seen_pairs.insert(pair) {
-        return Ok(Some(true));
-    }
 
-    sequence_eq_result(vm, left_sequence, right_sequence, seen_pairs).map(Some)
+    with_active_compare_pair(seen_pairs, pair, |seen_pairs| {
+        sequence_eq_result(vm, left_sequence, right_sequence, seen_pairs)
+    })
+    .map(Some)
 }
 
 fn sequence_eq_result(
