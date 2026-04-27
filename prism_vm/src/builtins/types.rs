@@ -2517,12 +2517,6 @@ pub fn builtin_slice(args: &[Value]) -> Result<Value, BuiltinError> {
         _ => unreachable!(),
     };
 
-    if step == Some(0) {
-        return Err(BuiltinError::ValueError(
-            "slice step cannot be zero".to_string(),
-        ));
-    }
-
     Ok(to_object_value(SliceObject::new(start, stop, step)))
 }
 

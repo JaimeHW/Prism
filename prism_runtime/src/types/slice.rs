@@ -245,7 +245,7 @@ pub struct SliceObject {
     start: SliceValue,
     /// Stop index (None = end).
     stop: SliceValue,
-    /// Step (None = 1, cannot be 0).
+    /// Step (None = 1; 0 is rejected when the slice is applied).
     step: SliceValue,
 }
 
@@ -258,14 +258,10 @@ impl SliceObject {
     /// * `stop` - Stop index (None = end)
     /// * `step` - Step size (None = 1)
     ///
-    /// # Panics
-    ///
-    /// Panics if step is Some(0) (zero step is not allowed).
+    /// A zero step is a valid slice object state; applying that slice to a
+    /// sequence raises `ValueError`, matching CPython.
     #[inline]
     pub fn new(start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Self {
-        if let Some(s) = step {
-            assert!(s != 0, "slice step cannot be zero");
-        }
         Self {
             header: ObjectHeader::new(TypeId::SLICE),
             start: start.into(),
@@ -299,7 +295,6 @@ impl SliceObject {
     /// Create a full slice: `slice(start, stop, step)` → `[start:stop:step]`.
     #[inline]
     pub fn full(start: i64, stop: i64, step: i64) -> Self {
-        assert!(step != 0, "slice step cannot be zero");
         Self {
             header: ObjectHeader::new(TypeId::SLICE),
             start: SliceValue::some(start),

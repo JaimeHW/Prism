@@ -212,6 +212,12 @@ fn array_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 fn array_slice(value: Value, slice: &SliceObject) -> Result<Value, BuiltinError> {
+    if slice.step() == Some(0) {
+        return Err(BuiltinError::ValueError(
+            "slice step cannot be zero".to_string(),
+        ));
+    }
+
     let spec = array_spec(value)?;
     let bytes = array_bytes(value)?;
     let len = bytes.len() / spec.itemsize;

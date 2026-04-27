@@ -894,6 +894,7 @@ fn list_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
         .as_object_ptr()
         .and_then(slice_object_from_value_ptr)
     {
+        reject_zero_step_slice_builtin(index)?;
         let indices = index.indices(list.len());
         let mut values = Vec::with_capacity(indices.length);
         for index in indices.iter() {
@@ -1157,6 +1158,7 @@ fn tuple_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
         .as_object_ptr()
         .and_then(slice_object_from_value_ptr)
     {
+        reject_zero_step_slice_builtin(index)?;
         let indices = index.indices(tuple.len());
         let mut values = Vec::with_capacity(indices.length);
         for index in indices.iter() {
@@ -1258,6 +1260,16 @@ fn sequence_contains_indexed(
 fn slice_object_from_value_ptr(ptr: *const ()) -> Option<&'static SliceObject> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     (header.type_id == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
+}
+
+#[inline]
+fn reject_zero_step_slice_builtin(slice: &SliceObject) -> Result<(), BuiltinError> {
+    if slice.step() == Some(0) {
+        return Err(BuiltinError::ValueError(
+            "slice step cannot be zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[inline]

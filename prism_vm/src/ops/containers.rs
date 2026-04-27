@@ -416,10 +416,6 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         Ok(v) => v,
         Err(cf) => return cf,
     };
-    if step == Some(0) {
-        return ControlFlow::Error(RuntimeError::value_error("slice step cannot be zero"));
-    }
-
     // Create slice on the active heap
     let slice = SliceObject::new(start, stop, step);
     let value = alloc_value_in_current_heap_or_box(slice);

@@ -293,6 +293,8 @@ fn subscr_slice(
     container: Value,
     slice: &SliceObject,
 ) -> Result<Option<SubscriptResult>, ControlFlow> {
+    reject_zero_step_slice(slice)?;
+
     if let Some(interned) = tagged_interned_string(container)? {
         return Ok(Some(SubscriptResult::AllocString(string_slice_str(
             interned.as_str(),
@@ -347,6 +349,16 @@ fn subscr_slice(
     }
 
     Ok(None)
+}
+
+#[inline]
+fn reject_zero_step_slice(slice: &SliceObject) -> Result<(), ControlFlow> {
+    if slice.step() == Some(0) {
+        return Err(ControlFlow::Error(RuntimeError::value_error(
+            "slice step cannot be zero",
+        )));
+    }
+    Ok(())
 }
 
 #[inline]
@@ -573,6 +585,9 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
 
             if let Some(slice) = slice_from_value(key) {
+                if let Err(err) = reject_zero_step_slice(slice) {
+                    return err;
+                }
                 let replacement = match collect_iterable_values(vm, value) {
                     Ok(values) => values,
                     Err(err) => return ControlFlow::Error(err),
@@ -604,6 +619,9 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 }
 
                 if let Some(slice) = slice_from_value(key) {
+                    if let Err(err) = reject_zero_step_slice(slice) {
+                        return err;
+                    }
                     let replacement = match bytearray_replacement_bytes(vm, value) {
                         Ok(bytes) => bytes,
                         Err(err) => return ControlFlow::Error(err),
@@ -673,6 +691,9 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
             }
 
             if let Some(slice) = slice_from_value(key) {
+                if let Err(err) = reject_zero_step_slice(slice) {
+                    return err;
+                }
                 list.delete_slice(slice);
                 return ControlFlow::Continue;
             }
