@@ -78,9 +78,9 @@ static INT_FROM_BYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(||
     )
 });
 static FLOAT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new_kw(
+    BuiltinFunctionObject::new_vm_kw(
         Arc::from("float.__new__"),
-        super::types::builtin_float_new_kw,
+        super::types::builtin_float_new_vm_kw,
     )
 });
 static FLOAT_GETFORMAT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {

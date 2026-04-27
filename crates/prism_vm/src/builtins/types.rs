@@ -3162,6 +3162,20 @@ fn builtin_int_new_impl(
 }
 
 pub(crate) fn builtin_float_new(args: &[Value]) -> Result<Value, BuiltinError> {
+    builtin_float_new_with(args, builtin_float)
+}
+
+pub(crate) fn builtin_float_new_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    builtin_float_new_with(args, |values| builtin_float_vm(vm, values))
+}
+
+fn builtin_float_new_with<F>(args: &[Value], convert: F) -> Result<Value, BuiltinError>
+where
+    F: FnOnce(&[Value]) -> Result<Value, BuiltinError>,
+{
     if args.is_empty() {
         return Err(BuiltinError::TypeError(
             "float.__new__() takes at least 1 argument (0 given)".to_string(),
@@ -3172,7 +3186,7 @@ pub(crate) fn builtin_float_new(args: &[Value]) -> Result<Value, BuiltinError> {
         .ok_or_else(|| BuiltinError::TypeError("float.__new__(X): X must be a type".to_string()))?;
 
     if class_type == TypeId::FLOAT {
-        return builtin_float(&args[1..]);
+        return convert(&args[1..]);
     }
 
     if !class_value_is_subtype(args[0], TypeId::FLOAT) {
@@ -3193,7 +3207,7 @@ pub(crate) fn builtin_float_new(args: &[Value]) -> Result<Value, BuiltinError> {
     let float = if args.len() == 1 {
         0.0
     } else {
-        let value = builtin_float(&args[1..])?;
+        let value = convert(&args[1..])?;
         prism_runtime::types::float::value_to_f64(value).ok_or_else(|| {
             BuiltinError::TypeError(
                 "float.__new__() failed to materialize float payload".to_string(),
@@ -3209,12 +3223,12 @@ pub(crate) fn builtin_float_new(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(to_object_value(instance))
 }
 
-pub(crate) fn builtin_float_new_kw(
+fn validate_float_new_keywords(
     positional: &[Value],
     keywords: &[(&str, Value)],
-) -> Result<Value, BuiltinError> {
+) -> Result<(), BuiltinError> {
     if keywords.is_empty() {
-        return builtin_float_new(positional);
+        return Ok(());
     }
     if positional.is_empty() {
         return Err(BuiltinError::TypeError(
@@ -3231,7 +3245,24 @@ pub(crate) fn builtin_float_new_kw(
         )));
     }
 
+    Ok(())
+}
+
+pub(crate) fn builtin_float_new_kw(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    validate_float_new_keywords(positional, keywords)?;
     builtin_float_new(positional)
+}
+
+pub(crate) fn builtin_float_new_vm_kw(
+    vm: &mut VirtualMachine,
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    validate_float_new_keywords(positional, keywords)?;
+    builtin_float_new_vm(vm, positional)
 }
 
 pub(crate) fn builtin_str_new(args: &[Value]) -> Result<Value, BuiltinError> {
