@@ -14,6 +14,7 @@ use crate::builtins::{
 };
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::objects::{extract_type_id, get_attribute_value};
+use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::intern;
@@ -44,6 +45,36 @@ const NEWTRUE: u8 = 0x88;
 const NEWFALSE: u8 = 0x89;
 const STOP: u8 = b'.';
 const PRISM_PICKLE_MAGIC: &[u8] = b"\x80PRISM-PICKLE\x01";
+
+const STD_MARK: u8 = b'(';
+const STD_EMPTY_TUPLE: u8 = b')';
+const STD_NONE: u8 = b'N';
+const STD_INT: u8 = b'I';
+const STD_BININT: u8 = b'J';
+const STD_BININT1: u8 = b'K';
+const STD_BININT2: u8 = b'M';
+const STD_LONG: u8 = b'L';
+const STD_TUPLE: u8 = b't';
+const STD_GLOBAL: u8 = b'c';
+const STD_REDUCE: u8 = b'R';
+const STD_BUILD: u8 = b'b';
+const STD_GET: u8 = b'g';
+const STD_BINGET: u8 = b'h';
+const STD_LONG_BINGET: u8 = b'j';
+const STD_PUT: u8 = b'p';
+const STD_BINPUT: u8 = b'q';
+const STD_LONG_BINPUT: u8 = b'r';
+const STD_TUPLE1: u8 = 0x85;
+const STD_TUPLE2: u8 = 0x86;
+const STD_TUPLE3: u8 = 0x87;
+const STD_LONG1: u8 = 0x8a;
+const STD_LONG4: u8 = 0x8b;
+const STD_SHORT_BINUNICODE: u8 = 0x8c;
+const STD_BINUNICODE: u8 = b'X';
+const STD_BINUNICODE8: u8 = 0x8d;
+const STD_STACK_GLOBAL: u8 = 0x93;
+const STD_MEMOIZE: u8 = 0x94;
+const STD_FRAME: u8 = 0x95;
 
 const TAG_REF: u8 = 0;
 const TAG_NONE: u8 = 1;
@@ -736,6 +767,480 @@ impl<'bytes> PickleReader<'bytes> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StdPickleCallable {
+    Iter,
+    Range,
+}
+
+#[derive(Clone)]
+enum StdPickleItem {
+    Mark,
+    Value(Value),
+    String(String),
+    Callable(StdPickleCallable),
+}
+
+struct StdPickleReader<'bytes> {
+    bytes: &'bytes [u8],
+    pos: usize,
+    stack: Vec<StdPickleItem>,
+    memo: Vec<Option<StdPickleItem>>,
+}
+
+impl<'bytes> StdPickleReader<'bytes> {
+    fn new(bytes: &'bytes [u8]) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            stack: Vec::with_capacity(16),
+            memo: Vec::new(),
+        }
+    }
+
+    fn read(mut self, vm: &mut VirtualMachine) -> Result<Value, BuiltinError> {
+        loop {
+            let opcode = self.read_u8()?;
+            match opcode {
+                PROTO => self.read_protocol()?,
+                STOP => return self.finish(),
+                STD_FRAME => self.read_frame()?,
+                STD_MARK => self.stack.push(StdPickleItem::Mark),
+                STD_NONE => self.push_value(Value::none()),
+                NEWFALSE => self.push_value(Value::bool(false)),
+                NEWTRUE => self.push_value(Value::bool(true)),
+                STD_INT => {
+                    let integer = self.read_decimal_line("pickle integer")?;
+                    self.push_value(bigint_to_value(integer));
+                }
+                STD_LONG => {
+                    let integer = self.read_long_line()?;
+                    self.push_value(bigint_to_value(integer));
+                }
+                STD_BININT => {
+                    let bytes = self.read_exact(4)?;
+                    let integer =
+                        i32::from_le_bytes(bytes.try_into().expect("read_exact returned 4 bytes"));
+                    self.push_value(bigint_to_value(BigInt::from(integer)));
+                }
+                STD_BININT1 => {
+                    let integer = self.read_u8()?;
+                    self.push_value(bigint_to_value(BigInt::from(integer)));
+                }
+                STD_BININT2 => {
+                    let bytes = self.read_exact(2)?;
+                    let integer =
+                        u16::from_le_bytes(bytes.try_into().expect("read_exact returned 2 bytes"));
+                    self.push_value(bigint_to_value(BigInt::from(integer)));
+                }
+                STD_LONG1 => {
+                    let len = self.read_u8()? as usize;
+                    let integer = BigInt::from_signed_bytes_le(self.read_exact(len)?);
+                    self.push_value(bigint_to_value(integer));
+                }
+                STD_LONG4 => {
+                    let len = self.read_u32_as_usize("LONG4 length")?;
+                    let integer = BigInt::from_signed_bytes_le(self.read_exact(len)?);
+                    self.push_value(bigint_to_value(integer));
+                }
+                STD_GLOBAL => {
+                    let module = self.read_utf8_line("global module")?;
+                    let name = self.read_utf8_line("global name")?;
+                    let item = resolve_std_global(vm, &module, &name)?;
+                    self.stack.push(item);
+                }
+                STD_SHORT_BINUNICODE => {
+                    let len = self.read_u8()? as usize;
+                    let string = self.read_utf8_exact(len, "SHORT_BINUNICODE payload")?;
+                    self.stack.push(StdPickleItem::String(string));
+                }
+                STD_BINUNICODE => {
+                    let len = self.read_u32_as_usize("BINUNICODE length")?;
+                    let string = self.read_utf8_exact(len, "BINUNICODE payload")?;
+                    self.stack.push(StdPickleItem::String(string));
+                }
+                STD_BINUNICODE8 => {
+                    let len = self.read_u64_as_usize("BINUNICODE8 length")?;
+                    let string = self.read_utf8_exact(len, "BINUNICODE8 payload")?;
+                    self.stack.push(StdPickleItem::String(string));
+                }
+                STD_STACK_GLOBAL => {
+                    let name = self.pop_string("STACK_GLOBAL name")?;
+                    let module = self.pop_string("STACK_GLOBAL module")?;
+                    let item = resolve_std_global(vm, &module, &name)?;
+                    self.stack.push(item);
+                }
+                STD_EMPTY_TUPLE => self.push_value(tuple_value(Vec::new())),
+                STD_TUPLE => self.push_mark_tuple()?,
+                STD_TUPLE1 => self.push_fixed_tuple(1)?,
+                STD_TUPLE2 => self.push_fixed_tuple(2)?,
+                STD_TUPLE3 => self.push_fixed_tuple(3)?,
+                STD_REDUCE => {
+                    let args = self.pop_value("REDUCE arguments")?;
+                    let callable = self.pop_item("REDUCE callable")?;
+                    let value = call_std_reduce(vm, callable, args)?;
+                    self.push_value(value);
+                }
+                STD_BUILD => {
+                    let state = self.pop_value("BUILD state")?;
+                    let object = self.peek_value("BUILD target")?;
+                    restore_reduce_state(vm, object, state)?;
+                }
+                STD_BINPUT => {
+                    let index = self.read_u8()? as usize;
+                    self.memoize_top(index)?;
+                }
+                STD_LONG_BINPUT => {
+                    let index = self.read_u32_as_usize("LONG_BINPUT index")?;
+                    self.memoize_top(index)?;
+                }
+                STD_PUT => {
+                    let index = self.read_memo_line("PUT index")?;
+                    self.memoize_top(index)?;
+                }
+                STD_MEMOIZE => {
+                    let index = self.memo.len();
+                    self.memoize_top(index)?;
+                }
+                STD_BINGET => {
+                    let index = self.read_u8()? as usize;
+                    self.push_memo(index)?;
+                }
+                STD_LONG_BINGET => {
+                    let index = self.read_u32_as_usize("LONG_BINGET index")?;
+                    self.push_memo(index)?;
+                }
+                STD_GET => {
+                    let index = self.read_memo_line("GET index")?;
+                    self.push_memo(index)?;
+                }
+                _ => {
+                    return Err(invalid_pickle(format!(
+                        "unsupported pickle opcode 0x{opcode:02x}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn read_protocol(&mut self) -> Result<(), BuiltinError> {
+        let protocol = self.read_u8()?;
+        if i64::from(protocol) > HIGHEST_PROTOCOL {
+            return Err(invalid_pickle(format!(
+                "unsupported pickle protocol {}",
+                protocol
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_frame(&mut self) -> Result<(), BuiltinError> {
+        let len = self.read_u64_as_usize("FRAME length")?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| invalid_pickle("pickle frame offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(invalid_pickle("truncated pickle frame"));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Value, BuiltinError> {
+        let value = self.pop_value("STOP value")?;
+        if !self.stack.is_empty() {
+            return Err(invalid_pickle("extra values left on pickle stack"));
+        }
+        Ok(value)
+    }
+
+    #[inline]
+    fn push_value(&mut self, value: Value) {
+        self.stack.push(StdPickleItem::Value(value));
+    }
+
+    fn pop_item(&mut self, context: &'static str) -> Result<StdPickleItem, BuiltinError> {
+        self.stack
+            .pop()
+            .ok_or_else(|| invalid_pickle(format!("missing {context}")))
+    }
+
+    fn pop_value(&mut self, context: &'static str) -> Result<Value, BuiltinError> {
+        let item = self.pop_item(context)?;
+        item.into_value(context)
+    }
+
+    fn peek_value(&self, context: &'static str) -> Result<Value, BuiltinError> {
+        self.stack
+            .last()
+            .ok_or_else(|| invalid_pickle(format!("missing {context}")))?
+            .clone()
+            .into_value(context)
+    }
+
+    fn pop_string(&mut self, context: &'static str) -> Result<String, BuiltinError> {
+        match self.pop_item(context)? {
+            StdPickleItem::String(value) => Ok(value),
+            _ => Err(invalid_pickle(format!("{context} is not a string"))),
+        }
+    }
+
+    fn push_mark_tuple(&mut self) -> Result<(), BuiltinError> {
+        let mark = self
+            .stack
+            .iter()
+            .rposition(|item| matches!(item, StdPickleItem::Mark))
+            .ok_or_else(|| invalid_pickle("tuple opcode without mark"))?;
+        let tail = self.stack.split_off(mark + 1);
+        self.stack.pop();
+        let values = tail
+            .into_iter()
+            .map(|item| item.into_value("tuple item"))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.push_value(tuple_value(values));
+        Ok(())
+    }
+
+    fn push_fixed_tuple(&mut self, len: usize) -> Result<(), BuiltinError> {
+        if self.stack.len() < len {
+            return Err(invalid_pickle("tuple opcode underflow"));
+        }
+        let start = self.stack.len() - len;
+        let tail = self.stack.split_off(start);
+        let values = tail
+            .into_iter()
+            .map(|item| item.into_value("tuple item"))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.push_value(tuple_value(values));
+        Ok(())
+    }
+
+    fn memoize_top(&mut self, index: usize) -> Result<(), BuiltinError> {
+        let item = self
+            .stack
+            .last()
+            .ok_or_else(|| invalid_pickle("memo opcode without stack value"))?
+            .clone();
+        if matches!(item, StdPickleItem::Mark) {
+            return Err(invalid_pickle("cannot memoize pickle mark"));
+        }
+        if index >= self.memo.len() {
+            self.memo.resize(index + 1, None);
+        }
+        self.memo[index] = Some(item);
+        Ok(())
+    }
+
+    fn push_memo(&mut self, index: usize) -> Result<(), BuiltinError> {
+        let item = self
+            .memo
+            .get(index)
+            .and_then(|slot| slot.clone())
+            .ok_or_else(|| invalid_pickle("invalid pickle memo reference"))?;
+        self.stack.push(item);
+        Ok(())
+    }
+
+    fn read_decimal_line(&mut self, context: &'static str) -> Result<BigInt, BuiltinError> {
+        let text = self.read_utf8_line(context)?;
+        parse_decimal_bigint(&text).ok_or_else(|| invalid_pickle(format!("invalid {context}")))
+    }
+
+    fn read_long_line(&mut self) -> Result<BigInt, BuiltinError> {
+        let text = self.read_utf8_line("pickle long")?;
+        let text = text
+            .strip_suffix('L')
+            .or_else(|| text.strip_suffix('l'))
+            .unwrap_or(&text);
+        parse_decimal_bigint(text).ok_or_else(|| invalid_pickle("invalid pickle long"))
+    }
+
+    fn read_memo_line(&mut self, context: &'static str) -> Result<usize, BuiltinError> {
+        let text = self.read_utf8_line(context)?;
+        text.parse::<usize>()
+            .map_err(|_| invalid_pickle(format!("invalid {context}")))
+    }
+
+    fn read_utf8_line(&mut self, context: &'static str) -> Result<String, BuiltinError> {
+        let line = self.read_line()?;
+        std::str::from_utf8(line)
+            .map(str::to_owned)
+            .map_err(|_| invalid_pickle(format!("invalid UTF-8 {context}")))
+    }
+
+    fn read_utf8_exact(
+        &mut self,
+        len: usize,
+        context: &'static str,
+    ) -> Result<String, BuiltinError> {
+        let bytes = self.read_exact(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| invalid_pickle(format!("invalid UTF-8 {context}")))
+    }
+
+    fn read_line(&mut self) -> Result<&'bytes [u8], BuiltinError> {
+        let start = self.pos;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b'\n' {
+                let line = &self.bytes[start..self.pos];
+                self.pos += 1;
+                return Ok(line);
+            }
+            self.pos += 1;
+        }
+        Err(invalid_pickle("unterminated pickle line"))
+    }
+
+    fn read_u8(&mut self) -> Result<u8, BuiltinError> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> Result<u32, BuiltinError> {
+        let bytes = self.read_exact(4)?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("read_exact returned 4 bytes"),
+        ))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, BuiltinError> {
+        let bytes = self.read_exact(8)?;
+        Ok(u64::from_le_bytes(
+            bytes.try_into().expect("read_exact returned 8 bytes"),
+        ))
+    }
+
+    fn read_u32_as_usize(&mut self, context: &'static str) -> Result<usize, BuiltinError> {
+        usize::try_from(self.read_u32()?)
+            .map_err(|_| invalid_pickle(format!("{context} does not fit in memory")))
+    }
+
+    fn read_u64_as_usize(&mut self, context: &'static str) -> Result<usize, BuiltinError> {
+        usize::try_from(self.read_u64()?)
+            .map_err(|_| invalid_pickle(format!("{context} does not fit in memory")))
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'bytes [u8], BuiltinError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| invalid_pickle("pickle payload offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(invalid_pickle("truncated pickle payload"));
+        }
+        let bytes = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+}
+
+impl StdPickleItem {
+    fn into_value(self, context: &'static str) -> Result<Value, BuiltinError> {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::String(value) => Ok(Value::string(intern(&value))),
+            Self::Mark => Err(invalid_pickle(format!("{context} is a mark"))),
+            Self::Callable(_) => Err(invalid_pickle(format!("{context} is not a value"))),
+        }
+    }
+}
+
+fn resolve_std_global(
+    vm: &VirtualMachine,
+    module: &str,
+    name: &str,
+) -> Result<StdPickleItem, BuiltinError> {
+    if matches!(module, "builtins" | "__builtin__") {
+        return match name {
+            "iter" => Ok(StdPickleItem::Callable(StdPickleCallable::Iter)),
+            "range" | "xrange" => Ok(StdPickleItem::Callable(StdPickleCallable::Range)),
+            _ => resolve_builtin(vm, name)
+                .map(StdPickleItem::Value)
+                .ok_or_else(|| {
+                    invalid_pickle(format!("unsupported pickle global {module}.{name}"))
+                }),
+        };
+    }
+
+    Err(invalid_pickle(format!(
+        "unsupported pickle global {module}.{name}"
+    )))
+}
+
+fn call_std_reduce(
+    vm: &mut VirtualMachine,
+    callable: StdPickleItem,
+    args_value: Value,
+) -> Result<Value, BuiltinError> {
+    let args_tuple = value_as_tuple_ref(args_value)
+        .ok_or_else(|| invalid_pickle("REDUCE arguments are not a tuple"))?;
+    let args = args_tuple.as_slice();
+
+    match callable {
+        StdPickleItem::Callable(StdPickleCallable::Range) => reduce_std_range(args),
+        StdPickleItem::Callable(StdPickleCallable::Iter) => {
+            let iter = vm
+                .builtin_value("iter")
+                .ok_or_else(|| invalid_pickle("cannot resolve builtins.iter"))?;
+            invoke_callable_value(vm, iter, args).map_err(runtime_error_to_builtin_error)
+        }
+        StdPickleItem::Value(value) => {
+            invoke_callable_value(vm, value, args).map_err(runtime_error_to_builtin_error)
+        }
+        _ => Err(invalid_pickle("REDUCE callable is not callable")),
+    }
+}
+
+fn reduce_std_range(args: &[Value]) -> Result<Value, BuiltinError> {
+    let (start, stop, step) = match args {
+        [stop] => (
+            BigInt::from(0),
+            std_pickle_index(*stop, "range stop")?,
+            BigInt::from(1),
+        ),
+        [start, stop] => (
+            std_pickle_index(*start, "range start")?,
+            std_pickle_index(*stop, "range stop")?,
+            BigInt::from(1),
+        ),
+        [start, stop, step] => (
+            std_pickle_index(*start, "range start")?,
+            std_pickle_index(*stop, "range stop")?,
+            std_pickle_index(*step, "range step")?,
+        ),
+        _ => {
+            return Err(invalid_pickle(
+                "range reducer expects one to three arguments",
+            ));
+        }
+    };
+    if step == BigInt::from(0) {
+        return Err(invalid_pickle("range step cannot be zero"));
+    }
+
+    Ok(crate::alloc_managed_value(RangeObject::from_bigints(
+        start, stop, step,
+    )))
+}
+
+fn std_pickle_index(value: Value, context: &'static str) -> Result<BigInt, BuiltinError> {
+    value_to_bigint(value).ok_or_else(|| invalid_pickle(format!("{context} is not an integer")))
+}
+
+fn parse_decimal_bigint(text: &str) -> Option<BigInt> {
+    let text = text.trim();
+    let text = text.strip_prefix('+').unwrap_or(text);
+    if text.is_empty() {
+        return None;
+    }
+    BigInt::parse_bytes(text.as_bytes(), 10)
+}
+
+#[inline]
+fn tuple_value(values: Vec<Value>) -> Value {
+    crate::alloc_managed_value(TupleObject::from_vec(values))
+}
+
 fn pickle_dumps(
     vm: &mut VirtualMachine,
     args: &[Value],
@@ -793,9 +1298,7 @@ fn pickle_loads(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builti
     }
 
     let Some(payload) = bytes.strip_prefix(PRISM_PICKLE_MAGIC) else {
-        return Err(BuiltinError::ValueError(
-            "unsupported or invalid pickle stream".to_string(),
-        ));
+        return StdPickleReader::new(&bytes).read(vm);
     };
 
     let mut reader = PickleReader::new(payload);

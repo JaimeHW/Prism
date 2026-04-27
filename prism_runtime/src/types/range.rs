@@ -488,15 +488,29 @@ impl RangeIterator {
             Self::Small {
                 start,
                 current,
+                stop,
                 step,
-                ..
-            } => (BigInt::from(*current) - BigInt::from(*start)) / BigInt::from(*step),
+            } => {
+                if (*step > 0 && *current >= *stop) || (*step < 0 && *current <= *stop) {
+                    BigInt::from(small_len(*start, *stop, *step))
+                } else {
+                    (BigInt::from(*current) - BigInt::from(*start)) / BigInt::from(*step)
+                }
+            }
             Self::Big {
                 start,
                 current,
+                stop,
                 step,
-                ..
-            } => (current - start) / step,
+            } => {
+                if (step.is_positive() && current >= stop)
+                    || (step.is_negative() && current <= stop)
+                {
+                    big_len(start, stop, step)
+                } else {
+                    (current - start) / step
+                }
+            }
         }
     }
 
