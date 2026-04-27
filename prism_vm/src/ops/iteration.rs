@@ -9,7 +9,10 @@ use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_specia
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::GeneratorObject;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::iter::{IteratorAdvanceError, IteratorObject};
 use std::cell::RefCell;
@@ -42,7 +45,7 @@ pub(crate) fn ensure_iterator_value(
         }
     }
 
-    if let Ok(iter) = value_to_iterator(&value) {
+    if !heap_type_overrides_iter(value) && let Ok(iter) = value_to_iterator(&value) {
         return Ok(iterator_to_value(iter));
     }
 
@@ -68,6 +71,23 @@ pub(crate) fn ensure_iterator_value(
             "__iter__ returned non-iterator".to_string(),
         ))
     }
+}
+
+#[inline]
+fn heap_type_overrides_iter(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return false;
+    }
+
+    global_class(ClassId(type_id.raw())).is_some_and(|class| {
+        class
+            .lookup_method_published(&intern("__iter__"))
+            .is_some()
+    })
 }
 
 /// Advance a VM-visible iterator or generator by one step.
