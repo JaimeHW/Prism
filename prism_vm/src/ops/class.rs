@@ -31,7 +31,7 @@
 use crate::VirtualMachine;
 use crate::builtins::{builtin_type_object_for_type_id, builtin_type_object_type_id};
 use crate::dispatch::ControlFlow;
-use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::error::RuntimeError;
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::objects::{get_attribute_value, resolve_class_attribute_in_vm};
@@ -482,7 +482,7 @@ pub(crate) fn invoke_descriptor_set_name_hooks(
     for (name, descriptor) in entries {
         let set_name = match get_attribute_value(vm, descriptor, &set_name_attr) {
             Ok(value) => value,
-            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => continue,
+            Err(err) if err.is_attribute_error() => continue,
             Err(err) => return Err(err),
         };
         invoke_callable_value(vm, set_name, &[class_value, Value::string(name)])?;
@@ -567,9 +567,7 @@ fn prepare_class_namespace(
     let metaclass_callable = materialize_metaclass_callable(metaclass);
     let prepare = match get_attribute_value(vm, metaclass_callable, &prepare_name) {
         Ok(value) => value,
-        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
-            return Ok(None);
-        }
+        Err(err) if err.is_attribute_error() => return Ok(None),
         Err(err) => return Err(err),
     };
 
