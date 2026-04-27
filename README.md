@@ -20,7 +20,7 @@
 
 ---
 
-Prism is a ground-up Python 3.12 implementation: parser, compiler, virtual machine, garbage collector, JIT compiler, standard library, and AOT tooling. The project is organized as an 11-crate Cargo workspace with explicit ownership boundaries for source compilation, runtime execution, and stdlib import metadata.
+Prism is a ground-up Python 3.12 implementation: parser, compiler, virtual machine, garbage collector, JIT compiler, standard library, and AOT tooling. The project is organized as an 11-crate Cargo workspace under `crates/`, with explicit ownership boundaries for source compilation, runtime execution, and stdlib import metadata.
 
 The codebase spans roughly 230k lines of Rust across the workspace.
 
@@ -184,7 +184,7 @@ Native builtin/import metadata is defined once in `prism_stdlib` and consumed by
 - **PreferNative**: Modules like `math`, `sys`, `time`, `io`, `gc`, `itertools`, `struct`, `array`, `marshal`, `binascii`, `signal`, `_thread`, `_codecs`, `_sre`, `_functools`, `weakref`, `typing`, `collections`, `operator`, `inspect`, `pickle`, and platform modules (`nt`, `msvcrt`, `winreg` on Windows; `posix` on Unix).
 - **PreferSourceWhenAvailable**: Modules like `os`, `os.path`, `json`, `functools`, and `re`, which prefer a source-backed implementation when the filesystem is available.
 
-Source fallback modules (e.g., `abc`, `contextlib`, `decimal`, `fractions`, `unittest`) are shipped in `prism_stdlib/python/`.
+Source fallback modules (e.g., `abc`, `contextlib`, `decimal`, `fractions`, `unittest`) are shipped in `crates/prism_stdlib/python/`.
 
 The import system also supports frozen source modules so the AOT pipeline can bundle code without runtime filesystem access.
 
