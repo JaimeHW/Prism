@@ -3099,12 +3099,12 @@ impl Compiler {
 
     fn validate_augassign_target(&self, target: &Expr) -> CompileResult<()> {
         match &target.kind {
-            ExprKind::Tuple(_) | ExprKind::List(_) => Err(CompileError {
+            ExprKind::Name(_) | ExprKind::Attribute { .. } | ExprKind::Subscript { .. } => Ok(()),
+            _ => Err(CompileError {
                 message: "illegal expression for augmented assignment".to_string(),
                 line: self.line_for_span(target.span),
                 column: 0,
             }),
-            _ => Ok(()),
         }
     }
 
