@@ -52,6 +52,8 @@ static FLOOR_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.floor"), math_floor_builtin));
 static FABS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.fabs"), math_fabs_builtin));
+static COPYSIGN_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.copysign"), math_copysign_builtin));
 static SIN_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.sin"), math_sin_builtin));
 static COS_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -78,6 +80,10 @@ static ERFC_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.erfc"), math_erfc_builtin));
 static ISFINITE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isfinite"), math_isfinite_builtin));
+static ISINF_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isinf"), math_isinf_builtin));
+static ISNAN_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isnan"), math_isnan_builtin));
 static GCD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.gcd"), math_gcd_builtin));
 
@@ -114,6 +120,7 @@ impl Module for MathModule {
             "ceil" => Ok(builtin_value(&CEIL_FUNCTION)),
             "floor" => Ok(builtin_value(&FLOOR_FUNCTION)),
             "fabs" => Ok(builtin_value(&FABS_FUNCTION)),
+            "copysign" => Ok(builtin_value(&COPYSIGN_FUNCTION)),
             "sin" => Ok(builtin_value(&SIN_FUNCTION)),
             "cos" => Ok(builtin_value(&COS_FUNCTION)),
             "acos" => Ok(builtin_value(&ACOS_FUNCTION)),
@@ -127,14 +134,16 @@ impl Module for MathModule {
             "erf" => Ok(builtin_value(&ERF_FUNCTION)),
             "erfc" => Ok(builtin_value(&ERFC_FUNCTION)),
             "isfinite" => Ok(builtin_value(&ISFINITE_FUNCTION)),
+            "isinf" => Ok(builtin_value(&ISINF_FUNCTION)),
+            "isnan" => Ok(builtin_value(&ISNAN_FUNCTION)),
             "gcd" => Ok(builtin_value(&GCD_FUNCTION)),
 
             // Functions are returned as None for now
             // Full implementation would return callable objects
-            "trunc" | "copysign" | "fmod" | "modf" | "remainder" | "tan" | "asin" | "atan"
-            | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "exp2"
-            | "expm1" | "log1p" | "pow" | "isqrt" | "hypot" | "factorial" | "comb" | "perm"
-            | "lcm" | "degrees" | "radians" | "isinf" | "isnan" => {
+            "trunc" | "fmod" | "modf" | "remainder" | "tan" | "asin" | "atan" | "atan2"
+            | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "exp2" | "expm1"
+            | "log1p" | "pow" | "isqrt" | "hypot" | "factorial" | "comb" | "perm" | "lcm"
+            | "degrees" | "radians" => {
                 // TODO: Return actual function objects when callable system is ready
                 Err(ModuleError::AttributeError(format!(
                     "math.{} is not yet callable as an object",
@@ -306,6 +315,15 @@ fn math_fabs_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+fn math_copysign_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_math_arg_count(args, "copysign", 2)?;
+    Ok(Value::float(copysign(
+        extract_float_builtin(&args[0])?,
+        extract_float_builtin(&args[1])?,
+    )))
+}
+
+#[inline]
 fn math_sin_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "sin", 1)?;
     Ok(Value::float(sin(extract_float_builtin(&args[0])?)))
@@ -405,6 +423,18 @@ fn math_erfc_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
 fn math_isfinite_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "isfinite", 1)?;
     Ok(Value::bool(isfinite(extract_float_builtin(&args[0])?)))
+}
+
+#[inline]
+fn math_isinf_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_math_arg_count(args, "isinf", 1)?;
+    Ok(Value::bool(isinf(extract_float_builtin(&args[0])?)))
+}
+
+#[inline]
+fn math_isnan_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_math_arg_count(args, "isnan", 1)?;
+    Ok(Value::bool(isnan(extract_float_builtin(&args[0])?)))
 }
 
 #[inline]
