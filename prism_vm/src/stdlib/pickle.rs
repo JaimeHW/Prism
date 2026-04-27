@@ -310,11 +310,7 @@ impl<'vm> PickleWriter<'vm> {
         self.write_str(&name)
     }
 
-    fn write_user_object(
-        &mut self,
-        ptr: *const (),
-        type_id: TypeId,
-    ) -> Result<(), BuiltinError> {
+    fn write_user_object(&mut self, ptr: *const (), type_id: TypeId) -> Result<(), BuiltinError> {
         let Some(id) = self.begin_memo(ptr)? else {
             return Ok(());
         };
@@ -348,8 +344,8 @@ impl<'vm> PickleWriter<'vm> {
 
         let reduce = get_attribute_value(self.vm, value, &intern("__reduce__"))
             .map_err(runtime_error_to_builtin_error)?;
-        let reduction = invoke_callable_value(self.vm, reduce, &[])
-            .map_err(runtime_error_to_builtin_error)?;
+        let reduction =
+            invoke_callable_value(self.vm, reduce, &[]).map_err(runtime_error_to_builtin_error)?;
 
         self.write_tag(TAG_REDUCE);
         self.write_u32(id);
@@ -468,9 +464,9 @@ impl<'bytes> PickleReader<'bytes> {
             }
             TAG_BYTEARRAY => {
                 let bytes = self.read_bytes()?;
-                Ok(crate::alloc_managed_value(BytesObject::bytearray_from_slice(
-                    bytes,
-                )))
+                Ok(crate::alloc_managed_value(
+                    BytesObject::bytearray_from_slice(bytes),
+                ))
             }
             TAG_LIST => self.read_list(vm),
             TAG_TUPLE => self.read_tuple(vm),
@@ -607,9 +603,8 @@ impl<'bytes> PickleReader<'bytes> {
             args.push(self.read_value(vm)?);
         }
         let starred = self.read_u8()? != 0;
-        let value = crate::alloc_managed_value(GenericAliasObject::new_with_starred(
-            origin, args, starred,
-        ));
+        let value =
+            crate::alloc_managed_value(GenericAliasObject::new_with_starred(origin, args, starred));
         self.insert_memo(id, value)?;
         Ok(value)
     }
@@ -852,9 +847,7 @@ fn class_export_name(class: &PyClassObject) -> (String, String) {
 
 fn checked_u32(value: usize, context: &'static str) -> Result<u32, BuiltinError> {
     u32::try_from(value).map_err(|_| {
-        BuiltinError::OverflowError(format!(
-            "{context} is too large to encode in Prism pickle"
-        ))
+        BuiltinError::OverflowError(format!("{context} is too large to encode in Prism pickle"))
     })
 }
 

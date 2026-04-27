@@ -41,16 +41,10 @@ pub enum IteratorReduction {
     EmptyIterable(IteratorEmptyIterable),
     /// Reconstruct as `iter(iterable)` and optionally restore an index with
     /// `__setstate__`.
-    Iterable {
-        iterable: Value,
-        state: Option<i64>,
-    },
+    Iterable { iterable: Value, state: Option<i64> },
     /// Reconstruct as `reversed(iterable)` and optionally restore a reverse
     /// iterator index with `__setstate__`.
-    ReversedIterable {
-        iterable: Value,
-        state: Option<i64>,
-    },
+    ReversedIterable { iterable: Value, state: Option<i64> },
     /// Reconstruct as `iter(callable, sentinel)`.
     CallSentinel { callable: Value, sentinel: Value },
     /// Reconstruct from a snapshot list of remaining values.
@@ -992,16 +986,21 @@ impl IteratorObject {
                     iter.clone().collect::<Vec<_>>(),
                 ))
             }
-            IterKind::Count { .. } | IterKind::Repeat { remaining: None, .. } => Ok(
-                IteratorReduction::RequiresVm("infinite iterator cannot be snapshotted"),
-            ),
+            IterKind::Count { .. }
+            | IterKind::Repeat {
+                remaining: None, ..
+            } => Ok(IteratorReduction::RequiresVm(
+                "infinite iterator cannot be snapshotted",
+            )),
             IterKind::Repeat {
                 value,
                 remaining: Some(count),
             } => Ok(IteratorReduction::RemainingValues(vec![*value; *count])),
             IterKind::List { list, index } => {
                 if self.exhausted {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::List));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::List,
+                    ));
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *list,
@@ -1010,7 +1009,9 @@ impl IteratorObject {
             }
             IterKind::Tuple { tuple, index } => {
                 if self.exhausted {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::Tuple,
+                    ));
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *tuple,
@@ -1022,7 +1023,9 @@ impl IteratorObject {
                 byte_offset,
             } => {
                 if self.exhausted {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::String));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::String,
+                    ));
                 }
                 let string_ref = string_from_value(*string);
                 let text = string_ref.as_str();
@@ -1034,7 +1037,9 @@ impl IteratorObject {
             }
             IterKind::Bytes { bytes, index } => {
                 if self.exhausted {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::Tuple,
+                    ));
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *bytes,
@@ -1065,7 +1070,9 @@ impl IteratorObject {
                     "protocol iterator cannot be snapshotted without VM context",
                 )),
             },
-            IterKind::SequenceGetItem { self_arg, index, .. } => match self_arg {
+            IterKind::SequenceGetItem {
+                self_arg, index, ..
+            } => match self_arg {
                 _ if self.exhausted => Ok(IteratorReduction::EmptyIterable(
                     IteratorEmptyIterable::Tuple,
                 )),
@@ -1079,7 +1086,9 @@ impl IteratorObject {
             },
             IterKind::CallSentinel { callable, sentinel } => {
                 if self.exhausted {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::Tuple,
+                    ));
                 }
                 Ok(IteratorReduction::CallSentinel {
                     callable: *callable,
@@ -1088,14 +1097,18 @@ impl IteratorObject {
             }
             IterKind::GenericAlias { alias, yielded } => {
                 if self.exhausted || *yielded {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::Tuple,
+                    ));
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *alias,
                     state: None,
                 })
             }
-            IterKind::Empty => Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::Tuple)),
+            IterKind::Empty => Ok(IteratorReduction::EmptyIterable(
+                IteratorEmptyIterable::Tuple,
+            )),
             IterKind::Chain { .. }
             | IterKind::Enumerate { .. }
             | IterKind::Zip { .. }
@@ -1115,7 +1128,9 @@ impl IteratorObject {
                 reverse_index,
             } => {
                 if self.exhausted {
-                    return Ok(IteratorReduction::EmptyIterable(IteratorEmptyIterable::List));
+                    return Ok(IteratorReduction::EmptyIterable(
+                        IteratorEmptyIterable::List,
+                    ));
                 }
                 Ok(IteratorReduction::ReversedIterable {
                     iterable: *list,

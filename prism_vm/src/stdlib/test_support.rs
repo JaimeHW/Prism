@@ -211,8 +211,9 @@ impl Module for SupportModule {
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
             "MISSING_C_DOCSTRINGS" => Ok(Value::bool(true)),
             "MAX_Py_ssize_t" => Ok(bigint_to_value(BigInt::from(isize::MAX))),
-            "NHASHBITS" => Ok(Value::int((usize::BITS - 1) as i64)
-                .expect("hash bit width fits in tagged int")),
+            "NHASHBITS" => Ok(
+                Value::int((usize::BITS - 1) as i64).expect("hash bit width fits in tagged int")
+            ),
             "NEVER_EQ" => Ok(*NEVER_EQ_VALUE),
             "Py_DEBUG" => Ok(Value::bool(false)),
             "TestFailed" => Ok(exception_type_value_for_id(

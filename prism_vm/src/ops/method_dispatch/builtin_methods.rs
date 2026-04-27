@@ -77,9 +77,8 @@ static LIST_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__len__"), list_len));
 static LIST_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__getitem__"), list_getitem));
-static LIST_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new_vm(Arc::from("list.__contains__"), list_contains)
-});
+static LIST_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.__contains__"), list_contains));
 static LIST_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__add__"), list_add));
 static LIST_IADD_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -2445,9 +2444,9 @@ fn iterator_reduce(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
             .map_err(runtime_error_to_builtin_error)?;
             reduce_tuple(vm, reducer_builtin, &[list], None)
         }
-        IteratorReduction::RequiresVm(reason) => Err(BuiltinError::NotImplemented(
-            reason.to_string(),
-        )),
+        IteratorReduction::RequiresVm(reason) => {
+            Err(BuiltinError::NotImplemented(reason.to_string()))
+        }
     }
 }
 
@@ -2466,18 +2465,14 @@ fn empty_reduce_iterable(
     kind: IteratorEmptyIterable,
 ) -> Result<Value, BuiltinError> {
     match kind {
-        IteratorEmptyIterable::Tuple => alloc_heap_value(
-            vm,
-            TupleObject::empty(),
-            "iterator reduce empty tuple",
-        )
-        .map_err(runtime_error_to_builtin_error),
-        IteratorEmptyIterable::List => alloc_heap_value(
-            vm,
-            ListObject::new(),
-            "iterator reduce empty list",
-        )
-        .map_err(runtime_error_to_builtin_error),
+        IteratorEmptyIterable::Tuple => {
+            alloc_heap_value(vm, TupleObject::empty(), "iterator reduce empty tuple")
+                .map_err(runtime_error_to_builtin_error)
+        }
+        IteratorEmptyIterable::List => {
+            alloc_heap_value(vm, ListObject::new(), "iterator reduce empty list")
+                .map_err(runtime_error_to_builtin_error)
+        }
         IteratorEmptyIterable::String => Ok(Value::string(intern(""))),
     }
 }

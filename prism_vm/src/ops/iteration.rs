@@ -45,7 +45,9 @@ pub(crate) fn ensure_iterator_value(
         }
     }
 
-    if !heap_type_overrides_iter(value) && let Ok(iter) = value_to_iterator(&value) {
+    if !heap_type_overrides_iter(value)
+        && let Ok(iter) = value_to_iterator(&value)
+    {
         return Ok(iterator_to_value(iter));
     }
 
@@ -83,11 +85,8 @@ fn heap_type_overrides_iter(value: Value) -> bool {
         return false;
     }
 
-    global_class(ClassId(type_id.raw())).is_some_and(|class| {
-        class
-            .lookup_method_published(&intern("__iter__"))
-            .is_some()
-    })
+    global_class(ClassId(type_id.raw()))
+        .is_some_and(|class| class.lookup_method_published(&intern("__iter__")).is_some())
 }
 
 /// Advance a VM-visible iterator or generator by one step.

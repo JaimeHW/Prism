@@ -1,4 +1,5 @@
 use super::{BytesIO, DEFAULT_BUFFER_SIZE, IoError, SEEK_CUR, StringIO};
+use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class,
     builtin_type_object_type_id, runtime_error_to_builtin_error,
@@ -6,7 +7,6 @@ use crate::builtins::{
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::objects::extract_type_id;
 use crate::stdlib::sys::standard_streams;
-use crate::VirtualMachine;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
@@ -309,7 +309,10 @@ fn set_common_stream_methods(class: &PyClassObject) {
     class.set_attr(intern("close"), builtin_value(&STREAM_CLOSE_METHOD));
     class.set_attr(intern("readline"), builtin_value(&STREAM_READLINE_METHOD));
     class.set_attr(intern("readlines"), builtin_value(&STREAM_READLINES_METHOD));
-    class.set_attr(intern("writelines"), builtin_value(&STREAM_WRITELINES_METHOD));
+    class.set_attr(
+        intern("writelines"),
+        builtin_value(&STREAM_WRITELINES_METHOD),
+    );
     class.set_attr(intern("__enter__"), builtin_value(&STREAM_ENTER_METHOD));
     class.set_attr(intern("__exit__"), builtin_value(&STREAM_EXIT_METHOD));
     class.set_attr(intern("__iter__"), builtin_value(&STREAM_ITER_METHOD));
@@ -1015,80 +1018,68 @@ fn stream_writelines(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
             }
             store_bytes_io(receiver, stream)?;
         }
-        StreamKind::TextFile => {
-            loop {
-                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
-                    IterStep::Yielded(item) => {
-                        let data = string_from_value(item, "writelines() argument")?;
-                        write_text_file(receiver, &data)?;
-                    }
-                    IterStep::Exhausted => break,
+        StreamKind::TextFile => loop {
+            match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                IterStep::Yielded(item) => {
+                    let data = string_from_value(item, "writelines() argument")?;
+                    write_text_file(receiver, &data)?;
                 }
+                IterStep::Exhausted => break,
             }
-        }
-        StreamKind::BinaryFile => {
-            loop {
-                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
-                    IterStep::Yielded(item) => {
-                        let data = bytes_from_value(item, "writelines() argument")?;
-                        write_binary_file(receiver, &data)?;
-                    }
-                    IterStep::Exhausted => break,
+        },
+        StreamKind::BinaryFile => loop {
+            match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                IterStep::Yielded(item) => {
+                    let data = bytes_from_value(item, "writelines() argument")?;
+                    write_binary_file(receiver, &data)?;
                 }
+                IterStep::Exhausted => break,
             }
-        }
-        StreamKind::StdOut => {
-            loop {
-                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
-                    IterStep::Yielded(item) => {
-                        let data = string_from_value(item, "writelines() argument")?;
-                        standard_streams()
-                            .write_stdout(&data)
-                            .map_err(host_stream_error)?;
-                    }
-                    IterStep::Exhausted => break,
+        },
+        StreamKind::StdOut => loop {
+            match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                IterStep::Yielded(item) => {
+                    let data = string_from_value(item, "writelines() argument")?;
+                    standard_streams()
+                        .write_stdout(&data)
+                        .map_err(host_stream_error)?;
                 }
+                IterStep::Exhausted => break,
             }
-        }
-        StreamKind::StdErr => {
-            loop {
-                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
-                    IterStep::Yielded(item) => {
-                        let data = string_from_value(item, "writelines() argument")?;
-                        standard_streams()
-                            .write_stderr(&data)
-                            .map_err(host_stream_error)?;
-                    }
-                    IterStep::Exhausted => break,
+        },
+        StreamKind::StdErr => loop {
+            match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                IterStep::Yielded(item) => {
+                    let data = string_from_value(item, "writelines() argument")?;
+                    standard_streams()
+                        .write_stderr(&data)
+                        .map_err(host_stream_error)?;
                 }
+                IterStep::Exhausted => break,
             }
-        }
-        StreamKind::StdOutBuffer => {
-            loop {
-                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
-                    IterStep::Yielded(item) => {
-                        let data = bytes_from_value(item, "writelines() argument")?;
-                        standard_streams()
-                            .write_stdout_bytes(&data)
-                            .map_err(host_stream_error)?;
-                    }
-                    IterStep::Exhausted => break,
+        },
+        StreamKind::StdOutBuffer => loop {
+            match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                IterStep::Yielded(item) => {
+                    let data = bytes_from_value(item, "writelines() argument")?;
+                    standard_streams()
+                        .write_stdout_bytes(&data)
+                        .map_err(host_stream_error)?;
                 }
+                IterStep::Exhausted => break,
             }
-        }
-        StreamKind::StdErrBuffer => {
-            loop {
-                match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
-                    IterStep::Yielded(item) => {
-                        let data = bytes_from_value(item, "writelines() argument")?;
-                        standard_streams()
-                            .write_stderr_bytes(&data)
-                            .map_err(host_stream_error)?;
-                    }
-                    IterStep::Exhausted => break,
+        },
+        StreamKind::StdErrBuffer => loop {
+            match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+                IterStep::Yielded(item) => {
+                    let data = bytes_from_value(item, "writelines() argument")?;
+                    standard_streams()
+                        .write_stderr_bytes(&data)
+                        .map_err(host_stream_error)?;
                 }
+                IterStep::Exhausted => break,
             }
-        }
+        },
         StreamKind::StdIn | StreamKind::StdInBuffer => {
             return Err(BuiltinError::OSError("stdin is not writable".to_string()));
         }

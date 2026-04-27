@@ -108,9 +108,8 @@ pub fn builtin_iter(args: &[Value]) -> Result<Value, BuiltinError> {
                 )));
             }
 
-            let iter = prism_runtime::types::iter::IteratorObject::from_call_sentinel(
-                args[0], args[1],
-            );
+            let iter =
+                prism_runtime::types::iter::IteratorObject::from_call_sentinel(args[0], args[1]);
             Ok(super::iter_dispatch::iterator_to_value(iter))
         }
         _ => Err(BuiltinError::TypeError(format!(
@@ -132,9 +131,8 @@ pub fn builtin_iter_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
                 )));
             }
 
-            let iter = prism_runtime::types::iter::IteratorObject::from_call_sentinel(
-                args[0], args[1],
-            );
+            let iter =
+                prism_runtime::types::iter::IteratorObject::from_call_sentinel(args[0], args[1]);
             Ok(super::iter_dispatch::iterator_to_value(iter))
         }
         _ => Err(BuiltinError::TypeError(format!(
