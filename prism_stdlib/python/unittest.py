@@ -232,6 +232,11 @@ class TestCase:
     def assertListEqual(self, first, second, msg=None):
         self.assertEqual(first, second, msg)
 
+    def assertDictEqual(self, first, second, msg=None):
+        self.assertIsInstance(first, dict, "First argument is not a dictionary")
+        self.assertIsInstance(second, dict, "Second argument is not a dictionary")
+        self.assertEqual(first, second, msg)
+
     def assertSequenceEqual(self, first, second, msg=None):
         self.assertEqual(first, second, msg)
 
@@ -306,6 +311,22 @@ class TestCase:
         with context:
             callable_obj(*args[1:], **kwargs)
         return context
+
+    def assertRegex(self, text, expected_regex, msg=None):
+        if _prism_re is None:
+            matched = expected_regex in text
+        else:
+            matched = _prism_re.search(expected_regex, text) is not None
+        if not matched:
+            self.fail(msg or (repr(expected_regex) + " not found in " + repr(text)))
+
+    def assertNotRegex(self, text, unexpected_regex, msg=None):
+        if _prism_re is None:
+            matched = unexpected_regex in text
+        else:
+            matched = _prism_re.search(unexpected_regex, text) is not None
+        if matched:
+            self.fail(msg or (repr(unexpected_regex) + " unexpectedly found in " + repr(text)))
 
     def assertWarns(self, expected_warning):
         return _AssertWarnsContext(expected_warning, self)
