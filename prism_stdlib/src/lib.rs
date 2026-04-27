@@ -201,6 +201,8 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "ctypes"
         | "fnmatch"
         | "inspect"
+        | "importlib"
+        | "importlib.util"
         | "itertools"
         | "io"
         | "marshal"

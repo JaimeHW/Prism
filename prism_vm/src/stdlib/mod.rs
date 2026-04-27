@@ -47,6 +47,7 @@ pub mod fnmatch;
 pub mod functools;
 pub mod gc;
 pub mod generators;
+pub mod importlib;
 pub mod inspect;
 pub mod io;
 pub mod itertools;
@@ -469,6 +470,16 @@ impl StdlibRegistry {
             &mut modules,
             "inspect",
             Box::new(inspect::InspectModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "importlib",
+            Box::new(importlib::ImportlibModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "importlib.util",
+            Box::new(importlib::ImportlibUtilModule::new()),
         );
 
         Self::insert_module(
