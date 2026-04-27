@@ -11,11 +11,18 @@ use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class, builtin_repr,
     exception_type_value_for_id, runtime_error_to_builtin_error,
 };
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::dict_access::{dict_get_item, dict_remove_item, dict_set_item};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::objects::{dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use num_bigint::BigInt;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
+use prism_runtime::object::shape::shape_registry;
+use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{SubclassBitmap, register_global_class};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::int::bigint_to_value;
@@ -31,6 +38,11 @@ const BIGMEM_1M: i64 = 1024 * 1024;
 const BIGMEM_1G: i64 = 1024 * BIGMEM_1M;
 const BIGMEM_2G: i64 = 2 * BIGMEM_1G;
 const BIGMEM_4G: i64 = 4 * BIGMEM_1G;
+const SWAP_ITEM_MAPPING_ATTR: &str = "__prism_swap_item_mapping__";
+const SWAP_ITEM_KEY_ATTR: &str = "__prism_swap_item_key__";
+const SWAP_ITEM_VALUE_ATTR: &str = "__prism_swap_item_value__";
+const SWAP_ITEM_OLD_VALUE_ATTR: &str = "__prism_swap_item_old_value__";
+const SWAP_ITEM_HAD_ITEM_ATTR: &str = "__prism_swap_item_had_item__";
 
 static ALWAYS_EQ_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_sentinel_class("_ALWAYS_EQ", &ALWAYS_EQ_METHODS));
@@ -44,6 +56,14 @@ static WARNINGS_FILTER_CONTEXT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::n
         "test.support.warnings_helper",
         &WARNINGS_FILTER_CONTEXT_ENTER_FUNCTION,
         &WARNINGS_FILTER_CONTEXT_EXIT_FUNCTION,
+    )
+});
+static SWAP_ITEM_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_context_manager_class(
+        "_SwapItem",
+        "test.support",
+        &SWAP_ITEM_ENTER_FUNCTION,
+        &SWAP_ITEM_EXIT_FUNCTION,
     )
 });
 static ALWAYS_EQ_VALUE: LazyLock<Value> =
@@ -87,6 +107,17 @@ static INFINITE_RECURSION_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyL
         Arc::from("test.support._InfiniteRecursion.__exit__"),
         infinite_recursion_exit,
     )
+});
+static SWAP_ITEM_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("test.support.swap_item"), swap_item));
+static SWAP_ITEM_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("test.support._SwapItem.__enter__"),
+        swap_item_enter,
+    )
+});
+static SWAP_ITEM_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("test.support._SwapItem.__exit__"), swap_item_exit)
 });
 static CPYTHON_ONLY_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("test.support.cpython_only"), cpython_only)
@@ -303,6 +334,7 @@ impl SupportModule {
                 Arc::from("skip_if_pgo_task"),
                 Arc::from("skip_on_s390x"),
                 Arc::from("sortdict"),
+                Arc::from("swap_item"),
                 Arc::from("threading_helper"),
                 Arc::from("verbose"),
             ],
@@ -364,6 +396,7 @@ impl Module for SupportModule {
             "skip_if_pgo_task" => Ok(builtin_value(&SKIP_IF_PGO_TASK_FUNCTION)),
             "skip_on_s390x" => Ok(builtin_value(&SKIP_ON_S390X_FUNCTION)),
             "sortdict" => Ok(builtin_value(&SORTDICT_FUNCTION)),
+            "swap_item" => Ok(builtin_value(&SWAP_ITEM_FUNCTION)),
             "verbose" => Ok(Value::int(1).expect("support.verbose fits in tagged int")),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support' has no attribute '{}'",
@@ -523,6 +556,232 @@ fn infinite_recursion_exit(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     Ok(Value::bool(false))
+}
+
+fn swap_item(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "swap_item() takes exactly 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut instance = allocate_heap_instance_for_class(SWAP_ITEM_CLASS.as_ref());
+    set_swap_item_property(&mut instance, SWAP_ITEM_MAPPING_ATTR, args[0]);
+    set_swap_item_property(&mut instance, SWAP_ITEM_KEY_ATTR, args[1]);
+    set_swap_item_property(&mut instance, SWAP_ITEM_VALUE_ATTR, args[2]);
+    set_swap_item_property(&mut instance, SWAP_ITEM_OLD_VALUE_ATTR, Value::none());
+    set_swap_item_property(&mut instance, SWAP_ITEM_HAD_ITEM_ATTR, Value::bool(false));
+    Ok(crate::alloc_managed_value(instance))
+}
+
+fn swap_item_enter(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "__enter__() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let (mapping, key, value) = {
+        let object = swap_item_object_ref(args[0])?;
+        (
+            swap_item_property(object, SWAP_ITEM_MAPPING_ATTR)?,
+            swap_item_property(object, SWAP_ITEM_KEY_ATTR)?,
+            swap_item_property(object, SWAP_ITEM_VALUE_ATTR)?,
+        )
+    };
+
+    let old_value =
+        mapping_get_optional(vm, mapping, key).map_err(runtime_error_to_builtin_error)?;
+    mapping_set_item(vm, mapping, key, value).map_err(runtime_error_to_builtin_error)?;
+
+    {
+        let object = swap_item_object_mut(args[0])?;
+        set_swap_item_property(
+            object,
+            SWAP_ITEM_OLD_VALUE_ATTR,
+            old_value.unwrap_or_else(Value::none),
+        );
+        set_swap_item_property(
+            object,
+            SWAP_ITEM_HAD_ITEM_ATTR,
+            Value::bool(old_value.is_some()),
+        );
+    }
+
+    Ok(old_value.unwrap_or_else(Value::none))
+}
+
+fn swap_item_exit(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "__exit__() takes exactly 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let (mapping, key, old_value, had_item) = {
+        let object = swap_item_object_ref(args[0])?;
+        (
+            swap_item_property(object, SWAP_ITEM_MAPPING_ATTR)?,
+            swap_item_property(object, SWAP_ITEM_KEY_ATTR)?,
+            swap_item_property(object, SWAP_ITEM_OLD_VALUE_ATTR)?,
+            swap_item_property(object, SWAP_ITEM_HAD_ITEM_ATTR)?
+                .as_bool()
+                .unwrap_or(false),
+        )
+    };
+
+    if had_item {
+        mapping_set_item(vm, mapping, key, old_value).map_err(runtime_error_to_builtin_error)?;
+    } else {
+        mapping_delete_if_present(vm, mapping, key).map_err(runtime_error_to_builtin_error)?;
+    }
+
+    Ok(Value::bool(false))
+}
+
+fn swap_item_object_ref(value: Value) -> Result<&'static ShapedObject, BuiltinError> {
+    let ptr = value.as_object_ptr().ok_or_else(swap_item_receiver_error)?;
+    if extract_type_id(ptr) != SWAP_ITEM_CLASS.class_type_id() {
+        return Err(swap_item_receiver_error());
+    }
+    Ok(unsafe { &*(ptr as *const ShapedObject) })
+}
+
+fn swap_item_object_mut(value: Value) -> Result<&'static mut ShapedObject, BuiltinError> {
+    let ptr = value.as_object_ptr().ok_or_else(swap_item_receiver_error)?;
+    if extract_type_id(ptr) != SWAP_ITEM_CLASS.class_type_id() {
+        return Err(swap_item_receiver_error());
+    }
+    Ok(unsafe { &mut *(ptr as *mut ShapedObject) })
+}
+
+fn swap_item_receiver_error() -> BuiltinError {
+    BuiltinError::TypeError("_SwapItem context manager method requires a '_SwapItem' object".into())
+}
+
+#[inline]
+fn set_swap_item_property(object: &mut ShapedObject, name: &str, value: Value) {
+    object.set_property(intern(name), value, shape_registry());
+}
+
+#[inline]
+fn swap_item_property(object: &ShapedObject, name: &str) -> Result<Value, BuiltinError> {
+    object
+        .get_property(name)
+        .ok_or_else(|| BuiltinError::TypeError(format!("corrupt _SwapItem object: missing {name}")))
+}
+
+fn mapping_get_optional(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    key: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    if let Some(ptr) = mapping.as_object_ptr()
+        && let Some(dict) = dict_storage_ref_from_ptr(ptr)
+    {
+        return dict_get_item(vm, dict, key);
+    }
+
+    if let Some(false) = mapping_contains_item(vm, mapping, key)? {
+        return Ok(None);
+    }
+
+    let target = resolve_special_method(mapping, "__getitem__")?;
+    match invoke_bound_mapping_method(vm, target, &[key]) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_key_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn mapping_set_item(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    key: Value,
+    value: Value,
+) -> Result<(), RuntimeError> {
+    if let Some(ptr) = mapping.as_object_ptr()
+        && let Some(dict) = dict_storage_mut_from_ptr(ptr)
+    {
+        return dict_set_item(vm, dict, key, value);
+    }
+
+    let target = resolve_special_method(mapping, "__setitem__")?;
+    invoke_bound_mapping_method(vm, target, &[key, value]).map(|_| ())
+}
+
+fn mapping_delete_if_present(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    key: Value,
+) -> Result<(), RuntimeError> {
+    if let Some(ptr) = mapping.as_object_ptr()
+        && let Some(dict) = dict_storage_mut_from_ptr(ptr)
+    {
+        let _ = dict_remove_item(vm, dict, key)?;
+        return Ok(());
+    }
+
+    if let Some(false) = mapping_contains_item(vm, mapping, key)? {
+        return Ok(());
+    }
+
+    let target = resolve_special_method(mapping, "__delitem__")?;
+    match invoke_bound_mapping_method(vm, target, &[key]) {
+        Ok(_) => Ok(()),
+        Err(err) if is_key_error(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn mapping_contains_item(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    key: Value,
+) -> Result<Option<bool>, RuntimeError> {
+    let target = match resolve_special_method(mapping, "__contains__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind(), RuntimeErrorKind::AttributeError { .. }) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+
+    let result = invoke_bound_mapping_method(vm, target, &[key])?;
+    crate::truthiness::try_is_truthy(vm, result).map(Some)
+}
+
+#[inline]
+fn invoke_bound_mapping_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    operands: &[Value],
+) -> Result<Value, RuntimeError> {
+    match (target.implicit_self, operands) {
+        (Some(receiver), [arg]) => invoke_callable_value(vm, target.callable, &[receiver, *arg]),
+        (Some(receiver), [arg1, arg2]) => {
+            invoke_callable_value(vm, target.callable, &[receiver, *arg1, *arg2])
+        }
+        (None, [arg]) => invoke_callable_value(vm, target.callable, &[*arg]),
+        (None, [arg1, arg2]) => invoke_callable_value(vm, target.callable, &[*arg1, *arg2]),
+        _ => Err(RuntimeError::type_error(
+            "internal mapping helper received an invalid arity",
+        )),
+    }
+}
+
+#[inline]
+fn is_key_error(err: &RuntimeError) -> bool {
+    match err.kind() {
+        RuntimeErrorKind::KeyError { .. } => true,
+        RuntimeErrorKind::Exception { type_id, .. } => {
+            *type_id == ExceptionTypeId::KeyError.as_u8() as u16
+        }
+        _ => false,
+    }
 }
 
 fn mark_unittest_skip(
