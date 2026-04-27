@@ -796,17 +796,22 @@ where
         None
     };
 
-    // Check for __hash__
     let hash_name = prism_core::intern::intern("__hash__");
-    if namespace.contains(&hash_name) {
-        flags |= ClassFlags::HASHABLE;
+    let eq_name = prism_core::intern::intern("__eq__");
+    let has_explicit_hash = namespace.get(&hash_name);
+    let defines_eq = namespace.contains(&eq_name);
+
+    if let Some(hash) = has_explicit_hash {
+        if !hash.is_none() {
+            flags |= ClassFlags::HASHABLE;
+        }
     }
 
-    // Check for __eq__
-    let eq_name = prism_core::intern::intern("__eq__");
-    if namespace.contains(&eq_name) {
+    if defines_eq {
         flags |= ClassFlags::HAS_EQ;
     }
+
+    let synthesize_unhashable = defines_eq && has_explicit_hash.is_none();
 
     // Check for __del__
     let del_name = prism_core::intern::intern("__del__");
@@ -819,6 +824,9 @@ where
     namespace.for_each(|name, value| {
         class.set_attr(name.clone(), normalize_class_namespace_value(name, value));
     });
+    if synthesize_unhashable {
+        class.set_attr(hash_name, Value::none());
+    }
 
     if let Some(slot_names) = slot_names {
         class.set_slots(slot_names.clone());

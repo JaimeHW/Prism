@@ -15,7 +15,9 @@ use prism_core::Value;
 use prism_core::intern::intern;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_runtime::object::class::PyClassObject;
-use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
+use prism_runtime::object::descriptor::{
+    BoundMethod, ClassMethodDescriptor, StaticMethodDescriptor,
+};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
@@ -1531,6 +1533,10 @@ pub(crate) fn hash_value(value: Value) -> Result<i64, BuiltinError> {
             let tuple = unsafe { &*(ptr as *const TupleObject) };
             hash_tuple(tuple)
         }
+        TypeId::METHOD => {
+            let method = unsafe { &*(ptr as *const BoundMethod) };
+            Ok(hash_bound_method(method))
+        }
         TypeId::SLICE => {
             let slice = unsafe { &*(ptr as *const SliceObject) };
             let components = TupleObject::from_slice(&[
@@ -1591,6 +1597,10 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
             let tuple = unsafe { &*(ptr as *const TupleObject) };
             hash_tuple_vm(vm, tuple)
         }
+        TypeId::METHOD => {
+            let method = unsafe { &*(ptr as *const BoundMethod) };
+            Ok(hash_bound_method(method))
+        }
         TypeId::SLICE => {
             let slice = unsafe { &*(ptr as *const SliceObject) };
             let components = TupleObject::from_slice(&[
@@ -1606,6 +1616,12 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
         }
         _ => match resolve_special_method(value, "__hash__") {
             Ok(target) => {
+                if target.callable.is_none() {
+                    return Err(BuiltinError::TypeError(format!(
+                        "unhashable type: '{}'",
+                        type_display_name(type_id)
+                    )));
+                }
                 let result = invoke_zero_arg_bound_method(vm, target)
                     .map_err(super::runtime_error_to_builtin_error)?;
                 hash_user_result(result, type_id)
@@ -1663,6 +1679,22 @@ fn hash_range(range: &RangeObject) -> Result<i64, BuiltinError> {
         ]
     };
     hash_tuple(&TupleObject::from_vec(components))
+}
+
+#[inline]
+fn hash_bound_method(method: &BoundMethod) -> i64 {
+    normalize_python_hash(
+        identity_hash_value(method.function()) ^ identity_hash_value(method.instance()),
+    )
+}
+
+#[inline]
+fn identity_hash_value(value: Value) -> i64 {
+    if let Some(ptr) = value.as_object_ptr() {
+        hash_pointer(ptr as usize)
+    } else {
+        hash_with_default_hasher(&value.raw_bits())
+    }
 }
 
 #[inline]
