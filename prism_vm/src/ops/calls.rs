@@ -2227,6 +2227,7 @@ fn invoke_builtin_with_keywords(
         "collections.namedtuple" => {
             invoke_namedtuple_builtin_with_keywords(vm, builtin, args, keywords)
         }
+        "list.__init__" => invoke_list_init_builtin_with_keywords(vm, builtin, args, keywords),
         "list.__new__" => invoke_builtin(vm, builtin, args),
         "tuple.__new__" => Err(RuntimeError::type_error(
             "tuple() takes no keyword arguments",
@@ -2381,6 +2382,52 @@ fn invoke_import_builtin_with_keywords(
     }
 
     invoke_builtin(vm, builtin, &call_args)
+}
+
+fn invoke_list_init_builtin_with_keywords(
+    vm: &mut VirtualMachine,
+    builtin: &BuiltinFunctionObject,
+    args: &[Value],
+    _keywords: &[(&str, Value)],
+) -> Result<Value, RuntimeError> {
+    if list_init_rejects_keywords(args.first().copied()) {
+        return Err(RuntimeError::type_error(
+            "list() takes no keyword arguments",
+        ));
+    }
+
+    invoke_builtin(vm, builtin, args)
+}
+
+fn list_init_rejects_keywords(receiver: Option<Value>) -> bool {
+    let Some(receiver) = receiver else {
+        return false;
+    };
+    let Some(ptr) = receiver.as_object_ptr() else {
+        return false;
+    };
+
+    let type_id = extract_type_id(ptr);
+    if type_id == TypeId::LIST {
+        return true;
+    }
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return true;
+    }
+
+    let Some(class) = global_class(ClassId(type_id.raw())) else {
+        return true;
+    };
+    if !class
+        .mro()
+        .iter()
+        .any(|&class_id| class_id_to_type_id(class_id) == TypeId::LIST)
+    {
+        return true;
+    }
+
+    resolve_instantiation_slot(class.as_ref(), "__new__")
+        .is_none_or(|new| slot_callable_matches_builtin_name(new, "list.__new__"))
 }
 
 fn invoke_namedtuple_builtin_with_keywords(

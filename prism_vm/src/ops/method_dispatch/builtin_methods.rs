@@ -22,9 +22,10 @@ use crate::ops::exception::helpers::{
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
-    alloc_heap_value, delete_attribute_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
-    get_attribute_value, list_storage_mut_from_ptr, list_storage_ref_from_ptr,
-    object_getattribute_default, set_attribute_value, tuple_storage_ref_from_ptr,
+    alloc_heap_value, delete_attribute_value, delete_list_item_value, dict_storage_mut_from_ptr,
+    dict_storage_ref_from_ptr, get_attribute_value, list_storage_mut_from_ptr,
+    list_storage_ref_from_ptr, object_getattribute_default, set_attribute_value,
+    set_list_item_value, tuple_storage_ref_from_ptr,
 };
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
@@ -77,6 +78,17 @@ static LIST_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__len__"), list_len));
 static LIST_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__getitem__"), list_getitem));
+static LIST_SETITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("list.__setitem__"), list_setitem_with_vm)
+});
+static LIST_DELITEM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__delitem__"), list_delitem));
+static LIST_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("list.__init__"),
+        crate::builtins::builtin_list_init_vm,
+    )
+});
 static LIST_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.__contains__"), list_contains));
 static LIST_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -396,6 +408,13 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
         "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_GETITEM_METHOD,
         ))),
+        "__setitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_SETITEM_METHOD,
+        ))),
+        "__delitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_DELITEM_METHOD,
+        ))),
+        "__init__" => Some(CachedMethod::simple(builtin_method_value(&LIST_INIT_METHOD))),
         "__contains__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_CONTAINS_METHOD,
         ))),
@@ -905,6 +924,22 @@ fn list_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
     let index = expect_sequence_index(args[1], "list")?;
     list.get(index)
         .ok_or_else(|| BuiltinError::IndexError("list index out of range".to_string()))
+}
+
+#[inline]
+fn list_setitem_with_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__setitem__", args, 2)?;
+    let ptr = expect_list_ptr(args[0], "__setitem__")?;
+    set_list_item_value(vm, ptr, args[1], args[2]).map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
+}
+
+#[inline]
+fn list_delitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__delitem__", args, 1)?;
+    let ptr = expect_list_ptr(args[0], "__delitem__")?;
+    delete_list_item_value(ptr, args[1]).map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
 }
 
 #[inline]

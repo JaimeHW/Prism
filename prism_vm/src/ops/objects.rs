@@ -44,11 +44,12 @@ use prism_runtime::object::views::{
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
-use prism_runtime::types::int::bigint_to_value;
+use prism_runtime::types::int::{bigint_to_value, value_to_saturated_i64};
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
@@ -115,6 +116,88 @@ pub(crate) fn list_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static ListO
 #[inline]
 pub(crate) fn list_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut ListObject> {
     prism_runtime::types::list::object_ptr_as_list_mut(ptr as *mut ())
+}
+
+pub(crate) fn set_list_item_value(
+    vm: &mut VirtualMachine,
+    ptr: *const (),
+    key: Value,
+    value: Value,
+) -> Result<(), RuntimeError> {
+    if let Some(slice) = slice_object_from_value(key) {
+        if slice.step() == Some(0) {
+            return Err(RuntimeError::value_error("slice step cannot be zero"));
+        }
+
+        let slice = copy_slice_object(slice);
+        let replacement = crate::ops::iteration::collect_iterable_values(vm, value)?;
+        let list = list_storage_mut_from_ptr(ptr).ok_or_else(|| {
+            RuntimeError::type_error("descriptor 'list.__setitem__' requires a list object")
+        })?;
+        list.assign_slice(&slice, replacement)
+            .map_err(|err| RuntimeError::value_error(err.to_string()))?;
+        return Ok(());
+    }
+
+    let idx = list_index_from_key(key)?;
+    let list = list_storage_mut_from_ptr(ptr).ok_or_else(|| {
+        RuntimeError::type_error("descriptor 'list.__setitem__' requires a list object")
+    })?;
+    if list.set(idx, value) {
+        Ok(())
+    } else {
+        Err(RuntimeError::index_error(idx, list.len()))
+    }
+}
+
+pub(crate) fn delete_list_item_value(ptr: *const (), key: Value) -> Result<(), RuntimeError> {
+    if let Some(slice) = slice_object_from_value(key) {
+        if slice.step() == Some(0) {
+            return Err(RuntimeError::value_error("slice step cannot be zero"));
+        }
+
+        let list = list_storage_mut_from_ptr(ptr).ok_or_else(|| {
+            RuntimeError::type_error("descriptor 'list.__delitem__' requires a list object")
+        })?;
+        list.delete_slice(slice);
+        return Ok(());
+    }
+
+    let idx = list_index_from_key(key)?;
+    let list = list_storage_mut_from_ptr(ptr).ok_or_else(|| {
+        RuntimeError::type_error("descriptor 'list.__delitem__' requires a list object")
+    })?;
+    if list.remove(idx).is_some() {
+        Ok(())
+    } else {
+        Err(RuntimeError::index_error(idx, list.len()))
+    }
+}
+
+#[inline]
+fn list_index_from_key(key: Value) -> Result<i64, RuntimeError> {
+    if let Some(index) = key.as_bool().map(i64::from) {
+        return Ok(index);
+    }
+    if let Some(index) = value_to_saturated_i64(key) {
+        return Ok(index);
+    }
+
+    Err(RuntimeError::type_error(
+        "list indices must be integers or slices",
+    ))
+}
+
+#[inline]
+fn slice_object_from_value(value: Value) -> Option<&'static SliceObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    (header.type_id == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
+}
+
+#[inline]
+fn copy_slice_object(slice: &SliceObject) -> SliceObject {
+    SliceObject::new(slice.start(), slice.stop(), slice.step())
 }
 
 #[inline]
@@ -2768,15 +2851,10 @@ pub fn set_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = container.as_object_ptr() {
         let type_id = extract_type_id(ptr);
 
-        if let Some(list) = list_storage_mut_from_ptr(ptr) {
-            return if let Some(idx) = key.as_int() {
-                if list.set(idx, value) {
-                    ControlFlow::Continue
-                } else {
-                    ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
-                }
-            } else {
-                ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+        if list_storage_ref_from_ptr(ptr).is_some() {
+            return match set_list_item_value(vm, ptr, key, value) {
+                Ok(()) => ControlFlow::Continue,
+                Err(err) => ControlFlow::Error(err),
             };
         }
 
@@ -2819,15 +2897,10 @@ pub fn del_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = container.as_object_ptr() {
         let type_id = extract_type_id(ptr);
 
-        if let Some(list) = list_storage_mut_from_ptr(ptr) {
-            return if let Some(idx) = key.as_int() {
-                if list.remove(idx).is_some() {
-                    ControlFlow::Continue
-                } else {
-                    ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
-                }
-            } else {
-                ControlFlow::Error(RuntimeError::type_error("list indices must be integers"))
+        if list_storage_ref_from_ptr(ptr).is_some() {
+            return match delete_list_item_value(ptr, key) {
+                Ok(()) => ControlFlow::Continue,
+                Err(err) => ControlFlow::Error(err),
             };
         }
 
