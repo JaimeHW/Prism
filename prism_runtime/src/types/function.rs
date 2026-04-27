@@ -228,7 +228,9 @@ impl FunctionAttrs {
     #[inline]
     fn set(&mut self, name: InternedString, value: Value) {
         match self.dict_ptr {
-            Some(mut ptr) => unsafe { ptr.as_mut() }.set(Value::string(name), value),
+            Some(mut ptr) => {
+                unsafe { ptr.as_mut() }.set(Value::string(name), value);
+            }
             None => {
                 self.inline.insert(name, value);
             }

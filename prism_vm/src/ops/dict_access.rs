@@ -61,33 +61,43 @@ pub(crate) fn dict_set_item(
     dict: &mut DictObject,
     key: Value,
     value: Value,
-) -> Result<(), RuntimeError> {
+) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
     if !key_requires_protocol_lookup && dict.contains_key(key) {
-        dict.set_with_hash_and_protocol_lookup(key, value, key_hash, key_requires_protocol_lookup);
-        return Ok(());
+        let replaced = dict.set_with_hash_and_protocol_lookup(
+            key,
+            value,
+            key_hash,
+            key_requires_protocol_lookup,
+        );
+        vm.drain_if_released_finalizer_candidate(replaced, value);
+        return Ok(replaced);
     }
     if !key_requires_protocol_lookup && !dict.has_protocol_keys() {
-        dict.set_with_hash_and_protocol_lookup(key, value, key_hash, false);
-        return Ok(());
+        let replaced = dict.set_with_hash_and_protocol_lookup(key, value, key_hash, false);
+        vm.drain_if_released_finalizer_candidate(replaced, value);
+        return Ok(replaced);
     }
 
     let keys = dict.keys().collect::<Vec<_>>();
     for candidate in keys {
         if dict_candidate_matches(vm, dict, candidate, key, key_hash)? {
-            dict.set_with_hash_and_protocol_lookup(
+            let replaced = dict.set_with_hash_and_protocol_lookup(
                 candidate,
                 value,
                 key_hash,
                 requires_protocol_scan(candidate),
             );
-            return Ok(());
+            vm.drain_if_released_finalizer_candidate(replaced, value);
+            return Ok(replaced);
         }
     }
 
-    dict.set_with_hash_and_protocol_lookup(key, value, key_hash, key_requires_protocol_lookup);
-    Ok(())
+    let replaced =
+        dict.set_with_hash_and_protocol_lookup(key, value, key_hash, key_requires_protocol_lookup);
+    vm.drain_if_released_finalizer_candidate(replaced, value);
+    Ok(replaced)
 }
 
 #[inline]

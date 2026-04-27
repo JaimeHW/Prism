@@ -244,7 +244,7 @@ pub fn dict_set(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         // SAFETY: We know this is a DictObject because BuildDict created it
         let dict = unsafe { &mut *(ptr as *mut DictObject) };
         match dict_set_item(vm, dict, key, value) {
-            Ok(()) => ControlFlow::Continue,
+            Ok(_) => ControlFlow::Continue,
             Err(err) => ControlFlow::Error(err),
         }
     } else {

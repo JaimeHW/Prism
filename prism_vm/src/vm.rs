@@ -2918,6 +2918,46 @@ impl VirtualMachine {
         self.finalizers.register(value);
     }
 
+    #[inline]
+    pub(crate) fn drain_if_released_finalizer_candidate(
+        &mut self,
+        released: Option<Value>,
+        replacement: Value,
+    ) {
+        let Some(value) = released else {
+            return;
+        };
+        if value == replacement || !self.finalizers.contains(value) {
+            return;
+        }
+        self.drain_unreachable_finalizers();
+    }
+
+    pub(crate) fn drain_if_released_finalizer_graph_candidate(
+        &mut self,
+        released: Value,
+        replacement: Value,
+    ) {
+        if self.finalizers.is_empty()
+            || released == replacement
+            || released.as_object_ptr().is_none()
+        {
+            return;
+        }
+
+        if self.finalizers.contains(released) {
+            self.drain_unreachable_finalizers();
+            return;
+        }
+
+        let mut reachability = ReachabilityTracer::new();
+        reachability.trace_value(released);
+        reachability.drain_object_graph();
+        if self.finalizers.intersects(reachability.reachable()) {
+            self.drain_unreachable_finalizers();
+        }
+    }
+
     pub(crate) fn drain_unreachable_finalizers(&mut self) -> usize {
         if self.finalizers.is_empty() || !self.finalizers.begin_drain() {
             return 0;

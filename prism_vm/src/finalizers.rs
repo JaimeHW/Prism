@@ -32,6 +32,18 @@ impl FinalizerRegistry {
     }
 
     #[inline]
+    pub(crate) fn contains(&self, value: Value) -> bool {
+        value
+            .as_object_ptr()
+            .is_some_and(|ptr| self.pending.contains_key(&(ptr as usize)))
+    }
+
+    #[inline]
+    pub(crate) fn intersects(&self, reachable: &FxHashSet<usize>) -> bool {
+        reachable.iter().any(|addr| self.pending.contains_key(addr))
+    }
+
+    #[inline]
     pub(crate) fn begin_drain(&mut self) -> bool {
         if self.draining {
             return false;

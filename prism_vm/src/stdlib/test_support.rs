@@ -706,7 +706,7 @@ fn mapping_set_item(
     if let Some(ptr) = mapping.as_object_ptr()
         && let Some(dict) = dict_storage_mut_from_ptr(ptr)
     {
-        return dict_set_item(vm, dict, key, value);
+        return dict_set_item(vm, dict, key, value).map(|_| ());
     }
 
     let target = resolve_special_method(mapping, "__setitem__")?;

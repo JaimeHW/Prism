@@ -3070,7 +3070,7 @@ pub fn set_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
                 match crate::ops::dict_access::dict_set_item(vm, dict, key, value) {
-                    Ok(()) => ControlFlow::Continue,
+                    Ok(_) => ControlFlow::Continue,
                     Err(err) => ControlFlow::Error(err),
                 }
             }
@@ -3081,7 +3081,7 @@ pub fn set_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     ));
                 };
                 match crate::ops::dict_access::dict_set_item(vm, dict, key, value) {
-                    Ok(()) => ControlFlow::Continue,
+                    Ok(_) => ControlFlow::Continue,
                     Err(err) => ControlFlow::Error(err),
                 }
             }
@@ -3189,7 +3189,9 @@ pub fn for_iter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     match next_step(vm, iter_val) {
         Ok(IterStep::Yielded(value)) => {
+            let released = vm.current_frame().get_reg(dst);
             vm.current_frame_mut().set_reg(dst, value);
+            vm.drain_if_released_finalizer_graph_candidate(released, value);
             ControlFlow::Continue
         }
         Ok(IterStep::Exhausted) => ControlFlow::Jump(offset),

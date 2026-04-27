@@ -112,13 +112,20 @@ pub fn load_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let slot = inst.imm16();
     if let Some(mapping) = vm.current_frame().locals_mapping() {
-        let (value, name) = {
+        let (value, name, released) = {
             let frame = vm.current_frame();
-            (frame.get_reg(inst.dst().0), mapped_local_name(frame, slot))
+            (
+                frame.get_reg(inst.dst().0),
+                mapped_local_name(frame, slot),
+                frame.local_is_written(slot).then(|| frame.get_local(slot)),
+            )
         };
         return match store_mapped_local(vm, mapping, &name, value) {
             Ok(()) => {
                 vm.current_frame_mut().set_local(slot, value);
+                if let Some(released) = released {
+                    vm.drain_if_released_finalizer_graph_candidate(released, value);
+                }
                 ControlFlow::Continue
             }
             Err(err) => ControlFlow::Error(err),
@@ -129,7 +136,11 @@ pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // Store opcodes use DstImm16 encoding where the source register is carried
     // in the dst field and imm16 is the destination slot index.
     let value = frame.get_reg(inst.dst().0);
+    let released = frame.local_is_written(slot).then(|| frame.get_local(slot));
     frame.set_local(slot, value);
+    if let Some(released) = released {
+        vm.drain_if_released_finalizer_graph_candidate(released, value);
+    }
     ControlFlow::Continue
 }
 
@@ -138,10 +149,19 @@ pub fn store_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let slot = inst.imm16();
     if let Some(mapping) = vm.current_frame().locals_mapping() {
-        let name = mapped_local_name(vm.current_frame(), slot);
+        let (name, released) = {
+            let frame = vm.current_frame();
+            (
+                mapped_local_name(frame, slot),
+                frame.local_is_written(slot).then(|| frame.get_local(slot)),
+            )
+        };
         return match delete_mapped_local(vm, mapping, &name) {
             Ok(true) => {
                 vm.current_frame_mut().clear_local(slot);
+                if let Some(released) = released {
+                    vm.drain_if_released_finalizer_graph_candidate(released, Value::none());
+                }
                 crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
                 ControlFlow::Continue
             }
@@ -151,7 +171,11 @@ pub fn delete_local(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     let frame = vm.current_frame_mut();
+    let released = frame.local_is_written(slot).then(|| frame.get_local(slot));
     frame.clear_local(slot);
+    if let Some(released) = released {
+        vm.drain_if_released_finalizer_graph_candidate(released, Value::none());
+    }
     crate::stdlib::_weakref::clear_unreachable_weakrefs_if_registered(vm);
     ControlFlow::Continue
 }

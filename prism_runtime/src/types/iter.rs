@@ -4,11 +4,13 @@
 //! and implements the Python iteration protocol.
 
 use crate::object::mro::ClassId;
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_builtins::global_class_bitmap;
 use crate::object::type_obj::TypeId;
-use crate::object::views::GenericAliasObject;
+use crate::object::views::{DictViewKind, GenericAliasObject};
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::bytes::BytesObject;
+use crate::types::dict::DictObject;
 use crate::types::int::bigint_to_value;
 use crate::types::list::{ListObject, value_as_list_ref};
 use crate::types::range::RangeIterator;
@@ -538,6 +540,18 @@ enum IterKind {
         index: usize,
     },
 
+    /// Live dictionary view iterator.
+    ///
+    /// This is used for `dict.keys()`, `dict.values()`, and `dict.items()`.
+    /// It keeps the backing dictionary alive and advances through insertion
+    /// order by cursor, checking a mutation token before every yield.
+    DictViewLive {
+        dict: Value,
+        kind: DictViewKind,
+        expected_version: u64,
+        index: usize,
+    },
+
     /// Set iterator.
     SetIter { values: Vec<Value>, index: usize },
 }
@@ -639,6 +653,48 @@ fn list_from_value(value: Value) -> &'static ListObject {
 #[inline(always)]
 fn tuple_from_value(value: Value) -> &'static TupleObject {
     object_ref(value, TypeId::TUPLE)
+}
+
+#[inline(always)]
+fn dict_from_value(value: Value) -> Option<&'static DictObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::DICT => Some(unsafe { &*(ptr as *const DictObject) }),
+        type_id
+            if type_id.raw() >= TypeId::FIRST_USER_TYPE && !is_native_iterator_type_id(type_id) =>
+        unsafe { (&*(ptr as *const ShapedObject)).dict_backing() },
+        _ => None,
+    }
+}
+
+fn collect_live_dict_view_remaining(
+    dict: Value,
+    kind: DictViewKind,
+    expected_version: u64,
+    index: usize,
+) -> Result<Vec<Value>, IteratorAdvanceError> {
+    let Some(dict_ref) = dict_from_value(dict) else {
+        return Err(IteratorAdvanceError::mutated(
+            "dictionary changed size during iteration",
+        ));
+    };
+    if dict_ref.version() != expected_version {
+        return Err(IteratorAdvanceError::mutated(
+            "dictionary changed size during iteration",
+        ));
+    }
+
+    let mut cursor = index;
+    let mut values = Vec::with_capacity(dict_ref.len().saturating_sub(index));
+    while let Some((key, value)) = dict_ref.next_entry_from(&mut cursor) {
+        values.push(match kind {
+            DictViewKind::Keys => key,
+            DictViewKind::Values => value,
+            DictViewKind::Items => create_tuple_pair_values(key, value),
+        });
+    }
+    Ok(values)
 }
 
 #[inline(always)]
@@ -1223,6 +1279,21 @@ impl IteratorObject {
         }
     }
 
+    /// Create a live dict view iterator guarded by the dict mutation token.
+    #[inline]
+    pub fn live_dict_view(dict: Value, kind: DictViewKind, expected_version: u64) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::DictViewLive {
+                dict,
+                kind,
+                expected_version,
+                index: 0,
+            },
+            exhausted: false,
+        }
+    }
+
     /// Create a set iterator.
     #[inline]
     pub fn set_iter(values: Vec<Value>) -> Self {
@@ -1316,6 +1387,9 @@ impl IteratorObject {
             IterKind::DictItems { items, index } => {
                 *index = usize_state.min(items.len());
                 self.exhausted = *index >= items.len();
+            }
+            IterKind::DictViewLive { index, .. } => {
+                *index = usize_state;
             }
             IterKind::SharedIterator { iterator } => {
                 if let Some(iter) = native_iterator_from_value_mut(*iterator) {
@@ -1593,6 +1667,14 @@ impl IteratorObject {
                     .skip(*index)
                     .map(|&(key, value)| create_tuple_pair_values(key, value))
                     .collect(),
+            )),
+            IterKind::DictViewLive {
+                dict,
+                kind,
+                expected_version,
+                index,
+            } => Ok(IteratorReduction::RemainingValues(
+                collect_live_dict_view_remaining(*dict, *kind, *expected_version, *index)?,
             )),
             IterKind::SetIter { values, index } => Ok(IteratorReduction::RemainingValues(
                 values.iter().skip(*index).copied().collect(),
@@ -2116,6 +2198,37 @@ impl IteratorObject {
                 }
             }
 
+            IterKind::DictViewLive {
+                dict,
+                kind,
+                expected_version,
+                index,
+            } => {
+                let Some(dict_ref) = dict_from_value(*dict) else {
+                    self.exhausted = true;
+                    return Err(IteratorAdvanceError::mutated(
+                        "dictionary changed size during iteration",
+                    ));
+                };
+                if dict_ref.version() != *expected_version {
+                    self.exhausted = true;
+                    return Err(IteratorAdvanceError::mutated(
+                        "dictionary changed size during iteration",
+                    ));
+                }
+                match dict_ref.next_entry_from(index) {
+                    Some((key, value)) => match kind {
+                        DictViewKind::Keys => Some(key),
+                        DictViewKind::Values => Some(value),
+                        DictViewKind::Items => Some(create_tuple_pair_values(key, value)),
+                    },
+                    None => {
+                        self.exhausted = true;
+                        None
+                    }
+                }
+            }
+
             IterKind::SetIter { values, index } => {
                 if *index < values.len() {
                     let value = values[*index];
@@ -2275,6 +2388,17 @@ impl IteratorObject {
             IterKind::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
             IterKind::DictValues { values, index } => Some(values.len().saturating_sub(*index)),
             IterKind::DictItems { items, index } => Some(items.len().saturating_sub(*index)),
+            IterKind::DictViewLive {
+                dict,
+                expected_version,
+                index,
+                ..
+            } => match dict_from_value(*dict) {
+                Some(dict) if dict.version() == *expected_version => {
+                    Some(dict.len().saturating_sub(*index))
+                }
+                _ => Some(0),
+            },
             IterKind::SetIter { values, index } => Some(values.len().saturating_sub(*index)),
         }
     }
@@ -2469,6 +2593,12 @@ impl IteratorObject {
                     .map(|&(key, value)| create_tuple_pair_values(key, value))
                     .collect(),
             ),
+            IterKind::DictViewLive {
+                dict,
+                kind,
+                expected_version,
+                index,
+            } => collect_live_dict_view_remaining(*dict, *kind, *expected_version, *index).ok(),
             IterKind::SetIter { values, index } => {
                 Some(values.iter().skip(*index).copied().collect())
             }
@@ -2820,6 +2950,11 @@ impl fmt::Debug for IteratorObject {
             IterKind::DictKeys { .. } => "dict_keys",
             IterKind::DictValues { .. } => "dict_values",
             IterKind::DictItems { .. } => "dict_items",
+            IterKind::DictViewLive { kind, .. } => match kind {
+                DictViewKind::Keys => "dict_keyiterator",
+                DictViewKind::Values => "dict_valueiterator",
+                DictViewKind::Items => "dict_itemiterator",
+            },
             IterKind::SetIter { .. } => "set_iterator",
         };
         write!(f, "<{}>", kind_name)

@@ -313,23 +313,14 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
         TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => {
             let view = value_as_dict_view(value).ok_or(IterError::InvalidObject)?;
             let dict_value = view.dict();
-            let values = if let Some(dict) = value_as_dict(&dict_value) {
-                match view.kind() {
-                    DictViewKind::Keys => dict.keys().collect(),
-                    DictViewKind::Values => dict.values().collect(),
-                    DictViewKind::Items => dict
-                        .iter()
-                        .map(|(key, value)| {
-                            let tuple =
-                                prism_runtime::types::tuple::TupleObject::from_slice(&[key, value]);
-                            let ptr = Box::leak(Box::new(tuple))
-                                as *mut prism_runtime::types::tuple::TupleObject
-                                as *const ();
-                            Value::object_ptr(ptr)
-                        })
-                        .collect(),
-                }
-            } else if matches!(get_type_id(&dict_value), Some(TypeId::MAPPING_PROXY)) {
+            if let Some(dict) = value_as_dict(&dict_value) {
+                return Ok(IteratorObject::live_dict_view(
+                    dict_value,
+                    view.kind(),
+                    dict.version(),
+                ));
+            }
+            let values = if matches!(get_type_id(&dict_value), Some(TypeId::MAPPING_PROXY)) {
                 let proxy = value_as_mapping_proxy(&dict_value).ok_or(IterError::InvalidObject)?;
                 let entries = crate::builtins::builtin_mapping_proxy_entries_static(proxy)
                     .map_err(|_| IterError::InvalidObject)?;
@@ -351,16 +342,7 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             } else {
                 return Err(IterError::InvalidObject);
             };
-            if dict_len_guard(dict_value).is_some() {
-                Ok(IteratorObject::guarded_values(
-                    dict_value,
-                    values,
-                    dict_len_guard,
-                    DICT_MUTATED,
-                ))
-            } else {
-                Ok(IteratorObject::from_values(values))
-            }
+            Ok(IteratorObject::from_values(values))
         }
 
         TypeId::SET | TypeId::FROZENSET => {
@@ -415,8 +397,7 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
 
 #[inline]
 fn dict_key_iterator(value: Value, dict: &DictObject) -> IteratorObject {
-    let keys: Vec<Value> = dict.keys().collect();
-    IteratorObject::guarded_values(value, keys, dict_len_guard, DICT_MUTATED)
+    IteratorObject::live_dict_view(value, DictViewKind::Keys, dict.version())
 }
 
 /// Get a human-readable type name for error messages.

@@ -221,6 +221,7 @@ impl DeepcopyMemo {
             memo_key_value(key)?,
             value,
         )
+        .map(|_| ())
         .map_err(runtime_error_to_builtin_error)
     }
 
@@ -242,6 +243,7 @@ impl DeepcopyMemo {
 
         let list = crate::alloc_managed_value(ListObject::from_slice(&[value]));
         dict_set_item(vm, memo_dict_mut(self.dict_value)?, key_value, list)
+            .map(|_| ())
             .map_err(runtime_error_to_builtin_error)
     }
 }

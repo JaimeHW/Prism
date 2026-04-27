@@ -101,14 +101,14 @@ impl DictObject {
 
     /// Set a key-value pair.
     #[inline]
-    pub fn set(&mut self, key: Value, value: Value) {
-        self.insert(key, value, None, requires_protocol_lookup(key));
+    pub fn set(&mut self, key: Value, value: Value) -> Option<Value> {
+        self.insert(key, value, None, requires_protocol_lookup(key))
     }
 
     /// Set a key-value pair after the VM has computed the Python hash.
     #[inline]
-    pub fn set_with_hash(&mut self, key: Value, value: Value, hash: i64) {
-        self.insert(key, value, Some(hash), requires_protocol_lookup(key));
+    pub fn set_with_hash(&mut self, key: Value, value: Value, hash: i64) -> Option<Value> {
+        self.insert(key, value, Some(hash), requires_protocol_lookup(key))
     }
 
     /// Set a key-value pair when the caller already classified whether lookup
@@ -120,8 +120,8 @@ impl DictObject {
         value: Value,
         hash: i64,
         requires_protocol_lookup: bool,
-    ) {
-        self.insert(key, value, Some(hash), requires_protocol_lookup);
+    ) -> Option<Value> {
+        self.insert(key, value, Some(hash), requires_protocol_lookup)
     }
 
     #[inline]
@@ -131,9 +131,10 @@ impl DictObject {
         value: Value,
         hash: Option<i64>,
         requires_protocol_lookup: bool,
-    ) {
+    ) -> Option<Value> {
         let key = HashableValue(key);
-        if self.entries.items.insert(key, value).is_none() {
+        let replaced = self.entries.items.insert(key, value);
+        if replaced.is_none() {
             self.bump_version();
             self.entries.positions.insert(key, self.entries.order.len());
             self.entries.order.push(Some(key));
@@ -144,6 +145,7 @@ impl DictObject {
         if let Some(hash) = hash {
             self.entries.hashes.insert(key, hash);
         }
+        replaced
     }
 
     /// Remove a key and return its value.
@@ -209,6 +211,26 @@ impl DictObject {
             key.as_ref()
                 .and_then(|key| self.entries.items.get(key).map(|value| (key.0, *value)))
         })
+    }
+
+    /// Return the next live key-value pair at or after an insertion-order cursor.
+    ///
+    /// The cursor is advanced past skipped tombstones and the returned entry.
+    /// This lets dict-view iterators preserve CPython's live-view semantics
+    /// without materializing the values they have not yielded yet.
+    pub fn next_entry_from(&self, cursor: &mut usize) -> Option<(Value, Value)> {
+        while *cursor < self.entries.order.len() {
+            let index = *cursor;
+            *cursor += 1;
+
+            let Some(key) = self.entries.order[index] else {
+                continue;
+            };
+            if let Some(value) = self.entries.items.get(&key) {
+                return Some((key.0, *value));
+            }
+        }
+        None
     }
 
     /// Return the cached Python hash for a stored key, when available.

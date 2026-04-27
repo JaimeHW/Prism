@@ -2482,6 +2482,7 @@ fn dict_fromkeys_set_item(
     {
         let dict = unsafe { &mut *(ptr as *mut DictObject) };
         return crate::ops::dict_access::dict_set_item(vm, dict, key, value)
+            .map(|_| ())
             .map_err(runtime_error_to_builtin_error);
     }
 
