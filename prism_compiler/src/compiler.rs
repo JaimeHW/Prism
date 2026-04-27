@@ -1699,13 +1699,55 @@ impl Compiler {
             self.builder.free_register(key_reg);
             self.builder.free_register(value_reg);
         } else if value.is_none() && !simple {
-            return Err(self.unsupported_stmt_error(
-                stmt,
-                "annotated attribute and subscript declarations without a value need target evaluation semantics",
-            ));
+            self.compile_annotation_target_evaluation(target)?;
         }
 
         Ok(())
+    }
+
+    fn compile_annotation_target_evaluation(&mut self, target: &Expr) -> CompileResult<()> {
+        match &target.kind {
+            ExprKind::Name(_) => Ok(()),
+            ExprKind::Attribute { value, .. } => {
+                let reg = self.compile_expr(value)?;
+                self.builder.free_register(reg);
+                Ok(())
+            }
+            ExprKind::Subscript { value, slice } => {
+                let value_reg = self.compile_expr(value)?;
+                self.builder.free_register(value_reg);
+                self.compile_annotation_slice_evaluation(slice)
+            }
+            ExprKind::Tuple(elts) | ExprKind::List(elts) => {
+                for elt in elts {
+                    self.compile_annotation_target_evaluation(elt)?;
+                }
+                Ok(())
+            }
+            ExprKind::Starred(inner) => self.compile_annotation_target_evaluation(inner),
+            _ => {
+                let reg = self.compile_expr(target)?;
+                self.builder.free_register(reg);
+                Ok(())
+            }
+        }
+    }
+
+    fn compile_annotation_slice_evaluation(&mut self, slice: &Expr) -> CompileResult<()> {
+        if let ExprKind::Slice { lower, upper, step } = &slice.kind {
+            for part in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let reg = self.compile_expr(part)?;
+                self.builder.free_register(reg);
+            }
+            Ok(())
+        } else {
+            let reg = self.compile_expr(slice)?;
+            self.builder.free_register(reg);
+            Ok(())
+        }
     }
 
     #[inline]
