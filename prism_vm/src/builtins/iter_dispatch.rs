@@ -157,7 +157,7 @@ fn value_as_deque(value: &Value) -> Option<&DequeObject> {
 
 #[inline(always)]
 fn dict_len_guard(value: Value) -> Option<usize> {
-    value_as_dict(&value).map(DictObject::len)
+    value_as_dict(&value).map(|dict| dict.version() as usize)
 }
 
 #[inline(always)]

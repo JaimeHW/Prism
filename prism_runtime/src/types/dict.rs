@@ -22,6 +22,7 @@ pub struct DictObject {
     /// Object header.
     pub header: ObjectHeader,
     entries: DictEntries,
+    version: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -40,6 +41,7 @@ impl DictObject {
         Self {
             header: ObjectHeader::new(TypeId::DICT),
             entries: DictEntries::default(),
+            version: 0,
         }
     }
 
@@ -55,6 +57,7 @@ impl DictObject {
                 order: Vec::with_capacity(capacity),
                 tombstones: 0,
             },
+            version: 0,
         }
     }
 
@@ -62,6 +65,12 @@ impl DictObject {
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.items.len()
+    }
+
+    /// Monotonic structural mutation counter for iterator invalidation.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Check if the dict is empty.
@@ -92,6 +101,7 @@ impl DictObject {
     fn insert(&mut self, key: Value, value: Value, hash: Option<i64>) {
         let key = HashableValue(key);
         if self.entries.items.insert(key, value).is_none() {
+            self.bump_version();
             self.entries.positions.insert(key, self.entries.order.len());
             self.entries.order.push(Some(key));
         }
@@ -106,6 +116,7 @@ impl DictObject {
         let key = HashableValue(key);
         let removed = self.entries.items.remove(&key);
         if removed.is_some() {
+            self.bump_version();
             self.entries.hashes.remove(&key);
             if let Some(index) = self.entries.positions.remove(&key)
                 && let Some(slot) = self.entries.order.get_mut(index)
@@ -127,6 +138,9 @@ impl DictObject {
     /// Clear all items.
     #[inline]
     pub fn clear(&mut self) {
+        if !self.entries.items.is_empty() {
+            self.bump_version();
+        }
         self.entries.items.clear();
         self.entries.hashes.clear();
         self.entries.order.clear();
@@ -203,6 +217,7 @@ impl DictObject {
                 return true;
             }
 
+            self.bump_version();
             if let Some(slot) = self.entries.order.get_mut(index)
                 && slot.take().is_some()
             {
@@ -214,6 +229,9 @@ impl DictObject {
             return true;
         }
 
+        if index != 0 {
+            self.bump_version();
+        }
         self.compact_order_with_prefix(key);
         true
     }
@@ -226,9 +244,16 @@ impl DictObject {
                 None => self.entries.tombstones = self.entries.tombstones.saturating_sub(1),
             }
         };
+        self.bump_version();
         self.entries.positions.remove(&key);
+        self.entries.hashes.remove(&key);
         let value = self.entries.items.remove(&key)?;
         Some((key.0, value))
+    }
+
+    #[inline]
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     #[inline]

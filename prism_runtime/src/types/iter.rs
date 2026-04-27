@@ -20,11 +20,14 @@ use prism_core::Value;
 use prism_core::intern::{InternedString, interned_by_ptr};
 use std::fmt;
 
-/// Host-provided fast length reader for guarded snapshot iterators.
+/// Host-provided fast mutation token reader for guarded snapshot iterators.
 ///
 /// The iterator type lives in `prism_runtime`, while some owner objects, such
 /// as `collections.deque`, are implemented by `prism_vm`. A function pointer
 /// keeps the runtime independent while still allowing O(1) mutation checks.
+/// The returned token may be a length for containers where size changes are
+/// the only invalidating mutations, or a version counter for containers such as
+/// dicts where same-size key changes must also invalidate active iterators.
 pub type IteratorLenGuard = fn(Value) -> Option<usize>;
 
 /// Error raised while advancing a native iterator.
