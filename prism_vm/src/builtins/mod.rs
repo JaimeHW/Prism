@@ -236,9 +236,9 @@ impl BuiltinRegistry {
         registry.register_function_vm("ascii", functions::builtin_ascii_vm);
 
         // Register numeric formatting functions
-        registry.register_function("bin", numeric::builtin_bin);
-        registry.register_function("hex", numeric::builtin_hex);
-        registry.register_function("oct", numeric::builtin_oct);
+        registry.register_function_vm("bin", numeric::builtin_bin_vm);
+        registry.register_function_vm("hex", numeric::builtin_hex_vm);
+        registry.register_function_vm("oct", numeric::builtin_oct_vm);
         registry.register_callable_type(
             "complex",
             prism_runtime::object::type_obj::TypeId::COMPLEX,

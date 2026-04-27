@@ -15,12 +15,18 @@
 //! maximum performance, we fast-path native integers. The fallback
 //! path handles objects with `__index__` when the object system is wired.
 
-use super::BuiltinError;
+use super::{BuiltinError, runtime_error_to_builtin_error};
+use crate::VirtualMachine;
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::python_numeric::{ComplexParts, complex_like_parts, is_complex_value};
+use num_bigint::BigInt;
+use num_traits::{Signed, Zero};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::complex::ComplexObject;
+use prism_runtime::types::int::value_to_bigint;
 
 // =============================================================================
 // Lookup Tables (Zero-Branch Hex Conversion)
@@ -37,6 +43,51 @@ const HEX_CHARS_UPPER: [u8; 16] = *b"0123456789ABCDEF";
 /// Octal digits lookup table.
 /// Index by 3-bit value (0-7) to get ASCII char.
 const OCT_CHARS: [u8; 8] = *b"01234567";
+
+#[derive(Clone, Copy)]
+enum IntegerFormatKind {
+    Binary,
+    Hex,
+    Octal,
+}
+
+impl IntegerFormatKind {
+    #[inline]
+    fn builtin_name(self) -> &'static str {
+        match self {
+            Self::Binary => "bin",
+            Self::Hex => "hex",
+            Self::Octal => "oct",
+        }
+    }
+
+    #[inline]
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Binary => "0b",
+            Self::Hex => "0x",
+            Self::Octal => "0o",
+        }
+    }
+
+    #[inline]
+    fn radix(self) -> u32 {
+        match self {
+            Self::Binary => 2,
+            Self::Hex => 16,
+            Self::Octal => 8,
+        }
+    }
+
+    #[inline]
+    fn format_i64(self, value: i64) -> Result<Value, BuiltinError> {
+        match self {
+            Self::Binary => format_binary(value),
+            Self::Hex => format_hex(value),
+            Self::Octal => format_oct(value),
+        }
+    }
+}
 
 // =============================================================================
 // Stack Buffer for Zero-Allocation Formatting
@@ -122,28 +173,12 @@ impl FormatBuffer {
 /// - Single pass bit extraction with shifts
 /// - Exact output length pre-computed
 pub fn builtin_bin(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.len() != 1 {
-        return Err(BuiltinError::TypeError(format!(
-            "bin() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
+    format_integer_direct(args, IntegerFormatKind::Binary)
+}
 
-    // Fast path: native integer
-    if let Some(n) = args[0].as_int() {
-        return format_binary(n);
-    }
-
-    // Bool is valid via __index__ (True=1, False=0)
-    if let Some(b) = args[0].as_bool() {
-        return format_binary(if b { 1 } else { 0 });
-    }
-
-    // TODO: Handle objects with __index__ protocol
-    Err(BuiltinError::TypeError(format!(
-        "'{}' object cannot be interpreted as an integer",
-        type_name_of(&args[0])
-    )))
+/// VM-aware bin(x) that honors Python's `__index__` protocol.
+pub fn builtin_bin_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    format_integer_vm(vm, args, IntegerFormatKind::Binary)
 }
 
 /// Format an i64 as binary string "0b...".
@@ -206,27 +241,12 @@ fn format_binary(n: i64) -> Result<Value, BuiltinError> {
 /// - Zero heap allocation for formatting
 /// - Single pass nibble extraction
 pub fn builtin_hex(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.len() != 1 {
-        return Err(BuiltinError::TypeError(format!(
-            "hex() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
+    format_integer_direct(args, IntegerFormatKind::Hex)
+}
 
-    // Fast path: native integer
-    if let Some(n) = args[0].as_int() {
-        return format_hex(n);
-    }
-
-    // Bool is valid via __index__
-    if let Some(b) = args[0].as_bool() {
-        return format_hex(if b { 1 } else { 0 });
-    }
-
-    Err(BuiltinError::TypeError(format!(
-        "'{}' object cannot be interpreted as an integer",
-        type_name_of(&args[0])
-    )))
+/// VM-aware hex(x) that honors Python's `__index__` protocol.
+pub fn builtin_hex_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    format_integer_vm(vm, args, IntegerFormatKind::Hex)
 }
 
 /// Format an i64 as hexadecimal string "0x...".
@@ -283,27 +303,12 @@ fn format_hex(n: i64) -> Result<Value, BuiltinError> {
 /// - Lookup table for 3-bit→char
 /// - Zero heap allocation for formatting
 pub fn builtin_oct(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.len() != 1 {
-        return Err(BuiltinError::TypeError(format!(
-            "oct() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
+    format_integer_direct(args, IntegerFormatKind::Octal)
+}
 
-    // Fast path: native integer
-    if let Some(n) = args[0].as_int() {
-        return format_oct(n);
-    }
-
-    // Bool is valid via __index__
-    if let Some(b) = args[0].as_bool() {
-        return format_oct(if b { 1 } else { 0 });
-    }
-
-    Err(BuiltinError::TypeError(format!(
-        "'{}' object cannot be interpreted as an integer",
-        type_name_of(&args[0])
-    )))
+/// VM-aware oct(x) that honors Python's `__index__` protocol.
+pub fn builtin_oct_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    format_integer_vm(vm, args, IntegerFormatKind::Octal)
 }
 
 /// Format an i64 as octal string "0o...".
@@ -336,6 +341,109 @@ fn format_oct(n: i64) -> Result<Value, BuiltinError> {
     }
 
     Ok(interned_string_value(buf.as_str()))
+}
+
+fn format_integer_direct(args: &[Value], kind: IntegerFormatKind) -> Result<Value, BuiltinError> {
+    let value = unary_integer_format_arg(args, kind)?;
+    format_integer_value(value, kind).ok_or_else(|| integer_format_type_error(value))
+}
+
+fn format_integer_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    kind: IntegerFormatKind,
+) -> Result<Value, BuiltinError> {
+    let value = unary_integer_format_arg(args, kind)?;
+    if let Some(formatted) = format_integer_value(value, kind) {
+        return Ok(formatted);
+    }
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => return Err(integer_format_type_error(value)),
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, target)?;
+    format_integer_value(indexed, kind).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            type_name_of(&indexed)
+        ))
+    })
+}
+
+#[inline]
+fn unary_integer_format_arg(
+    args: &[Value],
+    kind: IntegerFormatKind,
+) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{}() takes exactly one argument ({} given)",
+            kind.builtin_name(),
+            args.len()
+        )));
+    }
+
+    Ok(args[0])
+}
+
+#[inline]
+fn format_integer_value(value: Value, kind: IntegerFormatKind) -> Option<Value> {
+    if let Some(n) = value.as_int() {
+        return Some(kind.format_i64(n).expect("i64 formatting is infallible"));
+    }
+
+    if let Some(b) = value.as_bool() {
+        return Some(
+            kind.format_i64(if b { 1 } else { 0 })
+                .expect("bool formatting is infallible"),
+        );
+    }
+
+    value_to_bigint(value).map(|integer| format_bigint(&integer, kind))
+}
+
+fn format_bigint(value: &BigInt, kind: IntegerFormatKind) -> Value {
+    if value.is_zero() {
+        return interned_string_value(match kind {
+            IntegerFormatKind::Binary => "0b0",
+            IntegerFormatKind::Hex => "0x0",
+            IntegerFormatKind::Octal => "0o0",
+        });
+    }
+
+    let negative = value.is_negative();
+    let digits = value.abs().to_str_radix(kind.radix());
+    let mut output =
+        String::with_capacity(usize::from(negative) + kind.prefix().len() + digits.len());
+    if negative {
+        output.push('-');
+    }
+    output.push_str(kind.prefix());
+    output.push_str(&digits);
+    interned_string_value(&output)
+}
+
+#[inline]
+fn integer_format_type_error(value: Value) -> BuiltinError {
+    BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name_of(&value)
+    ))
+}
+
+#[inline]
+fn invoke_bound_method_no_args(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(runtime_error_to_builtin_error)
 }
 
 #[inline]
