@@ -208,7 +208,7 @@ fn float_to_int_value(value: f64) -> Result<Value, BuiltinError> {
 fn builtin_int_unsupported_argument(arg: Value) -> BuiltinError {
     BuiltinError::TypeError(format!(
         "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-        arg.type_name()
+        get_type_name(arg)
     ))
 }
 
@@ -1036,7 +1036,7 @@ fn parse_float_text_argument(argument: &FloatTextArgument) -> Result<Value, Buil
 fn builtin_float_unsupported_argument(arg: Value) -> BuiltinError {
     BuiltinError::TypeError(format!(
         "float() argument must be a string or a real number, not '{}'",
-        arg.type_name()
+        get_type_name(arg)
     ))
 }
 
