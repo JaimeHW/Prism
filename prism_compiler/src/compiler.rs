@@ -1245,6 +1245,7 @@ impl Compiler {
                 for name in class_locals {
                     class_builder.define_local(name);
                 }
+                class_builder.define_local("__annotations__");
                 for name in class_cellvars {
                     class_builder.add_cellvar(name);
                 }
@@ -1268,9 +1269,7 @@ impl Compiler {
                 {
                     self.emit_namespace_docstring_binding(doc);
                 }
-                if Self::body_needs_runtime_annotations(body) {
-                    self.builder.emit_setup_annotations();
-                }
+                self.builder.emit_setup_annotations();
 
                 // Compile class body statements (method definitions, class variables, etc.)
                 for (index, stmt) in body.iter().enumerate() {
