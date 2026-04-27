@@ -40,6 +40,8 @@ static COUNT_OF_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static INDEX_OF_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("operator.indexOf"), operator_index_of)
 });
+static INDEX_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.index"), operator_index));
 static LENGTH_HINT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("operator.length_hint"), operator_length_hint)
 });
@@ -66,6 +68,7 @@ const EXPORTS: &[&str] = &[
     "eq",
     "ge",
     "gt",
+    "index",
     "indexOf",
     "is_",
     "is_not",
@@ -117,6 +120,7 @@ impl Module for OperatorModule {
             "not_" => Ok(builtin_value(&NOT_FUNCTION)),
             "contains" => Ok(builtin_value(&CONTAINS_FUNCTION)),
             "countOf" => Ok(builtin_value(&COUNT_OF_FUNCTION)),
+            "index" => Ok(builtin_value(&INDEX_FUNCTION)),
             "indexOf" => Ok(builtin_value(&INDEX_OF_FUNCTION)),
             "length_hint" => Ok(builtin_value(&LENGTH_HINT_FUNCTION)),
             "eq" => Ok(builtin_value(&EQ_FUNCTION)),
@@ -229,6 +233,36 @@ fn operator_index_of(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
             }
         }
     }
+}
+
+fn operator_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("index", args, 1)?;
+    if let Some(flag) = args[0].as_bool() {
+        return Ok(bigint_to_value(BigInt::from(u8::from(flag))));
+    }
+    if let Some(integer) = value_to_bigint(args[0]) {
+        return Ok(bigint_to_value(integer));
+    }
+
+    let target = match resolve_special_method(args[0], "__index__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Err(BuiltinError::TypeError(format!(
+                "'{}' object cannot be interpreted as an integer",
+                value_type_name(args[0])
+            )));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let result =
+        invoke_zero_arg_bound_method(vm, target).map_err(runtime_error_to_builtin_error)?;
+    value_to_bigint(result).map(bigint_to_value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            value_type_name(result)
+        ))
+    })
 }
 
 fn operator_length_hint(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
