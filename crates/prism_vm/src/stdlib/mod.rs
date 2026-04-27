@@ -20,6 +20,7 @@ pub mod _contextvars;
 pub mod _functools;
 pub mod _imp;
 pub mod _overlapped;
+pub mod _prism_subprocess;
 pub mod _random;
 pub mod _sha2;
 pub mod _socket;
@@ -249,6 +250,12 @@ impl StdlibRegistry {
         );
 
         Self::insert_module(&mut modules, "_imp", Box::new(_imp::ImpModule::new()));
+
+        Self::insert_module(
+            &mut modules,
+            "_prism_subprocess",
+            Box::new(_prism_subprocess::PrismSubprocessModule::new()),
+        );
 
         Self::insert_module(
             &mut modules,

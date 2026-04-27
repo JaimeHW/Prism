@@ -47,6 +47,10 @@ native = ["windows"]
 policy = "prefer_native"
 
 [[module]]
+name = "_prism_subprocess"
+policy = "prefer_native"
+
+[[module]]
 name = "_random"
 builtin = ["all"]
 policy = "prefer_native"
