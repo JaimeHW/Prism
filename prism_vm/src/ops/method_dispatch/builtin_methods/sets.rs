@@ -627,8 +627,12 @@ pub(super) fn frozenset_issuperset_with_vm(
 #[inline]
 pub(super) fn frozenset_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("frozenset", "copy", args, 0)?;
-    expect_set_receiver(args[0], TypeId::FROZENSET, "copy")?;
-    Ok(args[0])
+    let set = expect_set_receiver(args[0], TypeId::FROZENSET, "copy")?;
+    if value_type_id(args[0]) == TypeId::FROZENSET {
+        Ok(args[0])
+    } else {
+        Ok(set_result_value(set.clone(), TypeId::FROZENSET))
+    }
 }
 
 #[inline]
