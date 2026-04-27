@@ -218,8 +218,7 @@ pub(super) fn set_add(args: &[Value]) -> Result<Value, BuiltinError> {
 pub(super) fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "remove", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "remove")?;
-    ensure_hashable(args[1])?;
-    if set.remove(args[1]) {
+    if remove_set_probe(set, args[1])? {
         Ok(Value::none())
     } else {
         Err(BuiltinError::KeyError(args[1].to_string()))
@@ -230,8 +229,7 @@ pub(super) fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
 pub(super) fn set_discard(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("set", "discard", args, 1)?;
     let set = expect_set_mut_receiver(args[0], TypeId::SET, "discard")?;
-    ensure_hashable(args[1])?;
-    set.discard(args[1]);
+    let _ = remove_set_probe(set, args[1])?;
     Ok(Value::none())
 }
 
@@ -642,6 +640,33 @@ fn contains_for_set_type(
 ) -> Result<Value, BuiltinError> {
     expect_method_arg_count(receiver_name, method_name, args, 1)?;
     let set = expect_set_receiver(args[0], expected_type, method_name)?;
-    ensure_hashable(args[1])?;
-    Ok(Value::bool(set.contains(args[1])))
+    Ok(Value::bool(contains_set_probe(set, args[1])?))
+}
+
+#[inline]
+fn contains_set_probe(set: &SetObject, probe: Value) -> Result<bool, BuiltinError> {
+    if is_set_like_probe(probe) {
+        return Ok(set.contains(probe));
+    }
+
+    ensure_hashable(probe)?;
+    Ok(set.contains(probe))
+}
+
+#[inline]
+fn remove_set_probe(set: &mut SetObject, probe: Value) -> Result<bool, BuiltinError> {
+    if is_set_like_probe(probe) {
+        return Ok(set.remove(probe));
+    }
+
+    ensure_hashable(probe)?;
+    Ok(set.remove(probe))
+}
+
+#[inline]
+fn is_set_like_probe(value: Value) -> bool {
+    value
+        .as_object_ptr()
+        .and_then(set_storage_ref_from_ptr)
+        .is_some()
 }

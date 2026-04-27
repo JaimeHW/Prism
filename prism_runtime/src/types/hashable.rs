@@ -6,12 +6,15 @@
 
 use crate::object::ObjectHeader;
 use crate::object::descriptor::BoundMethod;
+use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::types::int::value_to_bigint;
+use crate::types::set::SetObject;
 use crate::types::string::value_as_string_ref;
 use crate::types::tuple::TupleObject;
 use num_traits::ToPrimitive;
 use prism_core::Value;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// Hashable wrapper around `Value` for dict/set keys.
@@ -48,6 +51,10 @@ fn hashable_value_eq(left: Value, right: Value) -> bool {
 
     if let (Some(a), Some(b)) = (tuple_value(left), tuple_value(right)) {
         return tuple_eq(a, b);
+    }
+
+    if let (Some(a), Some(b)) = (set_value(left), set_value(right)) {
+        return set_eq(a, b);
     }
 
     if let (Some(a), Some(b)) = (bound_method_value(left), bound_method_value(right)) {
@@ -136,6 +143,11 @@ fn hash_hashable_value<H: Hasher>(value: Value, state: &mut H) {
         return;
     }
 
+    if let Some(set) = set_value(value) {
+        hash_set_value(set, state);
+        return;
+    }
+
     if let Some(bound) = bound_method_value(value) {
         0x6du8.hash(state);
         hash_hashable_value(bound.function(), state);
@@ -177,6 +189,18 @@ fn tuple_value(value: Value) -> Option<&'static TupleObject> {
 }
 
 #[inline]
+fn set_value(value: Value) -> Option<&'static SetObject> {
+    let ptr = value.as_object_ptr()?;
+    match type_id_of(ptr) {
+        TypeId::SET | TypeId::FROZENSET => Some(unsafe { &*(ptr as *const SetObject) }),
+        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
+            unsafe { &*(ptr as *const ShapedObject) }.set_backing()
+        }
+        _ => None,
+    }
+}
+
+#[inline]
 fn bound_method_value(value: Value) -> Option<&'static BoundMethod> {
     let ptr = value.as_object_ptr()?;
     if type_id_of(ptr) != TypeId::METHOD {
@@ -194,6 +218,34 @@ fn tuple_eq(left: &TupleObject, right: &TupleObject) -> bool {
             .copied()
             .zip(right.iter().copied())
             .all(|(a, b)| hashable_value_eq(a, b))
+}
+
+#[inline]
+fn set_eq(left: &SetObject, right: &SetObject) -> bool {
+    left.len() == right.len() && left.iter().all(|item| right.contains(item))
+}
+
+#[inline]
+fn hash_set_value<H: Hasher>(set: &SetObject, state: &mut H) {
+    0x53u8.hash(state);
+    set.len().hash(state);
+
+    let mut xor = 0u64;
+    let mut sum = 0u64;
+    for item in set.iter() {
+        let hash = hash_value_to_u64(item);
+        xor ^= hash;
+        sum = sum.wrapping_add(hash);
+    }
+    xor.hash(state);
+    sum.hash(state);
+}
+
+#[inline]
+fn hash_value_to_u64(value: Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_hashable_value(value, &mut hasher);
+    hasher.finish()
 }
 
 #[inline(always)]
