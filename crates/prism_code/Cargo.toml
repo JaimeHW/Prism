@@ -3,6 +3,13 @@ name = "prism_code"
 description = "Shared bytecode and code object representation for Prism"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 prism_core.workspace = true

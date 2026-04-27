@@ -3,9 +3,6 @@
 //! This crate defines the executable bytecode format that is shared across the
 //! compiler, VM, runtime, JIT, and AOT layers.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![warn(missing_docs)]
-
 pub mod builder;
 pub mod code_object;
 pub mod instruction;

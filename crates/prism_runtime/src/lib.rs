@@ -9,8 +9,6 @@
 //! - Runtime object tracer for GC integration
 //! - Write barrier utilities for container mutations
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 pub mod allocation_context;
 pub mod gc;
 pub mod gc_barrier;

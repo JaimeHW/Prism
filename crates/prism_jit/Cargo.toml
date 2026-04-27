@@ -3,6 +3,13 @@ name = "prism_jit"
 description = "JVM/V8-tier JIT compiler for Prism"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = []

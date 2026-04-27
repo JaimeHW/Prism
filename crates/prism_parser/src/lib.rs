@@ -2,9 +2,6 @@
 //!
 //! Complete Python 3.12 lexer and parser.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![warn(missing_docs)]
-
 pub mod ast;
 pub mod lexer;
 pub mod parser;

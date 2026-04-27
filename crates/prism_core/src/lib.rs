@@ -10,12 +10,6 @@
 //! - **Error Handling**: Result types and error definitions
 //! - **Memory**: Arena allocators and allocation primitives
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![warn(missing_docs)]
-#![warn(clippy::all)]
-#![warn(clippy::pedantic)]
-#![allow(clippy::module_name_repetitions)]
-
 pub mod aot;
 pub mod error;
 pub mod intern;

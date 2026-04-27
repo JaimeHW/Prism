@@ -42,9 +42,6 @@
 //! - All object references are properly traced during collection
 //! - Write barriers are executed after pointer stores to old-gen objects
 
-#![warn(missing_docs)]
-#![warn(clippy::all)]
-
 pub mod barrier;
 pub mod collector;
 pub mod config;

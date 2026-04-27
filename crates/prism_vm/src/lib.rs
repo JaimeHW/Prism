@@ -43,7 +43,6 @@
 //! assert_eq!(result.as_int(), Some(3));
 //! ```
 
-#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::new_without_default)]
 
 // Core modules

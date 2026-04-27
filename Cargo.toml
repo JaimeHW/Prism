@@ -64,6 +64,17 @@ regex = "1.10"
 sha2 = "0.10"
 windows-sys = "0.59"
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[workspace.lints.rustdoc]
+bare_urls = "warn"
+broken_intra_doc_links = "warn"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

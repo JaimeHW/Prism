@@ -36,9 +36,6 @@
 //! assert_eq!(code.instructions.len(), 4);
 //! ```
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![warn(missing_docs)]
-
 pub mod bytecode;
 pub mod class_compiler;
 pub mod compiler;
