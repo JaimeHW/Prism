@@ -1,8 +1,10 @@
-use super::BuiltinError;
+use super::{BuiltinError, runtime_error_to_builtin_error};
 use crate::VirtualMachine;
-use crate::ops::calls::value_supports_call_protocol;
+use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
 use crate::ops::iteration::{IterStep, collect_iterable_values, ensure_iterator_value, next_step};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::collections::deque::{DequeObject, value_as_deque};
+use num_bigint::BigInt;
 use num_traits::{One, Zero};
 use prism_core::Value;
 use prism_runtime::types::int::value_to_bigint;
@@ -20,6 +22,30 @@ use prism_runtime::types::range::RangeObject;
 ///
 /// Returns a range object representing a sequence of integers.
 pub fn builtin_range(args: &[Value]) -> Result<Value, BuiltinError> {
+    validate_range_arg_count(args)?;
+
+    let parse_int = |value: Value, position: &'static str| {
+        range_index_bigint_direct(value).ok_or_else(|| {
+            BuiltinError::TypeError(format!("range() integer {position} argument expected"))
+        })
+    };
+
+    let (start, stop, step) = parse_range_args(args, parse_int)?;
+    Ok(range_value_from_bigints(start, stop, step))
+}
+
+/// VM-aware range constructor that supports Python's `__index__` protocol.
+pub fn builtin_range_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    validate_range_arg_count(args)?;
+
+    let mut parse_int =
+        |value: Value, position: &'static str| range_index_bigint_vm(vm, value, position);
+
+    let (start, stop, step) = parse_range_args(args, &mut parse_int)?;
+    Ok(range_value_from_bigints(start, stop, step))
+}
+
+fn validate_range_arg_count(args: &[Value]) -> Result<(), BuiltinError> {
     if args.is_empty() {
         return Err(BuiltinError::TypeError(format!(
             "range expected at least 1 argument, got {}",
@@ -32,24 +58,24 @@ pub fn builtin_range(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
+    Ok(())
+}
 
-    let parse_int = |value: Value, position: &'static str| {
-        value_to_bigint(value).ok_or_else(|| {
-            BuiltinError::TypeError(format!("range() integer {position} argument expected"))
-        })
-    };
-
-    let (start, stop, step) = match args.len() {
+fn parse_range_args(
+    args: &[Value],
+    mut parse_int: impl FnMut(Value, &'static str) -> Result<BigInt, BuiltinError>,
+) -> Result<(BigInt, BigInt, BigInt), BuiltinError> {
+    match args.len() {
         1 => {
             // range(stop)
             let stop = parse_int(args[0], "end")?;
-            (num_bigint::BigInt::zero(), stop, num_bigint::BigInt::one())
+            Ok((BigInt::zero(), stop, BigInt::one()))
         }
         2 => {
             // range(start, stop)
             let start = parse_int(args[0], "start")?;
             let stop = parse_int(args[1], "end")?;
-            (start, stop, num_bigint::BigInt::one())
+            Ok((start, stop, BigInt::one()))
         }
         3 => {
             // range(start, stop, step)
@@ -61,16 +87,65 @@ pub fn builtin_range(args: &[Value]) -> Result<Value, BuiltinError> {
                     "range() arg 3 must not be zero".to_string(),
                 ));
             }
-            (start, stop, step)
+            Ok((start, stop, step))
         }
         _ => unreachable!(),
-    };
+    }
+}
 
-    // Create RangeObject on heap and return as Value
+fn range_value_from_bigints(start: BigInt, stop: BigInt, step: BigInt) -> Value {
     // TODO: Use GC allocator instead of Box::leak
     let range_obj = Box::new(RangeObject::from_bigints(start, stop, step));
     let ptr = Box::leak(range_obj) as *mut RangeObject as *const ();
-    Ok(Value::object_ptr(ptr))
+    Value::object_ptr(ptr)
+}
+
+#[inline]
+fn range_index_bigint_direct(value: Value) -> Option<BigInt> {
+    if let Some(boolean) = value.as_bool() {
+        return Some(BigInt::from(u8::from(boolean)));
+    }
+    value_to_bigint(value)
+}
+
+fn range_index_bigint_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    position: &'static str,
+) -> Result<BigInt, BuiltinError> {
+    if let Some(integer) = range_index_bigint_direct(value) {
+        return Ok(integer);
+    }
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => {
+            return Err(BuiltinError::TypeError(format!(
+                "range() integer {position} argument expected"
+            )));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, target)?;
+    range_index_bigint_direct(indexed).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        ))
+    })
+}
+
+#[inline]
+fn invoke_bound_method_no_args(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(runtime_error_to_builtin_error)
 }
 
 // =============================================================================

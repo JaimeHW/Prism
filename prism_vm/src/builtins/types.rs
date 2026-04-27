@@ -1427,6 +1427,7 @@ pub(crate) fn call_builtin_type_with_vm(
         TypeId::MODULE => builtin_module(args),
         TypeId::BOOL => builtin_bool_vm(vm, args),
         TypeId::FLOAT => builtin_float_vm(vm, args),
+        TypeId::RANGE => super::itertools::builtin_range_vm(vm, args),
         TypeId::LIST => {
             if args.len() > 1 {
                 return Err(BuiltinError::TypeError(format!(
