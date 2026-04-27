@@ -1523,13 +1523,20 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
 
 #[inline]
 fn hash_user_result(result: Value, type_id: TypeId) -> Result<i64, BuiltinError> {
+    if let Some(boolean) = result.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+
     let Some(integer) = value_to_bigint(result) else {
         return Err(BuiltinError::TypeError(format!(
             "__hash__ method should return an integer for '{}'",
             type_id.name()
         )));
     };
-    Ok(hash_bigint(&integer))
+    Ok(integer
+        .to_i64()
+        .map(normalize_python_hash)
+        .unwrap_or_else(|| hash_bigint(&integer)))
 }
 
 #[inline]

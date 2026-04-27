@@ -8,7 +8,7 @@ use crate::types::hashable::HashableValue;
 use crate::types::int::value_to_bigint;
 use crate::types::tuple::TupleObject;
 use prism_core::Value;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // =============================================================================
 // Dictionary Object
@@ -33,8 +33,8 @@ struct DictEntries {
     hashes: FxHashMap<HashableValue, i64>,
     order: Vec<Option<HashableValue>>,
     positions: FxHashMap<HashableValue, usize>,
+    protocol_keys: Option<FxHashSet<HashableValue>>,
     tombstones: usize,
-    protocol_key_count: usize,
 }
 
 impl DictObject {
@@ -57,9 +57,9 @@ impl DictObject {
                 items: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 hashes: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 positions: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+                protocol_keys: None,
                 order: Vec::with_capacity(capacity),
                 tombstones: 0,
-                protocol_key_count: 0,
             },
             version: 0,
         }
@@ -87,7 +87,10 @@ impl DictObject {
     /// collision resolution.
     #[inline]
     pub fn has_protocol_keys(&self) -> bool {
-        self.entries.protocol_key_count != 0
+        self.entries
+            .protocol_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.is_empty())
     }
 
     /// Get a value by key.
@@ -99,25 +102,44 @@ impl DictObject {
     /// Set a key-value pair.
     #[inline]
     pub fn set(&mut self, key: Value, value: Value) {
-        self.insert(key, value, None);
+        self.insert(key, value, None, requires_protocol_lookup(key));
     }
 
     /// Set a key-value pair after the VM has computed the Python hash.
     #[inline]
     pub fn set_with_hash(&mut self, key: Value, value: Value, hash: i64) {
-        self.insert(key, value, Some(hash));
+        self.insert(key, value, Some(hash), requires_protocol_lookup(key));
+    }
+
+    /// Set a key-value pair when the caller already classified whether lookup
+    /// may need Python-level equality.
+    #[inline]
+    pub fn set_with_hash_and_protocol_lookup(
+        &mut self,
+        key: Value,
+        value: Value,
+        hash: i64,
+        requires_protocol_lookup: bool,
+    ) {
+        self.insert(key, value, Some(hash), requires_protocol_lookup);
     }
 
     #[inline]
-    fn insert(&mut self, key: Value, value: Value, hash: Option<i64>) {
+    fn insert(
+        &mut self,
+        key: Value,
+        value: Value,
+        hash: Option<i64>,
+        requires_protocol_lookup: bool,
+    ) {
         let key = HashableValue(key);
         if self.entries.items.insert(key, value).is_none() {
             self.bump_version();
-            if requires_protocol_lookup(key.0) {
-                self.entries.protocol_key_count += 1;
-            }
             self.entries.positions.insert(key, self.entries.order.len());
             self.entries.order.push(Some(key));
+        }
+        if requires_protocol_lookup {
+            self.mark_protocol_key(key);
         }
         if let Some(hash) = hash {
             self.entries.hashes.insert(key, hash);
@@ -133,9 +155,7 @@ impl DictObject {
         };
 
         self.bump_version();
-        if requires_protocol_lookup(stored_key.0) {
-            self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
-        }
+        self.unmark_protocol_key(stored_key);
         self.entries.hashes.remove(&stored_key);
         if let Some(index) = self.entries.positions.remove(&stored_key)
             && let Some(slot) = self.entries.order.get_mut(index)
@@ -163,8 +183,8 @@ impl DictObject {
         self.entries.hashes.clear();
         self.entries.order.clear();
         self.entries.positions.clear();
+        self.entries.protocol_keys = None;
         self.entries.tombstones = 0;
-        self.entries.protocol_key_count = 0;
     }
 
     /// Get an iterator over keys.
@@ -266,11 +286,28 @@ impl DictObject {
         self.bump_version();
         self.entries.positions.remove(&key);
         self.entries.hashes.remove(&key);
-        if requires_protocol_lookup(key.0) {
-            self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
-        }
+        self.unmark_protocol_key(key);
         let value = self.entries.items.remove(&key)?;
         Some((key.0, value))
+    }
+
+    #[inline]
+    fn mark_protocol_key(&mut self, key: HashableValue) {
+        self.entries
+            .protocol_keys
+            .get_or_insert_with(FxHashSet::default)
+            .insert(key);
+    }
+
+    #[inline]
+    fn unmark_protocol_key(&mut self, key: HashableValue) {
+        let Some(keys) = self.entries.protocol_keys.as_mut() else {
+            return;
+        };
+        keys.remove(&key);
+        if keys.is_empty() {
+            self.entries.protocol_keys = None;
+        }
     }
 
     #[inline]
@@ -295,6 +332,12 @@ impl DictObject {
         self.entries
             .hashes
             .retain(|key, _| self.entries.items.contains_key(key));
+        if let Some(protocol_keys) = self.entries.protocol_keys.as_mut() {
+            protocol_keys.retain(|key| self.entries.items.contains_key(key));
+            if protocol_keys.is_empty() {
+                self.entries.protocol_keys = None;
+            }
+        }
         for key in self.entries.order.iter().filter_map(|key| *key) {
             self.entries.positions.insert(key, compacted.len());
             compacted.push(Some(key));

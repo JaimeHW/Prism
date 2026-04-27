@@ -61,24 +61,30 @@ pub(crate) fn dict_set_item(
     value: Value,
 ) -> Result<(), RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
+    let key_requires_protocol_lookup = requires_protocol_scan(key);
     if dict.contains_key(key) {
-        dict.set_with_hash(key, value, key_hash);
+        dict.set_with_hash_and_protocol_lookup(key, value, key_hash, key_requires_protocol_lookup);
         return Ok(());
     }
-    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
-        dict.set_with_hash(key, value, key_hash);
+    if !key_requires_protocol_lookup && !dict.has_protocol_keys() {
+        dict.set_with_hash_and_protocol_lookup(key, value, key_hash, false);
         return Ok(());
     }
 
     let keys = dict.keys().collect::<Vec<_>>();
     for candidate in keys {
         if dict_candidate_matches(vm, dict, candidate, key, key_hash)? {
-            dict.set_with_hash(candidate, value, key_hash);
+            dict.set_with_hash_and_protocol_lookup(
+                candidate,
+                value,
+                key_hash,
+                requires_protocol_scan(candidate),
+            );
             return Ok(());
         }
     }
 
-    dict.set_with_hash(key, value, key_hash);
+    dict.set_with_hash_and_protocol_lookup(key, value, key_hash, key_requires_protocol_lookup);
     Ok(())
 }
 
@@ -114,11 +120,12 @@ pub(crate) fn dict_setdefault(
     default: Value,
 ) -> Result<Value, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
+    let key_requires_protocol_lookup = requires_protocol_scan(key);
     if let Some(value) = dict.get(key) {
         return Ok(value);
     }
-    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
-        dict.set_with_hash(key, default, key_hash);
+    if !key_requires_protocol_lookup && !dict.has_protocol_keys() {
+        dict.set_with_hash_and_protocol_lookup(key, default, key_hash, false);
         return Ok(default);
     }
 
@@ -131,7 +138,7 @@ pub(crate) fn dict_setdefault(
         }
     }
 
-    dict.set_with_hash(key, default, key_hash);
+    dict.set_with_hash_and_protocol_lookup(key, default, key_hash, key_requires_protocol_lookup);
     Ok(default)
 }
 
