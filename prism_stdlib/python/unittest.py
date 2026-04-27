@@ -63,13 +63,14 @@ class _AssertRaisesContext:
         self.test_case = test_case
         self.expected_regex = expected_regex
         self.exception = None
+        self.msg = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
-            self.test_case.fail("expected exception was not raised")
+            self.test_case.fail(self.msg or "expected exception was not raised")
         if not issubclass(exc_type, self.expected):
             return False
         if self.expected_regex is not None:
@@ -252,20 +253,28 @@ class TestCase:
         if member in container:
             self.fail(msg or (repr(member) + " unexpectedly found"))
 
-    def assertRaises(self, expected_exception, callable_obj=None, *args):
+    def assertRaises(self, expected_exception, *args, **kwargs):
         context = _AssertRaisesContext(expected_exception, self)
-        if callable_obj is None:
+        if not args:
+            context.msg = kwargs.pop("msg", None)
+            if kwargs:
+                raise TypeError(repr(next(iter(kwargs))) + " is an invalid keyword argument for this function")
             return context
+        callable_obj = args[0]
         with context:
-            callable_obj(*args)
+            callable_obj(*args[1:], **kwargs)
         return context
 
-    def assertRaisesRegex(self, expected_exception, expected_regex, callable_obj=None, *args):
+    def assertRaisesRegex(self, expected_exception, expected_regex, *args, **kwargs):
         context = _AssertRaisesContext(expected_exception, self, expected_regex)
-        if callable_obj is None:
+        if not args:
+            context.msg = kwargs.pop("msg", None)
+            if kwargs:
+                raise TypeError(repr(next(iter(kwargs))) + " is an invalid keyword argument for this function")
             return context
+        callable_obj = args[0]
         with context:
-            callable_obj(*args)
+            callable_obj(*args[1:], **kwargs)
         return context
 
     def assertWarns(self, expected_warning):
