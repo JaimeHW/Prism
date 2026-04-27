@@ -1250,6 +1250,31 @@ pub(crate) fn compare_order_result(
     )))
 }
 
+/// Return the ordering relation used by Python's stable sort operations.
+///
+/// CPython sort only asks whether `left < right`; equality is inferred when
+/// neither side is less than the other. Keeping this helper beside the rich
+/// comparison engine gives `sorted()` and `list.sort()` the same primitive fast
+/// paths and tuple/list lexicographic semantics as the comparison opcodes.
+#[inline]
+pub(crate) fn compare_sort_ordering(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Ordering, RuntimeError> {
+    if left == right {
+        return Ok(Ordering::Equal);
+    }
+
+    if compare_order_result(vm, left, right, RichCompareOp::Lt)? {
+        return Ok(Ordering::Less);
+    }
+    if compare_order_result(vm, right, left, RichCompareOp::Lt)? {
+        return Ok(Ordering::Greater);
+    }
+    Ok(Ordering::Equal)
+}
+
 #[inline]
 fn contains_match(
     vm: &mut VirtualMachine,

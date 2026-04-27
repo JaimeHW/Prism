@@ -15,7 +15,7 @@ use crate::builtins::{
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::comparison::eq_result;
+use crate::ops::comparison::{compare_sort_ordering, eq_result};
 use crate::ops::dict_access::{
     dict_contains_key, dict_get_item, dict_missing_value, dict_remove_item, dict_set_item,
     dict_setdefault as dict_setdefault_item, missing_key_error,
@@ -1831,79 +1831,7 @@ fn compare_sort_keys(
     left: Value,
     right: Value,
 ) -> Result<Ordering, BuiltinError> {
-    if let Some(ordering) = primitive_sort_ordering(left, right) {
-        return Ok(ordering);
-    }
-
-    let left_lt = rich_lt(vm, left, right)?;
-    if left_lt == Some(true) {
-        return Ok(Ordering::Less);
-    }
-
-    let right_lt = rich_lt(vm, right, left)?;
-    if right_lt == Some(true) {
-        return Ok(Ordering::Greater);
-    }
-
-    if left_lt.is_none() && right_lt.is_none() {
-        return Err(BuiltinError::TypeError(format!(
-            "'<' not supported between instances of '{}' and '{}'",
-            left.type_name(),
-            right.type_name()
-        )));
-    }
-
-    Ok(Ordering::Equal)
-}
-
-#[inline]
-fn primitive_sort_ordering(left: Value, right: Value) -> Option<Ordering> {
-    if left == right {
-        return Some(Ordering::Equal);
-    }
-
-    let left_numeric = numeric_sort_key(left);
-    let right_numeric = numeric_sort_key(right);
-    if let (Some(left), Some(right)) = (left_numeric, right_numeric) {
-        return left.partial_cmp(&right);
-    }
-
-    match (value_as_string_ref(left), value_as_string_ref(right)) {
-        (Some(left), Some(right)) => Some(left.as_str().cmp(right.as_str())),
-        _ => None,
-    }
-}
-
-#[inline]
-fn numeric_sort_key(value: Value) -> Option<f64> {
-    if let Some(boolean) = value.as_bool() {
-        return Some(if boolean { 1.0 } else { 0.0 });
-    }
-    if let Some(integer) = value.as_int() {
-        return Some(integer as f64);
-    }
-    value.as_float()
-}
-
-#[inline]
-fn rich_lt(
-    vm: &mut VirtualMachine,
-    left: Value,
-    right: Value,
-) -> Result<Option<bool>, BuiltinError> {
-    match resolve_special_method(left, "__lt__") {
-        Ok(target) => {
-            let result = invoke_comparison_method(vm, target, right)?;
-            if result == builtin_not_implemented_value() {
-                return Ok(None);
-            }
-            crate::truthiness::try_is_truthy(vm, result)
-                .map(Some)
-                .map_err(runtime_error_to_builtin_error)
-        }
-        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => Ok(None),
-        Err(err) => Err(runtime_error_to_builtin_error(err)),
-    }
+    compare_sort_ordering(vm, left, right).map_err(runtime_error_to_builtin_error)
 }
 
 #[inline]

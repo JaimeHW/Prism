@@ -1,6 +1,7 @@
 use super::{BuiltinError, runtime_error_to_builtin_error};
 use crate::VirtualMachine;
 use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
+use crate::ops::comparison::compare_sort_ordering;
 use crate::ops::iteration::{IterStep, collect_iterable_values, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::collections::deque::{DequeObject, value_as_deque};
@@ -883,7 +884,7 @@ pub fn builtin_sorted_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Valu
         ));
     }
 
-    values.sort_by(|a, b| compare_values(a, b));
+    sort_values_with_vm(vm, &mut values)?;
 
     if reverse {
         values.reverse();
@@ -892,6 +893,28 @@ pub fn builtin_sorted_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Valu
     let list = prism_runtime::types::list::ListObject::from_slice(&values);
     let ptr = Box::leak(Box::new(list)) as *mut prism_runtime::types::list::ListObject as *const ();
     Ok(Value::object_ptr(ptr))
+}
+
+fn sort_values_with_vm(vm: &mut VirtualMachine, values: &mut [Value]) -> Result<(), BuiltinError> {
+    let mut compare_error = None;
+    values.sort_by(|left, right| {
+        if compare_error.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+
+        match compare_sort_ordering(vm, *left, *right) {
+            Ok(ordering) => ordering,
+            Err(err) => {
+                compare_error = Some(runtime_error_to_builtin_error(err));
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+
+    match compare_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Compare two Values for sorting.
