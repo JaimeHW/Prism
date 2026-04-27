@@ -44,7 +44,7 @@ use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, get_iterator_mut, value_to_iterator};
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
-use crate::ops::dict_access::dict_set_item;
+use crate::ops::dict_access::{dict_set_item, missing_key_error};
 use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id, get_attribute_value,
     list_storage_ref_from_ptr, tuple_storage_ref_from_ptr,
@@ -1841,7 +1841,7 @@ fn defaultdict_missing(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
         .unwrap_or_else(Value::none);
 
     if default_factory.is_none() {
-        return Err(BuiltinError::KeyError(collection_repr_text(args[1])?));
+        return Err(BuiltinError::Raised(missing_key_error(vm, args[1])));
     }
 
     let value = invoke_callable_value(vm, default_factory, &[]).map_err(BuiltinError::Raised)?;
