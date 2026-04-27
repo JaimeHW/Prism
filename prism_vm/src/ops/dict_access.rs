@@ -5,9 +5,11 @@
 //! `__hash__`, collision-time `__eq__`, and exception propagation.
 
 use crate::VirtualMachine;
+use crate::builtins::create_exception_with_args_in_vm;
 use crate::builtins::hash_value_vm;
 use crate::error::RuntimeError;
 use crate::ops::comparison::eq_result;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
@@ -126,6 +128,23 @@ pub(crate) fn dict_setdefault(
 
     dict.set_with_hash(key, default, key_hash);
     Ok(default)
+}
+
+#[inline]
+pub(crate) fn missing_key_error(vm: &VirtualMachine, key: Value) -> RuntimeError {
+    match create_exception_with_args_in_vm(
+        vm,
+        ExceptionTypeId::KeyError,
+        None,
+        vec![key].into_boxed_slice(),
+    ) {
+        Ok(exception) => RuntimeError::raised_exception(
+            ExceptionTypeId::KeyError.as_u8() as u16,
+            exception,
+            "key not found",
+        ),
+        Err(err) => err,
+    }
 }
 
 #[inline]

@@ -18,7 +18,7 @@ use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::eq_result;
 use crate::ops::dict_access::{
     dict_contains_key, dict_get_item, dict_remove_item, dict_set_item,
-    dict_setdefault as dict_setdefault_item,
+    dict_setdefault as dict_setdefault_item, missing_key_error,
 };
 use crate::ops::exception::helpers::{
     extract_type_id_from_value, is_exception_class_value, is_exception_instance_value,
@@ -1981,9 +1981,10 @@ fn dict_keys(args: &[Value]) -> Result<Value, BuiltinError> {
 fn dict_getitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__getitem__", args, 1)?;
     let dict = expect_dict_ref(args[0], "__getitem__")?;
-    dict_get_item(vm, dict, args[1])
-        .map_err(runtime_error_to_builtin_error)?
-        .ok_or_else(|| BuiltinError::KeyError("key not found".to_string()))
+    match dict_get_item(vm, dict, args[1]).map_err(runtime_error_to_builtin_error)? {
+        Some(value) => Ok(value),
+        None => Err(BuiltinError::Raised(missing_key_error(vm, args[1]))),
+    }
 }
 
 #[inline]
@@ -2007,10 +2008,10 @@ fn dict_setitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builti
 fn dict_delitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__delitem__", args, 1)?;
     let dict = expect_dict_mut(args[0], "__delitem__")?;
-    dict_remove_item(vm, dict, args[1])
-        .map_err(runtime_error_to_builtin_error)?
-        .map(|_| Value::none())
-        .ok_or_else(|| BuiltinError::KeyError("key not found".to_string()))
+    match dict_remove_item(vm, dict, args[1]).map_err(runtime_error_to_builtin_error)? {
+        Some(_) => Ok(Value::none()),
+        None => Err(BuiltinError::Raised(missing_key_error(vm, args[1]))),
+    }
 }
 
 #[inline]
@@ -2066,7 +2067,7 @@ fn dict_pop(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinErr
         return Ok(default);
     }
 
-    Err(BuiltinError::KeyError("key not found".to_string()))
+    Err(BuiltinError::Raised(missing_key_error(vm, args[1])))
 }
 
 #[inline]

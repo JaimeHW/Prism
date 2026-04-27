@@ -13,7 +13,7 @@ use crate::error::RuntimeError;
 use crate::ops::calls::{
     InvokeCallableOutcome, invoke_callable_value, invoke_callable_value_with_control_transfer,
 };
-use crate::ops::dict_access::{dict_get_item, dict_remove_item, dict_set_item};
+use crate::ops::dict_access::{dict_get_item, dict_remove_item, dict_set_item, missing_key_error};
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
@@ -115,7 +115,7 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 
     // Fast path: try integer subscript first (most common case)
     if let Some(index) = key.as_int() {
-        match subscr_integer(container, index) {
+        match subscr_integer(vm, container, index) {
             Ok(Some(subscr_result)) => {
                 return finish_subscr(vm, dst, subscr_result);
             }
@@ -176,7 +176,7 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
                     vm.current_frame_mut().set_reg(dst, value);
                     ControlFlow::Continue
                 }
-                Ok(None) => ControlFlow::Error(RuntimeError::key_error("key not found")),
+                Ok(None) => ControlFlow::Error(missing_key_error(vm, key)),
                 Err(err) => ControlFlow::Error(err),
             };
         }
@@ -189,7 +189,7 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
                     vm.current_frame_mut().set_reg(dst, value);
                     return ControlFlow::Continue;
                 }
-                Ok(None) => return ControlFlow::Error(RuntimeError::key_error("key not found")),
+                Ok(None) => return ControlFlow::Error(missing_key_error(vm, key)),
                 Err(err) => return ControlFlow::Error(err),
             }
         }
@@ -221,7 +221,11 @@ fn finish_subscr(vm: &mut VirtualMachine, dst: u8, result: SubscriptResult) -> C
 /// Returns `Ok(None)` when the container does not provide an integer fast path,
 /// allowing callers to fall back to the general `__getitem__` protocol.
 #[inline]
-fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult>, ControlFlow> {
+fn subscr_integer(
+    vm: &VirtualMachine,
+    container: Value,
+    index: i64,
+) -> Result<Option<SubscriptResult>, ControlFlow> {
     if let Some(interned) = tagged_interned_string(container)? {
         return subscr_str_integer(interned.as_str(), index).map(Some);
     }
@@ -293,10 +297,7 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
             if let Some(value) = dict.get(key) {
                 return Ok(Some(SubscriptResult::Value(value)));
             }
-            return Err(ControlFlow::Error(RuntimeError::key_error(format!(
-                "{}",
-                index
-            ))));
+            return Err(ControlFlow::Error(missing_key_error(vm, key)));
         }
     }
 
@@ -324,7 +325,7 @@ fn subscr_index_protocol(
     };
 
     if let Some(index) = index.to_i64() {
-        return subscr_integer(container, index);
+        return subscr_integer(vm, container, index);
     }
 
     subscr_large_integer(container, &index)
@@ -1049,7 +1050,7 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
                 match dict_remove_item(vm, dict, key) {
                     Ok(Some(_)) => return ControlFlow::Continue,
                     Ok(None) => {
-                        return ControlFlow::Error(RuntimeError::key_error("key not found"));
+                        return ControlFlow::Error(missing_key_error(vm, key));
                     }
                     Err(err) => return ControlFlow::Error(err),
                 }
@@ -1067,7 +1068,7 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         {
             match dict_remove_item(vm, dict, key) {
                 Ok(Some(_)) => return ControlFlow::Continue,
-                Ok(None) => return ControlFlow::Error(RuntimeError::key_error("key not found")),
+                Ok(None) => return ControlFlow::Error(missing_key_error(vm, key)),
                 Err(err) => return ControlFlow::Error(err),
             }
         }
