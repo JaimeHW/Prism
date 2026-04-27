@@ -65,6 +65,7 @@ pub mod operator;
 pub mod os;
 pub mod pickle;
 pub mod pickletools;
+pub mod platform;
 pub mod python_builtins;
 pub mod random;
 pub mod re;
@@ -535,6 +536,11 @@ impl StdlibRegistry {
             &mut modules,
             "pickletools",
             Box::new(pickletools::PickleToolsModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "platform",
+            Box::new(platform::PlatformModule::new()),
         );
 
         Self::insert_module(

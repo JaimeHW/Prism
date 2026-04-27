@@ -217,6 +217,7 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "operator"
         | "pickle"
         | "pickletools"
+        | "platform"
         | "random"
         | "string"
         | "test.support"
