@@ -13,6 +13,7 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
+use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
@@ -2073,6 +2074,7 @@ impl<'vm> ReprState<'vm> {
                 let complex = unsafe { &*(ptr as *const ComplexObject) };
                 Ok(complex.to_string())
             }
+            TypeId::TYPE => repr_type_object(ptr),
             TypeId::STATICMETHOD => {
                 let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
                 Ok(format!(
@@ -2477,6 +2479,38 @@ fn should_use_python_repr_protocol(value: Value) -> bool {
     };
 
     crate::ops::objects::extract_type_id(ptr).raw() >= TypeId::FIRST_USER_TYPE
+}
+
+fn repr_type_object(ptr: *const ()) -> Result<String, BuiltinError> {
+    if let Some(type_id) = crate::builtins::builtin_type_object_type_id(ptr) {
+        let module = match type_id {
+            TypeId::DEQUE => "collections",
+            _ => "builtins",
+        };
+        return Ok(render_type_repr(module, type_id.name()));
+    }
+
+    let class = unsafe { &*(ptr as *const PyClassObject) };
+    let module = class
+        .get_attr(&intern("__module__"))
+        .and_then(value_as_string_ref)
+        .map(|name| name.as_str().to_string())
+        .unwrap_or_else(|| "__main__".to_string());
+    let qualname = class
+        .get_attr(&intern("__qualname__"))
+        .and_then(value_as_string_ref)
+        .map(|name| name.as_str().to_string())
+        .unwrap_or_else(|| class.name().as_str().to_string());
+    Ok(render_type_repr(&module, &qualname))
+}
+
+#[inline]
+fn render_type_repr(module: &str, qualname: &str) -> String {
+    if module == "builtins" {
+        format!("<class '{qualname}'>")
+    } else {
+        format!("<class '{module}.{qualname}'>")
+    }
 }
 
 fn quote_python_string(input: &str) -> String {
