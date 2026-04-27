@@ -1420,20 +1420,26 @@ pub(crate) fn contains_value(
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
 
-                // Only integers can be in a range
-                if let Some(value) = needle.as_int() {
-                    return Ok(range.contains(value));
+                if let Some(value) = numeric_value_to_bigint(needle) {
+                    return Ok(range.contains_bigint(&value));
                 }
 
-                // Float values check: Python allows 5.0 in range(10)
-                if let Some(f) = needle.as_float() {
-                    // Check if it's a whole number
-                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                        return Ok(range.contains(f as i64));
+                if let Some(parts) = complex_like_parts(needle) {
+                    if parts.imag == 0.0
+                        && parts.real.is_finite()
+                        && parts.real.fract() == 0.0
+                        && parts.real >= i64::MIN as f64
+                        && parts.real <= i64::MAX as f64
+                    {
+                        return Ok(range.contains(parts.real as i64));
                     }
                 }
 
-                // Non-numeric types are not in range
+                for item in range.iter() {
+                    if eq_result(vm, item, needle)? {
+                        return Ok(true);
+                    }
+                }
                 return Ok(false);
             }
 

@@ -33,7 +33,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{GenericAliasObject, MappingProxyObject};
 use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::value_to_bigint;
+use prism_runtime::types::int::{bigint_to_saturated_i64, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::MemoryViewObject;
 use prism_runtime::types::range::RangeObject;
@@ -137,6 +137,14 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
                 Err(cf) => return cf,
             }
         }
+    }
+
+    match subscr_index_protocol(vm, container, key) {
+        Ok(Some(subscr_result)) => {
+            return finish_subscr(vm, dst, subscr_result);
+        }
+        Ok(None) => {}
+        Err(cf) => return cf,
     }
 
     // Dict with any key type (not just integer)
@@ -293,6 +301,143 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
     }
 
     Ok(None)
+}
+
+/// Built-in sequence subscript via Python's `__index__` protocol.
+///
+/// The small tagged-int path above handles the overwhelmingly common case.
+/// This path is intentionally gated on built-in sequence containers before it
+/// invokes user code, so dict keys and user-defined `__getitem__` implementations
+/// still receive the original key object.
+#[inline]
+fn subscr_index_protocol(
+    vm: &mut VirtualMachine,
+    container: Value,
+    key: Value,
+) -> Result<Option<SubscriptResult>, ControlFlow> {
+    if !has_builtin_integer_subscript(container)? {
+        return Ok(None);
+    }
+
+    let Some(index) = subscript_index_bigint(vm, key)? else {
+        return Ok(None);
+    };
+
+    if let Some(index) = index.to_i64() {
+        return subscr_integer(container, index);
+    }
+
+    subscr_large_integer(container, &index)
+}
+
+#[inline]
+fn has_builtin_integer_subscript(container: Value) -> Result<bool, ControlFlow> {
+    if tagged_interned_string(container)?.is_some() {
+        return Ok(true);
+    }
+
+    let Some(ptr) = container.as_object_ptr() else {
+        return Ok(false);
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+
+    let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+    if has_builtin_sequence_layout
+        && (list_storage_ref_from_ptr(ptr).is_some() || tuple_storage_ref_from_ptr(ptr).is_some())
+    {
+        return Ok(true);
+    }
+
+    Ok(matches!(
+        header.type_id,
+        TypeId::BYTES | TypeId::BYTEARRAY | TypeId::MEMORYVIEW | TypeId::STR | TypeId::RANGE
+    ))
+}
+
+fn subscript_index_bigint(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<BigInt>, ControlFlow> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(Some(BigInt::from(u8::from(flag))));
+    }
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(Some(integer));
+    }
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => return Ok(None),
+        Err(err) => return Err(ControlFlow::Error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, target)?;
+    value_to_bigint(indexed).map(Some).ok_or_else(|| {
+        ControlFlow::Error(RuntimeError::type_error(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        )))
+    })
+}
+
+#[inline]
+fn subscr_large_integer(
+    container: Value,
+    index: &BigInt,
+) -> Result<Option<SubscriptResult>, ControlFlow> {
+    if let Some(interned) = tagged_interned_string(container)? {
+        let len = interned.as_str().chars().count();
+        return Err(ControlFlow::Error(large_index_error(index, len)));
+    }
+
+    let Some(ptr) = container.as_object_ptr() else {
+        return Ok(None);
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+
+    let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+    if has_builtin_sequence_layout && let Some(list) = list_storage_ref_from_ptr(ptr) {
+        return Err(ControlFlow::Error(large_index_error(index, list.len())));
+    }
+    if has_builtin_sequence_layout && let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+        return Err(ControlFlow::Error(large_index_error(index, tuple.len())));
+    }
+
+    match header.type_id {
+        TypeId::BYTES | TypeId::BYTEARRAY => {
+            let bytes = unsafe { &*(ptr as *const BytesObject) };
+            Err(ControlFlow::Error(large_index_error(index, bytes.len())))
+        }
+        TypeId::MEMORYVIEW => {
+            let view = unsafe { &*(ptr as *const MemoryViewObject) };
+            if view.released() {
+                return Err(ControlFlow::Error(RuntimeError::value_error(
+                    "operation forbidden on released memoryview object",
+                )));
+            }
+            Err(ControlFlow::Error(large_index_error(index, view.len())))
+        }
+        TypeId::STR => {
+            let string = unsafe { &*(ptr as *const StringObject) };
+            Err(ControlFlow::Error(large_index_error(
+                index,
+                string.as_str().chars().count(),
+            )))
+        }
+        TypeId::RANGE => {
+            let range = unsafe { &*(ptr as *const RangeObject) };
+            if let Some(value) = range.get_value_bigint(index) {
+                return Ok(Some(SubscriptResult::Value(value)));
+            }
+            Err(ControlFlow::Error(large_index_error(index, range.len())))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[inline]
+fn large_index_error(index: &BigInt, len: usize) -> RuntimeError {
+    RuntimeError::index_error(bigint_to_saturated_i64(index), len)
 }
 
 /// Slice subscript - O(k) where k is slice length.

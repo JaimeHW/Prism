@@ -209,36 +209,36 @@ impl RangeObject {
 
     /// Get the element at index as a Python value.
     pub fn get_value(&self, index: i64) -> Option<Value> {
+        self.get_value_bigint(&BigInt::from(index))
+    }
+
+    /// Get the element at an arbitrary-precision index as a Python value.
+    pub fn get_value_bigint(&self, index: &BigInt) -> Option<Value> {
         match &self.repr {
             RangeRepr::Small { start, stop, step } => {
-                let len = small_len(*start, *stop, *step) as i64;
-                let idx = if index < 0 { len + index } else { index };
-                if idx < 0 || idx >= len {
+                let len = BigInt::from(small_len(*start, *stop, *step));
+                let mut idx = index.clone();
+                if idx.is_negative() {
+                    idx += &len;
+                }
+                if idx.is_negative() || idx >= len {
                     return None;
                 }
                 Some(bigint_to_value(
-                    BigInt::from(*start) + BigInt::from(idx) * BigInt::from(*step),
+                    BigInt::from(*start) + idx * BigInt::from(*step),
                 ))
             }
             RangeRepr::Big { start, stop, step } => {
-                let idx = if index < 0 {
-                    let len = self.try_len()?.to_i64()?;
-                    len + index
-                } else {
-                    index
-                };
-                if idx < 0 {
+                let len = big_len(start, stop, step);
+                let mut idx = index.clone();
+                if idx.is_negative() {
+                    idx += &len;
+                }
+                if idx.is_negative() || idx >= len {
                     return None;
                 }
 
-                let value = start + BigInt::from(idx) * step;
-                if step.is_positive() {
-                    if value < *start || value >= *stop {
-                        return None;
-                    }
-                } else if value > *start || value <= *stop {
-                    return None;
-                }
+                let value = start + idx * step;
                 Some(bigint_to_value(value))
             }
         }
@@ -263,29 +263,47 @@ impl RangeObject {
     /// Check if a small integer is in the range.
     #[inline]
     pub fn contains(&self, value: i64) -> bool {
+        self.contains_bigint(&BigInt::from(value))
+    }
+
+    /// Check if an arbitrary-precision integer is in the range.
+    #[inline]
+    pub fn contains_bigint(&self, value: &BigInt) -> bool {
         match &self.repr {
             RangeRepr::Small { start, stop, step } => {
-                if *step > 0 {
-                    if value < *start || value >= *stop {
+                let start = BigInt::from(*start);
+                let stop = BigInt::from(*stop);
+                let step = BigInt::from(*step);
+                if step.is_positive() {
+                    if value < &start || value >= &stop {
                         return false;
                     }
-                } else if value > *start || value <= *stop {
+                } else if value > &start || value <= &stop {
                     return false;
                 }
-                (i128::from(value) - i128::from(*start)) % i128::from(*step) == 0
+                ((value - start) % step).is_zero()
             }
             RangeRepr::Big { start, stop, step } => {
-                let value = BigInt::from(value);
                 if step.is_positive() {
-                    if value < *start || value >= *stop {
+                    if value < start || value >= stop {
                         return false;
                     }
-                } else if value > *start || value <= *stop {
+                } else if value > start || value <= stop {
                     return false;
                 }
                 ((value - start) % step).is_zero()
             }
         }
+    }
+
+    /// Return the position of an arbitrary-precision integer in the range.
+    #[inline]
+    pub fn index_of_bigint(&self, value: &BigInt) -> Option<BigInt> {
+        if !self.contains_bigint(value) {
+            return None;
+        }
+
+        Some((value - self.start_bigint()) / self.step_bigint())
     }
 
     /// Create an iterator over this range.
