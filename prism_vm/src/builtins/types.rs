@@ -1484,7 +1484,11 @@ pub(crate) fn call_builtin_type_with_vm(
                     let source = unsafe { &*(ptr as *const DictObject) };
                     let mut copy = DictObject::with_capacity(source.len());
                     for (key, value) in source.iter() {
-                        copy.set(key, value);
+                        if let Some(hash) = source.stored_hash(key) {
+                            copy.set_with_hash(key, value, hash);
+                        } else {
+                            copy.set(key, value);
+                        }
                     }
                     return Ok(to_object_value(copy));
                 }
@@ -1493,7 +1497,8 @@ pub(crate) fn call_builtin_type_with_vm(
             if let Some(entries) = mapping_entries_with_vm(vm, args[0])? {
                 let mut dict = DictObject::with_capacity(entries.len());
                 for (key, value) in entries {
-                    dict.set(key, value);
+                    crate::ops::dict_access::dict_set_item(vm, &mut dict, key, value)
+                        .map_err(runtime_error_to_builtin_error)?;
                 }
                 return Ok(to_object_value(dict));
             }
@@ -1503,7 +1508,8 @@ pub(crate) fn call_builtin_type_with_vm(
 
             for (index, item) in sequence.drain(..).enumerate() {
                 let (key, value) = dict_item_to_pair(item, index)?;
-                dict.set(key, value);
+                crate::ops::dict_access::dict_set_item(vm, &mut dict, key, value)
+                    .map_err(runtime_error_to_builtin_error)?;
             }
 
             Ok(to_object_value(dict))
@@ -1831,7 +1837,7 @@ pub(crate) fn call_builtin_type_kw_with_vm(
         TypeId::INT => builtin_int_kw_vm(vm, positional, keywords),
         TypeId::TYPE => builtin_type_kw_with_vm(vm, positional, keywords),
         TypeId::PROPERTY => builtin_property_kw(positional, keywords),
-        TypeId::DICT => builtin_dict_kw(positional, keywords),
+        TypeId::DICT => builtin_dict_kw_vm(vm, positional, keywords),
         TypeId::STR => builtin_str_kw(positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
         TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm_kw(vm, positional, keywords),
@@ -2276,6 +2282,13 @@ pub fn builtin_dict(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(to_object_value(dict))
 }
 
+pub(crate) fn builtin_dict_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    call_builtin_type_with_vm(vm, TypeId::DICT, args)
+}
+
 fn builtin_dict_kw(
     positional: &[Value],
     keywords: &[(&str, Value)],
@@ -2288,6 +2301,25 @@ fn builtin_dict_kw(
 
     for (name, value) in keywords {
         dict.set(Value::string(intern(name)), *value);
+    }
+
+    Ok(dict_value)
+}
+
+fn builtin_dict_kw_vm(
+    vm: &mut VirtualMachine,
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let dict_value = call_builtin_type_with_vm(vm, TypeId::DICT, positional)?;
+    let dict_ptr = dict_value
+        .as_object_ptr()
+        .expect("dict constructor should return an object-backed dict");
+    let dict = unsafe { &mut *(dict_ptr as *mut DictObject) };
+
+    for (name, value) in keywords {
+        crate::ops::dict_access::dict_set_item(vm, dict, Value::string(intern(name)), *value)
+            .map_err(runtime_error_to_builtin_error)?;
     }
 
     Ok(dict_value)

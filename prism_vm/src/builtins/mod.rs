@@ -229,7 +229,7 @@ impl BuiltinRegistry {
         registry.register_function_vm("pow", functions::builtin_pow_vm);
         registry.register_function("round", functions::builtin_round);
         registry.register_function("divmod", functions::builtin_divmod);
-        registry.register_function("hash", functions::builtin_hash);
+        registry.register_function_vm("hash", functions::builtin_hash_vm);
         registry.register_function("id", functions::builtin_id);
         registry.register_function("callable", functions::builtin_callable);
         registry.register_function_vm("repr", functions::builtin_repr_vm);
@@ -331,10 +331,10 @@ impl BuiltinRegistry {
             prism_runtime::object::type_obj::TypeId::TUPLE,
             types::builtin_tuple,
         );
-        registry.register_callable_type(
+        registry.register_callable_type_vm(
             "dict",
             prism_runtime::object::type_obj::TypeId::DICT,
-            types::builtin_dict,
+            types::builtin_dict_vm,
         );
         registry.register_callable_type(
             "set",

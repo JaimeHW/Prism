@@ -12,6 +12,7 @@ pub mod containers;
 pub mod context;
 pub mod control;
 pub mod coroutine;
+pub mod dict_access;
 pub mod exception;
 pub mod generator;
 pub mod iteration;

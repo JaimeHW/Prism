@@ -5,6 +5,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::dict_access::dict_set_item;
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::objects::read_attr_name;
 use prism_code::Instruction;
@@ -96,18 +97,24 @@ pub fn build_dict(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let pair_count = inst.src2().0 as usize;
     let dst = inst.dst().0;
 
-    // Build dict (borrow frame, then release)
-    let dict = {
+    let pairs = {
         let frame = vm.current_frame();
-        let mut dict = DictObject::new();
-        for i in 0..pair_count {
-            let key = frame.get_reg(start_reg + (i * 2) as u8);
-            let value = frame.get_reg(start_reg + (i * 2 + 1) as u8);
-            dict.set(key, value);
-        }
-        dict
+        (0..pair_count)
+            .map(|i| {
+                (
+                    frame.get_reg(start_reg + (i * 2) as u8),
+                    frame.get_reg(start_reg + (i * 2 + 1) as u8),
+                )
+            })
+            .collect::<Vec<_>>()
     };
 
+    let mut dict = DictObject::with_capacity(pair_count);
+    for (key, value) in pairs {
+        if let Err(err) = dict_set_item(vm, &mut dict, key, value) {
+            return ControlFlow::Error(err);
+        }
+    }
     let value = alloc_value_in_current_heap_or_box(dict);
 
     vm.current_frame_mut().set_reg(dst, value);
@@ -233,8 +240,10 @@ pub fn dict_set(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     if let Some(ptr) = dict_val.as_object_ptr() {
         // SAFETY: We know this is a DictObject because BuildDict created it
         let dict = unsafe { &mut *(ptr as *mut DictObject) };
-        dict.set(key, value);
-        ControlFlow::Continue
+        match dict_set_item(vm, dict, key, value) {
+            Ok(()) => ControlFlow::Continue,
+            Err(err) => ControlFlow::Error(err),
+        }
     } else {
         ControlFlow::Error(RuntimeError::type_error("expected dict object"))
     }

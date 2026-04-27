@@ -16,6 +16,10 @@ use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::eq_result;
+use crate::ops::dict_access::{
+    dict_contains_key, dict_get_item, dict_remove_item, dict_set_item,
+    dict_setdefault as dict_setdefault_item,
+};
 use crate::ops::exception::helpers::{
     extract_type_id_from_value, is_exception_class_value, is_exception_instance_value,
 };
@@ -252,23 +256,23 @@ static DICT_VALUES_METHOD: LazyLock<BuiltinFunctionObject> =
 static DICT_ITEMS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.items"), dict_items));
 static DICT_GET_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.get"), dict_get));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.get"), dict_get));
 static DICT_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__len__"), dict_len));
 static DICT_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__contains__"), dict_contains));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__contains__"), dict_contains));
 static DICT_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__getitem__"), dict_getitem));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__getitem__"), dict_getitem));
 static DICT_SETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__setitem__"), dict_setitem));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__setitem__"), dict_setitem));
 static DICT_DELITEM_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__delitem__"), dict_delitem));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__delitem__"), dict_delitem));
 static DICT_POP_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.pop"), dict_pop));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.pop"), dict_pop));
 static DICT_POPITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.popitem"), dict_popitem));
 static DICT_SETDEFAULT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.setdefault"), dict_setdefault));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.setdefault"), dict_setdefault));
 static DICT_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.clear"), dict_clear));
 static DICT_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -1974,37 +1978,37 @@ fn dict_keys(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn dict_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_getitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__getitem__", args, 1)?;
     let dict = expect_dict_ref(args[0], "__getitem__")?;
-    ensure_hashable(args[1])?;
-    dict.get(args[1])
+    dict_get_item(vm, dict, args[1])
+        .map_err(runtime_error_to_builtin_error)?
         .ok_or_else(|| BuiltinError::KeyError("key not found".to_string()))
 }
 
 #[inline]
-fn dict_contains(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__contains__", args, 1)?;
     let dict = expect_dict_ref(args[0], "__contains__")?;
-    ensure_hashable(args[1])?;
-    Ok(Value::bool(dict.get(args[1]).is_some()))
+    Ok(Value::bool(
+        dict_contains_key(vm, dict, args[1]).map_err(runtime_error_to_builtin_error)?,
+    ))
 }
 
 #[inline]
-fn dict_setitem(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_setitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__setitem__", args, 2)?;
     let dict = expect_dict_mut(args[0], "__setitem__")?;
-    ensure_hashable(args[1])?;
-    dict.set(args[1], args[2]);
+    dict_set_item(vm, dict, args[1], args[2]).map_err(runtime_error_to_builtin_error)?;
     Ok(Value::none())
 }
 
 #[inline]
-fn dict_delitem(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_delitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("dict", "__delitem__", args, 1)?;
     let dict = expect_dict_mut(args[0], "__delitem__")?;
-    ensure_hashable(args[1])?;
-    dict.remove(args[1])
+    dict_remove_item(vm, dict, args[1])
+        .map_err(runtime_error_to_builtin_error)?
         .map(|_| Value::none())
         .ok_or_else(|| BuiltinError::KeyError("key not found".to_string()))
 }
@@ -2020,7 +2024,7 @@ fn dict_items(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn dict_get(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_get(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     let given = args.len().saturating_sub(1);
     if !(1..=2).contains(&given) {
         return Err(BuiltinError::TypeError(format!(
@@ -2029,9 +2033,10 @@ fn dict_get(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let dict = expect_dict_ref(args[0], "get")?;
-    ensure_hashable(args[1])?;
     let default = args.get(2).copied().unwrap_or_else(Value::none);
-    Ok(dict.get(args[1]).unwrap_or(default))
+    Ok(dict_get_item(vm, dict, args[1])
+        .map_err(runtime_error_to_builtin_error)?
+        .unwrap_or(default))
 }
 
 #[inline]
@@ -2042,7 +2047,7 @@ fn dict_len(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn dict_pop(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_pop(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         let given = args.len().saturating_sub(1);
         return Err(BuiltinError::TypeError(format!(
@@ -2051,8 +2056,9 @@ fn dict_pop(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let dict = expect_dict_mut(args[0], "pop")?;
-    ensure_hashable(args[1])?;
-    if let Some(value) = dict.remove(args[1]) {
+    if let Some(value) =
+        dict_remove_item(vm, dict, args[1]).map_err(runtime_error_to_builtin_error)?
+    {
         return Ok(value);
     }
 
@@ -2074,7 +2080,7 @@ fn dict_popitem(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn dict_setdefault(args: &[Value]) -> Result<Value, BuiltinError> {
+fn dict_setdefault(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         let given = args.len().saturating_sub(1);
         return Err(BuiltinError::TypeError(format!(
@@ -2083,9 +2089,8 @@ fn dict_setdefault(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let dict = expect_dict_mut(args[0], "setdefault")?;
-    ensure_hashable(args[1])?;
     let default = args.get(2).copied().unwrap_or_else(Value::none);
-    Ok(dict.setdefault(args[1], default))
+    dict_setdefault_item(vm, dict, args[1], default).map_err(runtime_error_to_builtin_error)
 }
 
 #[inline]
@@ -2127,8 +2132,7 @@ fn dict_update_with_vm_kw(
     let dict = expect_dict_mut(args[0], "update")?;
 
     for (key, value) in entries {
-        ensure_hashable(key)?;
-        dict.set(key, value);
+        dict_set_item(vm, dict, key, value).map_err(runtime_error_to_builtin_error)?;
     }
     for &(name, value) in keywords {
         dict.set(Value::string(intern(name)), value);
@@ -2143,7 +2147,11 @@ fn dict_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     let dict = expect_dict_ref(args[0], "copy")?;
     let mut copied = DictObject::with_capacity(dict.len());
     for (key, value) in dict.iter() {
-        copied.set(key, value);
+        if let Some(hash) = dict.stored_hash(key) {
+            copied.set_with_hash(key, value, hash);
+        } else {
+            copied.set(key, value);
+        }
     }
     Ok(to_object_value(copied))
 }

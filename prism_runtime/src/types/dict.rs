@@ -27,6 +27,7 @@ pub struct DictObject {
 #[derive(Debug, Clone, Default)]
 struct DictEntries {
     items: FxHashMap<HashableValue, Value>,
+    hashes: FxHashMap<HashableValue, i64>,
     order: Vec<Option<HashableValue>>,
     positions: FxHashMap<HashableValue, usize>,
     tombstones: usize,
@@ -49,6 +50,7 @@ impl DictObject {
             header: ObjectHeader::new(TypeId::DICT),
             entries: DictEntries {
                 items: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+                hashes: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 positions: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 order: Vec::with_capacity(capacity),
                 tombstones: 0,
@@ -77,10 +79,24 @@ impl DictObject {
     /// Set a key-value pair.
     #[inline]
     pub fn set(&mut self, key: Value, value: Value) {
+        self.insert(key, value, None);
+    }
+
+    /// Set a key-value pair after the VM has computed the Python hash.
+    #[inline]
+    pub fn set_with_hash(&mut self, key: Value, value: Value, hash: i64) {
+        self.insert(key, value, Some(hash));
+    }
+
+    #[inline]
+    fn insert(&mut self, key: Value, value: Value, hash: Option<i64>) {
         let key = HashableValue(key);
         if self.entries.items.insert(key, value).is_none() {
             self.entries.positions.insert(key, self.entries.order.len());
             self.entries.order.push(Some(key));
+        }
+        if let Some(hash) = hash {
+            self.entries.hashes.insert(key, hash);
         }
     }
 
@@ -90,6 +106,7 @@ impl DictObject {
         let key = HashableValue(key);
         let removed = self.entries.items.remove(&key);
         if removed.is_some() {
+            self.entries.hashes.remove(&key);
             if let Some(index) = self.entries.positions.remove(&key)
                 && let Some(slot) = self.entries.order.get_mut(index)
                 && slot.take().is_some()
@@ -111,6 +128,7 @@ impl DictObject {
     #[inline]
     pub fn clear(&mut self) {
         self.entries.items.clear();
+        self.entries.hashes.clear();
         self.entries.order.clear();
         self.entries.positions.clear();
         self.entries.tombstones = 0;
@@ -140,10 +158,20 @@ impl DictObject {
         })
     }
 
+    /// Return the cached Python hash for a stored key, when available.
+    #[inline]
+    pub fn stored_hash(&self, key: Value) -> Option<i64> {
+        self.entries.hashes.get(&HashableValue(key)).copied()
+    }
+
     /// Update this dict with items from another.
     pub fn update(&mut self, other: &DictObject) {
         for (key, value) in other.iter() {
-            self.set(key, value);
+            if let Some(hash) = other.stored_hash(key) {
+                self.set_with_hash(key, value, hash);
+            } else {
+                self.set(key, value);
+            }
         }
     }
 
@@ -217,6 +245,9 @@ impl DictObject {
 
         let mut compacted = Vec::with_capacity(self.entries.items.len());
         self.entries.positions.clear();
+        self.entries
+            .hashes
+            .retain(|key, _| self.entries.items.contains_key(key));
         for key in self.entries.order.iter().filter_map(|key| *key) {
             self.entries.positions.insert(key, compacted.len());
             compacted.push(Some(key));

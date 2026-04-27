@@ -1386,8 +1386,21 @@ pub fn builtin_hash(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(bigint_to_value(BigInt::from(hash)))
 }
 
+/// VM-aware hash implementation that honors Python-level `__hash__`.
+pub fn builtin_hash_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "hash() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let hash = hash_value_vm(vm, args[0])?;
+    Ok(bigint_to_value(BigInt::from(hash)))
+}
+
 #[inline]
-fn hash_value(value: Value) -> Result<i64, BuiltinError> {
+pub(crate) fn hash_value(value: Value) -> Result<i64, BuiltinError> {
     if let Some(boolean) = value.as_bool() {
         return Ok(i64::from(boolean));
     }
@@ -1443,6 +1456,83 @@ fn hash_value(value: Value) -> Result<i64, BuiltinError> {
 }
 
 #[inline]
+pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+
+    if let Some(integer) = value.as_int() {
+        return Ok(normalize_python_hash(integer));
+    }
+
+    if let Some(float) = value.as_float() {
+        return Ok(hash_float(float, value.raw_bits() as usize));
+    }
+
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(hash_bigint(&integer));
+    }
+
+    if let Some(string) = value_as_string_ref(value) {
+        return Ok(hash_with_default_hasher(&string.as_str()));
+    }
+
+    if value.is_none() {
+        return Ok(hash_with_default_hasher(&value));
+    }
+
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("unhashable type".to_string()))?;
+    let type_id = crate::ops::objects::extract_type_id(ptr);
+    match type_id {
+        TypeId::LIST | TypeId::DICT | TypeId::SET => Err(BuiltinError::TypeError(format!(
+            "unhashable type: '{}'",
+            type_id.name()
+        ))),
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            hash_tuple_vm(vm, tuple)
+        }
+        TypeId::SLICE => {
+            let slice = unsafe { &*(ptr as *const SliceObject) };
+            let components = TupleObject::from_slice(&[
+                slice.start_value(),
+                slice.stop_value(),
+                slice.step_value(),
+            ]);
+            hash_tuple_vm(vm, &components)
+        }
+        TypeId::RANGE => {
+            let range = unsafe { &*(ptr as *const RangeObject) };
+            hash_range(range)
+        }
+        _ => match resolve_special_method(value, "__hash__") {
+            Ok(target) => {
+                let result = invoke_zero_arg_bound_method(vm, target)
+                    .map_err(super::runtime_error_to_builtin_error)?;
+                hash_user_result(result, type_id)
+            }
+            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+                Ok(hash_with_default_hasher(&(ptr as usize)))
+            }
+            Err(err) => Err(super::runtime_error_to_builtin_error(err)),
+        },
+    }
+}
+
+#[inline]
+fn hash_user_result(result: Value, type_id: TypeId) -> Result<i64, BuiltinError> {
+    let Some(integer) = value_to_bigint(result) else {
+        return Err(BuiltinError::TypeError(format!(
+            "__hash__ method should return an integer for '{}'",
+            type_id.name()
+        )));
+    };
+    Ok(hash_bigint(&integer))
+}
+
+#[inline]
 fn hash_range(range: &RangeObject) -> Result<i64, BuiltinError> {
     let len = range.len_bigint();
     let components = if len.is_zero() {
@@ -1473,6 +1563,29 @@ fn hash_tuple(tuple: &TupleObject) -> Result<i64, BuiltinError> {
     let len = tuple.len();
     for item in tuple.iter().copied() {
         let lane = hash_value(item)? as u64;
+        acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+        acc = acc.rotate_left(31);
+        acc = acc.wrapping_mul(XXPRIME_1);
+    }
+
+    acc = acc.wrapping_add((len as u64) ^ EMPTY_TUPLE_COMPAT_MANGLE);
+    if acc == u64::MAX {
+        return Ok(1_546_275_796);
+    }
+    Ok(acc as i64)
+}
+
+#[inline]
+fn hash_tuple_vm(vm: &mut VirtualMachine, tuple: &TupleObject) -> Result<i64, BuiltinError> {
+    const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
+    const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
+    const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
+    const EMPTY_TUPLE_COMPAT_MANGLE: u64 = XXPRIME_5 ^ 3_527_539;
+
+    let mut acc: u64 = XXPRIME_5;
+    let len = tuple.len();
+    for item in tuple.iter().copied() {
+        let lane = hash_value_vm(vm, item)? as u64;
         acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
         acc = acc.rotate_left(31);
         acc = acc.wrapping_mul(XXPRIME_1);

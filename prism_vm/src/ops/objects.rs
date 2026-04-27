@@ -2776,10 +2776,11 @@ pub fn del_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Uses TypeId dispatch for correct type handling.
 #[inline(always)]
 pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
-    let container = frame.get_reg(inst.src1().0);
-    let key = frame.get_reg(inst.src2().0);
     let dst = inst.dst().0;
+    let (container, key) = {
+        let frame = vm.current_frame();
+        (frame.get_reg(inst.src1().0), frame.get_reg(inst.src2().0))
+    };
 
     if let Some(ptr) = container.as_object_ptr() {
         let type_id = extract_type_id(ptr);
@@ -2787,7 +2788,7 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         if let Some(list) = list_storage_ref_from_ptr(ptr) {
             return if let Some(idx) = key.as_int() {
                 if let Some(val) = list.get(idx) {
-                    frame.set_reg(dst, val);
+                    vm.current_frame_mut().set_reg(dst, val);
                     ControlFlow::Continue
                 } else {
                     ControlFlow::Error(RuntimeError::index_error(idx, list.len()))
@@ -2800,7 +2801,7 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         if let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
             return if let Some(idx) = key.as_int() {
                 if let Some(val) = tuple.get(idx) {
-                    frame.set_reg(dst, val);
+                    vm.current_frame_mut().set_reg(dst, val);
                     ControlFlow::Continue
                 } else {
                     ControlFlow::Error(RuntimeError::index_error(idx, tuple.len()))
@@ -2818,7 +2819,7 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         return ControlFlow::Error(RuntimeError::index_error(idx, deque.len()));
                     };
                     if let Some(value) = deque.deque().get(index) {
-                        frame.set_reg(dst, *value);
+                        vm.current_frame_mut().set_reg(dst, *value);
                         ControlFlow::Continue
                     } else {
                         ControlFlow::Error(RuntimeError::index_error(idx, deque.len()))
@@ -2829,11 +2830,13 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             }
             TypeId::DICT => {
                 let dict = unsafe { &*(ptr as *const DictObject) };
-                if let Some(val) = dict.get(key) {
-                    frame.set_reg(dst, val);
-                    ControlFlow::Continue
-                } else {
-                    ControlFlow::Error(RuntimeError::key_error("key not found"))
+                match crate::ops::dict_access::dict_get_item(vm, dict, key) {
+                    Ok(Some(val)) => {
+                        vm.current_frame_mut().set_reg(dst, val);
+                        ControlFlow::Continue
+                    }
+                    Ok(None) => ControlFlow::Error(RuntimeError::key_error("key not found")),
+                    Err(err) => ControlFlow::Error(err),
                 }
             }
             type_id if is_user_defined_type(type_id) => {
@@ -2842,18 +2845,20 @@ pub fn get_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         "object is not subscriptable",
                     ));
                 };
-                if let Some(val) = dict.get(key) {
-                    frame.set_reg(dst, val);
-                    ControlFlow::Continue
-                } else {
-                    ControlFlow::Error(RuntimeError::key_error("key not found"))
+                match crate::ops::dict_access::dict_get_item(vm, dict, key) {
+                    Ok(Some(val)) => {
+                        vm.current_frame_mut().set_reg(dst, val);
+                        ControlFlow::Continue
+                    }
+                    Ok(None) => ControlFlow::Error(RuntimeError::key_error("key not found")),
+                    Err(err) => ControlFlow::Error(err),
                 }
             }
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
                 if let Some(idx) = key.as_int() {
                     if let Some(val) = range.get_value(idx) {
-                        frame.set_reg(dst, val);
+                        vm.current_frame_mut().set_reg(dst, val);
                         ControlFlow::Continue
                     } else {
                         ControlFlow::Error(RuntimeError::index_error(
@@ -2895,8 +2900,10 @@ pub fn set_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         match type_id {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
-                dict.set(key, value);
-                ControlFlow::Continue
+                match crate::ops::dict_access::dict_set_item(vm, dict, key, value) {
+                    Ok(()) => ControlFlow::Continue,
+                    Err(err) => ControlFlow::Error(err),
+                }
             }
             type_id if is_user_defined_type(type_id) => {
                 let Some(dict) = dict_storage_mut_from_ptr(ptr) else {
@@ -2904,8 +2911,10 @@ pub fn set_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         "object does not support item assignment",
                     ));
                 };
-                dict.set(key, value);
-                ControlFlow::Continue
+                match crate::ops::dict_access::dict_set_item(vm, dict, key, value) {
+                    Ok(()) => ControlFlow::Continue,
+                    Err(err) => ControlFlow::Error(err),
+                }
             }
             TypeId::TUPLE => ControlFlow::Error(RuntimeError::type_error(
                 "'tuple' object does not support item assignment",
@@ -2941,10 +2950,10 @@ pub fn del_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         match type_id {
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
-                if dict.remove(key).is_some() {
-                    ControlFlow::Continue
-                } else {
-                    ControlFlow::Error(RuntimeError::key_error("key not found"))
+                match crate::ops::dict_access::dict_remove_item(vm, dict, key) {
+                    Ok(Some(_)) => ControlFlow::Continue,
+                    Ok(None) => ControlFlow::Error(RuntimeError::key_error("key not found")),
+                    Err(err) => ControlFlow::Error(err),
                 }
             }
             type_id if is_user_defined_type(type_id) => {
@@ -2953,10 +2962,10 @@ pub fn del_item(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         "object does not support item deletion",
                     ));
                 };
-                if dict.remove(key).is_some() {
-                    ControlFlow::Continue
-                } else {
-                    ControlFlow::Error(RuntimeError::key_error("key not found"))
+                match crate::ops::dict_access::dict_remove_item(vm, dict, key) {
+                    Ok(Some(_)) => ControlFlow::Continue,
+                    Ok(None) => ControlFlow::Error(RuntimeError::key_error("key not found")),
+                    Err(err) => ControlFlow::Error(err),
                 }
             }
             TypeId::TUPLE => ControlFlow::Error(RuntimeError::type_error(

@@ -1415,7 +1415,7 @@ pub(crate) fn contains_value(
             // Dict: O(1) hash-based key lookup
             TypeId::DICT => {
                 let dict = unsafe { &*(ptr as *const DictObject) };
-                return Ok(dict.get(needle).is_some());
+                return crate::ops::dict_access::dict_contains_key(vm, dict, needle);
             }
 
             TypeId::MAPPING_PROXY => {
@@ -1485,7 +1485,7 @@ pub(crate) fn contains_value(
 
             if crate::ops::attribute::is_user_defined_type(type_id) {
                 if let Some(dict) = crate::ops::objects::dict_storage_ref_from_ptr(ptr) {
-                    return Ok(dict.get(needle).is_some());
+                    return crate::ops::dict_access::dict_contains_key(vm, dict, needle);
                 }
             }
 
