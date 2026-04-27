@@ -63,8 +63,8 @@ use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
 use std::sync::Arc;
 
 use super::helpers::{
-    check_dynamic_match, check_tuple_match, extract_type_id_from_value, is_exception_class_value,
-    is_exception_instance_value,
+    ExceptionMatchError, check_exception_match, check_tuple_match, extract_type_id_from_value,
+    is_exception_class_value, is_exception_instance_value,
 };
 
 // =============================================================================
@@ -76,6 +76,9 @@ const NO_TYPE_ID: u16 = 0xFFFF;
 
 /// Sentinel value for "no handler PC" indicating lookup is needed.
 const NO_HANDLER_PC: u32 = 0;
+
+const INVALID_EXCEPT_TARGET: &str =
+    "catching classes that do not inherit from BaseException is not allowed";
 
 // =============================================================================
 // RAISE Opcodes
@@ -300,7 +303,10 @@ pub fn check_exc_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
         let frame = vm.current_frame();
         let type_value = frame.get_reg(inst.src1().0);
         let active_exception = vm.get_active_exception();
-        check_dynamic_match(active_exception, exc_type_id, &type_value)
+        match check_exception_match(active_exception, exc_type_id, &type_value) {
+            Ok(matches) => matches,
+            Err(err) => return exception_match_error(err),
+        }
     };
 
     vm.current_frame_mut()
@@ -336,7 +342,10 @@ pub fn check_exc_match_tuple(vm: &mut VirtualMachine, inst: Instruction) -> Cont
 
     // Check if exception matches any type in the tuple
     let active_exception = vm.get_active_exception();
-    let matches = check_tuple_match(active_exception, exc_type_id, &types_tuple);
+    let matches = match check_tuple_match(active_exception, exc_type_id, &types_tuple) {
+        Ok(matches) => matches,
+        Err(err) => return exception_match_error(err),
+    };
     vm.current_frame_mut()
         .set_reg(dst_reg, Value::bool(matches));
     ControlFlow::Continue
@@ -863,22 +872,21 @@ pub fn exception_match(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlo
     let exc_type_id = vm.get_active_exception_type_id().unwrap_or(0);
     let active_exception = vm.get_active_exception();
 
-    // Try to match against the provided type
-    // First check if it's encoded as a type ID in the value
-    let matches = if let Some(target_type_id) = type_value.as_int() {
-        is_subclass(exc_type_id, target_type_id as u16)
-    } else {
-        // Try dynamic matching first (single exception type)
-        let single_match = check_dynamic_match(active_exception, exc_type_id, &type_value);
-        if single_match {
-            true
-        } else {
-            // Fall back to tuple matching for `except (TypeError, ValueError):` syntax
-            check_tuple_match(active_exception, exc_type_id, &type_value)
-        }
+    let matches = match check_exception_match(active_exception, exc_type_id, &type_value) {
+        Ok(matches) => matches,
+        Err(err) => return exception_match_error(err),
     };
 
     vm.current_frame_mut()
         .set_reg(dst_reg, Value::bool(matches));
     ControlFlow::Continue
+}
+
+#[inline(always)]
+fn exception_match_error(err: ExceptionMatchError) -> ControlFlow {
+    match err {
+        ExceptionMatchError::InvalidTarget => {
+            ControlFlow::Error(RuntimeError::type_error(INVALID_EXCEPT_TARGET))
+        }
+    }
 }

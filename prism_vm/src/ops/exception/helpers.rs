@@ -57,6 +57,16 @@ pub const DEFAULT_EXCEPTION_TYPE: u16 = 0;
 /// Maximum tuple size we'll check inline (avoid loop overhead).
 const INLINE_TUPLE_CHECK_SIZE: usize = 4;
 
+/// Error reported when an `except` target is not an exception class or tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionMatchError {
+    /// The handler target is not a valid exception class or exception tuple.
+    InvalidTarget,
+}
+
+/// Result type for runtime exception handler target checks.
+pub type ExceptionMatchResult = Result<bool, ExceptionMatchError>;
+
 // =============================================================================
 // Type Extraction
 // =============================================================================
@@ -322,27 +332,48 @@ pub fn check_dynamic_match(
     active_exception: Option<&Value>,
     exc_type_id: u16,
     type_value: &Value,
-) -> bool {
+) -> ExceptionMatchResult {
     if let Some(target_class) = heap_exception_class_from_value(type_value) {
-        return active_exception
-            .is_some_and(|value| heap_exception_matches_class(value, target_class));
+        return Ok(
+            active_exception.is_some_and(|value| heap_exception_matches_class(value, target_class))
+        );
     }
 
-    if let Some(active_exception) = active_exception
-        && let Some(target_type_id) = try_extract_type_object_id(type_value)
-        && heap_exception_matches_builtin_type(active_exception, target_type_id)
-    {
-        return true;
+    if is_exception_instance_value(type_value) {
+        return Err(ExceptionMatchError::InvalidTarget);
     }
 
-    // Extract type ID from the type value
-    let match_type_id = match extract_type_from_type_value(type_value) {
+    let match_type_id = match try_extract_type_object_id(type_value) {
         Some(id) => id,
-        None => return false, // Not a valid exception type
+        None => return Err(ExceptionMatchError::InvalidTarget),
     };
 
+    if let Some(active_exception) = active_exception
+        && heap_exception_matches_builtin_type(active_exception, match_type_id)
+    {
+        return Ok(true);
+    }
+
     // Check if exception type matches or is a subclass
-    exc_type_id == match_type_id || is_subclass(exc_type_id, match_type_id)
+    Ok(exc_type_id == match_type_id || is_subclass(exc_type_id, match_type_id))
+}
+
+/// Check whether the active exception matches a Python `except` target.
+///
+/// The target must be an exception class or a tuple, recursively, of exception
+/// classes. Invalid targets raise `TypeError` in the opcode layer rather than
+/// silently behaving as a non-match.
+#[inline]
+pub fn check_exception_match(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    target: &Value,
+) -> ExceptionMatchResult {
+    if let Some(elements) = try_extract_tuple_elements(target) {
+        return check_tuple_elements(active_exception, exc_type_id, &elements);
+    }
+
+    check_dynamic_match(active_exception, exc_type_id, target)
 }
 
 /// Check if one exception type is a subclass of another.
@@ -386,27 +417,36 @@ pub fn check_tuple_match(
     active_exception: Option<&Value>,
     exc_type_id: u16,
     types_tuple: &Value,
-) -> bool {
+) -> ExceptionMatchResult {
     // Early exit for non-tuple values
     if !types_tuple.is_object() {
-        return false;
+        return Err(ExceptionMatchError::InvalidTarget);
     }
 
     // Try to get tuple elements
     let elements = match try_extract_tuple_elements(types_tuple) {
         Some(elems) => elems,
-        None => return false,
+        None => return Err(ExceptionMatchError::InvalidTarget),
     };
 
+    check_tuple_elements(active_exception, exc_type_id, &elements)
+}
+
+#[inline]
+fn check_tuple_elements(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    elements: &[Value],
+) -> ExceptionMatchResult {
     let len = elements.len();
 
     // Unrolled check for small tuples (common case)
     if len <= INLINE_TUPLE_CHECK_SIZE {
-        return match_tuple_inline(active_exception, exc_type_id, &elements);
+        return match_tuple_inline(active_exception, exc_type_id, elements);
     }
 
     // Loop for larger tuples
-    match_tuple_loop(active_exception, exc_type_id, &elements)
+    match_tuple_loop(active_exception, exc_type_id, elements)
 }
 
 /// Inline tuple matching for small tuples.
@@ -417,24 +457,36 @@ fn match_tuple_inline(
     active_exception: Option<&Value>,
     exc_type_id: u16,
     elements: &[Value],
-) -> bool {
+) -> ExceptionMatchResult {
     match elements.len() {
-        0 => false,
-        1 => check_dynamic_match(active_exception, exc_type_id, &elements[0]),
+        0 => Ok(false),
+        1 => check_tuple_element_match(active_exception, exc_type_id, &elements[0]),
         2 => {
-            check_dynamic_match(active_exception, exc_type_id, &elements[0])
-                || check_dynamic_match(active_exception, exc_type_id, &elements[1])
+            if check_tuple_element_match(active_exception, exc_type_id, &elements[0])? {
+                return Ok(true);
+            }
+            check_tuple_element_match(active_exception, exc_type_id, &elements[1])
         }
         3 => {
-            check_dynamic_match(active_exception, exc_type_id, &elements[0])
-                || check_dynamic_match(active_exception, exc_type_id, &elements[1])
-                || check_dynamic_match(active_exception, exc_type_id, &elements[2])
+            if check_tuple_element_match(active_exception, exc_type_id, &elements[0])? {
+                return Ok(true);
+            }
+            if check_tuple_element_match(active_exception, exc_type_id, &elements[1])? {
+                return Ok(true);
+            }
+            check_tuple_element_match(active_exception, exc_type_id, &elements[2])
         }
         4 => {
-            check_dynamic_match(active_exception, exc_type_id, &elements[0])
-                || check_dynamic_match(active_exception, exc_type_id, &elements[1])
-                || check_dynamic_match(active_exception, exc_type_id, &elements[2])
-                || check_dynamic_match(active_exception, exc_type_id, &elements[3])
+            if check_tuple_element_match(active_exception, exc_type_id, &elements[0])? {
+                return Ok(true);
+            }
+            if check_tuple_element_match(active_exception, exc_type_id, &elements[1])? {
+                return Ok(true);
+            }
+            if check_tuple_element_match(active_exception, exc_type_id, &elements[2])? {
+                return Ok(true);
+            }
+            check_tuple_element_match(active_exception, exc_type_id, &elements[3])
         }
         _ => match_tuple_loop(active_exception, exc_type_id, elements),
     }
@@ -446,13 +498,26 @@ fn match_tuple_loop(
     active_exception: Option<&Value>,
     exc_type_id: u16,
     elements: &[Value],
-) -> bool {
+) -> ExceptionMatchResult {
     for type_value in elements {
-        if check_dynamic_match(active_exception, exc_type_id, type_value) {
-            return true;
+        if check_tuple_element_match(active_exception, exc_type_id, type_value)? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
+}
+
+#[inline]
+fn check_tuple_element_match(
+    active_exception: Option<&Value>,
+    exc_type_id: u16,
+    type_value: &Value,
+) -> ExceptionMatchResult {
+    if let Some(nested) = try_extract_tuple_elements(type_value) {
+        return check_tuple_elements(active_exception, exc_type_id, &nested);
+    }
+
+    check_dynamic_match(active_exception, exc_type_id, type_value)
 }
 
 /// Try to extract tuple elements from a value.

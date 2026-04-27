@@ -51,8 +51,9 @@ pub use opcodes::{
 // Re-export commonly used items
 pub use exc_info::{ExcInfo, build_exc_info, write_empty_exc_info, write_exc_info_to_registers};
 pub use helpers::{
-    DEFAULT_EXCEPTION_TYPE, NO_TYPE_ID, check_dynamic_match, check_tuple_match, extract_type_id,
-    extract_type_id_from_value, is_subclass,
+    DEFAULT_EXCEPTION_TYPE, ExceptionMatchError, NO_TYPE_ID, check_dynamic_match,
+    check_exception_match, check_tuple_match, extract_type_id, extract_type_id_from_value,
+    is_subclass,
 };
 pub use traceback::{
     build_frame_info, build_frame_info_with_line, capture_traceback, extend_traceback,
