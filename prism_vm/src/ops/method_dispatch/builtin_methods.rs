@@ -273,6 +273,12 @@ static DICT_SETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__setitem__"), dict_setitem));
 static DICT_DELITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__delitem__"), dict_delitem));
+static DICT_OR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__or__"), dict_or));
+static DICT_ROR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.__ror__"), dict_ror));
+static DICT_IOR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.__ior__"), dict_ior));
 static DICT_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("dict.pop"), dict_pop));
 static DICT_POPITEM_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -649,6 +655,9 @@ pub fn resolve_dict_method(name: &str) -> Option<CachedMethod> {
         "__delitem__" => Some(CachedMethod::simple(builtin_method_value(
             &DICT_DELITEM_METHOD,
         ))),
+        "__or__" => Some(CachedMethod::simple(builtin_method_value(&DICT_OR_METHOD))),
+        "__ror__" => Some(CachedMethod::simple(builtin_method_value(&DICT_ROR_METHOD))),
+        "__ior__" => Some(CachedMethod::simple(builtin_method_value(&DICT_IOR_METHOD))),
         "keys" => Some(CachedMethod::simple(builtin_method_value(
             &DICT_KEYS_METHOD,
         ))),
@@ -2035,6 +2044,48 @@ fn dict_delitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builti
         Some(_) => Ok(Value::none()),
         None => Err(BuiltinError::Raised(missing_key_error(vm, args[1]))),
     }
+}
+
+#[inline]
+fn dict_or(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("dict", "__or__", args, 1)?;
+    let left = expect_dict_ref(args[0], "__or__")?;
+    let Some(right) = dict_ref_if_compatible(args[1]) else {
+        return Ok(builtin_not_implemented_value());
+    };
+
+    Ok(to_object_value(merged_dict(left, right)))
+}
+
+#[inline]
+fn dict_ror(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("dict", "__ror__", args, 1)?;
+    let right = expect_dict_ref(args[0], "__ror__")?;
+    let Some(left) = dict_ref_if_compatible(args[1]) else {
+        return Ok(builtin_not_implemented_value());
+    };
+
+    Ok(to_object_value(merged_dict(left, right)))
+}
+
+#[inline]
+fn dict_ior(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("dict", "__ior__", args, 1)?;
+    dict_extend_with_vm_kw(vm, args[0], Some(args[1]), &[], "__ior__")?;
+    Ok(args[0])
+}
+
+#[inline]
+fn dict_ref_if_compatible(value: Value) -> Option<&'static DictObject> {
+    value.as_object_ptr().and_then(dict_storage_ref_from_ptr)
+}
+
+#[inline]
+fn merged_dict(left: &DictObject, right: &DictObject) -> DictObject {
+    let mut merged = DictObject::with_capacity(left.len() + right.len());
+    merged.update(left);
+    merged.update(right);
+    merged
 }
 
 #[inline]
