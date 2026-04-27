@@ -95,6 +95,9 @@ static REQUIRES_DOCSTRINGS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock:
 static GET_ATTRIBUTE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("test.support.get_attribute"), get_attribute)
 });
+static GC_COLLECT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("test.support.gc_collect"), gc_collect)
+});
 static BROKEN_ITER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_kw(Arc::from("test.support.BrokenIter"), broken_iter)
 });
@@ -169,6 +172,7 @@ impl SupportModule {
                 Arc::from("Py_DEBUG"),
                 Arc::from("TestFailed"),
                 Arc::from("cpython_only"),
+                Arc::from("gc_collect"),
                 Arc::from("get_attribute"),
                 Arc::from("infinite_recursion"),
                 Arc::from("is_emscripten"),
@@ -221,6 +225,7 @@ impl Module for SupportModule {
             )
             .expect("AssertionError exception type is registered")),
             "cpython_only" => Ok(builtin_value(&CPYTHON_ONLY_FUNCTION)),
+            "gc_collect" => Ok(builtin_value(&GC_COLLECT_FUNCTION)),
             "get_attribute" => Ok(builtin_value(&GET_ATTRIBUTE_FUNCTION)),
             "infinite_recursion" => Ok(builtin_value(&INFINITE_RECURSION_FUNCTION)),
             "is_emscripten" => Ok(Value::bool(false)),
@@ -443,6 +448,18 @@ fn get_attribute(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
         .ok_or_else(|| BuiltinError::TypeError("attribute name must be a string".to_string()))?;
     crate::ops::objects::get_attribute_value(vm, args[0], &intern(name.as_str()))
         .map_err(runtime_error_to_builtin_error)
+}
+
+fn gc_collect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "gc_collect() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    crate::stdlib::_weakref::clear_unreachable_weakrefs(vm);
+    Ok(Value::none())
 }
 
 fn broken_iter(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
