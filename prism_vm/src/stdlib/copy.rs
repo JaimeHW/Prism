@@ -5,7 +5,7 @@
 //! the steady-state fast path compact without turning compatibility behavior
 //! into a source-level dependency.
 
-use super::{_weakref, Module, ModuleError, ModuleResult, copyreg};
+use super::{_weakref, Module, ModuleError, ModuleResult, copyreg, weakref};
 use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class,
@@ -775,6 +775,9 @@ fn copy_native_backed_user(
     let Some(ptr) = value.as_object_ptr() else {
         return Ok(None);
     };
+    if let Some(kind) = weakref::weak_dict_kind(value) {
+        return copy_weak_dict(vm, value, kind).map(Some);
+    }
     let type_id = extract_type_id(ptr);
     if type_id.raw() < TypeId::FIRST_USER_TYPE {
         return Ok(None);
@@ -859,6 +862,9 @@ fn deepcopy_native_backed_user(
     let Some(ptr) = value.as_object_ptr() else {
         return Ok(None);
     };
+    if let Some(kind) = weakref::weak_dict_kind(value) {
+        return deepcopy_weak_dict(vm, value, kind, memo).map(Some);
+    }
     let type_id = extract_type_id(ptr);
     if type_id.raw() < TypeId::FIRST_USER_TYPE {
         return Ok(None);
@@ -916,6 +922,69 @@ fn deepcopy_native_backed_user(
 
     deepcopy_user_attribute_state(vm, value, copied, memo)?;
     Ok(Some(copied))
+}
+
+fn copy_weak_dict(
+    vm: &mut VirtualMachine,
+    value: Value,
+    kind: weakref::WeakDictKind,
+) -> Result<Value, BuiltinError> {
+    let source = dict_storage_for_copy(value, "weak dictionary")?;
+    let entries = source.iter().collect::<Vec<_>>();
+    let copied = weakref::new_weak_dict(kind);
+    let copied_ptr = copied
+        .as_object_ptr()
+        .expect("new weak dictionary values are object pointers");
+    let target = dict_storage_mut_from_ptr(copied_ptr)
+        .expect("new weak dictionary values carry dict storage");
+    for (key, item) in entries {
+        dict_set_item(vm, target, key, item).map_err(runtime_error_to_builtin_error)?;
+    }
+    copy_user_attribute_state(vm, value, copied)?;
+    Ok(copied)
+}
+
+fn deepcopy_weak_dict(
+    vm: &mut VirtualMachine,
+    value: Value,
+    kind: weakref::WeakDictKind,
+    memo: &mut DeepcopyMemo,
+) -> Result<Value, BuiltinError> {
+    let source = dict_storage_for_copy(value, "weak dictionary")?;
+    let entries = source.iter().collect::<Vec<_>>();
+    let copied = weakref::new_weak_dict(kind);
+    memo.store(vm, identity_key(value), copied)?;
+    let copied_ptr = copied
+        .as_object_ptr()
+        .expect("new weak dictionary values are object pointers");
+
+    for (key, item) in entries {
+        let key = match kind {
+            weakref::WeakDictKind::Key => key,
+            weakref::WeakDictKind::Value => deepcopy_inner(vm, key, memo)?,
+        };
+        let item = match kind {
+            weakref::WeakDictKind::Key => deepcopy_inner(vm, item, memo)?,
+            weakref::WeakDictKind::Value => item,
+        };
+        let target = dict_storage_mut_from_ptr(copied_ptr)
+            .expect("new weak dictionary values carry dict storage");
+        dict_set_item(vm, target, key, item).map_err(runtime_error_to_builtin_error)?;
+    }
+
+    deepcopy_user_attribute_state(vm, value, copied, memo)?;
+    Ok(copied)
+}
+
+fn dict_storage_for_copy(
+    value: Value,
+    type_name: &'static str,
+) -> Result<&'static DictObject, BuiltinError> {
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError(format!("copy source is not a {type_name}")))?;
+    dict_storage_ref_from_ptr(ptr)
+        .ok_or_else(|| BuiltinError::TypeError(format!("copy source is not a {type_name}")))
 }
 
 fn deepcopy_plain_user(

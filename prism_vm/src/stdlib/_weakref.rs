@@ -283,41 +283,45 @@ pub(crate) fn clear_unreachable_weakrefs(vm: &VirtualMachine) {
     let reachable = reachable_object_set(vm);
     let registry = shape_registry();
     let target_name = reference_target_property();
-    let mut weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
+    {
+        let mut weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
 
-    weakrefs.retain(|ptr| {
-        if !reachable.contains(ptr) {
-            return false;
-        }
+        weakrefs.retain(|ptr| {
+            if !reachable.contains(ptr) {
+                return false;
+            }
 
-        let object = unsafe { &mut *(*ptr as *mut ShapedObject) };
-        let Some(target) = object.get_property(target_name.as_ref()) else {
-            return false;
-        };
-        if target.is_none() {
-            return false;
-        }
+            let object = unsafe { &mut *(*ptr as *mut ShapedObject) };
+            let Some(target) = object.get_property(target_name.as_ref()) else {
+                return false;
+            };
+            if target.is_none() {
+                return false;
+            }
 
-        let target_is_reachable = target
-            .as_object_ptr()
-            .map(|ptr| reachable.contains(&(ptr as usize)))
-            .unwrap_or(true);
-        if !target_is_reachable {
-            object.set_property(target_name.clone(), Value::none(), registry);
-            return false;
-        }
+            let target_is_reachable = target
+                .as_object_ptr()
+                .map(|ptr| reachable.contains(&(ptr as usize)))
+                .unwrap_or(true);
+            if !target_is_reachable {
+                object.set_property(target_name.clone(), Value::none(), registry);
+                return false;
+            }
 
-        true
-    });
+            true
+        });
+    }
+
+    super::weakref::clear_unreachable_weak_dicts(&reachable);
 }
 
 pub(crate) fn clear_unreachable_weakrefs_if_registered(vm: &VirtualMachine) {
-    let has_registered_weakrefs = {
+    let has_registered_weak_state = {
         let weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
-        !weakrefs.is_empty()
+        !weakrefs.is_empty() || super::weakref::has_registered_weak_dicts()
     };
 
-    if has_registered_weakrefs {
+    if has_registered_weak_state {
         clear_unreachable_weakrefs(vm);
     }
 }
@@ -515,7 +519,13 @@ impl ReachabilityMarker {
             self.push(value);
         }
         if let Some(dict) = object.dict_backing() {
-            self.push_dict_entries(dict);
+            match super::weakref::weak_dict_kind_for_type_id(type_id) {
+                Some(super::weakref::WeakDictKind::Key) => self.push_weak_key_dict_entries(dict),
+                Some(super::weakref::WeakDictKind::Value) => {
+                    self.push_weak_value_dict_entries(dict)
+                }
+                None => self.push_dict_entries(dict),
+            }
         }
         if let Some(list) = object.list_backing() {
             for item in list.as_slice() {
@@ -526,6 +536,18 @@ impl ReachabilityMarker {
             for item in tuple.as_slice() {
                 self.push(*item);
             }
+        }
+    }
+
+    fn push_weak_key_dict_entries(&mut self, dict: &DictObject) {
+        for (_, value) in dict.iter() {
+            self.push(value);
+        }
+    }
+
+    fn push_weak_value_dict_entries(&mut self, dict: &DictObject) {
+        for (key, _) in dict.iter() {
+            self.push(key);
         }
     }
 }
