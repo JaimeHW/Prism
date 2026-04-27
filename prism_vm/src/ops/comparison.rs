@@ -242,21 +242,19 @@ pub(crate) enum SetLikeBinaryOp {
 }
 
 #[inline]
-fn compare_set_relation(left: Value, right: Value, relation: SetRelation) -> Option<bool> {
-    let left_ptr = left.as_object_ptr()?;
-    let right_ptr = right.as_object_ptr()?;
-
-    let left_type = unsafe { (*(left_ptr as *const ObjectHeader)).type_id };
-    let right_type = unsafe { (*(right_ptr as *const ObjectHeader)).type_id };
-
-    if !matches!(left_type, TypeId::SET | TypeId::FROZENSET)
-        || !matches!(right_type, TypeId::SET | TypeId::FROZENSET)
-    {
-        return None;
+fn set_operand(value: Value) -> Option<(&'static SetObject, TypeId)> {
+    let ptr = value.as_object_ptr()?;
+    let set = crate::ops::objects::set_storage_ref_from_ptr(ptr)?;
+    match set.header.type_id {
+        TypeId::SET | TypeId::FROZENSET => Some((set, set.header.type_id)),
+        _ => None,
     }
+}
 
-    let left_set = unsafe { &*(left_ptr as *const SetObject) };
-    let right_set = unsafe { &*(right_ptr as *const SetObject) };
+#[inline]
+fn compare_set_relation(left: Value, right: Value, relation: SetRelation) -> Option<bool> {
+    let (left_set, _) = set_operand(left)?;
+    let (right_set, _) = set_operand(right)?;
 
     Some(match relation {
         SetRelation::StrictSubset => {
@@ -308,19 +306,8 @@ pub(crate) fn set_binary_operands(
     left: Value,
     right: Value,
 ) -> Option<(&'static SetObject, &'static SetObject, TypeId)> {
-    let left_ptr = left.as_object_ptr()?;
-    let right_ptr = right.as_object_ptr()?;
-
-    let left_type = unsafe { (*(left_ptr as *const ObjectHeader)).type_id };
-    let right_type = unsafe { (*(right_ptr as *const ObjectHeader)).type_id };
-    if !matches!(left_type, TypeId::SET | TypeId::FROZENSET)
-        || !matches!(right_type, TypeId::SET | TypeId::FROZENSET)
-    {
-        return None;
-    }
-
-    let left_set = unsafe { &*(left_ptr as *const SetObject) };
-    let right_set = unsafe { &*(right_ptr as *const SetObject) };
+    let (left_set, left_type) = set_operand(left)?;
+    let (right_set, _) = set_operand(right)?;
     Some((left_set, right_set, left_type))
 }
 
@@ -365,8 +352,11 @@ fn materialize_set_like(value: Value) -> Result<Option<SetObject>, RuntimeError>
         return Ok(None);
     };
 
+    if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
+        return Ok(Some(set.clone()));
+    }
+
     match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
-        TypeId::SET | TypeId::FROZENSET => Ok(Some(unsafe { &*(ptr as *const SetObject) }.clone())),
         TypeId::DICT_KEYS | TypeId::DICT_ITEMS => {
             let view = unsafe { &*(ptr as *const DictViewObject) };
             materialize_dict_view_set(view)
@@ -703,6 +693,10 @@ pub(crate) fn builtin_eq_fallback(a: Value, b: Value) -> Option<bool> {
         return Some(values_equal(a, b));
     }
 
+    if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
+        return Some(left_set.len() == right_set.len() && left_set.is_subset(right_set));
+    }
+
     let (left_ptr, right_ptr) = (a.as_object_ptr()?, b.as_object_ptr()?);
     let left_type = unsafe { (*(left_ptr as *const ObjectHeader)).type_id };
     let right_type = unsafe { (*(right_ptr as *const ObjectHeader)).type_id };
@@ -780,6 +774,10 @@ fn eq_result_inner(
             return Ok(true);
         }
         return dict_eq_result(vm, left, right, seen_pairs);
+    }
+
+    if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
+        return Ok(left_set.len() == right_set.len() && left_set.is_subset(right_set));
     }
 
     if let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Eq)? {
@@ -868,6 +866,10 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
             return Ok(false);
         }
         return dict_eq_result(vm, left, right, &mut seen_pairs).map(|equal| !equal);
+    }
+
+    if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
+        return Ok(left_set.len() != right_set.len() || !left_set.is_subset(right_set));
     }
 
     if let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Ne)? {
@@ -2184,6 +2186,13 @@ fn values_equal_inner(a: Value, b: Value, seen_pairs: &mut FxHashSet<(usize, usi
             }
 
             return sequence_values_equal(left_items, right_items, seen_pairs);
+        }
+
+        if let (Some(left), Some(right)) = (
+            crate::ops::objects::set_storage_ref_from_ptr(pa),
+            crate::ops::objects::set_storage_ref_from_ptr(pb),
+        ) {
+            return left.len() == right.len() && left.is_subset(right);
         }
 
         match (left_type, right_type) {
