@@ -29,6 +29,7 @@ use crate::ops::objects::{
     list_storage_ref_from_ptr, object_getattribute_default, set_attribute_value,
     set_list_item_value, tuple_storage_ref_from_ptr,
 };
+use crate::ops::protocols::value_type_id;
 use crate::python_numeric::complex_like_parts;
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
@@ -1353,6 +1354,10 @@ fn range_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
 
 #[inline]
 fn range_integral_search_value(value: Value) -> Option<BigInt> {
+    if !matches!(value_type_id(value), TypeId::BOOL | TypeId::INT) {
+        return None;
+    }
+
     if let Some(boolean) = value.as_bool() {
         return Some(BigInt::from(u8::from(boolean)));
     }

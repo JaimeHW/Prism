@@ -9,7 +9,9 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
-use crate::ops::protocols::{RichCompareOp, binary_special_method, rich_compare_bool};
+use crate::ops::protocols::{
+    RichCompareOp, binary_special_method, rich_compare_bool, value_type_id,
+};
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
 };
@@ -78,6 +80,26 @@ fn numeric_value_to_bigint(value: Value) -> Option<BigInt> {
 #[inline]
 fn is_numeric_value(value: Value) -> bool {
     value.as_float().is_some() || numeric_value_to_bigint(value).is_some()
+}
+
+#[inline]
+fn exact_integral_value_to_bigint(value: Value) -> Option<BigInt> {
+    if matches!(value_type_id(value), TypeId::BOOL | TypeId::INT) {
+        numeric_value_to_bigint(value)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn is_exact_numeric_fast_type(type_id: TypeId) -> bool {
+    matches!(type_id, TypeId::BOOL | TypeId::INT | TypeId::FLOAT)
+}
+
+#[inline]
+fn has_numeric_subtype_operand(left: Value, right: Value) -> bool {
+    (is_numeric_value(left) && !is_exact_numeric_fast_type(value_type_id(left)))
+        || (is_numeric_value(right) && !is_exact_numeric_fast_type(value_type_id(right)))
 }
 
 #[inline]
@@ -496,6 +518,12 @@ fn eq_result_inner(
     b: Value,
     seen_pairs: &mut FxHashSet<(usize, usize)>,
 ) -> Result<bool, RuntimeError> {
+    if has_numeric_subtype_operand(a, b)
+        && let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Eq)?
+    {
+        return Ok(result);
+    }
+
     if let Some(ordering) = compare_numeric_values(a, b) {
         return Ok(ordering.is_eq());
     }
@@ -1420,11 +1448,13 @@ pub(crate) fn contains_value(
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
 
-                if let Some(value) = numeric_value_to_bigint(needle) {
+                if let Some(value) = exact_integral_value_to_bigint(needle) {
                     return Ok(range.contains_bigint(&value));
                 }
 
-                if let Some(parts) = complex_like_parts(needle) {
+                if matches!(value_type_id(needle), TypeId::FLOAT | TypeId::COMPLEX)
+                    && let Some(parts) = complex_like_parts(needle)
+                {
                     if parts.imag == 0.0
                         && parts.real.is_finite()
                         && parts.real.fract() == 0.0
