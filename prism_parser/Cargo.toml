@@ -10,3 +10,4 @@ license.workspace = true
 prism_core.workspace = true
 thiserror.workspace = true
 unicode-xid.workspace = true
+unicode_names2.workspace = true

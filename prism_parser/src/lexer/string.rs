@@ -368,9 +368,43 @@ fn parse_unicode_name_escape(cursor: &mut Cursor<'_>) -> Result<char, String> {
         name.push(c);
     }
 
-    // For now, we don't implement full unicode name lookup
-    // This would require a unicode database
-    Err(format!("unicode name lookup not implemented: {}", name))
+    unicode_names2::character(&name)
+        .ok_or_else(|| format!("unknown unicode character name: {}", name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StringPrefix, parse_string};
+    use crate::{lexer::cursor::Cursor, token::TokenKind};
+
+    fn parse_literal(source: &str) -> TokenKind {
+        let mut cursor = Cursor::new(source);
+        parse_string(&mut cursor, StringPrefix::default())
+    }
+
+    #[test]
+    fn parses_unicode_name_escape() {
+        assert_eq!(
+            parse_literal(r#""\N{EMPTY SET}""#),
+            TokenKind::String("\u{2205}".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_unicode_name_alias() {
+        assert_eq!(
+            parse_literal(r#""\N{NULL}""#),
+            TokenKind::String("\0".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_unicode_name() {
+        assert!(matches!(
+            parse_literal(r#""\N{EMPTY_SET}""#),
+            TokenKind::Error(message) if message.contains("unknown unicode character name")
+        ));
+    }
 }
 
 /// Parse f-string content.
