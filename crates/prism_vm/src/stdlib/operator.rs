@@ -19,6 +19,7 @@ use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::extract_type_id;
 use crate::ops::protocols::RichCompareOp;
+use crate::python_numeric::float_like_value;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::truthiness::try_is_truthy;
 use num_bigint::{BigInt, Sign};
@@ -64,6 +65,10 @@ static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
 static ADD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.add"), operator_add));
+static MOD_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.mod"), operator_mod));
+static POW_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.pow"), operator_pow));
 
 const EXPORTS: &[&str] = &[
     "add",
@@ -79,8 +84,10 @@ const EXPORTS: &[&str] = &[
     "le",
     "length_hint",
     "lt",
+    "mod",
     "ne",
     "not_",
+    "pow",
     "truth",
 ];
 
@@ -98,7 +105,7 @@ impl OperatorModule {
             attrs: EXPORTS
                 .iter()
                 .copied()
-                .chain(["__add__", "__all__"])
+                .chain(["__add__", "__mod__", "__pow__", "__all__"])
                 .map(Arc::from)
                 .collect(),
             all: string_list_value(EXPORTS),
@@ -136,6 +143,8 @@ impl Module for OperatorModule {
             "is_" => Ok(builtin_value(&IS_FUNCTION)),
             "is_not" => Ok(builtin_value(&IS_NOT_FUNCTION)),
             "add" | "__add__" => Ok(builtin_value(&ADD_FUNCTION)),
+            "mod" | "__mod__" => Ok(builtin_value(&MOD_FUNCTION)),
+            "pow" | "__pow__" => Ok(builtin_value(&POW_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'operator' has no attribute '{}'",
                 name
@@ -467,4 +476,131 @@ fn operator_is_not(args: &[Value]) -> Result<Value, BuiltinError> {
 fn operator_add(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("add", args, 2)?;
     add_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
+}
+
+fn operator_mod(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("mod", args, 2)?;
+    if let Some(result) = numeric_mod_values(args[0], args[1])? {
+        return Ok(result);
+    }
+
+    invoke_binary_operator_method(vm, args[0], args[1], "__mod__", "__rmod__", "%")
+}
+
+fn operator_pow(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("pow", args, 2)?;
+    crate::builtins::builtin_pow_vm(vm, args)
+}
+
+fn numeric_mod_values(left: Value, right: Value) -> Result<Option<Value>, BuiltinError> {
+    let left_is_float = prism_runtime::types::float::value_to_f64(left).is_some();
+    let right_is_float = prism_runtime::types::float::value_to_f64(right).is_some();
+
+    if left_is_float || right_is_float {
+        let Some(x) = float_like_value(left) else {
+            return Ok(None);
+        };
+        let Some(y) = float_like_value(right) else {
+            return Ok(None);
+        };
+        return python_float_mod(x, y).map(|value| Some(Value::float(value)));
+    }
+
+    let Some(x) = integer_value(left) else {
+        return Ok(None);
+    };
+    let Some(y) = integer_value(right) else {
+        return Ok(None);
+    };
+    if y == BigInt::from(0) {
+        return Err(runtime_error_to_builtin_error(RuntimeError::zero_division()));
+    }
+
+    Ok(Some(bigint_to_value(python_int_mod(x, y))))
+}
+
+fn integer_value(value: Value) -> Option<BigInt> {
+    value
+        .as_bool()
+        .map(|flag| BigInt::from(u8::from(flag)))
+        .or_else(|| value_to_bigint(value))
+}
+
+fn python_int_mod(left: BigInt, right: BigInt) -> BigInt {
+    let mut remainder = left % &right;
+    if remainder != BigInt::from(0) && remainder.sign() != right.sign() {
+        remainder += right;
+    }
+    remainder
+}
+
+fn python_float_mod(left: f64, right: f64) -> Result<f64, BuiltinError> {
+    if right == 0.0 {
+        return Err(runtime_error_to_builtin_error(
+            RuntimeError::zero_division_with_message("float modulo"),
+        ));
+    }
+
+    let mut result = left % right;
+    if result != 0.0 {
+        if (right < 0.0) != (result < 0.0) {
+            result += right;
+        }
+    } else {
+        result = 0.0_f64.copysign(right);
+    }
+    Ok(result)
+}
+
+fn invoke_binary_operator_method(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    primary: &'static str,
+    reflected: &'static str,
+    op: &'static str,
+) -> Result<Value, BuiltinError> {
+    if let Some(result) = try_invoke_binary_operator_method(vm, left, right, primary)? {
+        return Ok(result);
+    }
+    if let Some(result) = try_invoke_binary_operator_method(vm, right, left, reflected)? {
+        return Ok(result);
+    }
+
+    Err(runtime_error_to_builtin_error(
+        RuntimeError::unsupported_operand(op, value_type_name(left), value_type_name(right)),
+    ))
+}
+
+fn try_invoke_binary_operator_method(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    argument: Value,
+    method: &'static str,
+) -> Result<Option<Value>, BuiltinError> {
+    let target = match resolve_special_method(receiver, method) {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => return Ok(None),
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let result = invoke_one_arg_bound_method(vm, target, argument)
+        .map_err(runtime_error_to_builtin_error)?;
+    if result == builtin_not_implemented_value() {
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
+}
+
+#[inline]
+fn invoke_one_arg_bound_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    arg: Value,
+) -> Result<Value, RuntimeError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self, arg]),
+        None => invoke_callable_value(vm, target.callable, &[arg]),
+    }
 }
