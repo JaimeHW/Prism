@@ -22,6 +22,7 @@ pub mod r#match;
 pub mod method_dispatch;
 pub mod objects;
 pub mod protocols;
+pub mod set_access;
 pub mod subscript;
 pub mod unpack;
 

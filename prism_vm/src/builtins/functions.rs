@@ -1643,6 +1643,14 @@ fn hash_frozenset_vm(vm: &mut VirtualMachine, set: &SetObject) -> Result<i64, Bu
     hash_frozenset_with(set, |value| hash_value_vm(vm, value))
 }
 
+#[inline]
+pub(crate) fn hash_set_contents_vm(
+    vm: &mut VirtualMachine,
+    set: &SetObject,
+) -> Result<i64, BuiltinError> {
+    hash_frozenset_vm(vm, set)
+}
+
 fn hash_frozenset_with(
     set: &SetObject,
     mut hash_element: impl FnMut(Value) -> Result<i64, BuiltinError>,
