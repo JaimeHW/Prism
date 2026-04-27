@@ -505,7 +505,44 @@ impl ImportResolver {
             module.set_attr("modules", self.sys_modules_value);
         }
 
+        self.attach_eager_stdlib_children(name, &module)?;
+
         Ok(module)
+    }
+
+    fn attach_eager_stdlib_children(
+        &self,
+        name: &str,
+        module: &Arc<ModuleObject>,
+    ) -> Result<(), ImportError> {
+        match name {
+            "os" => self.attach_stdlib_child(module, "path", "os.path"),
+            _ => Ok(()),
+        }
+    }
+
+    fn attach_stdlib_child(
+        &self,
+        parent: &Arc<ModuleObject>,
+        attr_name: &str,
+        child_name: &str,
+    ) -> Result<(), ImportError> {
+        let child = if let Some(module) = self.get_cached(child_name) {
+            module
+        } else {
+            let Some(stdlib_module) = self.stdlib.get(child_name) else {
+                return Ok(());
+            };
+            let module = self.load_stdlib_module(child_name, stdlib_module)?;
+            self.cache_module(child_name, &module);
+            module
+        };
+
+        parent.set_attr(
+            attr_name,
+            Value::object_ptr(Arc::as_ptr(&child) as *const ()),
+        );
+        Ok(())
     }
 
     /// Import a specific attribute from a module.
