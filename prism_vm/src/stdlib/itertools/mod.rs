@@ -100,19 +100,16 @@ itertools_stub!(
     "filterfalse"
 );
 static ISLICE_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("itertools.islice"), builtin_islice));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("itertools.islice"), builtin_islice));
 itertools_stub!(
     STARMAP_FUNCTION,
     builtin_starmap,
     "itertools.starmap",
     "starmap"
 );
-itertools_stub!(
-    ZIP_LONGEST_FUNCTION,
-    builtin_zip_longest,
-    "itertools.zip_longest",
-    "zip_longest"
-);
+static ZIP_LONGEST_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("itertools.zip_longest"), builtin_zip_longest)
+});
 static PRODUCT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_kw(Arc::from("itertools.product"), builtin_product)
 });
@@ -240,6 +237,20 @@ fn collect_iterable_values(value: Value) -> Result<Vec<Value>, BuiltinError> {
     Ok(iterator.collect_remaining())
 }
 
+fn iterator_object_from_iterable(
+    vm: &mut crate::VirtualMachine,
+    value: Value,
+) -> Result<IteratorObject, BuiltinError> {
+    match crate::builtins::value_to_iterator(&value) {
+        Ok(iterator) => Ok(iterator),
+        Err(_) => {
+            let iterator_value = ensure_iterator_value(vm, value)
+                .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+            Ok(IteratorObject::from_existing_iterator(iterator_value))
+        }
+    }
+}
+
 fn parse_non_negative_usize(value: Value, name: &str) -> Result<usize, BuiltinError> {
     let Some(raw) = value_to_i64(value) else {
         return Err(BuiltinError::TypeError(format!(
@@ -318,15 +329,13 @@ fn builtin_repeat(args: &[Value]) -> Result<Value, BuiltinError> {
 fn builtin_chain(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     let mut iterators = Vec::with_capacity(args.len());
     for iterable in args {
-        let iterator_value = ensure_iterator_value(vm, *iterable)
-            .map_err(crate::builtins::runtime_error_to_builtin_error)?;
-        iterators.push(IteratorObject::from_existing_iterator(iterator_value));
+        iterators.push(iterator_object_from_iterable(vm, *iterable)?);
     }
 
     Ok(iterator_value(IteratorObject::chain(iterators)))
 }
 
-fn builtin_islice(args: &[Value]) -> Result<Value, BuiltinError> {
+fn builtin_islice(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if !(2..=4).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
             "islice expected 2 to 4 arguments, got {}",
@@ -334,7 +343,7 @@ fn builtin_islice(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let iterator = crate::builtins::value_to_iterator(&args[0]).map_err(BuiltinError::from)?;
+    let iterator = iterator_object_from_iterable(vm, args[0])?;
     let (start, stop, step) = match args.len() {
         2 => (0, parse_optional_non_negative_usize(args[1], "stop")?, 1),
         3 => (
@@ -360,6 +369,34 @@ fn builtin_islice(args: &[Value]) -> Result<Value, BuiltinError> {
 
     Ok(iterator_value(IteratorObject::islice(
         iterator, start, stop, step,
+    )))
+}
+
+fn builtin_zip_longest(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let mut fillvalue = Value::none();
+    for (name, value) in keywords {
+        match *name {
+            "fillvalue" => fillvalue = *value,
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "zip_longest() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+
+    let mut iterators = Vec::with_capacity(args.len());
+    for iterable in args {
+        iterators.push(iterator_object_from_iterable(vm, *iterable)?);
+    }
+
+    Ok(iterator_value(IteratorObject::zip_longest(
+        iterators, fillvalue,
     )))
 }
 

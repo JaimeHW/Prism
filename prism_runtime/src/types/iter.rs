@@ -273,6 +273,18 @@ enum IterKind {
     /// - Stops on shortest iterator (Python semantics)
     Zip { iterators: Vec<IteratorObject> },
 
+    /// Zip-longest iterator - parallel iteration until all inputs are exhausted.
+    ///
+    /// # Performance
+    /// - O(k) per step where k = number of iterators
+    /// - Tracks active lanes compactly to avoid probing exhausted inputs again
+    ZipLongest {
+        iterators: Vec<IteratorObject>,
+        active: Vec<bool>,
+        remaining: usize,
+        fillvalue: Value,
+    },
+
     /// Map iterator - applies function to each element.
     ///
     /// # Note
@@ -722,6 +734,26 @@ impl IteratorObject {
         }
     }
 
+    /// Create a zip_longest iterator over multiple iterators.
+    ///
+    /// # Performance
+    /// - O(k) construction and per-step work
+    /// - Stops probing lanes after their first exhaustion
+    #[inline]
+    pub fn zip_longest(iterators: Vec<IteratorObject>, fillvalue: Value) -> Self {
+        let len = iterators.len();
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::ZipLongest {
+                iterators,
+                active: vec![true; len],
+                remaining: len,
+                fillvalue,
+            },
+            exhausted: len == 0,
+        }
+    }
+
     /// Create a map iterator.
     ///
     /// # Note
@@ -1145,6 +1177,7 @@ impl IteratorObject {
             IterKind::Chain { .. }
             | IterKind::Enumerate { .. }
             | IterKind::Zip { .. }
+            | IterKind::ZipLongest { .. }
             | IterKind::Map { .. }
             | IterKind::Filter { .. }
             | IterKind::ISlice { .. } => Ok(IteratorReduction::RequiresVm(
@@ -1450,6 +1483,44 @@ impl IteratorObject {
 
                 Some(create_tuple_from_values(values))
             }
+            IterKind::ZipLongest {
+                iterators,
+                active,
+                remaining,
+                fillvalue,
+            } => {
+                if *remaining == 0 || iterators.is_empty() {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                let mut values = Vec::with_capacity(iterators.len());
+                let mut yielded_any = false;
+                for index in 0..iterators.len() {
+                    if active[index] {
+                        match iterators[index].next_checked()? {
+                            Some(value) => {
+                                yielded_any = true;
+                                values.push(value);
+                            }
+                            None => {
+                                active[index] = false;
+                                *remaining = remaining.saturating_sub(1);
+                                values.push(*fillvalue);
+                            }
+                        }
+                    } else {
+                        values.push(*fillvalue);
+                    }
+                }
+
+                if !yielded_any && *remaining == 0 {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                Some(create_tuple_from_values(values))
+            }
 
             IterKind::Map { func: _, inner } => {
                 // Map iterator: returns raw value, caller must apply function
@@ -1700,6 +1771,25 @@ impl IteratorObject {
                 // Minimum of all iterator size hints
                 iterators.iter().filter_map(|i| i.size_hint()).min()
             }
+            IterKind::ZipLongest {
+                iterators,
+                active,
+                remaining,
+                ..
+            } => {
+                if *remaining == 0 {
+                    return Some(0);
+                }
+
+                let mut max_remaining = 0usize;
+                for (is_active, iterator) in active.iter().zip(iterators.iter()) {
+                    if !*is_active {
+                        continue;
+                    }
+                    max_remaining = max_remaining.max(iterator.size_hint()?);
+                }
+                Some(max_remaining)
+            }
             IterKind::Map { inner, .. } => inner.size_hint(),
             IterKind::Filter { .. } => None, // Cannot know without evaluating predicate
             IterKind::ISlice {
@@ -1896,6 +1986,50 @@ impl IteratorObject {
 
                 return Ok(Some(create_tuple_from_values(values)));
             }
+            IterKind::ZipLongest {
+                iterators,
+                active,
+                remaining,
+                fillvalue,
+            } => {
+                if *remaining == 0 || iterators.is_empty() {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                let mut values = Vec::with_capacity(iterators.len());
+                let mut yielded_any = false;
+                for index in 0..iterators.len() {
+                    if active[index] {
+                        match iterators[index].next_with(
+                            invoke,
+                            is_truthy,
+                            advance_iterator,
+                            advance_sequence,
+                            advance_call_sentinel,
+                        )? {
+                            Some(value) => {
+                                yielded_any = true;
+                                values.push(value);
+                            }
+                            None => {
+                                active[index] = false;
+                                *remaining = remaining.saturating_sub(1);
+                                values.push(*fillvalue);
+                            }
+                        }
+                    } else {
+                        values.push(*fillvalue);
+                    }
+                }
+
+                if !yielded_any && *remaining == 0 {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                return Ok(Some(create_tuple_from_values(values)));
+            }
             IterKind::Filter { func, inner } => loop {
                 match inner.next_with(
                     invoke,
@@ -2014,6 +2148,7 @@ impl fmt::Debug for IteratorObject {
             IterKind::Chain { .. } => "chain",
             IterKind::Enumerate { .. } => "enumerate",
             IterKind::Zip { .. } => "zip",
+            IterKind::ZipLongest { .. } => "zip_longest",
             IterKind::Map { .. } => "map",
             IterKind::Filter { .. } => "filter",
             IterKind::ISlice { .. } => "islice",
