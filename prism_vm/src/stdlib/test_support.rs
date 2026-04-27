@@ -189,6 +189,12 @@ static SORTDICT_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static UNLINK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support.os_helper.unlink"), unlink)
 });
+static CREATE_EMPTY_FILE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.os_helper.create_empty_file"),
+        create_empty_file,
+    )
+});
 static FORGET_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("test.support.import_helper.forget"),
@@ -811,7 +817,11 @@ impl OsHelperModule {
     /// Create a new `test.support.os_helper` module descriptor.
     pub fn new() -> Self {
         Self {
-            attrs: vec![Arc::from("TESTFN"), Arc::from("unlink")],
+            attrs: vec![
+                Arc::from("TESTFN"),
+                Arc::from("create_empty_file"),
+                Arc::from("unlink"),
+            ],
         }
     }
 }
@@ -830,6 +840,7 @@ impl Module for OsHelperModule {
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
             "TESTFN" => Ok(Value::string(intern(TESTFN))),
+            "create_empty_file" => Ok(builtin_value(&CREATE_EMPTY_FILE_FUNCTION)),
             "unlink" => Ok(builtin_value(&UNLINK_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support.os_helper' has no attribute '{}'",
@@ -937,6 +948,22 @@ fn unlink(args: &[Value]) -> Result<Value, BuiltinError> {
         }
         Err(err) => Err(BuiltinError::OSError(err.to_string())),
     }
+}
+
+fn create_empty_file(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "create_empty_file() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let path = value_as_string_ref(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("create_empty_file() path must be str".to_string())
+    })?;
+    std::fs::File::create(Path::new(path.as_str()))
+        .map(|_| Value::none())
+        .map_err(|err| BuiltinError::OSError(err.to_string()))
 }
 
 /// Native `test.support.threading_helper` module descriptor.
