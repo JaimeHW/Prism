@@ -1434,8 +1434,32 @@ fn hash_value(value: Value) -> Result<i64, BuiltinError> {
             ]);
             hash_tuple(&components)
         }
+        TypeId::RANGE => {
+            let range = unsafe { &*(ptr as *const RangeObject) };
+            hash_range(range)
+        }
         _ => Ok(hash_with_default_hasher(&(ptr as usize))),
     }
+}
+
+#[inline]
+fn hash_range(range: &RangeObject) -> Result<i64, BuiltinError> {
+    let len = range.len_bigint();
+    let components = if len.is_zero() {
+        vec![bigint_to_value(BigInt::zero())]
+    } else if len == BigInt::one() {
+        vec![
+            bigint_to_value(BigInt::one()),
+            bigint_to_value(range.start_bigint()),
+        ]
+    } else {
+        vec![
+            bigint_to_value(len),
+            bigint_to_value(range.start_bigint()),
+            bigint_to_value(range.step_bigint()),
+        ]
+    };
+    hash_tuple(&TupleObject::from_vec(components))
 }
 
 #[inline]

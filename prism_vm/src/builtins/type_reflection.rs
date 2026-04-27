@@ -11,8 +11,10 @@ use prism_runtime::object::type_builtins::{
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DescriptorViewObject, MappingProxyObject, MethodWrapperObject};
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::bigint_to_value;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
+use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -1787,6 +1789,7 @@ pub(crate) fn builtin_instance_attribute_value(
         )),
         (TypeId::BOOL, "imag") => Ok(Some(Value::int(0).expect("zero should fit"))),
         (TypeId::BOOL, "denominator") => Ok(Some(Value::int(1).expect("one should fit"))),
+        (TypeId::RANGE, attr) => range_instance_attr_value(receiver, attr),
         (TypeId::SLICE, attr) => slice_instance_attr_value(receiver, attr),
         (TypeId::MEMORYVIEW, attr) => memoryview_instance_attr_value(vm, receiver, attr),
         (TypeId::OBJECT, "__str__") => alloc_view(
@@ -1814,6 +1817,7 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
         (TypeId::OBJECT, "__str__")
             | (TypeId::INT, "real" | "imag" | "numerator" | "denominator")
             | (TypeId::BOOL, "real" | "imag" | "numerator" | "denominator")
+            | (TypeId::RANGE, "start" | "stop" | "step")
             | (TypeId::SLICE, "start" | "stop" | "step")
             | (
                 TypeId::MEMORYVIEW,
@@ -1827,6 +1831,19 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
                     | "obj",
             )
     )
+}
+
+fn range_instance_attr_value(receiver: Value, attr: &str) -> Result<Option<Value>, RuntimeError> {
+    let Some(ptr) = receiver.as_object_ptr() else {
+        return Ok(None);
+    };
+    let range = unsafe { &*(ptr as *const RangeObject) };
+    Ok(match attr {
+        "start" => Some(bigint_to_value(range.start_bigint())),
+        "stop" => Some(bigint_to_value(range.stop_bigint())),
+        "step" => Some(bigint_to_value(range.step_bigint())),
+        _ => None,
+    })
 }
 
 fn slice_instance_attr_value(receiver: Value, attr: &str) -> Result<Option<Value>, RuntimeError> {
