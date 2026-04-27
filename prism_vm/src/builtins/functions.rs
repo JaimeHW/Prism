@@ -1378,25 +1378,33 @@ pub fn builtin_hash(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let hash = hash_value(args[0])?;
-    let mut signed = lower_48_signed(hash);
-    if signed == -1 {
-        signed = -2;
-    }
-    Value::int(signed).ok_or_else(|| BuiltinError::OverflowError("hash overflow".to_string()))
+    Ok(bigint_to_value(BigInt::from(hash)))
 }
 
 #[inline]
-fn hash_value(value: Value) -> Result<u64, BuiltinError> {
-    if value.is_none()
-        || value.as_bool().is_some()
-        || value.as_int().is_some()
-        || value.as_float().is_some()
-    {
-        return Ok(hash_with_default_hasher(&value));
+fn hash_value(value: Value) -> Result<i64, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+
+    if let Some(integer) = value.as_int() {
+        return Ok(normalize_python_hash(integer));
+    }
+
+    if let Some(float) = value.as_float() {
+        return Ok(hash_float(float, value.raw_bits() as usize));
+    }
+
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(hash_bigint(&integer));
     }
 
     if let Some(string) = value_as_string_ref(value) {
         return Ok(hash_with_default_hasher(&string.as_str()));
+    }
+
+    if value.is_none() {
+        return Ok(hash_with_default_hasher(&value));
     }
 
     let ptr = value
@@ -1417,37 +1425,110 @@ fn hash_value(value: Value) -> Result<u64, BuiltinError> {
 }
 
 #[inline]
-fn hash_tuple(tuple: &TupleObject) -> Result<u64, BuiltinError> {
-    // CPython-inspired tuple hash combiner.
-    let mut acc: u64 = 0x345678;
+fn hash_tuple(tuple: &TupleObject) -> Result<i64, BuiltinError> {
+    const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
+    const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
+    const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
+    const EMPTY_TUPLE_COMPAT_MANGLE: u64 = XXPRIME_5 ^ 3_527_539;
+
+    let mut acc: u64 = XXPRIME_5;
     let len = tuple.len();
-    for (index, item) in tuple.iter().copied().enumerate() {
-        let item_hash = hash_value(item)?;
-        acc = (acc ^ item_hash).wrapping_mul(1_000_003);
-        acc = acc.wrapping_add((index as u64).wrapping_mul(2).wrapping_add(82_520));
+    for item in tuple.iter().copied() {
+        let lane = hash_value(item)? as u64;
+        acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+        acc = acc.rotate_left(31);
+        acc = acc.wrapping_mul(XXPRIME_1);
     }
-    acc ^= len as u64;
+
+    acc = acc.wrapping_add((len as u64) ^ EMPTY_TUPLE_COMPAT_MANGLE);
     if acc == u64::MAX {
-        acc = u64::MAX - 1;
+        return Ok(1_546_275_796);
     }
-    Ok(acc)
+    Ok(acc as i64)
 }
 
 #[inline]
-fn hash_with_default_hasher<T: Hash>(value: &T) -> u64 {
+fn hash_bigint(value: &BigInt) -> i64 {
+    const HASH_MODULUS: u64 = (1u64 << 61) - 1;
+
+    let modulus = BigInt::from(HASH_MODULUS);
+    let magnitude = (value.abs() % modulus)
+        .to_i64()
+        .expect("hash modulus result always fits i64");
+    let signed = if value.sign() == Sign::Minus {
+        -magnitude
+    } else {
+        magnitude
+    };
+    normalize_python_hash(signed)
+}
+
+#[inline]
+fn hash_float(value: f64, identity: usize) -> i64 {
+    const HASH_BITS: i32 = 61;
+    const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
+    const HASH_INF: i64 = 314_159;
+
+    if !value.is_finite() {
+        return if value.is_infinite() {
+            if value.is_sign_positive() {
+                HASH_INF
+            } else {
+                -HASH_INF
+            }
+        } else {
+            hash_pointer(identity)
+        };
+    }
+
+    let (mut mantissa, mut exponent) = libm::frexp(value);
+    let sign = if mantissa < 0.0 {
+        mantissa = -mantissa;
+        -1
+    } else {
+        1
+    };
+
+    let mut acc = 0u64;
+    while mantissa != 0.0 {
+        acc = ((acc << 28) & HASH_MODULUS) | (acc >> (HASH_BITS as u32 - 28));
+        mantissa *= 268_435_456.0;
+        exponent -= 28;
+        let lane = mantissa as u64;
+        mantissa -= lane as f64;
+        acc += lane;
+        if acc >= HASH_MODULUS {
+            acc -= HASH_MODULUS;
+        }
+    }
+
+    let exponent = if exponent >= 0 {
+        exponent % HASH_BITS
+    } else {
+        HASH_BITS - 1 - ((-1 - exponent) % HASH_BITS)
+    } as u32;
+    acc = ((acc << exponent) & HASH_MODULUS) | (acc >> (HASH_BITS as u32 - exponent));
+
+    let signed = if sign < 0 { -(acc as i64) } else { acc as i64 };
+    normalize_python_hash(signed)
+}
+
+#[inline]
+fn hash_pointer(pointer: usize) -> i64 {
+    let rotated = pointer.rotate_right(4);
+    normalize_python_hash(rotated as isize as i64)
+}
+
+#[inline]
+fn hash_with_default_hasher<T: Hash>(value: &T) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
-    hasher.finish()
+    normalize_python_hash(hasher.finish() as i64)
 }
 
 #[inline]
-fn lower_48_signed(value: u64) -> i64 {
-    let masked = value & ((1u64 << 48) - 1);
-    if (masked & (1u64 << 47)) != 0 {
-        masked as i64 - (1i64 << 48)
-    } else {
-        masked as i64
-    }
+fn normalize_python_hash(hash: i64) -> i64 {
+    if hash == -1 { -2 } else { hash }
 }
 
 // =============================================================================
