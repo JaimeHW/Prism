@@ -30,6 +30,7 @@ use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashSet;
@@ -446,6 +447,12 @@ impl ReachabilityMarker {
                 for value in alias.args() {
                     self.push(*value);
                 }
+            }
+            TypeId::SLICE => {
+                let slice = unsafe { &*(ptr as *const SliceObject) };
+                self.push(slice.start_value());
+                self.push(slice.stop_value());
+                self.push(slice.step_value());
             }
             TypeId::MAPPING_PROXY => {
                 let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
