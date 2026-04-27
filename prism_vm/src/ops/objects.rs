@@ -2298,6 +2298,19 @@ pub(crate) fn set_attribute_value(
     name: &InternedString,
     value: Value,
 ) -> Result<(), RuntimeError> {
+    if invoke_user_defined_setattr(vm, obj, name, value)? {
+        return Ok(());
+    }
+
+    set_attribute_value_default(vm, obj, name, value)
+}
+
+pub(crate) fn set_attribute_value_default(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    name: &InternedString,
+    value: Value,
+) -> Result<(), RuntimeError> {
     if let Some(ptr) = obj.as_object_ptr() {
         if let Some(module) = vm.import_resolver.module_from_ptr(ptr) {
             module.set_attr(name.as_str(), value);
@@ -2485,6 +2498,28 @@ pub(crate) fn set_attribute_value(
     ))
 }
 
+fn invoke_user_defined_setattr(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    name: &InternedString,
+    value: Value,
+) -> Result<bool, RuntimeError> {
+    let Some(ptr) = obj.as_object_ptr() else {
+        return Ok(false);
+    };
+    let type_id = extract_type_id(ptr);
+    if !is_user_defined_type(type_id) {
+        return Ok(false);
+    }
+
+    let Some(slot) = lookup_instance_class_slot(type_id, &intern("__setattr__")) else {
+        return Ok(false);
+    };
+    let setattr = bind_user_class_attribute_value_in_vm(vm, slot.value, slot.defining_class, obj)?;
+    crate::ops::calls::invoke_callable_value(vm, setattr, &[Value::string(name.clone()), value])?;
+    Ok(true)
+}
+
 fn normalize_traceback_next_assignment(
     target_ptr: *const (),
     value: Value,
@@ -2526,6 +2561,18 @@ fn normalize_traceback_next_assignment(
 }
 
 pub(crate) fn delete_attribute_value(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    name: &InternedString,
+) -> Result<(), RuntimeError> {
+    if invoke_user_defined_delattr(vm, obj, name)? {
+        return Ok(());
+    }
+
+    delete_attribute_value_default(vm, obj, name)
+}
+
+pub(crate) fn delete_attribute_value_default(
     vm: &mut VirtualMachine,
     obj: Value,
     name: &InternedString,
@@ -2671,6 +2718,27 @@ pub(crate) fn delete_attribute_value(
         type_name,
         format!("'{}' object has no attribute '{}'", type_name, name),
     ))
+}
+
+fn invoke_user_defined_delattr(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    name: &InternedString,
+) -> Result<bool, RuntimeError> {
+    let Some(ptr) = obj.as_object_ptr() else {
+        return Ok(false);
+    };
+    let type_id = extract_type_id(ptr);
+    if !is_user_defined_type(type_id) {
+        return Ok(false);
+    }
+
+    let Some(slot) = lookup_instance_class_slot(type_id, &intern("__delattr__")) else {
+        return Ok(false);
+    };
+    let delattr = bind_user_class_attribute_value_in_vm(vm, slot.value, slot.defining_class, obj)?;
+    crate::ops::calls::invoke_callable_value(vm, delattr, &[Value::string(name.clone())])?;
+    Ok(true)
 }
 
 const EXTENDED_ATTR_NAME_SENTINEL: u8 = u8::MAX;

@@ -29,9 +29,10 @@ use crate::ops::iteration::{
 };
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
-    alloc_heap_value, delete_attribute_value, delete_list_item_value, dict_storage_mut_from_ptr,
-    dict_storage_ref_from_ptr, get_attribute_value, list_storage_mut_from_ptr,
-    list_storage_ref_from_ptr, object_getattribute_default, set_attribute_value,
+    alloc_heap_value, delete_attribute_value, delete_attribute_value_default,
+    delete_list_item_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr,
+    get_attribute_value, list_storage_mut_from_ptr, list_storage_ref_from_ptr,
+    object_getattribute_default, set_attribute_value, set_attribute_value_default,
     set_list_item_value, set_storage_mut_from_ptr, set_storage_ref_from_ptr,
     tuple_storage_ref_from_ptr,
 };
@@ -347,6 +348,10 @@ static OBJECT_REDUCE_EX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(
 });
 static TYPE_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("type.__repr__"), type_repr));
+static TYPE_SETATTR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("type.__setattr__"), type_setattr));
+static TYPE_DELATTR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("type.__delattr__"), type_delattr));
 static INT_REPR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("int.__repr__"), value_repr));
 static INT_STR_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -758,6 +763,12 @@ pub fn resolve_type_method(name: &str) -> Option<CachedMethod> {
     match name {
         "__repr__" => Some(CachedMethod::simple(builtin_method_value(
             &TYPE_REPR_METHOD,
+        ))),
+        "__setattr__" => Some(CachedMethod::simple(builtin_method_value(
+            &TYPE_SETATTR_METHOD,
+        ))),
+        "__delattr__" => Some(CachedMethod::simple(builtin_method_value(
+            &TYPE_DELATTR_METHOD,
         ))),
         _ => None,
     }
@@ -2344,7 +2355,7 @@ fn object_setattr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Buil
         ));
     };
 
-    set_attribute_value(vm, args[0], &intern(name.as_str()), args[2])
+    set_attribute_value_default(vm, args[0], &intern(name.as_str()), args[2])
         .map_err(runtime_error_to_builtin_error)?;
     Ok(Value::none())
 }
@@ -2357,9 +2368,55 @@ fn object_delattr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Buil
         ));
     };
 
-    delete_attribute_value(vm, args[0], &intern(name.as_str()))
+    delete_attribute_value_default(vm, args[0], &intern(name.as_str()))
         .map_err(runtime_error_to_builtin_error)?;
     Ok(Value::none())
+}
+
+fn type_setattr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("type", "__setattr__", args, 2)?;
+    expect_type_receiver(args[0], "__setattr__")?;
+    let Some(name) = value_as_string_ref(args[1]) else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    set_attribute_value_default(vm, args[0], &intern(name.as_str()), args[2])
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
+}
+
+fn type_delattr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("type", "__delattr__", args, 1)?;
+    expect_type_receiver(args[0], "__delattr__")?;
+    let Some(name) = value_as_string_ref(args[1]) else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    delete_attribute_value_default(vm, args[0], &intern(name.as_str()))
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::none())
+}
+
+fn expect_type_receiver(value: Value, method_name: &'static str) -> Result<(), BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'type.{method_name}' requires a 'type' object but received '{}'",
+            value.type_name()
+        )));
+    };
+
+    if crate::ops::objects::extract_type_id(ptr) == TypeId::TYPE {
+        return Ok(());
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "descriptor 'type.{method_name}' requires a 'type' object but received '{}'",
+        value.type_name()
+    )))
 }
 
 #[inline]

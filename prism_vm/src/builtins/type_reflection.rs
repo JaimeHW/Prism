@@ -208,6 +208,14 @@ const TYPE_ATTRS: &[AttrSpec] = &[
         kind: ReflectedValueKind::WrapperDescriptor,
     },
     AttrSpec {
+        name: "__setattr__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+    AttrSpec {
+        name: "__delattr__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+    AttrSpec {
         name: "__prepare__",
         kind: ReflectedValueKind::ClassMethodDescriptor,
     },
