@@ -28,6 +28,7 @@ use crate::ops::objects::{
     snapshot_frame_locals_dict,
 };
 use crate::python_numeric::int_like_value;
+use crate::stdlib::ast as stdlib_ast;
 use prism_compiler::compiler::CompileError;
 use prism_compiler::{Compiler, ModuleNamespaceMode, OptimizationLevel};
 use prism_core::intern::intern;
@@ -308,6 +309,10 @@ fn dynamic_source(value: Value, error_message: &str) -> Result<DynamicSource, Bu
 }
 
 fn source_text_for_compile(value: Value) -> Result<String, BuiltinError> {
+    if let Some(source) = stdlib_ast::parsed_ast_source(value) {
+        return Ok(source);
+    }
+
     match dynamic_source(
         value,
         "compile() source must be a string, bytes, or AST object",
@@ -579,6 +584,31 @@ fn compile_optimize_arg(value: Option<Value>) -> Result<OptimizationLevel, Built
     }
 }
 
+fn compile_flags_arg(flags: Option<i64>) -> Result<i64, BuiltinError> {
+    let flags = flags.unwrap_or(0);
+    let allowed = stdlib_ast::compiler_allowed_flags();
+    if flags < 0 || (flags & !allowed) != 0 {
+        return Err(BuiltinError::ValueError(
+            "compile(): unrecognised flags".to_string(),
+        ));
+    }
+    Ok(flags)
+}
+
+#[inline]
+fn wants_ast(flags: i64) -> bool {
+    (flags & stdlib_ast::compiler_only_ast_flag()) != 0
+}
+
+#[inline]
+fn ast_parse_mode(mode: CompileMode) -> crate::stdlib::_ast::AstParseMode {
+    match mode {
+        CompileMode::Exec => crate::stdlib::_ast::AstParseMode::Exec,
+        CompileMode::Eval => crate::stdlib::_ast::AstParseMode::Eval,
+        CompileMode::Single => crate::stdlib::_ast::AstParseMode::Single,
+    }
+}
+
 fn compile_optimize_arg_vm(
     vm: &mut VirtualMachine,
     value: Option<Value>,
@@ -667,10 +697,13 @@ fn compile_from_parsed_args(args: CompileArgs) -> Result<Value, BuiltinError> {
     let source = source_text_for_compile(args.source)?;
     let filename = compile_filename_arg(args.filename)?;
     let mode = compile_mode_arg(args.mode)?;
-    let _flags = optional_compile_int_arg(args.flags, 4, "flags")?;
+    let flags = compile_flags_arg(optional_compile_int_arg(args.flags, 4, "flags")?)?;
     let _dont_inherit = optional_compile_int_arg(args.dont_inherit, 5, "dont_inherit")?;
     let optimize = compile_optimize_arg(args.optimize)?;
     let _feature_version = optional_compile_int_arg(args.feature_version, 7, "_feature_version")?;
+    if wants_ast(flags) {
+        return stdlib_ast::parse_source_to_ast_value(&source, &filename, ast_parse_mode(mode));
+    }
     let code = compile_source_for_mode(
         &source,
         &filename,
@@ -688,11 +721,14 @@ fn compile_from_parsed_args_vm(
     let source = source_text_for_compile(args.source)?;
     let filename = compile_filename_arg(args.filename)?;
     let mode = compile_mode_arg(args.mode)?;
-    let _flags = optional_compile_int_arg_vm(vm, args.flags, 4, "flags")?;
+    let flags = compile_flags_arg(optional_compile_int_arg_vm(vm, args.flags, 4, "flags")?)?;
     let _dont_inherit = optional_compile_int_arg_vm(vm, args.dont_inherit, 5, "dont_inherit")?;
     let optimize = compile_optimize_arg_vm(vm, args.optimize)?;
     let _feature_version =
         optional_compile_int_arg_vm(vm, args.feature_version, 7, "_feature_version")?;
+    if wants_ast(flags) {
+        return stdlib_ast::parse_source_to_ast_value(&source, &filename, ast_parse_mode(mode));
+    }
     let code = compile_source_for_mode(
         &source,
         &filename,

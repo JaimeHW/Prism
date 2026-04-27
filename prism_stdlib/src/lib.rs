@@ -182,6 +182,7 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "_warnings"
         | "_weakref"
         | "array"
+        | "ast"
         | "atexit"
         | "math"
         | "errno"

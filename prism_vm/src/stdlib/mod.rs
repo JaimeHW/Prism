@@ -35,6 +35,7 @@ pub mod _warnings;
 pub mod _weakref;
 pub mod _winapi;
 pub mod array;
+pub mod ast;
 pub mod atexit;
 pub mod binascii;
 pub mod collections;
@@ -342,6 +343,7 @@ impl StdlibRegistry {
         );
 
         Self::insert_module(&mut modules, "array", Box::new(array::ArrayModule::new()));
+        Self::insert_module(&mut modules, "ast", Box::new(ast::AstModule::new()));
 
         Self::insert_module(
             &mut modules,
