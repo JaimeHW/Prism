@@ -40,32 +40,6 @@ cargo run -p prism_cli --bin prism -- -m package.module
 cargo run -p prism_cli --bin prism
 ```
 
-## Architecture
-
-```text
-                  prism_cli
-         prism / prismc / prism-test
-                    |
-        +-----------+-----------+
-        |                       |
-     prism_vm               prism_aot
-  interpreter, imports      build planner
-        |                       |
-        |                  prism_stdlib
-        |                 stdlib metadata
-        |
-  prism_runtime <---- prism_gc
-   object model      collector
-        |
-    prism_jit
-  tiered codegen
-
-prism_parser -> prism_compiler -> prism_code
-   lexer/AST     source frontend    bytecode format
-                 scope analysis
-                 code generation
-```
-
 ### Crate Overview
 
 | Crate | Purpose |
