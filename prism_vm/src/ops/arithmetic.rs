@@ -503,92 +503,87 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    // Try int + int
-    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
-        if let Some(value) = x.checked_add(y).and_then(Value::int) {
+    match add_values(vm, a, b) {
+        Ok(value) => {
             vm.current_frame_mut().set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
+            ControlFlow::Continue
         }
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
+/// Python `+` semantics as a reusable value-level operation.
+///
+/// The bytecode handler wraps this with inline-cache feedback. Native facades
+/// such as `operator.add` call this directly so stdlib code shares the same
+/// semantics without manufacturing a temporary interpreter frame.
+pub(crate) fn add_values(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Value, RuntimeError> {
+    use crate::speculative::{SpecResult, spec_list_concat};
+
+    if let (Some(x), Some(y)) = (int_like_value(left), int_like_value(right))
+        && let Some(value) = x.checked_add(y).and_then(Value::int)
+    {
+        return Ok(value);
     }
 
-    if let Some((x, y)) = integer_bigint_operands(a, b) {
-        vm.current_frame_mut()
-            .set_reg(inst.dst().0, bigint_to_value(x + y));
-        return ControlFlow::Continue;
+    if let Some((x, y)) = integer_bigint_operands(left, right) {
+        return Ok(bigint_to_value(x + y));
     }
 
-    if let Some(value) = try_add_complex_values(a, b) {
-        vm.current_frame_mut().set_reg(inst.dst().0, value);
-        return ControlFlow::Continue;
+    if let Some(value) = try_add_complex_values(left, right) {
+        return Ok(value);
     }
 
-    // Try str + str (supports both tagged interned strings and heap strings)
-    match concat_string_value_in_vm(vm, a, b) {
-        Ok(Some(value)) => {
-            vm.current_frame_mut().set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
-        }
-        Ok(None) => {}
-        Err(err) => return ControlFlow::Error(err),
+    if let Some(value) = concat_string_value_in_vm(vm, left, right)? {
+        return Ok(value);
     }
 
-    // Try bytes/bytearray concatenation. Match CPython's sequence semantics:
-    // accept byte sequences on both sides and preserve the left operand type.
-    if let Some(value) = concat_byte_sequence_values(a, b) {
-        vm.current_frame_mut().set_reg(inst.dst().0, value);
-        return ControlFlow::Continue;
+    if let Some(value) = concat_byte_sequence_values(left, right) {
+        return Ok(value);
     }
 
-    // Try list + list (slow path for list concatenation)
-    if a.is_object() && b.is_object() {
-        // Use spec_list_concat which handles type checking internally
-        let (result, value) = spec_list_concat(a, b);
+    if left.is_object() && right.is_object() {
+        let (result, value) = spec_list_concat(left, right);
         if result == SpecResult::Success {
-            vm.current_frame_mut().set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
+            return Ok(value);
         }
-        // If deopt, fall through to other type checks
     }
 
-    // Try tuple + tuple
-    if let (Some(a_ptr), Some(b_ptr)) = (a.as_object_ptr(), b.as_object_ptr()) {
-        let a_header = unsafe { &*(a_ptr as *const ObjectHeader) };
-        let b_header = unsafe { &*(b_ptr as *const ObjectHeader) };
-        if a_header.type_id == TypeId::TUPLE && b_header.type_id == TypeId::TUPLE {
+    if let (Some(left_ptr), Some(right_ptr)) = (left.as_object_ptr(), right.as_object_ptr()) {
+        let left_header = unsafe { &*(left_ptr as *const ObjectHeader) };
+        let right_header = unsafe { &*(right_ptr as *const ObjectHeader) };
+        if left_header.type_id == TypeId::TUPLE && right_header.type_id == TypeId::TUPLE {
             let tuple = unsafe {
-                (&*(a_ptr as *const TupleObject)).concat(&*(b_ptr as *const TupleObject))
+                (&*(left_ptr as *const TupleObject)).concat(&*(right_ptr as *const TupleObject))
             };
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, boxed_tuple_value(tuple));
-            return ControlFlow::Continue;
+            return Ok(boxed_tuple_value(tuple));
         }
     }
 
-    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__add__", "__radd__") {
-        Ok(true) => return ControlFlow::Continue,
-        Ok(false) => {}
-        Err(err) => return ControlFlow::Error(err),
+    if let Some(value) = binary_special_method(vm, left, right, "__add__", "__radd__")? {
+        return Ok(value);
     }
 
-    // Try float + float or mixed int/float
-    let Some(x) = float_like_value(a) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
+    let Some(x) = float_like_value(left) else {
+        return Err(RuntimeError::unsupported_operand(
             "+",
-            a.type_name(),
-            b.type_name(),
+            left.type_name(),
+            right.type_name(),
         ));
     };
-    let Some(y) = float_like_value(b) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
+    let Some(y) = float_like_value(right) else {
+        return Err(RuntimeError::unsupported_operand(
             "+",
-            a.type_name(),
-            b.type_name(),
+            left.type_name(),
+            right.type_name(),
         ));
     };
 
-    vm.current_frame_mut()
-        .set_reg(inst.dst().0, Value::float(x + y));
-    ControlFlow::Continue
+    Ok(Value::float(x + y))
 }
 
 #[inline]

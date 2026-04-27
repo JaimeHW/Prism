@@ -12,6 +12,7 @@ use crate::builtins::{
     runtime_error_to_builtin_error, try_len_value,
 };
 use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::arithmetic::add_values;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::{compare_order_result, contains_value, eq_result, ne_result};
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
@@ -61,8 +62,11 @@ static IS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_"), operator_is));
 static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
+static ADD_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.add"), operator_add));
 
 const EXPORTS: &[&str] = &[
+    "add",
     "contains",
     "countOf",
     "eq",
@@ -94,7 +98,7 @@ impl OperatorModule {
             attrs: EXPORTS
                 .iter()
                 .copied()
-                .chain(["__all__"])
+                .chain(["__add__", "__all__"])
                 .map(Arc::from)
                 .collect(),
             all: string_list_value(EXPORTS),
@@ -131,6 +135,7 @@ impl Module for OperatorModule {
             "ge" => Ok(builtin_value(&GE_FUNCTION)),
             "is_" => Ok(builtin_value(&IS_FUNCTION)),
             "is_not" => Ok(builtin_value(&IS_NOT_FUNCTION)),
+            "add" | "__add__" => Ok(builtin_value(&ADD_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'operator' has no attribute '{}'",
                 name
@@ -457,4 +462,9 @@ fn operator_is(args: &[Value]) -> Result<Value, BuiltinError> {
 fn operator_is_not(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("is_not", args, 2)?;
     Ok(Value::bool(args[0].raw_bits() != args[1].raw_bits()))
+}
+
+fn operator_add(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("add", args, 2)?;
+    add_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
 }
