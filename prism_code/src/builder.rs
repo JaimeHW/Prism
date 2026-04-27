@@ -334,6 +334,9 @@ impl FunctionBuilder {
     /// Free a register for reuse.
     #[inline]
     pub fn free_register(&mut self, reg: Register) {
+        if !self.separate_locals && (reg.0 as usize) < self.locals.len() {
+            return;
+        }
         self.free_registers.push(reg);
     }
 
@@ -414,9 +417,8 @@ impl FunctionBuilder {
     /// Free a contiguous block of registers (for cleanup after call).
     #[inline]
     pub fn free_register_block(&mut self, base: Register, count: u8) {
-        // Add all registers in the block to the free list
         for i in 0..count {
-            self.free_registers.push(Register(base.0 + i));
+            self.free_register(Register(base.0 + i));
         }
     }
 
@@ -556,6 +558,8 @@ impl FunctionBuilder {
                 self.next_register = u8::try_from(required).expect("register overflow");
                 self.max_registers = self.max_registers.max(self.next_register);
             }
+            self.free_registers
+                .retain(|reg| (reg.0 as usize) >= self.locals.len());
         }
         slot
     }
