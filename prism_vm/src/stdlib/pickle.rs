@@ -123,6 +123,7 @@ impl PickleModule {
                 Arc::from("DEFAULT_PROTOCOL"),
                 Arc::from("HIGHEST_PROTOCOL"),
                 Arc::from("__all__"),
+                Arc::from("bytes_types"),
                 Arc::from("dumps"),
                 Arc::from("loads"),
             ],
@@ -147,6 +148,10 @@ impl Module for PickleModule {
             "DEFAULT_PROTOCOL" => Ok(Value::int(DEFAULT_PROTOCOL).expect("protocol fits")),
             "HIGHEST_PROTOCOL" => Ok(Value::int(HIGHEST_PROTOCOL).expect("protocol fits")),
             "__all__" => Ok(self.all),
+            "bytes_types" => Ok(crate::alloc_managed_value(TupleObject::from_iter([
+                builtin_type_object_for_type_id(TypeId::BYTES),
+                builtin_type_object_for_type_id(TypeId::BYTEARRAY),
+            ]))),
             "dumps" => Ok(builtin_value(&DUMPS_FUNCTION)),
             "loads" => Ok(builtin_value(&LOADS_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
