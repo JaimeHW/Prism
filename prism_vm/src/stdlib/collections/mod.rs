@@ -41,7 +41,10 @@ pub mod ordereddict;
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinError, BuiltinFunctionObject, get_iterator_mut, value_to_iterator};
+use crate::builtins::{
+    BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class, get_iterator_mut,
+    value_to_iterator,
+};
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
 use crate::ops::dict_access::{dict_set_item, missing_key_error};
@@ -56,7 +59,7 @@ use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_parser::lexer::identifier::{is_id_continue, is_id_start};
 use prism_parser::token::Keyword;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
-use prism_runtime::object::descriptor::{ClassMethodDescriptor, PropertyDescriptor};
+use prism_runtime::object::descriptor::{BoundMethod, ClassMethodDescriptor, PropertyDescriptor};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -67,6 +70,7 @@ use prism_runtime::object::type_builtins::{
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject};
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -170,6 +174,18 @@ static DEFAULTDICT_MISSING: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("collections.defaultdict.__missing__"),
         defaultdict_missing,
+    )
+});
+static DEFAULTDICT_COPY: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.defaultdict.copy"), defaultdict_copy)
+});
+static DEFAULTDICT_OR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.defaultdict.__or__"), defaultdict_or)
+});
+static DEFAULTDICT_ROR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.defaultdict.__ror__"),
+        defaultdict_ror,
     )
 });
 static CHAINMAP_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -374,6 +390,10 @@ static DEFAULTDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
             ("__init__", builtin_value(&DEFAULTDICT_INIT)),
             ("__missing__", builtin_value(&DEFAULTDICT_MISSING)),
             ("__repr__", builtin_value(&DEFAULTDICT_REPR)),
+            ("copy", builtin_value(&DEFAULTDICT_COPY)),
+            ("__copy__", builtin_value(&DEFAULTDICT_COPY)),
+            ("__or__", builtin_value(&DEFAULTDICT_OR)),
+            ("__ror__", builtin_value(&DEFAULTDICT_ROR)),
         ],
     )
 });
@@ -1402,6 +1422,46 @@ fn heap_class_name_for_ptr(ptr: *const (), descriptor_name: &str) -> Result<Stri
     heap_class_for_ptr(ptr, descriptor_name).map(|class| class.name().as_str().to_string())
 }
 
+fn dict_source_ref(value: Value) -> Option<&'static DictObject> {
+    value.as_object_ptr().and_then(dict_storage_ref_from_ptr)
+}
+
+fn defaultdict_factory_from_ptr(
+    ptr: *const (),
+    descriptor_name: &str,
+) -> Result<Value, BuiltinError> {
+    Ok(expect_user_collection_from_ptr(ptr, descriptor_name)?
+        .get_property("default_factory")
+        .unwrap_or_else(Value::none))
+}
+
+fn new_defaultdict_like(
+    vm: &mut VirtualMachine,
+    prototype_ptr: *const (),
+    source: Value,
+    descriptor_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    let default_factory = defaultdict_factory_from_ptr(prototype_ptr, descriptor_name)?;
+    let class = heap_class_for_ptr(prototype_ptr, descriptor_name)?;
+
+    if class.class_type_id() == DEFAULTDICT_CLASS.class_type_id() {
+        let mut instance = allocate_heap_instance_for_class(class.as_ref());
+        instance.set_property(intern("default_factory"), default_factory, shape_registry());
+        let value = crate::alloc_managed_value(instance);
+        crate::ops::method_dispatch::dict_extend_with_vm_kw(
+            vm,
+            value,
+            Some(source),
+            &[],
+            descriptor_name,
+        )?;
+        return Ok(value);
+    }
+
+    let class_value = class_value(&class);
+    invoke_callable_value(vm, class_value, &[default_factory, source]).map_err(BuiltinError::Raised)
+}
+
 fn chainmap_maps_value_from_ptr(
     ptr: *const (),
     descriptor_name: &str,
@@ -1836,9 +1896,7 @@ fn defaultdict_missing(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
     }
 
     let ptr = expect_bound_collection_receiver(args, "__missing__")?;
-    let default_factory = expect_user_collection_from_ptr(ptr, "__missing__")?
-        .get_property("default_factory")
-        .unwrap_or_else(Value::none);
+    let default_factory = defaultdict_factory_from_ptr(ptr, "__missing__")?;
 
     if default_factory.is_none() {
         return Err(BuiltinError::Raised(missing_key_error(vm, args[1])));
@@ -1850,6 +1908,52 @@ fn defaultdict_missing(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
     Ok(value)
 }
 
+fn defaultdict_copy(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "copy() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let ptr = expect_bound_collection_receiver(args, "copy")?;
+    new_defaultdict_like(vm, ptr, args[0], "copy")
+}
+
+fn defaultdict_or(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "__or__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    if dict_source_ref(args[1]).is_none() {
+        return Ok(crate::builtins::builtin_not_implemented_value());
+    }
+
+    let ptr = expect_bound_collection_receiver(args, "__or__")?;
+    let value = new_defaultdict_like(vm, ptr, args[0], "__or__")?;
+    crate::ops::method_dispatch::dict_extend_with_vm_kw(vm, value, Some(args[1]), &[], "__or__")?;
+    Ok(value)
+}
+
+fn defaultdict_ror(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "__ror__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    if dict_source_ref(args[1]).is_none() {
+        return Ok(crate::builtins::builtin_not_implemented_value());
+    }
+
+    let ptr = expect_bound_collection_receiver(args, "__ror__")?;
+    let value = new_defaultdict_like(vm, ptr, args[1], "__ror__")?;
+    crate::ops::method_dispatch::dict_extend_with_vm_kw(vm, value, Some(args[0]), &[], "__ror__")?;
+    Ok(value)
+}
+
 fn defaultdict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
     let ptr = expect_collection_instance(args, "__repr__")?;
     let dict = dict_storage_ref_from_ptr(ptr).ok_or_else(|| {
@@ -1857,10 +1961,74 @@ fn defaultdict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
             "descriptor '__repr__' requires a dict-backed collections object".to_string(),
         )
     })?;
-    let default_factory =
-        shaped_property_repr(ptr, "default_factory")?.unwrap_or_else(|| "None".to_string());
-    let result = format!("defaultdict({default_factory}, {})", dict_repr_body(dict)?);
+    let type_name = heap_class_name_for_ptr(ptr, "__repr__")?;
+    let default_factory = defaultdict_factory_repr(ptr, dict)?;
+    let result = format!("{type_name}({default_factory}, {})", dict_repr_body(dict)?);
     Ok(Value::string(intern(&result)))
+}
+
+fn defaultdict_factory_repr(
+    owner_ptr: *const (),
+    owner_dict: &DictObject,
+) -> Result<String, BuiltinError> {
+    let Some(default_factory) =
+        expect_user_collection_from_ptr(owner_ptr, "__repr__")?.get_property("default_factory")
+    else {
+        return Ok("None".to_string());
+    };
+
+    if let Some(repr) = bound_method_default_factory_repr(owner_ptr, owner_dict, default_factory)? {
+        return Ok(repr);
+    }
+
+    collection_repr_text(default_factory)
+}
+
+fn bound_method_default_factory_repr(
+    owner_ptr: *const (),
+    owner_dict: &DictObject,
+    default_factory: Value,
+) -> Result<Option<String>, BuiltinError> {
+    let Some(method_ptr) = default_factory.as_object_ptr() else {
+        return Ok(None);
+    };
+    if extract_type_id(method_ptr) != TypeId::METHOD {
+        return Ok(None);
+    }
+
+    let method = unsafe { &*(method_ptr as *const BoundMethod) };
+    let mut function_name = bound_method_function_name(method.function())?;
+    let owner_repr = if method.instance().as_object_ptr() == Some(owner_ptr) {
+        let owner_type_name = heap_class_name_for_ptr(owner_ptr, "__repr__")?;
+        if !function_name.contains('.') {
+            function_name = format!("{owner_type_name}.{function_name}");
+        }
+        format!("{}(..., {})", owner_type_name, dict_repr_body(owner_dict)?)
+    } else {
+        collection_repr_text(method.instance())?
+    };
+
+    Ok(Some(format!(
+        "<bound method {function_name} of {owner_repr}>"
+    )))
+}
+
+fn bound_method_function_name(function: Value) -> Result<String, BuiltinError> {
+    let Some(ptr) = function.as_object_ptr() else {
+        return collection_repr_text(function);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION => {
+            let function = unsafe { &*(ptr as *const FunctionObject) };
+            Ok(function.code.qualname.as_ref().to_string())
+        }
+        TypeId::BUILTIN_FUNCTION => {
+            let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            Ok(function.name().to_string())
+        }
+        _ => collection_repr_text(function),
+    }
 }
 
 fn chainmap_init(_vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
