@@ -14,11 +14,13 @@ use crate::builtins::{
 };
 use crate::import::ModuleObject;
 use crate::ops::calls::value_supports_call_protocol;
+use crate::ops::comparison::eq_or_identical;
 use crate::ops::dict_access::{dict_get_item, dict_remove_item, dict_set_item};
 use crate::ops::objects::{dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::value_to_i64;
@@ -245,21 +247,23 @@ fn add_extension(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
 
     if let Some(existing) =
         dict_get_item(vm, registry, key).map_err(runtime_error_to_builtin_error)?
-        && existing != code_value
     {
-        return Err(BuiltinError::ValueError(format!(
-            "key {:?} is already registered with code {:?}",
-            key, existing
-        )));
+        if existing != code_value {
+            return Err(BuiltinError::ValueError(format!(
+                "key {:?} is already registered with code {:?}",
+                key, existing
+            )));
+        }
     }
     if let Some(existing) =
         dict_get_item(vm, inverted, code_value).map_err(runtime_error_to_builtin_error)?
-        && existing != key
     {
-        return Err(BuiltinError::ValueError(format!(
-            "code {} is already in use for key {:?}",
-            code, existing
-        )));
+        if !values_equal(vm, existing, key)? {
+            return Err(BuiltinError::ValueError(format!(
+                "code {} is already in use for key {:?}",
+                code, existing
+            )));
+        }
     }
 
     let registry = dict_mut(registry_value, "copyreg._extension_registry")?;
@@ -290,7 +294,12 @@ fn remove_extension(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bu
     let inverted_key =
         dict_get_item(vm, inverted, code_value).map_err(runtime_error_to_builtin_error)?;
 
-    if registered != Some(code_value) || inverted_key != Some(key) {
+    if registered != Some(code_value)
+        || !match inverted_key {
+            Some(existing) => values_equal(vm, existing, key)?,
+            None => false,
+        }
+    {
         return Err(BuiltinError::ValueError(format!(
             "key {:?} is not registered with code {}",
             key, code
@@ -361,7 +370,30 @@ fn slotnames(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    Ok(crate::alloc_managed_value(ListObject::new()))
+
+    let class = class_from_value(args[0], "_slotnames")?;
+    let cache_name = intern("__slotnames__");
+    if let Some(cached) = class.get_attr(&cache_name)
+        && !cached.is_none()
+    {
+        return Ok(cached);
+    }
+
+    let mut names = Vec::new();
+    for &class_id in class.mro() {
+        let Some(mro_class) = global_class(class_id) else {
+            continue;
+        };
+        collect_class_slotnames(mro_class.as_ref(), &mut names);
+    }
+
+    let value = crate::alloc_managed_value(ListObject::from_iter(
+        names
+            .into_iter()
+            .map(|name| Value::string(intern(name.as_str()))),
+    ));
+    class.set_attr(cache_name, value);
+    Ok(value)
 }
 
 fn copyreg_module(vm: &mut VirtualMachine) -> Result<Arc<ModuleObject>, BuiltinError> {
@@ -411,19 +443,63 @@ fn extension_key(module: Value, name: Value) -> Value {
     crate::alloc_managed_value(TupleObject::from_vec(vec![module, name]))
 }
 
+#[inline]
+fn values_equal(vm: &mut VirtualMachine, left: Value, right: Value) -> Result<bool, BuiltinError> {
+    eq_or_identical(vm, left, right).map_err(runtime_error_to_builtin_error)
+}
+
 fn heap_class_from_value(
+    value: Value,
+    context: &'static str,
+) -> Result<&'static PyClassObject, BuiltinError> {
+    class_from_value(value, context)
+}
+
+fn class_from_value(
     value: Value,
     context: &'static str,
 ) -> Result<&'static PyClassObject, BuiltinError> {
     let ptr = value.as_object_ptr().ok_or_else(|| {
         BuiltinError::TypeError(format!("{context} first argument must be a type"))
     })?;
-    if extract_type_id(ptr) != TypeId::TYPE
-        || crate::builtins::builtin_type_object_type_id(ptr).is_some()
-    {
+    if extract_type_id(ptr) != TypeId::TYPE {
+        return Err(BuiltinError::TypeError(format!(
+            "{context} first argument must be a type"
+        )));
+    }
+    if crate::builtins::builtin_type_object_type_id(ptr).is_some() {
         return Err(BuiltinError::TypeError(format!(
             "{context} currently requires a heap type"
         )));
     }
     Ok(unsafe { &*(ptr as *const PyClassObject) })
+}
+
+fn collect_class_slotnames(class: &PyClassObject, out: &mut Vec<String>) {
+    let Some(slot_names) = class.slot_names() else {
+        return;
+    };
+    for slot_name in slot_names {
+        if let Some(name) = normalize_slot_name(class.name().as_str(), slot_name.as_str()) {
+            out.push(name);
+        }
+    }
+}
+
+fn normalize_slot_name(class_name: &str, slot_name: &str) -> Option<String> {
+    match slot_name {
+        "__dict__" | "__weakref__" => return None,
+        _ => {}
+    }
+
+    if slot_name.starts_with("__") && !slot_name.ends_with("__") {
+        let stripped = class_name.trim_start_matches('_');
+        if stripped.is_empty() {
+            Some(slot_name.to_string())
+        } else {
+            Some(format!("_{stripped}{slot_name}"))
+        }
+    } else {
+        Some(slot_name.to_string())
+    }
 }
