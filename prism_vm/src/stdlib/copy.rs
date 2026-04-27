@@ -1,20 +1,24 @@
 //! Native subset of CPython's `copy` module.
 //!
-//! This provides the identity-preserving fast paths needed by early regression
-//! tests. Rich object graph copying belongs in the full stdlib implementation;
-//! immutable runtime objects can use these native identity paths directly.
+//! The module keeps the common immutable and container paths native while using
+//! Python's reducer protocol for extensible user-defined copying. That keeps
+//! the steady-state fast path compact without turning compatibility behavior
+//! into a source-level dependency.
 
-use super::{Module, ModuleError, ModuleResult};
+use super::{Module, ModuleError, ModuleResult, copyreg};
 use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class,
-    runtime_error_to_builtin_error,
+    exception_type_value_for_id, runtime_error_to_builtin_error, value_type_object,
 };
 use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
+use crate::ops::dict_access::dict_set_item;
 use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id, get_attribute_value,
+    set_attribute_value,
 };
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::mro::ClassId;
@@ -22,10 +26,13 @@ use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::slice::SliceObject;
-use prism_runtime::types::tuple::TupleObject;
+use prism_runtime::types::string::value_as_string_ref;
+use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -44,7 +51,12 @@ impl CopyModule {
     /// Create a new `copy` module descriptor.
     pub fn new() -> Self {
         Self {
-            attrs: vec![Arc::from("copy"), Arc::from("deepcopy")],
+            attrs: vec![
+                Arc::from("Error"),
+                Arc::from("copy"),
+                Arc::from("deepcopy"),
+                Arc::from("error"),
+            ],
         }
     }
 }
@@ -62,6 +74,7 @@ impl Module for CopyModule {
 
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
+            "Error" | "error" => Ok(copy_error_type()),
             "copy" => Ok(builtin_value(&COPY_FUNCTION)),
             "deepcopy" => Ok(builtin_value(&DEEPCOPY_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
@@ -81,6 +94,12 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
 }
 
+#[inline]
+fn copy_error_type() -> Value {
+    exception_type_value_for_id(ExceptionTypeId::Exception as u16)
+        .expect("Exception type is registered")
+}
+
 fn copy_value(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -88,13 +107,19 @@ fn copy_value(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinE
             args.len()
         )));
     }
-    if let Some(copied) = call_copy_protocol(vm, args[0])? {
-        return Ok(copied);
+    if is_copy_atomic(args[0]) {
+        return Ok(args[0]);
     }
     if let Some(copied) = shallow_copy_builtin(args[0]) {
         return Ok(copied);
     }
-    Ok(args[0])
+    if let Some(copied) = call_copy_protocol(vm, args[0])? {
+        return Ok(copied);
+    }
+    if let Some(copied) = reduce_copy(vm, args[0])? {
+        return Ok(copied);
+    }
+    Err(copy_error(args[0], "un(shallow)copyable"))
 }
 
 fn deepcopy_value(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -202,8 +227,48 @@ fn shallow_copy_builtin(value: Value) -> Option<Value> {
             let source = unsafe { &*(ptr as *const DictObject) };
             Some(crate::alloc_managed_value(shallow_copy_dict(source)))
         }
+        TypeId::SET => {
+            let source = unsafe { &*(ptr as *const SetObject) };
+            Some(crate::alloc_managed_value(source.clone()))
+        }
+        TypeId::BYTEARRAY => {
+            let source = unsafe { &*(ptr as *const BytesObject) };
+            Some(crate::alloc_managed_value(source.clone()))
+        }
         _ => None,
     }
+}
+
+fn is_copy_atomic(value: Value) -> bool {
+    if value.is_none()
+        || value.as_bool().is_some()
+        || value.as_int().is_some()
+        || value.as_float().is_some()
+        || value_as_string_ref(value).is_some()
+    {
+        return true;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    matches!(
+        extract_type_id(ptr),
+        TypeId::BYTES
+            | TypeId::CODE
+            | TypeId::COMPLEX
+            | TypeId::ELLIPSIS
+            | TypeId::EXCEPTION_TYPE
+            | TypeId::FROZENSET
+            | TypeId::FUNCTION
+            | TypeId::BUILTIN_FUNCTION
+            | TypeId::NOT_IMPLEMENTED
+            | TypeId::PROPERTY
+            | TypeId::RANGE
+            | TypeId::SLICE
+            | TypeId::TYPE
+            | TypeId::TUPLE
+    )
 }
 
 fn shallow_copy_dict(source: &DictObject) -> DictObject {
@@ -216,6 +281,209 @@ fn shallow_copy_dict(source: &DictObject) -> DictObject {
         }
     }
     copied
+}
+
+fn reduce_copy(vm: &mut VirtualMachine, value: Value) -> Result<Option<Value>, BuiltinError> {
+    let type_value = value_type_object(value);
+    if let Some(reducer) = copyreg::dispatch_reducer(vm, type_value)? {
+        let reduction =
+            invoke_callable_value(vm, reducer, &[value]).map_err(runtime_error_to_builtin_error)?;
+        return reconstruct_reduce(vm, value, reduction).map(Some);
+    }
+
+    if let Some(reduction) = call_reduce_ex(vm, value)? {
+        return reconstruct_reduce(vm, value, reduction).map(Some);
+    }
+    if let Some(reduction) = call_reduce(vm, value)? {
+        return reconstruct_reduce(vm, value, reduction).map(Some);
+    }
+    if let Some(copied) = copy_dict_backed_user(vm, value)? {
+        return Ok(Some(copied));
+    }
+    Ok(None)
+}
+
+fn call_reduce_ex(vm: &mut VirtualMachine, value: Value) -> Result<Option<Value>, BuiltinError> {
+    let method = match get_attribute_value(vm, value, &intern("__reduce_ex__")) {
+        Ok(method) => method,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+    if is_builtin_function_named(method, "object.__reduce_ex__") {
+        return Ok(None);
+    }
+    let protocol = Value::int(4).expect("copy protocol version fits tagged int");
+    invoke_callable_value(vm, method, &[protocol])
+        .map(Some)
+        .map_err(runtime_error_to_builtin_error)
+}
+
+fn call_reduce(vm: &mut VirtualMachine, value: Value) -> Result<Option<Value>, BuiltinError> {
+    let method = match get_attribute_value(vm, value, &intern("__reduce__")) {
+        Ok(method) => method,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+    invoke_callable_value(vm, method, &[])
+        .map(Some)
+        .map_err(runtime_error_to_builtin_error)
+}
+
+fn copy_dict_backed_user(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<Value>, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(None);
+    };
+    let type_id = extract_type_id(ptr);
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return Ok(None);
+    }
+    let Some(class) = global_class(ClassId(type_id.raw())) else {
+        return Ok(None);
+    };
+    let class_value = Value::object_ptr(Arc::as_ptr(&class) as *const ());
+    if !class_uses_default_new(vm, class_value)? {
+        return Ok(None);
+    }
+
+    let source = unsafe { &*(ptr as *const ShapedObject) };
+    let dict_entries = dict_storage_ref_from_ptr(ptr)
+        .map(|dict| dict.iter().collect::<Vec<(Value, Value)>>())
+        .unwrap_or_default();
+    let copied = crate::alloc_managed_value(allocate_heap_instance_for_class(class.as_ref()));
+    let copied_ptr = copied
+        .as_object_ptr()
+        .expect("new user instance values are object pointers");
+
+    {
+        let target = unsafe { &mut *(copied_ptr as *mut ShapedObject) };
+        for (name, item) in source.iter_properties() {
+            target.set_property(name, item, shape_registry());
+        }
+    }
+
+    if let Some(target_dict) = dict_storage_mut_from_ptr(copied_ptr) {
+        for (key, item) in dict_entries {
+            dict_set_item(vm, target_dict, key, item).map_err(runtime_error_to_builtin_error)?;
+        }
+    }
+
+    Ok(Some(copied))
+}
+
+fn class_uses_default_new(
+    vm: &mut VirtualMachine,
+    class_value: Value,
+) -> Result<bool, BuiltinError> {
+    match get_attribute_value(vm, class_value, &intern("__new__")) {
+        Ok(method) => Ok(is_builtin_function_named(method, "object.__new__")),
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => Ok(true),
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
+    }
+}
+
+fn is_builtin_function_named(value: Value, expected: &'static str) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    if extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION {
+        return false;
+    }
+    let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    function.name() == expected
+}
+
+fn reconstruct_reduce(
+    vm: &mut VirtualMachine,
+    original: Value,
+    reduction: Value,
+) -> Result<Value, BuiltinError> {
+    if value_as_string_ref(reduction).is_some() {
+        return Ok(original);
+    }
+
+    let tuple = value_as_tuple_ref(reduction).ok_or_else(|| {
+        BuiltinError::TypeError("copy reducer must return a string or tuple".into())
+    })?;
+    if !(2..=5).contains(&tuple.len()) {
+        return Err(BuiltinError::TypeError(
+            "copy reducer tuple must contain 2 to 5 items".to_string(),
+        ));
+    }
+
+    let callable = tuple
+        .get(0)
+        .ok_or_else(|| BuiltinError::TypeError("copy reducer is missing callable".into()))?;
+    let args_value = tuple
+        .get(1)
+        .ok_or_else(|| BuiltinError::TypeError("copy reducer is missing argument tuple".into()))?;
+    let args_tuple = value_as_tuple_ref(args_value).ok_or_else(|| {
+        BuiltinError::TypeError("copy reducer arguments must be a tuple".to_string())
+    })?;
+
+    let result = invoke_callable_value(vm, callable, args_tuple.as_slice())
+        .map_err(runtime_error_to_builtin_error)?;
+    if let Some(state) = tuple.get(2)
+        && !state.is_none()
+    {
+        restore_reduce_state(vm, result, state)?;
+    }
+
+    Ok(result)
+}
+
+fn restore_reduce_state(
+    vm: &mut VirtualMachine,
+    object: Value,
+    state: Value,
+) -> Result<(), BuiltinError> {
+    match get_attribute_value(vm, object, &intern("__setstate__")) {
+        Ok(setstate) => {
+            invoke_callable_value(vm, setstate, &[state])
+                .map(|_| ())
+                .map_err(runtime_error_to_builtin_error)?;
+            return Ok(());
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {}
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    }
+
+    let state_ptr = state
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("copy state must be a dictionary".to_string()))?;
+    let state_dict = dict_storage_ref_from_ptr(state_ptr)
+        .ok_or_else(|| BuiltinError::TypeError("copy state must be a dictionary".to_string()))?;
+
+    let object_ptr = object
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("copy state target is not an object".to_string()))?;
+    if let Some(target_dict) = dict_storage_mut_from_ptr(object_ptr) {
+        for (key, value) in state_dict.iter() {
+            dict_set_item(vm, target_dict, key, value).map_err(runtime_error_to_builtin_error)?;
+        }
+        return Ok(());
+    }
+
+    for (key, value) in state_dict.iter() {
+        let Some(name) = value_as_string_ref(key) else {
+            return Err(BuiltinError::TypeError(
+                "copy state keys must be strings for attribute restore".to_string(),
+            ));
+        };
+        set_attribute_value(vm, object, &intern(name.as_str()), value)
+            .map_err(runtime_error_to_builtin_error)?;
+    }
+    Ok(())
+}
+
+fn copy_error(value: Value, verb: &'static str) -> BuiltinError {
+    BuiltinError::TypeError(format!("{verb} object of type '{}'", value.type_name()))
 }
 
 fn deepcopy_dict_backed_user(
