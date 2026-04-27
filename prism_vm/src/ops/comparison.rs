@@ -363,6 +363,50 @@ enum NativeSequenceKind {
     Tuple,
 }
 
+#[derive(Clone, Copy)]
+enum NativeSequenceRef {
+    List(&'static ListObject),
+    Tuple(&'static TupleObject),
+}
+
+impl NativeSequenceRef {
+    #[inline]
+    fn kind(self) -> NativeSequenceKind {
+        match self {
+            Self::List(_) => NativeSequenceKind::List,
+            Self::Tuple(_) => NativeSequenceKind::Tuple,
+        }
+    }
+
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::List(list) => list.len(),
+            Self::Tuple(tuple) => tuple.len(),
+        }
+    }
+
+    #[inline]
+    fn get(self, index: usize) -> Option<Value> {
+        match self {
+            Self::List(list) => {
+                if index < list.len() {
+                    Some(unsafe { list.get_unchecked(index) })
+                } else {
+                    None
+                }
+            }
+            Self::Tuple(tuple) => {
+                if index < tuple.len() {
+                    Some(unsafe { tuple.get_unchecked(index) })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 fn native_sequence_items(value: Value) -> Option<(NativeSequenceKind, &'static [Value])> {
     if let Some(list) = value_as_list_ref(value) {
@@ -370,6 +414,25 @@ fn native_sequence_items(value: Value) -> Option<(NativeSequenceKind, &'static [
     }
 
     value_as_tuple_ref(value).map(|tuple| (NativeSequenceKind::Tuple, tuple.as_slice()))
+}
+
+#[inline]
+fn native_sequence_ref(value: Value) -> Option<NativeSequenceRef> {
+    if let Some(list) = value_as_list_ref(value) {
+        return Some(NativeSequenceRef::List(list));
+    }
+
+    value_as_tuple_ref(value).map(NativeSequenceRef::Tuple)
+}
+
+#[inline]
+fn exact_native_sequence_kind(value: Value) -> Option<NativeSequenceKind> {
+    let ptr = value.as_object_ptr()?;
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::LIST => Some(NativeSequenceKind::List),
+        TypeId::TUPLE => Some(NativeSequenceKind::Tuple),
+        _ => None,
+    }
 }
 
 pub(crate) fn builtin_eq_fallback(a: Value, b: Value) -> Option<bool> {
@@ -414,6 +477,16 @@ pub(crate) fn builtin_eq_fallback(a: Value, b: Value) -> Option<bool> {
 
 #[inline]
 pub(crate) fn eq_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, RuntimeError> {
+    let mut seen_pairs = FxHashSet::default();
+    eq_result_inner(vm, a, b, &mut seen_pairs)
+}
+
+fn eq_result_inner(
+    vm: &mut VirtualMachine,
+    a: Value,
+    b: Value,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<bool, RuntimeError> {
     if let Some(ordering) = compare_numeric_values(a, b) {
         return Ok(ordering.is_eq());
     }
@@ -430,8 +503,19 @@ pub(crate) fn eq_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         return Ok(equal);
     }
 
+    if exact_native_sequence_kind(a).is_some()
+        && exact_native_sequence_kind(a) == exact_native_sequence_kind(b)
+        && let Some(equal) = native_sequence_eq_result(vm, a, b, seen_pairs)?
+    {
+        return Ok(equal);
+    }
+
     if let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Eq)? {
         return Ok(result);
+    }
+
+    if let Some(equal) = native_sequence_eq_result(vm, a, b, seen_pairs)? {
+        return Ok(equal);
     }
 
     Ok(values_equal(a, b))
@@ -455,11 +539,93 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         return Ok(!equal);
     }
 
+    let mut seen_pairs = FxHashSet::default();
+    if exact_native_sequence_kind(a).is_some()
+        && exact_native_sequence_kind(a) == exact_native_sequence_kind(b)
+        && let Some(equal) = native_sequence_eq_result(vm, a, b, &mut seen_pairs)?
+    {
+        return Ok(!equal);
+    }
+
     if let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Ne)? {
         return Ok(result);
     }
 
+    if let Some(equal) = native_sequence_eq_result(vm, a, b, &mut seen_pairs)? {
+        return Ok(!equal);
+    }
+
     Ok(!values_equal(a, b))
+}
+
+fn native_sequence_eq_result(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<Option<bool>, RuntimeError> {
+    let Some(left_sequence) = native_sequence_ref(left) else {
+        return Ok(None);
+    };
+    let Some(right_sequence) = native_sequence_ref(right) else {
+        return Ok(None);
+    };
+    if left_sequence.kind() != right_sequence.kind() {
+        return Ok(None);
+    }
+
+    let (Some(left_ptr), Some(right_ptr)) = (left.as_object_ptr(), right.as_object_ptr()) else {
+        return Ok(None);
+    };
+    let pair = ordered_object_pair(left_ptr, right_ptr);
+    if !seen_pairs.insert(pair) {
+        return Ok(Some(true));
+    }
+
+    sequence_eq_result(vm, left_sequence, right_sequence, seen_pairs).map(Some)
+}
+
+fn sequence_eq_result(
+    vm: &mut VirtualMachine,
+    left: NativeSequenceRef,
+    right: NativeSequenceRef,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<bool, RuntimeError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+
+    let mut index = 0usize;
+    loop {
+        let left_len = left.len();
+        let right_len = right.len();
+        if index >= left_len || index >= right_len {
+            return Ok(left_len == right_len);
+        }
+
+        let Some(left_item) = left.get(index) else {
+            return Ok(right.len() == index);
+        };
+        let Some(right_item) = right.get(index) else {
+            return Ok(left.len() == index);
+        };
+
+        if left_item.raw_bits() == right_item.raw_bits() {
+            index += 1;
+            continue;
+        }
+
+        if !eq_result_inner(vm, left_item, right_item, seen_pairs)? {
+            let left_len = left.len();
+            let right_len = right.len();
+            if index >= left_len || index >= right_len {
+                return Ok(left_len == right_len);
+            }
+            return Ok(false);
+        }
+
+        index += 1;
+    }
 }
 
 fn compare_sequence_result(
