@@ -82,6 +82,8 @@ pub use sets::resolve_set_method;
 use text::char_index_to_byte_offset;
 pub use text::resolve_str_method;
 
+const DICT_MUTATED_DURING_UPDATE: &str = "dictionary changed size during iteration";
+
 static LIST_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__iter__"), list_iter));
 static LIST_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -2140,21 +2142,74 @@ pub(crate) fn dict_extend_with_vm_kw(
     keywords: &[(&str, Value)],
     method_name: &'static str,
 ) -> Result<(), BuiltinError> {
-    let entries = if let Some(source) = source {
-        collect_dict_update_entries(vm, source)?
+    if let Some(source) = source {
+        if !try_extend_from_native_dict_source(vm, receiver, source, method_name)? {
+            let entries = collect_dict_update_entries(vm, source)?;
+            apply_dict_update_entries(vm, receiver, entries, method_name)?;
+        }
     } else {
-        Vec::new()
-    };
-    let dict = expect_dict_mut(receiver, method_name)?;
-
-    for (key, value) in entries {
-        dict_set_item(vm, dict, key, value).map_err(runtime_error_to_builtin_error)?;
+        expect_dict_receiver(receiver, method_name)?;
     }
-    for &(name, value) in keywords {
-        dict.set(Value::string(intern(name)), value);
+
+    if !keywords.is_empty() {
+        let dict = expect_dict_mut(receiver, method_name)?;
+        for &(name, value) in keywords {
+            dict.set(Value::string(intern(name)), value);
+        }
     }
 
     Ok(())
+}
+
+fn try_extend_from_native_dict_source(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    source: Value,
+    method_name: &'static str,
+) -> Result<bool, BuiltinError> {
+    let Some(source_ptr) = source.as_object_ptr() else {
+        return Ok(false);
+    };
+    if receiver.as_object_ptr() == Some(source_ptr) {
+        return Ok(false);
+    }
+
+    let Some(source_dict) = dict_storage_ref_from_ptr(source_ptr) else {
+        return Ok(false);
+    };
+
+    let expected_version = source_dict.version();
+    let entries: Vec<(Value, Value)> = source_dict.iter().collect();
+    let target = expect_dict_mut(receiver, method_name)?;
+    for (key, value) in entries {
+        dict_set_item(vm, target, key, value).map_err(runtime_error_to_builtin_error)?;
+        if source_dict.version() != expected_version {
+            return Err(dict_mutated_during_update_error());
+        }
+    }
+    Ok(true)
+}
+
+#[inline]
+fn apply_dict_update_entries(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    entries: Vec<(Value, Value)>,
+    method_name: &'static str,
+) -> Result<(), BuiltinError> {
+    let dict = expect_dict_mut(receiver, method_name)?;
+    for (key, value) in entries {
+        dict_set_item(vm, dict, key, value).map_err(runtime_error_to_builtin_error)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn dict_mutated_during_update_error() -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::RuntimeError.as_u8() as u16,
+        DICT_MUTATED_DURING_UPDATE,
+    ))
 }
 
 #[inline]
