@@ -316,6 +316,14 @@ pub fn value_as_bytes_ref(value: Value) -> Option<&'static BytesObject> {
     object_ptr_as_bytes_ref(ptr)
 }
 
+/// Mutably borrow native byte-sequence storage from exact `bytes`/`bytearray`
+/// values and heap subclasses backed by native byte storage.
+#[inline]
+pub fn value_as_bytes_mut(value: Value) -> Option<&'static mut BytesObject> {
+    let ptr = value.as_object_ptr()? as *mut ();
+    object_ptr_as_bytes_mut(ptr)
+}
+
 #[inline(always)]
 fn is_shaped_heap_type(type_id: TypeId) -> bool {
     type_id.raw() >= TypeId::FIRST_USER_TYPE
@@ -330,6 +338,19 @@ pub fn object_ptr_as_bytes_ref(ptr: *const ()) -> Option<&'static BytesObject> {
         TypeId::BYTES | TypeId::BYTEARRAY => Some(unsafe { &*(ptr as *const BytesObject) }),
         type_id if is_shaped_heap_type(type_id) => unsafe {
             (&*(ptr as *const ShapedObject)).bytes_backing()
+        },
+        _ => None,
+    }
+}
+
+/// Mutably borrow native byte-sequence storage from an object pointer.
+#[inline]
+pub fn object_ptr_as_bytes_mut(ptr: *mut ()) -> Option<&'static mut BytesObject> {
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::BYTES | TypeId::BYTEARRAY => Some(unsafe { &mut *(ptr as *mut BytesObject) }),
+        type_id if is_shaped_heap_type(type_id) => unsafe {
+            (&mut *(ptr as *mut ShapedObject)).bytes_backing_mut()
         },
         _ => None,
     }

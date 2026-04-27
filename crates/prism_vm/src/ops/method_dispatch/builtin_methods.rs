@@ -53,7 +53,7 @@ use prism_runtime::object::descriptor::{
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
-use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_mut, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint, value_to_saturated_i64};
 use prism_runtime::types::iter::{IteratorEmptyIterable, IteratorObject, IteratorReduction};
@@ -4122,22 +4122,20 @@ fn expect_bytearray_ref(
     value: Value,
     method_name: &'static str,
 ) -> Result<&'static BytesObject, BuiltinError> {
-    let Some(ptr) = value.as_object_ptr() else {
-        return Err(BuiltinError::TypeError(format!(
+    let bytes = value_as_bytes_ref(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
             "descriptor 'bytearray.{method_name}' requires a 'bytearray' object but received '{}'",
             value.type_name()
-        )));
-    };
-
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::BYTEARRAY {
-        return Err(BuiltinError::TypeError(format!(
+        ))
+    })?;
+    if bytes.header.type_id == TypeId::BYTEARRAY {
+        Ok(bytes)
+    } else {
+        Err(BuiltinError::TypeError(format!(
             "descriptor 'bytearray.{method_name}' requires a 'bytearray' object but received '{}'",
-            header.type_id.name()
-        )));
+            value.type_name()
+        )))
     }
-
-    Ok(unsafe { &*(ptr as *const BytesObject) })
 }
 
 #[inline]
@@ -4145,22 +4143,20 @@ fn expect_bytearray_mut(
     value: Value,
     method_name: &'static str,
 ) -> Result<&'static mut BytesObject, BuiltinError> {
-    let Some(ptr) = value.as_object_ptr() else {
-        return Err(BuiltinError::TypeError(format!(
+    let bytes = value_as_bytes_mut(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
             "descriptor 'bytearray.{method_name}' requires a 'bytearray' object but received '{}'",
             value.type_name()
-        )));
-    };
-
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::BYTEARRAY {
-        return Err(BuiltinError::TypeError(format!(
+        ))
+    })?;
+    if bytes.header.type_id == TypeId::BYTEARRAY {
+        Ok(bytes)
+    } else {
+        Err(BuiltinError::TypeError(format!(
             "descriptor 'bytearray.{method_name}' requires a 'bytearray' object but received '{}'",
-            header.type_id.name()
-        )));
+            value.type_name()
+        )))
     }
-
-    Ok(unsafe { &mut *(ptr as *mut BytesObject) })
 }
 
 #[inline]
@@ -4269,22 +4265,20 @@ fn expect_bytes_ref(
     value: Value,
     method_name: &'static str,
 ) -> Result<&'static BytesObject, BuiltinError> {
-    let Some(ptr) = value.as_object_ptr() else {
-        return Err(BuiltinError::TypeError(format!(
+    let bytes = value_as_bytes_ref(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
             "descriptor 'bytes.{method_name}' requires a 'bytes' object but received '{}'",
             value.type_name()
-        )));
-    };
-
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::BYTES {
-        return Err(BuiltinError::TypeError(format!(
+        ))
+    })?;
+    if bytes.header.type_id == TypeId::BYTES {
+        Ok(bytes)
+    } else {
+        Err(BuiltinError::TypeError(format!(
             "descriptor 'bytes.{method_name}' requires a 'bytes' object but received '{}'",
-            header.type_id.name()
-        )));
+            value.type_name()
+        )))
     }
-
-    Ok(unsafe { &*(ptr as *const BytesObject) })
 }
 
 #[inline]
