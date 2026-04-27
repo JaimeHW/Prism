@@ -2084,10 +2084,27 @@ fn builtin_str_impl(
         if let Some(rendered) = str_protocol_value(vm, value)? {
             return Ok(rendered);
         }
+        if let Some(rendered) = string_backing_to_exact_str(value) {
+            return Ok(rendered);
+        }
         return super::functions::builtin_repr_vm(vm, &[value]);
     }
 
+    if let Some(rendered) = string_backing_to_exact_str(value) {
+        return Ok(rendered);
+    }
+
     super::functions::builtin_repr(&[value])
+}
+
+#[inline]
+fn string_backing_to_exact_str(value: Value) -> Option<Value> {
+    let text = value_as_string_ref(value)?;
+    if text.is_empty() {
+        Some(Value::string(intern("")))
+    } else {
+        Some(to_object_value(StringObject::new(text.as_str())))
+    }
 }
 
 fn builtin_str_kw(positional: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
