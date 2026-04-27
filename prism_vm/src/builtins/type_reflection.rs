@@ -324,6 +324,7 @@ const LIST_METHOD_NAMES: &[&str] = &[
     "__iter__",
     "__len__",
     "__getitem__",
+    "__contains__",
     "__add__",
     "append",
     "extend",
@@ -412,7 +413,14 @@ const MEMORYVIEW_METHOD_NAMES: &[&str] = &[
     "__enter__",
     "__exit__",
 ];
-const TUPLE_METHOD_NAMES: &[&str] = &["__iter__", "__len__", "__getitem__", "count", "index"];
+const TUPLE_METHOD_NAMES: &[&str] = &[
+    "__iter__",
+    "__len__",
+    "__getitem__",
+    "__contains__",
+    "count",
+    "index",
+];
 const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
 const PROPERTY_METHOD_NAMES: &[&str] = &[

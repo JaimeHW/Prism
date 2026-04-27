@@ -10,7 +10,7 @@ use crate::builtins::{
     builtin_hash, builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
     builtin_mapping_proxy_get_item_static, builtin_mapping_proxy_len,
     builtin_not_implemented_value, get_exception_type, get_iterator_mut, iterator_to_value,
-    try_length_hint, value_to_iterator,
+    runtime_error_to_builtin_error, try_length_hint, value_to_iterator,
 };
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
@@ -77,6 +77,9 @@ static LIST_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__len__"), list_len));
 static LIST_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__getitem__"), list_getitem));
+static LIST_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("list.__contains__"), list_contains)
+});
 static LIST_ADD_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.__add__"), list_add));
 static LIST_IADD_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -90,7 +93,7 @@ static LIST_EXTEND_METHOD: LazyLock<BuiltinFunctionObject> =
 static LIST_INSERT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.insert"), list_insert));
 static LIST_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.remove"), list_remove));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.remove"), list_remove));
 static LIST_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.pop"), list_pop));
 static LIST_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -98,9 +101,9 @@ static LIST_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
 static LIST_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.clear"), list_clear));
 static LIST_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.count"), list_count));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.count"), list_count));
 static LIST_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.index"), list_index));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("list.index"), list_index));
 static LIST_REVERSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("list.reverse"), list_reverse));
 static LIST_SORT_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -111,10 +114,13 @@ static TUPLE_LEN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.__len__"), tuple_len));
 static TUPLE_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.__getitem__"), tuple_getitem));
+static TUPLE_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("tuple.__contains__"), tuple_contains)
+});
 static TUPLE_COUNT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.count"), tuple_count));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("tuple.count"), tuple_count));
 static TUPLE_INDEX_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("tuple.index"), tuple_index));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("tuple.index"), tuple_index));
 static DEQUE_APPEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.append"), deque_append));
 static DEQUE_APPENDLEFT_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -391,6 +397,9 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
         "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_GETITEM_METHOD,
         ))),
+        "__contains__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_CONTAINS_METHOD,
+        ))),
         "__add__" => Some(CachedMethod::simple(builtin_method_value(&LIST_ADD_METHOD))),
         "__iadd__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_IADD_METHOD,
@@ -444,6 +453,9 @@ pub fn resolve_tuple_method(name: &str) -> Option<CachedMethod> {
         ))),
         "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
             &TUPLE_GETITEM_METHOD,
+        ))),
+        "__contains__" => Some(CachedMethod::simple(builtin_method_value(
+            &TUPLE_CONTAINS_METHOD,
         ))),
         "count" => Some(CachedMethod::simple(builtin_method_value(
             &TUPLE_COUNT_METHOD,
@@ -985,16 +997,23 @@ fn list_insert(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn list_remove(args: &[Value]) -> Result<Value, BuiltinError> {
+fn list_remove(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "remove", args, 1)?;
+    let ptr = expect_list_ptr(args[0], "remove")?;
+    let needle = args[1];
 
-    let remove_index = {
-        let list = expect_list_ref(args[0], "remove")?;
-        list.as_slice()
-            .iter()
-            .copied()
-            .position(|item| crate::ops::comparison::values_equal(item, args[1]))
-    };
+    let mut index = 0usize;
+    let mut remove_index = None;
+    while index < list_len_from_ptr(ptr) {
+        let Some(item) = list_item_from_ptr(ptr, index) else {
+            break;
+        };
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            remove_index = Some(index);
+            break;
+        }
+        index += 1;
+    }
 
     let Some(index) = remove_index else {
         return Err(BuiltinError::ValueError(
@@ -1049,23 +1068,39 @@ fn list_clear(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn list_count(args: &[Value]) -> Result<Value, BuiltinError> {
+fn list_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("list", "__contains__", args, 1)?;
+    let ptr = expect_list_ptr(args[0], "__contains__")?;
+    sequence_contains_indexed(vm, list_len_from_ptr, list_item_from_ptr, ptr, args[1])
+        .map(Value::bool)
+}
+
+#[inline]
+fn list_count(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "count", args, 1)?;
-    let list = expect_list_ref(args[0], "count")?;
-    let count = list
-        .as_slice()
-        .iter()
-        .copied()
-        .filter(|item| crate::ops::comparison::values_equal(*item, args[1]))
-        .count();
+    let ptr = expect_list_ptr(args[0], "count")?;
+    let needle = args[1];
+    let mut count = 0usize;
+    let mut index = 0usize;
+
+    while index < list_len_from_ptr(ptr) {
+        let Some(item) = list_item_from_ptr(ptr, index) else {
+            break;
+        };
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            count = count.saturating_add(1);
+        }
+        index += 1;
+    }
+
     Ok(Value::int(i64::try_from(count).unwrap_or(i64::MAX)).expect("count should fit"))
 }
 
 #[inline]
-fn list_index(args: &[Value]) -> Result<Value, BuiltinError> {
+fn list_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_range("list", "index", args, 1, 3)?;
-    let list = expect_list_ref(args[0], "index")?;
-    let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+    let ptr = expect_list_ptr(args[0], "index")?;
+    let len = i64::try_from(list_len_from_ptr(ptr)).unwrap_or(i64::MAX);
     let start = if args.len() >= 3 {
         normalize_search_bound(expect_integer_like_index(args[2])?, len)
     } else {
@@ -1077,13 +1112,18 @@ fn list_index(args: &[Value]) -> Result<Value, BuiltinError> {
         len
     };
 
-    for index in start..stop {
-        let item = list
-            .get(index)
-            .expect("normalized list.index bounds should stay in range");
-        if crate::ops::comparison::values_equal(item, args[1]) {
-            return Ok(Value::int(index).expect("list.index result should fit"));
+    let needle = args[1];
+    let mut index = usize::try_from(start).unwrap_or(usize::MAX);
+    let stop = usize::try_from(stop).unwrap_or(usize::MAX);
+    while index < stop && index < list_len_from_ptr(ptr) {
+        let Some(item) = list_item_from_ptr(ptr, index) else {
+            break;
+        };
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            return Ok(Value::int(i64::try_from(index).unwrap_or(i64::MAX))
+                .expect("list.index result should fit"));
         }
+        index += 1;
     }
 
     Err(BuiltinError::ValueError(
@@ -1132,20 +1172,27 @@ fn tuple_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn tuple_count(args: &[Value]) -> Result<Value, BuiltinError> {
+fn tuple_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("tuple", "__contains__", args, 1)?;
+    let tuple = expect_tuple_ref(args[0], "__contains__")?;
+    sequence_contains_slice(vm, tuple.as_slice(), args[1]).map(Value::bool)
+}
+
+#[inline]
+fn tuple_count(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("tuple", "count", args, 1)?;
     let tuple = expect_tuple_ref(args[0], "count")?;
-    let count = tuple
-        .as_slice()
-        .iter()
-        .copied()
-        .filter(|item| crate::ops::comparison::values_equal(*item, args[1]))
-        .count();
+    let mut count = 0usize;
+    for item in tuple.as_slice().iter().copied() {
+        if eq_result(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
+            count = count.saturating_add(1);
+        }
+    }
     Ok(Value::int(i64::try_from(count).unwrap_or(i64::MAX)).expect("count should fit"))
 }
 
 #[inline]
-fn tuple_index(args: &[Value]) -> Result<Value, BuiltinError> {
+fn tuple_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_range("tuple", "index", args, 1, 3)?;
     let tuple = expect_tuple_ref(args[0], "index")?;
     let len = i64::try_from(tuple.len()).unwrap_or(i64::MAX);
@@ -1162,7 +1209,7 @@ fn tuple_index(args: &[Value]) -> Result<Value, BuiltinError> {
 
     for index in start..stop {
         let item = tuple.as_slice()[index as usize];
-        if crate::ops::comparison::values_equal(item, args[1]) {
+        if eq_result(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
             return Ok(Value::int(index).expect("tuple.index result should fit"));
         }
     }
@@ -1170,6 +1217,41 @@ fn tuple_index(args: &[Value]) -> Result<Value, BuiltinError> {
     Err(BuiltinError::ValueError(
         "tuple.index(x): x not in tuple".to_string(),
     ))
+}
+
+#[inline]
+fn sequence_contains_slice(
+    vm: &mut VirtualMachine,
+    items: &[Value],
+    needle: Value,
+) -> Result<bool, BuiltinError> {
+    for item in items.iter().copied() {
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[inline]
+fn sequence_contains_indexed(
+    vm: &mut VirtualMachine,
+    len: fn(*const ()) -> usize,
+    item_at: fn(*const (), usize) -> Option<Value>,
+    ptr: *const (),
+    needle: Value,
+) -> Result<bool, BuiltinError> {
+    let mut index = 0usize;
+    while index < len(ptr) {
+        let Some(item) = item_at(ptr, index) else {
+            break;
+        };
+        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+            return Ok(true);
+        }
+        index += 1;
+    }
+    Ok(false)
 }
 
 #[inline]
@@ -2757,39 +2839,6 @@ fn collect_iterable_values_with_vm(
 }
 
 #[inline]
-fn runtime_error_to_builtin_error(err: crate::error::RuntimeError) -> BuiltinError {
-    let kind = err.kind().clone();
-    match kind {
-        RuntimeErrorKind::TypeError { message } => BuiltinError::TypeError(message.to_string()),
-        RuntimeErrorKind::UnsupportedOperandTypes { op, left, right } => BuiltinError::TypeError(
-            format!("unsupported operand type(s) for {op}: '{left}' and '{right}'"),
-        ),
-        RuntimeErrorKind::NotCallable { type_name } => {
-            BuiltinError::TypeError(format!("'{}' object is not callable", type_name))
-        }
-        RuntimeErrorKind::NotIterable { type_name } => {
-            BuiltinError::TypeError(format!("'{}' object is not iterable", type_name))
-        }
-        RuntimeErrorKind::NotSubscriptable { type_name } => {
-            BuiltinError::TypeError(format!("'{}' object is not subscriptable", type_name))
-        }
-        RuntimeErrorKind::AttributeError { type_name, attr } => BuiltinError::AttributeError(
-            format!("'{}' object has no attribute '{}'", type_name, attr),
-        ),
-        RuntimeErrorKind::KeyError { key } => BuiltinError::KeyError(key.to_string()),
-        RuntimeErrorKind::IndexError { index, length } => {
-            BuiltinError::IndexError(format!("index {index} out of range for length {length}"))
-        }
-        RuntimeErrorKind::ValueError { message } => BuiltinError::ValueError(message.to_string()),
-        RuntimeErrorKind::OverflowError { message } => {
-            BuiltinError::OverflowError(message.to_string())
-        }
-        RuntimeErrorKind::StopIteration => BuiltinError::StopIteration,
-        _ => BuiltinError::Raised(err),
-    }
-}
-
-#[inline]
 fn with_str_receiver<R>(
     value: Value,
     method_name: &'static str,
@@ -2855,6 +2904,12 @@ fn expect_list_ref(
     value: Value,
     method_name: &'static str,
 ) -> Result<&'static ListObject, BuiltinError> {
+    let ptr = expect_list_ptr(value, method_name)?;
+    Ok(list_ref_from_ptr(ptr))
+}
+
+#[inline]
+fn expect_list_ptr(value: Value, method_name: &'static str) -> Result<*const (), BuiltinError> {
     let Some(ptr) = value.as_object_ptr() else {
         return Err(BuiltinError::TypeError(format!(
             "descriptor 'list.{method_name}' requires a 'list' object but received '{}'",
@@ -2862,15 +2917,30 @@ fn expect_list_ref(
         )));
     };
 
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    let Some(list) = list_storage_ref_from_ptr(ptr) else {
+    if list_storage_ref_from_ptr(ptr).is_none() {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
         return Err(BuiltinError::TypeError(format!(
             "descriptor 'list.{method_name}' requires a 'list' object but received '{}'",
             header.type_id.name()
         )));
-    };
+    }
 
-    Ok(list)
+    Ok(ptr)
+}
+
+#[inline]
+fn list_ref_from_ptr(ptr: *const ()) -> &'static ListObject {
+    list_storage_ref_from_ptr(ptr).expect("validated list-backed object")
+}
+
+#[inline]
+fn list_len_from_ptr(ptr: *const ()) -> usize {
+    list_ref_from_ptr(ptr).len()
+}
+
+#[inline]
+fn list_item_from_ptr(ptr: *const (), index: usize) -> Option<Value> {
+    list_ref_from_ptr(ptr).get(i64::try_from(index).ok()?)
 }
 
 #[inline]

@@ -15,6 +15,7 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::objects::{list_storage_ref_from_ptr, tuple_storage_ref_from_ptr};
 use crate::ops::protocols::{binary_special_method, inplace_special_method};
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
@@ -1022,26 +1023,26 @@ fn repeat_sequence_value(value: Value, count: i64) -> Result<Option<Value>, Runt
     let repeat = repeat_count(count)?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
 
+    if let Some(list) = list_storage_ref_from_ptr(ptr) {
+        ensure_repeated_sequence_len(list.len(), repeat)?;
+        let repeated = list
+            .repeat(repeat)
+            .ok_or_else(sequence_repeat_memory_error)?;
+        return Ok(Some(boxed_list_value(repeated)));
+    }
+
+    if let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+        if header.type_id == TypeId::TUPLE && repeat == 1 {
+            return Ok(Some(value));
+        }
+        ensure_repeated_sequence_len(tuple.len(), repeat)?;
+        let repeated = tuple
+            .repeat(repeat)
+            .ok_or_else(sequence_repeat_memory_error)?;
+        return Ok(Some(boxed_tuple_value(repeated)));
+    }
+
     match header.type_id {
-        TypeId::LIST => {
-            let list = unsafe { &*(ptr as *const ListObject) };
-            ensure_repeated_sequence_len(list.len(), repeat)?;
-            let repeated = list
-                .repeat(repeat)
-                .ok_or_else(sequence_repeat_memory_error)?;
-            Ok(Some(boxed_list_value(repeated)))
-        }
-        TypeId::TUPLE => {
-            if repeat == 1 {
-                return Ok(Some(value));
-            }
-            let tuple = unsafe { &*(ptr as *const TupleObject) };
-            ensure_repeated_sequence_len(tuple.len(), repeat)?;
-            let repeated = tuple
-                .repeat(repeat)
-                .ok_or_else(sequence_repeat_memory_error)?;
-            Ok(Some(boxed_tuple_value(repeated)))
-        }
         TypeId::BYTES | TypeId::BYTEARRAY => {
             let bytes = unsafe { &*(ptr as *const BytesObject) };
             ensure_repeated_sequence_len(bytes.len(), repeat)?;
