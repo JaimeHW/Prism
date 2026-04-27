@@ -1418,9 +1418,9 @@ fn list_sort_with_vm(
 ) -> Result<Value, BuiltinError> {
     expect_method_arg_count("list", "sort", args, 0)?;
     let (key_func, reverse) = parse_list_sort_keywords(vm, keywords)?;
-    let values = {
+    let (values, mutation_version) = {
         let list = expect_list_ref(args[0], "sort")?;
-        list.as_slice().to_vec()
+        (list.as_slice().to_vec(), list.mutation_version())
     };
 
     let mut decorated = Vec::with_capacity(values.len());
@@ -1432,6 +1432,7 @@ fn list_sort_with_vm(
         };
         decorated.push((sort_key, value));
     }
+    ensure_list_not_modified_during_sort(args[0], mutation_version)?;
 
     let mut compare_error = None;
     decorated.sort_by(|(left_key, _), (right_key, _)| {
@@ -1450,6 +1451,7 @@ fn list_sort_with_vm(
     if let Some(err) = compare_error {
         return Err(err);
     }
+    ensure_list_not_modified_during_sort(args[0], mutation_version)?;
 
     if reverse {
         decorated.reverse();
@@ -1459,6 +1461,21 @@ fn list_sort_with_vm(
     list.clear();
     list.extend(decorated.into_iter().map(|(_, value)| value));
     Ok(Value::none())
+}
+
+#[inline]
+fn ensure_list_not_modified_during_sort(
+    receiver: Value,
+    expected_version: u64,
+) -> Result<(), BuiltinError> {
+    let list = expect_list_ref(receiver, "sort")?;
+    if list.mutation_version() == expected_version {
+        Ok(())
+    } else {
+        Err(BuiltinError::ValueError(
+            "list modified during sort".to_string(),
+        ))
+    }
 }
 
 #[inline]

@@ -11,7 +11,8 @@
 //! All templates reuse helpers from `list_specialize.rs` via `pub(super)` visibility.
 
 use super::list_specialize::{
-    emit_int_check_and_extract_for_list, emit_list_check_and_extract, list_layout,
+    emit_bump_list_mutation_version, emit_int_check_and_extract_for_list,
+    emit_list_check_and_extract, list_layout,
 };
 use super::{OpcodeTemplate, TemplateContext, value_tags};
 use crate::backend::x64::registers::{MemOperand, Scale};
@@ -95,6 +96,7 @@ impl OpcodeTemplate for ListPopLastTemplate {
 
         // Write new length back
         ctx.asm.mov_mr(&len_mem, scratch1);
+        emit_bump_list_mutation_version(ctx, acc, scratch2);
 
         // Load items pointer: scratch2 = list->vec.ptr
         let items_mem = MemOperand {
@@ -263,15 +265,21 @@ impl OpcodeTemplate for ListClearTemplate {
         emit_list_check_and_extract(ctx, acc, acc, scratch1, self.deopt_idx);
         // acc = ListObject pointer
 
-        // Set vec.len = 0
-        ctx.asm.xor_rr(scratch1, scratch1); // scratch1 = 0
+        // Set vec.len = 0 when the list is non-empty.
         let len_mem = MemOperand {
             base: Some(acc),
             index: None,
             scale: Scale::X1,
             disp: list_layout::ITEMS_LEN_OFFSET,
         };
+        ctx.asm.mov_rm(scratch1, &len_mem);
+        ctx.asm.cmp_ri(scratch1, 0);
+        let done_label = ctx.asm.create_label();
+        ctx.asm.je(done_label);
+        ctx.asm.xor_rr(scratch1, scratch1); // scratch1 = 0
         ctx.asm.mov_mr(&len_mem, scratch1);
+        emit_bump_list_mutation_version(ctx, acc, scratch1);
+        ctx.asm.bind_label(done_label);
     }
 
     #[inline]

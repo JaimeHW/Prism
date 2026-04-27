@@ -40,6 +40,8 @@ pub struct ListObject {
     pub header: ObjectHeader,
     /// List items.
     items: Vec<Value>,
+    /// Monotonic structural mutation version.
+    mutation_version: u64,
 }
 
 impl ListObject {
@@ -49,6 +51,7 @@ impl ListObject {
         Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: Vec::new(),
+            mutation_version: 0,
         }
     }
 
@@ -58,6 +61,7 @@ impl ListObject {
         Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: Vec::with_capacity(capacity),
+            mutation_version: 0,
         }
     }
 
@@ -67,6 +71,7 @@ impl ListObject {
         Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: iter.into_iter().collect(),
+            mutation_version: 0,
         }
     }
 
@@ -76,6 +81,7 @@ impl ListObject {
         Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: slice.to_vec(),
+            mutation_version: 0,
         }
     }
 
@@ -83,6 +89,17 @@ impl ListObject {
     #[inline]
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Current structural mutation version.
+    #[inline]
+    pub fn mutation_version(&self) -> u64 {
+        self.mutation_version
+    }
+
+    #[inline]
+    fn bump_mutation_version(&mut self) {
+        self.mutation_version = self.mutation_version.wrapping_add(1);
     }
 
     /// Check if the list is empty.
@@ -113,6 +130,7 @@ impl ListObject {
     pub fn set(&mut self, index: i64, value: Value) -> bool {
         if let Some(idx) = self.normalize_index(index) {
             self.items[idx] = value;
+            self.bump_mutation_version();
             true
         } else {
             false
@@ -123,36 +141,51 @@ impl ListObject {
     #[inline]
     pub fn push(&mut self, value: Value) {
         self.items.push(value);
+        self.bump_mutation_version();
     }
 
     /// Remove and return the last item.
     #[inline]
     pub fn pop(&mut self) -> Option<Value> {
-        self.items.pop()
+        let value = self.items.pop();
+        if value.is_some() {
+            self.bump_mutation_version();
+        }
+        value
     }
 
     /// Insert an item at index.
     pub fn insert(&mut self, index: i64, value: Value) {
         let idx = self.normalize_index_for_insert(index);
         self.items.insert(idx, value);
+        self.bump_mutation_version();
     }
 
     /// Remove and return item at index.
     pub fn remove(&mut self, index: i64) -> Option<Value> {
         let idx = self.normalize_index(index)?;
-        Some(self.items.remove(idx))
+        let value = self.items.remove(idx);
+        self.bump_mutation_version();
+        Some(value)
     }
 
     /// Clear all items.
     #[inline]
     pub fn clear(&mut self) {
-        self.items.clear();
+        if !self.items.is_empty() {
+            self.items.clear();
+            self.bump_mutation_version();
+        }
     }
 
     /// Extend list with items from iterator.
     #[inline]
     pub fn extend<I: IntoIterator<Item = Value>>(&mut self, iter: I) {
+        let old_len = self.items.len();
         self.items.extend(iter);
+        if self.items.len() != old_len {
+            self.bump_mutation_version();
+        }
     }
 
     /// Replace the elements selected by `slice` with the provided replacement
@@ -171,6 +204,7 @@ impl ListObject {
         if indices.step == 1 {
             let end = indices.stop.max(indices.start);
             self.items.splice(indices.start..end, replacement);
+            self.bump_mutation_version();
             return Ok(());
         }
 
@@ -184,6 +218,7 @@ impl ListObject {
         for (index, value) in indices.iter().zip(replacement.into_iter()) {
             self.items[index] = value;
         }
+        self.bump_mutation_version();
 
         Ok(())
     }
@@ -200,6 +235,7 @@ impl ListObject {
         if indices.step == 1 {
             let end = indices.stop.max(indices.start);
             self.items.drain(indices.start..end);
+            self.bump_mutation_version();
             return;
         }
 
@@ -209,12 +245,16 @@ impl ListObject {
         for index in removal_indices {
             self.items.remove(index);
         }
+        self.bump_mutation_version();
     }
 
     /// Reverse the list in place.
     #[inline]
     pub fn reverse(&mut self) {
-        self.items.reverse();
+        if self.items.len() > 1 {
+            self.items.reverse();
+            self.bump_mutation_version();
+        }
     }
 
     /// Concatenate two lists into a new list.
@@ -235,6 +275,7 @@ impl ListObject {
         Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: result,
+            mutation_version: 0,
         }
     }
 
@@ -262,6 +303,7 @@ impl ListObject {
         Some(Self {
             header: ObjectHeader::new(TypeId::LIST),
             items: result,
+            mutation_version: 0,
         })
     }
 
@@ -272,7 +314,10 @@ impl ListObject {
     #[inline]
     pub fn repeat_in_place(&mut self, n: usize) -> Option<()> {
         if n == 0 || self.items.is_empty() {
-            self.items.clear();
+            if !self.items.is_empty() {
+                self.items.clear();
+                self.bump_mutation_version();
+            }
             return Some(());
         }
         if n == 1 {
@@ -290,6 +335,7 @@ impl ListObject {
             let copy_len = self.items.len().min(remaining);
             self.items.extend_from_within(..copy_len);
         }
+        self.bump_mutation_version();
 
         Some(())
     }

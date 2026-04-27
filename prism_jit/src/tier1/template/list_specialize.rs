@@ -19,6 +19,7 @@
 //!  16      8    Vec<Value>.ptr        (pointer to items)
 //!  24      8    Vec<Value>.len        (usize)
 //!  32      8    Vec<Value>.cap        (usize)
+//!  40      8    mutation_version      (u64)
 //! ```
 //!
 //! NaN-boxing: Lists are object-tagged via `OBJECT_TAG`. The payload is a
@@ -44,6 +45,7 @@ use crate::backend::x64::registers::{MemOperand, Scale};
 /// ```text
 /// ObjectHeader: 16 bytes (type_id u32 + gc_flags u32 + hash u64)
 /// Vec<Value>: 24 bytes (ptr usize + len usize + cap usize)
+/// mutation_version: 8 bytes
 /// ```
 pub(super) mod list_layout {
     /// Offset of `type_id` (u32) within ObjectHeader.
@@ -58,11 +60,31 @@ pub(super) mod list_layout {
     /// Offset of Vec<Value>.cap within ListObject.
     pub const ITEMS_CAP_OFFSET: i32 = 32;
 
+    /// Offset of the structural mutation version within ListObject.
+    pub const MUTATION_VERSION_OFFSET: i32 = 40;
+
     /// Size of a single Value (u64 = 8 bytes).
     pub const VALUE_SIZE: i32 = 8;
 
     /// TypeId::LIST raw value.
     pub const LIST_TYPE_ID: u32 = 6;
+}
+
+#[inline]
+pub(super) fn emit_bump_list_mutation_version(
+    ctx: &mut TemplateContext,
+    list_ptr: Gpr,
+    scratch: Gpr,
+) {
+    let version_mem = MemOperand {
+        base: Some(list_ptr),
+        index: None,
+        scale: Scale::X1,
+        disp: list_layout::MUTATION_VERSION_OFFSET,
+    };
+    ctx.asm.mov_rm(scratch, &version_mem);
+    ctx.asm.inc(scratch);
+    ctx.asm.mov_mr(&version_mem, scratch);
 }
 
 // =============================================================================
@@ -399,6 +421,8 @@ impl OpcodeTemplate for ListStoreTemplate {
         ctx.asm.cmp_rr(scratch1, scratch2);
         ctx.asm.jae(ctx.deopt_label(self.deopt_idx));
 
+        ctx.asm.push(acc);
+
         // Load items pointer
         let items_mem = MemOperand {
             base: Some(acc),
@@ -420,6 +444,9 @@ impl OpcodeTemplate for ListStoreTemplate {
             disp: 0,
         };
         ctx.asm.mov_mr(&item_mem, scratch2);
+
+        ctx.asm.pop(acc);
+        emit_bump_list_mutation_version(ctx, acc, scratch2);
     }
 
     #[inline]
@@ -553,6 +580,7 @@ impl OpcodeTemplate for ListAppendFastTemplate {
         // Increment length: list->vec.len += 1
         ctx.asm.inc(scratch1);
         ctx.asm.mov_mr(&len_mem, scratch1);
+        emit_bump_list_mutation_version(ctx, acc, scratch2);
     }
 
     #[inline]
