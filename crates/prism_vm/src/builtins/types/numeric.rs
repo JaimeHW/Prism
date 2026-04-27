@@ -1051,12 +1051,12 @@ pub fn builtin_float_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
     }
 
     let arg = args[0];
-    if let Some(value) = builtin_float_base(arg)? {
+    if let Some(value) = builtin_float_exact_base(arg)? {
         return Ok(value);
     }
 
     if let Some(result) = invoke_zero_arg_special_method(vm, arg, "__float__")? {
-        if let Some(float) = result.as_float() {
+        if let Some(float) = prism_runtime::types::float::value_to_f64(result) {
             return Ok(Value::float(float));
         }
         return Err(BuiltinError::TypeError(format!(
@@ -1065,11 +1065,34 @@ pub fn builtin_float_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
         )));
     }
 
+    if let Some(float) = prism_runtime::types::float::value_to_f64(arg) {
+        return Ok(Value::float(float));
+    }
+
     if let Some(result) = invoke_zero_arg_special_method(vm, arg, "__index__")? {
         return float_from_index_value(result);
     }
 
     Err(builtin_float_unsupported_argument(arg))
+}
+
+#[inline]
+fn builtin_float_exact_base(arg: Value) -> Result<Option<Value>, BuiltinError> {
+    if let Some(text_arg) = float_text_argument(arg) {
+        return parse_float_text_argument(&text_arg).map(Some);
+    }
+
+    if let Some(f) = arg.as_float() {
+        return Ok(Some(Value::float(f)));
+    }
+    if let Some(i) = arg.as_int() {
+        return Ok(Some(Value::float(i as f64)));
+    }
+    if let Some(b) = arg.as_bool() {
+        return Ok(Some(Value::float(if b { 1.0 } else { 0.0 })));
+    }
+
+    Ok(None)
 }
 
 const F64_FRACTION_BITS: u32 = 52;
