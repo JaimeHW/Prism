@@ -51,6 +51,9 @@ const ASCII_MAX: u32 = 0x7F;
 /// Maximum byte sequence length accepted by constructors.
 const MAX_BYTE_SEQUENCE_SIZE: i64 = 1_000_000_000;
 
+/// Hard cap that prevents adversarial format specs from allocating forever.
+const MAX_FLOAT_FORMAT_PRECISION: usize = 1_000_000;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ByteSequenceKind {
     Bytes,
@@ -1403,7 +1406,12 @@ fn format_float(f: f64, format_spec: &str) -> Result<Value, BuiltinError> {
         _ if format_spec.starts_with('.') => {
             // Precision specification
             if let Some(precision) = parse_precision(format_spec) {
-                format!("{:.prec$}", f, prec = precision)
+                if precision > MAX_FLOAT_FORMAT_PRECISION {
+                    return Err(BuiltinError::OverflowError(
+                        "formatted float is too long".to_string(),
+                    ));
+                }
+                format!("{:.*}", precision, f)
             } else {
                 format!("{}", f)
             }
