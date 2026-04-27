@@ -7,6 +7,7 @@
 use crate::object::ObjectHeader;
 use crate::object::descriptor::BoundMethod;
 use crate::object::type_obj::TypeId;
+use crate::types::float::value_to_f64;
 use crate::types::int::value_to_bigint;
 use crate::types::set::SetObject;
 use crate::types::string::value_as_string_ref;
@@ -90,7 +91,7 @@ fn numeric_as_f64(value: Value) -> Option<f64> {
     if let Some(i) = value_to_bigint(value) {
         return i.to_f64();
     }
-    value.as_float()
+    value_to_f64(value)
 }
 
 #[inline]
@@ -115,7 +116,7 @@ fn hash_hashable_value<H: Hasher>(value: Value, state: &mut H) {
         return;
     }
 
-    if let Some(f) = value.as_float() {
+    if let Some(f) = value_to_f64(value) {
         if f.fract() == 0.0 && f.is_finite() && f >= (i64::MIN as f64) && f <= (i64::MAX as f64) {
             (f as i64).hash(state);
         } else {

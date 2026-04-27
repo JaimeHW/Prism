@@ -276,6 +276,13 @@ pub struct ShapedObject {
     /// semantics while preserving user-defined instance attributes in the
     /// shaped-object storage.
     int_backing: Option<Box<BigInt>>,
+
+    /// Optional native float storage for heap subclasses of `float`.
+    ///
+    /// The payload remains an unboxed IEEE-754 value behind the object header,
+    /// so builtin float operations can extract it without consulting instance
+    /// attributes or invoking Python-level descriptors.
+    float_backing: Option<Box<f64>>,
 }
 
 #[derive(Debug)]
@@ -301,6 +308,7 @@ impl ShapedObject {
             string_backing: None,
             bytes_backing: None,
             int_backing: None,
+            float_backing: None,
         }
     }
 
@@ -364,6 +372,14 @@ impl ShapedObject {
     pub fn new_int_backed(type_id: TypeId, empty_shape: Arc<Shape>, integer: BigInt) -> Self {
         let mut object = Self::new(type_id, empty_shape);
         object.int_backing = Some(Box::new(integer));
+        object
+    }
+
+    /// Create a new ShapedObject with native float storage.
+    #[inline]
+    pub fn new_float_backed(type_id: TypeId, empty_shape: Arc<Shape>, float: f64) -> Self {
+        let mut object = Self::new(type_id, empty_shape);
+        object.float_backing = Some(Box::new(float));
         object
     }
 
@@ -542,6 +558,18 @@ impl ShapedObject {
     #[inline]
     pub fn int_backing(&self) -> Option<&BigInt> {
         self.int_backing.as_deref()
+    }
+
+    /// Check whether this heap instance carries native float storage.
+    #[inline]
+    pub fn has_float_backing(&self) -> bool {
+        self.float_backing.is_some()
+    }
+
+    /// Read the native float storage for heap subclasses of `float`.
+    #[inline]
+    pub fn float_backing(&self) -> Option<f64> {
+        self.float_backing.as_deref().copied()
     }
 
     /// Get the current shape.

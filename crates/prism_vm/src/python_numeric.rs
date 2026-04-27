@@ -8,6 +8,7 @@
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::complex::ComplexObject;
+use prism_runtime::types::float::value_to_f64;
 use prism_runtime::types::int::value_to_i64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,9 +29,7 @@ pub fn int_like_value(value: Value) -> Option<i64> {
 /// Convert a value to its Python real-number slot value.
 #[inline(always)]
 pub fn float_like_value(value: Value) -> Option<f64> {
-    value
-        .as_float()
-        .or_else(|| int_like_value(value).map(|v| v as f64))
+    value_to_f64(value).or_else(|| int_like_value(value).map(|v| v as f64))
 }
 
 /// Check whether a value is an exact complex object.
@@ -48,7 +47,7 @@ pub fn is_complex_value(value: Value) -> bool {
 /// numeric tower as a real or complex number.
 #[inline(always)]
 pub fn complex_like_parts(value: Value) -> Option<ComplexParts> {
-    if let Some(float_value) = value.as_float() {
+    if let Some(float_value) = value_to_f64(value) {
         return Some(ComplexParts {
             real: float_value,
             imag: 0.0,

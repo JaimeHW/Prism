@@ -83,7 +83,7 @@ fn numeric_value_to_bigint(value: Value) -> Option<BigInt> {
 
 #[inline]
 fn is_numeric_value(value: Value) -> bool {
-    value.as_float().is_some() || numeric_value_to_bigint(value).is_some()
+    float_like_value(value).is_some() || numeric_value_to_bigint(value).is_some()
 }
 
 #[inline]
@@ -162,7 +162,7 @@ fn compare_numeric_values(left: Value, right: Value) -> Option<Ordering> {
         return Some(left_int.cmp(&right_int));
     }
 
-    match (left.as_float(), right.as_float()) {
+    match (float_like_value(left), float_like_value(right)) {
         (Some(left_float), Some(right_float)) => left_float.partial_cmp(&right_float),
         (Some(left_float), None) => {
             compare_f64_to_bigint(left_float, &numeric_value_to_bigint(right)?)
