@@ -20,9 +20,15 @@ use prism_runtime::types::range::RangeObject;
 ///
 /// Returns a range object representing a sequence of integers.
 pub fn builtin_range(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.is_empty() || args.len() > 3 {
+    if args.is_empty() {
         return Err(BuiltinError::TypeError(format!(
-            "range expected 1 to 3 arguments, got {}",
+            "range expected at least 1 argument, got {}",
+            args.len()
+        )));
+    }
+    if args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "range expected at most 3 arguments, got {}",
             args.len()
         )));
     }
