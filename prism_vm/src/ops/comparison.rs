@@ -27,6 +27,7 @@ use prism_runtime::object::views::UnionTypeObject;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::value_as_list_ref;
+use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::simd::search::{bytes_contains, str_contains};
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::value_as_string_ref;
@@ -1603,6 +1604,11 @@ fn values_equal_inner(a: Value, b: Value, seen_pairs: &mut FxHashSet<(usize, usi
                 return values_equal_inner(left.start_value(), right.start_value(), seen_pairs)
                     && values_equal_inner(left.stop_value(), right.stop_value(), seen_pairs)
                     && values_equal_inner(left.step_value(), right.step_value(), seen_pairs);
+            }
+            (TypeId::RANGE, TypeId::RANGE) => {
+                let left = unsafe { &*(pa as *const RangeObject) };
+                let right = unsafe { &*(pb as *const RangeObject) };
+                return left == right;
             }
             (TypeId::LIST, TypeId::LIST) => {
                 let pair = ordered_object_pair(pa, pb);

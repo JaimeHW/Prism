@@ -126,12 +126,30 @@ impl RangeObject {
         }
     }
 
+    /// Return the start value as an arbitrary-precision integer.
+    #[inline]
+    pub fn start_bigint(&self) -> BigInt {
+        match &self.repr {
+            RangeRepr::Small { start, .. } => BigInt::from(*start),
+            RangeRepr::Big { start, .. } => start.clone(),
+        }
+    }
+
     /// Return the stop value when it fits in `i64`.
     #[inline]
     pub fn stop_i64(&self) -> Option<i64> {
         match &self.repr {
             RangeRepr::Small { stop, .. } => Some(*stop),
             RangeRepr::Big { stop, .. } => stop.to_i64(),
+        }
+    }
+
+    /// Return the stop value as an arbitrary-precision integer.
+    #[inline]
+    pub fn stop_bigint(&self) -> BigInt {
+        match &self.repr {
+            RangeRepr::Small { stop, .. } => BigInt::from(*stop),
+            RangeRepr::Big { stop, .. } => stop.clone(),
         }
     }
 
@@ -144,12 +162,30 @@ impl RangeObject {
         }
     }
 
+    /// Return the step value as an arbitrary-precision integer.
+    #[inline]
+    pub fn step_bigint(&self) -> BigInt {
+        match &self.repr {
+            RangeRepr::Small { step, .. } => BigInt::from(*step),
+            RangeRepr::Big { step, .. } => step.clone(),
+        }
+    }
+
     /// Get the number of elements when it fits in `usize`.
     #[inline]
     pub fn try_len(&self) -> Option<usize> {
         match &self.repr {
             RangeRepr::Small { start, stop, step } => Some(small_len(*start, *stop, *step)),
             RangeRepr::Big { start, stop, step } => big_len(start, stop, step).to_usize(),
+        }
+    }
+
+    /// Get the number of elements as an arbitrary-precision integer.
+    #[inline]
+    pub fn len_bigint(&self) -> BigInt {
+        match &self.repr {
+            RangeRepr::Small { start, stop, step } => BigInt::from(small_len(*start, *stop, *step)),
+            RangeRepr::Big { start, stop, step } => big_len(start, stop, step),
         }
     }
 
@@ -206,6 +242,16 @@ impl RangeObject {
                 Some(bigint_to_value(value))
             }
         }
+    }
+
+    /// Compute the value at a non-normalized integer index.
+    ///
+    /// Callers are responsible for ensuring the index is semantically valid for
+    /// their operation. This is used by range slicing, where CPython preserves
+    /// arithmetic range structure without materializing elements.
+    #[inline]
+    pub fn value_at_index_bigint(&self, index: &BigInt) -> BigInt {
+        self.start_bigint() + index * self.step_bigint()
     }
 
     /// Get the element at index when it fits in `i64`.
@@ -332,17 +378,20 @@ impl Clone for RangeObject {
 
 impl PartialEq for RangeObject {
     fn eq(&self, other: &Self) -> bool {
-        match (self.try_len(), other.try_len()) {
-            (Some(a), Some(b)) if a != b => return false,
-            _ => {}
+        let self_len = self.len_bigint();
+        let other_len = other.len_bigint();
+        if self_len != other_len {
+            return false;
         }
-
-        if self.is_empty() && other.is_empty() {
+        if self_len.is_zero() {
             return true;
         }
 
-        self.iter().next() == other.iter().next()
-            && self.repr_step_string() == other.repr_step_string()
+        if self.start_bigint() != other.start_bigint() {
+            return false;
+        }
+
+        self_len == BigInt::one() || self.step_bigint() == other.step_bigint()
     }
 }
 
@@ -371,16 +420,6 @@ impl fmt::Display for RangeObject {
                     write!(f, "range({}, {}, {})", start, stop, step)
                 }
             }
-        }
-    }
-}
-
-impl RangeObject {
-    #[inline]
-    fn repr_step_string(&self) -> String {
-        match &self.repr {
-            RangeRepr::Small { step, .. } => step.to_string(),
-            RangeRepr::Big { step, .. } => step.to_string(),
         }
     }
 }
