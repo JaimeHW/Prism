@@ -24,6 +24,7 @@ use crate::ops::set_access::set_add_item;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::object::descriptor::BoundMethod;
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::global_class;
@@ -471,6 +472,14 @@ fn deepcopy_builtin(
         TypeId::BYTEARRAY => {
             let source = unsafe { &*(ptr as *const BytesObject) };
             Ok(Some(crate::alloc_managed_value(source.clone())))
+        }
+        TypeId::METHOD => {
+            let method = unsafe { &*(ptr as *const BoundMethod) };
+            let instance = deepcopy_inner(vm, method.instance(), memo)?;
+            Ok(Some(crate::alloc_managed_value(BoundMethod::new(
+                method.function(),
+                instance,
+            ))))
         }
         TypeId::SLICE => {
             let source = unsafe { &*(ptr as *const SliceObject) };
