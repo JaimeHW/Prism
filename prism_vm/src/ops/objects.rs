@@ -1160,11 +1160,26 @@ pub(crate) fn descriptor_attr_value_in_vm(
     value: Value,
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
+    if name.as_str() == "__isabstractmethod__"
+        && value.as_object_ptr().is_some_and(|ptr| {
+            matches!(
+                extract_type_id(ptr),
+                TypeId::CLASSMETHOD | TypeId::STATICMETHOD | TypeId::PROPERTY
+            )
+        })
+    {
+        return descriptor_is_abstract_in_vm(vm, value)
+            .map(|abstract_method| Some(Value::bool(abstract_method)));
+    }
+
     if let Some(value) = descriptor_attr_value(value, name) {
         return Ok(Some(value));
     }
 
-    if matches!(name.as_str(), "__get__" | "__set__" | "__delete__") {
+    if matches!(
+        name.as_str(),
+        "__get__" | "__set__" | "__delete__" | "__set_name__"
+    ) {
         let Some(ptr) = value.as_object_ptr() else {
             return Ok(None);
         };
@@ -1190,6 +1205,53 @@ pub(crate) fn descriptor_attr_value_in_vm(
             get_attribute_value(vm, wrapped, name).map(Some)
         }
         _ => Ok(None),
+    }
+}
+
+fn descriptor_is_abstract_in_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<bool, RuntimeError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(false);
+    };
+
+    match extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => {
+            let func = unsafe { &*(ptr as *const FunctionObject) };
+            match func.get_attr(&intern("__isabstractmethod__")) {
+                Some(value) => crate::truthiness::try_is_truthy(vm, value),
+                None => Ok(false),
+            }
+        }
+        TypeId::CLASSMETHOD => {
+            let desc = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+            descriptor_is_abstract_in_vm(vm, desc.function())
+        }
+        TypeId::STATICMETHOD => {
+            let desc = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+            descriptor_is_abstract_in_vm(vm, desc.function())
+        }
+        TypeId::PROPERTY => {
+            let desc = unsafe { &*(ptr as *const PropertyDescriptor) };
+            if let Some(getter) = desc.getter()
+                && descriptor_is_abstract_in_vm(vm, getter)?
+            {
+                return Ok(true);
+            }
+            if let Some(setter) = desc.setter()
+                && descriptor_is_abstract_in_vm(vm, setter)?
+            {
+                return Ok(true);
+            }
+            if let Some(deleter) = desc.deleter()
+                && descriptor_is_abstract_in_vm(vm, deleter)?
+            {
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -1780,13 +1842,13 @@ pub(crate) fn get_attribute_value(
             });
         }
 
-        if type_id != TypeId::EXCEPTION_TYPE
+        if !matches!(type_id, TypeId::EXCEPTION_TYPE | TypeId::TYPE)
             && let Some(value) = builtin_instance_attribute_value(vm, type_id, obj, name)?
         {
             return Ok(value);
         }
 
-        if type_id != TypeId::EXCEPTION_TYPE
+        if !matches!(type_id, TypeId::EXCEPTION_TYPE | TypeId::TYPE)
             && let Some(value) = builtin_instance_method_attr_value(obj, type_id, name)
         {
             return Ok(value);
@@ -2188,6 +2250,11 @@ pub(crate) fn set_attribute_value(
                 };
                 let traceback = unsafe { &mut *(ptr as *mut TracebackViewObject) };
                 traceback.set_next(next);
+                Ok(())
+            }
+            TypeId::PROPERTY if name.as_str() == "__doc__" => {
+                let descriptor = unsafe { &*(ptr as *const PropertyDescriptor) };
+                descriptor.set_doc(value);
                 Ok(())
             }
             TypeId::TYPE => {

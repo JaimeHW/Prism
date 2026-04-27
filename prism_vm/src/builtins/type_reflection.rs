@@ -415,7 +415,15 @@ const MEMORYVIEW_METHOD_NAMES: &[&str] = &[
 const TUPLE_METHOD_NAMES: &[&str] = &["__iter__", "__len__", "__getitem__", "count", "index"];
 const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
-const PROPERTY_METHOD_NAMES: &[&str] = &["getter", "setter", "deleter"];
+const PROPERTY_METHOD_NAMES: &[&str] = &[
+    "__get__",
+    "__set__",
+    "__delete__",
+    "__set_name__",
+    "getter",
+    "setter",
+    "deleter",
+];
 const REGEX_PATTERN_METHOD_NAMES: &[&str] = &[
     "match",
     "search",
@@ -864,7 +872,19 @@ fn subclasses_root_type_id(class_value: Value) -> Result<TypeId, BuiltinError> {
 }
 
 #[inline]
-fn user_type_doc_value(class: &PyClassObject) -> Value {
+fn user_type_doc_value(
+    vm: &mut VirtualMachine,
+    class: &PyClassObject,
+    owner_value: Value,
+) -> Result<Value, RuntimeError> {
+    match class.get_attr(&intern("__doc__")) {
+        Some(value) => crate::ops::objects::resolve_class_attribute_in_vm(vm, value, owner_value),
+        None => Ok(Value::none()),
+    }
+}
+
+#[inline]
+fn user_type_doc_value_static(class: &PyClassObject) -> Value {
     class
         .get_attr(&intern("__doc__"))
         .unwrap_or_else(Value::none)
@@ -1243,7 +1263,7 @@ fn user_type_attribute_value(
             .map(class_id_to_type_value)
             .transpose()
             .map(|value| Some(value.unwrap_or_else(Value::none))),
-        Some(ReflectedValueKind::DocValue) => Ok(Some(user_type_doc_value(class))),
+        Some(ReflectedValueKind::DocValue) => user_type_doc_value(vm, class, owner_value).map(Some),
         Some(ReflectedValueKind::NameString) => Ok(Some(Value::string(class.name().clone()))),
         Some(ReflectedValueKind::QualNameString) => Ok(Some(
             class
@@ -1294,7 +1314,7 @@ fn user_type_attribute_value_static(
             .map(class_id_to_type_value)
             .transpose()
             .map(|value| Some(value.unwrap_or_else(Value::none))),
-        Some(ReflectedValueKind::DocValue) => Ok(Some(user_type_doc_value(class))),
+        Some(ReflectedValueKind::DocValue) => Ok(Some(user_type_doc_value_static(class))),
         Some(ReflectedValueKind::NameString) => Ok(Some(Value::string(class.name().clone()))),
         Some(ReflectedValueKind::QualNameString) => Ok(Some(
             class

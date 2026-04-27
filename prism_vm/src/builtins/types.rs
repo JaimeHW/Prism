@@ -8,7 +8,7 @@ use super::{
 use crate::VirtualMachine;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::import::ModuleObject;
-use crate::ops::calls::invoke_callable_value;
+use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::collections::deque::{builtin_deque, builtin_deque_kw, builtin_deque_with_vm};
 use num_bigint::{BigInt, Sign};
@@ -691,6 +691,9 @@ fn isinstance_single_target_vm(
     if exact_class_match(instance, target) {
         return Ok(true);
     }
+    if let Some(result) = collections_abc_isinstance_result(instance, target) {
+        return Ok(result);
+    }
     if let Some(result) = invoke_metaclass_check(vm, target, "__instancecheck__", instance)? {
         return Ok(result);
     }
@@ -710,6 +713,9 @@ fn issubclass_single_target_vm(
         if is_exact_type_target(target) && raw_issubclass_value(subclass, target)? {
             return Ok(true);
         }
+    }
+    if let Some(result) = collections_abc_issubclass_result(subclass, target) {
+        return Ok(result);
     }
     if let Some(result) = invoke_metaclass_check(vm, target, "__subclasscheck__", subclass)? {
         return Ok(result);
@@ -781,6 +787,382 @@ fn class_value_is_subtype(class_value: Value, target: TypeId) -> bool {
         }
         class_id.0 == target.raw()
     })
+}
+
+type CollectionsAbcKind = crate::stdlib::collections::abc::CollectionsAbcKind;
+
+#[inline]
+fn collections_abc_isinstance_result(instance: Value, target: Value) -> Option<bool> {
+    let kind = crate::stdlib::collections::abc::abc_kind_for_class_value(target)?;
+    Some(collections_abc_instance_matches(instance, target, kind))
+}
+
+#[inline]
+fn collections_abc_issubclass_result(subclass: Value, target: Value) -> Option<bool> {
+    let kind = crate::stdlib::collections::abc::abc_kind_for_class_value(target)?;
+    if class_value_to_type_id(subclass).is_none() {
+        return None;
+    }
+    Some(collections_abc_class_matches(subclass, target, kind))
+}
+
+fn collections_abc_instance_matches(
+    instance: Value,
+    target: Value,
+    kind: CollectionsAbcKind,
+) -> bool {
+    if collections_abc_builtin_type_matches(value_type_id(instance), kind) {
+        return true;
+    }
+
+    if kind == CollectionsAbcKind::Callable && value_supports_call_protocol(instance) {
+        return true;
+    }
+
+    collections_abc_class_matches(value_type_object(instance), target, kind)
+}
+
+fn collections_abc_class_matches(
+    class_value: Value,
+    target: Value,
+    kind: CollectionsAbcKind,
+) -> bool {
+    if let Some(target_type) = class_value_to_type_id(target)
+        && class_value_is_subtype(class_value, target_type)
+    {
+        return true;
+    }
+
+    collections_abc_class_matches_kind(class_value, kind)
+}
+
+fn collections_abc_class_matches_kind(class_value: Value, kind: CollectionsAbcKind) -> bool {
+    let Some(class_type) = class_value_to_type_id(class_value) else {
+        return false;
+    };
+
+    if collections_abc_builtin_type_matches(class_type, kind) {
+        return true;
+    }
+
+    if let Some(actual_kind) =
+        crate::stdlib::collections::abc::abc_kind_for_class_value(class_value)
+    {
+        return collections_abc_kind_implies(actual_kind, kind);
+    }
+
+    match kind {
+        CollectionsAbcKind::Awaitable => class_defines_all_specials(class_value, &["__await__"]),
+        CollectionsAbcKind::Coroutine => {
+            class_defines_all_specials(class_value, &["__await__", "send", "throw", "close"])
+        }
+        CollectionsAbcKind::AsyncIterable => {
+            class_defines_all_specials(class_value, &["__aiter__"])
+        }
+        CollectionsAbcKind::AsyncIterator => {
+            class_defines_all_specials(class_value, &["__aiter__", "__anext__"])
+        }
+        CollectionsAbcKind::AsyncGenerator => class_defines_all_specials(
+            class_value,
+            &["__aiter__", "__anext__", "asend", "athrow", "aclose"],
+        ),
+        CollectionsAbcKind::Hashable => class_hashable_for_collections_abc(class_value),
+        CollectionsAbcKind::Iterable => class_defines_all_specials(class_value, &["__iter__"]),
+        CollectionsAbcKind::Iterator => {
+            class_defines_all_specials(class_value, &["__iter__", "__next__"])
+        }
+        CollectionsAbcKind::Generator => class_defines_all_specials(
+            class_value,
+            &["__iter__", "__next__", "send", "throw", "close"],
+        ),
+        CollectionsAbcKind::Reversible => {
+            class_defines_all_specials(class_value, &["__reversed__"])
+                || class_defines_all_specials(class_value, &["__len__", "__getitem__"])
+        }
+        CollectionsAbcKind::Sized => class_defines_all_specials(class_value, &["__len__"]),
+        CollectionsAbcKind::Container => class_defines_all_specials(class_value, &["__contains__"]),
+        CollectionsAbcKind::Callable => class_defines_all_specials(class_value, &["__call__"]),
+        CollectionsAbcKind::Collection => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Sized)
+                && collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Iterable)
+                && collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Container)
+        }
+        CollectionsAbcKind::Set => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Collection)
+                && class_defines_all_specials(class_value, &["__contains__"])
+        }
+        CollectionsAbcKind::MutableSet => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Set)
+                && class_defines_all_specials(class_value, &["add", "discard"])
+        }
+        CollectionsAbcKind::Mapping => {
+            class_defines_all_specials(class_value, &["__getitem__", "__iter__", "__len__"])
+        }
+        CollectionsAbcKind::MutableMapping => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Mapping)
+                && class_defines_all_specials(class_value, &["__setitem__", "__delitem__"])
+        }
+        CollectionsAbcKind::MappingView => class_defines_all_specials(class_value, &["__len__"]),
+        CollectionsAbcKind::KeysView | CollectionsAbcKind::ItemsView => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::MappingView)
+                && collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Set)
+        }
+        CollectionsAbcKind::ValuesView => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::MappingView)
+                && collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Collection)
+        }
+        CollectionsAbcKind::Sequence => {
+            class_defines_all_specials(class_value, &["__len__", "__getitem__"])
+        }
+        CollectionsAbcKind::MutableSequence => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Sequence)
+                && class_defines_all_specials(
+                    class_value,
+                    &["__setitem__", "__delitem__", "insert"],
+                )
+        }
+        CollectionsAbcKind::ByteString => {
+            collections_abc_class_matches_kind(class_value, CollectionsAbcKind::Sequence)
+        }
+        CollectionsAbcKind::Buffer => class_defines_all_specials(class_value, &["__buffer__"]),
+    }
+}
+
+#[inline]
+fn collections_abc_builtin_type_matches(type_id: TypeId, kind: CollectionsAbcKind) -> bool {
+    use crate::stdlib::collections::abc::CollectionsAbcKind::*;
+
+    match kind {
+        Awaitable | Coroutine | AsyncIterable | AsyncIterator | AsyncGenerator => false,
+        Hashable => !matches!(
+            type_id,
+            TypeId::LIST | TypeId::DICT | TypeId::SET | TypeId::BYTEARRAY
+        ),
+        Iterable => matches!(
+            type_id,
+            TypeId::LIST
+                | TypeId::TUPLE
+                | TypeId::STR
+                | TypeId::RANGE
+                | TypeId::DICT
+                | TypeId::MAPPING_PROXY
+                | TypeId::DICT_KEYS
+                | TypeId::DICT_VALUES
+                | TypeId::DICT_ITEMS
+                | TypeId::SET
+                | TypeId::FROZENSET
+                | TypeId::BYTES
+                | TypeId::BYTEARRAY
+                | TypeId::MEMORYVIEW
+                | TypeId::DEQUE
+                | TypeId::ITERATOR
+                | TypeId::GENERATOR
+        ),
+        Iterator => matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR),
+        Generator => type_id == TypeId::GENERATOR,
+        Reversible => matches!(
+            type_id,
+            TypeId::LIST
+                | TypeId::TUPLE
+                | TypeId::STR
+                | TypeId::RANGE
+                | TypeId::BYTES
+                | TypeId::BYTEARRAY
+        ),
+        Sized => matches!(
+            type_id,
+            TypeId::LIST
+                | TypeId::TUPLE
+                | TypeId::STR
+                | TypeId::RANGE
+                | TypeId::DICT
+                | TypeId::MAPPING_PROXY
+                | TypeId::DICT_KEYS
+                | TypeId::DICT_VALUES
+                | TypeId::DICT_ITEMS
+                | TypeId::SET
+                | TypeId::FROZENSET
+                | TypeId::BYTES
+                | TypeId::BYTEARRAY
+                | TypeId::MEMORYVIEW
+                | TypeId::DEQUE
+        ),
+        Container => matches!(
+            type_id,
+            TypeId::LIST
+                | TypeId::TUPLE
+                | TypeId::STR
+                | TypeId::RANGE
+                | TypeId::DICT
+                | TypeId::MAPPING_PROXY
+                | TypeId::DICT_KEYS
+                | TypeId::DICT_VALUES
+                | TypeId::DICT_ITEMS
+                | TypeId::SET
+                | TypeId::FROZENSET
+                | TypeId::BYTES
+                | TypeId::BYTEARRAY
+                | TypeId::MEMORYVIEW
+                | TypeId::DEQUE
+        ),
+        Callable => matches!(
+            type_id,
+            TypeId::FUNCTION
+                | TypeId::METHOD
+                | TypeId::CLOSURE
+                | TypeId::STATICMETHOD
+                | TypeId::TYPE
+                | TypeId::BUILTIN_FUNCTION
+                | TypeId::EXCEPTION_TYPE
+                | TypeId::WRAPPER_DESCRIPTOR
+                | TypeId::METHOD_WRAPPER
+                | TypeId::METHOD_DESCRIPTOR
+                | TypeId::CLASSMETHOD_DESCRIPTOR
+        ),
+        Collection => {
+            collections_abc_builtin_type_matches(type_id, Sized)
+                && collections_abc_builtin_type_matches(type_id, Iterable)
+                && collections_abc_builtin_type_matches(type_id, Container)
+        }
+        Set => matches!(
+            type_id,
+            TypeId::SET | TypeId::FROZENSET | TypeId::DICT_KEYS | TypeId::DICT_ITEMS
+        ),
+        MutableSet => type_id == TypeId::SET,
+        Mapping => matches!(type_id, TypeId::DICT | TypeId::MAPPING_PROXY),
+        MutableMapping => type_id == TypeId::DICT,
+        MappingView => matches!(
+            type_id,
+            TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS
+        ),
+        KeysView => type_id == TypeId::DICT_KEYS,
+        ItemsView => type_id == TypeId::DICT_ITEMS,
+        ValuesView => type_id == TypeId::DICT_VALUES,
+        Sequence => matches!(
+            type_id,
+            TypeId::LIST
+                | TypeId::TUPLE
+                | TypeId::STR
+                | TypeId::RANGE
+                | TypeId::BYTES
+                | TypeId::BYTEARRAY
+                | TypeId::MEMORYVIEW
+        ),
+        MutableSequence => matches!(type_id, TypeId::LIST | TypeId::BYTEARRAY),
+        ByteString => matches!(type_id, TypeId::BYTES | TypeId::BYTEARRAY),
+        Buffer => matches!(
+            type_id,
+            TypeId::BYTES | TypeId::BYTEARRAY | TypeId::MEMORYVIEW
+        ),
+    }
+}
+
+#[inline]
+fn collections_abc_kind_implies(actual: CollectionsAbcKind, target: CollectionsAbcKind) -> bool {
+    use crate::stdlib::collections::abc::CollectionsAbcKind::*;
+
+    actual == target
+        || matches!(
+            (actual, target),
+            (Coroutine, Awaitable)
+                | (AsyncIterator, AsyncIterable)
+                | (AsyncGenerator, AsyncIterator | AsyncIterable)
+                | (Iterator, Iterable)
+                | (Generator, Iterator | Iterable)
+                | (Reversible, Iterable)
+                | (Collection, Sized | Iterable | Container)
+                | (Set, Collection | Sized | Iterable | Container)
+                | (MutableSet, Set | Collection | Sized | Iterable | Container)
+                | (Mapping, Collection | Sized | Iterable | Container)
+                | (
+                    MutableMapping,
+                    Mapping | Collection | Sized | Iterable | Container
+                )
+                | (MappingView, Sized)
+                | (
+                    KeysView,
+                    MappingView | Set | Collection | Sized | Iterable | Container
+                )
+                | (
+                    ItemsView,
+                    MappingView | Set | Collection | Sized | Iterable | Container
+                )
+                | (
+                    ValuesView,
+                    MappingView | Collection | Sized | Iterable | Container
+                )
+                | (
+                    Sequence,
+                    Reversible | Collection | Sized | Iterable | Container
+                )
+                | (
+                    MutableSequence,
+                    Sequence | Reversible | Collection | Sized | Iterable | Container
+                )
+                | (
+                    ByteString,
+                    Sequence | Reversible | Collection | Sized | Iterable | Container
+                )
+        )
+}
+
+fn class_defines_all_specials(class_value: Value, names: &[&str]) -> bool {
+    names
+        .iter()
+        .all(|name| class_special_method_status(class_value, &intern(name)) == Some(true))
+}
+
+fn class_hashable_for_collections_abc(class_value: Value) -> bool {
+    class_special_method_status(class_value, &intern("__hash__")) != Some(false)
+}
+
+fn class_special_method_status(class_value: Value, name: &InternedString) -> Option<bool> {
+    let ptr = class_value.as_object_ptr()?;
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::TYPE => {
+            if let Some(type_id) = builtin_type_object_type_id(ptr) {
+                return builtin_special_method_status(type_id, name);
+            }
+
+            let class = class_object_from_ptr(ptr)?;
+            for &class_id in class.mro() {
+                if let Some(status) = class_id_special_method_status(class_id, name) {
+                    return Some(status);
+                }
+            }
+            None
+        }
+        TypeId::EXCEPTION_TYPE => builtin_special_method_status(TypeId::EXCEPTION, name),
+        _ => None,
+    }
+}
+
+fn class_id_special_method_status(class_id: ClassId, name: &InternedString) -> Option<bool> {
+    if class_id == ClassId::OBJECT || class_id.0 < TypeId::FIRST_USER_TYPE {
+        return builtin_special_method_status(class_id_to_type_id(class_id), name);
+    }
+
+    global_class(class_id)
+        .and_then(|class| class.get_attr(name))
+        .map(|value| !value.is_none())
+}
+
+#[inline]
+fn builtin_special_method_status(type_id: TypeId, name: &InternedString) -> Option<bool> {
+    if name.as_str() == "__hash__" {
+        return Some(!matches!(
+            type_id,
+            TypeId::LIST | TypeId::DICT | TypeId::SET | TypeId::BYTEARRAY
+        ));
+    }
+
+    if crate::ops::objects::builtin_instance_method_attr_exists(type_id, name)
+        || builtin_instance_has_attribute(type_id, name)
+    {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -1543,11 +1925,12 @@ pub fn builtin_property(args: &[Value]) -> Result<Value, BuiltinError> {
     let getter = normalize(args.first().copied());
     let setter = normalize(args.get(1).copied());
     let deleter = normalize(args.get(2).copied());
-    let doc = normalize(args.get(3).copied());
+    let explicit_doc = normalize(args.get(3).copied());
+    let (doc, getter_doc) = property_doc_and_source(getter, explicit_doc);
 
-    Ok(to_object_value(PropertyDescriptor::new_full(
-        getter, setter, deleter, doc,
-    )))
+    Ok(to_object_value(
+        PropertyDescriptor::new_full_with_doc_source(getter, setter, deleter, doc, getter_doc),
+    ))
 }
 
 fn builtin_property_kw(
@@ -1590,12 +1973,48 @@ fn builtin_property_kw(
     }
 
     let normalize = |value: Option<Value>| value.filter(|value| !value.is_none());
-    Ok(to_object_value(PropertyDescriptor::new_full(
-        normalize(slots[0]),
-        normalize(slots[1]),
-        normalize(slots[2]),
-        normalize(slots[3]),
-    )))
+    let getter = normalize(slots[0]);
+    let setter = normalize(slots[1]);
+    let deleter = normalize(slots[2]);
+    let explicit_doc = normalize(slots[3]);
+    let (doc, getter_doc) = property_doc_and_source(getter, explicit_doc);
+
+    Ok(to_object_value(
+        PropertyDescriptor::new_full_with_doc_source(getter, setter, deleter, doc, getter_doc),
+    ))
+}
+
+#[inline]
+fn property_doc_and_source(
+    getter: Option<Value>,
+    explicit_doc: Option<Value>,
+) -> (Option<Value>, bool) {
+    if explicit_doc.is_some() {
+        return (explicit_doc, false);
+    }
+
+    let doc = getter.and_then(property_doc_from_accessor);
+    (doc, doc.is_some())
+}
+
+#[inline]
+pub(crate) fn property_doc_from_accessor(accessor: Value) -> Option<Value> {
+    let ptr = accessor.as_object_ptr()?;
+    let doc_name = intern("__doc__");
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::FUNCTION | TypeId::CLOSURE => {
+            let func = unsafe { &*(ptr as *const FunctionObject) };
+            crate::ops::objects::function_attr_value(func, &doc_name)
+                .filter(|value| !value.is_none())
+        }
+        TypeId::BUILTIN_FUNCTION => {
+            let builtin = unsafe { &*(ptr as *const crate::builtins::BuiltinFunctionObject) };
+            crate::ops::objects::builtin_function_attr_value(builtin, &doc_name)
+                .filter(|value| !value.is_none())
+        }
+        _ => None,
+    }
 }
 
 /// Builtin int constructor.
@@ -3231,11 +3650,32 @@ pub fn builtin_hasattr_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Val
 
     let obj = args[0];
     let name = attribute_name(args[1])?;
+    let saved_exception_context =
+        (vm.has_active_exception() || vm.has_exc_info()).then(|| vm.capture_exception_context());
+
+    #[inline]
+    fn restore_swallowed_exception_state(
+        vm: &mut VirtualMachine,
+        snapshot: Option<crate::vm::ExceptionContextSnapshot>,
+    ) {
+        if let Some(snapshot) = snapshot {
+            vm.restore_exception_context(snapshot);
+        } else if vm.has_active_exception() {
+            vm.clear_active_exception();
+            vm.clear_exception_state();
+        }
+    }
 
     match crate::ops::objects::get_attribute_value(vm, obj, &name) {
-        Ok(_) => Ok(Value::bool(true)),
+        Ok(_) => {
+            restore_swallowed_exception_state(vm, saved_exception_context);
+            Ok(Value::bool(true))
+        }
         Err(err) => match runtime_error_to_builtin_error(err) {
-            BuiltinError::AttributeError(_) => Ok(Value::bool(false)),
+            BuiltinError::AttributeError(_) => {
+                restore_swallowed_exception_state(vm, saved_exception_context);
+                Ok(Value::bool(false))
+            }
             other => Err(other),
         },
     }
