@@ -137,6 +137,19 @@ impl ListObject {
         }
     }
 
+    /// Swap two items by normalized positive index.
+    #[inline]
+    pub fn swap_indices(&mut self, left: usize, right: usize) -> bool {
+        if left >= self.items.len() || right >= self.items.len() {
+            return false;
+        }
+        if left != right {
+            self.items.swap(left, right);
+            self.bump_mutation_version();
+        }
+        true
+    }
+
     /// Append an item to the end.
     #[inline]
     pub fn push(&mut self, value: Value) {

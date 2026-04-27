@@ -61,10 +61,12 @@ pub mod operator;
 pub mod os;
 pub mod pickle;
 pub mod python_builtins;
+pub mod random;
 pub mod re;
 pub(crate) mod secure_random;
 pub mod select;
 pub mod signal;
+pub mod string;
 pub mod sys;
 pub mod test_support;
 pub mod textwrap;
@@ -427,6 +429,12 @@ impl StdlibRegistry {
         // Register pure-Python stdlib fallbacks.
         Self::insert_module(&mut modules, "re", Box::new(re::ReModule::new()));
 
+        Self::insert_module(
+            &mut modules,
+            "random",
+            Box::new(random::RandomPublicModule::new()),
+        );
+
         Self::insert_module(&mut modules, "json", Box::new(json::JsonModule::new()));
 
         // Prefer Prism's native collections module for now. The CPython
@@ -499,6 +507,16 @@ impl StdlibRegistry {
             &mut modules,
             "test.support.os_helper",
             Box::new(test_support::OsHelperModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "test.support.import_helper",
+            Box::new(test_support::ImportHelperModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "string",
+            Box::new(string::StringPublicModule::new()),
         );
         Self::insert_module(
             &mut modules,

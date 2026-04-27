@@ -139,6 +139,12 @@ static SORTDICT_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static UNLINK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support.os_helper.unlink"), unlink)
 });
+static IMPORT_MODULE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("test.support.import_helper.import_module"),
+        import_module,
+    )
+});
 
 const ALWAYS_EQ_METHODS: [(&str, &LazyLock<BuiltinFunctionObject>); 2] = [
     ("__eq__", &ALWAYS_EQ_EQ_FUNCTION),
@@ -618,6 +624,63 @@ impl Module for OsHelperModule {
     fn dir(&self) -> Vec<Arc<str>> {
         self.attrs.clone()
     }
+}
+
+/// Native `test.support.import_helper` module descriptor.
+#[derive(Debug, Clone)]
+pub struct ImportHelperModule {
+    attrs: Vec<Arc<str>>,
+}
+
+impl ImportHelperModule {
+    /// Create a new `test.support.import_helper` module descriptor.
+    pub fn new() -> Self {
+        Self {
+            attrs: vec![Arc::from("import_module")],
+        }
+    }
+}
+
+impl Default for ImportHelperModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Module for ImportHelperModule {
+    fn name(&self) -> &str {
+        "test.support.import_helper"
+    }
+
+    fn get_attr(&self, name: &str) -> ModuleResult {
+        match name {
+            "import_module" => Ok(builtin_value(&IMPORT_MODULE_FUNCTION)),
+            _ => Err(ModuleError::AttributeError(format!(
+                "module 'test.support.import_helper' has no attribute '{}'",
+                name
+            ))),
+        }
+    }
+
+    fn dir(&self) -> Vec<Arc<str>> {
+        self.attrs.clone()
+    }
+}
+
+fn import_module(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "import_module() takes from 1 to 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let name = value_as_string_ref(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("import_module() name must be str".to_string()))?;
+    let module = vm
+        .import_module_named(name.as_str())
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(Value::object_ptr(Arc::as_ptr(&module) as *const ()))
 }
 
 fn unlink(args: &[Value]) -> Result<Value, BuiltinError> {

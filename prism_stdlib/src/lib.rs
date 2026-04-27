@@ -209,7 +209,10 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "locale"
         | "operator"
         | "pickle"
+        | "random"
+        | "string"
         | "test.support"
+        | "test.support.import_helper"
         | "test.support.os_helper"
         | "textwrap"
         | "traceback" => Some(StdlibResolutionPolicy::PreferNative),

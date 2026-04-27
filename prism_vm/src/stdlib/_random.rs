@@ -87,7 +87,8 @@ impl Module for RandomModule {
     }
 }
 
-fn random_class_value() -> Value {
+/// Return the native `_random.Random` class object.
+pub fn random_class_value() -> Value {
     Value::object_ptr(Arc::as_ptr(random_class()) as *const ())
 }
 
