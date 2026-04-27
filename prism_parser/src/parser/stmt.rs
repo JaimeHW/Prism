@@ -348,6 +348,12 @@ impl StmtParser {
         targets.push(ExprParser::parse(parser, Precedence::Lowest)?);
 
         while parser.match_token(TokenKind::Comma) {
+            if parser.check(TokenKind::Newline)
+                || parser.check(TokenKind::Semicolon)
+                || parser.check(TokenKind::Eof)
+            {
+                break;
+            }
             targets.push(ExprParser::parse(parser, Precedence::Lowest)?);
         }
 
@@ -737,20 +743,28 @@ impl StmtParser {
         parser.advance(); // consume 'with'
 
         let mut items = Vec::new();
-        loop {
-            let context_expr = ExprParser::parse(parser, Precedence::Lowest)?;
-            let optional_vars = if parser.match_keyword(KW::As) {
-                Some(ExprParser::parse(parser, Precedence::Lowest)?)
-            } else {
-                None
-            };
-            items.push(WithItem {
-                context_expr,
-                optional_vars,
-            });
 
-            if !parser.match_token(TokenKind::Comma) {
-                break;
+        if parser.match_token(TokenKind::LeftParen) {
+            parser.skip_newlines();
+            while !parser.check(TokenKind::RightParen) {
+                items.push(Self::parse_with_item(parser)?);
+
+                if !parser.match_token(TokenKind::Comma) {
+                    break;
+                }
+                parser.skip_newlines();
+                if parser.check(TokenKind::RightParen) {
+                    break;
+                }
+            }
+            parser.expect(TokenKind::RightParen, "expected ')'")?;
+        } else {
+            loop {
+                items.push(Self::parse_with_item(parser)?);
+
+                if !parser.match_token(TokenKind::Comma) {
+                    break;
+                }
             }
         }
 
@@ -764,6 +778,19 @@ impl StmtParser {
         };
 
         Ok(Stmt::new(kind, parser.span_from(start)))
+    }
+
+    fn parse_with_item(parser: &mut Parser<'_>) -> PrismResult<WithItem> {
+        let context_expr = ExprParser::parse(parser, Precedence::Lowest)?;
+        let optional_vars = if parser.match_keyword(KW::As) {
+            Some(ExprParser::parse(parser, Precedence::Lowest)?)
+        } else {
+            None
+        };
+        Ok(WithItem {
+            context_expr,
+            optional_vars,
+        })
     }
 
     /// Parse a function definition.
