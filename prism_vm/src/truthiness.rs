@@ -85,6 +85,9 @@ fn exact_truthiness(value: Value) -> Option<bool> {
     if let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr) {
         return Some(!list.is_empty());
     }
+    if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
+        return Some(!set.is_empty());
+    }
 
     Some(match extract_type_id(ptr) {
         TypeId::STR => !unsafe { &*(ptr as *const StringObject) }.is_empty(),

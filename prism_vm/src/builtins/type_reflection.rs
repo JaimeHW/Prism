@@ -140,10 +140,19 @@ static DICT_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static SET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("set.__new__"), super::types::builtin_set_new)
 });
+static SET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("set.__init__"), super::types::builtin_set_init_vm)
+});
 static FROZENSET_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("frozenset.__new__"),
         super::types::builtin_frozenset_new,
+    )
+});
+static FROZENSET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("frozenset.__init__"),
+        super::types::builtin_frozenset_init,
     )
 });
 static MODULE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -306,9 +315,21 @@ const DICT_TYPE_ATTRS: &[AttrSpec] = &[
     },
 ];
 
-const SET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+const SET_TYPE_ATTRS: &[AttrSpec] = &[
+    NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__init__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+];
 
-const FROZENSET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+const FROZENSET_TYPE_ATTRS: &[AttrSpec] = &[
+    NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__init__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
+];
 
 const MODULE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
@@ -1009,6 +1030,8 @@ pub(crate) fn reflected_descriptor_callable_value(
             (TypeId::OBJECT, "__init__") => Some(builtin_method_value(&OBJECT_INIT_METHOD)),
             (TypeId::TYPE, "__init__") => Some(builtin_method_value(&TYPE_INIT_METHOD)),
             (TypeId::DICT, "__init__") => Some(builtin_method_value(&DICT_INIT_METHOD)),
+            (TypeId::SET, "__init__") => Some(builtin_method_value(&SET_INIT_METHOD)),
+            (TypeId::FROZENSET, "__init__") => Some(builtin_method_value(&FROZENSET_INIT_METHOD)),
             _ => builtin_type_method_value(owner, name.as_str()),
         },
         TypeId::METHOD_DESCRIPTOR => builtin_type_method_value(owner, name.as_str()),

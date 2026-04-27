@@ -12,6 +12,12 @@ static SET_POP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.pop"), set_pop));
 static SET_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.clear"), set_clear));
+static SET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("set.__init__"),
+        crate::builtins::builtin_set_init_vm,
+    )
+});
 static SET_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("set.update"), set_update_with_vm));
 static SET_DIFFERENCE_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -62,6 +68,12 @@ static SET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("set.__contains__"), set_contains));
 static FROZENSET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("frozenset.__contains__"), frozenset_contains)
+});
+static FROZENSET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("frozenset.__init__"),
+        crate::builtins::builtin_frozenset_init,
+    )
 });
 static FROZENSET_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("frozenset.copy"), frozenset_copy));
@@ -119,6 +131,9 @@ pub fn resolve_set_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {
         (TypeId::SET, "clear") => Some(CachedMethod::simple(builtin_method_value(
             &SET_CLEAR_METHOD,
         ))),
+        (TypeId::SET, "__init__") => {
+            Some(CachedMethod::simple(builtin_method_value(&SET_INIT_METHOD)))
+        }
         (TypeId::SET, "update") => Some(CachedMethod::simple(builtin_method_value(
             &SET_UPDATE_METHOD,
         ))),
@@ -182,6 +197,9 @@ pub fn resolve_set_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {
         ))),
         (TypeId::FROZENSET, "__contains__") => Some(CachedMethod::simple(builtin_method_value(
             &FROZENSET_CONTAINS_METHOD,
+        ))),
+        (TypeId::FROZENSET, "__init__") => Some(CachedMethod::simple(builtin_method_value(
+            &FROZENSET_INIT_METHOD,
         ))),
         _ => None,
     }

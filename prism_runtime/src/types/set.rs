@@ -24,6 +24,7 @@ use rustc_hash::FxHashSet;
 /// - Remove: O(1) average
 /// - Union/Intersection: O(n)
 #[repr(C)]
+#[derive(Debug)]
 pub struct SetObject {
     /// Object header.
     pub header: ObjectHeader,

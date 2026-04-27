@@ -124,6 +124,28 @@ pub(crate) fn list_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut L
     prism_runtime::types::list::object_ptr_as_list_mut(ptr as *mut ())
 }
 
+#[inline]
+pub(crate) fn set_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static SetObject> {
+    match extract_type_id(ptr) {
+        TypeId::SET | TypeId::FROZENSET => Some(unsafe { &*(ptr as *const SetObject) }),
+        type_id if uses_shaped_user_instance_layout(type_id) => {
+            unsafe { &*(ptr as *const ShapedObject) }.set_backing()
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+pub(crate) fn set_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut SetObject> {
+    match extract_type_id(ptr) {
+        TypeId::SET | TypeId::FROZENSET => Some(unsafe { &mut *(ptr as *mut SetObject) }),
+        type_id if uses_shaped_user_instance_layout(type_id) => {
+            unsafe { &mut *(ptr as *mut ShapedObject) }.set_backing_mut()
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn set_list_item_value(
     vm: &mut VirtualMachine,
     ptr: *const (),

@@ -101,6 +101,27 @@ static DICT_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
         crate::builtins::builtin_dict_init_vm_kw,
     )
 });
+static SET_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("set.__new__"), crate::builtins::builtin_set_new)
+});
+static SET_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("set.__init__"),
+        crate::builtins::builtin_set_init_vm,
+    )
+});
+static FROZENSET_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("frozenset.__new__"),
+        crate::builtins::builtin_frozenset_new,
+    )
+});
+static FROZENSET_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("frozenset.__init__"),
+        crate::builtins::builtin_frozenset_init,
+    )
+});
 static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("int.__new__"),
@@ -531,6 +552,10 @@ fn builtin_instantiation_slot_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::LIST, "__init__") => Some(builtin_slot_value(&LIST_INIT_SLOT_FUNCTION)),
         (TypeId::DICT, "__new__") => Some(builtin_slot_value(&DICT_NEW_SLOT_FUNCTION)),
         (TypeId::DICT, "__init__") => Some(builtin_slot_value(&DICT_INIT_SLOT_FUNCTION)),
+        (TypeId::SET, "__new__") => Some(builtin_slot_value(&SET_NEW_SLOT_FUNCTION)),
+        (TypeId::SET, "__init__") => Some(builtin_slot_value(&SET_INIT_SLOT_FUNCTION)),
+        (TypeId::FROZENSET, "__new__") => Some(builtin_slot_value(&FROZENSET_NEW_SLOT_FUNCTION)),
+        (TypeId::FROZENSET, "__init__") => Some(builtin_slot_value(&FROZENSET_INIT_SLOT_FUNCTION)),
         (TypeId::INT, "__new__") => Some(builtin_slot_value(&INT_NEW_SLOT_FUNCTION)),
         (TypeId::FLOAT, "__new__") => Some(builtin_slot_value(&FLOAT_NEW_SLOT_FUNCTION)),
         (TypeId::STR, "__new__") => Some(builtin_slot_value(&STR_NEW_SLOT_FUNCTION)),
@@ -906,7 +931,9 @@ fn should_route_keywords_to_init_only(
 ) -> bool {
     has_keywords
         && (slot_callable_matches_builtin_name(new_callable, "tuple.__new__")
-            || slot_callable_matches_builtin_name(new_callable, "dict.__new__"))
+            || slot_callable_matches_builtin_name(new_callable, "dict.__new__")
+            || slot_callable_matches_builtin_name(new_callable, "set.__new__")
+            || slot_callable_matches_builtin_name(new_callable, "frozenset.__new__"))
         && resolve_instantiation_slot(class, "__init__")
             .is_some_and(|init| !slot_callable_matches_builtin_name(init, "object.__init__"))
 }

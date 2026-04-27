@@ -308,12 +308,16 @@ unsafe impl Trace for ShapedObject {
         if let Some(list) = self.list_backing() {
             list.trace(tracer);
         }
+        if let Some(set) = self.set_backing() {
+            set.trace(tracer);
+        }
     }
 
     fn size_of(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.dict_backing().map_or(0, Trace::size_of)
             + self.list_backing().map_or(0, Trace::size_of)
+            + self.set_backing().map_or(0, Trace::size_of)
             + self.string_backing().map_or(0, Trace::size_of)
     }
 }

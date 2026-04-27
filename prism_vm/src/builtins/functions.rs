@@ -149,6 +149,9 @@ fn exact_len(value: Value) -> Result<Option<usize>, RuntimeError> {
     if let Some(tuple) = crate::ops::objects::tuple_storage_ref_from_ptr(ptr) {
         return Ok(Some(tuple.len()));
     }
+    if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
+        return Ok(Some(set.len()));
+    }
     match type_id {
         TypeId::DICT => Ok(Some(unsafe { &*(ptr as *const DictObject) }.len())),
         TypeId::MAPPING_PROXY => {

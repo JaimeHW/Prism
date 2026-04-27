@@ -143,9 +143,9 @@ fn value_as_mapping_proxy(value: &Value) -> Option<&MappingProxyObject> {
 /// Extract SetObject from Value.
 #[inline(always)]
 fn value_as_set(value: &Value) -> Option<&SetObject> {
-    let ptr = value.as_object_ptr()?;
-    // SAFETY: Caller verified TypeId::SET
-    Some(unsafe { &*(ptr as *const SetObject) })
+    value
+        .as_object_ptr()
+        .and_then(crate::ops::objects::set_storage_ref_from_ptr)
 }
 
 /// Extract DequeObject from Value.
@@ -251,6 +251,16 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
 
     if let Some(dict) = value_as_dict(value) {
         return Ok(dict_key_iterator(*value, dict));
+    }
+
+    if let Some(set) = value_as_set(value) {
+        let values: Vec<Value> = set.iter().collect();
+        return Ok(IteratorObject::guarded_values(
+            *value,
+            values,
+            set_len_guard,
+            SET_MUTATED,
+        ));
     }
 
     // Fast path: Check if already an iterator

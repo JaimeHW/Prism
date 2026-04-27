@@ -25,6 +25,7 @@ use crate::object::type_obj::TypeId;
 use crate::types::bytes::BytesObject;
 use crate::types::dict::DictObject;
 use crate::types::list::ListObject;
+use crate::types::set::SetObject;
 use crate::types::string::StringObject;
 use crate::types::tuple::TupleObject;
 use num_bigint::BigInt;
@@ -242,6 +243,14 @@ pub struct ShapedObject {
     /// keeping user-defined instance attributes in the shaped-object storage.
     list_backing: Option<Box<ListObject>>,
 
+    /// Optional native set storage for heap subclasses of `set` and
+    /// `frozenset`.
+    ///
+    /// The backing set carries its own logical builtin type id, allowing shared
+    /// method descriptors to enforce mutability while user attributes remain in
+    /// shaped-object storage.
+    set_backing: Option<Box<SetObject>>,
+
     /// Optional native tuple storage for tuple-like heap objects.
     ///
     /// This supports CPython struct-sequence style objects that expose named
@@ -287,6 +296,7 @@ impl ShapedObject {
             instance_dict: None,
             dict_backing: None,
             list_backing: None,
+            set_backing: None,
             tuple_backing: None,
             string_backing: None,
             bytes_backing: None,
@@ -307,6 +317,17 @@ impl ShapedObject {
     pub fn new_list_backed(type_id: TypeId, empty_shape: Arc<Shape>) -> Self {
         let mut object = Self::new(type_id, empty_shape);
         object.list_backing = Some(Box::new(ListObject::new()));
+        object
+    }
+
+    /// Create a new ShapedObject with native set or frozenset storage.
+    #[inline]
+    pub fn new_set_backed(type_id: TypeId, empty_shape: Arc<Shape>, backing_type: TypeId) -> Self {
+        debug_assert!(matches!(backing_type, TypeId::SET | TypeId::FROZENSET));
+        let mut object = Self::new(type_id, empty_shape);
+        let mut set = SetObject::new();
+        set.header.type_id = backing_type;
+        object.set_backing = Some(Box::new(set));
         object
     }
 
@@ -433,6 +454,26 @@ impl ShapedObject {
     #[inline]
     pub fn list_backing_mut(&mut self) -> Option<&mut ListObject> {
         self.list_backing.as_deref_mut()
+    }
+
+    /// Check whether this heap instance carries native set storage.
+    #[inline]
+    pub fn has_set_backing(&self) -> bool {
+        self.set_backing.is_some()
+    }
+
+    /// Borrow the native set storage for heap subclasses of `set` or
+    /// `frozenset`.
+    #[inline]
+    pub fn set_backing(&self) -> Option<&SetObject> {
+        self.set_backing.as_deref()
+    }
+
+    /// Mutably borrow the native set storage for heap subclasses of `set` or
+    /// `frozenset`.
+    #[inline]
+    pub fn set_backing_mut(&mut self) -> Option<&mut SetObject> {
+        self.set_backing.as_deref_mut()
     }
 
     /// Check whether this heap instance carries native tuple storage.

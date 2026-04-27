@@ -31,7 +31,8 @@ use crate::ops::objects::{
     alloc_heap_value, delete_attribute_value, delete_list_item_value, dict_storage_mut_from_ptr,
     dict_storage_ref_from_ptr, get_attribute_value, list_storage_mut_from_ptr,
     list_storage_ref_from_ptr, object_getattribute_default, set_attribute_value,
-    set_list_item_value, tuple_storage_ref_from_ptr,
+    set_list_item_value, set_storage_mut_from_ptr, set_storage_ref_from_ptr,
+    tuple_storage_ref_from_ptr,
 };
 use crate::ops::protocols::value_type_id;
 use crate::python_numeric::complex_like_parts;
@@ -3620,15 +3621,22 @@ fn expect_set_receiver(
         )));
     };
 
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != expected_type {
+    let Some(set) = set_storage_ref_from_ptr(ptr) else {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
         return Err(BuiltinError::TypeError(format!(
             "descriptor '{receiver_name}.{method_name}' requires a '{receiver_name}' object but received '{}'",
             header.type_id.name()
         )));
+    };
+
+    if set.header.type_id != expected_type {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '{receiver_name}.{method_name}' requires a '{receiver_name}' object but received '{}'",
+            set.header.type_id.name()
+        )));
     }
 
-    Ok(unsafe { &*(ptr as *const SetObject) })
+    Ok(set)
 }
 
 #[inline]
@@ -3645,15 +3653,22 @@ fn expect_set_mut_receiver(
         )));
     };
 
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != expected_type {
+    let Some(set) = set_storage_mut_from_ptr(ptr) else {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
         return Err(BuiltinError::TypeError(format!(
             "descriptor '{receiver_name}.{method_name}' requires a '{receiver_name}' object but received '{}'",
             header.type_id.name()
         )));
+    };
+
+    if set.header.type_id != expected_type {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '{receiver_name}.{method_name}' requires a '{receiver_name}' object but received '{}'",
+            set.header.type_id.name()
+        )));
     }
 
-    Ok(unsafe { &mut *(ptr as *mut SetObject) })
+    Ok(set)
 }
 
 #[inline]

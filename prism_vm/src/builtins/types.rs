@@ -2860,6 +2860,12 @@ fn class_uses_native_list_storage(class: &PyClassObject) -> bool {
 }
 
 #[inline]
+fn class_uses_native_set_storage(class: &PyClassObject) -> bool {
+    class_uses_native_storage(class, TypeId::SET)
+        || class_uses_native_storage(class, TypeId::FROZENSET)
+}
+
+#[inline]
 fn class_uses_native_tuple_storage(class: &PyClassObject) -> bool {
     class_uses_native_storage(class, TypeId::TUPLE)
 }
@@ -2881,6 +2887,17 @@ pub(crate) fn allocate_heap_instance_for_class(class: &PyClassObject) -> ShapedO
         ShapedObject::new_dict_backed(class.class_type_id(), class.instance_shape().clone())
     } else if class_uses_native_list_storage(class) {
         ShapedObject::new_list_backed(class.class_type_id(), class.instance_shape().clone())
+    } else if class_uses_native_set_storage(class) {
+        let backing_type = if class_uses_native_storage(class, TypeId::FROZENSET) {
+            TypeId::FROZENSET
+        } else {
+            TypeId::SET
+        };
+        ShapedObject::new_set_backed(
+            class.class_type_id(),
+            class.instance_shape().clone(),
+            backing_type,
+        )
     } else if class_uses_native_tuple_storage(class) {
         ShapedObject::new_tuple_backed(
             class.class_type_id(),
@@ -3265,11 +3282,166 @@ pub(crate) fn builtin_dict_init_vm_kw(
 }
 
 pub(crate) fn builtin_set_new(args: &[Value]) -> Result<Value, BuiltinError> {
-    builtin_constructor_new(args, TypeId::SET, "set", builtin_set)
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "set.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "set expected at most 1 argument, got {}",
+            args.len() - 1
+        )));
+    }
+
+    let class_type = class_value_to_type_id(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("set.__new__(X): X must be a type".to_string()))?;
+    if class_type == TypeId::SET {
+        return Ok(to_object_value(SetObject::new()));
+    }
+    if !class_value_is_subtype(args[0], TypeId::SET) {
+        return Err(BuiltinError::TypeError(
+            "set.__new__(X): X is not a subtype of set".to_string(),
+        ));
+    }
+
+    let class_ptr = args[0]
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("set.__new__(X): X must be a type".to_string()))?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "set.__new__() for builtin set subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    Ok(to_object_value(ShapedObject::new_set_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+        TypeId::SET,
+    )))
 }
 
 pub(crate) fn builtin_frozenset_new(args: &[Value]) -> Result<Value, BuiltinError> {
-    builtin_constructor_new(args, TypeId::FROZENSET, "frozenset", builtin_frozenset)
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "frozenset.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "frozenset expected at most 1 argument, got {}",
+            args.len() - 1
+        )));
+    }
+
+    let class_type = class_value_to_type_id(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("frozenset.__new__(X): X must be a type".to_string())
+    })?;
+
+    let values = match args.get(1).copied() {
+        Some(value) => {
+            if class_type == TypeId::FROZENSET
+                && value.as_object_ptr().is_some_and(|ptr| {
+                    crate::ops::objects::extract_type_id(ptr) == TypeId::FROZENSET
+                })
+            {
+                return Ok(value);
+            }
+            iter_values(value)?
+        }
+        None => Vec::new(),
+    };
+    let set = build_validated_set(values)?;
+
+    if class_type == TypeId::FROZENSET {
+        return Ok(to_frozenset_value(set));
+    }
+    if !class_value_is_subtype(args[0], TypeId::FROZENSET) {
+        return Err(BuiltinError::TypeError(
+            "frozenset.__new__(X): X is not a subtype of frozenset".to_string(),
+        ));
+    }
+
+    let class_ptr = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("frozenset.__new__(X): X must be a type".to_string())
+    })?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "frozenset.__new__() for builtin frozenset subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    let mut instance = ShapedObject::new_set_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+        TypeId::FROZENSET,
+    );
+    *instance
+        .set_backing_mut()
+        .expect("frozenset subclass instance should carry native set storage") = set;
+    instance
+        .set_backing_mut()
+        .expect("frozenset subclass instance should carry native set storage")
+        .header
+        .type_id = TypeId::FROZENSET;
+    Ok(to_object_value(instance))
+}
+
+pub(crate) fn builtin_set_init_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "set.__init__() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a set object".to_string())
+    })?;
+    let set = crate::ops::objects::set_storage_mut_from_ptr(self_ptr).ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a set object".to_string())
+    })?;
+    if set.header.type_id != TypeId::SET {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__init__' requires a set object".to_string(),
+        ));
+    }
+
+    set.clear();
+    if let Some(iterable) = args.get(1).copied() {
+        for value in iter_values_with_vm(vm, iterable)? {
+            validate_hashable_value(value)?;
+            set.add(value);
+        }
+    }
+
+    Ok(Value::none())
+}
+
+pub(crate) fn builtin_frozenset_init(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "frozenset.__init__() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a frozenset object".to_string())
+    })?;
+    let set = crate::ops::objects::set_storage_ref_from_ptr(self_ptr).ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a frozenset object".to_string())
+    })?;
+    if set.header.type_id != TypeId::FROZENSET {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__init__' requires a frozenset object".to_string(),
+        ));
+    }
+
+    Ok(Value::none())
 }
 
 pub(crate) fn builtin_module_new(args: &[Value]) -> Result<Value, BuiltinError> {
