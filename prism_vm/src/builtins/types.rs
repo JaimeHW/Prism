@@ -1470,6 +1470,12 @@ pub(crate) fn call_builtin_type_with_vm(
             if args.is_empty() {
                 return Ok(to_object_value(TupleObject::empty()));
             }
+            if args[0]
+                .as_object_ptr()
+                .is_some_and(|ptr| crate::ops::objects::extract_type_id(ptr) == TypeId::TUPLE)
+            {
+                return Ok(args[0]);
+            }
 
             let values = iter_values_with_vm(vm, args[0])?;
             Ok(to_object_value(TupleObject::from_vec(values)))
@@ -2228,6 +2234,12 @@ pub fn builtin_tuple(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     if args.is_empty() {
         return Ok(to_object_value(TupleObject::empty()));
+    }
+    if args[0]
+        .as_object_ptr()
+        .is_some_and(|ptr| crate::ops::objects::extract_type_id(ptr) == TypeId::TUPLE)
+    {
+        return Ok(args[0]);
     }
 
     let values = iter_values(args[0])?;
