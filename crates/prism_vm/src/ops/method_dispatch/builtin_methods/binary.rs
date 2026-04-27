@@ -14,6 +14,19 @@ enum ReturnIdentity {
     Never,
 }
 
+#[derive(Clone, Copy)]
+enum JustifyMode {
+    Left,
+    Right,
+    Center,
+}
+
+#[derive(Clone, Copy)]
+enum AffixMode {
+    Prefix,
+    Suffix,
+}
+
 static BYTES_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.decode"), bytes_decode));
 static BYTES_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -24,6 +37,48 @@ static BYTES_UPPER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.upper"), bytes_upper));
 static BYTES_LOWER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.lower"), bytes_lower));
+static BYTES_CAPITALIZE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.capitalize"), bytes_capitalize));
+static BYTES_SWAPCASE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.swapcase"), bytes_swapcase));
+static BYTES_TITLE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.title"), bytes_title));
+static BYTES_EXPANDTABS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytes.expandtabs"), bytes_expandtabs_kw)
+});
+static BYTES_ISALNUM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.isalnum"), bytes_isalnum));
+static BYTES_ISALPHA_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.isalpha"), bytes_isalpha));
+static BYTES_ISASCII_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.isascii"), bytes_isascii));
+static BYTES_ISDIGIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.isdigit"), bytes_isdigit));
+static BYTES_ISLOWER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.islower"), bytes_islower));
+static BYTES_ISSPACE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.isspace"), bytes_isspace));
+static BYTES_ISTITLE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.istitle"), bytes_istitle));
+static BYTES_ISUPPER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.isupper"), bytes_isupper));
+static BYTES_CENTER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.center"), bytes_center));
+static BYTES_LJUST_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.ljust"), bytes_ljust));
+static BYTES_RJUST_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.rjust"), bytes_rjust));
+static BYTES_ZFILL_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.zfill"), bytes_zfill));
+static BYTES_REMOVEPREFIX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytes.removeprefix"), bytes_removeprefix)
+});
+static BYTES_REMOVESUFFIX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytes.removesuffix"), bytes_removesuffix)
+});
+static BYTES_SPLITLINES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytes.splitlines"), bytes_splitlines_kw)
+});
 static BYTES_STRIP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.strip"), bytes_strip));
 static BYTES_LSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -72,6 +127,50 @@ static BYTEARRAY_UPPER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.upper"), bytearray_upper));
 static BYTEARRAY_LOWER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.lower"), bytearray_lower));
+static BYTEARRAY_CAPITALIZE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.capitalize"), bytearray_capitalize)
+});
+static BYTEARRAY_SWAPCASE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.swapcase"), bytearray_swapcase)
+});
+static BYTEARRAY_TITLE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.title"), bytearray_title));
+static BYTEARRAY_EXPANDTABS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytearray.expandtabs"), bytearray_expandtabs_kw)
+});
+static BYTEARRAY_ISALNUM_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.isalnum"), bytearray_isalnum));
+static BYTEARRAY_ISALPHA_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.isalpha"), bytearray_isalpha));
+static BYTEARRAY_ISASCII_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.isascii"), bytearray_isascii));
+static BYTEARRAY_ISDIGIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.isdigit"), bytearray_isdigit));
+static BYTEARRAY_ISLOWER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.islower"), bytearray_islower));
+static BYTEARRAY_ISSPACE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.isspace"), bytearray_isspace));
+static BYTEARRAY_ISTITLE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.istitle"), bytearray_istitle));
+static BYTEARRAY_ISUPPER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.isupper"), bytearray_isupper));
+static BYTEARRAY_CENTER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.center"), bytearray_center));
+static BYTEARRAY_LJUST_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.ljust"), bytearray_ljust));
+static BYTEARRAY_RJUST_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.rjust"), bytearray_rjust));
+static BYTEARRAY_ZFILL_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.zfill"), bytearray_zfill));
+static BYTEARRAY_REMOVEPREFIX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.removeprefix"), bytearray_removeprefix)
+});
+static BYTEARRAY_REMOVESUFFIX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("bytearray.removesuffix"), bytearray_removesuffix)
+});
+static BYTEARRAY_SPLITLINES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytearray.splitlines"), bytearray_splitlines_kw)
+});
 static BYTEARRAY_STRIP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.strip"), bytearray_strip));
 static BYTEARRAY_LSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -127,6 +226,63 @@ pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
         ))),
         "lower" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_LOWER_METHOD,
+        ))),
+        "capitalize" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_CAPITALIZE_METHOD,
+        ))),
+        "swapcase" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_SWAPCASE_METHOD,
+        ))),
+        "title" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_TITLE_METHOD,
+        ))),
+        "expandtabs" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_EXPANDTABS_METHOD,
+        ))),
+        "isalnum" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISALNUM_METHOD,
+        ))),
+        "isalpha" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISALPHA_METHOD,
+        ))),
+        "isascii" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISASCII_METHOD,
+        ))),
+        "isdigit" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISDIGIT_METHOD,
+        ))),
+        "islower" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISLOWER_METHOD,
+        ))),
+        "isspace" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISSPACE_METHOD,
+        ))),
+        "istitle" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISTITLE_METHOD,
+        ))),
+        "isupper" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ISUPPER_METHOD,
+        ))),
+        "center" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_CENTER_METHOD,
+        ))),
+        "ljust" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_LJUST_METHOD,
+        ))),
+        "rjust" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_RJUST_METHOD,
+        ))),
+        "zfill" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_ZFILL_METHOD,
+        ))),
+        "removeprefix" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_REMOVEPREFIX_METHOD,
+        ))),
+        "removesuffix" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_REMOVESUFFIX_METHOD,
+        ))),
+        "splitlines" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_SPLITLINES_METHOD,
         ))),
         "strip" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_STRIP_METHOD,
@@ -200,6 +356,63 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
         ))),
         "lower" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_LOWER_METHOD,
+        ))),
+        "capitalize" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_CAPITALIZE_METHOD,
+        ))),
+        "swapcase" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_SWAPCASE_METHOD,
+        ))),
+        "title" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_TITLE_METHOD,
+        ))),
+        "expandtabs" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_EXPANDTABS_METHOD,
+        ))),
+        "isalnum" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISALNUM_METHOD,
+        ))),
+        "isalpha" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISALPHA_METHOD,
+        ))),
+        "isascii" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISASCII_METHOD,
+        ))),
+        "isdigit" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISDIGIT_METHOD,
+        ))),
+        "islower" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISLOWER_METHOD,
+        ))),
+        "isspace" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISSPACE_METHOD,
+        ))),
+        "istitle" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISTITLE_METHOD,
+        ))),
+        "isupper" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ISUPPER_METHOD,
+        ))),
+        "center" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_CENTER_METHOD,
+        ))),
+        "ljust" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_LJUST_METHOD,
+        ))),
+        "rjust" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_RJUST_METHOD,
+        ))),
+        "zfill" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_ZFILL_METHOD,
+        ))),
+        "removeprefix" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_REMOVEPREFIX_METHOD,
+        ))),
+        "removesuffix" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_REMOVESUFFIX_METHOD,
+        ))),
+        "splitlines" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_SPLITLINES_METHOD,
         ))),
         "strip" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_STRIP_METHOD,
@@ -307,6 +520,180 @@ pub(super) fn bytes_lower(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+pub(super) fn bytes_capitalize(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_capitalize(args, "bytes", expect_bytes_ref, TypeId::BYTES)
+}
+
+#[inline]
+pub(super) fn bytes_swapcase(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_swapcase(args, "bytes", expect_bytes_ref, TypeId::BYTES)
+}
+
+#[inline]
+pub(super) fn bytes_title(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_title(args, "bytes", expect_bytes_ref, TypeId::BYTES)
+}
+
+#[inline]
+pub(super) fn bytes_expandtabs(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytes_expandtabs_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_expandtabs_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_expandtabs_kw(args, keywords, "bytes", expect_bytes_ref, TypeId::BYTES)
+}
+
+#[inline]
+pub(super) fn bytes_isalnum(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytes", "isalnum", expect_bytes_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| is_ascii_byte_alnum(byte))
+    })
+}
+
+#[inline]
+pub(super) fn bytes_isalpha(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytes", "isalpha", expect_bytes_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| is_ascii_byte_alpha(byte))
+    })
+}
+
+#[inline]
+pub(super) fn bytes_isascii(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytes", "isascii", expect_bytes_ref, |data| {
+        data.iter().all(|&byte| byte.is_ascii())
+    })
+}
+
+#[inline]
+pub(super) fn bytes_isdigit(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytes", "isdigit", expect_bytes_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| byte.is_ascii_digit())
+    })
+}
+
+#[inline]
+pub(super) fn bytes_islower(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(
+        args,
+        "bytes",
+        "islower",
+        expect_bytes_ref,
+        is_ascii_bytes_lower,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_isspace(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytes", "isspace", expect_bytes_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| is_ascii_byte_whitespace(byte))
+    })
+}
+
+#[inline]
+pub(super) fn bytes_istitle(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(
+        args,
+        "bytes",
+        "istitle",
+        expect_bytes_ref,
+        is_ascii_bytes_title,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_isupper(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(
+        args,
+        "bytes",
+        "isupper",
+        expect_bytes_ref,
+        is_ascii_bytes_upper,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_center(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_justify(
+        args,
+        "bytes",
+        "center",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        JustifyMode::Center,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_ljust(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_justify(
+        args,
+        "bytes",
+        "ljust",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        JustifyMode::Left,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_rjust(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_justify(
+        args,
+        "bytes",
+        "rjust",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        JustifyMode::Right,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_zfill(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_zfill(args, "bytes", expect_bytes_ref, TypeId::BYTES)
+}
+
+#[inline]
+pub(super) fn bytes_removeprefix(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_remove_affix(
+        args,
+        "bytes",
+        "removeprefix",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        AffixMode::Prefix,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_removesuffix(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_remove_affix(
+        args,
+        "bytes",
+        "removesuffix",
+        expect_bytes_ref,
+        TypeId::BYTES,
+        AffixMode::Suffix,
+    )
+}
+
+#[inline]
+pub(super) fn bytes_splitlines(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytes_splitlines_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_splitlines_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_splitlines_kw(args, keywords, "bytes", expect_bytes_ref, TypeId::BYTES)
+}
+
+#[inline]
 pub(super) fn bytes_strip(args: &[Value]) -> Result<Value, BuiltinError> {
     byte_sequence_strip(
         args,
@@ -390,6 +777,192 @@ pub(super) fn bytearray_lower(args: &[Value]) -> Result<Value, BuiltinError> {
         expect_bytearray_ref,
         TypeId::BYTEARRAY,
         u8::to_ascii_lowercase,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_capitalize(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_capitalize(args, "bytearray", expect_bytearray_ref, TypeId::BYTEARRAY)
+}
+
+#[inline]
+pub(super) fn bytearray_swapcase(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_swapcase(args, "bytearray", expect_bytearray_ref, TypeId::BYTEARRAY)
+}
+
+#[inline]
+pub(super) fn bytearray_title(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_title(args, "bytearray", expect_bytearray_ref, TypeId::BYTEARRAY)
+}
+
+#[inline]
+pub(super) fn bytearray_expandtabs(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytearray_expandtabs_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_expandtabs_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_expandtabs_kw(
+        args,
+        keywords,
+        "bytearray",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_isalnum(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytearray", "isalnum", expect_bytearray_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| is_ascii_byte_alnum(byte))
+    })
+}
+
+#[inline]
+pub(super) fn bytearray_isalpha(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytearray", "isalpha", expect_bytearray_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| is_ascii_byte_alpha(byte))
+    })
+}
+
+#[inline]
+pub(super) fn bytearray_isascii(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytearray", "isascii", expect_bytearray_ref, |data| {
+        data.iter().all(|&byte| byte.is_ascii())
+    })
+}
+
+#[inline]
+pub(super) fn bytearray_isdigit(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytearray", "isdigit", expect_bytearray_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| byte.is_ascii_digit())
+    })
+}
+
+#[inline]
+pub(super) fn bytearray_islower(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(
+        args,
+        "bytearray",
+        "islower",
+        expect_bytearray_ref,
+        is_ascii_bytes_lower,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_isspace(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(args, "bytearray", "isspace", expect_bytearray_ref, |data| {
+        !data.is_empty() && data.iter().all(|&byte| is_ascii_byte_whitespace(byte))
+    })
+}
+
+#[inline]
+pub(super) fn bytearray_istitle(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(
+        args,
+        "bytearray",
+        "istitle",
+        expect_bytearray_ref,
+        is_ascii_bytes_title,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_isupper(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_predicate(
+        args,
+        "bytearray",
+        "isupper",
+        expect_bytearray_ref,
+        is_ascii_bytes_upper,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_center(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_justify(
+        args,
+        "bytearray",
+        "center",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        JustifyMode::Center,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_ljust(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_justify(
+        args,
+        "bytearray",
+        "ljust",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        JustifyMode::Left,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_rjust(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_justify(
+        args,
+        "bytearray",
+        "rjust",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        JustifyMode::Right,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_zfill(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_zfill(args, "bytearray", expect_bytearray_ref, TypeId::BYTEARRAY)
+}
+
+#[inline]
+pub(super) fn bytearray_removeprefix(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_remove_affix(
+        args,
+        "bytearray",
+        "removeprefix",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        AffixMode::Prefix,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_removesuffix(args: &[Value]) -> Result<Value, BuiltinError> {
+    byte_sequence_remove_affix(
+        args,
+        "bytearray",
+        "removesuffix",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+        AffixMode::Suffix,
+    )
+}
+
+#[inline]
+pub(super) fn bytearray_splitlines(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytearray_splitlines_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_splitlines_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_splitlines_kw(
+        args,
+        keywords,
+        "bytearray",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
     )
 }
 
@@ -778,6 +1351,279 @@ fn byte_sequence_case_transform(
         converted,
         result_type,
     )))
+}
+
+fn byte_sequence_capitalize(
+    args: &[Value],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, "capitalize", args, 0)?;
+    let bytes = receiver(args[0], "capitalize")?;
+    let data = bytes.as_bytes();
+    let mut converted = Vec::with_capacity(data.len());
+    if let Some((&first, rest)) = data.split_first() {
+        converted.push(first.to_ascii_uppercase());
+        converted.extend(rest.iter().map(u8::to_ascii_lowercase));
+    }
+    Ok(byte_sequence_value(converted, result_type))
+}
+
+fn byte_sequence_swapcase(
+    args: &[Value],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, "swapcase", args, 0)?;
+    let bytes = receiver(args[0], "swapcase")?;
+    let converted = bytes
+        .as_bytes()
+        .iter()
+        .map(|&byte| {
+            if byte.is_ascii_lowercase() {
+                byte.to_ascii_uppercase()
+            } else if byte.is_ascii_uppercase() {
+                byte.to_ascii_lowercase()
+            } else {
+                byte
+            }
+        })
+        .collect();
+    Ok(byte_sequence_value(converted, result_type))
+}
+
+fn byte_sequence_title(
+    args: &[Value],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, "title", args, 0)?;
+    let bytes = receiver(args[0], "title")?;
+    let mut previous_cased = false;
+    let converted = bytes
+        .as_bytes()
+        .iter()
+        .map(|&byte| {
+            if is_ascii_byte_alpha(byte) {
+                let mapped = if previous_cased {
+                    byte.to_ascii_lowercase()
+                } else {
+                    byte.to_ascii_uppercase()
+                };
+                previous_cased = true;
+                mapped
+            } else {
+                previous_cased = false;
+                byte
+            }
+        })
+        .collect();
+    Ok(byte_sequence_value(converted, result_type))
+}
+
+fn byte_sequence_expandtabs_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+) -> Result<Value, BuiltinError> {
+    let tabsize = bind_expandtabs_tabsize(args, keywords, receiver_name)?;
+    let bytes = receiver(args[0], "expandtabs")?;
+    let data = bytes.as_bytes();
+    let tabsize = tabsize.max(0) as usize;
+    let mut column = 0usize;
+    let mut expanded = Vec::with_capacity(data.len());
+
+    for &byte in data {
+        match byte {
+            b'\t' => {
+                if tabsize > 0 {
+                    let spaces = tabsize - (column % tabsize);
+                    let new_len = expanded.len().checked_add(spaces).ok_or_else(|| {
+                        BuiltinError::OverflowError("result too large".to_string())
+                    })?;
+                    expanded.resize(new_len, b' ');
+                    column = column.checked_add(spaces).ok_or_else(|| {
+                        BuiltinError::OverflowError("result too large".to_string())
+                    })?;
+                }
+            }
+            b'\n' | b'\r' => {
+                expanded.push(byte);
+                column = 0;
+            }
+            _ => {
+                expanded.push(byte);
+                column = column
+                    .checked_add(1)
+                    .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?;
+            }
+        }
+    }
+
+    Ok(byte_sequence_value(expanded, result_type))
+}
+
+fn byte_sequence_predicate<F>(
+    args: &[Value],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    predicate: F,
+) -> Result<Value, BuiltinError>
+where
+    F: FnOnce(&[u8]) -> bool,
+{
+    expect_method_arg_count(receiver_name, method_name, args, 0)?;
+    let bytes = receiver(args[0], method_name)?;
+    Ok(Value::bool(predicate(bytes.as_bytes())))
+}
+
+fn byte_sequence_justify(
+    args: &[Value],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+    mode: JustifyMode,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_range(receiver_name, method_name, args, 1, 2)?;
+    let bytes = receiver(args[0], method_name)?;
+    let data = bytes.as_bytes();
+    let width = parse_byte_width(args[1], method_name, 1)?;
+    if width <= data.len() {
+        return unchanged_byte_sequence(
+            args[0],
+            data,
+            result_type,
+            byte_sequence_identity(result_type),
+        );
+    }
+
+    let fill = parse_fill_byte(args.get(2).copied(), method_name)?;
+    let padding = width - data.len();
+    let (left, right) = match mode {
+        JustifyMode::Left => (0, padding),
+        JustifyMode::Right => (padding, 0),
+        JustifyMode::Center => (padding / 2, padding - (padding / 2)),
+    };
+
+    let mut result = Vec::with_capacity(width);
+    result.resize(left, fill);
+    result.extend_from_slice(data);
+    let new_len = result
+        .len()
+        .checked_add(right)
+        .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))?;
+    result.resize(new_len, fill);
+    Ok(byte_sequence_value(result, result_type))
+}
+
+fn byte_sequence_zfill(
+    args: &[Value],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, "zfill", args, 1)?;
+    let bytes = receiver(args[0], "zfill")?;
+    let data = bytes.as_bytes();
+    let width = parse_byte_width(args[1], "zfill", 1)?;
+    if width <= data.len() {
+        return unchanged_byte_sequence(
+            args[0],
+            data,
+            result_type,
+            byte_sequence_identity(result_type),
+        );
+    }
+
+    let padding = width - data.len();
+    let mut result = Vec::with_capacity(width);
+    if matches!(data.first(), Some(b'+' | b'-')) {
+        result.push(data[0]);
+        result.resize(1 + padding, b'0');
+        result.extend_from_slice(&data[1..]);
+    } else {
+        result.resize(padding, b'0');
+        result.extend_from_slice(data);
+    }
+    Ok(byte_sequence_value(result, result_type))
+}
+
+fn byte_sequence_remove_affix(
+    args: &[Value],
+    receiver_name: &'static str,
+    method_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+    mode: AffixMode,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count(receiver_name, method_name, args, 1)?;
+    let bytes = receiver(args[0], method_name)?;
+    let affix = bytes_like_argument_bytes(args[1])?;
+    let data = bytes.as_bytes();
+
+    let result = match mode {
+        AffixMode::Prefix if data.starts_with(&affix) => &data[affix.len()..],
+        AffixMode::Suffix if !affix.is_empty() && data.ends_with(&affix) => {
+            &data[..data.len() - affix.len()]
+        }
+        _ => {
+            return unchanged_byte_sequence(
+                args[0],
+                data,
+                result_type,
+                byte_sequence_identity(result_type),
+            );
+        }
+    };
+
+    Ok(byte_sequence_value(result.to_vec(), result_type))
+}
+
+fn byte_sequence_splitlines_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+    result_type: TypeId,
+) -> Result<Value, BuiltinError> {
+    let keepends = bind_splitlines_keepends(args, keywords, receiver_name)?;
+    let bytes = receiver(args[0], "splitlines")?;
+    let data = bytes.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+
+    while index < data.len() {
+        let eol_len = match data[index] {
+            b'\n' | 0x0b | 0x0c => 1,
+            b'\r' if data.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        let line_end = if keepends { index + eol_len } else { index };
+        parts.push(byte_sequence_slice_value(
+            &data[start..line_end],
+            result_type,
+        ));
+        index += eol_len;
+        start = index;
+    }
+
+    if start < data.len() {
+        parts.push(byte_sequence_slice_value(&data[start..], result_type));
+    }
+    Ok(to_object_value(ListObject::from_slice(parts.as_slice())))
 }
 
 fn byte_sequence_join_with_vm(
@@ -1343,6 +2189,74 @@ fn bind_byte_split_keyword_args(
     Ok((separator, maxsplit))
 }
 
+fn bind_expandtabs_tabsize(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+) -> Result<i64, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.expandtabs() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let mut tabsize = args.get(1).copied();
+    for (name, value) in keywords {
+        match *name {
+            "tabsize" => {
+                if tabsize.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "expandtabs() got multiple values for argument 'tabsize'".to_string(),
+                    ));
+                }
+                tabsize = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{receiver_name}.expandtabs() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    tabsize.map_or(Ok(8), |value| parse_byte_signed_int(value, "expandtabs", 1))
+}
+
+fn bind_splitlines_keepends(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+) -> Result<bool, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.splitlines() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let mut keepends = args.get(1).copied();
+    for (name, value) in keywords {
+        match *name {
+            "keepends" => {
+                if keepends.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "splitlines() got multiple values for argument 'keepends'".to_string(),
+                    ));
+                }
+                keepends = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{receiver_name}.splitlines() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok(keepends.is_some_and(crate::truthiness::is_truthy))
+}
+
 #[inline]
 fn parse_byte_count(
     count: Option<Value>,
@@ -1371,6 +2285,49 @@ fn parse_byte_count(
     )))
 }
 
+#[inline]
+fn parse_byte_width(
+    value: Value,
+    method_name: &'static str,
+    position: usize,
+) -> Result<usize, BuiltinError> {
+    let width = parse_byte_signed_int(value, method_name, position)?;
+    if width <= 0 {
+        return Ok(0);
+    }
+    usize::try_from(width).map_err(|_| BuiltinError::OverflowError("result too large".to_string()))
+}
+
+#[inline]
+fn parse_byte_signed_int(
+    value: Value,
+    method_name: &'static str,
+    position: usize,
+) -> Result<i64, BuiltinError> {
+    if let Some(value) = value.as_bool() {
+        return Ok(i64::from(value));
+    }
+    value_to_saturated_i64(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "{method_name}() argument {position} must be int, not {}",
+            value.type_name()
+        ))
+    })
+}
+
+fn parse_fill_byte(fill: Option<Value>, method_name: &'static str) -> Result<u8, BuiltinError> {
+    let Some(fill) = fill else {
+        return Ok(b' ');
+    };
+    let fill = bytes_like_argument_bytes(fill)?;
+    if fill.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "{method_name}() argument 2 must be a byte string of length 1"
+        )));
+    }
+    Ok(fill[0])
+}
+
 fn unchanged_byte_sequence(
     receiver: Value,
     data: &[u8],
@@ -1388,6 +2345,20 @@ fn unchanged_byte_sequence(
         data.to_vec(),
         result_type,
     )))
+}
+
+#[inline]
+fn byte_sequence_identity(result_type: TypeId) -> ReturnIdentity {
+    if result_type == TypeId::BYTES {
+        ReturnIdentity::WhenUnchanged
+    } else {
+        ReturnIdentity::Never
+    }
+}
+
+#[inline]
+fn byte_sequence_value(data: Vec<u8>, result_type: TypeId) -> Value {
+    to_object_value(BytesObject::from_vec_with_type(data, result_type))
 }
 
 fn replace_empty_byte_pattern(
@@ -1670,6 +2641,60 @@ fn previous_ascii_whitespace(data: &[u8], start: usize, mut end: usize) -> Optio
 #[inline]
 fn is_ascii_byte_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+#[inline]
+fn is_ascii_byte_alpha(byte: u8) -> bool {
+    byte.is_ascii_alphabetic()
+}
+
+#[inline]
+fn is_ascii_byte_alnum(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+fn is_ascii_bytes_lower(data: &[u8]) -> bool {
+    let mut has_lower = false;
+    for &byte in data {
+        if byte.is_ascii_uppercase() {
+            return false;
+        }
+        has_lower |= byte.is_ascii_lowercase();
+    }
+    has_lower
+}
+
+fn is_ascii_bytes_upper(data: &[u8]) -> bool {
+    let mut has_upper = false;
+    for &byte in data {
+        if byte.is_ascii_lowercase() {
+            return false;
+        }
+        has_upper |= byte.is_ascii_uppercase();
+    }
+    has_upper
+}
+
+fn is_ascii_bytes_title(data: &[u8]) -> bool {
+    let mut has_cased = false;
+    let mut previous_cased = false;
+    for &byte in data {
+        if byte.is_ascii_uppercase() {
+            if previous_cased {
+                return false;
+            }
+            previous_cased = true;
+            has_cased = true;
+        } else if byte.is_ascii_lowercase() {
+            if !previous_cased {
+                return false;
+            }
+            has_cased = true;
+        } else {
+            previous_cased = false;
+        }
+    }
+    has_cased
 }
 
 #[inline]
