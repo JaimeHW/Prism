@@ -1625,7 +1625,7 @@ pub fn builtin_repr(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let repr = repr_value(args[0], 0)?;
+    let repr = repr_value(args[0])?;
     Ok(Value::string(intern(&repr)))
 }
 
@@ -1638,7 +1638,7 @@ pub fn builtin_repr_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value,
         )));
     }
 
-    let repr = repr_value_vm(vm, args[0], 0)?;
+    let repr = repr_value_vm(vm, args[0])?;
     Ok(Value::string(intern(&repr)))
 }
 
@@ -1653,7 +1653,7 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let repr = repr_value(args[0], 0)?;
+    let repr = repr_value(args[0])?;
     let ascii = escape_non_ascii(&repr);
     Ok(Value::string(intern(&ascii)))
 }
@@ -1667,175 +1667,288 @@ pub fn builtin_ascii_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
         )));
     }
 
-    let repr = repr_value_vm(vm, args[0], 0)?;
+    let repr = repr_value_vm(vm, args[0])?;
     let ascii = escape_non_ascii(&repr);
     Ok(Value::string(intern(&ascii)))
 }
 
-const MAX_REPR_DEPTH: usize = 12;
+const MAX_REPR_DEPTH: usize = 64;
 
-fn repr_list_like(list: &ListObject, depth: usize) -> Result<String, BuiltinError> {
-    let mut out = String::from("[");
-    let mut first = true;
-    for item in list.iter() {
-        if !first {
-            out.push_str(", ");
-        }
-        first = false;
-        out.push_str(&repr_value(*item, depth + 1)?);
-    }
-    out.push(']');
-    Ok(out)
+#[derive(Default)]
+struct ReprState {
+    active: SmallVec<[usize; 16]>,
+    depth: usize,
 }
 
-fn repr_value(value: Value, depth: usize) -> Result<String, BuiltinError> {
-    if depth >= MAX_REPR_DEPTH {
-        return Ok("...".to_string());
+impl ReprState {
+    fn repr_value(&mut self, value: Value) -> Result<String, BuiltinError> {
+        if self.depth >= MAX_REPR_DEPTH {
+            return Err(BuiltinError::Raised(RuntimeError::recursion_error(
+                self.depth,
+            )));
+        }
+
+        self.depth += 1;
+        let result = self.repr_value_inner(value);
+        self.depth -= 1;
+        result
     }
 
-    if value.is_none() {
-        return Ok("None".to_string());
+    fn repr_value_inner(&mut self, value: Value) -> Result<String, BuiltinError> {
+        if value.is_none() {
+            return Ok("None".to_string());
+        }
+        if let Some(b) = value.as_bool() {
+            return Ok(if b {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            });
+        }
+        if let Some(int_repr) = int_value_to_string(value) {
+            return Ok(int_repr);
+        }
+        if let Some(f) = value.as_float() {
+            if f.fract() == 0.0 && f.is_finite() {
+                return Ok(format!("{:.1}", f));
+            }
+            return Ok(f.to_string());
+        }
+        if let Some(string) = value_as_string_ref(value) {
+            return Ok(quote_python_string(string.as_str()));
+        }
+        if let Some(text) = crate::builtins::exception_repr_text_for_value(value) {
+            return Ok(text);
+        }
+        if let Some(text) = crate::stdlib::_thread::native_thread_object_repr(value) {
+            return Ok(text);
+        }
+
+        let ptr = value
+            .as_object_ptr()
+            .ok_or_else(|| BuiltinError::TypeError("invalid object reference".to_string()))?;
+        if crate::ops::objects::list_storage_ref_from_ptr(ptr).is_some() {
+            return self.repr_list_like(ptr);
+        }
+
+        let type_id = crate::ops::objects::extract_type_id(ptr);
+        match type_id {
+            TypeId::BYTES => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                Ok(quote_python_bytes(bytes.as_bytes()))
+            }
+            TypeId::BYTEARRAY => {
+                let bytes = unsafe { &*(ptr as *const BytesObject) };
+                Ok(format!(
+                    "bytearray({})",
+                    quote_python_bytes(bytes.as_bytes())
+                ))
+            }
+            TypeId::MEMORYVIEW => {
+                let view = unsafe { &*(ptr as *const MemoryViewObject) };
+                Ok(format!(
+                    "<memory at 0x{:x}; format {}; len {}>",
+                    ptr as usize,
+                    view.format_str(),
+                    view.len()
+                ))
+            }
+            TypeId::TUPLE => self.with_container(ptr, "(...)", |state| {
+                let tuple = unsafe { &*(ptr as *const TupleObject) };
+                state.repr_tuple(tuple)
+            }),
+            TypeId::DICT => self.with_container(ptr, "{...}", |state| {
+                let dict = unsafe { &*(ptr as *const DictObject) };
+                state.repr_dict(dict)
+            }),
+            TypeId::SET => self.with_container(ptr, "{...}", |state| {
+                let set = unsafe { &*(ptr as *const SetObject) };
+                state.repr_set(set)
+            }),
+            TypeId::RANGE => {
+                let range = unsafe { &*(ptr as *const RangeObject) };
+                Ok(range.to_string())
+            }
+            TypeId::COMPLEX => {
+                let complex = unsafe { &*(ptr as *const ComplexObject) };
+                Ok(complex.to_string())
+            }
+            TypeId::STATICMETHOD => {
+                let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
+                Ok(format!(
+                    "<staticmethod({})>",
+                    self.repr_value(descriptor.function())?
+                ))
+            }
+            TypeId::CLASSMETHOD => {
+                let descriptor = unsafe { &*(ptr as *const ClassMethodDescriptor) };
+                Ok(format!(
+                    "<classmethod({})>",
+                    self.repr_value(descriptor.function())?
+                ))
+            }
+            TypeId::BUILTIN_FUNCTION => {
+                let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+                Ok(format!(
+                    "<built-in function {}>",
+                    builtin_function_short_name(function.name())
+                ))
+            }
+            _ => Ok(format!(
+                "<{} object at 0x{:x}>",
+                type_id.name(),
+                ptr as usize
+            )),
+        }
     }
-    if let Some(b) = value.as_bool() {
-        return Ok(if b {
-            "True".to_string()
-        } else {
-            "False".to_string()
+
+    fn with_container<F>(
+        &mut self,
+        ptr: *const (),
+        recursive_repr: &'static str,
+        render: F,
+    ) -> Result<String, BuiltinError>
+    where
+        F: FnOnce(&mut Self) -> Result<String, BuiltinError>,
+    {
+        let key = ptr as usize;
+        if self.active.contains(&key) {
+            return Ok(recursive_repr.to_string());
+        }
+
+        self.active.push(key);
+        let result = render(self);
+        self.active.pop();
+        result
+    }
+
+    fn repr_list_like(&mut self, root_ptr: *const ()) -> Result<String, BuiltinError> {
+        #[derive(Clone, Copy)]
+        struct ListReprFrame {
+            ptr: *const (),
+            index: usize,
+        }
+
+        let root_key = root_ptr as usize;
+        if self.active.contains(&root_key) {
+            return Ok("[...]".to_string());
+        }
+
+        let mut out = String::from("[");
+        let mut frames = SmallVec::<[ListReprFrame; 16]>::new();
+        self.active.push(root_key);
+        frames.push(ListReprFrame {
+            ptr: root_ptr,
+            index: 0,
         });
-    }
-    if let Some(int_repr) = int_value_to_string(value) {
-        return Ok(int_repr);
-    }
-    if let Some(f) = value.as_float() {
-        if f.fract() == 0.0 && f.is_finite() {
-            return Ok(format!("{:.1}", f));
+
+        while let Some(frame) = frames.last_mut() {
+            let list = crate::ops::objects::list_storage_ref_from_ptr(frame.ptr)
+                .ok_or_else(|| BuiltinError::TypeError("invalid list reference".to_string()))?;
+
+            if frame.index >= list.len() {
+                out.push(']');
+                frames.pop();
+                self.active.pop();
+                continue;
+            }
+
+            if frame.index > 0 {
+                out.push_str(", ");
+            }
+
+            let item = unsafe { list.get_unchecked(frame.index) };
+            frame.index += 1;
+
+            let Some(child_ptr) = item.as_object_ptr() else {
+                out.push_str(&self.repr_value(item)?);
+                continue;
+            };
+
+            if crate::ops::objects::list_storage_ref_from_ptr(child_ptr).is_none() {
+                out.push_str(&self.repr_value(item)?);
+                continue;
+            }
+
+            let child_key = child_ptr as usize;
+            if self.active.contains(&child_key) {
+                out.push_str("[...]");
+                continue;
+            }
+
+            if frames.len() >= MAX_REPR_DEPTH {
+                return Err(BuiltinError::Raised(RuntimeError::recursion_error(
+                    frames.len(),
+                )));
+            }
+
+            out.push('[');
+            self.active.push(child_key);
+            frames.push(ListReprFrame {
+                ptr: child_ptr,
+                index: 0,
+            });
         }
-        return Ok(f.to_string());
-    }
-    if let Some(string) = value_as_string_ref(value) {
-        return Ok(quote_python_string(string.as_str()));
-    }
-    if let Some(text) = crate::builtins::exception_repr_text_for_value(value) {
-        return Ok(text);
-    }
-    if let Some(text) = crate::stdlib::_thread::native_thread_object_repr(value) {
-        return Ok(text);
+
+        Ok(out)
     }
 
-    let ptr = value
-        .as_object_ptr()
-        .ok_or_else(|| BuiltinError::TypeError("invalid object reference".to_string()))?;
-    if let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(ptr) {
-        return repr_list_like(list, depth);
+    fn repr_tuple(&mut self, tuple: &TupleObject) -> Result<String, BuiltinError> {
+        if tuple.is_empty() {
+            return Ok("()".to_string());
+        }
+
+        let mut out = String::from("(");
+        for (index, item) in tuple.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&self.repr_value(*item)?);
+        }
+        if tuple.len() == 1 {
+            out.push(',');
+        }
+        out.push(')');
+        Ok(out)
     }
-    let type_id = crate::ops::objects::extract_type_id(ptr);
-    match type_id {
-        TypeId::BYTES => {
-            let bytes = unsafe { &*(ptr as *const BytesObject) };
-            Ok(quote_python_bytes(bytes.as_bytes()))
-        }
-        TypeId::BYTEARRAY => {
-            let bytes = unsafe { &*(ptr as *const BytesObject) };
-            Ok(format!(
-                "bytearray({})",
-                quote_python_bytes(bytes.as_bytes())
-            ))
-        }
-        TypeId::MEMORYVIEW => {
-            let view = unsafe { &*(ptr as *const MemoryViewObject) };
-            Ok(format!(
-                "<memory at 0x{:x}; format {}; len {}>",
-                ptr as usize,
-                view.format_str(),
-                view.len()
-            ))
-        }
-        TypeId::TUPLE => {
-            let tuple = unsafe { &*(ptr as *const TupleObject) };
-            if tuple.is_empty() {
-                return Ok("()".to_string());
+
+    fn repr_dict(&mut self, dict: &DictObject) -> Result<String, BuiltinError> {
+        let mut out = String::from("{");
+        let mut first = true;
+        for (key, value) in dict.iter() {
+            if !first {
+                out.push_str(", ");
             }
-            let mut out = String::from("(");
-            for (index, item) in tuple.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(&repr_value(*item, depth + 1)?);
-            }
-            if tuple.len() == 1 {
-                out.push(',');
-            }
-            out.push(')');
-            Ok(out)
+            first = false;
+            out.push_str(&self.repr_value(key)?);
+            out.push_str(": ");
+            out.push_str(&self.repr_value(value)?);
         }
-        TypeId::DICT => {
-            let dict = unsafe { &*(ptr as *const DictObject) };
-            let mut out = String::from("{");
-            let mut first = true;
-            for (key, value) in dict.iter() {
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                out.push_str(&repr_value(key, depth + 1)?);
-                out.push_str(": ");
-                out.push_str(&repr_value(value, depth + 1)?);
-            }
-            out.push('}');
-            Ok(out)
-        }
-        TypeId::SET => {
-            let set = unsafe { &*(ptr as *const SetObject) };
-            if set.is_empty() {
-                return Ok("set()".to_string());
-            }
-            let mut out = String::from("{");
-            let mut first = true;
-            for value in set.iter() {
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                out.push_str(&repr_value(value, depth + 1)?);
-            }
-            out.push('}');
-            Ok(out)
-        }
-        TypeId::RANGE => {
-            let range = unsafe { &*(ptr as *const RangeObject) };
-            Ok(range.to_string())
-        }
-        TypeId::COMPLEX => {
-            let complex = unsafe { &*(ptr as *const ComplexObject) };
-            Ok(complex.to_string())
-        }
-        TypeId::STATICMETHOD => {
-            let descriptor = unsafe { &*(ptr as *const StaticMethodDescriptor) };
-            Ok(format!(
-                "<staticmethod({})>",
-                repr_value(descriptor.function(), depth + 1)?
-            ))
-        }
-        TypeId::CLASSMETHOD => {
-            let descriptor = unsafe { &*(ptr as *const ClassMethodDescriptor) };
-            Ok(format!(
-                "<classmethod({})>",
-                repr_value(descriptor.function(), depth + 1)?
-            ))
-        }
-        TypeId::BUILTIN_FUNCTION => {
-            let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
-            Ok(format!(
-                "<built-in function {}>",
-                builtin_function_short_name(function.name())
-            ))
-        }
-        _ => Ok(format!(
-            "<{} object at 0x{:x}>",
-            type_id.name(),
-            ptr as usize
-        )),
+        out.push('}');
+        Ok(out)
     }
+
+    fn repr_set(&mut self, set: &SetObject) -> Result<String, BuiltinError> {
+        if set.is_empty() {
+            return Ok("set()".to_string());
+        }
+
+        let mut out = String::from("{");
+        let mut first = true;
+        for value in set.iter() {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(&self.repr_value(value)?);
+        }
+        out.push('}');
+        Ok(out)
+    }
+}
+
+fn repr_value(value: Value) -> Result<String, BuiltinError> {
+    ReprState::default().repr_value(value)
 }
 
 #[inline]
@@ -1845,11 +1958,7 @@ fn builtin_function_short_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn repr_value_vm(
-    vm: &mut VirtualMachine,
-    value: Value,
-    depth: usize,
-) -> Result<String, BuiltinError> {
+fn repr_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<String, BuiltinError> {
     if should_use_python_repr_protocol(value) {
         match resolve_special_method(value, "__repr__") {
             Ok(target) => {
@@ -1868,7 +1977,7 @@ fn repr_value_vm(
         }
     }
 
-    repr_value(value, depth)
+    repr_value(value)
 }
 
 #[inline]
