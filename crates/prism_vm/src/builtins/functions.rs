@@ -2,6 +2,7 @@
 
 use super::{BuiltinError, BuiltinFunctionObject};
 use crate::VirtualMachine;
+use crate::builtins::float_format::python_float_str;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
@@ -2823,20 +2824,7 @@ fn render_type_repr(module: &str, qualname: &str) -> String {
 
 #[inline]
 fn float_repr_string(value: f64) -> String {
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    if value.fract() == 0.0 {
-        return format!("{value:.1}");
-    }
-    value.to_string()
+    python_float_str(value)
 }
 
 pub(crate) fn quote_python_string(input: &str) -> String {

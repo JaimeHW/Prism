@@ -5,6 +5,7 @@
 //! conversion types used across the CPython standard library.
 
 use super::BuiltinError;
+use super::float_format::{FloatFormatSign, FloatFormatSpec, format_python_float};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
@@ -734,19 +735,24 @@ fn int_argument(value: Value, conversion: char) -> Result<i64, BuiltinError> {
 
 fn format_float(value: Value, spec: &PercentSpec) -> Result<String, BuiltinError> {
     let float = float_argument(value, spec.conversion)?;
-    let negative = float.is_sign_negative();
-    let magnitude = float.abs();
-    let precision = spec.precision.unwrap_or(6);
-
-    let body = match spec.conversion {
-        'e' => format!("{magnitude:.precision$e}"),
-        'E' => format!("{magnitude:.precision$E}"),
-        'f' | 'F' => format!("{magnitude:.precision$}"),
-        'g' | 'G' => format!("{magnitude:.precision$}"),
-        _ => unreachable!(),
-    };
-
-    Ok(apply_numeric_width(body, negative, "", spec))
+    format_python_float(
+        float,
+        &FloatFormatSpec {
+            alternate: spec.alternate,
+            zero_pad: spec.zero_pad,
+            left_adjust: spec.left_adjust,
+            sign: if spec.sign_plus {
+                FloatFormatSign::Plus
+            } else if spec.sign_space {
+                FloatFormatSign::Space
+            } else {
+                FloatFormatSign::MinusOnly
+            },
+            width: spec.width,
+            precision: spec.precision,
+            ty: Some(spec.conversion),
+        },
+    )
 }
 
 fn float_argument(value: Value, conversion: char) -> Result<f64, BuiltinError> {

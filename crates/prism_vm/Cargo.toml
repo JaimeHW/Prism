@@ -35,6 +35,7 @@ libm.workspace = true
 
 # Regex engine - guaranteed O(m*n) performance
 regex.workspace = true
+ryu.workspace = true
 # Extended regex with backreferences/lookaround
 fancy-regex.workspace = true
 sha2.workspace = true

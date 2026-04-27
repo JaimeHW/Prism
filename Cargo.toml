@@ -62,6 +62,7 @@ libc = "0.2"
 libm = "0.2"
 memchr = "2.7"
 regex = "1.10"
+ryu = "1.0"
 sha2 = "0.10"
 windows-sys = "0.59"
 

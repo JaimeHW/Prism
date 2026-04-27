@@ -18,6 +18,7 @@
 //! - `format()` - String formatting (simplified)
 
 use super::BuiltinError;
+use super::float_format::{FloatFormatSign, FloatFormatSpec, format_python_float};
 use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
@@ -50,9 +51,6 @@ const ASCII_MAX: u32 = 0x7F;
 
 /// Maximum byte sequence length accepted by constructors.
 const MAX_BYTE_SEQUENCE_SIZE: i64 = 1_000_000_000;
-
-/// Hard cap that prevents adversarial format specs from allocating forever.
-const MAX_FLOAT_FORMAT_PRECISION: usize = 1_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ByteSequenceKind {
@@ -1234,6 +1232,8 @@ fn format_value(value: Value, format_spec: &str) -> Result<Value, BuiltinError> 
 struct NumericFormatSpec {
     alternate_form: bool,
     zero_pad: bool,
+    left_adjust: bool,
+    sign: FloatFormatSign,
     width: Option<usize>,
     grouping: Option<char>,
     precision: Option<usize>,
@@ -1244,17 +1244,30 @@ impl NumericFormatSpec {
     #[inline]
     fn parse(format_spec: &str) -> Result<Self, BuiltinError> {
         let mut chars = format_spec.chars().peekable();
+        let mut left_adjust = false;
 
         if matches!(chars.clone().nth(1), Some('<' | '>' | '^' | '=')) {
             chars.next();
-            chars.next();
+            left_adjust = matches!(chars.next(), Some('<'));
         } else if matches!(chars.peek(), Some('<' | '>' | '^' | '=')) {
-            chars.next();
+            left_adjust = matches!(chars.next(), Some('<'));
         }
 
-        if matches!(chars.peek(), Some('+' | '-' | ' ')) {
-            chars.next();
-        }
+        let sign = match chars.peek().copied() {
+            Some('+') => {
+                chars.next();
+                FloatFormatSign::Plus
+            }
+            Some(' ') => {
+                chars.next();
+                FloatFormatSign::Space
+            }
+            Some('-') => {
+                chars.next();
+                FloatFormatSign::MinusOnly
+            }
+            _ => FloatFormatSign::MinusOnly,
+        };
 
         let alternate_form = matches!(chars.peek(), Some('#'));
         if alternate_form {
@@ -1306,6 +1319,8 @@ impl NumericFormatSpec {
         Ok(Self {
             alternate_form,
             zero_pad,
+            left_adjust,
+            sign,
             width,
             grouping,
             precision,
@@ -1391,41 +1406,20 @@ fn format_int(n: i64, format_spec: &str) -> Result<Value, BuiltinError> {
 /// Format a float according to format_spec.
 #[inline]
 fn format_float(f: f64, format_spec: &str) -> Result<Value, BuiltinError> {
-    let formatted = match format_spec {
-        "e" => format!("{:e}", f),     // Exponential lowercase
-        "E" => format!("{:E}", f),     // Exponential uppercase
-        "f" | "F" => format!("{}", f), // Fixed-point
-        "g" | "G" => {
-            // General format: use exponential if exponent >= precision
-            // Simplified: just use Display format
-            format!("{}", f)
-        }
-        "%" => format!("{}%", f * 100.0), // Percentage
-        _ if format_spec.starts_with('.') => {
-            // Precision specification
-            if let Some(precision) = parse_precision(format_spec) {
-                if precision > MAX_FLOAT_FORMAT_PRECISION {
-                    return Err(BuiltinError::OverflowError(
-                        "formatted float is too long".to_string(),
-                    ));
-                }
-                format!("{:.*}", precision, f)
-            } else {
-                format!("{}", f)
-            }
-        }
-        _ => format!("{}", f),
-    };
-
+    let spec = NumericFormatSpec::parse(format_spec)?;
+    let formatted = format_python_float(
+        f,
+        &FloatFormatSpec {
+            alternate: spec.alternate_form,
+            zero_pad: spec.zero_pad,
+            left_adjust: spec.left_adjust,
+            sign: spec.sign,
+            width: spec.width,
+            precision: spec.precision,
+            ty: spec.ty,
+        },
+    )?;
     Ok(Value::string(intern(&formatted)))
-}
-
-/// Parse precision from format spec like ".2f" → 2.
-#[inline]
-fn parse_precision(format_spec: &str) -> Option<usize> {
-    let s = format_spec.trim_start_matches('.');
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
 }
 
 /// Format integer with thousands separator (,).
