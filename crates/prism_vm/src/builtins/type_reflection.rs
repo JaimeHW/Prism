@@ -78,12 +78,21 @@ static INT_FROM_BYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(||
     )
 });
 static FLOAT_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("float.__new__"), super::types::builtin_float_new)
+    BuiltinFunctionObject::new_kw(
+        Arc::from("float.__new__"),
+        super::types::builtin_float_new_kw,
+    )
 });
 static FLOAT_GETFORMAT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("float.__getformat__"),
         super::types::builtin_float_getformat,
+    )
+});
+static FLOAT_FROMHEX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("float.fromhex"),
+        super::types::builtin_float_fromhex_vm,
     )
 });
 static STR_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -256,7 +265,15 @@ const INT_TYPE_ATTRS: &[AttrSpec] = &[
 const FLOAT_TYPE_ATTRS: &[AttrSpec] = &[
     NEW_WRAPPER_ATTR,
     AttrSpec {
+        name: "hex",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+    AttrSpec {
         name: "__getformat__",
+        kind: ReflectedValueKind::ClassMethodDescriptor,
+    },
+    AttrSpec {
+        name: "fromhex",
         kind: ReflectedValueKind::ClassMethodDescriptor,
     },
 ];
@@ -1027,6 +1044,7 @@ fn builtin_type_bound_method_value(owner: TypeId, name: &str) -> Option<Value> {
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
         (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
+        (TypeId::FLOAT, "fromhex") => Some(builtin_method_value(&FLOAT_FROMHEX_METHOD)),
         (TypeId::BOOL, "from_bytes") => Some(builtin_method_value(&BOOL_FROM_BYTES_METHOD)),
         (TypeId::OBJECT, "__init_subclass__") => {
             Some(builtin_method_value(&OBJECT_INIT_SUBCLASS_METHOD))
@@ -1043,6 +1061,7 @@ fn builtin_type_class_method_value(owner: TypeId, name: &str) -> Option<Value> {
         (TypeId::DICT, "fromkeys") => Some(builtin_method_value(&DICT_FROMKEYS_METHOD)),
         (TypeId::INT, "from_bytes") => Some(builtin_method_value(&INT_FROM_BYTES_METHOD)),
         (TypeId::FLOAT, "__getformat__") => Some(builtin_method_value(&FLOAT_GETFORMAT_METHOD)),
+        (TypeId::FLOAT, "fromhex") => Some(builtin_method_value(&FLOAT_FROMHEX_METHOD)),
         (TypeId::BOOL, "from_bytes") => Some(builtin_method_value(&BOOL_FROM_BYTES_METHOD)),
         (TypeId::OBJECT, "__init_subclass__") => {
             Some(builtin_method_value(&OBJECT_INIT_SUBCLASS_METHOD))

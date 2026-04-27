@@ -313,14 +313,19 @@ fn parse_int_text_argument(argument: &IntTextArgument, base: u32) -> Result<Valu
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
+        .position(|byte| !is_python_ascii_whitespace(*byte))
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
+        .rposition(|byte| !is_python_ascii_whitespace(*byte))
         .map(|index| index + 1)
         .unwrap_or(start);
     &bytes[start..end]
+}
+
+#[inline]
+fn is_python_ascii_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
 #[inline]
@@ -986,7 +991,7 @@ fn builtin_float_base(arg: Value) -> Result<Option<Value>, BuiltinError> {
         return parse_float_text_argument(&text_arg).map(Some);
     }
 
-    if let Some(f) = arg.as_float() {
+    if let Some(f) = prism_runtime::types::float::value_to_f64(arg) {
         return Ok(Some(Value::float(f)));
     }
     if let Some(i) = arg.as_int() {
@@ -1065,6 +1070,294 @@ pub fn builtin_float_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
     }
 
     Err(builtin_float_unsupported_argument(arg))
+}
+
+const F64_FRACTION_BITS: u32 = 52;
+const F64_MIN_NORMAL_EXP: i64 = -1022;
+const F64_MIN_SUBNORMAL_EXP: i64 = -1074;
+const F64_MAX_NORMAL_EXP: i64 = 1023;
+const HEX_FLOAT_EXP_LIMIT: i64 = 1_000_000;
+
+struct HexFloatParts {
+    negative: bool,
+    mantissa: BigInt,
+    binary_exp: i64,
+}
+
+/// Builtin implementation backing `float.fromhex`.
+pub(crate) fn builtin_float_fromhex_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "float.fromhex() takes exactly one argument ({given} given)"
+        )));
+    }
+
+    if !class_value_is_subtype(args[0], TypeId::FLOAT) {
+        return Err(BuiltinError::TypeError(
+            "descriptor 'fromhex' for 'float' objects doesn't apply to a non-float type"
+                .to_string(),
+        ));
+    }
+
+    let Some(text) = value_to_owned_string(args[1]) else {
+        return Err(BuiltinError::TypeError(format!(
+            "float.fromhex() argument must be str, not {}",
+            args[1].type_name()
+        )));
+    };
+    let float = parse_float_fromhex_text(&text)?;
+
+    if class_value_to_type_id(args[0]) == Some(TypeId::FLOAT) {
+        return Ok(Value::float(float));
+    }
+
+    invoke_callable_value(vm, args[0], &[Value::float(float)])
+        .map_err(runtime_error_to_builtin_error)
+}
+
+fn parse_float_fromhex_text(text: &str) -> Result<f64, BuiltinError> {
+    let trimmed = trim_ascii_whitespace(text.as_bytes());
+    if trimmed.is_empty() {
+        return Err(invalid_hex_float_error(text));
+    }
+
+    if let Some(value) = normalize_float_special_value(trimmed) {
+        return Ok(value);
+    }
+
+    let parts = parse_hex_float_parts(trimmed).ok_or_else(|| invalid_hex_float_error(text))?;
+    hex_float_parts_to_f64(parts)
+}
+
+fn parse_hex_float_parts(bytes: &[u8]) -> Option<HexFloatParts> {
+    let (negative, mut rest) = match bytes.first().copied()? {
+        b'+' => (false, &bytes[1..]),
+        b'-' => (true, &bytes[1..]),
+        _ => (false, bytes),
+    };
+
+    if rest.len() >= 2 && rest[0] == b'0' && matches!(rest[1], b'x' | b'X') {
+        rest = &rest[2..];
+    }
+    if rest.is_empty() {
+        return None;
+    }
+
+    let mut mantissa = BigInt::zero();
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    let mut fraction_digits = 0_i64;
+    let mut index = 0_usize;
+
+    while index < rest.len() {
+        let byte = rest[index];
+        if matches!(byte, b'p' | b'P') {
+            break;
+        }
+        if byte == b'.' {
+            if saw_dot {
+                return None;
+            }
+            saw_dot = true;
+            index += 1;
+            continue;
+        }
+
+        let digit = hex_digit_value(byte)?;
+        mantissa = (mantissa << 4_usize) + BigInt::from(digit);
+        saw_digit = true;
+        if saw_dot {
+            fraction_digits = fraction_digits.saturating_add(1).min(HEX_FLOAT_EXP_LIMIT);
+        }
+        index += 1;
+    }
+
+    if !saw_digit {
+        return None;
+    }
+
+    let mut exponent = 0_i64;
+    if index < rest.len() {
+        if !matches!(rest[index], b'p' | b'P') {
+            return None;
+        }
+        index += 1;
+        let exponent_negative = match rest.get(index).copied() {
+            Some(b'+') => {
+                index += 1;
+                false
+            }
+            Some(b'-') => {
+                index += 1;
+                true
+            }
+            _ => false,
+        };
+        let exponent_start = index;
+        while index < rest.len() && rest[index].is_ascii_digit() {
+            index += 1;
+        }
+        if exponent_start == index || index != rest.len() {
+            return None;
+        }
+        exponent =
+            parse_saturating_decimal_exponent(&rest[exponent_start..index], exponent_negative)?;
+    }
+
+    let fractional_bits = fraction_digits.saturating_mul(4).min(HEX_FLOAT_EXP_LIMIT);
+    let binary_exp = exponent
+        .saturating_sub(fractional_bits)
+        .clamp(-HEX_FLOAT_EXP_LIMIT, HEX_FLOAT_EXP_LIMIT);
+
+    Some(HexFloatParts {
+        negative,
+        mantissa,
+        binary_exp,
+    })
+}
+
+fn parse_saturating_decimal_exponent(bytes: &[u8], negative: bool) -> Option<i64> {
+    let mut value = 0_i64;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
+        if value > HEX_FLOAT_EXP_LIMIT {
+            return Some(if negative {
+                -HEX_FLOAT_EXP_LIMIT
+            } else {
+                HEX_FLOAT_EXP_LIMIT
+            });
+        }
+    }
+    Some(if negative { -value } else { value })
+}
+
+#[inline]
+fn hex_digit_value(byte: u8) -> Option<u32> {
+    let digit = ascii_digit_value(byte)?;
+    (digit < 16).then_some(digit)
+}
+
+fn hex_float_parts_to_f64(parts: HexFloatParts) -> Result<f64, BuiltinError> {
+    if parts.mantissa.is_zero() {
+        let zero = if parts.negative { -0.0 } else { 0.0 };
+        return Ok(zero);
+    }
+
+    let mantissa_bits = i64::try_from(parts.mantissa.bits()).unwrap_or(i64::MAX);
+    let floor_log2 = mantissa_bits
+        .saturating_sub(1)
+        .saturating_add(parts.binary_exp);
+
+    if floor_log2 > F64_MAX_NORMAL_EXP + 1 {
+        return Err(hex_float_overflow_error());
+    }
+    if floor_log2 < F64_MIN_SUBNORMAL_EXP - 2 {
+        let zero = if parts.negative { -0.0 } else { 0.0 };
+        return Ok(zero);
+    }
+
+    let sign_bit = if parts.negative { 1_u64 << 63 } else { 0 };
+    if floor_log2 < F64_MIN_NORMAL_EXP {
+        return hex_float_subnormal_to_f64(&parts.mantissa, parts.binary_exp, sign_bit);
+    }
+
+    hex_float_normal_to_f64(&parts.mantissa, parts.binary_exp, floor_log2, sign_bit)
+}
+
+fn hex_float_subnormal_to_f64(
+    mantissa: &BigInt,
+    binary_exp: i64,
+    sign_bit: u64,
+) -> Result<f64, BuiltinError> {
+    let units = round_scaled_to_even(mantissa, binary_exp - F64_MIN_SUBNORMAL_EXP);
+    let normal_threshold = BigInt::from(1_u64) << F64_FRACTION_BITS as usize;
+    if units.is_zero() {
+        return Ok(f64::from_bits(sign_bit));
+    }
+    if units < normal_threshold {
+        let fraction = units
+            .to_u64()
+            .expect("subnormal significand should fit in f64 fraction bits");
+        return Ok(f64::from_bits(sign_bit | fraction));
+    }
+    if units == normal_threshold {
+        return Ok(f64::from_bits(sign_bit | (1_u64 << F64_FRACTION_BITS)));
+    }
+
+    hex_float_normal_to_f64(mantissa, binary_exp, F64_MIN_NORMAL_EXP, sign_bit)
+}
+
+fn hex_float_normal_to_f64(
+    mantissa: &BigInt,
+    binary_exp: i64,
+    mut exponent: i64,
+    sign_bit: u64,
+) -> Result<f64, BuiltinError> {
+    let unit_exp = exponent - i64::from(F64_FRACTION_BITS);
+    let mut significand = round_scaled_to_even(mantissa, binary_exp - unit_exp);
+    let hidden_bit = BigInt::from(1_u64) << F64_FRACTION_BITS as usize;
+    let carry_bit = BigInt::from(1_u64) << (F64_FRACTION_BITS as usize + 1);
+
+    if significand == carry_bit {
+        significand = hidden_bit.clone();
+        exponent += 1;
+    }
+    if exponent > F64_MAX_NORMAL_EXP {
+        return Err(hex_float_overflow_error());
+    }
+
+    let fraction = (significand - hidden_bit)
+        .to_u64()
+        .expect("normal significand should fit in f64 fraction bits");
+    let exponent_bits = ((exponent + 1023) as u64) << F64_FRACTION_BITS;
+    Ok(f64::from_bits(sign_bit | exponent_bits | fraction))
+}
+
+fn round_scaled_to_even(mantissa: &BigInt, shift: i64) -> BigInt {
+    if shift >= 0 {
+        return mantissa << usize::try_from(shift).unwrap_or(usize::MAX);
+    }
+
+    let right_shift = usize::try_from(-shift).unwrap_or(usize::MAX);
+    let quotient = mantissa >> right_shift;
+    let remainder = mantissa - (&quotient << right_shift);
+    if remainder.is_zero() {
+        return quotient;
+    }
+
+    let halfway = BigInt::from(1_u8) << (right_shift - 1);
+    let round_up = match remainder.cmp(&halfway) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => (&quotient & BigInt::from(1_u8)) != BigInt::zero(),
+    };
+
+    if round_up {
+        quotient + BigInt::from(1_u8)
+    } else {
+        quotient
+    }
+}
+
+fn invalid_hex_float_error(text: &str) -> BuiltinError {
+    BuiltinError::ValueError(format!(
+        "invalid hexadecimal floating-point string: {:?}",
+        text
+    ))
+}
+
+#[inline]
+fn hex_float_overflow_error() -> BuiltinError {
+    BuiltinError::OverflowError("hexadecimal value too large to represent as a float".to_string())
 }
 
 #[inline]

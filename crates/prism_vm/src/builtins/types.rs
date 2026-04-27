@@ -50,8 +50,8 @@ mod numeric;
 
 pub use numeric::{builtin_float, builtin_float_vm, builtin_int, builtin_int_vm};
 pub(crate) use numeric::{
-    builtin_float_getformat, builtin_int_from_bytes, builtin_int_from_bytes_vm,
-    builtin_int_to_bytes, native_float_format_description,
+    builtin_float_fromhex_vm, builtin_float_getformat, builtin_int_from_bytes,
+    builtin_int_from_bytes_vm, builtin_int_to_bytes, native_float_format_description,
 };
 use numeric::{builtin_int_kw, builtin_int_kw_vm};
 
@@ -3156,7 +3156,76 @@ fn builtin_int_new_impl(
 }
 
 pub(crate) fn builtin_float_new(args: &[Value]) -> Result<Value, BuiltinError> {
-    builtin_constructor_new(args, TypeId::FLOAT, "float", builtin_float)
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "float.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+
+    let class_type = class_value_to_type_id(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("float.__new__(X): X must be a type".to_string()))?;
+
+    if class_type == TypeId::FLOAT {
+        return builtin_float(&args[1..]);
+    }
+
+    if !class_value_is_subtype(args[0], TypeId::FLOAT) {
+        return Err(BuiltinError::TypeError(
+            "float.__new__(X): X is not a subtype of float".to_string(),
+        ));
+    }
+
+    let class_ptr = args[0]
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("float.__new__(X): X must be a type".to_string()))?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "float.__new__() for builtin float subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    let float = if args.len() == 1 {
+        0.0
+    } else {
+        let value = builtin_float(&args[1..])?;
+        prism_runtime::types::float::value_to_f64(value).ok_or_else(|| {
+            BuiltinError::TypeError(
+                "float.__new__() failed to materialize float payload".to_string(),
+            )
+        })?
+    };
+
+    let instance = ShapedObject::new_float_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+        float,
+    );
+    Ok(to_object_value(instance))
+}
+
+pub(crate) fn builtin_float_new_kw(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if keywords.is_empty() {
+        return builtin_float_new(positional);
+    }
+    if positional.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "float.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+
+    let class_type = class_value_to_type_id(positional[0])
+        .ok_or_else(|| BuiltinError::TypeError("float.__new__(X): X must be a type".to_string()))?;
+    if class_type == TypeId::FLOAT || positional.len() == 1 {
+        let keyword_name = keywords[0].0;
+        return Err(BuiltinError::TypeError(format!(
+            "float.__new__() got an unexpected keyword argument '{keyword_name}'"
+        )));
+    }
+
+    builtin_float_new(positional)
 }
 
 pub(crate) fn builtin_str_new(args: &[Value]) -> Result<Value, BuiltinError> {

@@ -424,6 +424,19 @@ static FLOAT_STR_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__str__"), value_str));
 static FLOAT_FORMAT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__format__"), value_format));
+static FLOAT_HEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.hex"), float_hex));
+static FLOAT_IS_INTEGER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.is_integer"), float_is_integer));
+static FLOAT_AS_INTEGER_RATIO_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("float.as_integer_ratio"), float_as_integer_ratio)
+});
+static FLOAT_FLOOR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__floor__"), float_floor));
+static FLOAT_CEIL_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__ceil__"), float_ceil));
+static FLOAT_TRUNC_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__trunc__"), float_trunc));
 static MEMORYVIEW_TOBYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("memoryview.tobytes"), memoryview_tobytes)
 });
@@ -908,8 +921,196 @@ pub fn resolve_float_method(name: &str) -> Option<CachedMethod> {
         "__format__" => Some(CachedMethod::simple(builtin_method_value(
             &FLOAT_FORMAT_METHOD,
         ))),
+        "hex" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_HEX_METHOD,
+        ))),
+        "is_integer" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_IS_INTEGER_METHOD,
+        ))),
+        "as_integer_ratio" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_AS_INTEGER_RATIO_METHOD,
+        ))),
+        "__floor__" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_FLOOR_METHOD,
+        ))),
+        "__ceil__" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_CEIL_METHOD,
+        ))),
+        "__trunc__" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_TRUNC_METHOD,
+        ))),
         _ => None,
     }
+}
+
+fn expect_float_receiver(args: &[Value], method_name: &'static str) -> Result<f64, BuiltinError> {
+    prism_runtime::types::float::value_to_f64(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '{method_name}' for 'float' objects doesn't apply to a '{}' object",
+            args[0].type_name()
+        ))
+    })
+}
+
+fn float_hex(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "hex", args, 0)?;
+    let value = expect_float_receiver(args, "hex")?;
+    let text = format_float_hex(value);
+    Ok(Value::string(intern(&text)))
+}
+
+fn format_float_hex(value: f64) -> String {
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if negative {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    if magnitude == 0 {
+        return if negative {
+            "-0x0.0p+0".to_string()
+        } else {
+            "0x0.0p+0".to_string()
+        };
+    }
+
+    let sign = if negative { "-" } else { "" };
+    let exponent_bits = ((magnitude >> 52) & 0x7ff) as i32;
+    let fraction = magnitude & ((1_u64 << 52) - 1);
+    if exponent_bits == 0 {
+        format!("{sign}0x0.{fraction:013x}p-1022")
+    } else {
+        let exponent = exponent_bits - 1023;
+        format!("{sign}0x1.{fraction:013x}p{exponent:+}")
+    }
+}
+
+fn float_is_integer(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "is_integer", args, 0)?;
+    let value = expect_float_receiver(args, "is_integer")?;
+    Ok(Value::bool(value.is_finite() && value.fract() == 0.0))
+}
+
+fn float_as_integer_ratio(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "as_integer_ratio", args, 0)?;
+    let value = expect_float_receiver(args, "as_integer_ratio")?;
+    let (numerator, denominator) = float_integer_ratio(value)?;
+    Ok(to_object_value(TupleObject::from_slice(&[
+        bigint_to_value(numerator),
+        bigint_to_value(denominator),
+    ])))
+}
+
+fn float_floor(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "__floor__", args, 0)?;
+    float_integral_method(args, "__floor__", f64::floor)
+}
+
+fn float_ceil(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "__ceil__", args, 0)?;
+    float_integral_method(args, "__ceil__", f64::ceil)
+}
+
+fn float_trunc(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "__trunc__", args, 0)?;
+    float_integral_method(args, "__trunc__", f64::trunc)
+}
+
+fn float_integral_method(
+    args: &[Value],
+    method_name: &'static str,
+    operation: fn(f64) -> f64,
+) -> Result<Value, BuiltinError> {
+    let value = expect_float_receiver(args, method_name)?;
+    if value.is_nan() {
+        return Err(BuiltinError::ValueError(format!(
+            "cannot convert float NaN to integer for {method_name}"
+        )));
+    }
+    if value.is_infinite() {
+        return Err(BuiltinError::OverflowError(format!(
+            "cannot convert float infinity to integer for {method_name}"
+        )));
+    }
+
+    Ok(bigint_to_value(float_integer_to_bigint(operation(value))))
+}
+
+fn float_integer_ratio(value: f64) -> Result<(BigInt, BigInt), BuiltinError> {
+    if value.is_nan() {
+        return Err(BuiltinError::ValueError(
+            "cannot convert NaN to integer ratio".to_string(),
+        ));
+    }
+    if value.is_infinite() {
+        return Err(BuiltinError::OverflowError(
+            "cannot convert Infinity to integer ratio".to_string(),
+        ));
+    }
+
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i64;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    if exponent_bits == 0 && fraction == 0 {
+        return Ok((BigInt::zero(), BigInt::one()));
+    }
+
+    let (mut numerator, mut exponent) = if exponent_bits == 0 {
+        (BigInt::from(fraction), -1074_i64)
+    } else {
+        (
+            BigInt::from((1_u64 << 52) | fraction),
+            exponent_bits - 1023 - 52,
+        )
+    };
+
+    while exponent < 0 && !numerator.is_zero() && (&numerator & BigInt::one()).is_zero() {
+        numerator >>= 1_usize;
+        exponent += 1;
+    }
+
+    let denominator = if exponent >= 0 {
+        numerator <<= exponent as usize;
+        BigInt::one()
+    } else {
+        BigInt::one() << ((-exponent) as usize)
+    };
+
+    if negative {
+        numerator = -numerator;
+    }
+    Ok((numerator, denominator))
+}
+
+fn float_integer_to_bigint(value: f64) -> BigInt {
+    debug_assert!(value.is_finite());
+
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i64;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    if exponent_bits == 0 {
+        return BigInt::zero();
+    }
+
+    let mut integer = BigInt::from((1_u64 << 52) | fraction);
+    let shift = exponent_bits - 1023 - 52;
+    if shift >= 0 {
+        integer <<= shift as usize;
+    } else {
+        integer >>= (-shift) as usize;
+    }
+
+    if negative { -integer } else { integer }
 }
 
 pub fn resolve_generic_dunder_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {

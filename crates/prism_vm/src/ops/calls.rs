@@ -129,9 +129,9 @@ static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(||
     )
 });
 static FLOAT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_kw(
         Arc::from("float.__new__"),
-        crate::builtins::builtin_float_new,
+        crate::builtins::builtin_float_new_kw,
     )
 });
 static STR_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
