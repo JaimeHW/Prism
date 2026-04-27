@@ -134,6 +134,7 @@ impl SetObject {
     pub fn pop(&mut self) -> Option<Value> {
         if let Some(hv) = self.items.iter().next().copied() {
             self.items.remove(&hv);
+            self.clear_hash_cache();
             Some(hv.0)
         } else {
             None
@@ -157,8 +158,12 @@ impl SetObject {
     /// Return the union of two sets as a new set.
     pub fn union(&self, other: &SetObject) -> SetObject {
         let mut result = self.clone_set();
+        let mut changed = false;
         for hv in other.items.iter() {
-            result.items.insert(*hv);
+            changed |= result.items.insert(*hv);
+        }
+        if changed {
+            result.clear_hash_cache();
         }
         result
     }
@@ -229,8 +234,12 @@ impl SetObject {
 
     /// Update self with the union of self and other.
     pub fn update(&mut self, other: &SetObject) {
+        let mut changed = false;
         for hv in other.items.iter() {
-            self.items.insert(*hv);
+            changed |= self.items.insert(*hv);
+        }
+        if changed {
+            self.clear_hash_cache();
         }
     }
 
