@@ -666,14 +666,6 @@ pub(crate) fn super_attribute_value_static(
     for &class_id in &mro[start..] {
         if class_id.0 < TypeId::FIRST_USER_TYPE {
             let owner = class_id_to_type_id(class_id);
-            if super_obj.binding() != SuperBinding::Unbound
-                && let Some(cached) = resolve_builtin_instance_method(owner, name.as_str())
-            {
-                return Ok(Some(bind_cached_builtin_method(
-                    cached.method,
-                    super_obj.obj(),
-                )));
-            }
             if let Some(value) =
                 builtin_bound_type_attribute_value_static(owner, super_obj.obj(), name)?
             {
@@ -744,14 +736,6 @@ pub(crate) fn super_attribute_value_in_vm(
     for &class_id in &mro[start..] {
         if class_id.0 < TypeId::FIRST_USER_TYPE {
             let owner = class_id_to_type_id(class_id);
-            if super_obj.binding() != SuperBinding::Unbound
-                && let Some(cached) = resolve_builtin_instance_method(owner, name.as_str())
-            {
-                return Ok(Some(bind_cached_builtin_method(
-                    cached.method,
-                    super_obj.obj(),
-                )));
-            }
             if let Some(value) =
                 builtin_bound_type_attribute_value_static(owner, super_obj.obj(), name)?
             {

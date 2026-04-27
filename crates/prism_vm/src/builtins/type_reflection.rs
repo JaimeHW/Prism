@@ -1576,7 +1576,7 @@ pub(crate) fn builtin_bound_type_attribute_value(
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
     if owner == TypeId::OBJECT && name.as_str() == "__new__" {
-        return Ok(builtin_type_method_value(owner, name.as_str()));
+        return Ok(builtin_type_static_method_value(owner, name.as_str()));
     }
 
     if let Some(method) = builtin_type_bound_method_value(owner, name.as_str()) {
@@ -1630,7 +1630,7 @@ pub(crate) fn builtin_bound_type_attribute_value_static(
     name: &InternedString,
 ) -> Result<Option<Value>, RuntimeError> {
     if owner == TypeId::OBJECT && name.as_str() == "__new__" {
-        return Ok(builtin_type_method_value(owner, name.as_str()));
+        return Ok(builtin_type_static_method_value(owner, name.as_str()));
     }
 
     if let Some(method) = builtin_type_bound_method_value(owner, name.as_str()) {
