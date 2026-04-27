@@ -217,6 +217,7 @@ impl BuiltinRegistry {
         registry.register_value("None", Value::none());
         registry.register_value("True", Value::bool(true));
         registry.register_value("False", Value::bool(false));
+        registry.register_value("__debug__", Value::bool(true));
         registry.register_value("Ellipsis", builtin_ellipsis_value());
         registry.register_value("NotImplemented", builtin_not_implemented_value());
 
