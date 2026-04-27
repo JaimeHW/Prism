@@ -101,6 +101,12 @@ static GC_COLLECT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static BROKEN_ITER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_kw(Arc::from("test.support.BrokenIter"), broken_iter)
 });
+static CHECK_IMPL_DETAIL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(
+        Arc::from("test.support.check_impl_detail"),
+        check_impl_detail,
+    )
+});
 static CHECK_FREE_AFTER_ITERATING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("test.support.check_free_after_iterating"),
@@ -170,6 +176,7 @@ impl SupportModule {
                 Arc::from("ALWAYS_EQ"),
                 Arc::from("BrokenIter"),
                 Arc::from("C_RECURSION_LIMIT"),
+                Arc::from("check_impl_detail"),
                 Arc::from("check_free_after_iterating"),
                 Arc::from("MISSING_C_DOCSTRINGS"),
                 Arc::from("MAX_Py_ssize_t"),
@@ -218,6 +225,7 @@ impl Module for SupportModule {
             "C_RECURSION_LIMIT" => {
                 Ok(Value::int(C_RECURSION_LIMIT).expect("recursion test limit fits"))
             }
+            "check_impl_detail" => Ok(builtin_value(&CHECK_IMPL_DETAIL_FUNCTION)),
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
             "MISSING_C_DOCSTRINGS" => Ok(Value::bool(true)),
             "MAX_Py_ssize_t" => Ok(bigint_to_value(BigInt::from(isize::MAX))),
@@ -501,6 +509,28 @@ fn empty_iterator_list(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     Ok(crate::alloc_managed_value(ListObject::new()))
+}
+
+fn check_impl_detail(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "check_impl_detail() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let Some((_, first_value)) = keywords.first() else {
+        return Ok(Value::bool(false));
+    };
+    let default = !first_value.is_truthy();
+
+    for (name, value) in keywords {
+        if *name == "prism" {
+            return Ok(Value::bool(value.is_truthy()));
+        }
+    }
+
+    Ok(Value::bool(default))
 }
 
 fn load_package_tests(args: &[Value]) -> Result<Value, BuiltinError> {
