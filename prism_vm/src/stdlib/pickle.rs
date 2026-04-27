@@ -13,7 +13,9 @@ use crate::builtins::{
     runtime_error_to_builtin_error,
 };
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::objects::{extract_type_id, get_attribute_value};
+use crate::ops::objects::{
+    dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id, get_attribute_value,
+};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
@@ -96,6 +98,7 @@ const TAG_REDUCE: u8 = 15;
 const TAG_GENERIC_ALIAS: u8 = 16;
 const TAG_SLICE: u8 = 17;
 const TAG_RANGE: u8 = 18;
+const TAG_DICT_BACKED_USER_OBJECT: u8 = 19;
 
 const TYPE_KIND_BUILTIN: u8 = 0;
 const TYPE_KIND_USER: u8 = 1;
@@ -260,6 +263,12 @@ impl<'vm> PickleWriter<'vm> {
             {
                 self.write_reduce(value, ptr)
             }
+            type_id
+                if type_id.raw() >= TypeId::FIRST_USER_TYPE
+                    && dict_storage_ref_from_ptr(ptr).is_some() =>
+            {
+                self.write_dict_backed_user_object(ptr, type_id)
+            }
             type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
                 self.write_user_object(ptr, type_id)
             }
@@ -376,6 +385,49 @@ impl<'vm> PickleWriter<'vm> {
         self.write_len(attrs.len(), "attribute count")?;
         for (name, value) in attrs {
             self.write_str(name.as_str())?;
+            self.write_value(value)?;
+        }
+        Ok(())
+    }
+
+    fn write_dict_backed_user_object(
+        &mut self,
+        ptr: *const (),
+        type_id: TypeId,
+    ) -> Result<(), BuiltinError> {
+        let Some(id) = self.begin_memo(ptr)? else {
+            return Ok(());
+        };
+        let class = global_class(ClassId(type_id.raw())).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "cannot pickle instance of unpublished type '{}'",
+                type_id.name()
+            ))
+        })?;
+        let (module, name) = class_export_name(class.as_ref());
+        let shaped = unsafe { &*(ptr as *const ShapedObject) };
+        let attrs = shaped.iter_properties().collect::<Vec<_>>();
+        let dict = dict_storage_ref_from_ptr(ptr).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "cannot pickle dict-backed instance of '{}'",
+                type_id.name()
+            ))
+        })?;
+        let entries = dict.iter().collect::<Vec<_>>();
+
+        self.write_tag(TAG_DICT_BACKED_USER_OBJECT);
+        self.write_u32(id);
+        self.write_u32(type_id.raw());
+        self.write_str(&module)?;
+        self.write_str(&name)?;
+        self.write_len(attrs.len(), "attribute count")?;
+        for (name, value) in attrs {
+            self.write_str(name.as_str())?;
+            self.write_value(value)?;
+        }
+        self.write_len(entries.len(), "dictionary entry count")?;
+        for (key, value) in entries {
+            self.write_value(key)?;
             self.write_value(value)?;
         }
         Ok(())
@@ -544,6 +596,7 @@ impl<'bytes> PickleReader<'bytes> {
             TAG_BUILTIN_FUNCTION => self.read_builtin_function(vm),
             TAG_TYPE => self.read_type(vm),
             TAG_USER_OBJECT => self.read_user_object(vm),
+            TAG_DICT_BACKED_USER_OBJECT => self.read_dict_backed_user_object(vm),
             TAG_REDUCE => self.read_reduce(vm),
             TAG_GENERIC_ALIAS => self.read_generic_alias(vm),
             TAG_SLICE => self.read_slice(vm),
@@ -655,6 +708,45 @@ impl<'bytes> PickleReader<'bytes> {
             let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
             shaped.set_property(intern(&name), attr_value, shape_registry());
         }
+        Ok(value)
+    }
+
+    fn read_dict_backed_user_object(
+        &mut self,
+        vm: &mut VirtualMachine,
+    ) -> Result<Value, BuiltinError> {
+        let id = self.read_u32()?;
+        let class_id = self.read_u32()?;
+        let module = self.read_string()?;
+        let name = self.read_string()?;
+        let attr_count = self.read_len()?;
+        let class = resolve_user_class(vm, class_id, &module, &name)?;
+        let object = allocate_heap_instance_for_class(class.as_ref());
+        let value = crate::alloc_managed_value(object);
+        self.insert_memo(id, value)?;
+
+        for _ in 0..attr_count {
+            let name = self.read_string()?;
+            let attr_value = self.read_value(vm)?;
+            let ptr = value
+                .as_object_ptr()
+                .expect("new heap instances are object values");
+            let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+            shaped.set_property(intern(&name), attr_value, shape_registry());
+        }
+
+        let entry_count = self.read_len()?;
+        for _ in 0..entry_count {
+            let key = self.read_value(vm)?;
+            let item = self.read_value(vm)?;
+            let ptr = value
+                .as_object_ptr()
+                .expect("new heap instances are object values");
+            let dict = dict_storage_mut_from_ptr(ptr)
+                .ok_or_else(|| invalid_pickle("class is not dict-backed"))?;
+            dict.set(key, item);
+        }
+
         Ok(value)
     }
 
