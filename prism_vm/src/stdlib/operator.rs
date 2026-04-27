@@ -14,6 +14,7 @@ use crate::builtins::{
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::{compare_order_result, contains_value, eq_result, ne_result};
+use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::extract_type_id;
 use crate::ops::protocols::RichCompareOp;
@@ -32,6 +33,12 @@ static NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.not_"), operator_not));
 static CONTAINS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("operator.contains"), operator_contains)
+});
+static COUNT_OF_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("operator.countOf"), operator_count_of)
+});
+static INDEX_OF_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("operator.indexOf"), operator_index_of)
 });
 static LENGTH_HINT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("operator.length_hint"), operator_length_hint)
@@ -55,9 +62,11 @@ static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
 
 const EXPORTS: &[&str] = &[
     "contains",
+    "countOf",
     "eq",
     "ge",
     "gt",
+    "indexOf",
     "is_",
     "is_not",
     "le",
@@ -107,6 +116,8 @@ impl Module for OperatorModule {
             "truth" => Ok(builtin_value(&TRUTH_FUNCTION)),
             "not_" => Ok(builtin_value(&NOT_FUNCTION)),
             "contains" => Ok(builtin_value(&CONTAINS_FUNCTION)),
+            "countOf" => Ok(builtin_value(&COUNT_OF_FUNCTION)),
+            "indexOf" => Ok(builtin_value(&INDEX_OF_FUNCTION)),
             "length_hint" => Ok(builtin_value(&LENGTH_HINT_FUNCTION)),
             "eq" => Ok(builtin_value(&EQ_FUNCTION)),
             "ne" => Ok(builtin_value(&NE_FUNCTION)),
@@ -173,6 +184,51 @@ fn operator_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
     contains_value(vm, args[1], args[0])
         .map(Value::bool)
         .map_err(BuiltinError::Raised)
+}
+
+fn operator_count_of(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("countOf", args, 2)?;
+    let iterator = ensure_iterator_value(vm, args[0]).map_err(runtime_error_to_builtin_error)?;
+    let mut count = 0_i64;
+
+    loop {
+        match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+            IterStep::Yielded(item) => {
+                if eq_result(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        BuiltinError::OverflowError("countOf result is too large".to_string())
+                    })?;
+                }
+            }
+            IterStep::Exhausted => {
+                return Ok(Value::int(count).expect("non-negative count should fit"));
+            }
+        }
+    }
+}
+
+fn operator_index_of(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("indexOf", args, 2)?;
+    let iterator = ensure_iterator_value(vm, args[0]).map_err(runtime_error_to_builtin_error)?;
+    let mut index = 0_i64;
+
+    loop {
+        match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
+            IterStep::Yielded(item) => {
+                if eq_result(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
+                    return Ok(Value::int(index).expect("non-negative index should fit"));
+                }
+                index = index.checked_add(1).ok_or_else(|| {
+                    BuiltinError::OverflowError("indexOf index is too large".to_string())
+                })?;
+            }
+            IterStep::Exhausted => {
+                return Err(BuiltinError::ValueError(
+                    "sequence.index(x): x not in sequence".to_string(),
+                ));
+            }
+        }
+    }
 }
 
 fn operator_length_hint(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
