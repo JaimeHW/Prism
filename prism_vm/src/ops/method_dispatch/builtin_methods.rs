@@ -280,6 +280,12 @@ static DICT_UPDATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 });
 static DICT_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("dict.copy"), dict_copy));
+static DICT_FROMKEYS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("dict.fromkeys"),
+        crate::builtins::builtin_dict_fromkeys_vm,
+    )
+});
 static MAPPING_PROXY_KEYS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("mappingproxy.keys"), mappingproxy_keys));
 static MAPPING_PROXY_VALUES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -659,6 +665,9 @@ pub fn resolve_dict_method(name: &str) -> Option<CachedMethod> {
         ))),
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &DICT_COPY_METHOD,
+        ))),
+        "fromkeys" => Some(CachedMethod::simple(builtin_method_value(
+            &DICT_FROMKEYS_METHOD,
         ))),
         _ => None,
     }

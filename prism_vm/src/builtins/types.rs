@@ -2326,7 +2326,10 @@ fn builtin_dict_kw_vm(
 }
 
 /// Builtin implementation backing `dict.fromkeys`.
-pub(crate) fn builtin_dict_fromkeys(args: &[Value]) -> Result<Value, BuiltinError> {
+pub(crate) fn builtin_dict_fromkeys_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
     let given = args.len().saturating_sub(1);
     if !(2..=3).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
@@ -2335,24 +2338,64 @@ pub(crate) fn builtin_dict_fromkeys(args: &[Value]) -> Result<Value, BuiltinErro
         )));
     }
 
-    let class = args[0];
-    let class_ptr = class.as_object_ptr().ok_or_else(|| {
-        BuiltinError::TypeError("dict.fromkeys() descriptor requires a type receiver".to_string())
-    })?;
-    if builtin_type_object_type_id(class_ptr) != Some(TypeId::DICT) {
-        return Err(BuiltinError::TypeError(
-            "dict.fromkeys() currently requires the built-in dict type".to_string(),
-        ));
-    }
-
-    let keys = iter_values(args[1])?;
+    let class = dict_fromkeys_receiver_class(args[0])?;
     let value = args.get(2).copied().unwrap_or(Value::none());
-    let mut dict = DictObject::with_capacity(keys.len());
-    for key in keys {
-        dict.set(key, value);
+
+    if class_value_to_type_id(class) == Some(TypeId::DICT) {
+        let keys = iter_values_with_vm(vm, args[1])?;
+        let mut dict = DictObject::with_capacity(keys.len());
+        for key in keys {
+            crate::ops::dict_access::dict_set_item(vm, &mut dict, key, value)
+                .map_err(runtime_error_to_builtin_error)?;
+        }
+        return Ok(to_object_value(dict));
     }
 
-    Ok(to_object_value(dict))
+    let result = invoke_callable_value(vm, class, &[]).map_err(runtime_error_to_builtin_error)?;
+    let keys = iter_values_with_vm(vm, args[1])?;
+    for key in keys {
+        dict_fromkeys_set_item(vm, result, key, value)?;
+    }
+
+    Ok(result)
+}
+
+fn dict_fromkeys_receiver_class(receiver: Value) -> Result<Value, BuiltinError> {
+    let class = if class_value_to_type_id(receiver).is_some() {
+        receiver
+    } else {
+        value_type_object(receiver)
+    };
+
+    if class_value_is_subtype(class, TypeId::DICT) {
+        return Ok(class);
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "descriptor 'fromkeys' for 'dict' objects doesn't apply to a '{}' object",
+        receiver.type_name()
+    )))
+}
+
+fn dict_fromkeys_set_item(
+    vm: &mut VirtualMachine,
+    result: Value,
+    key: Value,
+    value: Value,
+) -> Result<(), BuiltinError> {
+    if let Some(ptr) = result.as_object_ptr()
+        && crate::ops::objects::extract_type_id(ptr) == TypeId::DICT
+    {
+        let dict = unsafe { &mut *(ptr as *mut DictObject) };
+        return crate::ops::dict_access::dict_set_item(vm, dict, key, value)
+            .map_err(runtime_error_to_builtin_error);
+    }
+
+    let setitem = crate::ops::objects::get_attribute_value(vm, result, &intern("__setitem__"))
+        .map_err(runtime_error_to_builtin_error)?;
+    invoke_callable_value(vm, setitem, &[key, value])
+        .map(|_| ())
+        .map_err(runtime_error_to_builtin_error)
 }
 
 /// Builtin implementation backing `str.maketrans`.

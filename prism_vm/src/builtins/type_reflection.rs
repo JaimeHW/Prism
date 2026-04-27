@@ -21,9 +21,9 @@ use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
 
 static DICT_FROMKEYS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("dict.fromkeys"),
-        super::types::builtin_dict_fromkeys,
+        super::types::builtin_dict_fromkeys_vm,
     )
 });
 static STR_MAKETRANS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -365,6 +365,7 @@ const DICT_METHOD_NAMES: &[&str] = &[
     "clear",
     "update",
     "copy",
+    "fromkeys",
 ];
 const OBJECT_METHOD_NAMES: &[&str] = &["__eq__", "__ne__", "__setattr__", "__delattr__"];
 const INT_METHOD_NAMES: &[&str] = &[
