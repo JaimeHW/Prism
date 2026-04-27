@@ -634,6 +634,17 @@ fn instantiate_user_defined_class(
     };
 
     if should_run_init {
+        if rejects_default_object_constructor_args(
+            class,
+            init_callable,
+            posargc != 0 || kwargc != 0,
+        ) {
+            return Err(RuntimeError::type_error(format!(
+                "{}() takes no arguments",
+                class.name()
+            )));
+        }
+
         let init_arg_policy = init_arg_policy_for_new_result(class, new_result, init_callable);
         invoke_class_init(
             vm,
@@ -681,6 +692,13 @@ fn instantiate_user_defined_class_from_values(
     };
 
     if should_run_init {
+        if rejects_default_object_constructor_args(class, init_callable, !args.is_empty()) {
+            return Err(RuntimeError::type_error(format!(
+                "{}() takes no arguments",
+                class.name()
+            )));
+        }
+
         let init_arg_policy = init_arg_policy_for_new_result(class, new_result, init_callable);
         invoke_class_init_direct(vm, new_result, init_callable, args, init_arg_policy)?;
     }
@@ -726,6 +744,17 @@ fn instantiate_user_defined_class_from_values_with_keywords(
     };
 
     if should_run_init {
+        if rejects_default_object_constructor_args(
+            class,
+            init_callable,
+            !args.is_empty() || !keywords.is_empty(),
+        ) {
+            return Err(RuntimeError::type_error(format!(
+                "{}() takes no arguments",
+                class.name()
+            )));
+        }
+
         let init_arg_policy = init_arg_policy_for_new_result(class, new_result, init_callable);
         invoke_class_init_direct_with_keywords(
             vm,
@@ -738,6 +767,18 @@ fn instantiate_user_defined_class_from_values_with_keywords(
     }
 
     Ok(new_result)
+}
+
+#[inline]
+fn rejects_default_object_constructor_args(
+    class: &PyClassObject,
+    init_callable: Value,
+    has_constructor_args: bool,
+) -> bool {
+    has_constructor_args
+        && slot_callable_matches_builtin_name(init_callable, "object.__init__")
+        && resolve_instantiation_slot(class, "__new__")
+            .is_some_and(|new| slot_callable_matches_builtin_name(new, "object.__new__"))
 }
 
 fn reject_abstract_class_instantiation(class: &PyClassObject) -> Result<(), RuntimeError> {

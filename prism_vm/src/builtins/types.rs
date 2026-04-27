@@ -3640,10 +3640,7 @@ pub(crate) fn builtin_module_new(args: &[Value]) -> Result<Value, BuiltinError> 
 
 pub(crate) fn builtin_object_new(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
-        return Err(BuiltinError::TypeError(format!(
-            "object.__new__() takes exactly one argument ({} given)",
-            args.len()
-        )));
+        return Err(object_new_extra_args_error(args));
     }
 
     let class_value = args[0];
@@ -3670,9 +3667,7 @@ pub(crate) fn builtin_object_new(args: &[Value]) -> Result<Value, BuiltinError> 
 
 pub(crate) fn builtin_object_init(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
-        return Err(BuiltinError::TypeError(
-            "object.__init__() takes exactly one argument (the instance to initialize)".to_string(),
-        ));
+        return Err(object_init_extra_args_error(args));
     }
 
     let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
@@ -3686,6 +3681,84 @@ pub(crate) fn builtin_object_init(args: &[Value]) -> Result<Value, BuiltinError>
     }
 
     Ok(Value::none())
+}
+
+fn object_new_extra_args_error(args: &[Value]) -> BuiltinError {
+    if let Some(class) = args.first().copied().and_then(heap_class_from_type_value) {
+        if heap_class_uses_object_new_and_init(class) {
+            return BuiltinError::TypeError(format!("{}() takes no arguments", class.name()));
+        }
+    }
+
+    BuiltinError::TypeError(
+        "object.__new__() takes exactly one argument (the type to instantiate)".to_string(),
+    )
+}
+
+fn object_init_extra_args_error(args: &[Value]) -> BuiltinError {
+    if let Some(class) = args
+        .first()
+        .copied()
+        .and_then(heap_class_from_instance_value)
+    {
+        if heap_class_uses_object_new_and_init(class.as_ref()) {
+            return BuiltinError::TypeError(format!(
+                "{}.__init__() takes exactly one argument (the instance to initialize)",
+                class.name()
+            ));
+        }
+    }
+
+    BuiltinError::TypeError(
+        "object.__init__() takes exactly one argument (the instance to initialize)".to_string(),
+    )
+}
+
+fn heap_class_from_type_value(value: Value) -> Option<&'static PyClassObject> {
+    let ptr = value.as_object_ptr()?;
+    if builtin_type_object_type_id(ptr).is_some() {
+        return None;
+    }
+    class_object_from_ptr(ptr)
+}
+
+fn heap_class_from_instance_value(value: Value) -> Option<std::sync::Arc<PyClassObject>> {
+    let ptr = value.as_object_ptr()?;
+    let type_id = crate::ops::objects::extract_type_id(ptr);
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return None;
+    }
+
+    global_class(ClassId(type_id.raw()))
+}
+
+fn heap_class_uses_object_new_and_init(class: &PyClassObject) -> bool {
+    heap_class_slot_resolves_to_object(class, "__new__")
+        && heap_class_slot_resolves_to_object(class, "__init__")
+}
+
+fn heap_class_slot_resolves_to_object(class: &PyClassObject, name: &str) -> bool {
+    let name = intern(name);
+
+    for &class_id in class.mro() {
+        if class_id.0 >= TypeId::FIRST_USER_TYPE {
+            if class_id == class.class_id() {
+                if class.get_attr(&name).is_some() {
+                    return false;
+                }
+                continue;
+            }
+
+            if global_class(class_id).is_some_and(|owner| owner.get_attr(&name).is_some()) {
+                return false;
+            }
+            continue;
+        }
+
+        return class_id_to_type_id(class_id) == TypeId::OBJECT;
+    }
+
+    false
 }
 
 pub(crate) fn builtin_object_init_subclass(
