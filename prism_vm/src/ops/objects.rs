@@ -39,7 +39,8 @@ use prism_runtime::object::super_obj::{SuperBinding, SuperObject};
 use prism_runtime::object::type_builtins::{builtin_class_mro, class_id_to_type_id, global_class};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{
-    CellViewObject, CodeObjectView, FrameViewObject, TracebackViewObject,
+    CellViewObject, CodeObjectView, DictViewObject, FrameViewObject, MappingProxyObject,
+    TracebackViewObject,
 };
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
@@ -2151,6 +2152,17 @@ pub(crate) fn get_attribute_value(
                         .get()
                         .ok_or_else(|| RuntimeError::value_error("Cell is empty")),
                     _ => Err(RuntimeError::attribute_error("cell", name.as_str())),
+                }
+            }
+            TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => {
+                let view = unsafe { &*(ptr as *const DictViewObject) };
+                match name.as_str() {
+                    "mapping" => alloc_heap_value(
+                        vm,
+                        MappingProxyObject::for_mapping(view.dict()),
+                        "dictionary view mapping proxy",
+                    ),
+                    _ => Err(RuntimeError::attribute_error(type_id.name(), name.as_str())),
                 }
             }
             TypeId::SUPER => super_attribute_value_in_vm(vm, obj, name)?
