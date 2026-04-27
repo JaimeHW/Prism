@@ -603,6 +603,14 @@ fn is_reference_type_id(type_id: TypeId) -> bool {
         .is_some_and(|bitmap| bitmap.is_subclass_of(reference_type_id))
 }
 
+pub(crate) fn is_reference_value(value: Value) -> bool {
+    let Some(ptr) = aligned_object_ptr(value) else {
+        return false;
+    };
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    is_reference_type_id(type_id)
+}
+
 fn reference_new(args: &[Value]) -> Result<Value, BuiltinError> {
     if !(2..=3).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(

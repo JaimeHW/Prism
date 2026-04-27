@@ -5,7 +5,7 @@
 //! the steady-state fast path compact without turning compatibility behavior
 //! into a source-level dependency.
 
-use super::{Module, ModuleError, ModuleResult, copyreg};
+use super::{_weakref, Module, ModuleError, ModuleResult, copyreg};
 use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class,
@@ -28,6 +28,7 @@ use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::slice::SliceObject;
@@ -244,7 +245,9 @@ fn is_copy_atomic(value: Value) -> bool {
         || value.as_bool().is_some()
         || value.as_int().is_some()
         || value.as_float().is_some()
+        || value_to_bigint(value).is_some()
         || value_as_string_ref(value).is_some()
+        || _weakref::is_reference_value(value)
     {
         return true;
     }

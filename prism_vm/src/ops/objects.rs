@@ -1967,12 +1967,14 @@ pub(crate) fn get_attribute_value(
         }
 
         if !matches!(type_id, TypeId::EXCEPTION_TYPE | TypeId::TYPE)
+            && !is_user_defined_type(type_id)
             && let Some(value) = builtin_instance_attribute_value(vm, type_id, obj, name)?
         {
             return Ok(value);
         }
 
         if !matches!(type_id, TypeId::EXCEPTION_TYPE | TypeId::TYPE)
+            && !is_user_defined_type(type_id)
             && let Some(value) = builtin_instance_method_attr_value(obj, type_id, name)
         {
             return Ok(value);

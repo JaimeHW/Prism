@@ -1702,19 +1702,7 @@ pub fn ne(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
 #[inline(always)]
 fn values_identical(a: Value, b: Value) -> bool {
-    if a.is_none() && b.is_none() {
-        true
-    } else if a.is_bool() && b.is_bool() {
-        a.as_bool() == b.as_bool()
-    } else if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
-        x == y
-    } else if a.is_string() && b.is_string() {
-        a.as_string_object_ptr() == b.as_string_object_ptr()
-    } else if a.is_object() && b.is_object() {
-        a.as_object_ptr() == b.as_object_ptr()
-    } else {
-        false
-    }
+    a.raw_bits() == b.raw_bits()
 }
 
 /// Is: dst = src1 is src2
