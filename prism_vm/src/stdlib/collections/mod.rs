@@ -60,9 +60,11 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
-    SubclassBitmap, builtin_class_mro, class_id_to_type_id, global_class, register_global_class,
+    SubclassBitmap, builtin_class_mro, class_id_to_type_id, global_class, global_class_bitmap,
+    register_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::{DictViewKind, DictViewObject};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::StringObject;
@@ -259,6 +261,78 @@ static CHAINMAP_CLEAR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static USERDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("collections.UserDict.__repr__"), userdict_repr)
 });
+static USERDICT_INIT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("collections.UserDict.__init__"), userdict_init)
+});
+static USERDICT_LEN: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.__len__"), userdict_len)
+});
+static USERDICT_GETITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserDict.__getitem__"),
+        userdict_getitem,
+    )
+});
+static USERDICT_SETITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserDict.__setitem__"),
+        userdict_setitem,
+    )
+});
+static USERDICT_DELITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserDict.__delitem__"),
+        userdict_delitem,
+    )
+});
+static USERDICT_ITER: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.__iter__"), userdict_iter)
+});
+static USERDICT_CONTAINS: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserDict.__contains__"),
+        userdict_contains,
+    )
+});
+static USERDICT_GET: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.get"), userdict_get)
+});
+static USERDICT_KEYS: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.keys"), userdict_keys)
+});
+static USERDICT_ITEMS: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.items"), userdict_items)
+});
+static USERDICT_VALUES: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.values"), userdict_values)
+});
+static USERDICT_UPDATE: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("collections.UserDict.update"), userdict_update)
+});
+static USERDICT_CLEAR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.clear"), userdict_clear)
+});
+static USERDICT_COPY: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.copy"), userdict_copy)
+});
+static USERDICT_EQ: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.__eq__"), userdict_eq)
+});
+static USERDICT_NE: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserDict.__ne__"), userdict_ne)
+});
+static USERDICT_FROMKEYS_FN: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserDict.fromkeys"),
+        userdict_fromkeys,
+    )
+});
+static USERDICT_FROMKEYS: LazyLock<Value> = LazyLock::new(|| {
+    let descriptor = Box::new(ClassMethodDescriptor::new(builtin_value(
+        &USERDICT_FROMKEYS_FN,
+    )));
+    Value::object_ptr(Box::into_raw(descriptor) as *const ())
+});
 static USERLIST_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("collections.UserList.__repr__"), userlist_repr)
 });
@@ -320,7 +394,26 @@ static USERDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
     build_native_collection_class(
         "UserDict",
         &[],
-        &[("__repr__", builtin_value(&USERDICT_REPR))],
+        &[
+            ("__init__", builtin_value(&USERDICT_INIT)),
+            ("__len__", builtin_value(&USERDICT_LEN)),
+            ("__getitem__", builtin_value(&USERDICT_GETITEM)),
+            ("__setitem__", builtin_value(&USERDICT_SETITEM)),
+            ("__delitem__", builtin_value(&USERDICT_DELITEM)),
+            ("__iter__", builtin_value(&USERDICT_ITER)),
+            ("__contains__", builtin_value(&USERDICT_CONTAINS)),
+            ("get", builtin_value(&USERDICT_GET)),
+            ("keys", builtin_value(&USERDICT_KEYS)),
+            ("items", builtin_value(&USERDICT_ITEMS)),
+            ("values", builtin_value(&USERDICT_VALUES)),
+            ("update", builtin_value(&USERDICT_UPDATE)),
+            ("clear", builtin_value(&USERDICT_CLEAR)),
+            ("copy", builtin_value(&USERDICT_COPY)),
+            ("fromkeys", *USERDICT_FROMKEYS),
+            ("__repr__", builtin_value(&USERDICT_REPR)),
+            ("__eq__", builtin_value(&USERDICT_EQ)),
+            ("__ne__", builtin_value(&USERDICT_NE)),
+        ],
     )
 });
 static USERLIST_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
@@ -2122,10 +2215,302 @@ fn chainmap_clear(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Buil
     Ok(Value::none())
 }
 
+fn userdict_init(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "UserDict expected at most 1 argument, got {given}"
+        )));
+    }
+
+    let ptr = expect_userdict_instance_value(args[0], "__init__")?;
+    let data = leak_object_value(DictObject::new());
+    let instance = expect_user_collection_from_ptr_mut(ptr, "__init__")?;
+    instance.set_property(intern("data"), data, shape_registry());
+
+    let source = args.get(1).copied().filter(|value| !value.is_none());
+    crate::ops::method_dispatch::dict_extend_with_vm_kw(vm, data, source, keywords, "__init__")?;
+    Ok(Value::none())
+}
+
+fn userdict_len(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__len__", 1)?;
+    let data = userdict_data_value(args[0], "__len__")?;
+    let len = crate::builtins::try_len_value(vm, data).map_err(BuiltinError::Raised)?;
+    len_to_value(len, "UserDict")
+}
+
+fn userdict_getitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__getitem__", 2)?;
+    let data = userdict_data_value(args[0], "__getitem__")?;
+    match mapping_get_item(vm, data, args[1]) {
+        Ok(value) => Ok(value),
+        Err(err) if is_missing_mapping_key_error(&err) => userdict_missing(vm, args[0], args[1]),
+        Err(err) => Err(BuiltinError::Raised(err)),
+    }
+}
+
+fn userdict_setitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__setitem__", 3)?;
+    let data = userdict_data_value(args[0], "__setitem__")?;
+    mapping_set_item(vm, data, args[1], args[2]).map_err(BuiltinError::Raised)?;
+    Ok(Value::none())
+}
+
+fn userdict_delitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__delitem__", 2)?;
+    let data = userdict_data_value(args[0], "__delitem__")?;
+    mapping_delete_item(vm, data, args[1]).map_err(BuiltinError::Raised)?;
+    Ok(Value::none())
+}
+
+fn userdict_iter(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__iter__", 1)?;
+    let data = userdict_data_value(args[0], "__iter__")?;
+    crate::builtins::builtin_iter_vm(vm, &[data])
+}
+
+fn userdict_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__contains__", 2)?;
+    let data = userdict_data_value(args[0], "__contains__")?;
+    mapping_contains_key(vm, data, args[1])
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn userdict_get(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if !(1..=2).contains(&given) {
+        return Err(BuiltinError::TypeError(format!(
+            "UserDict.get() takes from 1 to 2 arguments ({given} given)"
+        )));
+    }
+
+    let data = userdict_data_value(args[0], "get")?;
+    if mapping_contains_key(vm, data, args[1]).map_err(BuiltinError::Raised)? {
+        mapping_get_item(vm, data, args[1]).map_err(BuiltinError::Raised)
+    } else {
+        Ok(args.get(2).copied().unwrap_or_else(Value::none))
+    }
+}
+
+fn userdict_keys(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userdict_view_or_method(vm, args, "keys", DictViewKind::Keys)
+}
+
+fn userdict_items(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userdict_view_or_method(vm, args, "items", DictViewKind::Items)
+}
+
+fn userdict_values(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userdict_view_or_method(vm, args, "values", DictViewKind::Values)
+}
+
+fn userdict_update(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "UserDict.update() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let data = userdict_data_value(args[0], "update")?;
+    crate::ops::method_dispatch::dict_extend_with_vm_kw(
+        vm,
+        data,
+        args.get(1).copied(),
+        keywords,
+        "update",
+    )?;
+    Ok(Value::none())
+}
+
+fn userdict_clear(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "clear", 1)?;
+    let data = userdict_data_value(args[0], "clear")?;
+    if let Some(ptr) = data.as_object_ptr()
+        && let Some(dict) = dict_storage_mut_from_ptr(ptr)
+    {
+        dict.clear();
+        return Ok(Value::none());
+    }
+
+    invoke_mapping_no_arg_method(vm, data, "clear")?;
+    Ok(Value::none())
+}
+
+fn userdict_copy(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "copy", 1)?;
+    let ptr = expect_userdict_instance_value(args[0], "copy")?;
+    let class_value = heap_class_value_for_ptr(ptr, "copy")?;
+    let data = userdict_data_value(args[0], "copy")?;
+    let copied = mapping_copy(vm, data).map_err(BuiltinError::Raised)?;
+    invoke_callable_value(vm, class_value, &[copied]).map_err(BuiltinError::Raised)
+}
+
+fn userdict_fromkeys(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "fromkeys() takes 2 or 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let result = invoke_callable_value(vm, args[0], &[]).map_err(BuiltinError::Raised)?;
+    let value = args.get(2).copied().unwrap_or_else(Value::none);
+    let keys = collect_iterable_values_runtime(vm, args[1]).map_err(BuiltinError::Raised)?;
+    for key in keys {
+        mapping_set_item(vm, result, key, value).map_err(BuiltinError::Raised)?;
+    }
+    Ok(result)
+}
+
+fn userdict_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__eq__", 2)?;
+    let left = userdict_data_value(args[0], "__eq__")?;
+    let right = userdict_data_value_if_userdict(args[1], "__eq__")?.unwrap_or(args[1]);
+    crate::ops::comparison::eq_result(vm, left, right)
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn userdict_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, "__ne__", 2)?;
+    let left = userdict_data_value(args[0], "__ne__")?;
+    let right = userdict_data_value_if_userdict(args[1], "__ne__")?.unwrap_or(args[1]);
+    crate::ops::comparison::eq_result(vm, left, right)
+        .map(|equal| Value::bool(!equal))
+        .map_err(BuiltinError::Raised)
+}
+
 fn userdict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
-    let ptr = expect_collection_instance(args, "__repr__")?;
-    let data_repr = shaped_property_repr(ptr, "data")?.unwrap_or_else(|| "{}".to_string());
-    Ok(Value::string(intern(&format!("UserDict({data_repr})"))))
+    expect_userdict_arg_count(args, "__repr__", 1)?;
+    let data = userdict_data_value(args[0], "__repr__")?;
+    Ok(Value::string(intern(&collection_repr_text(data)?)))
+}
+
+fn expect_userdict_arg_count(
+    args: &[Value],
+    method_name: &str,
+    expected: usize,
+) -> Result<(), BuiltinError> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "UserDict.{method_name}() takes exactly {expected} arguments ({} given)",
+            args.len()
+        )))
+    }
+}
+
+fn expect_userdict_instance_value(
+    value: Value,
+    descriptor_name: &str,
+) -> Result<*const (), BuiltinError> {
+    let ptr = expect_collection_instance(&[value], descriptor_name)?;
+    let type_id = extract_type_id(ptr);
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && global_class_bitmap(ClassId(type_id.raw()))
+            .is_some_and(|bitmap| bitmap.is_subclass_of(USERDICT_CLASS.class_type_id()))
+    {
+        Ok(ptr)
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "descriptor '{descriptor_name}' requires a collections.UserDict object"
+        )))
+    }
+}
+
+fn userdict_data_value(value: Value, descriptor_name: &str) -> Result<Value, BuiltinError> {
+    let ptr = expect_userdict_instance_value(value, descriptor_name)?;
+    expect_user_collection_from_ptr(ptr, descriptor_name)?
+        .get_property("data")
+        .ok_or_else(|| {
+            BuiltinError::AttributeError(
+                "collections.UserDict instance has no 'data' attribute".to_string(),
+            )
+        })
+}
+
+fn userdict_data_value_if_userdict(
+    value: Value,
+    descriptor_name: &str,
+) -> Result<Option<Value>, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(None);
+    };
+    let type_id = extract_type_id(ptr);
+    if type_id.raw() < TypeId::FIRST_USER_TYPE
+        || !global_class_bitmap(ClassId(type_id.raw()))
+            .is_some_and(|bitmap| bitmap.is_subclass_of(USERDICT_CLASS.class_type_id()))
+    {
+        return Ok(None);
+    }
+    userdict_data_value(value, descriptor_name).map(Some)
+}
+
+fn userdict_missing(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    key: Value,
+) -> Result<Value, BuiltinError> {
+    let ptr = expect_userdict_instance_value(receiver, "__getitem__")?;
+    let class_value = heap_class_value_for_ptr(ptr, "__getitem__")?;
+    match get_attribute_value(vm, class_value, &intern("__missing__")) {
+        Ok(missing) => {
+            invoke_callable_value(vm, missing, &[receiver, key]).map_err(BuiltinError::Raised)
+        }
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            Err(BuiltinError::KeyError(collection_repr_text(key)?))
+        }
+        Err(err) => Err(BuiltinError::Raised(err)),
+    }
+}
+
+fn userdict_view_or_method(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    method_name: &'static str,
+    kind: DictViewKind,
+) -> Result<Value, BuiltinError> {
+    expect_userdict_arg_count(args, method_name, 1)?;
+    let data = userdict_data_value(args[0], method_name)?;
+    if let Some(ptr) = data.as_object_ptr()
+        && dict_storage_ref_from_ptr(ptr).is_some()
+    {
+        return Ok(leak_object_value(DictViewObject::new(kind, data)));
+    }
+
+    invoke_mapping_no_arg_method(vm, data, method_name)
+}
+
+fn invoke_mapping_no_arg_method(
+    vm: &mut VirtualMachine,
+    mapping: Value,
+    method_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    let method =
+        get_attribute_value(vm, mapping, &intern(method_name)).map_err(BuiltinError::Raised)?;
+    invoke_callable_value(vm, method, &[]).map_err(BuiltinError::Raised)
+}
+
+fn len_to_value(len: usize, type_name: &str) -> Result<Value, BuiltinError> {
+    if len > i64::MAX as usize {
+        return Err(BuiltinError::OverflowError(format!(
+            "{type_name} length overflow"
+        )));
+    }
+    Value::int(len as i64)
+        .ok_or_else(|| BuiltinError::OverflowError(format!("{type_name} length overflow")))
 }
 
 fn userlist_repr(args: &[Value]) -> Result<Value, BuiltinError> {
