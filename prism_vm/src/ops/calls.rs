@@ -576,13 +576,18 @@ fn instantiate_user_defined_class(
 
     let class_value = Value::object_ptr(class as *const PyClassObject as *const ());
     let new_result = if let Some(new_callable) = resolve_instantiation_slot(class, "__new__") {
+        let new_kwargc = if should_route_keywords_to_init_only(class, new_callable, kwargc != 0) {
+            0
+        } else {
+            kwargc
+        };
         invoke_class_new(
             vm,
             class_value,
             new_callable,
             dst_reg,
             posargc,
-            kwargc,
+            new_kwargc,
             kwnames_idx,
         )?
     } else {
@@ -670,7 +675,13 @@ fn instantiate_user_defined_class_from_values_with_keywords(
 
     let class_value = Value::object_ptr(class as *const PyClassObject as *const ());
     let new_result = if let Some(new_callable) = resolve_instantiation_slot(class, "__new__") {
-        invoke_class_new_direct_with_keywords(vm, class_value, new_callable, args, keywords)?
+        let new_keywords: &[(&str, Value)] =
+            if should_route_keywords_to_init_only(class, new_callable, !keywords.is_empty()) {
+                &[]
+            } else {
+                keywords
+            };
+        invoke_class_new_direct_with_keywords(vm, class_value, new_callable, args, new_keywords)?
     } else {
         allocate_default_instance(vm, class)?
     };
@@ -870,6 +881,18 @@ fn init_arg_policy_for_new_result(
     } else {
         InitArgPolicy::IgnoreConstructorArgs
     }
+}
+
+#[inline]
+fn should_route_keywords_to_init_only(
+    class: &PyClassObject,
+    new_callable: Value,
+    has_keywords: bool,
+) -> bool {
+    has_keywords
+        && slot_callable_matches_builtin_name(new_callable, "tuple.__new__")
+        && resolve_instantiation_slot(class, "__init__")
+            .is_some_and(|init| !slot_callable_matches_builtin_name(init, "object.__init__"))
 }
 
 #[inline]
@@ -2205,6 +2228,9 @@ fn invoke_builtin_with_keywords(
             invoke_namedtuple_builtin_with_keywords(vm, builtin, args, keywords)
         }
         "list.__new__" => invoke_builtin(vm, builtin, args),
+        "tuple.__new__" => Err(RuntimeError::type_error(
+            "tuple() takes no keyword arguments",
+        )),
         "type.__init__" => invoke_type_init_builtin_with_keywords(builtin, args, keywords),
         "type.__new__" => invoke_type_new_builtin_with_keywords(vm, builtin, args, keywords),
         _ if builtin.accepts_keywords() => builtin
