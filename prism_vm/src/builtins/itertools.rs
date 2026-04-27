@@ -814,7 +814,7 @@ fn deque_len_guard(value: Value) -> Option<usize> {
 /// # Arguments
 ///
 /// - `iterable`: Any iterable to sort
-/// - `key`: Optional function to extract comparison key (currently placeholder)
+/// - `key`: Optional function to extract comparison key
 /// - `reverse`: If `True`, sort in descending order
 ///
 /// # Examples
@@ -878,13 +878,13 @@ pub fn builtin_sorted_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Valu
     let mut values =
         collect_iterable_values(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
 
-    if key_func.is_some() {
-        return Err(BuiltinError::NotImplemented(
-            "sorted() with key function requires VM integration".to_string(),
-        ));
+    if let Some(key_func) = key_func {
+        let mut keyed = build_sort_keys(vm, values, key_func)?;
+        sort_keyed_values_with_vm(vm, &mut keyed)?;
+        values = keyed.into_iter().map(|(_, value)| value).collect();
+    } else {
+        sort_values_with_vm(vm, &mut values)?;
     }
-
-    sort_values_with_vm(vm, &mut values)?;
 
     if reverse {
         values.reverse();
@@ -893,6 +893,45 @@ pub fn builtin_sorted_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Valu
     let list = prism_runtime::types::list::ListObject::from_slice(&values);
     let ptr = Box::leak(Box::new(list)) as *mut prism_runtime::types::list::ListObject as *const ();
     Ok(Value::object_ptr(ptr))
+}
+
+fn build_sort_keys(
+    vm: &mut VirtualMachine,
+    values: Vec<Value>,
+    key_func: Value,
+) -> Result<Vec<(Value, Value)>, BuiltinError> {
+    let mut keyed = Vec::with_capacity(values.len());
+    for value in values {
+        let key = invoke_callable_value(vm, key_func, &[value])
+            .map_err(runtime_error_to_builtin_error)?;
+        keyed.push((key, value));
+    }
+    Ok(keyed)
+}
+
+fn sort_keyed_values_with_vm(
+    vm: &mut VirtualMachine,
+    keyed: &mut [(Value, Value)],
+) -> Result<(), BuiltinError> {
+    let mut compare_error = None;
+    keyed.sort_by(|(left_key, _), (right_key, _)| {
+        if compare_error.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+
+        match compare_sort_ordering(vm, *left_key, *right_key) {
+            Ok(ordering) => ordering,
+            Err(err) => {
+                compare_error = Some(runtime_error_to_builtin_error(err));
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+
+    match compare_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn sort_values_with_vm(vm: &mut VirtualMachine, values: &mut [Value]) -> Result<(), BuiltinError> {
