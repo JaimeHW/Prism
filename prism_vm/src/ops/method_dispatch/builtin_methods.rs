@@ -17,7 +17,7 @@ use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::eq_result;
 use crate::ops::dict_access::{
-    dict_contains_key, dict_get_item, dict_remove_item, dict_set_item,
+    dict_contains_key, dict_get_item, dict_missing_value, dict_remove_item, dict_set_item,
     dict_setdefault as dict_setdefault_item, missing_key_error,
 };
 use crate::ops::exception::helpers::{
@@ -2001,7 +2001,12 @@ fn dict_getitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builti
     let dict = expect_dict_ref(args[0], "__getitem__")?;
     match dict_get_item(vm, dict, args[1]).map_err(runtime_error_to_builtin_error)? {
         Some(value) => Ok(value),
-        None => Err(BuiltinError::Raised(missing_key_error(vm, args[1]))),
+        None => match dict_missing_value(vm, args[0], args[1])
+            .map_err(runtime_error_to_builtin_error)?
+        {
+            Some(value) => Ok(value),
+            None => Err(BuiltinError::Raised(missing_key_error(vm, args[1]))),
+        },
     }
 }
 

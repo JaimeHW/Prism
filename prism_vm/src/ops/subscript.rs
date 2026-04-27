@@ -13,7 +13,9 @@ use crate::error::RuntimeError;
 use crate::ops::calls::{
     InvokeCallableOutcome, invoke_callable_value, invoke_callable_value_with_control_transfer,
 };
-use crate::ops::dict_access::{dict_get_item, dict_remove_item, dict_set_item, missing_key_error};
+use crate::ops::dict_access::{
+    dict_get_item, dict_missing_value, dict_remove_item, dict_set_item, missing_key_error,
+};
 use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
@@ -189,7 +191,14 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
                     vm.current_frame_mut().set_reg(dst, value);
                     return ControlFlow::Continue;
                 }
-                Ok(None) => return ControlFlow::Error(missing_key_error(vm, key)),
+                Ok(None) => match dict_missing_value(vm, container, key) {
+                    Ok(Some(value)) => {
+                        vm.current_frame_mut().set_reg(dst, value);
+                        return ControlFlow::Continue;
+                    }
+                    Ok(None) => return ControlFlow::Error(missing_key_error(vm, key)),
+                    Err(err) => return ControlFlow::Error(err),
+                },
                 Err(err) => return ControlFlow::Error(err),
             }
         }
@@ -222,7 +231,7 @@ fn finish_subscr(vm: &mut VirtualMachine, dst: u8, result: SubscriptResult) -> C
 /// allowing callers to fall back to the general `__getitem__` protocol.
 #[inline]
 fn subscr_integer(
-    vm: &VirtualMachine,
+    vm: &mut VirtualMachine,
     container: Value,
     index: i64,
 ) -> Result<Option<SubscriptResult>, ControlFlow> {
@@ -292,10 +301,17 @@ fn subscr_integer(
             _ => {}
         }
 
-        if let Some(dict) = dict_storage_ref_from_ptr(ptr) {
+        if can_use_dict_storage_fast_path(ptr, "__getitem__")
+            && let Some(dict) = dict_storage_ref_from_ptr(ptr)
+        {
             let key = Value::int_unchecked(index);
             if let Some(value) = dict.get(key) {
                 return Ok(Some(SubscriptResult::Value(value)));
+            }
+            match dict_missing_value(vm, container, key) {
+                Ok(Some(value)) => return Ok(Some(SubscriptResult::Value(value))),
+                Ok(None) => {}
+                Err(err) => return Err(ControlFlow::Error(err)),
             }
             return Err(ControlFlow::Error(missing_key_error(vm, key)));
         }

@@ -8,9 +8,14 @@ use crate::VirtualMachine;
 use crate::builtins::create_exception_with_args_in_vm;
 use crate::builtins::hash_value_vm;
 use crate::error::RuntimeError;
+use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::eq_result;
+use crate::ops::objects::{bind_instance_attribute_in_vm, extract_type_id};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
+use prism_core::intern::intern;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::value_to_bigint;
@@ -148,6 +153,33 @@ pub(crate) fn missing_key_error(vm: &VirtualMachine, key: Value) -> RuntimeError
 }
 
 #[inline]
+pub(crate) fn dict_missing_value(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    key: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(receiver_ptr) = receiver.as_object_ptr() else {
+        return Ok(None);
+    };
+
+    let receiver_type = extract_type_id(receiver_ptr);
+    if receiver_type.raw() < TypeId::FIRST_USER_TYPE {
+        return Ok(None);
+    }
+
+    let missing_name = intern("__missing__");
+    let Some(class) = global_class(ClassId(receiver_type.raw())) else {
+        return Ok(None);
+    };
+    let Some(slot) = class.lookup_method_published(&missing_name) else {
+        return Ok(None);
+    };
+
+    let callable = bind_instance_attribute_in_vm(vm, slot.value, receiver)?;
+    invoke_callable_value(vm, callable, &[key]).map(Some)
+}
+
+#[inline]
 fn dict_candidate_matches(
     vm: &mut VirtualMachine,
     dict: &DictObject,
@@ -180,7 +212,7 @@ fn requires_protocol_scan(value: Value) -> bool {
     let Some(ptr) = value.as_object_ptr() else {
         return true;
     };
-    let type_id = crate::ops::objects::extract_type_id(ptr);
+    let type_id = extract_type_id(ptr);
     match type_id {
         TypeId::TUPLE => {
             let tuple = unsafe { &*(ptr as *const TupleObject) };
