@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "prism_aot",
-    "prism_code",
-    "prism_core",
-    "prism_parser",
-    "prism_compiler",
-    "prism_stdlib",
-    "prism_gc",
-    "prism_vm",
-    "prism_jit",
-    "prism_runtime",
-    "prism_cli",
+    "crates/prism_aot",
+    "crates/prism_code",
+    "crates/prism_core",
+    "crates/prism_parser",
+    "crates/prism_compiler",
+    "crates/prism_stdlib",
+    "crates/prism_gc",
+    "crates/prism_vm",
+    "crates/prism_jit",
+    "crates/prism_runtime",
+    "crates/prism_cli",
 ]
 
 [workspace.package]
@@ -24,16 +24,16 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 # Internal crates
-prism_core = { path = "prism_core" }
-prism_code = { path = "prism_code" }
-prism_gc = { path = "prism_gc" }
-prism_parser = { path = "prism_parser" }
-prism_compiler = { path = "prism_compiler" }
-prism_stdlib = { path = "prism_stdlib" }
-prism_vm = { path = "prism_vm" }
-prism_jit = { path = "prism_jit" }
-prism_runtime = { path = "prism_runtime" }
-prism_aot = { path = "prism_aot" }
+prism_core = { path = "crates/prism_core" }
+prism_code = { path = "crates/prism_code" }
+prism_gc = { path = "crates/prism_gc" }
+prism_parser = { path = "crates/prism_parser" }
+prism_compiler = { path = "crates/prism_compiler" }
+prism_stdlib = { path = "crates/prism_stdlib" }
+prism_vm = { path = "crates/prism_vm" }
+prism_jit = { path = "crates/prism_jit" }
+prism_runtime = { path = "crates/prism_runtime" }
+prism_aot = { path = "crates/prism_aot" }
 
 # External dependencies
 thiserror = "2.0"
