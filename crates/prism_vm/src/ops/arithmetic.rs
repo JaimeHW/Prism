@@ -18,7 +18,7 @@ use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_specia
 use crate::ops::objects::{list_storage_ref_from_ptr, tuple_storage_ref_from_ptr};
 use crate::ops::protocols::{binary_special_method, inplace_special_method};
 use crate::python_numeric::{
-    complex_like_parts, float_like_value, int_like_value, is_complex_value,
+    complex_like_parts, float_like_value, int_like_value, is_complex_value, python_float_pow_value,
 };
 use crate::type_feedback::BinaryOpFeedback;
 use num_bigint::BigInt;
@@ -1600,9 +1600,13 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         ));
     };
 
-    vm.current_frame_mut()
-        .set_reg(inst.dst().0, Value::float(x.powf(y)));
-    ControlFlow::Continue
+    match python_float_pow_value(x, y) {
+        Ok(value) => {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
+    }
 }
 
 /// MatMul: dst = src1 @ src2.

@@ -5,6 +5,7 @@
 //! builtin implementations use these helpers when they need Python-compatible
 //! numeric coercion.
 
+use crate::error::RuntimeError;
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::complex::ComplexObject;
@@ -72,4 +73,53 @@ pub fn complex_like_parts(value: Value) -> Option<ComplexParts> {
         real: complex.real(),
         imag: complex.imag(),
     })
+}
+
+/// Fast-path IEEE float power when CPython does not require non-libm behavior.
+#[inline(always)]
+pub fn python_float_pow_fast_path(base: f64, exponent: f64) -> Option<f64> {
+    if exponent == 0.0 || base == 1.0 || (base == -1.0 && exponent.is_infinite()) {
+        return Some(1.0);
+    }
+
+    if float_pow_needs_runtime_path(base, exponent) {
+        None
+    } else {
+        Some(base.powf(exponent))
+    }
+}
+
+/// Python-compatible float power, including CPython's explicit edge semantics.
+#[inline]
+pub fn python_float_pow_value(base: f64, exponent: f64) -> Result<Value, RuntimeError> {
+    if let Some(result) = python_float_pow_fast_path(base, exponent) {
+        return Ok(Value::float(result));
+    }
+
+    if base == 0.0 && exponent.is_finite() && exponent < 0.0 {
+        return Err(RuntimeError::zero_division_with_message(
+            "0.0 cannot be raised to a negative power",
+        ));
+    }
+
+    debug_assert!(base.is_finite() && base < 0.0);
+    debug_assert!(exponent.is_finite() && !float_is_integral(exponent));
+
+    let magnitude = (-base).powf(exponent);
+    let phase = std::f64::consts::PI * exponent;
+    Ok(crate::alloc_managed_value(ComplexObject::new(
+        magnitude * phase.cos(),
+        magnitude * phase.sin(),
+    )))
+}
+
+#[inline(always)]
+fn float_pow_needs_runtime_path(base: f64, exponent: f64) -> bool {
+    (base == 0.0 && exponent.is_finite() && exponent < 0.0)
+        || (base.is_finite() && base < 0.0 && exponent.is_finite() && !float_is_integral(exponent))
+}
+
+#[inline(always)]
+fn float_is_integral(value: f64) -> bool {
+    value.trunc() == value
 }

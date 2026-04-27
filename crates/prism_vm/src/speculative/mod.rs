@@ -25,6 +25,7 @@
 //! - **Memory**: Fixed 256-slot cache (4KB total)
 
 use crate::ic_manager::ICSiteId;
+use crate::python_numeric::python_float_pow_fast_path;
 use crate::type_feedback::OperandPair;
 
 // =============================================================================
@@ -523,7 +524,9 @@ pub fn spec_pow_float(a: Value, b: Value) -> (SpecResult, Value) {
     let y = b.as_float().or_else(|| b.as_int().map(|i| i as f64));
 
     if let (Some(x), Some(y)) = (x, y) {
-        return (SpecResult::Success, Value::float(x.powf(y)));
+        if let Some(result) = python_float_pow_fast_path(x, y) {
+            return (SpecResult::Success, Value::float(result));
+        }
     }
     (SpecResult::Deopt, Value::none())
 }
