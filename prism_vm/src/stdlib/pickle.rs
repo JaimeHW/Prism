@@ -28,6 +28,7 @@ use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use std::collections::HashMap;
@@ -60,6 +61,7 @@ const TAG_TYPE: u8 = 13;
 const TAG_USER_OBJECT: u8 = 14;
 const TAG_REDUCE: u8 = 15;
 const TAG_GENERIC_ALIAS: u8 = 16;
+const TAG_SLICE: u8 = 17;
 
 const TYPE_KIND_BUILTIN: u8 = 0;
 const TYPE_KIND_USER: u8 = 1;
@@ -216,6 +218,7 @@ impl<'vm> PickleWriter<'vm> {
             TypeId::TYPE => self.write_type(ptr),
             TypeId::ITERATOR => self.write_reduce(value, ptr),
             TypeId::GENERIC_ALIAS => self.write_generic_alias(ptr),
+            TypeId::SLICE => self.write_slice(ptr),
             type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
                 self.write_user_object(ptr, type_id)
             }
@@ -369,6 +372,19 @@ impl<'vm> PickleWriter<'vm> {
         Ok(())
     }
 
+    fn write_slice(&mut self, ptr: *const ()) -> Result<(), BuiltinError> {
+        let Some(id) = self.begin_memo(ptr)? else {
+            return Ok(());
+        };
+        let slice = unsafe { &*(ptr as *const SliceObject) };
+
+        self.write_tag(TAG_SLICE);
+        self.write_u32(id);
+        self.write_value(slice.start_value())?;
+        self.write_value(slice.stop_value())?;
+        self.write_value(slice.step_value())
+    }
+
     fn begin_memo(&mut self, ptr: *const ()) -> Result<Option<u32>, BuiltinError> {
         let key = ptr as usize;
         if let Some(id) = self.memo.get(&key).copied() {
@@ -476,6 +492,7 @@ impl<'bytes> PickleReader<'bytes> {
             TAG_USER_OBJECT => self.read_user_object(vm),
             TAG_REDUCE => self.read_reduce(vm),
             TAG_GENERIC_ALIAS => self.read_generic_alias(vm),
+            TAG_SLICE => self.read_slice(vm),
             _ => Err(invalid_pickle("unknown value tag")),
         }
     }
@@ -605,6 +622,16 @@ impl<'bytes> PickleReader<'bytes> {
         let starred = self.read_u8()? != 0;
         let value =
             crate::alloc_managed_value(GenericAliasObject::new_with_starred(origin, args, starred));
+        self.insert_memo(id, value)?;
+        Ok(value)
+    }
+
+    fn read_slice(&mut self, vm: &mut VirtualMachine) -> Result<Value, BuiltinError> {
+        let id = self.read_u32()?;
+        let start = self.read_value(vm)?;
+        let stop = self.read_value(vm)?;
+        let step = self.read_value(vm)?;
+        let value = crate::alloc_managed_value(SliceObject::new(start, stop, step));
         self.insert_memo(id, value)?;
         Ok(value)
     }
