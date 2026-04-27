@@ -214,6 +214,7 @@ impl TestCapiModule {
         Self {
             attrs: [
                 "__doc__",
+                "FLT_MAX",
                 "MethInstance",
                 "MethClass",
                 "MethStatic",
@@ -253,6 +254,7 @@ impl Module for TestCapiModule {
             "__doc__" => Ok(Value::string(intern(
                 "Native CPython C-API test helpers for Prism's regression suite.",
             ))),
+            "FLT_MAX" => Ok(Value::float(f32::MAX as f64)),
             "MethInstance" => Ok(class_value(&METH_INSTANCE_CLASS)),
             "MethClass" => Ok(class_value(&METH_CLASS_CLASS)),
             "MethStatic" => Ok(class_value(&METH_STATIC_CLASS)),
@@ -288,6 +290,7 @@ impl Module for TestCapiModule {
         let module_value = Value::object_ptr(module as *const ModuleObject as *const ());
 
         module.set_attr("__doc__", self.get_attr("__doc__")?);
+        module.set_attr("FLT_MAX", Value::float(f32::MAX as f64));
         module.set_attr("MethInstance", class_value(&METH_INSTANCE_CLASS));
         module.set_attr("MethClass", class_value(&METH_CLASS_CLASS));
         module.set_attr("MethStatic", class_value(&METH_STATIC_CLASS));

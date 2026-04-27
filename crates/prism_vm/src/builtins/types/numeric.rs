@@ -841,18 +841,29 @@ impl FloatTextArgument {
 }
 
 #[inline]
-fn float_text_argument(value: Value) -> Option<FloatTextArgument> {
+fn float_text_argument(value: Value) -> Result<Option<FloatTextArgument>, BuiltinError> {
     if let Some(text) = value_to_owned_string(value) {
-        return Some(FloatTextArgument::Str(text));
+        return Ok(Some(FloatTextArgument::Str(text)));
     }
 
-    let ptr = value.as_object_ptr()?;
+    if let Some(view) = value_as_memoryview_ref(value) {
+        if view.released() {
+            return Err(BuiltinError::ValueError(
+                "operation forbidden on released memoryview object".to_string(),
+            ));
+        }
+        return Ok(Some(FloatTextArgument::Bytes(view.as_bytes().to_vec())));
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(None);
+    };
     match crate::ops::objects::extract_type_id(ptr) {
         TypeId::BYTES | TypeId::BYTEARRAY => {
             let bytes = unsafe { &*(ptr as *const BytesObject) };
-            Some(FloatTextArgument::Bytes(bytes.as_bytes().to_vec()))
+            Ok(Some(FloatTextArgument::Bytes(bytes.as_bytes().to_vec())))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -992,7 +1003,7 @@ fn builtin_float_unsupported_argument(arg: Value) -> BuiltinError {
 
 #[inline]
 fn builtin_float_base(arg: Value) -> Result<Option<Value>, BuiltinError> {
-    if let Some(text_arg) = float_text_argument(arg) {
+    if let Some(text_arg) = float_text_argument(arg)? {
         return parse_float_text_argument(&text_arg).map(Some);
     }
 
@@ -1083,7 +1094,7 @@ pub fn builtin_float_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
 
 #[inline]
 fn builtin_float_exact_base(arg: Value) -> Result<Option<Value>, BuiltinError> {
-    if let Some(text_arg) = float_text_argument(arg) {
+    if let Some(text_arg) = float_text_argument(arg)? {
         return parse_float_text_argument(&text_arg).map(Some);
     }
 
