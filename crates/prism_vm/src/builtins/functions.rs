@@ -1279,6 +1279,53 @@ fn mod_floor_bigint(value: &BigInt, modulus: &BigInt) -> BigInt {
 ///
 /// round(number[, ndigits]) - Round a number to a given precision.
 pub fn builtin_round(args: &[Value]) -> Result<Value, BuiltinError> {
+    let (number, ndigits) = parse_round_positional_args(args)?;
+    builtin_round_impl(number, ndigits.as_ref())
+}
+
+pub fn builtin_round_kw(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let args = collect_round_args(positional, keywords)?;
+    builtin_round(&args)
+}
+
+fn collect_round_args(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<SmallVec<[Value; 2]>, BuiltinError> {
+    if positional.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "round expected 1 or 2 arguments, got {}",
+            positional.len() + keywords.len()
+        )));
+    }
+
+    let mut args = SmallVec::<[Value; 2]>::new();
+    args.extend_from_slice(positional);
+    for &(name, value) in keywords {
+        match name {
+            "ndigits" => {
+                if args.len() >= 2 {
+                    return Err(BuiltinError::TypeError(
+                        "round() got multiple values for argument 'ndigits'".to_string(),
+                    ));
+                }
+                args.push(value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "round() got an unexpected keyword argument '{}'",
+                    other
+                )));
+            }
+        }
+    }
+    Ok(args)
+}
+
+fn parse_round_positional_args(args: &[Value]) -> Result<(Value, Option<BigInt>), BuiltinError> {
     if args.is_empty() || args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
             "round expected 1 or 2 arguments, got {}",
@@ -1286,44 +1333,200 @@ pub fn builtin_round(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let ndigits = if args.len() == 2 {
-        args[1].as_int().unwrap_or(0)
+    let ndigits = if let Some(&value) = args.get(1) {
+        round_ndigits_arg(value)?
     } else {
-        0
+        None
     };
 
-    if let Some(i) = args[0].as_int() {
-        // Rounding an integer with no ndigits returns the integer
-        if ndigits >= 0 {
-            return Ok(args[0]);
-        }
-        // Negative ndigits: round to nearest 10^(-ndigits)
-        let factor = 10i64.pow((-ndigits) as u32);
-        let rounded = ((i as f64 / factor as f64).round() * factor as f64) as i64;
-        return Value::int(rounded)
-            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in round".to_string()));
+    Ok((args[0], ndigits))
+}
+
+fn round_ndigits_arg(value: Value) -> Result<Option<BigInt>, BuiltinError> {
+    if value.is_none() {
+        return Ok(None);
     }
 
-    if let Some(f) = args[0].as_float() {
-        if ndigits == 0 {
-            // Round to integer
-            let rounded = f.round();
-            if rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64 {
-                return Value::int(rounded as i64).ok_or_else(|| {
-                    BuiltinError::OverflowError("integer overflow in round".to_string())
-                });
-            }
-            return Ok(Value::float(rounded));
-        }
-        // Round to ndigits decimal places
-        let factor = 10f64.powi(ndigits as i32);
-        let rounded = (f * factor).round() / factor;
-        return Ok(Value::float(rounded));
+    if let Some(boolean) = value.as_bool() {
+        return Ok(Some(BigInt::from(u8::from(boolean))));
+    }
+
+    value_to_bigint(value).map(Some).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value_type_name(value)
+        ))
+    })
+}
+
+fn builtin_round_impl(number: Value, ndigits: Option<&BigInt>) -> Result<Value, BuiltinError> {
+    if let Some(integer) = numeric_value_to_bigint(number) {
+        return round_integer_value(integer, ndigits);
+    }
+
+    if let Some(float) = number.as_float() {
+        return round_float_value(float, ndigits);
     }
 
     Err(BuiltinError::TypeError(
         "round() argument must be a number".to_string(),
     ))
+}
+
+fn round_integer_value(value: BigInt, ndigits: Option<&BigInt>) -> Result<Value, BuiltinError> {
+    let Some(ndigits) = ndigits else {
+        return Ok(bigint_to_value(value));
+    };
+    if ndigits.sign() != Sign::Minus {
+        return Ok(bigint_to_value(value));
+    }
+
+    let Some(scale) = (-ndigits).to_u32() else {
+        return Ok(Value::int_unchecked(0));
+    };
+    let factor = BigInt::from(10_u8).pow(scale);
+    let rounded = round_bigint_to_factor(value, &factor);
+    Ok(bigint_to_value(rounded))
+}
+
+fn round_float_value(value: f64, ndigits: Option<&BigInt>) -> Result<Value, BuiltinError> {
+    let Some(ndigits) = ndigits else {
+        if value.is_nan() {
+            return Err(BuiltinError::ValueError(
+                "cannot convert float NaN to integer".to_string(),
+            ));
+        }
+        if value.is_infinite() {
+            return Err(BuiltinError::OverflowError(
+                "cannot convert float infinity to integer".to_string(),
+            ));
+        }
+
+        return Ok(bigint_to_value(finite_f64_to_bigint(round_half_even(
+            value,
+        ))));
+    };
+
+    if value.is_nan() || value.is_infinite() {
+        return Ok(Value::float(value));
+    }
+
+    let rounded = match ndigits.to_i64() {
+        Some(digits) if digits > 323 => value,
+        Some(digits) if digits < -308 => 0.0_f64.copysign(value),
+        Some(digits) => round_f64_to_decimal_digits(value, digits)?,
+        None if ndigits.sign() == Sign::Minus => 0.0_f64.copysign(value),
+        None => value,
+    };
+    Ok(Value::float(rounded))
+}
+
+fn round_bigint_to_factor(value: BigInt, factor: &BigInt) -> BigInt {
+    debug_assert!(!factor.is_zero());
+
+    let negative = value.sign() == Sign::Minus;
+    let abs_value = value.abs();
+    let quotient = &abs_value / factor;
+    let remainder = &abs_value % factor;
+
+    let twice_remainder = &remainder << 1_usize;
+    let mut rounded = if twice_remainder > *factor {
+        quotient + 1_u8
+    } else if twice_remainder == *factor && (&quotient & BigInt::one()).is_one() {
+        quotient + 1_u8
+    } else {
+        quotient
+    } * factor;
+
+    if negative {
+        rounded = -rounded;
+    }
+    rounded
+}
+
+fn round_f64_to_decimal_digits(value: f64, ndigits: i64) -> Result<f64, BuiltinError> {
+    if ndigits >= 0 {
+        return Ok(round_f64_positive_digits(value, ndigits as i32));
+    }
+
+    let scale = 10f64.powi((-ndigits) as i32);
+    let rounded = round_half_even(value / scale) * scale;
+    if rounded.is_infinite() {
+        return Err(BuiltinError::OverflowError(
+            "rounded value too large to represent".to_string(),
+        ));
+    }
+    if rounded == 0.0 {
+        Ok(0.0_f64.copysign(value))
+    } else {
+        Ok(rounded)
+    }
+}
+
+fn round_f64_positive_digits(value: f64, ndigits: i32) -> f64 {
+    if ndigits <= 308 {
+        let scale = 10f64.powi(ndigits);
+        let scaled = value * scale;
+        if !scaled.is_finite() {
+            return value;
+        }
+        return round_half_even(scaled) / scale;
+    }
+
+    let high_scale = 1e308_f64;
+    let low_scale = 10f64.powi(ndigits - 308);
+    let scaled = (value * high_scale) * low_scale;
+    if !scaled.is_finite() {
+        return value;
+    }
+    (round_half_even(scaled) / low_scale) / high_scale
+}
+
+fn round_half_even(value: f64) -> f64 {
+    let truncated = value.trunc();
+    let fraction = (value - truncated).abs();
+    if fraction < 0.5 {
+        return truncated;
+    }
+    if fraction > 0.5 {
+        return truncated + value.signum();
+    }
+    if (truncated / 2.0).fract() == 0.0 {
+        truncated
+    } else {
+        truncated + value.signum()
+    }
+}
+
+fn finite_f64_to_bigint(value: f64) -> BigInt {
+    debug_assert!(value.is_finite());
+
+    if value == 0.0 {
+        return BigInt::zero();
+    }
+
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i64;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (mantissa, exponent) = if exponent_bits == 0 {
+        (BigInt::from(fraction), -1074_i64)
+    } else {
+        (
+            BigInt::from((1_u64 << 52) | fraction),
+            exponent_bits - 1023 - 52,
+        )
+    };
+
+    let mut value = if exponent >= 0 {
+        mantissa << exponent as usize
+    } else {
+        mantissa >> (-exponent) as usize
+    };
+    if negative {
+        value = -value;
+    }
+    value
 }
 
 // =============================================================================
