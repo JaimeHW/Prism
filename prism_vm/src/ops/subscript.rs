@@ -20,7 +20,8 @@ use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
     list_storage_mut_from_ptr, list_storage_ref_from_ptr, tuple_storage_ref_from_ptr,
 };
-use num_traits::ToPrimitive;
+use num_bigint::BigInt;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_code::Instruction;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
@@ -36,7 +37,7 @@ use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::memoryview::MemoryViewObject;
 use prism_runtime::types::range::RangeObject;
-use prism_runtime::types::slice::SliceObject;
+use prism_runtime::types::slice::{SliceIndices, SliceObject};
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 
@@ -128,7 +129,7 @@ pub fn binary_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         let header = unsafe { &*(ptr as *const ObjectHeader) };
         if header.type_id == TypeId::SLICE {
             let slice = unsafe { &*(ptr as *const SliceObject) };
-            match subscr_slice(container, slice) {
+            match subscr_slice(vm, container, slice) {
                 Ok(Some(subscr_result)) => {
                     return finish_subscr(vm, dst, subscr_result);
                 }
@@ -300,16 +301,16 @@ fn subscr_integer(container: Value, index: i64) -> Result<Option<SubscriptResult
 /// allowing callers to fall back to the general `__getitem__` protocol.
 #[inline]
 fn subscr_slice(
+    vm: &mut VirtualMachine,
     container: Value,
     slice: &SliceObject,
 ) -> Result<Option<SubscriptResult>, ControlFlow> {
-    reject_zero_step_slice(slice)?;
-
     if let Some(interned) = tagged_interned_string(container)? {
         return Ok(Some(SubscriptResult::AllocString(string_slice_str(
+            vm,
             interned.as_str(),
             slice,
-        ))));
+        )?)));
     }
 
     if let Some(ptr) = container.as_object_ptr() {
@@ -318,19 +319,22 @@ fn subscr_slice(
         let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
 
         if has_builtin_sequence_layout && let Some(list) = list_storage_ref_from_ptr(ptr) {
-            let result = list_slice(list, slice);
+            let indices = resolve_slice_indices_usize(vm, slice, list.len())?;
+            let result = list_slice(list, indices);
             return Ok(Some(SubscriptResult::AllocList(result)));
         }
 
         if has_builtin_sequence_layout && let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
-            let result = tuple_slice(tuple, slice);
+            let indices = resolve_slice_indices_usize(vm, slice, tuple.len())?;
+            let result = tuple_slice(tuple, indices);
             return Ok(Some(SubscriptResult::AllocTuple(result)));
         }
 
         match header.type_id {
             TypeId::BYTES | TypeId::BYTEARRAY => {
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
-                let result = bytes.slice(slice);
+                let indices = resolve_slice_indices_usize(vm, slice, bytes.len())?;
+                let result = bytes_slice(bytes, indices);
                 return Ok(Some(SubscriptResult::AllocBytes(result)));
             }
             TypeId::MEMORYVIEW => {
@@ -340,18 +344,19 @@ fn subscr_slice(
                         "operation forbidden on released memoryview object",
                     )));
                 }
-                let result = view.slice(slice);
+                let indices = resolve_slice_indices_usize(vm, slice, view.len())?;
+                let result = memoryview_slice(view, indices);
                 let value = crate::alloc_managed_value(result);
                 return Ok(Some(SubscriptResult::Value(value)));
             }
             TypeId::STR => {
                 let string = unsafe { &*(ptr as *const StringObject) };
-                let result = string_slice(string, slice);
+                let result = string_slice(vm, string, slice)?;
                 return Ok(Some(SubscriptResult::AllocString(result)));
             }
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
-                let result = range_slice(range, slice)?;
+                let result = range_slice(vm, range, slice)?;
                 return Ok(Some(SubscriptResult::AllocRange(result)));
             }
             _ => {}
@@ -359,6 +364,195 @@ fn subscr_slice(
     }
 
     Ok(None)
+}
+
+#[inline]
+fn range_slice(
+    vm: &mut VirtualMachine,
+    range: &RangeObject,
+    slice: &SliceObject,
+) -> Result<RangeObject, ControlFlow> {
+    let indices = resolve_slice_indices_bigint(vm, slice, range.len_bigint())?;
+    let new_step = range.step_bigint() * &indices.step;
+    let new_start = range.value_at_index_bigint(&indices.start);
+    let new_stop = &new_start + &new_step * &indices.length;
+
+    Ok(RangeObject::from_bigints(new_start, new_stop, new_step))
+}
+
+#[derive(Debug)]
+struct BigSliceIndices {
+    start: BigInt,
+    step: BigInt,
+    length: BigInt,
+}
+
+fn resolve_slice_indices_usize(
+    vm: &mut VirtualMachine,
+    slice: &SliceObject,
+    length: usize,
+) -> Result<SliceIndices, ControlFlow> {
+    let indices = resolve_slice_indices_bigint(vm, slice, BigInt::from(length))?;
+    let start = bigint_index_to_usize(&indices.start)?;
+    let slice_length = bigint_index_to_usize(&indices.length)?;
+    let step = bigint_to_saturated_isize(&indices.step);
+
+    Ok(SliceIndices {
+        start,
+        stop: 0,
+        step,
+        length: slice_length,
+    })
+}
+
+fn resolve_slice_indices_bigint(
+    vm: &mut VirtualMachine,
+    slice: &SliceObject,
+    length: BigInt,
+) -> Result<BigSliceIndices, ControlFlow> {
+    debug_assert!(length >= BigInt::zero());
+    let step = if slice.step_value().is_none() {
+        BigInt::one()
+    } else {
+        slice_index_bigint(vm, slice.step_value())?
+    };
+    if step.is_zero() {
+        return Err(ControlFlow::Error(RuntimeError::value_error(
+            "slice step cannot be zero",
+        )));
+    }
+
+    let (lower, upper) = if step.is_negative() {
+        (-BigInt::one(), &length - BigInt::one())
+    } else {
+        (BigInt::zero(), length.clone())
+    };
+
+    let start = if slice.start_value().is_none() {
+        if step.is_negative() {
+            upper.clone()
+        } else {
+            lower.clone()
+        }
+    } else {
+        clamp_slice_component_bigint(
+            slice_index_bigint(vm, slice.start_value())?,
+            &length,
+            &lower,
+            &upper,
+        )
+    };
+
+    let stop = if slice.stop_value().is_none() {
+        if step.is_negative() {
+            lower.clone()
+        } else {
+            upper.clone()
+        }
+    } else {
+        clamp_slice_component_bigint(
+            slice_index_bigint(vm, slice.stop_value())?,
+            &length,
+            &lower,
+            &upper,
+        )
+    };
+
+    let slice_length = if step.is_positive() {
+        if stop > start {
+            ((&stop - &start - BigInt::one()) / &step) + BigInt::one()
+        } else {
+            BigInt::zero()
+        }
+    } else if start > stop {
+        ((&start - &stop - BigInt::one()) / (-&step)) + BigInt::one()
+    } else {
+        BigInt::zero()
+    };
+
+    Ok(BigSliceIndices {
+        start,
+        step,
+        length: slice_length,
+    })
+}
+
+fn clamp_slice_component_bigint(
+    mut value: BigInt,
+    length: &BigInt,
+    lower: &BigInt,
+    upper: &BigInt,
+) -> BigInt {
+    if value.is_negative() {
+        value += length;
+        if value < *lower { lower.clone() } else { value }
+    } else if value > *upper {
+        upper.clone()
+    } else {
+        value
+    }
+}
+
+fn slice_index_bigint(vm: &mut VirtualMachine, value: Value) -> Result<BigInt, ControlFlow> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(BigInt::from(u8::from(flag)));
+    }
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(integer);
+    }
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => {
+            return Err(ControlFlow::Error(RuntimeError::type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            )));
+        }
+        Err(err) => return Err(ControlFlow::Error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, target)?;
+    value_to_bigint(indexed).ok_or_else(|| {
+        ControlFlow::Error(RuntimeError::type_error(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        )))
+    })
+}
+
+#[inline]
+fn invoke_bound_method_no_args(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, ControlFlow> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(ControlFlow::Error)
+}
+
+#[inline]
+fn bigint_index_to_usize(value: &BigInt) -> Result<usize, ControlFlow> {
+    if value.is_negative() {
+        return Ok(0);
+    }
+    value.to_usize().ok_or_else(|| {
+        ControlFlow::Error(RuntimeError::overflow_error(
+            "slice index is too large for this sequence",
+        ))
+    })
+}
+
+#[inline]
+fn bigint_to_saturated_isize(value: &BigInt) -> isize {
+    value.to_isize().unwrap_or_else(|| {
+        if value.is_negative() {
+            isize::MIN
+        } else {
+            isize::MAX
+        }
+    })
 }
 
 #[inline]
@@ -372,42 +566,6 @@ fn reject_zero_step_slice(slice: &SliceObject) -> Result<(), ControlFlow> {
 }
 
 #[inline]
-fn range_slice(range: &RangeObject, slice: &SliceObject) -> Result<RangeObject, ControlFlow> {
-    let len = range.try_len().ok_or_else(|| range_slice_overflow())?;
-    let indices = slice.indices(len);
-    if indices.length == 0 {
-        return Ok(RangeObject::new(0, 0, 1));
-    }
-
-    let first = range
-        .get(indices.start as i64)
-        .ok_or_else(|| ControlFlow::Error(RuntimeError::index_error(indices.start as i64, len)))?;
-    let base_step = range.step_i64().ok_or_else(range_slice_overflow)?;
-    let slice_step = i64::try_from(indices.step).map_err(|_| range_slice_overflow())?;
-    let new_step = base_step
-        .checked_mul(slice_step)
-        .ok_or_else(range_slice_overflow)?;
-    let length = i64::try_from(indices.length).map_err(|_| range_slice_overflow())?;
-    let stop = first
-        .checked_add(
-            new_step
-                .checked_mul(length)
-                .ok_or_else(range_slice_overflow)?,
-        )
-        .ok_or_else(range_slice_overflow)?;
-
-    Ok(RangeObject::new(first, stop, new_step))
-}
-
-#[inline]
-fn range_slice_overflow() -> ControlFlow {
-    ControlFlow::Error(RuntimeError::exception(
-        crate::stdlib::exceptions::ExceptionTypeId::OverflowError.as_u8() as u16,
-        "range slice result is too large",
-    ))
-}
-
-#[inline]
 fn slice_from_value(value: Value) -> Option<&'static SliceObject> {
     let ptr = value.as_object_ptr()?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
@@ -416,16 +574,13 @@ fn slice_from_value(value: Value) -> Option<&'static SliceObject> {
 
 /// List slice using SliceObject for proper Python semantics.
 #[inline]
-fn list_slice(list: &ListObject, slice: &SliceObject) -> ListObject {
-    let len = list.len();
-    let indices = slice.indices(len);
-
+fn list_slice(list: &ListObject, indices: SliceIndices) -> ListObject {
     // Pre-allocate for exact capacity
     let mut result = ListObject::with_capacity(indices.length);
 
     // Use iterator for proper step handling
     for idx in indices.iter() {
-        if idx < len {
+        if idx < list.len() {
             // Safe: idx bounds checked by SliceIndices
             let value = unsafe { list.get_unchecked(idx) };
             result.push(value);
@@ -437,16 +592,13 @@ fn list_slice(list: &ListObject, slice: &SliceObject) -> ListObject {
 
 /// Tuple slice using SliceObject for proper Python semantics.
 #[inline]
-fn tuple_slice(tuple: &TupleObject, slice: &SliceObject) -> TupleObject {
-    let len = tuple.len();
-    let indices = slice.indices(len);
-
+fn tuple_slice(tuple: &TupleObject, indices: SliceIndices) -> TupleObject {
     // Pre-allocate for exact capacity
     let mut items = Vec::with_capacity(indices.length);
 
     // Use iterator for proper step handling
     for idx in indices.iter() {
-        if idx < len {
+        if idx < tuple.len() {
             if let Some(value) = tuple.get(idx as i64) {
                 items.push(value);
             }
@@ -454,6 +606,31 @@ fn tuple_slice(tuple: &TupleObject, slice: &SliceObject) -> TupleObject {
     }
 
     TupleObject::from_vec(items)
+}
+
+#[inline]
+fn bytes_slice(bytes: &BytesObject, indices: SliceIndices) -> BytesObject {
+    let mut data = Vec::with_capacity(indices.length);
+    for idx in indices.iter() {
+        if let Some(byte) = bytes.as_bytes().get(idx).copied() {
+            data.push(byte);
+        }
+    }
+    BytesObject::from_vec_with_type(data, bytes.header.type_id)
+}
+
+#[inline]
+fn memoryview_slice(view: &MemoryViewObject, indices: SliceIndices) -> MemoryViewObject {
+    let item_size = view.item_size();
+    let mut data = Vec::with_capacity(indices.length * item_size);
+    for idx in indices.iter() {
+        let start = idx * item_size;
+        let end = start + item_size;
+        if end <= view.as_bytes().len() {
+            data.extend_from_slice(&view.as_bytes()[start..end]);
+        }
+    }
+    MemoryViewObject::from_vec(view.source(), data, view.format(), view.readonly())
 }
 
 /// Resolve the content backing a tagged interned string value.
@@ -495,18 +672,26 @@ fn normalize_string_index(index: i64, len: usize) -> Option<usize> {
 
 /// String slice using SliceObject for proper Python semantics.
 #[inline]
-fn string_slice(string: &StringObject, slice: &SliceObject) -> StringObject {
-    string_slice_str(string.as_str(), slice)
+fn string_slice(
+    vm: &mut VirtualMachine,
+    string: &StringObject,
+    slice: &SliceObject,
+) -> Result<StringObject, ControlFlow> {
+    string_slice_str(vm, string.as_str(), slice)
 }
 
 /// Slice a Python string with full Unicode code point semantics.
 #[inline]
-fn string_slice_str(string: &str, slice: &SliceObject) -> StringObject {
+fn string_slice_str(
+    vm: &mut VirtualMachine,
+    string: &str,
+    slice: &SliceObject,
+) -> Result<StringObject, ControlFlow> {
     let len = string.chars().count(); // Character count, not byte count
-    let indices = slice.indices(len);
+    let indices = resolve_slice_indices_usize(vm, slice, len)?;
 
     if indices.length == 0 {
-        return StringObject::empty();
+        return Ok(StringObject::empty());
     }
 
     // Collect characters at specified indices
@@ -519,7 +704,7 @@ fn string_slice_str(string: &str, slice: &SliceObject) -> StringObject {
         }
     }
 
-    StringObject::from_string(result)
+    Ok(StringObject::from_string(result))
 }
 
 #[inline]
