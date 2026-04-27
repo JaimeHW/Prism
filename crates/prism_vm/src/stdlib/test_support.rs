@@ -8,8 +8,8 @@
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{
-    BuiltinError, BuiltinFunctionObject, allocate_heap_instance_for_class, builtin_repr,
-    exception_type_value_for_id, runtime_error_to_builtin_error,
+    BuiltinError, BuiltinFunctionObject, ExceptionValue, allocate_heap_instance_for_class,
+    builtin_compile, builtin_repr, exception_type_value_for_id, runtime_error_to_builtin_error,
 };
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
@@ -176,6 +176,12 @@ static CHECK_IMPL_DETAIL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::n
         check_impl_detail,
     )
 });
+static CHECK_SYNTAX_ERROR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("test.support.check_syntax_error"),
+        check_syntax_error,
+    )
+});
 static CHECK_FREE_AFTER_ITERATING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("test.support.check_free_after_iterating"),
@@ -263,6 +269,18 @@ static SAVE_RESTORE_WARNINGS_FILTERS_FUNCTION: LazyLock<BuiltinFunctionObject> =
             save_restore_warnings_filters,
         )
     });
+static CHECK_SYNTAX_WARNING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("test.support.warnings_helper.check_syntax_warning"),
+        check_syntax_warning,
+    )
+});
+static CHECK_NO_WARNINGS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(
+        Arc::from("test.support.warnings_helper.check_no_warnings"),
+        check_no_warnings,
+    )
+});
 static WARNINGS_FILTER_CONTEXT_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| {
         BuiltinFunctionObject::new(
@@ -307,6 +325,7 @@ impl SupportModule {
                 Arc::from("bigmemtest"),
                 Arc::from("check_impl_detail"),
                 Arc::from("check_free_after_iterating"),
+                Arc::from("check_syntax_error"),
                 Arc::from("MISSING_C_DOCSTRINGS"),
                 Arc::from("MAX_Py_ssize_t"),
                 Arc::from("NHASHBITS"),
@@ -365,6 +384,7 @@ impl Module for SupportModule {
             "bigmemtest" => Ok(builtin_value(&BIGMEMTEST_FUNCTION)),
             "check_impl_detail" => Ok(builtin_value(&CHECK_IMPL_DETAIL_FUNCTION)),
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
+            "check_syntax_error" => Ok(builtin_value(&CHECK_SYNTAX_ERROR_FUNCTION)),
             "MISSING_C_DOCSTRINGS" => Ok(Value::bool(true)),
             "MAX_Py_ssize_t" => Ok(bigint_to_value(BigInt::from(isize::MAX))),
             "NHASHBITS" => Ok(
@@ -975,6 +995,140 @@ fn check_impl_detail(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value
     Ok(Value::bool(default))
 }
 
+fn check_syntax_error(
+    _vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "check_syntax_error() takes from 2 to 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let statement = value_as_string_ref(args[1]).ok_or_else(|| {
+        BuiltinError::TypeError("check_syntax_error() statement must be str".to_string())
+    })?;
+    let errtext = if args.len() == 3 {
+        value_as_string_ref(args[2]).ok_or_else(|| {
+            BuiltinError::TypeError("check_syntax_error() errtext must be str".to_string())
+        })?
+    } else {
+        value_as_string_ref(Value::string(intern(""))).expect("interned empty string is valid")
+    };
+
+    let mut expected_lineno = None;
+    let mut expected_offset = None;
+    for (name, value) in keywords {
+        match *name {
+            "lineno" => {
+                expected_lineno = optional_check_syntax_error_position("lineno", *value)?;
+            }
+            "offset" => {
+                expected_offset = optional_check_syntax_error_position("offset", *value)?;
+            }
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "check_syntax_error() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+
+    let compile_args = [
+        args[1],
+        Value::string(intern("<test string>")),
+        Value::string(intern("exec")),
+    ];
+
+    let err = match builtin_compile(&compile_args) {
+        Ok(_) => return assertion_error("SyntaxError not raised"),
+        Err(BuiltinError::Raised(err)) => err,
+        Err(err) => return Err(err),
+    };
+
+    let RuntimeErrorKind::Exception { type_id, message } = err.kind() else {
+        return Err(BuiltinError::Raised(err));
+    };
+    if *type_id != ExceptionTypeId::SyntaxError.as_u8() as u16 {
+        return Err(BuiltinError::Raised(err));
+    }
+
+    if !errtext.is_empty() && !syntax_error_text_matches(errtext.as_str(), message.as_ref())? {
+        return assertion_error(format!(
+            "SyntaxError message {:?} does not match {:?}",
+            message,
+            errtext.as_str()
+        ));
+    }
+
+    let syntax = err
+        .raised_value
+        .and_then(|value| unsafe { ExceptionValue::from_value(value) });
+    let actual_lineno = syntax.and_then(ExceptionValue::syntax_lineno);
+    let actual_offset = syntax.and_then(ExceptionValue::syntax_offset);
+
+    if actual_lineno.is_none() {
+        return assertion_error("SyntaxError.lineno is None");
+    }
+    if actual_offset.is_none() {
+        return assertion_error("SyntaxError.offset is None");
+    }
+    if let Some(expected) = expected_lineno
+        && actual_lineno != Some(expected)
+    {
+        return assertion_error(format!(
+            "SyntaxError.lineno is {}, expected {} for {:?}",
+            actual_lineno.unwrap_or(0),
+            expected,
+            statement.as_str()
+        ));
+    }
+    if let Some(expected) = expected_offset
+        && actual_offset != Some(expected)
+    {
+        return assertion_error(format!(
+            "SyntaxError.offset is {}, expected {} for {:?}",
+            actual_offset.unwrap_or(0),
+            expected,
+            statement.as_str()
+        ));
+    }
+
+    Ok(Value::none())
+}
+
+fn optional_check_syntax_error_position(
+    name: &str,
+    value: Value,
+) -> Result<Option<u32>, BuiltinError> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let Some(position) = value.as_int() else {
+        return Err(BuiltinError::TypeError(format!(
+            "check_syntax_error() {name} must be int or None"
+        )));
+    };
+    u32::try_from(position)
+        .map(Some)
+        .map_err(|_| BuiltinError::ValueError(format!("{name} out of range")))
+}
+
+fn syntax_error_text_matches(pattern: &str, message: &str) -> Result<bool, BuiltinError> {
+    regex::Regex::new(pattern)
+        .map(|regex| regex.is_match(message))
+        .map_err(|err| BuiltinError::ValueError(format!("invalid regex pattern: {err}")))
+}
+
+fn assertion_error(message: impl Into<Arc<str>>) -> Result<Value, BuiltinError> {
+    Err(BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::AssertionError.as_u8() as u16,
+        message.into(),
+    )))
+}
+
 fn load_package_tests(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 4 {
         return Err(BuiltinError::TypeError(format!(
@@ -1303,7 +1457,11 @@ impl WarningsHelperModule {
     /// Create a new `test.support.warnings_helper` module descriptor.
     pub fn new() -> Self {
         Self {
-            attrs: vec![Arc::from("save_restore_warnings_filters")],
+            attrs: vec![
+                Arc::from("check_no_warnings"),
+                Arc::from("check_syntax_warning"),
+                Arc::from("save_restore_warnings_filters"),
+            ],
         }
     }
 }
@@ -1321,6 +1479,8 @@ impl Module for WarningsHelperModule {
 
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
+            "check_no_warnings" => Ok(builtin_value(&CHECK_NO_WARNINGS_FUNCTION)),
+            "check_syntax_warning" => Ok(builtin_value(&CHECK_SYNTAX_WARNING_FUNCTION)),
             "save_restore_warnings_filters" => {
                 Ok(builtin_value(&SAVE_RESTORE_WARNINGS_FILTERS_FUNCTION))
             }
@@ -1342,6 +1502,82 @@ fn save_restore_warnings_filters(args: &[Value]) -> Result<Value, BuiltinError> 
             "save_restore_warnings_filters() takes no arguments ({} given)",
             args.len()
         )));
+    }
+    Ok(*WARNINGS_FILTER_CONTEXT_VALUE)
+}
+
+fn check_syntax_warning(
+    _vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "check_syntax_warning() takes from 2 to 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    value_as_string_ref(args[1]).ok_or_else(|| {
+        BuiltinError::TypeError("check_syntax_warning() statement must be str".to_string())
+    })?;
+    if args.len() == 3 {
+        value_as_string_ref(args[2]).ok_or_else(|| {
+            BuiltinError::TypeError("check_syntax_warning() errtext must be str".to_string())
+        })?;
+    }
+    for (name, value) in keywords {
+        match *name {
+            "lineno" | "offset" => {
+                let _ = optional_check_syntax_error_position(name, *value)?;
+            }
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "check_syntax_warning() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+
+    let compile_args = [
+        args[1],
+        Value::string(intern("<testcase>")),
+        Value::string(intern("exec")),
+    ];
+    match builtin_compile(&compile_args) {
+        Ok(_) => assertion_error(
+            "SyntaxWarning not raised: compiler warning emission is not implemented for this source",
+        ),
+        Err(BuiltinError::Raised(err)) => Err(BuiltinError::Raised(err)),
+        Err(err) => Err(err),
+    }
+}
+
+fn check_no_warnings(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "check_no_warnings() takes from 1 to 4 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    if args.len() >= 2 {
+        value_as_string_ref(args[1]).ok_or_else(|| {
+            BuiltinError::TypeError("check_no_warnings() message must be str".to_string())
+        })?;
+    }
+    for (name, value) in keywords {
+        match *name {
+            "message" => {
+                value_as_string_ref(*value).ok_or_else(|| {
+                    BuiltinError::TypeError("check_no_warnings() message must be str".to_string())
+                })?;
+            }
+            "category" | "force_gc" => {}
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "check_no_warnings() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
     }
     Ok(*WARNINGS_FILTER_CONTEXT_VALUE)
 }
