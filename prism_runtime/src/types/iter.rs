@@ -1324,7 +1324,10 @@ impl IteratorObject {
                 }
                 Ok(IteratorReduction::ReversedIterable {
                     iterable: *list,
-                    state: Some(BigInt::from(reverse_index.saturating_sub(1))),
+                    state: Some(match reverse_index.checked_sub(1) {
+                        Some(index) => BigInt::from(index),
+                        None => BigInt::from(-1),
+                    }),
                 })
             }
             IterKind::GuardedReversedValues {
