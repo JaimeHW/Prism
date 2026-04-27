@@ -19,7 +19,9 @@ use crate::ops::comparison::eq_result;
 use crate::ops::exception::helpers::{
     extract_type_id_from_value, is_exception_class_value, is_exception_instance_value,
 };
-use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
+use crate::ops::iteration::{
+    IterStep, ensure_iterator_value, next_step, reserve_advisory_length_hint,
+};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{
     alloc_heap_value, delete_attribute_value, delete_list_item_value, dict_storage_mut_from_ptr,
@@ -2868,9 +2870,8 @@ fn collect_iterable_values_with_vm(
     let capacity = try_length_hint(vm, iterable, 0).map_err(runtime_error_to_builtin_error)?;
     let iterator = ensure_iterator_value(vm, iterable).map_err(runtime_error_to_builtin_error)?;
     let mut values = Vec::new();
-    values.try_reserve(capacity).map_err(|_| {
-        BuiltinError::Raised(RuntimeError::memory_error("length hint is too large"))
-    })?;
+    reserve_advisory_length_hint(&mut values, capacity)
+        .map_err(runtime_error_to_builtin_error)?;
 
     loop {
         match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {

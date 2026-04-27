@@ -17,6 +17,8 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::iter::{IteratorAdvanceError, IteratorObject};
 use std::cell::RefCell;
 
+const MAX_ADVISORY_LENGTH_HINT_RESERVE: usize = 1 << 20;
+
 impl From<IteratorAdvanceError> for RuntimeError {
     #[inline]
     fn from(err: IteratorAdvanceError) -> Self {
@@ -239,9 +241,7 @@ pub(crate) fn collect_iterable_values(
     let capacity = try_length_hint(vm, iterable, 0)?;
     let iterator = ensure_iterator_value(vm, iterable)?;
     let mut values = Vec::new();
-    values
-        .try_reserve(capacity)
-        .map_err(|_| RuntimeError::memory_error("length hint is too large"))?;
+    reserve_advisory_length_hint(&mut values, capacity)?;
 
     loop {
         match next_step(vm, iterator)? {
@@ -249,6 +249,21 @@ pub(crate) fn collect_iterable_values(
             IterStep::Exhausted => return Ok(values),
         }
     }
+}
+
+#[inline]
+pub(crate) fn reserve_advisory_length_hint<T>(
+    values: &mut Vec<T>,
+    hint: usize,
+) -> Result<(), RuntimeError> {
+    let reserve = hint.min(MAX_ADVISORY_LENGTH_HINT_RESERVE);
+    if reserve == 0 {
+        return Ok(());
+    }
+
+    values
+        .try_reserve(reserve)
+        .map_err(|_| RuntimeError::memory_error("length hint is too large"))
 }
 
 fn call_bound_method_target(
