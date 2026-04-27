@@ -446,6 +446,8 @@ static FLOAT_TRUEDIV_METHOD: LazyLock<BuiltinFunctionObject> =
 static MEMORYVIEW_TOBYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("memoryview.tobytes"), memoryview_tobytes)
 });
+static MEMORYVIEW_HEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("memoryview.hex"), memoryview_hex));
 static MEMORYVIEW_TOLIST_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("memoryview.tolist"), memoryview_tolist));
 static MEMORYVIEW_CAST_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -1237,6 +1239,9 @@ pub fn resolve_memoryview_method(name: &str) -> Option<CachedMethod> {
     match name {
         "tobytes" => Some(CachedMethod::simple(builtin_method_value(
             &MEMORYVIEW_TOBYTES_METHOD,
+        ))),
+        "hex" => Some(CachedMethod::simple(builtin_method_value(
+            &MEMORYVIEW_HEX_METHOD,
         ))),
         "tolist" => Some(CachedMethod::simple(builtin_method_value(
             &MEMORYVIEW_TOLIST_METHOD,
@@ -3164,6 +3169,15 @@ fn memoryview_tobytes(args: &[Value]) -> Result<Value, BuiltinError> {
     let view = expect_memoryview_ref(args[0], "tobytes")?;
     ensure_memoryview_not_released(view)?;
     Ok(to_object_value(BytesObject::from_vec(view.to_vec())))
+}
+
+fn memoryview_hex(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    let (separator, bytes_per_sep) =
+        binary::parse_byte_hex_arguments(args, keywords, "memoryview", "hex")?;
+    let view = expect_memoryview_ref(args[0], "hex")?;
+    ensure_memoryview_not_released(view)?;
+    let hex = binary::format_byte_sequence_hex(&view.to_vec(), separator, bytes_per_sep)?;
+    Ok(to_object_value(StringObject::from_string(hex)))
 }
 
 fn memoryview_tolist(args: &[Value]) -> Result<Value, BuiltinError> {

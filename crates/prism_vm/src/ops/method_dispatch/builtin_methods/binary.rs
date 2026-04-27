@@ -29,6 +29,10 @@ enum AffixMode {
 
 static BYTES_DECODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.decode"), bytes_decode));
+static BYTES_BYTES_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.__bytes__"), bytes_bytes));
+static BYTES_HEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("bytes.hex"), bytes_hex_kw));
 static BYTES_STARTSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.startswith"), bytes_startswith));
 static BYTES_ENDSWITH_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -113,6 +117,8 @@ static BYTES_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> =
 
 static BYTEARRAY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.copy"), bytearray_copy));
+static BYTEARRAY_HEX_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("bytearray.hex"), bytearray_hex_kw));
 static BYTEARRAY_APPEND_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("bytearray.append"), bytearray_append_with_vm)
 });
@@ -237,8 +243,14 @@ static BYTEARRAY_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::
 /// Resolve builtin bytes methods backed by static builtin function objects.
 pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
     match name {
+        "__bytes__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_BYTES_METHOD,
+        ))),
         "decode" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_DECODE_METHOD,
+        ))),
+        "hex" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTES_HEX_METHOD,
         ))),
         "startswith" => Some(CachedMethod::simple(builtin_method_value(
             &BYTES_STARTSWITH_METHOD,
@@ -363,6 +375,9 @@ pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
     match name {
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_COPY_METHOD,
+        ))),
+        "hex" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_HEX_METHOD,
         ))),
         "append" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_APPEND_METHOD,
@@ -521,8 +536,45 @@ pub(super) fn bytes_decode(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
+pub(super) fn bytes_bytes(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytes", "__bytes__", args, 0)?;
+    let bytes = expect_bytes_ref(args[0], "__bytes__")?;
+    if value_has_exact_type(args[0], TypeId::BYTES) {
+        return Ok(args[0]);
+    }
+
+    Ok(to_object_value(BytesObject::from_vec(bytes.to_vec())))
+}
+
+#[inline]
+pub(super) fn bytes_hex(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytes_hex_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_hex_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_hex_kw(args, keywords, "bytes", expect_bytes_ref)
+}
+
+#[inline]
 pub(super) fn bytearray_decode(args: &[Value]) -> Result<Value, BuiltinError> {
     decode_bytes_method(args, "bytearray", expect_bytearray_ref)
+}
+
+#[inline]
+pub(super) fn bytearray_hex(args: &[Value]) -> Result<Value, BuiltinError> {
+    bytearray_hex_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_hex_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_hex_kw(args, keywords, "bytearray", expect_bytearray_ref)
 }
 
 #[inline]
@@ -1407,6 +1459,153 @@ fn decode_bytes_method(
 
     let bytes = receiver(args[0], "decode")?;
     crate::builtins::decode_bytes_to_value(bytes.as_bytes(), encoding.as_deref(), errors.as_deref())
+}
+
+#[inline]
+fn byte_sequence_hex_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
+) -> Result<Value, BuiltinError> {
+    let (separator, bytes_per_sep) =
+        parse_byte_hex_arguments(args, keywords, receiver_name, "hex")?;
+    let bytes = receiver(args[0], "hex")?;
+    let hex = format_byte_sequence_hex(bytes.as_bytes(), separator, bytes_per_sep)?;
+    Ok(to_object_value(StringObject::from_string(hex)))
+}
+
+pub(super) fn parse_byte_hex_arguments(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+    method_name: &'static str,
+) -> Result<(Option<u8>, i64), BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.{method_name}() needs an argument"
+        )));
+    }
+
+    expect_method_arg_range(receiver_name, method_name, args, 0, 2)?;
+
+    let mut separator = args.get(1).copied();
+    let mut bytes_per_sep = args.get(2).copied();
+    for (name, value) in keywords {
+        match *name {
+            "sep" => {
+                if separator.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "hex() got multiple values for argument 'sep'".to_string(),
+                    ));
+                }
+                separator = Some(*value);
+            }
+            "bytes_per_sep" => {
+                if bytes_per_sep.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "hex() got multiple values for argument 'bytes_per_sep'".to_string(),
+                    ));
+                }
+                bytes_per_sep = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{receiver_name}.{method_name}() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    let bytes_per_sep = bytes_per_sep
+        .map(|value| parse_byte_signed_int(value, method_name, 2))
+        .transpose()?
+        .unwrap_or(1);
+    let separator = separator.map(parse_hex_separator).transpose()?;
+    Ok((separator, bytes_per_sep))
+}
+
+pub(super) fn format_byte_sequence_hex(
+    data: &[u8],
+    separator: Option<u8>,
+    bytes_per_sep: i64,
+) -> Result<String, BuiltinError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let group_size = bytes_per_sep
+        .unsigned_abs()
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let separator_count = if separator.is_some() && group_size != 0 {
+        data.len().saturating_sub(1) / group_size
+    } else {
+        0
+    };
+    let capacity = data
+        .len()
+        .checked_mul(2)
+        .and_then(|hex_len| hex_len.checked_add(separator_count))
+        .ok_or_else(|| BuiltinError::OverflowError("hex string is too large".to_string()))?;
+    let mut output = String::with_capacity(capacity);
+
+    for (index, &byte) in data.iter().enumerate() {
+        if should_insert_hex_separator(index, data.len(), group_size, bytes_per_sep) {
+            if let Some(separator) = separator {
+                output.push(char::from(separator));
+            }
+        }
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+
+    Ok(output)
+}
+
+#[inline]
+fn should_insert_hex_separator(
+    index: usize,
+    len: usize,
+    group_size: usize,
+    bytes_per_sep: i64,
+) -> bool {
+    if index == 0 || group_size == 0 {
+        return false;
+    }
+
+    if bytes_per_sep > 0 {
+        (len - index).is_multiple_of(group_size)
+    } else {
+        index.is_multiple_of(group_size)
+    }
+}
+
+#[inline]
+fn parse_hex_separator(value: Value) -> Result<u8, BuiltinError> {
+    if let Some(text) = value_as_string_ref(value) {
+        let mut chars = text.as_str().chars();
+        let Some(separator) = chars.next() else {
+            return Err(BuiltinError::ValueError("sep must be length 1".to_string()));
+        };
+        if chars.next().is_some() || !separator.is_ascii() {
+            return Err(BuiltinError::ValueError(
+                "sep must be ASCII and length 1".to_string(),
+            ));
+        }
+        return Ok(separator as u8);
+    }
+
+    let bytes = bytes_like_argument_bytes(value).map_err(|_| {
+        BuiltinError::TypeError(format!(
+            "sep must be str or bytes-like object, not {}",
+            value.type_name()
+        ))
+    })?;
+    match bytes.as_slice() {
+        [separator] if separator.is_ascii() => Ok(*separator),
+        _ => Err(BuiltinError::ValueError(
+            "sep must be ASCII and length 1".to_string(),
+        )),
+    }
 }
 
 #[inline]
