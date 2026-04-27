@@ -1,0 +1,364 @@
+# Prism stdlib module inventory.
+#
+# `builtin` controls visibility through importlib's builtin importer.
+# `native` controls whether Prism ships a native Rust implementation on a
+# platform. When `policy` is set and `native` is omitted, native support defaults
+# to all platforms.
+
+[[module]]
+name = "_abc"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_ast"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_codecs"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_contextvars"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_functools"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_imp"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_io"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_overlapped"
+builtin = ["windows", "other"]
+native = ["windows"]
+policy = "prefer_native"
+
+[[module]]
+name = "_random"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_sha2"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_socket"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_sre"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_ssl"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_string"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_struct"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_testcapi"
+policy = "prefer_native"
+
+[[module]]
+name = "_thread"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_tokenize"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_tracemalloc"
+policy = "prefer_native"
+
+[[module]]
+name = "_warnings"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_weakref"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "_winapi"
+builtin = ["windows", "other"]
+native = ["windows"]
+policy = "prefer_native"
+
+[[module]]
+name = "array"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "ast"
+policy = "prefer_native"
+
+[[module]]
+name = "atexit"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "binascii"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "builtins"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "collections"
+policy = "prefer_native"
+
+[[module]]
+name = "collections.abc"
+policy = "prefer_native"
+
+[[module]]
+name = "copy"
+policy = "prefer_native"
+
+[[module]]
+name = "copyreg"
+policy = "prefer_native"
+
+[[module]]
+name = "ctypes"
+policy = "prefer_native"
+
+[[module]]
+name = "dbm"
+policy = "prefer_native"
+
+[[module]]
+name = "errno"
+policy = "prefer_native"
+
+[[module]]
+name = "fnmatch"
+policy = "prefer_native"
+
+[[module]]
+name = "functools"
+policy = "prefer_source_when_available"
+
+[[module]]
+name = "gc"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "http"
+policy = "prefer_native"
+
+[[module]]
+name = "http.cookies"
+policy = "prefer_native"
+
+[[module]]
+name = "importlib"
+policy = "prefer_native"
+
+[[module]]
+name = "importlib.util"
+policy = "prefer_native"
+
+[[module]]
+name = "inspect"
+policy = "prefer_native"
+
+[[module]]
+name = "io"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "itertools"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "json"
+policy = "prefer_source_when_available"
+
+[[module]]
+name = "keyword"
+policy = "prefer_native"
+
+[[module]]
+name = "locale"
+policy = "prefer_native"
+
+[[module]]
+name = "marshal"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "math"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "msvcrt"
+builtin = ["windows"]
+native = ["windows"]
+policy = "prefer_native"
+
+[[module]]
+name = "nt"
+builtin = ["windows"]
+native = ["windows"]
+policy = "prefer_native"
+
+[[module]]
+name = "operator"
+policy = "prefer_native"
+
+[[module]]
+name = "os"
+policy = "prefer_source_when_available"
+
+[[module]]
+name = "os.path"
+policy = "prefer_source_when_available"
+
+[[module]]
+name = "pickle"
+policy = "prefer_native"
+
+[[module]]
+name = "pickletools"
+policy = "prefer_native"
+
+[[module]]
+name = "platform"
+policy = "prefer_native"
+
+[[module]]
+name = "posix"
+builtin = ["unix"]
+
+[[module]]
+name = "random"
+policy = "prefer_native"
+
+[[module]]
+name = "re"
+policy = "prefer_source_when_available"
+
+[[module]]
+name = "select"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "shutil"
+policy = "prefer_native"
+
+[[module]]
+name = "signal"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "string"
+policy = "prefer_native"
+
+[[module]]
+name = "struct"
+policy = "prefer_native"
+
+[[module]]
+name = "sys"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "test.support"
+policy = "prefer_native"
+
+[[module]]
+name = "test.support.import_helper"
+policy = "prefer_native"
+
+[[module]]
+name = "test.support.os_helper"
+policy = "prefer_native"
+
+[[module]]
+name = "test.support.threading_helper"
+policy = "prefer_native"
+
+[[module]]
+name = "test.support.warnings_helper"
+policy = "prefer_native"
+
+[[module]]
+name = "textwrap"
+policy = "prefer_native"
+
+[[module]]
+name = "threading"
+policy = "prefer_native"
+
+[[module]]
+name = "time"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "traceback"
+policy = "prefer_native"
+
+[[module]]
+name = "types"
+policy = "prefer_native"
+
+[[module]]
+name = "typing"
+policy = "prefer_native"
+
+[[module]]
+name = "weakref"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
+name = "winreg"
+builtin = ["windows", "other"]
+native = ["windows"]
+policy = "prefer_native"

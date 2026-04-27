@@ -591,7 +591,9 @@ impl StdlibRegistry {
 
         Self::insert_module(&mut modules, "io", Box::new(io::IoModule::new()));
 
-        Self { modules }
+        let registry = Self { modules };
+        registry.debug_assert_manifest_coverage();
+        registry
     }
 
     fn insert_module(
@@ -602,6 +604,27 @@ impl StdlibRegistry {
         let policy = prism_stdlib::native_module_policy(name)
             .unwrap_or_else(|| panic!("native stdlib module `{name}` is missing metadata"));
         modules.insert(Arc::from(name), RegisteredModule { module, policy });
+    }
+
+    fn debug_assert_manifest_coverage(&self) {
+        #[cfg(debug_assertions)]
+        {
+            use std::collections::BTreeSet;
+
+            let registered = self
+                .modules
+                .keys()
+                .map(|name| name.as_ref())
+                .collect::<BTreeSet<_>>();
+            let expected = prism_stdlib::native_modules()
+                .map(prism_stdlib::NativeModuleMetadata::name)
+                .collect::<BTreeSet<_>>();
+
+            debug_assert_eq!(
+                registered, expected,
+                "native stdlib registry must match prism_stdlib/modules.toml"
+            );
+        }
     }
 
     /// Get a module by name.
@@ -631,5 +654,25 @@ impl StdlibRegistry {
 impl Default for StdlibRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn registry_matches_generated_stdlib_manifest() {
+        let registry = StdlibRegistry::new();
+        let registered = registry.list_modules().into_iter().collect::<BTreeSet<_>>();
+        let expected = prism_stdlib::native_modules()
+            .map(prism_stdlib::NativeModuleMetadata::name)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            registered, expected,
+            "prism_vm native registry must consume the generated prism_stdlib manifest"
+        );
     }
 }

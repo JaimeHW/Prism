@@ -13,3 +13,6 @@ workspace = true
 
 [dependencies]
 
+[build-dependencies]
+serde.workspace = true
+toml.workspace = true
