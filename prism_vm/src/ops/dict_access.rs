@@ -9,7 +9,7 @@ use crate::builtins::create_exception_with_args_in_vm;
 use crate::builtins::hash_value_vm;
 use crate::error::RuntimeError;
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::comparison::eq_result;
+use crate::ops::comparison::eq_or_identical;
 use crate::ops::objects::{bind_user_class_attribute_value_in_vm, extract_type_id};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
@@ -210,7 +210,7 @@ fn dict_candidate_matches(
     if candidate_hash != key_hash {
         return Ok(false);
     }
-    eq_result(vm, candidate, key)
+    eq_or_identical(vm, candidate, key)
 }
 
 #[inline]

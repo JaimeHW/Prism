@@ -734,6 +734,18 @@ pub(crate) fn eq_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
     eq_result_inner(vm, a, b, &mut seen_pairs)
 }
 
+#[inline]
+pub(crate) fn eq_or_identical(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<bool, RuntimeError> {
+    if left.raw_bits() == right.raw_bits() {
+        return Ok(true);
+    }
+    eq_result(vm, left, right)
+}
+
 fn eq_result_inner(
     vm: &mut VirtualMachine,
     a: Value,
@@ -1299,13 +1311,9 @@ fn contains_match(
     needle: Value,
     candidate: Value,
 ) -> Result<bool, RuntimeError> {
-    if needle.raw_bits() == candidate.raw_bits() {
-        return Ok(true);
-    }
-
     // Membership compares each element against the searched value
     // (`candidate == needle`), which matters for asymmetric __eq__ methods.
-    eq_result(vm, candidate, needle)
+    eq_or_identical(vm, candidate, needle)
 }
 
 // =============================================================================

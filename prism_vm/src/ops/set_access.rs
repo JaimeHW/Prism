@@ -8,7 +8,7 @@
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, hash_set_contents_vm, hash_value_vm};
 use crate::error::RuntimeError;
-use crate::ops::comparison::eq_result;
+use crate::ops::comparison::eq_or_identical;
 use crate::ops::objects::{extract_type_id, set_storage_ref_from_ptr};
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
@@ -144,7 +144,7 @@ fn set_candidate_matches(
     if candidate_hash != key_hash {
         return Ok(false);
     }
-    eq_result(vm, candidate, key)
+    eq_or_identical(vm, candidate, key)
 }
 
 #[inline]
@@ -193,7 +193,7 @@ fn set_content_candidate_matches(
     if candidate_hash != key_hash {
         return Ok(false);
     }
-    eq_result(vm, candidate, key)
+    eq_or_identical(vm, candidate, key)
 }
 
 #[inline]

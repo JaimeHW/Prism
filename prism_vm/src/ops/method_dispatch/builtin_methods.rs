@@ -16,7 +16,7 @@ use crate::builtins::{
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::comparison::{compare_sort_ordering, eq_result};
+use crate::ops::comparison::{compare_sort_ordering, eq_or_identical, eq_result};
 use crate::ops::dict_access::{
     dict_contains_key, dict_get_item, dict_missing_value, dict_remove_item, dict_set_item,
     dict_setdefault as dict_setdefault_item, missing_key_error,
@@ -1123,7 +1123,7 @@ fn list_remove(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
         let Some(item) = list_item_from_ptr(ptr, index) else {
             break;
         };
-        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
             remove_index = Some(index);
             break;
         }
@@ -1202,7 +1202,7 @@ fn list_count(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinE
         let Some(item) = list_item_from_ptr(ptr, index) else {
             break;
         };
-        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
             count = count.saturating_add(1);
         }
         index += 1;
@@ -1234,7 +1234,7 @@ fn list_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinE
         let Some(item) = list_item_from_ptr(ptr, index) else {
             break;
         };
-        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
             return Ok(Value::int(i64::try_from(index).unwrap_or(i64::MAX))
                 .expect("list.index result should fit"));
         }
@@ -1300,7 +1300,7 @@ fn tuple_count(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
     let tuple = expect_tuple_ref(args[0], "count")?;
     let mut count = 0usize;
     for item in tuple.as_slice().iter().copied() {
-        if eq_result(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
             count = count.saturating_add(1);
         }
     }
@@ -1325,7 +1325,7 @@ fn tuple_index(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
 
     for index in start..stop {
         let item = tuple.as_slice()[index as usize];
-        if eq_result(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, args[1]).map_err(runtime_error_to_builtin_error)? {
             return Ok(Value::int(index).expect("tuple.index result should fit"));
         }
     }
@@ -1550,7 +1550,7 @@ fn sequence_contains_slice(
     needle: Value,
 ) -> Result<bool, BuiltinError> {
     for item in items.iter().copied() {
-        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
             return Ok(true);
         }
     }
@@ -1570,7 +1570,7 @@ fn sequence_contains_indexed(
         let Some(item) = item_at(ptr, index) else {
             break;
         };
-        if eq_result(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
+        if eq_or_identical(vm, item, needle).map_err(runtime_error_to_builtin_error)? {
             return Ok(true);
         }
         index += 1;
