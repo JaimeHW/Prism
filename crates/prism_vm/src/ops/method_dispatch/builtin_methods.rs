@@ -37,7 +37,7 @@ use crate::ops::objects::{
     tuple_storage_ref_from_ptr,
 };
 use crate::ops::protocols::value_type_id;
-use crate::python_numeric::complex_like_parts;
+use crate::python_numeric::{complex_like_parts, float_like_value};
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{CloseResult, GeneratorObject, prepare_close};
@@ -437,6 +437,8 @@ static FLOAT_CEIL_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__ceil__"), float_ceil));
 static FLOAT_TRUNC_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__trunc__"), float_trunc));
+static FLOAT_TRUEDIV_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("float.__truediv__"), float_truediv));
 static MEMORYVIEW_TOBYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("memoryview.tobytes"), memoryview_tobytes)
 });
@@ -939,6 +941,9 @@ pub fn resolve_float_method(name: &str) -> Option<CachedMethod> {
         "__trunc__" => Some(CachedMethod::simple(builtin_method_value(
             &FLOAT_TRUNC_METHOD,
         ))),
+        "__truediv__" => Some(CachedMethod::simple(builtin_method_value(
+            &FLOAT_TRUEDIV_METHOD,
+        ))),
         _ => None,
     }
 }
@@ -1022,6 +1027,18 @@ fn float_ceil(args: &[Value]) -> Result<Value, BuiltinError> {
 fn float_trunc(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("float", "__trunc__", args, 0)?;
     float_integral_method(args, "__trunc__", f64::trunc)
+}
+
+fn float_truediv(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("float", "__truediv__", args, 1)?;
+    let left = expect_float_receiver(args, "__truediv__")?;
+    let Some(right) = float_like_value(args[1]) else {
+        return Ok(builtin_not_implemented_value());
+    };
+    if right == 0.0 {
+        return Err(BuiltinError::Raised(RuntimeError::zero_division()));
+    }
+    Ok(Value::float(left / right))
 }
 
 fn float_integral_method(
@@ -1964,6 +1981,9 @@ fn int_index(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     if let Some(value) = args[0].as_bool() {
         return Ok(Value::int(i64::from(value)).expect("bool index result should fit"));
+    }
+    if let Some(value) = value_to_bigint(args[0]) {
+        return Ok(bigint_to_value(value));
     }
 
     Err(BuiltinError::TypeError(format!(

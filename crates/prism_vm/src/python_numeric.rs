@@ -6,11 +6,12 @@
 //! numeric coercion.
 
 use crate::error::RuntimeError;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::float::value_to_f64;
-use prism_runtime::types::int::value_to_i64;
+use prism_runtime::types::int::{value_to_bigint, value_to_i64};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ComplexParts {
@@ -30,7 +31,14 @@ pub fn int_like_value(value: Value) -> Option<i64> {
 /// Convert a value to its Python real-number slot value.
 #[inline(always)]
 pub fn float_like_value(value: Value) -> Option<f64> {
-    value_to_f64(value).or_else(|| int_like_value(value).map(|v| v as f64))
+    if let Some(float) = value_to_f64(value) {
+        return Some(float);
+    }
+    if let Some(integer) = int_like_value(value) {
+        return Some(integer as f64);
+    }
+
+    value_to_bigint(value).and_then(|integer| integer.to_f64().filter(|float| float.is_finite()))
 }
 
 /// Check whether a value is an exact complex object.
@@ -55,9 +63,9 @@ pub fn complex_like_parts(value: Value) -> Option<ComplexParts> {
         });
     }
 
-    if let Some(int_value) = int_like_value(value) {
+    if let Some(int_value) = float_like_value(value) {
         return Some(ComplexParts {
-            real: int_value as f64,
+            real: int_value,
             imag: 0.0,
         });
     }
