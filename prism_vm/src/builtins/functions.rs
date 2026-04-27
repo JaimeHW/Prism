@@ -29,6 +29,7 @@ use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::{object_ptr_as_string_ref, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
@@ -1832,18 +1833,51 @@ pub fn builtin_ascii_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
 
 const MAX_REPR_DEPTH: usize = 64;
 
-#[derive(Default)]
+thread_local! {
+    static REPR_ACTIVE_STACK: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ReprThreadActiveGuard {
+    key: usize,
+}
+
+impl ReprThreadActiveGuard {
+    fn push(key: usize) -> Self {
+        REPR_ACTIVE_STACK.with(|stack| stack.borrow_mut().push(key));
+        Self { key }
+    }
+}
+
+impl Drop for ReprThreadActiveGuard {
+    fn drop(&mut self) {
+        REPR_ACTIVE_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(popped, Some(self.key));
+        });
+    }
+}
+
 struct ReprState<'vm> {
     vm: Option<&'vm mut VirtualMachine>,
     active: SmallVec<[usize; 16]>,
     depth: usize,
 }
 
+impl<'vm> Default for ReprState<'vm> {
+    fn default() -> Self {
+        Self {
+            vm: None,
+            active: repr_active_snapshot(),
+            depth: 0,
+        }
+    }
+}
+
 impl<'vm> ReprState<'vm> {
     fn with_vm(vm: &'vm mut VirtualMachine) -> Self {
         Self {
             vm: Some(vm),
-            active: SmallVec::new(),
+            active: repr_active_snapshot(),
             depth: 0,
         }
     }
@@ -1937,10 +1971,12 @@ impl<'vm> ReprState<'vm> {
                     state.repr_dict_view(view)
                 })
             }
-            TypeId::SET => self.with_container(ptr, "{...}", |state| {
-                let set = unsafe { &*(ptr as *const SetObject) };
-                state.repr_set(set)
-            }),
+            TypeId::SET | TypeId::FROZENSET => {
+                self.with_container(ptr, set_recursive_repr(type_id), |state| {
+                    let set = unsafe { &*(ptr as *const SetObject) };
+                    state.repr_set(set)
+                })
+            }
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
                 Ok(range.to_string())
@@ -2028,6 +2064,7 @@ impl<'vm> ReprState<'vm> {
         }
 
         self.active.push(key);
+        let _thread_guard = ReprThreadActiveGuard::push(key);
         let result = render(self);
         self.active.pop();
         result
@@ -2047,7 +2084,9 @@ impl<'vm> ReprState<'vm> {
 
         let mut out = String::from("[");
         let mut frames = SmallVec::<[ListReprFrame; 16]>::new();
+        let mut thread_guards = SmallVec::<[ReprThreadActiveGuard; 16]>::new();
         self.active.push(root_key);
+        thread_guards.push(ReprThreadActiveGuard::push(root_key));
         frames.push(ListReprFrame {
             ptr: root_ptr,
             index: 0,
@@ -2060,6 +2099,7 @@ impl<'vm> ReprState<'vm> {
             if frame.index >= list.len() {
                 out.push(']');
                 frames.pop();
+                thread_guards.pop();
                 self.active.pop();
                 continue;
             }
@@ -2095,6 +2135,7 @@ impl<'vm> ReprState<'vm> {
 
             out.push('[');
             self.active.push(child_key);
+            thread_guards.push(ReprThreadActiveGuard::push(child_key));
             frames.push(ListReprFrame {
                 ptr: child_ptr,
                 index: 0,
@@ -2183,7 +2224,10 @@ impl<'vm> ReprState<'vm> {
 
     fn repr_set(&mut self, set: &SetObject) -> Result<String, BuiltinError> {
         if set.is_empty() {
-            return Ok("set()".to_string());
+            return Ok(match set.header.type_id {
+                TypeId::FROZENSET => "frozenset()".to_string(),
+                _ => "set()".to_string(),
+            });
         }
 
         let mut out = String::from("{");
@@ -2196,7 +2240,22 @@ impl<'vm> ReprState<'vm> {
             out.push_str(&self.repr_value(value)?);
         }
         out.push('}');
-        Ok(out)
+        Ok(match set.header.type_id {
+            TypeId::FROZENSET => format!("frozenset({out})"),
+            _ => out,
+        })
+    }
+}
+
+fn repr_active_snapshot() -> SmallVec<[usize; 16]> {
+    REPR_ACTIVE_STACK.with(|stack| stack.borrow().iter().copied().collect())
+}
+
+#[inline]
+fn set_recursive_repr(type_id: TypeId) -> &'static str {
+    match type_id {
+        TypeId::FROZENSET => "frozenset(...)",
+        _ => "set(...)",
     }
 }
 
