@@ -24,9 +24,11 @@ use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::BoundMethod;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class_bitmap;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{
-    DictViewKind, DictViewObject, MappingProxyObject, UnionTypeObject,
+    DictViewKind, DictViewObject, MappingProxyObject, MappingProxySource, UnionTypeObject,
 };
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
@@ -763,6 +765,10 @@ fn eq_result_inner(
         return Ok(equal);
     }
 
+    if let Some(equal) = mapping_proxy_eq_result(vm, a, b, seen_pairs)? {
+        return Ok(equal);
+    }
+
     if let (Some((left_ptr, left)), Some((right_ptr, right))) =
         (exact_dict_operand(a), exact_dict_operand(b))
     {
@@ -847,6 +853,10 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         return Ok(!equal);
     }
 
+    if let Some(equal) = mapping_proxy_eq_result(vm, a, b, &mut seen_pairs)? {
+        return Ok(!equal);
+    }
+
     if let (Some((left_ptr, left)), Some((right_ptr, right))) =
         (exact_dict_operand(a), exact_dict_operand(b))
     {
@@ -921,6 +931,121 @@ fn dict_eq_result(
     }
 
     Ok(true)
+}
+
+enum MappingCompareOperand {
+    Borrowed {
+        identity: *const (),
+        dict: &'static DictObject,
+    },
+    Owned {
+        identity: *const (),
+        dict: DictObject,
+    },
+}
+
+impl MappingCompareOperand {
+    #[inline]
+    fn identity(&self) -> *const () {
+        match self {
+            Self::Borrowed { identity, .. } | Self::Owned { identity, .. } => *identity,
+        }
+    }
+
+    #[inline]
+    fn dict(&self) -> &DictObject {
+        match self {
+            Self::Borrowed { dict, .. } => dict,
+            Self::Owned { dict, .. } => dict,
+        }
+    }
+}
+
+#[inline]
+fn exact_mapping_proxy_operand(value: Value) -> Option<(*const (), &'static MappingProxyObject)> {
+    let ptr = value.as_object_ptr()?;
+    (unsafe { (*(ptr as *const ObjectHeader)).type_id } == TypeId::MAPPING_PROXY)
+        .then(|| (ptr, unsafe { &*(ptr as *const MappingProxyObject) }))
+}
+
+fn mapping_compare_operand(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<MappingCompareOperand>, RuntimeError> {
+    if let Some((ptr, dict)) = exact_dict_operand(value) {
+        return Ok(Some(MappingCompareOperand::Borrowed {
+            identity: ptr,
+            dict,
+        }));
+    }
+
+    if let Some(ptr) = value.as_object_ptr()
+        && is_dict_subclass_instance(ptr)
+        && let Some(dict) = crate::ops::objects::dict_storage_ref_from_ptr(ptr)
+    {
+        return Ok(Some(MappingCompareOperand::Borrowed {
+            identity: ptr,
+            dict,
+        }));
+    }
+
+    let Some((proxy_ptr, proxy)) = exact_mapping_proxy_operand(value) else {
+        return Ok(None);
+    };
+
+    if let MappingProxySource::Dict(mapping) = proxy.source()
+        && let Some(mapping_ptr) = mapping.as_object_ptr()
+        && let Some(dict) = crate::ops::objects::dict_storage_ref_from_ptr(mapping_ptr)
+    {
+        return Ok(Some(MappingCompareOperand::Borrowed {
+            identity: mapping_ptr,
+            dict,
+        }));
+    }
+
+    let entries = crate::builtins::builtin_mapping_proxy_entries_static(proxy)?;
+    let mut dict = DictObject::with_capacity(entries.len());
+    for (key, value) in entries {
+        crate::ops::dict_access::dict_set_item(vm, &mut dict, key, value)?;
+    }
+
+    Ok(Some(MappingCompareOperand::Owned {
+        identity: proxy_ptr,
+        dict,
+    }))
+}
+
+#[inline]
+fn is_dict_subclass_instance(ptr: *const ()) -> bool {
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && global_class_bitmap(ClassId(type_id.raw()))
+            .is_some_and(|bitmap| bitmap.is_subclass_of(TypeId::DICT))
+}
+
+fn mapping_proxy_eq_result(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<Option<bool>, RuntimeError> {
+    if exact_mapping_proxy_operand(left).is_none() && exact_mapping_proxy_operand(right).is_none() {
+        return Ok(None);
+    }
+
+    let Some(left) = mapping_compare_operand(vm, left)? else {
+        return Ok(None);
+    };
+    let Some(right) = mapping_compare_operand(vm, right)? else {
+        return Ok(None);
+    };
+
+    let pair = ordered_object_pair(left.identity(), right.identity());
+    if !seen_pairs.insert(pair) {
+        return Ok(Some(true));
+    }
+
+    dict_eq_result(vm, left.dict(), right.dict(), seen_pairs).map(Some)
 }
 
 fn native_sequence_eq_result(
