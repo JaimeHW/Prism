@@ -44,6 +44,7 @@ pub use trig::*;
 use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use prism_core::Value;
+use prism_runtime::types::int::value_to_saturated_i64;
 use std::sync::{Arc, LazyLock};
 
 static CEIL_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -86,6 +87,8 @@ static ISNAN_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isnan"), math_isnan_builtin));
 static GCD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.gcd"), math_gcd_builtin));
+static LDEXP_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.ldexp"), math_ldexp_builtin));
 
 /// The math module instance.
 pub struct MathModule;
@@ -137,6 +140,7 @@ impl Module for MathModule {
             "isinf" => Ok(builtin_value(&ISINF_FUNCTION)),
             "isnan" => Ok(builtin_value(&ISNAN_FUNCTION)),
             "gcd" => Ok(builtin_value(&GCD_FUNCTION)),
+            "ldexp" => Ok(builtin_value(&LDEXP_FUNCTION)),
 
             // Functions are returned as None for now
             // Full implementation would return callable objects
@@ -201,6 +205,7 @@ impl Module for MathModule {
             // Power
             Arc::from("pow"),
             Arc::from("sqrt"),
+            Arc::from("ldexp"),
             Arc::from("isqrt"),
             Arc::from("hypot"),
             // Special
@@ -272,6 +277,36 @@ fn extract_float_builtin(value: &Value) -> Result<f64, BuiltinError> {
 #[inline]
 fn extract_int_builtin(value: &Value) -> Result<i64, BuiltinError> {
     extract_int(value).map_err(map_math_error)
+}
+
+#[derive(Clone, Copy)]
+enum LdexpExponent {
+    InRange(i32),
+    Overflow,
+    Underflow,
+}
+
+#[inline]
+fn classify_ldexp_exponent(exponent: i64) -> LdexpExponent {
+    if exponent > i32::MAX as i64 {
+        LdexpExponent::Overflow
+    } else if exponent < i32::MIN as i64 {
+        LdexpExponent::Underflow
+    } else {
+        LdexpExponent::InRange(exponent as i32)
+    }
+}
+
+#[inline]
+fn extract_ldexp_exponent(value: Value) -> Result<LdexpExponent, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(LdexpExponent::InRange(i32::from(boolean)));
+    }
+    value_to_saturated_i64(value)
+        .map(classify_ldexp_exponent)
+        .ok_or_else(|| {
+            BuiltinError::TypeError("Expected an int as second argument to ldexp.".to_string())
+        })
 }
 
 #[inline]
@@ -445,6 +480,31 @@ fn math_gcd_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     Value::int(current)
         .ok_or_else(|| BuiltinError::OverflowError("math result out of range".to_string()))
+}
+
+#[inline]
+fn math_ldexp_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_math_arg_count(args, "ldexp", 2)?;
+    let mantissa = extract_float_builtin(&args[0])?;
+    let exponent = extract_ldexp_exponent(args[1])?;
+
+    if mantissa == 0.0 || !mantissa.is_finite() {
+        return Ok(Value::float(mantissa));
+    }
+
+    let result = match exponent {
+        LdexpExponent::InRange(exponent) => ldexp(mantissa, exponent),
+        LdexpExponent::Overflow => {
+            return Err(BuiltinError::OverflowError("math range error".to_string()));
+        }
+        LdexpExponent::Underflow => 0.0_f64.copysign(mantissa),
+    };
+
+    if result.is_infinite() {
+        return Err(BuiltinError::OverflowError("math range error".to_string()));
+    }
+
+    Ok(Value::float(result))
 }
 
 /// Helper to extract a float from Value.
