@@ -222,6 +222,8 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "test.support"
         | "test.support.import_helper"
         | "test.support.os_helper"
+        | "test.support.threading_helper"
+        | "test.support.warnings_helper"
         | "textwrap"
         | "threading"
         | "traceback" => Some(StdlibResolutionPolicy::PreferNative),

@@ -27,6 +27,10 @@ use std::sync::LazyLock;
 
 const TESTFN: &str = "@prism_test_tmp";
 const C_RECURSION_LIMIT: i64 = 64;
+const BIGMEM_1M: i64 = 1024 * 1024;
+const BIGMEM_1G: i64 = 1024 * BIGMEM_1M;
+const BIGMEM_2G: i64 = 2 * BIGMEM_1G;
+const BIGMEM_4G: i64 = 4 * BIGMEM_1G;
 
 static ALWAYS_EQ_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_sentinel_class("_ALWAYS_EQ", &ALWAYS_EQ_METHODS));
@@ -34,12 +38,22 @@ static NEVER_EQ_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_sentinel_class("_NEVER_EQ", &NEVER_EQ_METHODS));
 static INFINITE_RECURSION_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(build_infinite_recursion_class);
+static WARNINGS_FILTER_CONTEXT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_context_manager_class(
+        "_SaveRestoreWarningsFilters",
+        "test.support.warnings_helper",
+        &WARNINGS_FILTER_CONTEXT_ENTER_FUNCTION,
+        &WARNINGS_FILTER_CONTEXT_EXIT_FUNCTION,
+    )
+});
 static ALWAYS_EQ_VALUE: LazyLock<Value> =
     LazyLock::new(|| sentinel_instance(ALWAYS_EQ_CLASS.as_ref()));
 static NEVER_EQ_VALUE: LazyLock<Value> =
     LazyLock::new(|| sentinel_instance(NEVER_EQ_CLASS.as_ref()));
 static INFINITE_RECURSION_VALUE: LazyLock<Value> =
     LazyLock::new(|| sentinel_instance(INFINITE_RECURSION_CLASS.as_ref()));
+static WARNINGS_FILTER_CONTEXT_VALUE: LazyLock<Value> =
+    LazyLock::new(|| sentinel_instance(WARNINGS_FILTER_CONTEXT_CLASS.as_ref()));
 
 static ALWAYS_EQ_EQ_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support._ALWAYS_EQ.__eq__"), always_eq_eq)
@@ -86,11 +100,29 @@ static REQUIRES_LIMITED_API_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock
 static REFCOUNT_TEST_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("test.support.refcount_test"), refcount_test)
 });
+static BIGMEMTEST_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("test.support.bigmemtest"), bigmemtest)
+});
+static BIGMEM_SKIP_DECORATOR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("test.support._bigmem_skip_decorator"),
+        bigmem_skip_decorator,
+    )
+});
 static REQUIRES_DOCSTRINGS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("test.support.requires_docstrings"),
         identity_decorator,
     )
+});
+static REQUIRES_RESOURCE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.requires_resource"),
+        requires_resource,
+    )
+});
+static NO_TRACING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("test.support.no_tracing"), identity_decorator)
 });
 static GET_ATTRIBUTE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("test.support.get_attribute"), get_attribute)
@@ -140,10 +172,22 @@ static RUN_WITH_LOCALES_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::ne
 static SKIP_ON_S390X_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support.skip_on_s390x"), identity_decorator)
 });
+static SKIP_IF_PGO_TASK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.skip_if_pgo_task"),
+        identity_decorator,
+    )
+});
 static SORTDICT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("test.support.sortdict"), sortdict));
 static UNLINK_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support.os_helper.unlink"), unlink)
+});
+static FORGET_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("test.support.import_helper.forget"),
+        forget_module,
+    )
 });
 static IMPORT_MODULE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
@@ -151,6 +195,45 @@ static IMPORT_MODULE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
         import_module,
     )
 });
+static REAP_THREADS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.threading_helper.reap_threads"),
+        identity_decorator,
+    )
+});
+static REQUIRES_WORKING_THREADING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.threading_helper.requires_working_threading"),
+        requires_working_threading,
+    )
+});
+static THREADING_SKIP_DECORATOR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("test.support.threading_helper._skip_decorator"),
+        threading_skip_decorator,
+    )
+});
+static SAVE_RESTORE_WARNINGS_FILTERS_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("test.support.warnings_helper.save_restore_warnings_filters"),
+            save_restore_warnings_filters,
+        )
+    });
+static WARNINGS_FILTER_CONTEXT_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("test.support.warnings_helper._SaveRestoreWarningsFilters.__enter__"),
+            noop_context_enter,
+        )
+    });
+static WARNINGS_FILTER_CONTEXT_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("test.support.warnings_helper._SaveRestoreWarningsFilters.__exit__"),
+            noop_context_exit,
+        )
+    });
 
 const ALWAYS_EQ_METHODS: [(&str, &LazyLock<BuiltinFunctionObject>); 2] = [
     ("__eq__", &ALWAYS_EQ_EQ_FUNCTION),
@@ -176,6 +259,9 @@ impl SupportModule {
                 Arc::from("ALWAYS_EQ"),
                 Arc::from("BrokenIter"),
                 Arc::from("C_RECURSION_LIMIT"),
+                Arc::from("_2G"),
+                Arc::from("_4G"),
+                Arc::from("bigmemtest"),
                 Arc::from("check_impl_detail"),
                 Arc::from("check_free_after_iterating"),
                 Arc::from("MISSING_C_DOCSTRINGS"),
@@ -193,14 +279,18 @@ impl SupportModule {
                 Arc::from("iter_builtin_types"),
                 Arc::from("iter_slot_wrappers"),
                 Arc::from("load_package_tests"),
+                Arc::from("no_tracing"),
                 Arc::from("refcount_test"),
                 Arc::from("os_helper"),
+                Arc::from("requires_resource"),
                 Arc::from("requires_limited_api"),
                 Arc::from("requires_docstrings"),
                 Arc::from("run_with_locale"),
                 Arc::from("run_with_locales"),
+                Arc::from("skip_if_pgo_task"),
                 Arc::from("skip_on_s390x"),
                 Arc::from("sortdict"),
+                Arc::from("threading_helper"),
                 Arc::from("verbose"),
             ],
         }
@@ -225,6 +315,9 @@ impl Module for SupportModule {
             "C_RECURSION_LIMIT" => {
                 Ok(Value::int(C_RECURSION_LIMIT).expect("recursion test limit fits"))
             }
+            "_2G" => Ok(Value::int(BIGMEM_2G).expect("_2G fits in tagged int")),
+            "_4G" => Ok(Value::int(BIGMEM_4G).expect("_4G fits in tagged int")),
+            "bigmemtest" => Ok(builtin_value(&BIGMEMTEST_FUNCTION)),
             "check_impl_detail" => Ok(builtin_value(&CHECK_IMPL_DETAIL_FUNCTION)),
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
             "MISSING_C_DOCSTRINGS" => Ok(Value::bool(true)),
@@ -247,11 +340,14 @@ impl Module for SupportModule {
             "iter_builtin_types" => Ok(builtin_value(&ITER_BUILTIN_TYPES_FUNCTION)),
             "iter_slot_wrappers" => Ok(builtin_value(&ITER_SLOT_WRAPPERS_FUNCTION)),
             "load_package_tests" => Ok(builtin_value(&LOAD_PACKAGE_TESTS_FUNCTION)),
+            "no_tracing" => Ok(builtin_value(&NO_TRACING_FUNCTION)),
             "refcount_test" => Ok(builtin_value(&REFCOUNT_TEST_FUNCTION)),
+            "requires_resource" => Ok(builtin_value(&REQUIRES_RESOURCE_FUNCTION)),
             "requires_limited_api" => Ok(builtin_value(&REQUIRES_LIMITED_API_FUNCTION)),
             "requires_docstrings" => Ok(builtin_value(&REQUIRES_DOCSTRINGS_FUNCTION)),
             "run_with_locale" => Ok(builtin_value(&RUN_WITH_LOCALE_FUNCTION)),
             "run_with_locales" => Ok(builtin_value(&RUN_WITH_LOCALES_FUNCTION)),
+            "skip_if_pgo_task" => Ok(builtin_value(&SKIP_IF_PGO_TASK_FUNCTION)),
             "skip_on_s390x" => Ok(builtin_value(&SKIP_ON_S390X_FUNCTION)),
             "sortdict" => Ok(builtin_value(&SORTDICT_FUNCTION)),
             "verbose" => Ok(Value::int(1).expect("support.verbose fits in tagged int")),
@@ -306,6 +402,26 @@ fn build_infinite_recursion_class() -> Arc<PyClassObject> {
         intern("__exit__"),
         builtin_value(&INFINITE_RECURSION_EXIT_FUNCTION),
     );
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
+
+    let class = Arc::new(class);
+    let mut bitmap = SubclassBitmap::for_type(class.class_type_id());
+    bitmap.set_bit(TypeId::OBJECT);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
+}
+
+fn build_context_manager_class(
+    name: &'static str,
+    module: &'static str,
+    enter: &'static LazyLock<BuiltinFunctionObject>,
+    exit: &'static LazyLock<BuiltinFunctionObject>,
+) -> Arc<PyClassObject> {
+    let mut class = PyClassObject::new_simple(intern(name));
+    class.set_attr(intern("__module__"), Value::string(intern(module)));
+    class.set_attr(intern("__qualname__"), Value::string(intern(name)));
+    class.set_attr(intern("__enter__"), builtin_value(&**enter));
+    class.set_attr(intern("__exit__"), builtin_value(&**exit));
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
 
     let class = Arc::new(class);
@@ -450,6 +566,59 @@ fn refcount_test(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
     mark_unittest_skip(vm, args[0], "CPython reference counting detail")
 }
 
+fn bigmemtest(args: &[Value], keywords: &[(&str, Value)]) -> Result<Value, BuiltinError> {
+    if args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "bigmemtest() takes at most 3 positional arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut seen_size = !args.is_empty();
+    let mut seen_memuse = args.len() >= 2;
+    let mut seen_dry_run = args.len() >= 3;
+
+    for (name, _) in keywords {
+        match *name {
+            "size" if !seen_size => seen_size = true,
+            "memuse" if !seen_memuse => seen_memuse = true,
+            "dry_run" if !seen_dry_run => seen_dry_run = true,
+            "size" | "memuse" | "dry_run" => {
+                return Err(BuiltinError::TypeError(format!(
+                    "bigmemtest() got multiple values for argument '{name}'"
+                )));
+            }
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "bigmemtest() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+
+    if !seen_size || !seen_memuse {
+        return Err(BuiltinError::TypeError(
+            "bigmemtest() missing required arguments: 'size' and 'memuse'".to_string(),
+        ));
+    }
+
+    Ok(builtin_value(&BIGMEM_SKIP_DECORATOR_FUNCTION))
+}
+
+fn bigmem_skip_decorator(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "bigmemtest decorator takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    mark_unittest_skip(
+        vm,
+        args[0],
+        "big memory tests require an explicit memory limit",
+    )
+}
+
 fn get_attribute(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
@@ -548,6 +717,16 @@ fn run_with_locale(args: &[Value]) -> Result<Value, BuiltinError> {
         return Err(BuiltinError::TypeError(
             "run_with_locale() missing locale category".to_string(),
         ));
+    }
+    Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
+}
+
+fn requires_resource(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "requires_resource() takes exactly one argument ({} given)",
+            args.len()
+        )));
     }
     Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
 }
@@ -666,7 +845,7 @@ impl ImportHelperModule {
     /// Create a new `test.support.import_helper` module descriptor.
     pub fn new() -> Self {
         Self {
-            attrs: vec![Arc::from("import_module")],
+            attrs: vec![Arc::from("forget"), Arc::from("import_module")],
         }
     }
 }
@@ -684,6 +863,7 @@ impl Module for ImportHelperModule {
 
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
+            "forget" => Ok(builtin_value(&FORGET_FUNCTION)),
             "import_module" => Ok(builtin_value(&IMPORT_MODULE_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support.import_helper' has no attribute '{}'",
@@ -695,6 +875,20 @@ impl Module for ImportHelperModule {
     fn dir(&self) -> Vec<Arc<str>> {
         self.attrs.clone()
     }
+}
+
+fn forget_module(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "forget() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let name = value_as_string_ref(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("forget() module name must be str".to_string()))?;
+    vm.import_resolver.remove_module(name.as_str());
+    Ok(Value::none())
 }
 
 fn import_module(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -735,4 +929,145 @@ fn unlink(args: &[Value]) -> Result<Value, BuiltinError> {
         }
         Err(err) => Err(BuiltinError::OSError(err.to_string())),
     }
+}
+
+/// Native `test.support.threading_helper` module descriptor.
+#[derive(Debug, Clone)]
+pub struct ThreadingHelperModule {
+    attrs: Vec<Arc<str>>,
+}
+
+impl ThreadingHelperModule {
+    /// Create a new `test.support.threading_helper` module descriptor.
+    pub fn new() -> Self {
+        Self {
+            attrs: vec![
+                Arc::from("reap_threads"),
+                Arc::from("requires_working_threading"),
+            ],
+        }
+    }
+}
+
+impl Default for ThreadingHelperModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Module for ThreadingHelperModule {
+    fn name(&self) -> &str {
+        "test.support.threading_helper"
+    }
+
+    fn get_attr(&self, name: &str) -> ModuleResult {
+        match name {
+            "reap_threads" => Ok(builtin_value(&REAP_THREADS_FUNCTION)),
+            "requires_working_threading" => Ok(builtin_value(&REQUIRES_WORKING_THREADING_FUNCTION)),
+            _ => Err(ModuleError::AttributeError(format!(
+                "module 'test.support.threading_helper' has no attribute '{}'",
+                name
+            ))),
+        }
+    }
+
+    fn dir(&self) -> Vec<Arc<str>> {
+        self.attrs.clone()
+    }
+}
+
+fn requires_working_threading(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "requires_working_threading() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(builtin_value(&THREADING_SKIP_DECORATOR_FUNCTION))
+}
+
+fn threading_skip_decorator(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "threading skip decorator takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    mark_unittest_skip(vm, args[0], "high-level threading runtime is not available")
+}
+
+/// Native `test.support.warnings_helper` module descriptor.
+#[derive(Debug, Clone)]
+pub struct WarningsHelperModule {
+    attrs: Vec<Arc<str>>,
+}
+
+impl WarningsHelperModule {
+    /// Create a new `test.support.warnings_helper` module descriptor.
+    pub fn new() -> Self {
+        Self {
+            attrs: vec![Arc::from("save_restore_warnings_filters")],
+        }
+    }
+}
+
+impl Default for WarningsHelperModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Module for WarningsHelperModule {
+    fn name(&self) -> &str {
+        "test.support.warnings_helper"
+    }
+
+    fn get_attr(&self, name: &str) -> ModuleResult {
+        match name {
+            "save_restore_warnings_filters" => {
+                Ok(builtin_value(&SAVE_RESTORE_WARNINGS_FILTERS_FUNCTION))
+            }
+            _ => Err(ModuleError::AttributeError(format!(
+                "module 'test.support.warnings_helper' has no attribute '{}'",
+                name
+            ))),
+        }
+    }
+
+    fn dir(&self) -> Vec<Arc<str>> {
+        self.attrs.clone()
+    }
+}
+
+fn save_restore_warnings_filters(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "save_restore_warnings_filters() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(*WARNINGS_FILTER_CONTEXT_VALUE)
+}
+
+fn noop_context_enter(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "__enter__() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(args[0])
+}
+
+fn noop_context_exit(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "__exit__() takes exactly 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(Value::bool(false))
 }

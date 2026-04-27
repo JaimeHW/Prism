@@ -554,6 +554,16 @@ impl StdlibRegistry {
         );
         Self::insert_module(
             &mut modules,
+            "test.support.threading_helper",
+            Box::new(test_support::ThreadingHelperModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
+            "test.support.warnings_helper",
+            Box::new(test_support::WarningsHelperModule::new()),
+        );
+        Self::insert_module(
+            &mut modules,
             "string",
             Box::new(string::StringPublicModule::new()),
         );
