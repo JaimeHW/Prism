@@ -83,6 +83,18 @@ static TUPLE_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
         crate::builtins::builtin_tuple_new,
     )
 });
+static LIST_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("list.__new__"),
+        crate::builtins::builtin_list_new,
+    )
+});
+static LIST_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("list.__init__"),
+        crate::builtins::builtin_list_init_vm,
+    )
+});
 static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(
         Arc::from("int.__new__"),
@@ -503,6 +515,8 @@ fn builtin_instantiation_slot_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::TYPE, "__new__") => Some(builtin_slot_value(&TYPE_NEW_SLOT_FUNCTION)),
         (TypeId::TYPE, "__init__") => Some(builtin_slot_value(&TYPE_INIT_SLOT_FUNCTION)),
         (TypeId::TUPLE, "__new__") => Some(builtin_slot_value(&TUPLE_NEW_SLOT_FUNCTION)),
+        (TypeId::LIST, "__new__") => Some(builtin_slot_value(&LIST_NEW_SLOT_FUNCTION)),
+        (TypeId::LIST, "__init__") => Some(builtin_slot_value(&LIST_INIT_SLOT_FUNCTION)),
         (TypeId::INT, "__new__") => Some(builtin_slot_value(&INT_NEW_SLOT_FUNCTION)),
         (TypeId::FLOAT, "__new__") => Some(builtin_slot_value(&FLOAT_NEW_SLOT_FUNCTION)),
         (TypeId::STR, "__new__") => Some(builtin_slot_value(&STR_NEW_SLOT_FUNCTION)),
@@ -2190,6 +2204,7 @@ fn invoke_builtin_with_keywords(
         "collections.namedtuple" => {
             invoke_namedtuple_builtin_with_keywords(vm, builtin, args, keywords)
         }
+        "list.__new__" => invoke_builtin(vm, builtin, args),
         "type.__init__" => invoke_type_init_builtin_with_keywords(builtin, args, keywords),
         "type.__new__" => invoke_type_new_builtin_with_keywords(vm, builtin, args, keywords),
         _ if builtin.accepts_keywords() => builtin

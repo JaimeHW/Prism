@@ -3079,7 +3079,65 @@ fn builtin_byte_sequence_new(
 }
 
 pub(crate) fn builtin_list_new(args: &[Value]) -> Result<Value, BuiltinError> {
-    builtin_constructor_new(args, TypeId::LIST, "list", builtin_list)
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "list.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+
+    let class_type = class_value_to_type_id(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("list.__new__(X): X must be a type".to_string()))?;
+
+    if class_type == TypeId::LIST {
+        return Ok(to_object_value(ListObject::new()));
+    }
+
+    if !class_value_is_subtype(args[0], TypeId::LIST) {
+        return Err(BuiltinError::TypeError(
+            "list.__new__(X): X is not a subtype of list".to_string(),
+        ));
+    }
+
+    let class_ptr = args[0]
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("list.__new__(X): X must be a type".to_string()))?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "list.__new__() for builtin list subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    Ok(to_object_value(ShapedObject::new_list_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+    )))
+}
+
+pub(crate) fn builtin_list_init_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "list.__init__() takes 1 or 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a list object".to_string())
+    })?;
+    let list = crate::ops::objects::list_storage_mut_from_ptr(self_ptr).ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a list object".to_string())
+    })?;
+
+    list.clear();
+    if let Some(iterable) = args.get(1).copied() {
+        let values = iter_values_with_vm(vm, iterable)?;
+        list.extend(values);
+    }
+
+    Ok(Value::none())
 }
 
 pub(crate) fn builtin_dict_new(args: &[Value]) -> Result<Value, BuiltinError> {
