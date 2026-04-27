@@ -159,12 +159,8 @@ fn write_print_to_python_file(
     rendered: &str,
 ) -> Result<(), BuiltinError> {
     let write = get_attribute_value(vm, file, &intern("write")).map_err(BuiltinError::Raised)?;
-    let rendered_value = vm
-        .allocator()
-        .alloc_value(StringObject::from_string(rendered.to_string()))
-        .ok_or_else(|| {
-            BuiltinError::TypeError("out of memory allocating print output".to_string())
-        })?;
+    let rendered_value =
+        crate::alloc_managed_value(StringObject::from_string(rendered.to_string()));
     invoke_callable_value(vm, write, &[rendered_value]).map_err(BuiltinError::Raised)?;
     Ok(())
 }
