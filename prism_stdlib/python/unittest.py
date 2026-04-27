@@ -212,6 +212,14 @@ class TestCase:
         if first is second:
             self.fail(msg or (repr(first) + " is " + repr(second)))
 
+    def assertIsNone(self, obj, msg=None):
+        if obj is not None:
+            self.fail(msg or (repr(obj) + " is not None"))
+
+    def assertIsNotNone(self, obj, msg=None):
+        if obj is None:
+            self.fail(msg or "unexpectedly None")
+
     def assertIsInstance(self, obj, cls, msg=None):
         if not isinstance(obj, cls):
             self.fail(msg or "object is not an instance")
@@ -227,6 +235,14 @@ class TestCase:
     def assertGreater(self, first, second, msg=None):
         if not first > second:
             self.fail(msg or (repr(first) + " is not greater than " + repr(second)))
+
+    def assertLess(self, first, second, msg=None):
+        if not first < second:
+            self.fail(msg or (repr(first) + " is not less than " + repr(second)))
+
+    def assertLessEqual(self, first, second, msg=None):
+        if not first <= second:
+            self.fail(msg or (repr(first) + " is greater than " + repr(second)))
 
     def assertIn(self, member, container, msg=None):
         if member not in container:
