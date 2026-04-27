@@ -249,6 +249,10 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
         return Ok(IteratorObject::from_values(tuple.as_slice().to_vec()));
     }
 
+    if let Some(dict) = value_as_dict(value) {
+        return Ok(dict_key_iterator(*value, dict));
+    }
+
     // Fast path: Check if already an iterator
     if let Some(type_id) = exact_type_id {
         if is_native_iterator_type_id(type_id) {
@@ -286,13 +290,7 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
         TypeId::DICT => {
             // dict iteration yields keys by default
             let dict = value_as_dict(value).ok_or(IterError::InvalidObject)?;
-            let keys: Vec<Value> = dict.keys().collect();
-            Ok(IteratorObject::guarded_values(
-                *value,
-                keys,
-                dict_len_guard,
-                DICT_MUTATED,
-            ))
+            Ok(dict_key_iterator(*value, dict))
         }
 
         TypeId::MAPPING_PROXY => {
@@ -403,6 +401,12 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
             Err(IterError::NotIterable(type_id.name().into()))
         }
     }
+}
+
+#[inline]
+fn dict_key_iterator(value: Value, dict: &DictObject) -> IteratorObject {
+    let keys: Vec<Value> = dict.keys().collect();
+    IteratorObject::guarded_values(value, keys, dict_len_guard, DICT_MUTATED)
 }
 
 /// Get a human-readable type name for error messages.
