@@ -5,8 +5,11 @@
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::hashable::HashableValue;
+use crate::types::int::value_to_bigint;
+use crate::types::string::value_as_string_ref;
+use crate::types::tuple::TupleObject;
 use prism_core::Value;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 const HASH_CACHE_EMPTY: i64 = i64::MIN;
@@ -33,6 +36,11 @@ pub struct SetObject {
     pub header: ObjectHeader,
     /// Set items.
     items: FxHashSet<HashableValue>,
+    /// Python hash values computed by the VM for keys that entered through a
+    /// protocol-aware path.
+    hashes: FxHashMap<HashableValue, i64>,
+    /// Keys whose equality may execute Python code during collision checks.
+    protocol_keys: Option<FxHashSet<HashableValue>>,
     /// Cached hash for immutable frozenset views of this storage.
     hash_cache: AtomicI64,
 }
@@ -44,6 +52,8 @@ impl SetObject {
         Self {
             header: ObjectHeader::new(TypeId::SET),
             items: FxHashSet::default(),
+            hashes: FxHashMap::default(),
+            protocol_keys: None,
             hash_cache: AtomicI64::new(HASH_CACHE_EMPTY),
         }
     }
@@ -54,6 +64,8 @@ impl SetObject {
         Self {
             header: ObjectHeader::new(TypeId::SET),
             items: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
+            hashes: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            protocol_keys: None,
             hash_cache: AtomicI64::new(HASH_CACHE_EMPTY),
         }
     }
@@ -90,14 +102,55 @@ impl SetObject {
         self.items.is_empty()
     }
 
+    /// Return true when at least one key can require Python-level equality for
+    /// collision resolution.
+    #[inline]
+    pub fn has_protocol_keys(&self) -> bool {
+        self.protocol_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.is_empty())
+    }
+
     /// Add an element to the set.
     ///
     /// Returns true if the element was not already present.
     #[inline]
     pub fn add(&mut self, value: Value) -> bool {
-        let inserted = self.items.insert(HashableValue(value));
+        self.insert(value, None, requires_protocol_lookup(value))
+    }
+
+    /// Add an element after the VM has computed the Python hash.
+    #[inline]
+    pub fn add_with_hash(&mut self, value: Value, hash: i64) -> bool {
+        self.insert(value, Some(hash), requires_protocol_lookup(value))
+    }
+
+    /// Add an element when the caller already classified whether lookup may
+    /// need Python-level equality.
+    #[inline]
+    pub fn add_with_hash_and_protocol_lookup(
+        &mut self,
+        value: Value,
+        hash: i64,
+        requires_protocol_lookup: bool,
+    ) -> bool {
+        self.insert(value, Some(hash), requires_protocol_lookup)
+    }
+
+    #[inline]
+    fn insert(&mut self, value: Value, hash: Option<i64>, requires_protocol_lookup: bool) -> bool {
+        let key = HashableValue(value);
+        let inserted = self.items.insert(key);
         if inserted {
+            if requires_protocol_lookup {
+                self.mark_protocol_key(key);
+            }
+            if let Some(hash) = hash {
+                self.hashes.insert(key, hash);
+            }
             self.clear_hash_cache();
+        } else if let Some(hash) = hash {
+            self.hashes.entry(key).or_insert(hash);
         }
         inserted
     }
@@ -107,19 +160,21 @@ impl SetObject {
     /// Returns true if the element was present.
     #[inline]
     pub fn remove(&mut self, value: Value) -> bool {
-        let removed = self.items.remove(&HashableValue(value));
-        if removed {
+        let key = HashableValue(value);
+        if let Some(stored_key) = self.items.take(&key) {
+            self.hashes.remove(&stored_key);
+            self.unmark_protocol_key(stored_key);
             self.clear_hash_cache();
+            true
+        } else {
+            false
         }
-        removed
     }
 
     /// Discard an element (same as remove, but doesn't error if missing).
     #[inline]
     pub fn discard(&mut self, value: Value) {
-        if self.items.remove(&HashableValue(value)) {
-            self.clear_hash_cache();
-        }
+        self.remove(value);
     }
 
     /// Check if the set contains an element.
@@ -128,12 +183,20 @@ impl SetObject {
         self.items.contains(&HashableValue(value))
     }
 
+    /// Return the cached Python hash for a stored key, when available.
+    #[inline]
+    pub fn stored_hash(&self, key: Value) -> Option<i64> {
+        self.hashes.get(&HashableValue(key)).copied()
+    }
+
     /// Remove and return an arbitrary element.
     ///
     /// Returns None if the set is empty.
     pub fn pop(&mut self) -> Option<Value> {
         if let Some(hv) = self.items.iter().next().copied() {
             self.items.remove(&hv);
+            self.hashes.remove(&hv);
+            self.unmark_protocol_key(hv);
             self.clear_hash_cache();
             Some(hv.0)
         } else {
@@ -146,6 +209,8 @@ impl SetObject {
     pub fn clear(&mut self) {
         if !self.items.is_empty() {
             self.items.clear();
+            self.hashes.clear();
+            self.protocol_keys = None;
             self.clear_hash_cache();
         }
     }
@@ -160,7 +225,7 @@ impl SetObject {
         let mut result = self.clone_set();
         let mut changed = false;
         for hv in other.items.iter() {
-            changed |= result.items.insert(*hv);
+            changed |= result.insert_from(*hv, other);
         }
         if changed {
             result.clear_hash_cache();
@@ -173,7 +238,7 @@ impl SetObject {
         let mut result = SetObject::new();
         for hv in self.items.iter() {
             if other.items.contains(hv) {
-                result.items.insert(*hv);
+                result.insert_from(*hv, self);
             }
         }
         result
@@ -184,7 +249,7 @@ impl SetObject {
         let mut result = SetObject::new();
         for hv in self.items.iter() {
             if !other.items.contains(hv) {
-                result.items.insert(*hv);
+                result.insert_from(*hv, self);
             }
         }
         result
@@ -196,13 +261,13 @@ impl SetObject {
         // Elements in self but not other
         for hv in self.items.iter() {
             if !other.items.contains(hv) {
-                result.items.insert(*hv);
+                result.insert_from(*hv, self);
             }
         }
         // Elements in other but not self
         for hv in other.items.iter() {
             if !self.items.contains(hv) {
-                result.items.insert(*hv);
+                result.insert_from(*hv, other);
             }
         }
         result
@@ -236,7 +301,7 @@ impl SetObject {
     pub fn update(&mut self, other: &SetObject) {
         let mut changed = false;
         for hv in other.items.iter() {
-            changed |= self.items.insert(*hv);
+            changed |= self.insert_from(*hv, other);
         }
         if changed {
             self.clear_hash_cache();
@@ -248,6 +313,7 @@ impl SetObject {
         let old_len = self.items.len();
         self.items.retain(|hv| other.items.contains(hv));
         if self.items.len() != old_len {
+            self.retain_metadata_for_items();
             self.clear_hash_cache();
         }
     }
@@ -256,7 +322,10 @@ impl SetObject {
     pub fn difference_update(&mut self, other: &SetObject) {
         let old_len = self.items.len();
         for hv in other.items.iter() {
-            self.items.remove(hv);
+            if let Some(stored_key) = self.items.take(hv) {
+                self.hashes.remove(&stored_key);
+                self.unmark_protocol_key(stored_key);
+            }
         }
         if self.items.len() != old_len {
             self.clear_hash_cache();
@@ -267,10 +336,11 @@ impl SetObject {
     pub fn symmetric_difference_update(&mut self, other: &SetObject) {
         let old_len = self.items.len();
         for hv in other.items.iter() {
-            if self.items.contains(hv) {
-                self.items.remove(hv);
+            if let Some(stored_key) = self.items.take(hv) {
+                self.hashes.remove(&stored_key);
+                self.unmark_protocol_key(stored_key);
             } else {
-                self.items.insert(*hv);
+                self.insert_from(*hv, other);
             }
         }
         if self.items.len() != old_len || !other.items.is_empty() {
@@ -298,13 +368,89 @@ impl SetObject {
         self.hash_cache.store(HASH_CACHE_EMPTY, Ordering::Relaxed);
     }
 
+    #[inline]
+    fn insert_from(&mut self, key: HashableValue, source: &SetObject) -> bool {
+        let inserted = self.items.insert(key);
+        if inserted {
+            if let Some(hash) = source.hashes.get(&key).copied() {
+                self.hashes.insert(key, hash);
+            }
+            if source
+                .protocol_keys
+                .as_ref()
+                .is_some_and(|keys| keys.contains(&key))
+            {
+                self.mark_protocol_key(key);
+            }
+        }
+        inserted
+    }
+
+    #[inline]
+    fn mark_protocol_key(&mut self, key: HashableValue) {
+        self.protocol_keys
+            .get_or_insert_with(FxHashSet::default)
+            .insert(key);
+    }
+
+    #[inline]
+    fn unmark_protocol_key(&mut self, key: HashableValue) {
+        let Some(keys) = self.protocol_keys.as_mut() else {
+            return;
+        };
+        keys.remove(&key);
+        if keys.is_empty() {
+            self.protocol_keys = None;
+        }
+    }
+
+    fn retain_metadata_for_items(&mut self) {
+        self.hashes.retain(|key, _| self.items.contains(key));
+        if let Some(keys) = self.protocol_keys.as_mut() {
+            keys.retain(|key| self.items.contains(key));
+            if keys.is_empty() {
+                self.protocol_keys = None;
+            }
+        }
+    }
+
     /// Clone the set.
     fn clone_set(&self) -> SetObject {
         SetObject {
             header: ObjectHeader::new(TypeId::SET),
             items: self.items.clone(),
+            hashes: self.hashes.clone(),
+            protocol_keys: self.protocol_keys.clone(),
             hash_cache: AtomicI64::new(self.hash_cache.load(Ordering::Relaxed)),
         }
+    }
+}
+
+#[inline]
+fn requires_protocol_lookup(value: Value) -> bool {
+    !is_fast_lookup_key(value)
+}
+
+fn is_fast_lookup_key(value: Value) -> bool {
+    if value.as_bool().is_some()
+        || value.as_int().is_some()
+        || value.as_float().is_some()
+        || value_to_bigint(value).is_some()
+        || value.is_none()
+        || value_as_string_ref(value).is_some()
+    {
+        return true;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            tuple.iter().copied().all(is_fast_lookup_key)
+        }
+        _ => false,
     }
 }
 

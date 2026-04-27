@@ -6,7 +6,6 @@
 
 use crate::object::ObjectHeader;
 use crate::object::descriptor::BoundMethod;
-use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
 use crate::types::int::value_to_bigint;
 use crate::types::set::SetObject;
@@ -193,9 +192,6 @@ fn set_value(value: Value) -> Option<&'static SetObject> {
     let ptr = value.as_object_ptr()?;
     match type_id_of(ptr) {
         TypeId::SET | TypeId::FROZENSET => Some(unsafe { &*(ptr as *const SetObject) }),
-        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
-            unsafe { &*(ptr as *const ShapedObject) }.set_backing()
-        }
         _ => None,
     }
 }
