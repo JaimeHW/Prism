@@ -213,6 +213,9 @@ class TestCase:
             msg = "test failed"
         raise self.failureException(msg)
 
+    def skipTest(self, reason):
+        raise SkipTest(reason)
+
     def assertTrue(self, expr, msg=None):
         if not expr:
             self.fail(msg or "expression is not true")
