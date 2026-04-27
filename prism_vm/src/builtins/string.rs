@@ -141,7 +141,9 @@ pub(crate) fn decode_bytes_to_value(
     encoding: Option<&str>,
     errors: Option<&str>,
 ) -> Result<Value, BuiltinError> {
-    Ok(text_value(decode_bytes_to_text(input, encoding, errors)?))
+    Ok(decoded_text_value(decode_bytes_to_text(
+        input, encoding, errors,
+    )?))
 }
 
 // =============================================================================
@@ -1115,11 +1117,7 @@ fn surrogateescape_byte(code_point: u32) -> Option<u8> {
 }
 
 #[inline]
-fn text_value(text: String) -> Value {
-    if text.is_ascii() {
-        return Value::string(intern(&text));
-    }
-
+fn decoded_text_value(text: String) -> Value {
     let ptr =
         Box::leak(Box::new(StringObject::from_string(text))) as *mut StringObject as *const ();
     Value::object_ptr(ptr)
