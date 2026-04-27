@@ -2101,10 +2101,7 @@ impl<'vm> ReprState<'vm> {
             return Ok(int_repr);
         }
         if let Some(f) = value.as_float() {
-            if f.fract() == 0.0 && f.is_finite() {
-                return Ok(format!("{:.1}", f));
-            }
-            return Ok(f.to_string());
+            return Ok(float_repr_string(f));
         }
         if let Some(string) = value_as_string_ref(value) {
             return Ok(quote_python_string(string.as_str()));
@@ -2622,7 +2619,25 @@ fn render_type_repr(module: &str, qualname: &str) -> String {
     }
 }
 
-fn quote_python_string(input: &str) -> String {
+#[inline]
+fn float_repr_string(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    if value.fract() == 0.0 {
+        return format!("{value:.1}");
+    }
+    value.to_string()
+}
+
+pub(crate) fn quote_python_string(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 2);
     out.push('\'');
     for ch in input.chars() {
@@ -2642,7 +2657,7 @@ fn quote_python_string(input: &str) -> String {
     out
 }
 
-fn quote_python_bytes(input: &[u8]) -> String {
+pub(crate) fn quote_python_bytes(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len() + 3);
     out.push('b');
     out.push('\'');

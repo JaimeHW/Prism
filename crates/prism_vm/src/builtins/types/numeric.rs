@@ -828,13 +828,14 @@ impl FloatTextArgument {
 
     fn invalid_literal(&self) -> BuiltinError {
         match self {
-            Self::Str(text) => {
-                BuiltinError::ValueError(format!("could not convert string to float: {:?}", text))
-            }
-            Self::Bytes(bytes) => {
-                let text = String::from_utf8_lossy(bytes);
-                BuiltinError::ValueError(format!("could not convert string to float: b{:?}", text))
-            }
+            Self::Str(text) => BuiltinError::ValueError(format!(
+                "could not convert string to float: {}",
+                crate::builtins::quote_python_string(text)
+            )),
+            Self::Bytes(bytes) => BuiltinError::ValueError(format!(
+                "could not convert string to float: {}",
+                crate::builtins::quote_python_bytes(bytes)
+            )),
         }
     }
 }
@@ -872,7 +873,11 @@ fn normalize_float_special_value(bytes: &[u8]) -> Option<f64> {
     }
 
     if rest.eq_ignore_ascii_case(b"nan") {
-        return Some(if negative { -f64::NAN } else { f64::NAN });
+        return Some(f64::from_bits(if negative {
+            0xfff8_0000_0000_0000
+        } else {
+            0x7ff8_0000_0000_0000
+        }));
     }
 
     None

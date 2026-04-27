@@ -156,10 +156,11 @@ impl Value {
         // Check if it's a NaN that would collide with our tagged values
         // Any NaN where (bits & QNAN) == QNAN would be misidentified as tagged
         if bits & QNAN == QNAN {
-            // Use a safe NaN representation: quiet NaN with payload=1, tag bits clear
-            // 0x7FF0_0000_0000_0001 = exponent all 1s, mantissa = 1 (valid NaN, but doesn't collide)
+            // Use a safe NaN representation with payload=1 and tag bits clear.
+            // 0x7FF0_0000_0000_0001 has exponent all 1s and a non-zero mantissa,
+            // but it leaves Prism's QNaN tag pattern free and preserves the sign bit.
             Self {
-                bits: 0x7FF0_0000_0000_0001,
+                bits: (bits & SIGN_BIT) | 0x7FF0_0000_0000_0001,
             }
         } else {
             Self { bits }
