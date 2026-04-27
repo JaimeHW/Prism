@@ -117,9 +117,9 @@ static FROZENSET_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::
     )
 });
 static FROZENSET_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_kw(
         Arc::from("frozenset.__init__"),
-        crate::builtins::builtin_frozenset_init,
+        crate::builtins::builtin_frozenset_init_kw,
     )
 });
 static INT_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -929,13 +929,37 @@ fn should_route_keywords_to_init_only(
     new_callable: Value,
     has_keywords: bool,
 ) -> bool {
-    has_keywords
-        && (slot_callable_matches_builtin_name(new_callable, "tuple.__new__")
+    if !has_keywords {
+        return false;
+    }
+
+    let builtin_new_accepts_no_keywords =
+        slot_callable_matches_builtin_name(new_callable, "tuple.__new__")
             || slot_callable_matches_builtin_name(new_callable, "dict.__new__")
             || slot_callable_matches_builtin_name(new_callable, "set.__new__")
-            || slot_callable_matches_builtin_name(new_callable, "frozenset.__new__"))
-        && resolve_instantiation_slot(class, "__init__")
-            .is_some_and(|init| !slot_callable_matches_builtin_name(init, "object.__init__"))
+            || slot_callable_matches_builtin_name(new_callable, "frozenset.__new__");
+    if !builtin_new_accepts_no_keywords {
+        return false;
+    }
+
+    let Some(init) = resolve_instantiation_slot(class, "__init__") else {
+        return false;
+    };
+    if slot_callable_matches_builtin_name(init, "object.__init__") {
+        return false;
+    }
+    if slot_callable_matches_builtin_name(new_callable, "set.__new__")
+        && slot_callable_matches_builtin_name(init, "set.__init__")
+    {
+        return false;
+    }
+    if slot_callable_matches_builtin_name(new_callable, "frozenset.__new__")
+        && slot_callable_matches_builtin_name(init, "frozenset.__init__")
+    {
+        return false;
+    }
+
+    true
 }
 
 #[inline]

@@ -3422,26 +3422,20 @@ pub(crate) fn builtin_set_init_vm(
 }
 
 pub(crate) fn builtin_frozenset_init(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.is_empty() || args.len() > 2 {
-        let given = args.len().saturating_sub(1);
-        return Err(BuiltinError::TypeError(format!(
-            "frozenset.__init__() takes at most 1 argument ({given} given)"
-        )));
-    }
-
-    let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
-        BuiltinError::TypeError("descriptor '__init__' requires a frozenset object".to_string())
-    })?;
-    let set = crate::ops::objects::set_storage_ref_from_ptr(self_ptr).ok_or_else(|| {
-        BuiltinError::TypeError("descriptor '__init__' requires a frozenset object".to_string())
-    })?;
-    if set.header.type_id != TypeId::FROZENSET {
+    if args.is_empty() {
         return Err(BuiltinError::TypeError(
-            "descriptor '__init__' requires a frozenset object".to_string(),
+            "descriptor '__init__' of 'object' object needs an argument".to_string(),
         ));
     }
 
     Ok(Value::none())
+}
+
+pub(crate) fn builtin_frozenset_init_kw(
+    args: &[Value],
+    _keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    builtin_frozenset_init(args)
 }
 
 pub(crate) fn builtin_module_new(args: &[Value]) -> Result<Value, BuiltinError> {

@@ -70,9 +70,9 @@ static FROZENSET_CONTAINS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::ne
     BuiltinFunctionObject::new(Arc::from("frozenset.__contains__"), frozenset_contains)
 });
 static FROZENSET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_kw(
         Arc::from("frozenset.__init__"),
-        crate::builtins::builtin_frozenset_init,
+        crate::builtins::builtin_frozenset_init_kw,
     )
 });
 static FROZENSET_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
