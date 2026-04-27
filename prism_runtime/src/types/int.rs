@@ -72,9 +72,10 @@ pub fn object_ptr_as_int_ref(ptr: *const ()) -> Option<&'static BigInt> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     match header.type_id {
         TypeId::INT => Some(unsafe { &*(ptr as *const IntObject) }.value()),
-        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
-            (&*(ptr as *const ShapedObject)).int_backing()
-        },
+        type_id
+            if type_id.raw() >= TypeId::FIRST_USER_TYPE
+                && !crate::types::iter::is_native_iterator_type_id(type_id) =>
+        unsafe { (&*(ptr as *const ShapedObject)).int_backing() },
         _ => None,
     }
 }

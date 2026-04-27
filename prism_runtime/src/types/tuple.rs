@@ -184,6 +184,12 @@ pub fn value_as_tuple_ref(value: Value) -> Option<&'static TupleObject> {
     object_ptr_as_tuple_ref(ptr)
 }
 
+#[inline(always)]
+fn is_shaped_heap_type(type_id: TypeId) -> bool {
+    type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && !crate::types::iter::is_native_iterator_type_id(type_id)
+}
+
 /// Borrow native tuple storage from an object pointer.
 #[inline(always)]
 pub fn object_ptr_as_tuple_ref(ptr: *const ()) -> Option<&'static TupleObject> {
@@ -191,7 +197,7 @@ pub fn object_ptr_as_tuple_ref(ptr: *const ()) -> Option<&'static TupleObject> {
     match header.type_id {
         TypeId::TUPLE => Some(unsafe { &*(ptr as *const TupleObject) }),
         TypeId::OBJECT => unsafe { (&*(ptr as *const ShapedObject)).tuple_backing() },
-        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+        type_id if is_shaped_heap_type(type_id) => unsafe {
             (&*(ptr as *const ShapedObject)).tuple_backing()
         },
         _ => None,

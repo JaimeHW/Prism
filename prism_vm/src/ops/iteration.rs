@@ -14,7 +14,9 @@ use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::iter::{IteratorAdvanceError, IteratorObject};
+use prism_runtime::types::iter::{
+    IteratorAdvanceError, IteratorObject, is_native_iterator_type_id,
+};
 use std::cell::RefCell;
 
 const MAX_ADVISORY_LENGTH_HINT_RESERVE: usize = 1 << 20;
@@ -42,7 +44,7 @@ pub(crate) fn ensure_iterator_value(
 ) -> Result<Value, RuntimeError> {
     if let Some(ptr) = value.as_object_ptr() {
         let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-        if matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR) {
+        if type_id == TypeId::GENERATOR || is_native_iterator_type_id(type_id) {
             return Ok(value);
         }
     }
@@ -105,7 +107,7 @@ pub(crate) fn next_step(
 
     let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
     match type_id {
-        TypeId::ITERATOR => {
+        _ if is_native_iterator_type_id(type_id) => {
             let iter = unsafe { &mut *(ptr as *mut IteratorObject) };
             let vm_cell = RefCell::new(vm);
             Ok(
@@ -301,7 +303,8 @@ fn supports_next_protocol(value: Value) -> bool {
     };
 
     let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
-    matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR)
+    type_id == TypeId::GENERATOR
+        || is_native_iterator_type_id(type_id)
         || resolve_special_method(value, "__next__").is_ok()
 }
 

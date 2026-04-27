@@ -74,6 +74,7 @@ impl TypeId {
     pub const REGEX_PATTERN: Self = Self(51);
     pub const REGEX_MATCH: Self = Self(52);
     pub const COMPLEX: Self = Self(53);
+    pub const ENUMERATE: Self = Self(54);
 
     /// First ID available for user-defined types.
     pub const FIRST_USER_TYPE: u32 = 256;
@@ -153,6 +154,7 @@ impl TypeId {
             51 => "Pattern",
             52 => "Match",
             53 => "complex",
+            54 => "enumerate",
             _ => "<unknown>",
         }
     }

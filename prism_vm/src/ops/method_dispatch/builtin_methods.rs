@@ -373,7 +373,10 @@ static ITERATOR_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
 static ITERATOR_NEXT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("iterator.__next__"), iterator_next));
 static ITERATOR_LENGTH_HINT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("iterator.__length_hint__"), iterator_length_hint)
+    BuiltinFunctionObject::new_vm(
+        Arc::from("iterator.__length_hint__"),
+        iterator_length_hint_vm,
+    )
 });
 static ITERATOR_REDUCE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("iterator.__reduce__"), iterator_reduce)
@@ -2715,13 +2718,17 @@ fn iterator_next(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
     }
 }
 
-fn iterator_length_hint(args: &[Value]) -> Result<Value, BuiltinError> {
+fn iterator_length_hint_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("iterator", "__length_hint__", args, 0)?;
     let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
         BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
     })?;
-    Ok(Value::int(iter.size_hint().unwrap_or(0) as i64)
-        .expect("iterator length hint should fit in tagged int"))
+    let hint = iter
+        .size_hint_with(&mut |source| {
+            crate::builtins::try_len_value(vm, source).map_err(runtime_error_to_builtin_error)
+        })?
+        .unwrap_or(0);
+    Ok(Value::int(hint as i64).expect("iterator length hint should fit in tagged int"))
 }
 
 fn iterator_reduce(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -2778,6 +2785,17 @@ fn iterator_reduce(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
             )
             .map_err(runtime_error_to_builtin_error)?;
             reduce_tuple(vm, reducer_builtin, &[list], None)
+        }
+        IteratorReduction::Enumerate { values, start } => {
+            let callable = crate::builtins::builtin_type(&[args[0]])?;
+            let list = alloc_heap_value(
+                vm,
+                ListObject::from_iter(values),
+                "enumerate reduce remaining values",
+            )
+            .map_err(runtime_error_to_builtin_error)?;
+            let start = bigint_to_value(start);
+            reduce_tuple(vm, callable, &[list, start], None)
         }
         IteratorReduction::RequiresVm(reason) => {
             Err(BuiltinError::NotImplemented(reason.to_string()))

@@ -448,6 +448,12 @@ impl Default for ListObject {
 }
 
 #[inline(always)]
+fn is_shaped_heap_type(type_id: TypeId) -> bool {
+    type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && !crate::types::iter::is_native_iterator_type_id(type_id)
+}
+
+#[inline(always)]
 pub fn value_as_list_ref(value: Value) -> Option<&'static ListObject> {
     let ptr = value.as_object_ptr()?;
     object_ptr_as_list_ref(ptr)
@@ -458,7 +464,7 @@ pub fn object_ptr_as_list_ref(ptr: *const ()) -> Option<&'static ListObject> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     match header.type_id {
         TypeId::LIST => Some(unsafe { &*(ptr as *const ListObject) }),
-        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+        type_id if is_shaped_heap_type(type_id) => unsafe {
             (&*(ptr as *const ShapedObject)).list_backing()
         },
         _ => None,
@@ -470,7 +476,7 @@ pub fn object_ptr_as_list_mut(ptr: *mut ()) -> Option<&'static mut ListObject> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     match header.type_id {
         TypeId::LIST => Some(unsafe { &mut *(ptr as *mut ListObject) }),
-        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+        type_id if is_shaped_heap_type(type_id) => unsafe {
             (&mut *(ptr as *mut ShapedObject)).list_backing_mut()
         },
         _ => None,

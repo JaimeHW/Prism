@@ -48,7 +48,7 @@ use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::iter::IteratorObject;
+use prism_runtime::types::iter::{IteratorObject, is_native_iterator_type_id};
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
@@ -176,10 +176,10 @@ pub fn get_iterator_mut(value: &Value) -> Option<&mut IteratorObject> {
     let ptr = value.as_object_ptr()?;
     // First verify it's actually an iterator
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::ITERATOR {
+    if !is_native_iterator_type_id(header.type_id) {
         return None;
     }
-    // SAFETY: Verified TypeId::ITERATOR
+    // SAFETY: Verified the value uses IteratorObject's native layout.
     Some(unsafe { &mut *(ptr as *mut IteratorObject) })
 }
 
@@ -187,7 +187,8 @@ pub fn get_iterator_mut(value: &Value) -> Option<&mut IteratorObject> {
 #[inline(always)]
 pub fn is_iterator(value: &Value) -> bool {
     match get_type_id(value) {
-        Some(TypeId::ITERATOR | TypeId::GENERATOR) => true,
+        Some(TypeId::GENERATOR) => true,
+        Some(type_id) if is_native_iterator_type_id(type_id) => true,
         _ => false,
     }
 }
@@ -250,7 +251,7 @@ pub fn value_to_iterator(value: &Value) -> Result<IteratorObject, IterError> {
 
     // Fast path: Check if already an iterator
     if let Some(type_id) = exact_type_id {
-        if type_id == TypeId::ITERATOR {
+        if is_native_iterator_type_id(type_id) {
             return Ok(IteratorObject::from_existing_iterator(*value));
         }
     }

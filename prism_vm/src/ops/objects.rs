@@ -45,7 +45,7 @@ use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_saturated_i64};
-use prism_runtime::types::iter::IteratorObject;
+use prism_runtime::types::iter::{IteratorObject, is_native_iterator_type_id};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
@@ -77,10 +77,15 @@ pub fn extract_type_id(ptr: *const ()) -> TypeId {
 }
 
 #[inline]
+fn uses_shaped_user_instance_layout(type_id: TypeId) -> bool {
+    is_user_defined_type(type_id) && !is_native_iterator_type_id(type_id)
+}
+
+#[inline]
 pub(crate) fn dict_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static DictObject> {
     match extract_type_id(ptr) {
         TypeId::DICT => Some(unsafe { &*(ptr as *const DictObject) }),
-        type_id if is_user_defined_type(type_id) => {
+        type_id if uses_shaped_user_instance_layout(type_id) => {
             unsafe { &*(ptr as *const ShapedObject) }.dict_backing()
         }
         _ => None,
@@ -91,7 +96,7 @@ pub(crate) fn dict_storage_ref_from_ptr(ptr: *const ()) -> Option<&'static DictO
 pub(crate) fn dict_storage_mut_from_ptr(ptr: *const ()) -> Option<&'static mut DictObject> {
     match extract_type_id(ptr) {
         TypeId::DICT => Some(unsafe { &mut *(ptr as *mut DictObject) }),
-        type_id if is_user_defined_type(type_id) => {
+        type_id if uses_shaped_user_instance_layout(type_id) => {
             unsafe { &mut *(ptr as *mut ShapedObject) }.dict_backing_mut()
         }
         _ => None,
@@ -1752,6 +1757,19 @@ fn lookup_user_defined_instance_attribute_default(
         return Ok(class_id_to_value(ClassId(type_id.raw())));
     }
 
+    if !uses_shaped_user_instance_layout(type_id) {
+        if let Some(slot) = class_slot {
+            return bind_user_class_attribute_value_in_vm(vm, slot.value, slot.defining_class, obj)
+                .map(Some);
+        }
+
+        if let Some(value) = lookup_builtin_base_instance_attr(vm, obj, type_id, name)? {
+            return Ok(Some(value));
+        }
+
+        return Ok(None);
+    }
+
     if name.as_str() == "__dict__" {
         return Ok(Some(ensure_user_defined_instance_dict_value(ptr)));
     }
@@ -2391,6 +2409,14 @@ pub(crate) fn set_attribute_value(
                         return Ok(());
                     }
 
+                    if !uses_shaped_user_instance_layout(type_id) {
+                        let type_name = user_defined_instance_type_name(type_id);
+                        return Err(RuntimeError::attribute_error(
+                            Arc::clone(&type_name),
+                            format!("'{}' object has no attribute '{}'", type_name, name),
+                        ));
+                    }
+
                     if name.as_str() == "__dict__" {
                         return set_user_defined_instance_dict_value(ptr, value);
                     }
@@ -2565,6 +2591,14 @@ pub(crate) fn delete_attribute_value(
                         && invoke_descriptor_delete_in_vm(vm, descriptor, obj)?
                     {
                         return Ok(());
+                    }
+
+                    if !uses_shaped_user_instance_layout(type_id) {
+                        let type_name = user_defined_instance_type_name(type_id);
+                        return Err(RuntimeError::attribute_error(
+                            Arc::clone(&type_name),
+                            format!("'{}' object has no attribute '{}'", type_name, name),
+                        ));
                     }
 
                     if name.as_str() == "__dict__" {

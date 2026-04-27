@@ -3,10 +3,13 @@
 //! Provides a unified iterator type that can wrap different iterable objects
 //! and implements the Python iteration protocol.
 
+use crate::object::mro::ClassId;
+use crate::object::type_builtins::global_class_bitmap;
 use crate::object::type_obj::TypeId;
 use crate::object::views::GenericAliasObject;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::bytes::BytesObject;
+use crate::types::int::bigint_to_value;
 use crate::types::list::{ListObject, value_as_list_ref};
 use crate::types::range::RangeIterator;
 use crate::types::string::StringObject;
@@ -64,6 +67,9 @@ pub enum IteratorReduction {
     CallSentinel { callable: Value, sentinel: Value },
     /// Reconstruct from a snapshot list of remaining values.
     RemainingValues(Vec<Value>),
+    /// Reconstruct an enumerate-compatible object from remaining values and
+    /// the next index to yield.
+    Enumerate { values: Vec<Value>, start: BigInt },
     /// This iterator needs VM-side calls to snapshot safely.
     RequiresVm(&'static str),
 }
@@ -108,8 +114,8 @@ impl std::error::Error for IteratorAdvanceError {}
 /// # Performance
 /// Uses Box::leak for now, should integrate with GC in production.
 #[inline]
-fn create_tuple_pair(index: i64, value: Value) -> Value {
-    let tuple = TupleObject::from_slice(&[Value::int(index).unwrap_or(Value::none()), value]);
+fn create_tuple_pair(index: Value, value: Value) -> Value {
+    let tuple = TupleObject::from_slice(&[index, value]);
     let ptr = Box::leak(Box::new(tuple)) as *mut TupleObject as *const ();
     Value::object_ptr(ptr)
 }
@@ -263,7 +269,7 @@ enum IterKind {
     /// - Single allocation for boxed inner iterator
     Enumerate {
         inner: Box<IteratorObject>,
-        index: i64,
+        index: EnumerateIndex,
     },
 
     /// Zip iterator - parallel iteration over multiple iterables.
@@ -332,6 +338,14 @@ enum IterKind {
     /// Reverse iterator over a live list.
     ReversedList { list: Value, reverse_index: usize },
 
+    /// Reverse iterator over an object implementing `__len__` and `__getitem__`.
+    ReversedSequence {
+        source: Value,
+        getitem: Value,
+        implicit_self: Option<Value>,
+        reverse_index: usize,
+    },
+
     /// Reverse snapshot iterator guarded by source container length.
     GuardedReversedValues {
         owner: Value,
@@ -376,6 +390,48 @@ enum CountState {
 enum CountStep {
     Int(i64),
     Float(f64),
+}
+
+#[derive(Clone, Debug)]
+enum EnumerateIndex {
+    Int(i64),
+    Big(BigInt),
+}
+
+impl EnumerateIndex {
+    #[inline]
+    fn from_bigint(value: BigInt) -> Self {
+        value.to_i64().map(Self::Int).unwrap_or(Self::Big(value))
+    }
+
+    #[inline]
+    fn to_bigint(&self) -> BigInt {
+        match self {
+            Self::Int(value) => BigInt::from(*value),
+            Self::Big(value) => value.clone(),
+        }
+    }
+
+    #[inline]
+    fn next_value(&mut self) -> Value {
+        match self {
+            Self::Int(current) => {
+                let current_value = *current;
+                let value = Value::int(current_value)
+                    .unwrap_or_else(|| bigint_to_value(BigInt::from(current_value)));
+                match current_value.checked_add(1) {
+                    Some(next) => *current = next,
+                    None => *self = Self::Big(BigInt::from(current_value) + 1),
+                }
+                value
+            }
+            Self::Big(current) => {
+                let value = bigint_to_value(current.clone());
+                *current += 1;
+                value
+            }
+        }
+    }
 }
 
 impl StringValueRef<'_> {
@@ -469,14 +525,19 @@ fn byte_offset_for_char_index(text: &str, char_index: usize) -> usize {
 
 #[inline(always)]
 fn iterator_from_value(value: Value) -> &'static IteratorObject {
-    object_ref(value, TypeId::ITERATOR)
+    let ptr = value
+        .as_object_ptr()
+        .expect("iterator backing value must be an object");
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    debug_assert!(is_native_iterator_type_id(header.type_id));
+    unsafe { &*(ptr as *const IteratorObject) }
 }
 
 #[inline(always)]
 fn native_iterator_from_value(value: Value) -> Option<&'static IteratorObject> {
     let ptr = value.as_object_ptr()?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::ITERATOR {
+    if !is_native_iterator_type_id(header.type_id) {
         return None;
     }
 
@@ -489,7 +550,7 @@ fn iterator_from_value_mut(value: Value) -> &'static mut IteratorObject {
         .as_object_ptr()
         .expect("iterator proxy backing value must be an object");
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    debug_assert_eq!(header.type_id, TypeId::ITERATOR);
+    debug_assert!(is_native_iterator_type_id(header.type_id));
     unsafe { &mut *(ptr as *mut IteratorObject) }
 }
 
@@ -497,11 +558,24 @@ fn iterator_from_value_mut(value: Value) -> &'static mut IteratorObject {
 fn native_iterator_from_value_mut(value: Value) -> Option<&'static mut IteratorObject> {
     let ptr = value.as_object_ptr()?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::ITERATOR {
+    if !is_native_iterator_type_id(header.type_id) {
         return None;
     }
 
     Some(unsafe { &mut *(ptr as *mut IteratorObject) })
+}
+
+/// Return whether `type_id` is represented in memory as an [`IteratorObject`].
+///
+/// The exact builtin iterator and enumerate types are checked without touching
+/// global class metadata. Heap subclasses of `enumerate` reuse this native
+/// layout so inherited `__next__` stays a direct iterator-engine call.
+#[inline]
+pub fn is_native_iterator_type_id(type_id: TypeId) -> bool {
+    matches!(type_id, TypeId::ITERATOR | TypeId::ENUMERATE)
+        || (type_id.raw() >= TypeId::FIRST_USER_TYPE
+            && global_class_bitmap(ClassId(type_id.raw()))
+                .is_some_and(|bitmap| bitmap.is_subclass_of(TypeId::ENUMERATE)))
 }
 
 impl IteratorObject {
@@ -708,11 +782,21 @@ impl IteratorObject {
     /// - O(1) per iteration step
     #[inline]
     pub fn enumerate(inner: IteratorObject, start: i64) -> Self {
+        Self::enumerate_with_type(inner, BigInt::from(start), TypeId::ENUMERATE)
+    }
+
+    /// Create an enumerate iterator with an exact Python-visible type.
+    ///
+    /// Heap subclasses of `enumerate` use this to retain the native iterator
+    /// layout while exposing their subclass type through `type(obj)`.
+    #[inline]
+    pub fn enumerate_with_type(inner: IteratorObject, start: BigInt, type_id: TypeId) -> Self {
+        debug_assert!(type_id == TypeId::ENUMERATE || type_id.raw() >= TypeId::FIRST_USER_TYPE);
         Self {
-            header: ObjectHeader::new(TypeId::ITERATOR),
+            header: ObjectHeader::new(type_id),
             kind: IterKind::Enumerate {
                 inner: Box::new(inner),
-                index: start,
+                index: EnumerateIndex::from_bigint(start),
             },
             exhausted: false,
         }
@@ -838,6 +922,26 @@ impl IteratorObject {
             header: ObjectHeader::new(TypeId::ITERATOR),
             kind: IterKind::ReversedList {
                 list,
+                reverse_index: len,
+            },
+            exhausted: len == 0,
+        }
+    }
+
+    /// Create a lazy reverse iterator over a sequence protocol object.
+    #[inline]
+    pub fn reversed_sequence(
+        source: Value,
+        getitem: Value,
+        implicit_self: Option<Value>,
+        len: usize,
+    ) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::ReversedSequence {
+                source,
+                getitem,
+                implicit_self,
                 reverse_index: len,
             },
             exhausted: len == 0,
@@ -1024,6 +1128,15 @@ impl IteratorObject {
                     *reverse_index = index + 1;
                 }
             }
+            IterKind::ReversedSequence { reverse_index, .. } => {
+                if raw_state.sign() == num_bigint::Sign::Minus {
+                    *reverse_index = 0;
+                    self.exhausted = true;
+                } else {
+                    *reverse_index = usize::try_from(raw_state).unwrap_or(usize::MAX);
+                    self.exhausted = *reverse_index == 0;
+                }
+            }
             IterKind::Empty => {
                 self.exhausted = true;
             }
@@ -1174,14 +1287,25 @@ impl IteratorObject {
             IterKind::Empty => Ok(IteratorReduction::EmptyIterable(
                 IteratorEmptyIterable::Tuple,
             )),
+            IterKind::Enumerate { inner, index } => match inner.remaining_values_snapshot() {
+                Some(values) => Ok(IteratorReduction::Enumerate {
+                    values,
+                    start: index.to_bigint(),
+                }),
+                None => Ok(IteratorReduction::RequiresVm(
+                    "enumerate inner iterator cannot be snapshotted",
+                )),
+            },
             IterKind::Chain { .. }
-            | IterKind::Enumerate { .. }
             | IterKind::Zip { .. }
             | IterKind::ZipLongest { .. }
             | IterKind::Map { .. }
             | IterKind::Filter { .. }
             | IterKind::ISlice { .. } => Ok(IteratorReduction::RequiresVm(
                 "composite iterator requires VM context to reduce",
+            )),
+            IterKind::ReversedSequence { .. } => Ok(IteratorReduction::RequiresVm(
+                "sequence reverse iterator requires VM context to reduce",
             )),
             IterKind::Reversed {
                 values,
@@ -1450,10 +1574,8 @@ impl IteratorObject {
             IterKind::Enumerate { inner, index } => {
                 match inner.next_checked()? {
                     Some(value) => {
-                        let idx = *index;
-                        *index += 1;
                         // Return (index, value) as a 2-tuple
-                        Some(create_tuple_pair(idx, value))
+                        Some(create_tuple_pair(index.next_value(), value))
                     }
                     None => {
                         self.exhausted = true;
@@ -1621,6 +1743,12 @@ impl IteratorObject {
                     *reverse_index -= 1;
                     list.get(*reverse_index as i64)
                 }
+            }
+
+            IterKind::ReversedSequence { .. } => {
+                return Err(IteratorAdvanceError::mutated(
+                    "sequence reverse iterator requires VM context",
+                ));
             }
 
             IterKind::GuardedReversedValues {
@@ -1816,6 +1944,7 @@ impl IteratorObject {
                     Some(*reverse_index)
                 }
             }
+            IterKind::ReversedSequence { reverse_index, .. } => Some(*reverse_index),
             IterKind::GuardedReversedValues {
                 owner,
                 expected_len,
@@ -1837,6 +1966,25 @@ impl IteratorObject {
         }
     }
 
+    /// Get the remaining length hint, allowing VM-backed protocol calls.
+    pub fn size_hint_with<E>(
+        &self,
+        sequence_len: &mut impl FnMut(Value) -> Result<usize, E>,
+    ) -> Result<Option<usize>, E> {
+        if self.exhausted {
+            return Ok(Some(0));
+        }
+
+        match &self.kind {
+            IterKind::ReversedSequence {
+                source,
+                reverse_index,
+                ..
+            } => sequence_len(*source).map(|len| Some((*reverse_index).min(len))),
+            _ => Ok(self.size_hint()),
+        }
+    }
+
     /// Collect remaining elements into a vector.
     pub fn collect_remaining(&mut self) -> Vec<Value> {
         let mut result = Vec::new();
@@ -1844,6 +1992,159 @@ impl IteratorObject {
             result.push(v);
         }
         result
+    }
+
+    /// Snapshot the remaining values for finite native iterators without
+    /// advancing them.
+    pub fn remaining_values_snapshot(&self) -> Option<Vec<Value>> {
+        if self.exhausted {
+            return Some(Vec::new());
+        }
+
+        match &self.kind {
+            IterKind::Range(iter) => Some(iter.clone().collect()),
+            IterKind::Repeat {
+                value,
+                remaining: Some(count),
+            } => Some(vec![*value; *count]),
+            IterKind::List { list, index } => {
+                let list = list_from_value(*list);
+                Some(list.as_slice().iter().copied().skip(*index).collect())
+            }
+            IterKind::Tuple { tuple, index } => {
+                let tuple = tuple_from_value(*tuple);
+                Some(tuple.iter().copied().skip(*index).collect())
+            }
+            IterKind::StringChars {
+                string,
+                byte_offset,
+            } => {
+                let string = string_from_value(*string);
+                Some(
+                    string.as_str()[(*byte_offset).min(string.len())..]
+                        .chars()
+                        .map(|ch| Value::string(prism_core::intern::intern(&ch.to_string())))
+                        .collect(),
+                )
+            }
+            IterKind::Bytes { bytes, index } => {
+                let bytes = bytes_from_value(*bytes);
+                Some(
+                    bytes.as_bytes()[(*index).min(bytes.len())..]
+                        .iter()
+                        .map(|&byte| {
+                            Value::int(byte as i64)
+                                .expect("byte iterator value should fit in tagged int")
+                        })
+                        .collect(),
+                )
+            }
+            IterKind::Values { values, index } => {
+                Some(values.iter().skip(*index).copied().collect())
+            }
+            IterKind::GuardedValues {
+                owner,
+                expected_len,
+                len_guard,
+                values,
+                index,
+                ..
+            } => {
+                if len_guard(*owner) == Some(*expected_len) {
+                    Some(values.iter().skip(*index).copied().collect())
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            IterKind::SharedIterator { iterator } => native_iterator_from_value(*iterator)
+                .and_then(IteratorObject::remaining_values_snapshot),
+            IterKind::GenericAlias { alias, yielded } => {
+                if *yielded {
+                    Some(Vec::new())
+                } else {
+                    Some(vec![create_starred_generic_alias(*alias)])
+                }
+            }
+            IterKind::Empty => Some(Vec::new()),
+            IterKind::Chain { iterators, current } => {
+                let mut values = Vec::new();
+                for iterator in iterators.iter().skip(*current) {
+                    values.extend(iterator.remaining_values_snapshot()?);
+                }
+                Some(values)
+            }
+            IterKind::Enumerate { inner, index } => {
+                let mut next_index = index.clone();
+                let values = inner
+                    .remaining_values_snapshot()?
+                    .into_iter()
+                    .map(|value| create_tuple_pair(next_index.next_value(), value))
+                    .collect();
+                Some(values)
+            }
+            IterKind::Reversed {
+                values,
+                reverse_index,
+            } => Some(values.iter().take(*reverse_index).rev().copied().collect()),
+            IterKind::ReversedList {
+                list,
+                reverse_index,
+            } => {
+                let list = list_from_value(*list);
+                if list.len() < *reverse_index {
+                    Some(Vec::new())
+                } else {
+                    Some(
+                        list.as_slice()
+                            .iter()
+                            .copied()
+                            .take(*reverse_index)
+                            .rev()
+                            .collect(),
+                    )
+                }
+            }
+            IterKind::ReversedSequence { .. } => None,
+            IterKind::GuardedReversedValues {
+                owner,
+                expected_len,
+                len_guard,
+                values,
+                reverse_index,
+                ..
+            } => {
+                if len_guard(*owner) == Some(*expected_len) {
+                    Some(values.iter().take(*reverse_index).rev().copied().collect())
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            IterKind::DictKeys { keys, index } => Some(keys.iter().skip(*index).copied().collect()),
+            IterKind::DictValues { values, index } => {
+                Some(values.iter().skip(*index).copied().collect())
+            }
+            IterKind::DictItems { items, index } => Some(
+                items
+                    .iter()
+                    .skip(*index)
+                    .map(|&(key, value)| create_tuple_pair_values(key, value))
+                    .collect(),
+            ),
+            IterKind::SetIter { values, index } => {
+                Some(values.iter().skip(*index).copied().collect())
+            }
+            IterKind::Count { .. }
+            | IterKind::Repeat {
+                remaining: None, ..
+            }
+            | IterKind::SequenceGetItem { .. }
+            | IterKind::CallSentinel { .. }
+            | IterKind::Zip { .. }
+            | IterKind::ZipLongest { .. }
+            | IterKind::Map { .. }
+            | IterKind::Filter { .. }
+            | IterKind::ISlice { .. } => None,
+        }
     }
 
     /// Advance the iterator using VM-provided callable and truthiness hooks.
@@ -1950,11 +2251,7 @@ impl IteratorObject {
                     advance_sequence,
                     advance_call_sentinel,
                 )? {
-                    Some(value) => {
-                        let current_index = *index;
-                        *index += 1;
-                        Ok(Some(create_tuple_pair(current_index, value)))
-                    }
+                    Some(value) => Ok(Some(create_tuple_pair(index.next_value(), value))),
                     None => {
                         self.exhausted = true;
                         Ok(None)
@@ -2120,6 +2417,29 @@ impl IteratorObject {
                     }
                 };
             }
+            IterKind::ReversedSequence {
+                getitem,
+                implicit_self,
+                reverse_index,
+                ..
+            } => {
+                if *reverse_index == 0 {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+
+                *reverse_index -= 1;
+                let index = i64::try_from(*reverse_index).map_err(|_| {
+                    IteratorAdvanceError::mutated("sequence iterator index overflow")
+                })?;
+                return match advance_sequence(*getitem, *implicit_self, index)? {
+                    Some(value) => Ok(Some(value)),
+                    None => {
+                        self.exhausted = true;
+                        Ok(None)
+                    }
+                };
+            }
             _ => {}
         }
 
@@ -2154,6 +2474,7 @@ impl fmt::Debug for IteratorObject {
             IterKind::ISlice { .. } => "islice",
             IterKind::Reversed { .. } => "reversed",
             IterKind::ReversedList { .. } => "list_reverseiterator",
+            IterKind::ReversedSequence { .. } => "reversed",
             IterKind::GuardedReversedValues { .. } => "reversed",
             IterKind::DictKeys { .. } => "dict_keys",
             IterKind::DictValues { .. } => "dict_values",

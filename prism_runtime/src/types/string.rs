@@ -175,13 +175,19 @@ pub fn value_as_string_ref(value: Value) -> Option<StringValueRef<'static>> {
 }
 
 #[inline(always)]
+fn is_shaped_heap_type(type_id: TypeId) -> bool {
+    type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && !crate::types::iter::is_native_iterator_type_id(type_id)
+}
+
+#[inline(always)]
 pub fn object_ptr_as_string_ref(ptr: *const ()) -> Option<StringValueRef<'static>> {
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     match header.type_id {
         TypeId::STR => Some(StringValueRef::Heap(unsafe {
             &*(ptr as *const StringObject)
         })),
-        type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => unsafe {
+        type_id if is_shaped_heap_type(type_id) => unsafe {
             (&*(ptr as *const ShapedObject))
                 .string_backing()
                 .map(StringValueRef::Heap)
