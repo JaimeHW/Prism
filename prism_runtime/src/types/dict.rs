@@ -5,6 +5,8 @@
 use crate::object::type_obj::TypeId;
 use crate::object::{ObjectHeader, PyObject};
 use crate::types::hashable::HashableValue;
+use crate::types::int::value_to_bigint;
+use crate::types::tuple::TupleObject;
 use prism_core::Value;
 use rustc_hash::FxHashMap;
 
@@ -32,6 +34,7 @@ struct DictEntries {
     order: Vec<Option<HashableValue>>,
     positions: FxHashMap<HashableValue, usize>,
     tombstones: usize,
+    protocol_key_count: usize,
 }
 
 impl DictObject {
@@ -56,6 +59,7 @@ impl DictObject {
                 positions: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 order: Vec::with_capacity(capacity),
                 tombstones: 0,
+                protocol_key_count: 0,
             },
             version: 0,
         }
@@ -77,6 +81,13 @@ impl DictObject {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.items.is_empty()
+    }
+
+    /// Return true when at least one key can require Python-level equality for
+    /// collision resolution.
+    #[inline]
+    pub fn has_protocol_keys(&self) -> bool {
+        self.entries.protocol_key_count != 0
     }
 
     /// Get a value by key.
@@ -102,6 +113,9 @@ impl DictObject {
         let key = HashableValue(key);
         if self.entries.items.insert(key, value).is_none() {
             self.bump_version();
+            if requires_protocol_lookup(key.0) {
+                self.entries.protocol_key_count += 1;
+            }
             self.entries.positions.insert(key, self.entries.order.len());
             self.entries.order.push(Some(key));
         }
@@ -114,19 +128,23 @@ impl DictObject {
     #[inline]
     pub fn remove(&mut self, key: Value) -> Option<Value> {
         let key = HashableValue(key);
-        let removed = self.entries.items.remove(&key);
-        if removed.is_some() {
-            self.bump_version();
-            self.entries.hashes.remove(&key);
-            if let Some(index) = self.entries.positions.remove(&key)
-                && let Some(slot) = self.entries.order.get_mut(index)
-                && slot.take().is_some()
-            {
-                self.entries.tombstones += 1;
-            }
-            self.maybe_compact_order();
+        let Some((stored_key, value)) = self.entries.items.remove_entry(&key) else {
+            return None;
+        };
+
+        self.bump_version();
+        if requires_protocol_lookup(stored_key.0) {
+            self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
         }
-        removed
+        self.entries.hashes.remove(&stored_key);
+        if let Some(index) = self.entries.positions.remove(&stored_key)
+            && let Some(slot) = self.entries.order.get_mut(index)
+            && slot.take().is_some()
+        {
+            self.entries.tombstones += 1;
+        }
+        self.maybe_compact_order();
+        Some(value)
     }
 
     /// Check if the dict contains a key.
@@ -146,6 +164,7 @@ impl DictObject {
         self.entries.order.clear();
         self.entries.positions.clear();
         self.entries.tombstones = 0;
+        self.entries.protocol_key_count = 0;
     }
 
     /// Get an iterator over keys.
@@ -247,6 +266,9 @@ impl DictObject {
         self.bump_version();
         self.entries.positions.remove(&key);
         self.entries.hashes.remove(&key);
+        if requires_protocol_lookup(key.0) {
+            self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
+        }
         let value = self.entries.items.remove(&key)?;
         Some((key.0, value))
     }
@@ -297,6 +319,35 @@ impl DictObject {
 
         self.entries.order = compacted;
         self.entries.tombstones = 0;
+    }
+}
+
+#[inline]
+fn requires_protocol_lookup(value: Value) -> bool {
+    !is_fast_lookup_key(value)
+}
+
+fn is_fast_lookup_key(value: Value) -> bool {
+    if value.as_bool().is_some()
+        || value.as_int().is_some()
+        || value.as_float().is_some()
+        || value_to_bigint(value).is_some()
+        || value.is_none()
+        || value.is_string()
+    {
+        return true;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::STR => true,
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            tuple.iter().copied().all(is_fast_lookup_key)
+        }
+        _ => false,
     }
 }
 

@@ -27,7 +27,7 @@ pub(crate) fn dict_get_item(
     if let Some(value) = dict.get(key) {
         return Ok(Some(value));
     }
-    if !requires_protocol_scan(key) {
+    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
         return Ok(None);
     }
 
@@ -60,7 +60,7 @@ pub(crate) fn dict_set_item(
         dict.set_with_hash(key, value, key_hash);
         return Ok(());
     }
-    if !requires_protocol_scan(key) {
+    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
         dict.set_with_hash(key, value, key_hash);
         return Ok(());
     }
@@ -87,7 +87,7 @@ pub(crate) fn dict_remove_item(
     if let Some(value) = dict.remove(key) {
         return Ok(Some(value));
     }
-    if !requires_protocol_scan(key) {
+    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
         return Ok(None);
     }
 
@@ -112,7 +112,7 @@ pub(crate) fn dict_setdefault(
     if let Some(value) = dict.get(key) {
         return Ok(value);
     }
-    if !requires_protocol_scan(key) {
+    if !requires_protocol_scan(key) && !dict.has_protocol_keys() {
         dict.set_with_hash(key, default, key_hash);
         return Ok(default);
     }
