@@ -1851,8 +1851,12 @@ impl ReprThreadActiveGuard {
 impl Drop for ReprThreadActiveGuard {
     fn drop(&mut self) {
         REPR_ACTIVE_STACK.with(|stack| {
-            let popped = stack.borrow_mut().pop();
-            debug_assert_eq!(popped, Some(self.key));
+            let mut stack = stack.borrow_mut();
+            if stack.last().copied() == Some(self.key) {
+                stack.pop();
+            } else if let Some(index) = stack.iter().rposition(|key| *key == self.key) {
+                stack.remove(index);
+            }
         });
     }
 }
@@ -2093,8 +2097,12 @@ impl<'vm> ReprState<'vm> {
         });
 
         while let Some(frame) = frames.last_mut() {
-            let list = crate::ops::objects::list_storage_ref_from_ptr(frame.ptr)
-                .ok_or_else(|| BuiltinError::TypeError("invalid list reference".to_string()))?;
+            let Some(list) = crate::ops::objects::list_storage_ref_from_ptr(frame.ptr) else {
+                self.clear_list_repr_state(&mut thread_guards);
+                return Err(BuiltinError::TypeError(
+                    "invalid list reference".to_string(),
+                ));
+            };
 
             if frame.index >= list.len() {
                 out.push(']');
@@ -2112,12 +2120,24 @@ impl<'vm> ReprState<'vm> {
             frame.index += 1;
 
             let Some(child_ptr) = item.as_object_ptr() else {
-                out.push_str(&self.repr_value(item)?);
+                match self.repr_value(item) {
+                    Ok(repr) => out.push_str(&repr),
+                    Err(err) => {
+                        self.clear_list_repr_state(&mut thread_guards);
+                        return Err(err);
+                    }
+                }
                 continue;
             };
 
             if crate::ops::objects::list_storage_ref_from_ptr(child_ptr).is_none() {
-                out.push_str(&self.repr_value(item)?);
+                match self.repr_value(item) {
+                    Ok(repr) => out.push_str(&repr),
+                    Err(err) => {
+                        self.clear_list_repr_state(&mut thread_guards);
+                        return Err(err);
+                    }
+                }
                 continue;
             }
 
@@ -2128,6 +2148,7 @@ impl<'vm> ReprState<'vm> {
             }
 
             if frames.len() >= MAX_REPR_DEPTH {
+                self.clear_list_repr_state(&mut thread_guards);
                 return Err(BuiltinError::Raised(RuntimeError::recursion_error(
                     frames.len(),
                 )));
@@ -2143,6 +2164,12 @@ impl<'vm> ReprState<'vm> {
         }
 
         Ok(out)
+    }
+
+    fn clear_list_repr_state(&mut self, thread_guards: &mut SmallVec<[ReprThreadActiveGuard; 16]>) {
+        while thread_guards.pop().is_some() {
+            self.active.pop();
+        }
     }
 
     fn repr_tuple(&mut self, tuple: &TupleObject) -> Result<String, BuiltinError> {
