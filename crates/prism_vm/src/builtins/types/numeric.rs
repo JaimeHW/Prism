@@ -151,9 +151,7 @@ fn builtin_int_native(
         return Ok(Some(bigint_to_value(integer)));
     }
     if let Some(f) = arg.as_float() {
-        return Value::int(f as i64)
-            .ok_or_else(|| BuiltinError::OverflowError("int too large".to_string()))
-            .map(Some);
+        return float_to_int_value(f).map(Some);
     }
     if let Some(b) = arg.as_bool() {
         return Ok(Some(
@@ -162,6 +160,48 @@ fn builtin_int_native(
     }
 
     Ok(None)
+}
+
+fn float_to_int_value(value: f64) -> Result<Value, BuiltinError> {
+    if value.is_nan() {
+        return Err(BuiltinError::ValueError(
+            "cannot convert float NaN to integer".to_string(),
+        ));
+    }
+    if value.is_infinite() {
+        return Err(BuiltinError::OverflowError(
+            "cannot convert float infinity to integer".to_string(),
+        ));
+    }
+
+    const F64_EXPONENT_BIAS: i32 = 1023;
+    const F64_FRACTION_BITS_U64: u32 = 52;
+    const F64_FRACTION_MASK: u64 = (1_u64 << F64_FRACTION_BITS_U64) - 1;
+    const F64_EXPONENT_MASK: u64 = 0x7ff;
+
+    let bits = value.to_bits();
+    let exponent_bits = ((bits >> F64_FRACTION_BITS_U64) & F64_EXPONENT_MASK) as i32;
+    if exponent_bits == 0 {
+        return Ok(Value::int(0).expect("zero should be representable"));
+    }
+
+    let exponent = exponent_bits - F64_EXPONENT_BIAS;
+    if exponent < 0 {
+        return Ok(Value::int(0).expect("zero should be representable"));
+    }
+
+    let significand = (1_u64 << F64_FRACTION_BITS_U64) | (bits & F64_FRACTION_MASK);
+    let magnitude = if exponent >= F64_FRACTION_BITS_U64 as i32 {
+        BigInt::from(significand) << ((exponent - F64_FRACTION_BITS_U64 as i32) as usize)
+    } else {
+        BigInt::from(significand >> (F64_FRACTION_BITS_U64 as i32 - exponent))
+    };
+    let integer = if value.is_sign_negative() {
+        -magnitude
+    } else {
+        magnitude
+    };
+    Ok(bigint_to_value(integer))
 }
 
 #[inline]
