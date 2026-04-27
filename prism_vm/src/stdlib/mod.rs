@@ -40,6 +40,7 @@ pub mod atexit;
 pub mod binascii;
 pub mod collections;
 pub mod copy;
+pub mod copyreg;
 pub mod ctypes;
 pub mod errno;
 pub mod exceptions;
@@ -360,6 +361,11 @@ impl StdlibRegistry {
             Box::new(ctypes::CtypesModule::new()),
         );
         Self::insert_module(&mut modules, "copy", Box::new(copy::CopyModule::new()));
+        Self::insert_module(
+            &mut modules,
+            "copyreg",
+            Box::new(copyreg::CopyRegModule::new()),
+        );
 
         Self::insert_module(
             &mut modules,

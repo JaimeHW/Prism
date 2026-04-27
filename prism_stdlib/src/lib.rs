@@ -198,6 +198,7 @@ pub fn native_module_policy(name: &str) -> Option<StdlibResolutionPolicy> {
         | "collections"
         | "collections.abc"
         | "copy"
+        | "copyreg"
         | "ctypes"
         | "fnmatch"
         | "inspect"
