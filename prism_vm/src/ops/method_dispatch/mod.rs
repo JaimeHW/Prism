@@ -53,7 +53,7 @@ pub(crate) fn resolve_builtin_instance_method(type_id: TypeId, name: &str) -> Op
         TypeId::BYTEARRAY => builtin_methods::resolve_bytearray_method(name),
         TypeId::MEMORYVIEW => builtin_methods::resolve_memoryview_method(name),
         TypeId::PROPERTY => builtin_methods::resolve_property_method(name),
-        TypeId::ITERATOR => builtin_methods::resolve_iterator_method(name),
+        TypeId::ITERATOR | TypeId::ENUMERATE => builtin_methods::resolve_iterator_method(name),
         TypeId::STR => builtin_methods::resolve_str_method(name),
         TypeId::SET | TypeId::FROZENSET => builtin_methods::resolve_set_method(type_id, name),
         TypeId::GENERATOR => builtin_methods::resolve_generator_method(name),

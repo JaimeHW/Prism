@@ -286,6 +286,7 @@ fn supports_membership_iteration_fallback(type_id: TypeId) -> bool {
         TypeId::OBJECT
             | TypeId::TYPE
             | TypeId::ITERATOR
+            | TypeId::ENUMERATE
             | TypeId::GENERATOR
             | TypeId::DEQUE
             | TypeId::DICT_KEYS

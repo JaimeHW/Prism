@@ -5,10 +5,15 @@ use crate::ops::iteration::{IterStep, collect_iterable_values, ensure_iterator_v
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::collections::deque::{DequeObject, value_as_deque};
 use num_bigint::BigInt;
-use num_traits::{One, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::class::PyClassObject;
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class_bitmap;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::int::value_to_bigint;
+use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::value_as_list_ref;
 use prism_runtime::types::range::RangeObject;
 
@@ -323,27 +328,29 @@ fn get_type_name(value: &Value) -> &'static str {
 ///
 /// enumerate(iterable, start=0) -> enumerate object
 pub fn builtin_enumerate(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(BuiltinError::TypeError(format!(
-            "enumerate expected 1 or 2 arguments, got {}",
-            args.len()
-        )));
-    }
+    let (iterable, start) = bind_enumerate_args(args, &[])?;
+    enumerate_value_static(iterable, start, TypeId::ENUMERATE)
+}
 
-    // Parse start argument (default 0)
-    let start = if args.len() == 2 {
-        args[1].as_int().ok_or_else(|| {
-            BuiltinError::TypeError("'start' argument must be an integer".to_string())
-        })?
-    } else {
-        0
-    };
+/// Keyword-aware enumerate constructor for static registry calls.
+pub fn builtin_enumerate_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let (iterable, start) = bind_enumerate_args(args, keywords)?;
+    enumerate_value_static(iterable, start, TypeId::ENUMERATE)
+}
 
+fn enumerate_value_static(
+    iterable: Value,
+    start: BigInt,
+    type_id: TypeId,
+) -> Result<Value, BuiltinError> {
     // Convert iterable to iterator using O(1) TypeId dispatch
-    let inner = super::iter_dispatch::value_to_iterator(&args[0])?;
+    let inner = super::iter_dispatch::value_to_iterator(&iterable)?;
 
     // Create enumerate iterator
-    let enumerate = prism_runtime::types::iter::IteratorObject::enumerate(inner, start);
+    let enumerate = IteratorObject::enumerate_with_type(inner, start, type_id);
     Ok(super::iter_dispatch::iterator_to_value(enumerate))
 }
 
@@ -352,28 +359,143 @@ pub fn builtin_enumerate_vm(
     vm: &mut VirtualMachine,
     args: &[Value],
 ) -> Result<Value, BuiltinError> {
-    if args.is_empty() || args.len() > 2 {
+    let (iterable, start) = bind_enumerate_args(args, &[])?;
+    enumerate_value_with_type(vm, iterable, start, TypeId::ENUMERATE)
+}
+
+/// VM-aware enumerate constructor with keyword support.
+pub fn builtin_enumerate_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let (iterable, start) = bind_enumerate_args(args, keywords)?;
+    enumerate_value_with_type(vm, iterable, start, TypeId::ENUMERATE)
+}
+
+/// `enumerate.__new__(cls, iterable, start=0)` for builtin and heap subclasses.
+pub fn builtin_enumerate_new_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let Some(class_value) = args.first().copied() else {
+        return Err(BuiltinError::TypeError(
+            "enumerate.__new__() missing required argument 'type'".to_string(),
+        ));
+    };
+    let type_id = enumerate_target_type_id(class_value).ok_or_else(|| {
+        BuiltinError::TypeError("enumerate.__new__() argument 1 must be a type".to_string())
+    })?;
+    if !is_enumerate_subtype(type_id) {
+        return Err(BuiltinError::TypeError(
+            "enumerate.__new__(type): type is not a subtype of enumerate".to_string(),
+        ));
+    }
+
+    let (iterable, start) = bind_enumerate_args(&args[1..], keywords)?;
+    enumerate_value_with_type(vm, iterable, start, type_id)
+}
+
+fn enumerate_value_with_type(
+    vm: &mut VirtualMachine,
+    iterable: Value,
+    start: BigInt,
+    type_id: TypeId,
+) -> Result<Value, BuiltinError> {
+    let iterator =
+        ensure_iterator_value(vm, iterable).map_err(super::runtime_error_to_builtin_error)?;
+    let enumerate = IteratorObject::enumerate_with_type(
+        IteratorObject::from_existing_iterator(iterator),
+        start,
+        type_id,
+    );
+    Ok(super::iter_dispatch::iterator_to_value(enumerate))
+}
+
+fn bind_enumerate_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<(Value, BigInt), BuiltinError> {
+    if args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
-            "enumerate expected 1 or 2 arguments, got {}",
+            "enumerate expected at most 2 arguments, got {}",
             args.len()
         )));
     }
 
-    let start = if args.len() == 2 {
-        args[1].as_int().ok_or_else(|| {
-            BuiltinError::TypeError("'start' argument must be an integer".to_string())
-        })?
-    } else {
-        0
+    let mut iterable = args.first().copied();
+    let mut start = args.get(1).copied();
+
+    for &(name, value) in keywords {
+        match name {
+            "iterable" => assign_enumerate_keyword(&mut iterable, value, "iterable")?,
+            "start" => assign_enumerate_keyword(&mut start, value, "start")?,
+            unknown => {
+                return Err(BuiltinError::TypeError(format!(
+                    "enumerate() got an unexpected keyword argument '{}'",
+                    unknown
+                )));
+            }
+        }
+    }
+
+    let iterable = iterable.ok_or_else(|| {
+        BuiltinError::TypeError("enumerate() missing required argument 'iterable'".to_string())
+    })?;
+    let start = match start {
+        Some(value) => enumerate_start_index(value)?,
+        None => BigInt::zero(),
     };
 
-    let iterator =
-        ensure_iterator_value(vm, args[0]).map_err(super::runtime_error_to_builtin_error)?;
-    let enumerate = prism_runtime::types::iter::IteratorObject::enumerate(
-        prism_runtime::types::iter::IteratorObject::from_existing_iterator(iterator),
-        start,
-    );
-    Ok(super::iter_dispatch::iterator_to_value(enumerate))
+    Ok((iterable, start))
+}
+
+#[inline]
+fn assign_enumerate_keyword(
+    slot: &mut Option<Value>,
+    value: Value,
+    name: &'static str,
+) -> Result<(), BuiltinError> {
+    if slot.is_some() {
+        return Err(BuiltinError::TypeError(format!(
+            "enumerate() got multiple values for argument '{}'",
+            name
+        )));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+#[inline]
+fn enumerate_start_index(value: Value) -> Result<BigInt, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(BigInt::from(u8::from(flag)));
+    }
+    value_to_bigint(value)
+        .ok_or_else(|| BuiltinError::TypeError("'start' argument must be an integer".to_string()))
+}
+
+fn enumerate_target_type_id(value: Value) -> Option<TypeId> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::TYPE {
+        return None;
+    }
+    if let Some(type_id) = super::builtin_type_object_type_id(ptr) {
+        return Some(type_id);
+    }
+
+    let class = unsafe { &*(ptr as *const PyClassObject) };
+    Some(class.class_type_id())
+}
+
+#[inline]
+fn is_enumerate_subtype(type_id: TypeId) -> bool {
+    type_id == TypeId::ENUMERATE
+        || (type_id.raw() >= TypeId::FIRST_USER_TYPE
+            && global_class_bitmap(ClassId(type_id.raw()))
+                .is_some_and(|bitmap| bitmap.is_subclass_of(TypeId::ENUMERATE)))
 }
 
 // =============================================================================
@@ -587,6 +709,78 @@ pub fn builtin_reversed(args: &[Value]) -> Result<Value, BuiltinError> {
 
     // Create reversed iterator
     let reversed = prism_runtime::types::iter::IteratorObject::reversed(values);
+    Ok(super::iter_dispatch::iterator_to_value(reversed))
+}
+
+/// VM-aware reversed constructor with CPython sequence-protocol fallback.
+pub fn builtin_reversed_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "reversed expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+
+    if let Some(range) = value_as_range_ref(args[0]) {
+        let reversed =
+            prism_runtime::types::iter::IteratorObject::from_range(range.reverse().iter());
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
+    }
+
+    if value_as_list_ref(args[0]).is_some() {
+        let reversed = prism_runtime::types::iter::IteratorObject::reversed_list(args[0]);
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
+    }
+
+    if let Some(deque) = value_as_deque(&args[0]) {
+        let values = deque.deque().iter().copied().collect();
+        let reversed = prism_runtime::types::iter::IteratorObject::guarded_reversed_values(
+            args[0],
+            values,
+            deque_len_guard,
+            "deque mutated during iteration",
+        );
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
+    }
+
+    match resolve_special_method(args[0], "__reversed__") {
+        Ok(target) => return invoke_bound_method_no_args(vm, target),
+        Err(err) if err.is_attribute_error() => {}
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    }
+
+    if let Ok(mut iter) = super::iter_dispatch::value_to_iterator(&args[0]) {
+        let values = iter.collect_remaining();
+        let reversed = IteratorObject::reversed(values);
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
+    }
+
+    let len = crate::builtins::try_len_value(vm, args[0]).map_err(|err| {
+        if err.is_attribute_error()
+            || matches!(err.kind, crate::error::RuntimeErrorKind::TypeError { .. })
+        {
+            BuiltinError::TypeError(format!(
+                "'{}' object is not reversible",
+                args[0].type_name()
+            ))
+        } else {
+            runtime_error_to_builtin_error(err)
+        }
+    })?;
+
+    let getitem = resolve_special_method(args[0], "__getitem__").map_err(|err| {
+        if err.is_attribute_error() {
+            BuiltinError::TypeError(format!(
+                "'{}' object is not reversible",
+                args[0].type_name()
+            ))
+        } else {
+            runtime_error_to_builtin_error(err)
+        }
+    })?;
+
+    let reversed =
+        IteratorObject::reversed_sequence(args[0], getitem.callable, getitem.implicit_self, len);
     Ok(super::iter_dispatch::iterator_to_value(reversed))
 }
 

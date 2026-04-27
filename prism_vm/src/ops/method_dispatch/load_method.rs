@@ -470,7 +470,7 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
         TypeId::MEMORYVIEW => builtin_methods::resolve_memoryview_method(name)
             .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
         TypeId::PROPERTY => resolve_property_method(name),
-        TypeId::ITERATOR => builtin_methods::resolve_iterator_method(name)
+        TypeId::ITERATOR | TypeId::ENUMERATE => builtin_methods::resolve_iterator_method(name)
             .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
         TypeId::EXCEPTION => resolve_exception_method(obj, name),
         TypeId::TUPLE => resolve_tuple_method(name),

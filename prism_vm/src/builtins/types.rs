@@ -956,9 +956,13 @@ fn collections_abc_builtin_type_matches(type_id: TypeId, kind: CollectionsAbcKin
                 | TypeId::MEMORYVIEW
                 | TypeId::DEQUE
                 | TypeId::ITERATOR
+                | TypeId::ENUMERATE
                 | TypeId::GENERATOR
         ),
-        Iterator => matches!(type_id, TypeId::ITERATOR | TypeId::GENERATOR),
+        Iterator => matches!(
+            type_id,
+            TypeId::ITERATOR | TypeId::ENUMERATE | TypeId::GENERATOR
+        ),
         Generator => type_id == TypeId::GENERATOR,
         Reversible => matches!(
             type_id,
@@ -1392,6 +1396,7 @@ pub(crate) fn call_builtin_type(type_id: TypeId, args: &[Value]) -> Result<Value
         TypeId::OBJECT => builtin_object(args),
         TypeId::SLICE => builtin_slice(args),
         TypeId::RANGE => super::itertools::builtin_range(args),
+        TypeId::ENUMERATE => super::itertools::builtin_enumerate(args),
         TypeId::BYTEARRAY => super::string::builtin_bytearray(args),
         TypeId::MEMORYVIEW => builtin_memoryview(args),
         TypeId::MAPPING_PROXY => builtin_mappingproxy(args),
@@ -1428,6 +1433,7 @@ pub(crate) fn call_builtin_type_with_vm(
         TypeId::BOOL => builtin_bool_vm(vm, args),
         TypeId::FLOAT => builtin_float_vm(vm, args),
         TypeId::RANGE => super::itertools::builtin_range_vm(vm, args),
+        TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm(vm, args),
         TypeId::LIST => {
             if args.len() > 1 {
                 return Err(BuiltinError::TypeError(format!(
@@ -1828,6 +1834,7 @@ pub(crate) fn call_builtin_type_kw_with_vm(
         TypeId::DICT => builtin_dict_kw(positional, keywords),
         TypeId::STR => builtin_str_kw(positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
+        TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm_kw(vm, positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
             "{}() does not accept keyword arguments yet",
             type_id.name()
@@ -1850,6 +1857,7 @@ pub(crate) fn call_builtin_type_kw(
         TypeId::DICT => builtin_dict_kw(positional, keywords),
         TypeId::STR => builtin_str_kw(positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
+        TypeId::ENUMERATE => super::itertools::builtin_enumerate_kw(positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
             "{}() does not accept keyword arguments yet",
             type_id.name()

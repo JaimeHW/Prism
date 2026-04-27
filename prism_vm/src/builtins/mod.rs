@@ -267,11 +267,15 @@ impl BuiltinRegistry {
         // Register iteration functions
         registry.register_function_vm("iter", itertools::builtin_iter_vm);
         registry.register_function_vm("next", itertools::builtin_next_vm);
-        registry.register_function_vm("enumerate", itertools::builtin_enumerate_vm);
+        registry.register_callable_type_vm(
+            "enumerate",
+            prism_runtime::object::type_obj::TypeId::ENUMERATE,
+            itertools::builtin_enumerate_vm,
+        );
         registry.register_function_vm("zip", itertools::builtin_zip_vm);
         registry.register_function_vm("map", itertools::builtin_map_vm);
         registry.register_function_vm("filter", itertools::builtin_filter_vm);
-        registry.register_function("reversed", itertools::builtin_reversed);
+        registry.register_function_vm("reversed", itertools::builtin_reversed_vm);
         registry.register_function_vm("sorted", itertools::builtin_sorted_vm);
         registry.register_function_vm("all", itertools::builtin_all_vm);
         registry.register_function_vm("any", itertools::builtin_any_vm);
@@ -474,6 +478,20 @@ impl BuiltinRegistry {
     ) {
         let name = name.into();
         self.functions.insert(name.clone(), constructor);
+        self.entries
+            .insert(name, types::builtin_type_object_for_type_id(type_id));
+    }
+
+    /// Register a builtin type object with a VM-aware direct-call constructor.
+    #[inline]
+    pub fn register_callable_type_vm(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        type_id: prism_runtime::object::type_obj::TypeId,
+        constructor: VmBuiltinFn,
+    ) {
+        let name = name.into();
+        self.vm_functions.insert(name.clone(), constructor);
         self.entries
             .insert(name, types::builtin_type_object_for_type_id(type_id));
     }

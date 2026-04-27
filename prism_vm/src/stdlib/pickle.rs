@@ -28,6 +28,7 @@ use prism_runtime::object::views::GenericAliasObject;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
+use prism_runtime::types::iter::is_native_iterator_type_id;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::slice::SliceObject;
@@ -249,10 +250,16 @@ impl<'vm> PickleWriter<'vm> {
             TypeId::DICT => self.write_dict(ptr),
             TypeId::BUILTIN_FUNCTION => self.write_builtin_function(ptr),
             TypeId::TYPE => self.write_type(ptr),
-            TypeId::ITERATOR => self.write_reduce(value, ptr),
+            TypeId::ITERATOR | TypeId::ENUMERATE => self.write_reduce(value, ptr),
             TypeId::GENERIC_ALIAS => self.write_generic_alias(ptr),
             TypeId::SLICE => self.write_slice(ptr),
             TypeId::RANGE => self.write_range(ptr),
+            type_id
+                if type_id.raw() >= TypeId::FIRST_USER_TYPE
+                    && is_native_iterator_type_id(type_id) =>
+            {
+                self.write_reduce(value, ptr)
+            }
             type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
                 self.write_user_object(ptr, type_id)
             }

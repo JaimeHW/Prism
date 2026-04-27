@@ -146,6 +146,12 @@ static MODULE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
         super::types::builtin_module_new,
     )
 });
+static ENUMERATE_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("enumerate.__new__"),
+        super::itertools::builtin_enumerate_new_vm_kw,
+    )
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReflectedValueKind {
@@ -295,6 +301,8 @@ const SET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 const FROZENSET_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
 const MODULE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+
+const ENUMERATE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
 const FUNCTION_TYPE_ATTRS: &[AttrSpec] = &[
     AttrSpec {
@@ -474,6 +482,7 @@ fn builtin_type_attr_specs(type_id: TypeId) -> &'static [AttrSpec] {
         TypeId::SET => SET_TYPE_ATTRS,
         TypeId::FROZENSET => FROZENSET_TYPE_ATTRS,
         TypeId::MODULE => MODULE_TYPE_ATTRS,
+        TypeId::ENUMERATE => ENUMERATE_TYPE_ATTRS,
         TypeId::FUNCTION => FUNCTION_TYPE_ATTRS,
         _ => &[],
     }
@@ -502,7 +511,7 @@ fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
         TypeId::MEMORYVIEW => MEMORYVIEW_METHOD_NAMES,
         TypeId::TUPLE => TUPLE_METHOD_NAMES,
         TypeId::SLICE => SLICE_METHOD_NAMES,
-        TypeId::ITERATOR => ITERATOR_METHOD_NAMES,
+        TypeId::ITERATOR | TypeId::ENUMERATE => ITERATOR_METHOD_NAMES,
         TypeId::GENERATOR => GENERATOR_METHOD_NAMES,
         TypeId::PROPERTY => PROPERTY_METHOD_NAMES,
         TypeId::REGEX_PATTERN => REGEX_PATTERN_METHOD_NAMES,
@@ -937,6 +946,7 @@ fn builtin_type_static_method_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::SET, "__new__") => Some(builtin_method_value(&SET_NEW_METHOD)),
         (TypeId::FROZENSET, "__new__") => Some(builtin_method_value(&FROZENSET_NEW_METHOD)),
         (TypeId::MODULE, "__new__") => Some(builtin_method_value(&MODULE_NEW_METHOD)),
+        (TypeId::ENUMERATE, "__new__") => Some(builtin_method_value(&ENUMERATE_NEW_METHOD)),
         _ => None,
     }
 }
