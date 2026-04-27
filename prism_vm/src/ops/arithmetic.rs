@@ -744,6 +744,25 @@ fn try_binary_special_method_result(
 }
 
 #[inline]
+fn user_defined_binary_slot_candidate(value: Value) -> bool {
+    value.as_object_ptr().is_some_and(|ptr| {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        header.type_id.raw() >= TypeId::FIRST_USER_TYPE
+    })
+}
+
+#[inline]
+fn modulo_needs_user_slot_dispatch(left: Value, right: Value) -> bool {
+    if user_defined_binary_slot_candidate(left) {
+        return true;
+    }
+
+    user_defined_binary_slot_candidate(right)
+        && value_as_string_ref(left).is_none()
+        && value_as_byte_sequence_ref(left).is_none()
+}
+
+#[inline]
 fn value_as_byte_sequence_ref(value: Value) -> Option<&'static BytesObject> {
     let ptr = value.as_object_ptr()?;
     let header = unsafe { &*(ptr as *const ObjectHeader) };
@@ -1380,6 +1399,15 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
+    let tried_special = modulo_needs_user_slot_dispatch(a, b);
+    if tried_special {
+        match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mod__", "__rmod__") {
+            Ok(true) => return ControlFlow::Continue,
+            Ok(false) => {}
+            Err(err) => return ControlFlow::Error(err),
+        }
+    }
+
     let frame = vm.current_frame_mut();
 
     if let Some(template) = value_as_string_ref(a) {
@@ -1425,10 +1453,12 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     let _ = frame;
 
-    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mod__", "__rmod__") {
-        Ok(true) => return ControlFlow::Continue,
-        Ok(false) => {}
-        Err(err) => return ControlFlow::Error(err),
+    if !tried_special {
+        match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mod__", "__rmod__") {
+            Ok(true) => return ControlFlow::Continue,
+            Ok(false) => {}
+            Err(err) => return ControlFlow::Error(err),
+        }
     }
 
     let frame = vm.current_frame_mut();
