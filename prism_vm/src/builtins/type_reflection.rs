@@ -1829,10 +1829,7 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
     )
 }
 
-fn slice_instance_attr_value(
-    receiver: Value,
-    attr: &str,
-) -> Result<Option<Value>, RuntimeError> {
+fn slice_instance_attr_value(receiver: Value, attr: &str) -> Result<Option<Value>, RuntimeError> {
     let Some(ptr) = receiver.as_object_ptr() else {
         return Ok(None);
     };

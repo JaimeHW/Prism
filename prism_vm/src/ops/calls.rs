@@ -84,10 +84,7 @@ static TUPLE_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
     )
 });
 static LIST_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
-        Arc::from("list.__new__"),
-        crate::builtins::builtin_list_new,
-    )
+    BuiltinFunctionObject::new(Arc::from("list.__new__"), crate::builtins::builtin_list_new)
 });
 static LIST_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(

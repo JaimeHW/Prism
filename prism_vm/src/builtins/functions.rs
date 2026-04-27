@@ -1423,8 +1423,11 @@ fn hash_value(value: Value) -> Result<i64, BuiltinError> {
         }
         TypeId::SLICE => {
             let slice = unsafe { &*(ptr as *const SliceObject) };
-            let components =
-                TupleObject::from_slice(&[slice.start_value(), slice.stop_value(), slice.step_value()]);
+            let components = TupleObject::from_slice(&[
+                slice.start_value(),
+                slice.stop_value(),
+                slice.step_value(),
+            ]);
             hash_tuple(&components)
         }
         _ => Ok(hash_with_default_hasher(&(ptr as usize))),

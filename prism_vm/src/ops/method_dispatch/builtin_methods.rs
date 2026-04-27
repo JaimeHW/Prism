@@ -421,7 +421,9 @@ pub fn resolve_list_method(name: &str) -> Option<CachedMethod> {
         "__delitem__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_DELITEM_METHOD,
         ))),
-        "__init__" => Some(CachedMethod::simple(builtin_method_value(&LIST_INIT_METHOD))),
+        "__init__" => Some(CachedMethod::simple(builtin_method_value(
+            &LIST_INIT_METHOD,
+        ))),
         "__contains__" => Some(CachedMethod::simple(builtin_method_value(
             &LIST_CONTAINS_METHOD,
         ))),
@@ -1316,7 +1318,12 @@ fn slice_indices(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
             lower.clone()
         }
     } else {
-        clamp_slice_component(slice_index_bigint(vm, slice.start_value())?, &length, &lower, &upper)
+        clamp_slice_component(
+            slice_index_bigint(vm, slice.start_value())?,
+            &length,
+            &lower,
+            &upper,
+        )
     };
 
     let stop = if slice.stop_value().is_none() {
@@ -1326,7 +1333,12 @@ fn slice_indices(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
             upper.clone()
         }
     } else {
-        clamp_slice_component(slice_index_bigint(vm, slice.stop_value())?, &length, &lower, &upper)
+        clamp_slice_component(
+            slice_index_bigint(vm, slice.stop_value())?,
+            &length,
+            &lower,
+            &upper,
+        )
     };
 
     Ok(to_object_value(TupleObject::from_slice(&[
@@ -1344,11 +1356,7 @@ fn clamp_slice_component(
 ) -> BigInt {
     if value.is_negative() {
         value += length;
-        if value < *lower {
-            lower.clone()
-        } else {
-            value
-        }
+        if value < *lower { lower.clone() } else { value }
     } else if value > *upper {
         upper.clone()
     } else {
@@ -1390,8 +1398,9 @@ fn invoke_bound_method_no_args(
     match target.implicit_self {
         Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self])
             .map_err(runtime_error_to_builtin_error),
-        None => invoke_callable_value(vm, target.callable, &[])
-            .map_err(runtime_error_to_builtin_error),
+        None => {
+            invoke_callable_value(vm, target.callable, &[]).map_err(runtime_error_to_builtin_error)
+        }
     }
 }
 
@@ -3044,8 +3053,7 @@ fn collect_iterable_values_with_vm(
     let capacity = try_length_hint(vm, iterable, 0).map_err(runtime_error_to_builtin_error)?;
     let iterator = ensure_iterator_value(vm, iterable).map_err(runtime_error_to_builtin_error)?;
     let mut values = Vec::new();
-    reserve_advisory_length_hint(&mut values, capacity)
-        .map_err(runtime_error_to_builtin_error)?;
+    reserve_advisory_length_hint(&mut values, capacity).map_err(runtime_error_to_builtin_error)?;
 
     loop {
         match next_step(vm, iterator).map_err(runtime_error_to_builtin_error)? {
