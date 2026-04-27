@@ -30,7 +30,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{
     DictViewKind, DictViewObject, MappingProxyObject, MappingProxySource, UnionTypeObject,
 };
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::value_as_bytes_ref as value_as_bytes_object_ref;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::value_as_list_ref;
 use prism_runtime::types::range::RangeObject;
@@ -176,14 +176,7 @@ fn compare_numeric_values(left: Value, right: Value) -> Option<Ordering> {
 
 #[inline]
 fn value_as_bytes_ref(value: Value) -> Option<&'static [u8]> {
-    let ptr = value.as_object_ptr()?;
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    match header.type_id {
-        TypeId::BYTES | TypeId::BYTEARRAY => {
-            Some(unsafe { &*(ptr as *const BytesObject) }.as_bytes())
-        }
-        _ => None,
-    }
+    value_as_bytes_object_ref(value).map(|bytes| bytes.as_bytes())
 }
 
 #[inline]

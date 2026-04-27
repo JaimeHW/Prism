@@ -23,7 +23,7 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::complex::ComplexObject;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::float::value_to_f64;
@@ -2337,6 +2337,16 @@ impl<'vm> ReprState<'vm> {
         }
         if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
             return self.repr_set_container(ptr, type_id, set);
+        }
+        if let Some(bytes) = value_as_bytes_ref(value) {
+            return if bytes.is_bytearray() {
+                Ok(format!(
+                    "bytearray({})",
+                    quote_python_bytes(bytes.as_bytes())
+                ))
+            } else {
+                Ok(quote_python_bytes(bytes.as_bytes()))
+            };
         }
 
         match type_id {
