@@ -183,11 +183,18 @@ fn end_capture(args: &[Value]) -> Result<Value, BuiltinError> {
 pub(crate) fn emit_bool_invert_deprecation_warning(
     vm: &mut VirtualMachine,
 ) -> Result<(), RuntimeError> {
+    emit_deprecation_warning(vm, BOOL_INVERT_DEPRECATION_MESSAGE)
+}
+
+pub(crate) fn emit_deprecation_warning(
+    vm: &mut VirtualMachine,
+    message: &str,
+) -> Result<(), RuntimeError> {
     let context = WarningContext::capture(vm)?;
     emit_warning(
         vm,
         builtin_warning_category(ExceptionTypeId::DeprecationWarning)?,
-        BOOL_INVERT_DEPRECATION_MESSAGE,
+        message,
         &context,
     )
 }
