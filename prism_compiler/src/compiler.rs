@@ -1158,8 +1158,11 @@ impl Compiler {
                     .map(|d| self.compile_expr(d))
                     .collect::<Result<_, _>>()?;
 
-                // Step 2: Evaluate base classes into registers
+                // Step 2: Evaluate base classes and class-keyword expressions.
                 let base_count = bases.len();
+                let has_dynamic_bases = bases
+                    .iter()
+                    .any(|base| matches!(&base.kind, ExprKind::Starred(_)));
                 let explicit_metaclass = keywords
                     .iter()
                     .find(|keyword| keyword.arg.as_deref() == Some("metaclass"))
@@ -1168,16 +1171,54 @@ impl Compiler {
                     .iter()
                     .filter(|keyword| keyword.arg.as_deref() != Some("metaclass"))
                     .collect();
-                let base_count_u8 = u8::try_from(base_count).map_err(|_| CompileError {
+                let has_dynamic_keywords =
+                    class_keywords.iter().any(|keyword| keyword.arg.is_none());
+
+                let dynamic_bases_reg = if has_dynamic_bases {
+                    if bases.len() > 24 {
+                        return Err(CompileError {
+                            message:
+                                "class definition *bases unpack supports at most 24 source entries"
+                                    .to_string(),
+                            line: stmt_line,
+                            column: 0,
+                        });
+                    }
+                    let bases_reg = self.builder.alloc_register();
+                    self.compile_unpacking_sequence_literal(
+                        bases,
+                        bases_reg,
+                        stmt_line,
+                        SequenceLiteralKind::Tuple,
+                    )?;
+                    Some(bases_reg)
+                } else {
+                    None
+                };
+
+                let static_base_count = if has_dynamic_bases { 0 } else { base_count };
+                let static_keyword_count = if has_dynamic_keywords {
+                    0
+                } else {
+                    class_keywords.len()
+                };
+                let base_count_u8 = u8::try_from(static_base_count).map_err(|_| CompileError {
                     message: "class definition supports at most 255 base classes".to_string(),
                     line: stmt_line,
                     column: 0,
                 })?;
+                let static_keyword_count_u8 =
+                    u8::try_from(static_keyword_count).map_err(|_| CompileError {
+                        message: "class definition supports at most 255 keyword arguments"
+                            .to_string(),
+                        line: stmt_line,
+                        column: 0,
+                    })?;
                 let class_block_size = u8::try_from(
-                    base_count
+                    static_base_count
                         + 1
                         + usize::from(explicit_metaclass.is_some())
-                        + class_keywords.len(),
+                        + static_keyword_count,
                 )
                 .map_err(|_| CompileError {
                     message: "class definition requires more registers than the VM can encode"
@@ -1185,24 +1226,33 @@ impl Compiler {
                     line: stmt_line,
                     column: 0,
                 })?;
-                // Reserve the BUILD_CLASS register block up front and compile bases
-                // directly into their final positions. This avoids keeping a second
-                // layer of temporary base registers live under high register pressure.
                 let result_reg = self.builder.alloc_register_block(class_block_size);
-                for (index, base) in bases.iter().enumerate() {
-                    let base_dst = Register::new(result_reg.0 + 1 + index as u8);
-                    self.compile_expr_into(base, base_dst)?;
+                if !has_dynamic_bases {
+                    // Reserve the BUILD_CLASS register block up front and compile bases
+                    // directly into their final positions. This avoids keeping a second
+                    // layer of temporary base registers live under high register pressure.
+                    for (index, base) in bases.iter().enumerate() {
+                        let base_dst = Register::new(result_reg.0 + 1 + index as u8);
+                        self.compile_expr_into(base, base_dst)?;
+                    }
                 }
                 if let Some(metaclass_expr) = explicit_metaclass {
-                    let meta_dst = Register::new(result_reg.0 + 1 + base_count as u8);
+                    let meta_dst = Register::new(result_reg.0 + 1 + static_base_count as u8);
                     self.compile_expr_into(metaclass_expr, meta_dst)?;
                 }
-                let keyword_base =
-                    result_reg.0 + 1 + base_count as u8 + u8::from(explicit_metaclass.is_some());
-                for (index, keyword) in class_keywords.iter().enumerate() {
-                    let kw_dst = Register::new(keyword_base + index as u8);
-                    self.compile_expr_into(&keyword.value, kw_dst)?;
-                }
+                let dynamic_keywords_reg = if has_dynamic_keywords {
+                    Some(self.compile_class_keyword_mapping(&class_keywords, stmt_line)?)
+                } else {
+                    let keyword_base = result_reg.0
+                        + 1
+                        + static_base_count as u8
+                        + u8::from(explicit_metaclass.is_some());
+                    for (index, keyword) in class_keywords.iter().enumerate() {
+                        let kw_dst = Register::new(keyword_base + index as u8);
+                        self.compile_expr_into(&keyword.value, kw_dst)?;
+                    }
+                    None
+                };
 
                 // Step 3: Create the class body code object using builder-swap pattern
                 // Find the scope for this class from the symbol table
@@ -1299,14 +1349,40 @@ impl Compiler {
                 // Step 4: Emit BUILD_CLASS instruction
                 // BUILD_CLASS consumes bases from the contiguous block
                 // [result, base0, base1, ...].
-                if explicit_metaclass.is_some() {
-                    self.builder
-                        .emit_build_class_with_meta(result_reg, code_idx, base_count_u8);
-                } else {
-                    self.builder
-                        .emit_build_class(result_reg, code_idx, base_count_u8);
+                match (explicit_metaclass.is_some(), dynamic_bases_reg) {
+                    (true, Some(bases_reg)) => self.builder.emit_build_class_with_meta_ext(
+                        result_reg,
+                        code_idx,
+                        base_count_u8,
+                        Some(bases_reg),
+                        has_dynamic_keywords,
+                    ),
+                    (false, Some(bases_reg)) => self.builder.emit_build_class_ext(
+                        result_reg,
+                        code_idx,
+                        base_count_u8,
+                        Some(bases_reg),
+                        has_dynamic_keywords,
+                    ),
+                    (true, None) => self.builder.emit_build_class_with_meta_ext(
+                        result_reg,
+                        code_idx,
+                        base_count_u8,
+                        None,
+                        has_dynamic_keywords,
+                    ),
+                    (false, None) => self.builder.emit_build_class_ext(
+                        result_reg,
+                        code_idx,
+                        base_count_u8,
+                        None,
+                        has_dynamic_keywords,
+                    ),
                 }
-                if !class_keywords.is_empty() {
+                if let Some(kwargs_reg) = dynamic_keywords_reg {
+                    self.builder
+                        .emit(Instruction::new(Opcode::CallKwEx, kwargs_reg.0, 0, 0));
+                } else if static_keyword_count_u8 > 0 {
                     let names = class_keywords
                         .iter()
                         .map(|keyword| {
@@ -1326,10 +1402,16 @@ impl Compiler {
                     let kwnames_idx = self.builder.add_kwnames_tuple(names);
                     self.builder.emit(Instruction::new(
                         Opcode::CallKwEx,
-                        class_keywords.len() as u8,
+                        static_keyword_count_u8,
                         (kwnames_idx & 0xFF) as u8,
                         (kwnames_idx >> 8) as u8,
                     ));
+                }
+                if let Some(bases_reg) = dynamic_bases_reg {
+                    self.builder.free_register(bases_reg);
+                }
+                if let Some(kwargs_reg) = dynamic_keywords_reg {
+                    self.builder.free_register(kwargs_reg);
                 }
 
                 // Step 5: Apply decorators in reverse order
@@ -1856,6 +1938,80 @@ impl Compiler {
 
         self.builder.free_register_block(base_reg, count);
         Ok(())
+    }
+
+    fn compile_class_keyword_mapping(
+        &mut self,
+        keywords: &[&prism_parser::ast::Keyword],
+        line: u32,
+    ) -> CompileResult<Register> {
+        if keywords.is_empty() {
+            let dict_reg = self.builder.alloc_register();
+            self.builder.emit(Instruction::new(
+                Opcode::BuildDict,
+                dict_reg.0,
+                dict_reg.0,
+                0,
+            ));
+            return Ok(dict_reg);
+        }
+
+        if keywords.len() > 24 {
+            return Err(CompileError {
+                message: "class definition **kwargs unpack supports at most 24 keyword entries"
+                    .to_string(),
+                line,
+                column: 0,
+            });
+        }
+
+        // Materialize every header keyword as a mapping, then merge in source
+        // order. Static keywords become singleton dicts; **mapping entries are
+        // merged directly. Runtime class construction will consume "metaclass"
+        // specially without mutating the merged mapping.
+        let count = keywords.len() as u8;
+        let base_reg = self.builder.alloc_register_block(count);
+        let mut unpack_flags = 0_u32;
+
+        for (index, keyword) in keywords.iter().enumerate() {
+            let entry_reg = Register::new(base_reg.0 + index as u8);
+
+            if let Some(name) = keyword.arg.as_ref() {
+                let key_idx = self.builder.add_string(name);
+                let pair_base = self.builder.alloc_register_block(2);
+                let key_reg = pair_base;
+                let value_reg = Register::new(pair_base.0 + 1);
+                self.builder.emit_load_const(key_reg, key_idx);
+
+                let temp = self.compile_expr(&keyword.value)?;
+                if temp != value_reg {
+                    self.builder.emit_move(value_reg, temp);
+                }
+                self.builder.free_register(temp);
+
+                self.builder.emit(Instruction::new(
+                    Opcode::BuildDict,
+                    entry_reg.0,
+                    pair_base.0,
+                    1,
+                ));
+                self.builder.free_register_block(pair_base, 2);
+            } else {
+                let temp = self.compile_expr(&keyword.value)?;
+                if temp != entry_reg {
+                    self.builder.emit_move(entry_reg, temp);
+                }
+                self.builder.free_register(temp);
+            }
+
+            unpack_flags |= 1 << index;
+        }
+
+        let dict_reg = self.builder.alloc_register();
+        self.builder
+            .emit_build_dict_unpack(dict_reg, base_reg, count, unpack_flags);
+        self.builder.free_register_block(base_reg, count);
+        Ok(dict_reg)
     }
 
     fn parse_bigint_literal(literal: &str) -> Option<BigInt> {
