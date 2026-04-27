@@ -85,8 +85,9 @@ static BYTES_LSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.lstrip"), bytes_lstrip));
 static BYTES_RSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.rstrip"), bytes_rstrip));
-static BYTES_TRANSLATE_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytes.translate"), bytes_translate));
+static BYTES_TRANSLATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("bytes.translate"), bytes_translate_kw)
+});
 static BYTES_JOIN_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("bytes.join"), bytes_join_with_vm));
 static BYTES_FIND_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -202,7 +203,7 @@ static BYTEARRAY_LSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
 static BYTEARRAY_RSTRIP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.rstrip"), bytearray_rstrip));
 static BYTEARRAY_TRANSLATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("bytearray.translate"), bytearray_translate)
+    BuiltinFunctionObject::new_kw(Arc::from("bytearray.translate"), bytearray_translate_kw)
 });
 static BYTEARRAY_JOIN_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("bytearray.join"), bytearray_join_with_vm)
@@ -782,7 +783,15 @@ pub(super) fn bytes_rstrip(args: &[Value]) -> Result<Value, BuiltinError> {
 
 #[inline]
 pub(super) fn bytes_translate(args: &[Value]) -> Result<Value, BuiltinError> {
-    byte_sequence_translate(args, "bytes", expect_bytes_ref, TypeId::BYTES)
+    bytes_translate_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytes_translate_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_translate_kw(args, keywords, "bytes", expect_bytes_ref, TypeId::BYTES)
 }
 
 #[inline]
@@ -1055,7 +1064,21 @@ pub(super) fn bytearray_rstrip(args: &[Value]) -> Result<Value, BuiltinError> {
 
 #[inline]
 pub(super) fn bytearray_translate(args: &[Value]) -> Result<Value, BuiltinError> {
-    byte_sequence_translate(args, "bytearray", expect_bytearray_ref, TypeId::BYTEARRAY)
+    bytearray_translate_kw(args, &[])
+}
+
+#[inline]
+pub(super) fn bytearray_translate_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    byte_sequence_translate_kw(
+        args,
+        keywords,
+        "bytearray",
+        expect_bytearray_ref,
+        TypeId::BYTEARRAY,
+    )
 }
 
 #[inline]
@@ -2092,17 +2115,18 @@ fn strip_byte_bounds(
 }
 
 #[inline]
-fn byte_sequence_translate(
+fn byte_sequence_translate_kw(
     args: &[Value],
+    keywords: &[(&str, Value)],
     receiver_name: &'static str,
     receiver: fn(Value, &'static str) -> Result<&'static BytesObject, BuiltinError>,
     result_type: TypeId,
 ) -> Result<Value, BuiltinError> {
-    expect_method_arg_range(receiver_name, "translate", args, 1, 2)?;
+    let (table_arg, delete_arg) = bind_byte_translate_keyword_args(args, keywords, receiver_name)?;
 
     let bytes = receiver(args[0], "translate")?;
-    let table = parse_byte_translate_table(args[1])?;
-    let delete = parse_byte_delete_set(args.get(2).copied())?;
+    let table = parse_byte_translate_table(table_arg)?;
+    let delete = parse_byte_delete_set(delete_arg)?;
     let data = bytes.as_bytes();
     let mut translated = Vec::with_capacity(data.len());
     let mut changed = false;
@@ -2128,6 +2152,41 @@ fn byte_sequence_translate(
         translated,
         result_type,
     )))
+}
+
+fn bind_byte_translate_keyword_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+    receiver_name: &'static str,
+) -> Result<(Value, Option<Value>), BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given < 1 || given > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "{receiver_name}.translate() takes from 1 to 2 arguments ({given} given)"
+        )));
+    }
+
+    let table = args[1];
+    let mut delete = args.get(2).copied();
+    for (name, value) in keywords {
+        match *name {
+            "delete" => {
+                if delete.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "translate() got multiple values for argument 'delete'".to_string(),
+                    ));
+                }
+                delete = Some(*value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{receiver_name}.translate() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok((table, delete))
 }
 
 #[inline]
