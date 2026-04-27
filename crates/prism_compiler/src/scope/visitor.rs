@@ -2,6 +2,7 @@
 
 use super::symbol::{Scope, ScopeKind, SymbolFlags, SymbolTable};
 use crate::class_compiler::ClassCompiler;
+use crate::name_mangling::mangle_private_name;
 use prism_parser::ast::{Expr, ExprKind, Module, Pattern, PatternKind, Stmt, StmtKind};
 use std::sync::Arc;
 
@@ -9,6 +10,8 @@ use std::sync::Arc;
 pub struct ScopeAnalyzer {
     /// Stack of scopes being analyzed.
     scope_stack: Vec<Scope>,
+    /// Active class names used for private-name mangling.
+    private_context_stack: Vec<Arc<str>>,
 }
 
 impl ScopeAnalyzer {
@@ -16,6 +19,7 @@ impl ScopeAnalyzer {
     pub fn new() -> Self {
         Self {
             scope_stack: Vec::new(),
+            private_context_stack: Vec::new(),
         }
     }
 
@@ -45,6 +49,16 @@ impl ScopeAnalyzer {
         self.scope_stack.pop().expect("scope stack underflow")
     }
 
+    #[inline]
+    fn current_private_context(&self) -> Option<&str> {
+        self.private_context_stack.last().map(|name| name.as_ref())
+    }
+
+    #[inline]
+    fn mangle_current(&self, name: &str) -> Arc<str> {
+        Arc::from(mangle_private_name(self.current_private_context(), name).as_ref())
+    }
+
     /// Visit a statement.
     fn visit_stmt(&mut self, scope: &mut Scope, stmt: &Stmt) {
         match &stmt.kind {
@@ -65,8 +79,9 @@ impl ScopeAnalyzer {
                 ..
             } => {
                 // Function name is defined in enclosing scope
+                let binding_name = self.mangle_current(name);
+                scope.define(binding_name, SymbolFlags::DEF);
                 let name_arc: Arc<str> = name.clone().into();
-                scope.define(name_arc.clone(), SymbolFlags::DEF);
 
                 // Visit decorators in enclosing scope
                 for dec in decorator_list {
@@ -92,20 +107,20 @@ impl ScopeAnalyzer {
                 func_scope.kwonlyarg_count = args.kwonlyargs.len() as u16;
 
                 for arg in &args.posonlyargs {
-                    func_scope.define(arg.arg.clone(), SymbolFlags::PARAM);
+                    func_scope.define(self.mangle_current(arg.arg.as_ref()), SymbolFlags::PARAM);
                 }
                 for arg in &args.args {
-                    func_scope.define(arg.arg.clone(), SymbolFlags::PARAM);
+                    func_scope.define(self.mangle_current(arg.arg.as_ref()), SymbolFlags::PARAM);
                 }
                 if let Some(vararg) = &args.vararg {
-                    func_scope.define(vararg.arg.clone(), SymbolFlags::PARAM);
+                    func_scope.define(self.mangle_current(vararg.arg.as_ref()), SymbolFlags::PARAM);
                     func_scope.has_varargs = true;
                 }
                 for arg in &args.kwonlyargs {
-                    func_scope.define(arg.arg.clone(), SymbolFlags::PARAM);
+                    func_scope.define(self.mangle_current(arg.arg.as_ref()), SymbolFlags::PARAM);
                 }
                 if let Some(kwarg) = &args.kwarg {
-                    func_scope.define(kwarg.arg.clone(), SymbolFlags::PARAM);
+                    func_scope.define(self.mangle_current(kwarg.arg.as_ref()), SymbolFlags::PARAM);
                     func_scope.has_varkw = true;
                 }
 
@@ -146,8 +161,9 @@ impl ScopeAnalyzer {
                 ..
             } => {
                 // Class name is defined in enclosing scope
+                let binding_name = self.mangle_current(name);
+                scope.define(binding_name, SymbolFlags::DEF);
                 let name_arc: Arc<str> = name.clone().into();
-                scope.define(name_arc.clone(), SymbolFlags::DEF);
 
                 // Visit decorators in enclosing scope
                 for dec in decorator_list {
@@ -163,14 +179,16 @@ impl ScopeAnalyzer {
                 }
 
                 // Create class scope
-                let mut class_scope = Scope::new(ScopeKind::Class, name_arc);
+                let class_scope = Scope::new(ScopeKind::Class, name_arc.clone());
 
                 // Analyze class body
+                self.private_context_stack.push(name_arc.clone());
                 self.push_scope(class_scope);
                 for s in body {
                     self.visit_stmt_in_current(s);
                 }
                 let mut class_scope = self.pop_scope();
+                self.private_context_stack.pop();
 
                 if ClassCompiler::uses_zero_arg_super(body) {
                     class_scope.define("__class__", SymbolFlags::DEF);
@@ -278,7 +296,7 @@ impl ScopeAnalyzer {
                 }
                 for handler in handlers {
                     if let Some(name) = &handler.name {
-                        scope.define(name.clone(), SymbolFlags::DEF);
+                        scope.define(self.mangle_current(name.as_ref()), SymbolFlags::DEF);
                     }
                     if let Some(typ) = &handler.typ {
                         self.visit_expr(scope, typ);
@@ -297,13 +315,16 @@ impl ScopeAnalyzer {
 
             StmtKind::Global(names) => {
                 for name in names {
-                    scope.define(name.clone(), SymbolFlags::GLOBAL_EXPLICIT);
+                    scope.define(
+                        self.mangle_current(name.as_ref()),
+                        SymbolFlags::GLOBAL_EXPLICIT,
+                    );
                 }
             }
 
             StmtKind::Nonlocal(names) => {
                 for name in names {
-                    scope.define(name.clone(), SymbolFlags::NONLOCAL);
+                    scope.define(self.mangle_current(name.as_ref()), SymbolFlags::NONLOCAL);
                 }
             }
 
@@ -311,10 +332,10 @@ impl ScopeAnalyzer {
                 for alias in aliases {
                     let name = alias.asname.as_ref().unwrap_or(&alias.name);
                     // Get the first component of the module name
-                    let local_name: Arc<str> = if let Some(pos) = name.find('.') {
-                        name[..pos].into()
+                    let local_name = if let Some(pos) = name.find('.') {
+                        self.mangle_current(&name[..pos])
                     } else {
-                        name.clone().into()
+                        self.mangle_current(name.as_ref())
                     };
                     scope.define(local_name, SymbolFlags::DEF | SymbolFlags::IMPORTED);
                 }
@@ -323,7 +344,10 @@ impl ScopeAnalyzer {
             StmtKind::ImportFrom { names, .. } => {
                 for alias in names {
                     let name = alias.asname.as_ref().unwrap_or(&alias.name);
-                    scope.define(name.clone(), SymbolFlags::DEF | SymbolFlags::IMPORTED);
+                    scope.define(
+                        self.mangle_current(name.as_ref()),
+                        SymbolFlags::DEF | SymbolFlags::IMPORTED,
+                    );
                 }
             }
 
@@ -395,7 +419,7 @@ impl ScopeAnalyzer {
     fn visit_expr(&mut self, scope: &mut Scope, expr: &Expr) {
         match &expr.kind {
             ExprKind::Name(name) => {
-                scope.use_symbol(name.clone());
+                scope.use_symbol(self.mangle_current(name.as_ref()));
             }
 
             ExprKind::Lambda { args, body } => {
@@ -403,9 +427,28 @@ impl ScopeAnalyzer {
                 let mut lambda_scope = Scope::new(ScopeKind::Lambda, "<lambda>");
 
                 // Parameters
-                for arg in &args.args {
-                    lambda_scope.define(arg.arg.clone(), SymbolFlags::PARAM);
+                for arg in &args.posonlyargs {
+                    lambda_scope.define(self.mangle_current(arg.arg.as_ref()), SymbolFlags::PARAM);
                 }
+                for arg in &args.args {
+                    lambda_scope.define(self.mangle_current(arg.arg.as_ref()), SymbolFlags::PARAM);
+                }
+                if let Some(vararg) = &args.vararg {
+                    lambda_scope
+                        .define(self.mangle_current(vararg.arg.as_ref()), SymbolFlags::PARAM);
+                    lambda_scope.has_varargs = true;
+                }
+                for arg in &args.kwonlyargs {
+                    lambda_scope.define(self.mangle_current(arg.arg.as_ref()), SymbolFlags::PARAM);
+                }
+                if let Some(kwarg) = &args.kwarg {
+                    lambda_scope
+                        .define(self.mangle_current(kwarg.arg.as_ref()), SymbolFlags::PARAM);
+                    lambda_scope.has_varkw = true;
+                }
+                lambda_scope.arg_count = args.args.len() as u16 + args.posonlyargs.len() as u16;
+                lambda_scope.posonlyarg_count = args.posonlyargs.len() as u16;
+                lambda_scope.kwonlyarg_count = args.kwonlyargs.len() as u16;
 
                 // Defaults in enclosing scope
                 for default in &args.defaults {
@@ -593,7 +636,7 @@ impl ScopeAnalyzer {
                 // Named expression target is defined in enclosing non-comprehension scope
                 // For now, just define in current scope
                 if let ExprKind::Name(name) = &target.kind {
-                    scope.define(name.clone(), SymbolFlags::DEF);
+                    scope.define(self.mangle_current(name.as_ref()), SymbolFlags::DEF);
                 }
                 self.visit_expr(scope, value);
             }
@@ -638,7 +681,7 @@ impl ScopeAnalyzer {
     fn define_target(&mut self, scope: &mut Scope, target: &Expr) {
         match &target.kind {
             ExprKind::Name(name) => {
-                scope.define(name.clone(), SymbolFlags::DEF);
+                scope.define(self.mangle_current(name.as_ref()), SymbolFlags::DEF);
             }
             ExprKind::Tuple(elts) | ExprKind::List(elts) => {
                 for e in elts {
@@ -661,7 +704,7 @@ impl ScopeAnalyzer {
         match &pattern.kind {
             PatternKind::MatchAs { name, pattern } => {
                 if let Some(n) = name {
-                    scope.define(n.clone(), SymbolFlags::DEF);
+                    scope.define(self.mangle_current(n.as_ref()), SymbolFlags::DEF);
                 }
                 if let Some(p) = pattern {
                     self.visit_pattern_bindings(scope, p);
@@ -669,7 +712,7 @@ impl ScopeAnalyzer {
             }
             PatternKind::MatchStar(name) => {
                 if let Some(n) = name {
-                    scope.define(n.clone(), SymbolFlags::DEF);
+                    scope.define(self.mangle_current(n.as_ref()), SymbolFlags::DEF);
                 }
             }
             PatternKind::MatchSequence(patterns) => {
@@ -692,7 +735,7 @@ impl ScopeAnalyzer {
                     self.visit_pattern_bindings(scope, p);
                 }
                 if let Some(r) = rest {
-                    scope.define(r.clone(), SymbolFlags::DEF);
+                    scope.define(self.mangle_current(r.as_ref()), SymbolFlags::DEF);
                 }
                 for k in keys {
                     self.visit_expr(scope, k);

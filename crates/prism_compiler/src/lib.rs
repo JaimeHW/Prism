@@ -42,6 +42,7 @@ pub mod compiler;
 pub mod exception_compiler;
 pub mod function_compiler;
 pub mod match_compiler;
+mod name_mangling;
 pub mod scope;
 pub mod source;
 

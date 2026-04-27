@@ -10,6 +10,7 @@ use crate::bytecode::{
     CodeFlags, CodeObject, FunctionBuilder, Instruction, Label, LocalSlot, Opcode, Register,
 };
 use crate::function_compiler::{VarLocation, VariableEmitter};
+use crate::name_mangling::mangle_private_name;
 use crate::scope::{ClosureAnalyzer, ScopeAnalyzer, ScopeKind, SymbolFlags, SymbolTable};
 
 use num_bigint::BigInt;
@@ -295,6 +296,8 @@ pub struct Compiler {
     /// Per-scope child cursor for deterministic nested-scope lookup.
     /// Indexed by scope depth (`scope_path.len()`).
     scope_child_offsets: Vec<usize>,
+    /// Active class names used for CPython private-name mangling.
+    private_context_stack: Vec<Arc<str>>,
 }
 
 impl Compiler {
@@ -322,6 +325,7 @@ impl Compiler {
             module_namespace_mode: ModuleNamespaceMode::Standard,
             scope_path: Vec::new(),
             scope_child_offsets: vec![0],
+            private_context_stack: Vec::new(),
         }
     }
 
@@ -394,6 +398,7 @@ impl Compiler {
             module_namespace_mode,
             scope_path: Vec::new(),
             scope_child_offsets: vec![0],
+            private_context_stack: Vec::new(),
         };
 
         compiler.builder.set_filename(filename);
@@ -664,6 +669,16 @@ impl Compiler {
     fn emit_exception_type_attr(&mut self, dst: Register, exception: Register) {
         let class_name_idx = self.builder.add_name("__class__");
         self.builder.emit_get_attr(dst, exception, class_name_idx);
+    }
+
+    #[inline]
+    pub(super) fn current_private_context(&self) -> Option<&str> {
+        self.private_context_stack.last().map(|name| name.as_ref())
+    }
+
+    #[inline]
+    pub(super) fn mangle_identifier<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        mangle_private_name(self.current_private_context(), name)
     }
 
     /// Resolve a variable name to its location.
@@ -1310,6 +1325,7 @@ impl Compiler {
                 if let Some(scope_idx) = class_scope_idx {
                     self.enter_child_scope(scope_idx);
                 }
+                self.private_context_stack.push(Arc::from(name.as_ref()));
 
                 // CPython seeds every class body namespace with __module__ and
                 // __qualname__ before user statements execute.
@@ -1334,6 +1350,7 @@ impl Compiler {
                 if class_scope_idx.is_some() {
                     self.exit_child_scope();
                 }
+                self.private_context_stack.pop();
 
                 // Class body returns the namespace dict (implicit)
                 self.builder.emit_return_none();
@@ -1437,9 +1454,10 @@ impl Compiler {
                 }
 
                 // Step 6: Store the class in the enclosing scope
-                let location = self.resolve_variable(name);
+                let binding_name = self.mangle_identifier(name);
+                let location = self.resolve_variable(binding_name.as_ref());
                 self.builder
-                    .emit_store_var(location, result_reg, Some(name));
+                    .emit_store_var(location, result_reg, Some(binding_name.as_ref()));
                 self.builder
                     .free_register_block(result_reg, class_block_size);
             }
@@ -1461,8 +1479,9 @@ impl Compiler {
                         alias.name.split('.').next().unwrap_or(&alias.name)
                     };
 
+                    let binding_name = self.mangle_identifier(store_name);
                     let module_name_idx = self.builder.add_name(alias.name.clone());
-                    let store_name_idx = self.builder.add_name(store_name.to_string());
+                    let store_name_idx = self.builder.add_name(binding_name.to_string());
 
                     // Always import the full dotted name so parent packages and leaf
                     // modules are initialized and cached.
@@ -1482,7 +1501,7 @@ impl Compiler {
                     };
 
                     // Store the module in the appropriate scope
-                    match self.resolve_variable(store_name) {
+                    match self.resolve_variable(binding_name.as_ref()) {
                         VarLocation::Local(slot) => {
                             self.builder
                                 .emit_store_local(LocalSlot::new(slot as u16), value_reg);
@@ -1536,8 +1555,9 @@ impl Compiler {
 
                     for alias in names {
                         let local_name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        let binding_name = self.mangle_identifier(local_name.as_ref());
                         let attr_name_idx = self.builder.add_name(alias.name.clone());
-                        let store_name_idx = self.builder.add_name(local_name.clone());
+                        let store_name_idx = self.builder.add_name(binding_name.to_string());
 
                         // Emit ImportFrom: reg = module.attr
                         let attr_reg = self.builder.alloc_register();
@@ -1545,7 +1565,7 @@ impl Compiler {
                             .emit_import_from(attr_reg, mod_reg, attr_name_idx);
 
                         // Store in the appropriate scope
-                        match self.resolve_variable(local_name) {
+                        match self.resolve_variable(binding_name.as_ref()) {
                             VarLocation::Local(slot) => {
                                 self.builder
                                     .emit_store_local(LocalSlot::new(slot as u16), attr_reg);
@@ -1775,7 +1795,8 @@ impl Compiler {
                 annotations_location,
                 Some("__annotations__"),
             );
-            let key_idx = self.builder.add_string(name.as_str());
+            let name = self.mangle_identifier(name);
+            let key_idx = self.builder.add_string(name.as_ref());
             self.builder.emit_load_const(key_reg, key_idx);
             self.builder
                 .emit_set_item(annotations_reg, key_reg, value_reg);
@@ -2172,7 +2193,8 @@ impl Compiler {
 
             ExprKind::Name(name) => {
                 // Use scope-aware variable resolution
-                let location = self.resolve_variable(name);
+                let name = self.mangle_identifier(name);
+                let location = self.resolve_variable(name.as_ref());
                 self.builder
                     .emit_load_var(reg, location, Some(name.as_ref()));
             }
@@ -2396,7 +2418,8 @@ impl Compiler {
 
             ExprKind::Attribute { value, attr, .. } => {
                 let obj_reg = self.compile_expr(value)?;
-                let name_idx = self.builder.add_name(attr.clone());
+                let attr = self.mangle_identifier(attr);
+                let name_idx = self.builder.add_name(attr.to_string());
                 self.builder.emit_get_attr(reg, obj_reg, name_idx);
                 self.builder.free_register(obj_reg);
             }
@@ -3124,7 +3147,8 @@ impl Compiler {
         let self_reg = Register::new(method_reg.0 + 1);
 
         // Step 3: Emit LoadMethod - this populates method_reg and self_reg
-        let name_idx = self.builder.add_name(method_name);
+        let method_name = self.mangle_identifier(method_name);
+        let name_idx = self.builder.add_name(method_name.to_string());
         self.builder.emit_load_method(method_reg, obj_reg, name_idx);
 
         // Free the object register since LoadMethod copies self to self_reg
@@ -3162,7 +3186,8 @@ impl Compiler {
         match &target.kind {
             ExprKind::Name(name) => {
                 // Use scope-aware variable resolution
-                let location = self.resolve_variable(name);
+                let name = self.mangle_identifier(name);
+                let location = self.resolve_variable(name.as_ref());
                 self.builder
                     .emit_store_var(location, value, Some(name.as_ref()));
             }
@@ -3171,7 +3196,8 @@ impl Compiler {
                 value: obj, attr, ..
             } => {
                 let obj_reg = self.compile_expr(obj)?;
-                let name_idx = self.builder.add_name(attr.clone());
+                let attr = self.mangle_identifier(attr);
+                let name_idx = self.builder.add_name(attr.to_string());
                 self.builder.emit_set_attr(obj_reg, name_idx, value);
                 self.builder.free_register(obj_reg);
             }
@@ -3295,14 +3321,16 @@ impl Compiler {
     fn compile_delete_target(&mut self, target: &Expr) -> CompileResult<()> {
         match &target.kind {
             ExprKind::Name(name) => {
-                let location = self.resolve_variable(name);
-                self.builder.emit_delete_var(location, Some(name));
+                let name = self.mangle_identifier(name);
+                let location = self.resolve_variable(name.as_ref());
+                self.builder.emit_delete_var(location, Some(name.as_ref()));
             }
             ExprKind::Attribute {
                 value: obj, attr, ..
             } => {
                 let obj_reg = self.compile_expr(obj)?;
-                let name_idx = self.builder.add_name(attr.clone());
+                let attr = self.mangle_identifier(attr);
+                let name_idx = self.builder.add_name(attr.to_string());
                 self.builder.emit_del_attr(obj_reg, name_idx);
                 self.builder.free_register(obj_reg);
             }

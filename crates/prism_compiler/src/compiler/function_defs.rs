@@ -52,10 +52,10 @@ impl Compiler {
             });
         }
 
-        let mut entries: Vec<(&str, &Expr)> = Vec::new();
+        let mut entries: Vec<(String, &Expr)> = Vec::new();
         for (arg, default_expr) in kwonlyargs.iter().zip(kw_defaults.iter()) {
             if let Some(expr) = default_expr {
-                entries.push((arg.arg.as_str(), expr));
+                entries.push((self.mangle_identifier(arg.arg.as_ref()).to_string(), expr));
             }
         }
 
@@ -80,7 +80,7 @@ impl Compiler {
             let key_reg = Register::new(first_pair.0 + (i as u8 * 2));
             let value_reg = Register::new(key_reg.0 + 1);
 
-            let key_idx = self.builder.add_string(*name);
+            let key_idx = self.builder.add_string(name.as_str());
             self.builder.emit_load_const(key_reg, key_idx);
 
             let value_tmp = self.compile_expr(value_expr)?;
@@ -180,27 +180,27 @@ impl Compiler {
 
         // Position-only parameters
         for arg in &args.posonlyargs {
-            func_builder.define_local(arg.arg.as_str());
+            func_builder.define_local(self.mangle_identifier(arg.arg.as_ref()).to_string());
         }
 
         // Regular positional parameters
         for arg in &args.args {
-            func_builder.define_local(arg.arg.as_str());
+            func_builder.define_local(self.mangle_identifier(arg.arg.as_ref()).to_string());
         }
 
         // *args
         if let Some(ref vararg) = args.vararg {
-            func_builder.define_local(vararg.arg.as_str());
+            func_builder.define_local(self.mangle_identifier(vararg.arg.as_ref()).to_string());
         }
 
         // Keyword-only parameters
         for arg in &args.kwonlyargs {
-            func_builder.define_local(arg.arg.as_str());
+            func_builder.define_local(self.mangle_identifier(arg.arg.as_ref()).to_string());
         }
 
         // **kwargs
         if let Some(ref kwarg) = args.kwarg {
-            func_builder.define_local(kwarg.arg.as_str());
+            func_builder.define_local(self.mangle_identifier(kwarg.arg.as_ref()).to_string());
         }
 
         // Register non-cell locals from scope analysis so nested captures can
@@ -374,8 +374,10 @@ impl Compiler {
         }
 
         // Store function using lexical scope resolution.
-        let location = self.resolve_variable(name);
-        self.builder.emit_store_var(location, func_reg, Some(name));
+        let binding_name = self.mangle_identifier(name);
+        let location = self.resolve_variable(binding_name.as_ref());
+        self.builder
+            .emit_store_var(location, func_reg, Some(binding_name.as_ref()));
         self.builder.free_register(func_reg);
 
         Ok(())
@@ -539,19 +541,19 @@ impl Compiler {
 
         // Register parameters as locals
         for arg in &args.posonlyargs {
-            lambda_builder.define_local(arg.arg.as_str());
+            lambda_builder.define_local(self.mangle_identifier(arg.arg.as_ref()).to_string());
         }
         for arg in &args.args {
-            lambda_builder.define_local(arg.arg.as_str());
+            lambda_builder.define_local(self.mangle_identifier(arg.arg.as_ref()).to_string());
         }
         if let Some(ref vararg) = args.vararg {
-            lambda_builder.define_local(vararg.arg.as_str());
+            lambda_builder.define_local(self.mangle_identifier(vararg.arg.as_ref()).to_string());
         }
         for arg in &args.kwonlyargs {
-            lambda_builder.define_local(arg.arg.as_str());
+            lambda_builder.define_local(self.mangle_identifier(arg.arg.as_ref()).to_string());
         }
         if let Some(ref kwarg) = args.kwarg {
-            lambda_builder.define_local(kwarg.arg.as_str());
+            lambda_builder.define_local(self.mangle_identifier(kwarg.arg.as_ref()).to_string());
         }
 
         for name in lambda_locals {

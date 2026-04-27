@@ -167,7 +167,8 @@ impl Compiler {
 
                 // If handler has a name binding (except E as e:), store the exception
                 if let Some(name) = &handler.name {
-                    let location = self.resolve_variable(name);
+                    let name = self.mangle_identifier(name.as_ref());
+                    let location = self.resolve_variable(name.as_ref());
                     self.builder
                         .emit_store_var(location, exc_reg, Some(name.as_ref()));
                 }
@@ -182,7 +183,8 @@ impl Compiler {
                     let exc_reg = self.builder.alloc_register();
                     self.builder
                         .emit(Instruction::op_d(Opcode::LoadException, exc_reg));
-                    let location = self.resolve_variable(name);
+                    let name = self.mangle_identifier(name.as_ref());
+                    let location = self.resolve_variable(name.as_ref());
                     self.builder
                         .emit_store_var(location, exc_reg, Some(name.as_ref()));
                     self.builder.free_register(exc_reg);
@@ -984,13 +986,14 @@ impl Compiler {
                 // Bind the name if present (None means wildcard _)
                 if let Some(bound_name) = name {
                     // Use resolve_variable to properly handle scope
-                    match self.resolve_variable(bound_name) {
+                    let bound_name = self.mangle_identifier(bound_name.as_ref());
+                    match self.resolve_variable(bound_name.as_ref()) {
                         VarLocation::Local(slot) => {
                             self.builder
                                 .emit_store_local(LocalSlot::new(slot), subject_reg);
                         }
                         VarLocation::Global => {
-                            let name_idx = self.builder.add_name(Arc::from(bound_name.as_ref()));
+                            let name_idx = self.builder.add_name(bound_name.to_string());
                             self.builder.emit_store_global(name_idx, subject_reg);
                         }
                         VarLocation::Closure(slot) => {
