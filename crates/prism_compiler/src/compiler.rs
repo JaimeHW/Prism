@@ -1697,11 +1697,15 @@ impl Compiler {
                 self.compile_try(body, handlers, orelse, finalbody)?;
             }
 
-            StmtKind::TryStar { .. } => {
-                return Err(self.unsupported_stmt_error(
-                    stmt,
-                    "try/except* requires ExceptionGroup splitting semantics",
-                ));
+            StmtKind::TryStar {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                // Keep except* on the zero-cost exception-table path. Group-aware
+                // splitting belongs in the VM matcher, not in bytecode scaffolding.
+                self.compile_try(body, handlers, orelse, finalbody)?;
             }
 
             StmtKind::With { items, body } => {

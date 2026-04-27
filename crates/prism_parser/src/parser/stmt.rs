@@ -673,16 +673,34 @@ impl StmtParser {
         parser.expect(TokenKind::Colon, "expected ':'")?;
         let body = Self::parse_suite(parser)?;
 
-        let is_star = parser.check_keyword(KW::Except) && {
-            // Peek to see if it's 'except*'
-            false // Simplified - would need lookahead
-        };
-
         let mut handlers = Vec::new();
+        let mut saw_except = false;
+        let mut saw_except_star = false;
+
         while parser.match_keyword(KW::Except) {
             let handler_start = parser.previous().span.start;
+            let handler_is_star = parser.match_token(TokenKind::Star);
+
+            if handler_is_star {
+                saw_except_star = true;
+                if saw_except {
+                    return Err(parser.error_at_previous(
+                        "cannot have both 'except' and 'except*' on the same 'try'",
+                    ));
+                }
+            } else {
+                saw_except = true;
+                if saw_except_star {
+                    return Err(parser.error_at_previous(
+                        "cannot have both 'except' and 'except*' on the same 'try'",
+                    ));
+                }
+            }
 
             let (typ, name) = if parser.check(TokenKind::Colon) {
+                if handler_is_star {
+                    return Err(parser.error_at_current("expected expression after 'except*'"));
+                }
                 (None, None)
             } else {
                 let typ = Some(ExprParser::parse(parser, Precedence::Lowest)?);
@@ -719,7 +737,7 @@ impl StmtParser {
             Vec::new()
         };
 
-        let kind = if is_star {
+        let kind = if saw_except_star {
             StmtKind::TryStar {
                 body,
                 handlers,
