@@ -41,7 +41,7 @@ use prism_runtime::types::memoryview::{
 };
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::slice::SliceObject;
-use prism_runtime::types::string::{StringObject, clone_string_value};
+use prism_runtime::types::string::{StringObject, clone_string_value, value_as_string_ref};
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{LazyLock, Mutex};
@@ -1357,19 +1357,8 @@ fn dict_item_to_pair(item: Value, index: usize) -> Result<(Value, Value), Builti
 }
 
 fn attribute_name(name: Value) -> Result<InternedString, BuiltinError> {
-    if name.is_string() {
-        let ptr = name
-            .as_string_object_ptr()
-            .ok_or_else(|| BuiltinError::TypeError("attribute name must be string".to_string()))?;
-        return interned_by_ptr(ptr as *const u8)
-            .ok_or_else(|| BuiltinError::TypeError("attribute name must be string".to_string()));
-    }
-
-    if let Some(ptr) = name.as_object_ptr() {
-        if crate::ops::objects::extract_type_id(ptr) == TypeId::STR {
-            let string_obj = unsafe { &*(ptr as *const StringObject) };
-            return Ok(intern(string_obj.as_str()));
-        }
+    if let Some(string) = value_as_string_ref(name) {
+        return Ok(intern(string.as_str()));
     }
 
     Err(BuiltinError::TypeError(
