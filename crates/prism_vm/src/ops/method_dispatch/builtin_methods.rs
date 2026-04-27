@@ -64,7 +64,7 @@ use prism_runtime::types::memoryview::{
 use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::simd::search::{
-    bytes_count as simd_bytes_count, bytes_find as simd_bytes_find,
+    bytes_count as simd_bytes_count, bytes_find as simd_bytes_find, bytes_rfind as simd_bytes_rfind,
 };
 use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::{StringObject, StringValueRef, value_as_string_ref};
@@ -2972,12 +2972,18 @@ fn parse_slice_bound(
         return Ok(default);
     };
 
-    bound.as_int().map(|value| value as isize).ok_or_else(|| {
-        BuiltinError::TypeError(format!(
-            "{receiver_name}.{method_name}() slice indices must be integers, not '{}'",
-            bound.type_name()
-        ))
-    })
+    if bound.is_none() {
+        return Ok(default);
+    }
+
+    value_to_saturated_i64(bound)
+        .map(|value| value as isize)
+        .ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "{receiver_name}.{method_name}() slice indices must be integers, not '{}'",
+                bound.type_name()
+            ))
+        })
 }
 
 #[inline]

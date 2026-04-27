@@ -630,7 +630,7 @@ fn byte_sequence_find_like(
     let haystack = &bytes.as_bytes()[start..end];
     let offset = match direction {
         SearchDirection::Forward => simd_bytes_find(haystack, &needle),
-        SearchDirection::Reverse => byte_sequence_rfind(haystack, &needle),
+        SearchDirection::Reverse => simd_bytes_rfind(haystack, &needle),
     };
 
     match offset {
@@ -689,19 +689,20 @@ fn normalize_byte_search_bounds(
     receiver_name: &'static str,
     method_name: &'static str,
 ) -> Result<Option<(usize, usize)>, BuiltinError> {
-    let start = clamp_slice_index(
-        parse_slice_bound(args.get(2).copied(), 0, receiver_name, method_name)?,
-        len,
-    );
-    let end = clamp_slice_index(
-        parse_slice_bound(
-            args.get(3).copied(),
-            len as isize,
-            receiver_name,
-            method_name,
-        )?,
-        len,
-    );
+    let raw_start = parse_slice_bound(args.get(2).copied(), 0, receiver_name, method_name)?;
+    let len_bound = isize::try_from(len).unwrap_or(isize::MAX);
+    if raw_start > len_bound {
+        return Ok(None);
+    }
+
+    let raw_end = parse_slice_bound(
+        args.get(3).copied(),
+        len as isize,
+        receiver_name,
+        method_name,
+    )?;
+    let start = clamp_slice_index(raw_start, len);
+    let end = clamp_slice_index(raw_end, len);
 
     Ok((start <= end).then_some((start, end)))
 }
@@ -714,23 +715,6 @@ fn byte_sequence_missing_result(missing: MissingNeedle) -> Result<Value, Builtin
             Err(BuiltinError::ValueError("subsection not found".to_string()))
         }
     }
-}
-
-#[inline]
-fn byte_sequence_rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(haystack.len());
-    }
-    if needle.len() > haystack.len() {
-        return None;
-    }
-    if needle.len() == 1 {
-        return haystack.iter().rposition(|&byte| byte == needle[0]);
-    }
-
-    haystack
-        .windows(needle.len())
-        .rposition(|candidate| candidate == needle)
 }
 
 #[inline]
