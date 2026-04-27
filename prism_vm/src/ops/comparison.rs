@@ -405,8 +405,11 @@ fn dict_view_entries(view: &DictViewObject) -> Result<Vec<(Value, Value)>, Runti
         ));
     };
 
+    if let Some(dict) = crate::ops::objects::dict_storage_ref_from_ptr(ptr) {
+        return Ok(dict.iter().collect());
+    }
+
     match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
-        TypeId::DICT => Ok(unsafe { &*(ptr as *const DictObject) }.iter().collect()),
         TypeId::MAPPING_PROXY => {
             let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
             crate::builtins::builtin_mapping_proxy_entries_static(proxy)
@@ -1878,6 +1881,11 @@ pub(crate) fn contains_value(
                 return crate::builtins::builtin_mapping_proxy_contains_key(proxy, needle);
             }
 
+            TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => {
+                let view = unsafe { &*(ptr as *const DictViewObject) };
+                return dict_view_contains(vm, view, needle);
+            }
+
             // String: SIMD-accelerated substring search
             TypeId::STR => {
                 let haystack = unsafe { &*(ptr as *const StringObject) };
@@ -1955,6 +1963,95 @@ pub(crate) fn contains_value(
 
     // Inline types: integers, floats, bools cannot be containers
     Err(RuntimeError::type_error("argument of type is not iterable"))
+}
+
+fn dict_view_contains(
+    vm: &mut VirtualMachine,
+    view: &DictViewObject,
+    needle: Value,
+) -> Result<bool, RuntimeError> {
+    match view.kind() {
+        DictViewKind::Keys => dict_view_contains_key(vm, view, needle),
+        DictViewKind::Values => {
+            for (_, value) in dict_view_entries(view)? {
+                if contains_match(vm, needle, value)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        DictViewKind::Items => dict_items_view_contains(vm, view, needle),
+    }
+}
+
+fn dict_view_contains_key(
+    vm: &mut VirtualMachine,
+    view: &DictViewObject,
+    needle: Value,
+) -> Result<bool, RuntimeError> {
+    let Some(ptr) = view.dict().as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "invalid dictionary view backing object",
+        ));
+    };
+
+    if let Some(dict) = crate::ops::objects::dict_storage_ref_from_ptr(ptr) {
+        return crate::ops::dict_access::dict_contains_key(vm, dict, needle);
+    }
+
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::MAPPING_PROXY => {
+            let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+            crate::builtins::builtin_mapping_proxy_contains_key(proxy, needle)
+        }
+        _ => Err(RuntimeError::type_error(
+            "invalid dictionary view backing object",
+        )),
+    }
+}
+
+fn dict_items_view_contains(
+    vm: &mut VirtualMachine,
+    view: &DictViewObject,
+    needle: Value,
+) -> Result<bool, RuntimeError> {
+    let Some((needle_key, needle_value)) = dict_item_candidate(needle) else {
+        return Ok(false);
+    };
+    let Some(ptr) = view.dict().as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "invalid dictionary view backing object",
+        ));
+    };
+
+    if let Some(dict) = crate::ops::objects::dict_storage_ref_from_ptr(ptr) {
+        return match crate::ops::dict_access::dict_get_item(vm, dict, needle_key)? {
+            Some(value) => contains_match(vm, needle_value, value),
+            None => Ok(false),
+        };
+    }
+
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::MAPPING_PROXY => {
+            for (key, value) in dict_view_entries(view)? {
+                if contains_match(vm, needle_key, key)? && contains_match(vm, needle_value, value)?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Err(RuntimeError::type_error(
+            "invalid dictionary view backing object",
+        )),
+    }
+}
+
+#[inline]
+fn dict_item_candidate(value: Value) -> Option<(Value, Value)> {
+    let tuple = value_as_tuple_ref(value)?;
+    let values = tuple.as_slice();
+    (values.len() == 2).then_some((values[0], values[1]))
 }
 
 #[inline]
