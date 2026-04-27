@@ -1826,12 +1826,21 @@ pub fn builtin_ascii_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
 const MAX_REPR_DEPTH: usize = 64;
 
 #[derive(Default)]
-struct ReprState {
+struct ReprState<'vm> {
+    vm: Option<&'vm mut VirtualMachine>,
     active: SmallVec<[usize; 16]>,
     depth: usize,
 }
 
-impl ReprState {
+impl<'vm> ReprState<'vm> {
+    fn with_vm(vm: &'vm mut VirtualMachine) -> Self {
+        Self {
+            vm: Some(vm),
+            active: SmallVec::new(),
+            depth: 0,
+        }
+    }
+
     fn repr_value(&mut self, value: Value) -> Result<String, BuiltinError> {
         if self.depth >= MAX_REPR_DEPTH {
             return Err(BuiltinError::Raised(RuntimeError::recursion_error(
@@ -1872,6 +1881,9 @@ impl ReprState {
             return Ok(text);
         }
         if let Some(text) = crate::stdlib::_thread::native_thread_object_repr(value) {
+            return Ok(text);
+        }
+        if let Some(text) = self.repr_python_protocol(value)? {
             return Ok(text);
         }
 
@@ -1965,6 +1977,32 @@ impl ReprState {
                 type_id.name(),
                 ptr as usize
             )),
+        }
+    }
+
+    fn repr_python_protocol(&mut self, value: Value) -> Result<Option<String>, BuiltinError> {
+        if !should_use_python_repr_protocol(value) {
+            return Ok(None);
+        }
+
+        let Some(vm) = self.vm.as_deref_mut() else {
+            return Ok(None);
+        };
+
+        match resolve_special_method(value, "__repr__") {
+            Ok(target) => {
+                let rendered = invoke_zero_arg_bound_method(vm, target)
+                    .map_err(super::runtime_error_to_builtin_error)?;
+                let Some(text) = value_as_string_ref(rendered) else {
+                    return Err(BuiltinError::TypeError(format!(
+                        "__repr__ returned non-string (type {})",
+                        value_type_name(rendered)
+                    )));
+                };
+                Ok(Some(text.as_str().to_string()))
+            }
+            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => Ok(None),
+            Err(err) => Err(super::runtime_error_to_builtin_error(err)),
         }
     }
 
@@ -2176,25 +2214,7 @@ fn builtin_function_short_name(name: &str) -> &str {
 }
 
 fn repr_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<String, BuiltinError> {
-    if should_use_python_repr_protocol(value) {
-        match resolve_special_method(value, "__repr__") {
-            Ok(target) => {
-                let rendered = invoke_zero_arg_bound_method(vm, target)
-                    .map_err(super::runtime_error_to_builtin_error)?;
-                let Some(text) = value_as_string_ref(rendered) else {
-                    return Err(BuiltinError::TypeError(format!(
-                        "__repr__ returned non-string (type {})",
-                        value_type_name(rendered)
-                    )));
-                };
-                return Ok(text.as_str().to_string());
-            }
-            Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {}
-            Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
-        }
-    }
-
-    repr_value(value)
+    ReprState::with_vm(vm).repr_value(value)
 }
 
 #[inline]
