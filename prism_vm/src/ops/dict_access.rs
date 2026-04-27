@@ -10,7 +10,7 @@ use crate::builtins::hash_value_vm;
 use crate::error::RuntimeError;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::eq_result;
-use crate::ops::objects::{bind_instance_attribute_in_vm, extract_type_id};
+use crate::ops::objects::{bind_user_class_attribute_value_in_vm, extract_type_id};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::intern;
@@ -182,7 +182,8 @@ pub(crate) fn dict_missing_value(
         return Ok(None);
     };
 
-    let callable = bind_instance_attribute_in_vm(vm, slot.value, receiver)?;
+    let callable =
+        bind_user_class_attribute_value_in_vm(vm, slot.value, slot.defining_class, receiver)?;
     invoke_callable_value(vm, callable, &[key]).map(Some)
 }
 

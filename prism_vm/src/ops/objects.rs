@@ -315,7 +315,7 @@ fn bind_user_class_attribute_value(
 }
 
 #[inline]
-fn bind_user_class_attribute_value_in_vm(
+pub(crate) fn bind_user_class_attribute_value_in_vm(
     vm: &mut VirtualMachine,
     value: Value,
     defining_class: ClassId,

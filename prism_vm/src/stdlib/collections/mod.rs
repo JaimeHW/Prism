@@ -43,7 +43,8 @@ use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, get_iterator_mut, value_to_iterator};
 use crate::error::{RuntimeError, RuntimeErrorKind};
-use crate::ops::calls::invoke_callable_value;
+use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
+use crate::ops::dict_access::dict_set_item;
 use crate::ops::objects::{
     dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id, get_attribute_value,
     list_storage_ref_from_ptr, tuple_storage_ref_from_ptr,
@@ -157,6 +158,18 @@ static DEFAULTDICT_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("collections.defaultdict.__repr__"),
         defaultdict_repr,
+    )
+});
+static DEFAULTDICT_INIT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("collections.defaultdict.__init__"),
+        defaultdict_init,
+    )
+});
+static DEFAULTDICT_MISSING: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.defaultdict.__missing__"),
+        defaultdict_missing,
     )
 });
 static CHAINMAP_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -357,7 +370,11 @@ static DEFAULTDICT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
     build_native_collection_class(
         "defaultdict",
         &[ClassId(TypeId::DICT.raw())],
-        &[("__repr__", builtin_value(&DEFAULTDICT_REPR))],
+        &[
+            ("__init__", builtin_value(&DEFAULTDICT_INIT)),
+            ("__missing__", builtin_value(&DEFAULTDICT_MISSING)),
+            ("__repr__", builtin_value(&DEFAULTDICT_REPR)),
+        ],
     )
 });
 static CHAINMAP_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
@@ -1768,6 +1785,69 @@ fn ordered_dict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
     }
     out.push_str("])");
     Ok(Value::string(intern(&out)))
+}
+
+fn defaultdict_init(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "defaultdict.__init__() missing required argument 'self'".to_string(),
+        ));
+    }
+    if args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "defaultdict expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
+
+    let ptr = expect_bound_collection_receiver(args, "__init__")?;
+    let default_factory = args.get(1).copied().unwrap_or_else(Value::none);
+    if !default_factory.is_none() && !value_supports_call_protocol(default_factory) {
+        return Err(BuiltinError::TypeError(
+            "first argument must be callable or None".to_string(),
+        ));
+    }
+
+    {
+        let instance = expect_user_collection_from_ptr_mut(ptr, "__init__")?;
+        instance.set_property(intern("default_factory"), default_factory, shape_registry());
+    }
+
+    crate::ops::method_dispatch::dict_extend_with_vm_kw(
+        vm,
+        args[0],
+        args.get(2).copied(),
+        keywords,
+        "__init__",
+    )?;
+    Ok(Value::none())
+}
+
+fn defaultdict_missing(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "__missing__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let ptr = expect_bound_collection_receiver(args, "__missing__")?;
+    let default_factory = expect_user_collection_from_ptr(ptr, "__missing__")?
+        .get_property("default_factory")
+        .unwrap_or_else(Value::none);
+
+    if default_factory.is_none() {
+        return Err(BuiltinError::KeyError(collection_repr_text(args[1])?));
+    }
+
+    let value = invoke_callable_value(vm, default_factory, &[]).map_err(BuiltinError::Raised)?;
+    let dict = expect_collection_dict_mut_from_ptr(ptr, "__missing__")?;
+    dict_set_item(vm, dict, args[1], value).map_err(BuiltinError::Raised)?;
+    Ok(value)
 }
 
 fn defaultdict_repr(args: &[Value]) -> Result<Value, BuiltinError> {
