@@ -307,6 +307,12 @@ impl ExcInfoEntry {
         self.frame_id
     }
 
+    /// Updates the frame ID associated with this exception context.
+    #[inline]
+    pub fn set_frame_id(&mut self, frame_id: u32) {
+        self.frame_id = frame_id;
+    }
+
     /// Returns the program counter where exception was raised.
     #[inline]
     pub const fn pc(&self) -> u32 {
@@ -561,6 +567,17 @@ impl ExcInfoStack {
     #[inline]
     pub fn truncate(&mut self, depth: usize) {
         self.entries.truncate(depth);
+    }
+
+    /// Reassigns all entries to `frame_id`.
+    ///
+    /// This is used by suspended generators whose saved exception context is
+    /// restored onto a freshly pushed VM frame.
+    #[inline]
+    pub fn remap_all_frame_ids(&mut self, frame_id: u32) {
+        for entry in &mut self.entries {
+            entry.set_frame_id(frame_id);
+        }
     }
 }
 

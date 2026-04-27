@@ -36,6 +36,8 @@ use prism_code::{CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode};
 use prism_compiler::compile_source_code;
 use prism_core::intern::intern;
 use prism_core::{PrismResult, Value};
+use prism_gc::Trace;
+use prism_gc::trace::Tracer;
 use prism_runtime::allocation_context::{RuntimeHeapBinding, alloc_value_in_current_heap_or_box};
 use prism_runtime::object::class::ClassDict;
 use prism_runtime::object::mro::ClassId;
@@ -180,6 +182,42 @@ pub(crate) struct ExceptionContextSnapshot {
     active_exception_type_id: Option<u16>,
     exc_info_stack: ExcInfoStack,
     active_except_handlers: Vec<ActiveExceptHandler>,
+}
+
+impl ExceptionContextSnapshot {
+    #[inline]
+    pub(crate) fn empty() -> Self {
+        Self {
+            exc_state: ExceptionState::Normal,
+            handler_stack: HandlerStack::new(),
+            active_exception: None,
+            active_exception_type_id: None,
+            exc_info_stack: ExcInfoStack::new(),
+            active_except_handlers: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remap_all_frame_ids(&mut self, frame_id: u32) {
+        self.handler_stack.remap_all_frame_ids(frame_id);
+        self.exc_info_stack.remap_all_frame_ids(frame_id);
+        for handler in &mut self.active_except_handlers {
+            handler.frame_id = frame_id;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn trace_values(&self, tracer: &mut dyn Tracer) {
+        self.active_exception.trace(tracer);
+        for entry in self.exc_info_stack.iter_bottom_up() {
+            if let Some(value) = entry.value() {
+                value.trace(tracer);
+            }
+        }
+        for handler in &self.active_except_handlers {
+            handler.value.trace(tracer);
+        }
+    }
 }
 
 /// Deterministic interpreter execution budget.

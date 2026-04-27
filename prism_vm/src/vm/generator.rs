@@ -81,6 +81,14 @@ impl VirtualMachine {
         let caller_depth = self.frames.len();
         let caller_scratch_255 = self.frames[caller_idx].get_reg(255);
         let caller_exception_context = self.capture_exception_context();
+        let mut generator_exception_context = if prev_state == RuntimeGeneratorState::Suspended {
+            generator
+                .take_exception_context()
+                .unwrap_or_else(ExceptionContextSnapshot::empty)
+        } else {
+            generator.clear_exception_context();
+            ExceptionContextSnapshot::empty()
+        };
 
         let generator_module = self.module_from_globals_ptr(generator.module_ptr());
         let mut frame = self.acquire_frame(
@@ -117,6 +125,8 @@ impl VirtualMachine {
         self.frames.push(frame);
         self.set_current_frame_idx(self.frames.len() - 1);
         let generator_frame_idx = self.current_frame_idx;
+        generator_exception_context.remap_all_frame_ids(generator_frame_idx as u32);
+        self.restore_exception_context(generator_exception_context);
 
         let mut outcome: Option<GeneratorResumeOutcome> = None;
         let mut failure: Option<RuntimeError> = None;
@@ -243,6 +253,7 @@ impl VirtualMachine {
                             &frame.registers,
                             LivenessMap::ALL,
                         );
+                        generator.set_exception_context(self.capture_exception_context());
                         outcome = Some(GeneratorResumeOutcome::Yielded(value));
                         break 'exec;
                     }
@@ -314,16 +325,20 @@ impl VirtualMachine {
         }
         self.set_current_frame_idx(caller_idx);
         self.frames[caller_idx].set_reg(255, caller_scratch_255);
+        self.restore_exception_context(caller_exception_context);
 
         if let Some(err) = failure {
             generator.exhaust();
+            generator.clear_exception_context();
             return Err(err);
         }
 
-        self.restore_exception_context(caller_exception_context);
-
         match outcome {
-            Some(result) => Ok(result),
+            Some(result @ GeneratorResumeOutcome::Yielded(_)) => Ok(result),
+            Some(result @ GeneratorResumeOutcome::Returned(_)) => {
+                generator.clear_exception_context();
+                Ok(result)
+            }
             None => Err(RuntimeError::internal(
                 "generator resume exited without outcome",
             )),

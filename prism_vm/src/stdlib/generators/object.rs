@@ -146,6 +146,9 @@ pub struct GeneratorObject {
 
     /// Module globals backing this generator's code.
     module_ptr: *const (),
+
+    /// Exception state owned by this suspended generator.
+    exception_context: Option<crate::vm::ExceptionContextSnapshot>,
 }
 
 impl GeneratorObject {
@@ -167,6 +170,7 @@ impl GeneratorObject {
             receive_value: None,
             closure: None,
             module_ptr: std::ptr::null(),
+            exception_context: None,
         }
     }
 
@@ -185,6 +189,7 @@ impl GeneratorObject {
             receive_value: None,
             closure: None,
             module_ptr: std::ptr::null(),
+            exception_context: None,
         }
     }
 
@@ -397,6 +402,24 @@ impl GeneratorObject {
     // Flag Manipulation
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Takes the suspended exception context for VM resume.
+    #[inline]
+    pub(crate) fn take_exception_context(&mut self) -> Option<crate::vm::ExceptionContextSnapshot> {
+        self.exception_context.take()
+    }
+
+    /// Stores exception state captured at the current yield point.
+    #[inline]
+    pub(crate) fn set_exception_context(&mut self, context: crate::vm::ExceptionContextSnapshot) {
+        self.exception_context = Some(context);
+    }
+
+    /// Clears any suspended exception state after exhaustion or failure.
+    #[inline]
+    pub(crate) fn clear_exception_context(&mut self) {
+        self.exception_context = None;
+    }
+
     /// Sets the STARTED flag.
     #[inline]
     pub fn mark_started(&mut self) {
@@ -436,6 +459,7 @@ impl Clone for GeneratorObject {
             receive_value: self.receive_value,
             closure: self.closure.clone(),
             module_ptr: self.module_ptr,
+            exception_context: self.exception_context.clone(),
         }
     }
 }
@@ -469,6 +493,9 @@ unsafe impl Trace for GeneratorObject {
                     value.trace(tracer);
                 }
             }
+        }
+        if let Some(context) = &self.exception_context {
+            context.trace_values(tracer);
         }
     }
 }

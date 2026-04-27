@@ -282,6 +282,18 @@ impl HandlerStack {
         self.frames.truncate(depth);
     }
 
+    /// Reassigns all handler frames in this stack to `frame_id`.
+    ///
+    /// Suspended generators persist their handler stack independently of the
+    /// caller stack. When resumed, their VM frame may occupy a different index,
+    /// so the saved handler metadata must be rebound to the live frame id.
+    #[inline]
+    pub fn remap_all_frame_ids(&mut self, frame_id: u32) {
+        for frame in &mut self.frames {
+            frame.frame_id = frame_id;
+        }
+    }
+
     /// Returns the handler at the given index (0 = bottom).
     #[inline]
     pub fn get(&self, index: usize) -> Option<&HandlerFrame> {
