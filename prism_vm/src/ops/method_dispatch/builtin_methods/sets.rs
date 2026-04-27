@@ -221,7 +221,7 @@ pub(super) fn set_remove(args: &[Value]) -> Result<Value, BuiltinError> {
     if remove_set_probe(set, args[1])? {
         Ok(Value::none())
     } else {
-        Err(BuiltinError::KeyError(args[1].to_string()))
+        Err(key_error_for_value(args[1]))
     }
 }
 
@@ -665,6 +665,24 @@ fn remove_set_probe(set: &mut SetObject, probe: Value) -> Result<bool, BuiltinEr
 
     ensure_hashable(probe)?;
     Ok(set.remove(probe))
+}
+
+#[inline]
+fn key_error_for_value(key: Value) -> BuiltinError {
+    let exception = create_exception_with_args(
+        ExceptionTypeId::KeyError,
+        None,
+        vec![key].into_boxed_slice(),
+    );
+    let message = unsafe { ExceptionValue::from_value(exception) }
+        .map(|exception| exception.display_text())
+        .unwrap_or_else(|| "key not found".to_string());
+
+    BuiltinError::Raised(RuntimeError::raised_exception(
+        ExceptionTypeId::KeyError.as_u8() as u16,
+        exception,
+        message,
+    ))
 }
 
 #[inline]

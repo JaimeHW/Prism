@@ -9,8 +9,9 @@ use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, EXCEPTION_TYPE_ID, ExceptionTypeObject, ExceptionValue,
     builtin_hash, builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
     builtin_mapping_proxy_get_item_static, builtin_mapping_proxy_len,
-    builtin_not_implemented_value, get_exception_type, get_iterator_mut, iterator_to_value,
-    runtime_error_to_builtin_error, try_length_hint, value_to_iterator,
+    builtin_not_implemented_value, create_exception_with_args, get_exception_type,
+    get_iterator_mut, iterator_to_value, runtime_error_to_builtin_error, try_length_hint,
+    value_to_iterator,
 };
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
