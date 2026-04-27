@@ -11,6 +11,8 @@ use crate::types::list::{ListObject, value_as_list_ref};
 use crate::types::range::RangeIterator;
 use crate::types::string::StringObject;
 use crate::types::tuple::TupleObject;
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::{InternedString, interned_by_ptr};
 use std::fmt;
@@ -41,10 +43,23 @@ pub enum IteratorReduction {
     EmptyIterable(IteratorEmptyIterable),
     /// Reconstruct as `iter(iterable)` and optionally restore an index with
     /// `__setstate__`.
-    Iterable { iterable: Value, state: Option<i64> },
+    Iterable {
+        iterable: Value,
+        state: Option<BigInt>,
+    },
     /// Reconstruct as `reversed(iterable)` and optionally restore a reverse
     /// iterator index with `__setstate__`.
-    ReversedIterable { iterable: Value, state: Option<i64> },
+    ReversedIterable {
+        iterable: Value,
+        state: Option<BigInt>,
+    },
+    /// Reconstruct a range iterator without materializing remaining values.
+    Range {
+        start: BigInt,
+        stop: BigInt,
+        step: BigInt,
+        state: Option<BigInt>,
+    },
     /// Reconstruct as `iter(callable, sentinel)`.
     CallSentinel { callable: Value, sentinel: Value },
     /// Reconstruct from a snapshot list of remaining values.
@@ -887,12 +902,26 @@ impl IteratorObject {
     /// iterator. For lazy sequence iterators the next `__getitem__` decides
     /// whether the index is in range.
     pub fn set_state(&mut self, state: i64) {
-        let raw_state = state;
-        let state = raw_state.max(0);
+        self.set_state_bigint(&BigInt::from(state));
+    }
+
+    /// Restore an iterator position from an arbitrary-precision Python index.
+    pub fn set_state_bigint(&mut self, raw_state: &BigInt) {
+        let state_i64 = raw_state.to_i64().unwrap_or_else(|| {
+            if raw_state.sign() == num_bigint::Sign::Minus {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        });
+        let state = state_i64.max(0);
         let usize_state = usize::try_from(state).unwrap_or(usize::MAX);
         self.exhausted = false;
 
         match &mut self.kind {
+            IterKind::Range(iter) => {
+                self.exhausted = iter.set_state_bigint(raw_state);
+            }
             IterKind::List { list, index } => {
                 let len = list_from_value(*list).len();
                 *index = usize_state.min(len);
@@ -936,7 +965,7 @@ impl IteratorObject {
             }
             IterKind::SharedIterator { iterator } => {
                 if let Some(iter) = native_iterator_from_value_mut(*iterator) {
-                    iter.set_state(state);
+                    iter.set_state_bigint(raw_state);
                     self.exhausted = iter.is_exhausted();
                 }
             }
@@ -953,7 +982,7 @@ impl IteratorObject {
                 reverse_index,
             } => {
                 let len = list_from_value(*list).len();
-                if raw_state < 0 || len == 0 {
+                if raw_state.sign() == num_bigint::Sign::Minus || len == 0 {
                     *reverse_index = 0;
                     self.exhausted = true;
                 } else {
@@ -982,9 +1011,13 @@ impl IteratorObject {
                 if self.exhausted {
                     return Ok(IteratorReduction::RemainingValues(Vec::new()));
                 }
-                Ok(IteratorReduction::RemainingValues(
-                    iter.clone().collect::<Vec<_>>(),
-                ))
+                let (start, stop, step) = iter.bounds_bigint();
+                Ok(IteratorReduction::Range {
+                    start,
+                    stop,
+                    step,
+                    state: Some(iter.state_bigint()),
+                })
             }
             IterKind::Count { .. }
             | IterKind::Repeat {
@@ -1004,7 +1037,7 @@ impl IteratorObject {
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *list,
-                    state: Some(i64::try_from(*index).unwrap_or(i64::MAX)),
+                    state: Some(BigInt::from(*index)),
                 })
             }
             IterKind::Tuple { tuple, index } => {
@@ -1015,7 +1048,7 @@ impl IteratorObject {
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *tuple,
-                    state: Some(i64::try_from(*index).unwrap_or(i64::MAX)),
+                    state: Some(BigInt::from(*index)),
                 })
             }
             IterKind::StringChars {
@@ -1032,7 +1065,7 @@ impl IteratorObject {
                 let char_index = text[..(*byte_offset).min(text.len())].chars().count();
                 Ok(IteratorReduction::Iterable {
                     iterable: *string,
-                    state: Some(i64::try_from(char_index).unwrap_or(i64::MAX)),
+                    state: Some(BigInt::from(char_index)),
                 })
             }
             IterKind::Bytes { bytes, index } => {
@@ -1043,7 +1076,7 @@ impl IteratorObject {
                 }
                 Ok(IteratorReduction::Iterable {
                     iterable: *bytes,
-                    state: Some(i64::try_from(*index).unwrap_or(i64::MAX)),
+                    state: Some(BigInt::from(*index)),
                 })
             }
             IterKind::Values { values, index } => Ok(IteratorReduction::RemainingValues(
@@ -1078,7 +1111,7 @@ impl IteratorObject {
                 )),
                 Some(iterable) => Ok(IteratorReduction::Iterable {
                     iterable: *iterable,
-                    state: Some(*index),
+                    state: Some(BigInt::from(*index)),
                 }),
                 None => Ok(IteratorReduction::RequiresVm(
                     "unbound sequence iterator cannot be reduced",
@@ -1134,7 +1167,7 @@ impl IteratorObject {
                 }
                 Ok(IteratorReduction::ReversedIterable {
                     iterable: *list,
-                    state: Some(i64::try_from(*reverse_index).unwrap_or(i64::MAX) - 1),
+                    state: Some(BigInt::from(reverse_index.saturating_sub(1))),
                 })
             }
             IterKind::GuardedReversedValues {

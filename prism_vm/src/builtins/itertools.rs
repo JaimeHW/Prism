@@ -7,6 +7,7 @@ use crate::stdlib::collections::deque::{DequeObject, value_as_deque};
 use num_bigint::BigInt;
 use num_traits::{One, Zero};
 use prism_core::Value;
+use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::value_as_list_ref;
 use prism_runtime::types::range::RangeObject;
@@ -558,6 +559,12 @@ pub fn builtin_reversed(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
+    if let Some(range) = value_as_range_ref(args[0]) {
+        let reversed =
+            prism_runtime::types::iter::IteratorObject::from_range(range.reverse().iter());
+        return Ok(super::iter_dispatch::iterator_to_value(reversed));
+    }
+
     if value_as_list_ref(args[0]).is_some() {
         let reversed = prism_runtime::types::iter::IteratorObject::reversed_list(args[0]);
         return Ok(super::iter_dispatch::iterator_to_value(reversed));
@@ -581,6 +588,13 @@ pub fn builtin_reversed(args: &[Value]) -> Result<Value, BuiltinError> {
     // Create reversed iterator
     let reversed = prism_runtime::types::iter::IteratorObject::reversed(values);
     Ok(super::iter_dispatch::iterator_to_value(reversed))
+}
+
+#[inline]
+fn value_as_range_ref(value: Value) -> Option<&'static RangeObject> {
+    let ptr = value.as_object_ptr()?;
+    let header = unsafe { &*(ptr as *const prism_runtime::object::ObjectHeader) };
+    (header.type_id == TypeId::RANGE).then(|| unsafe { &*(ptr as *const RangeObject) })
 }
 
 #[inline]

@@ -2748,6 +2748,20 @@ fn iterator_reduce(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
         IteratorReduction::ReversedIterable { iterable, state } => {
             reduce_tuple(vm, reducer_builtin, &[iterable], state)
         }
+        IteratorReduction::Range {
+            start,
+            stop,
+            step,
+            state,
+        } => {
+            let range = alloc_heap_value(
+                vm,
+                RangeObject::from_bigints(start, stop, step),
+                "iterator reduce range",
+            )
+            .map_err(runtime_error_to_builtin_error)?;
+            reduce_tuple(vm, reducer_builtin, &[range], state)
+        }
         IteratorReduction::CallSentinel { callable, sentinel } => {
             reduce_tuple(vm, reducer_builtin, &[callable, sentinel], None)
         }
@@ -2768,11 +2782,11 @@ fn iterator_reduce(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
 
 fn iterator_setstate(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("iterator", "__setstate__", args, 1)?;
-    let state = expect_integer_like_index(args[1])?;
+    let state = iterator_state_index(args[1])?;
     let iter = get_iterator_mut(&args[0]).ok_or_else(|| {
         BuiltinError::TypeError("'iterator' object is not an iterator".to_string())
     })?;
-    iter.set_state(state);
+    iter.set_state_bigint(&state);
     Ok(Value::none())
 }
 
@@ -2839,7 +2853,7 @@ fn reduce_tuple(
     vm: &mut VirtualMachine,
     callable: Value,
     call_args: &[Value],
-    state: Option<i64>,
+    state: Option<BigInt>,
 ) -> Result<Value, BuiltinError> {
     let args_tuple = alloc_heap_value(
         vm,
@@ -2850,7 +2864,7 @@ fn reduce_tuple(
 
     let values = match state {
         Some(state) => {
-            let state_value = bigint_to_value(state.into());
+            let state_value = bigint_to_value(state);
             [callable, args_tuple, state_value].to_vec()
         }
         None => [callable, args_tuple].to_vec(),
@@ -3318,6 +3332,21 @@ fn expect_integer_like_index(value: Value) -> Result<i64, BuiltinError> {
 
     if let Some(boolean) = value.as_bool() {
         return Ok(if boolean { 1 } else { 0 });
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        value.type_name()
+    )))
+}
+
+#[inline]
+fn iterator_state_index(value: Value) -> Result<BigInt, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(BigInt::from(u8::from(boolean)));
+    }
+    if let Some(index) = value_to_bigint(value) {
+        return Ok(index);
     }
 
     Err(BuiltinError::TypeError(format!(

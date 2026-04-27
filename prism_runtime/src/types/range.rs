@@ -311,11 +311,13 @@ impl RangeObject {
     pub fn iter(&self) -> RangeIterator {
         match &self.repr {
             RangeRepr::Small { start, stop, step } => RangeIterator::Small {
+                start: *start,
                 current: *start,
                 stop: *stop,
                 step: *step,
             },
             RangeRepr::Big { start, stop, step } => RangeIterator::Big {
+                start: start.clone(),
                 current: start.clone(),
                 stop: stop.clone(),
                 step: step.clone(),
@@ -346,37 +348,10 @@ impl RangeObject {
             return RangeObject::new(0, 0, 1);
         }
 
-        match &self.repr {
-            RangeRepr::Small {
-                start,
-                stop: _,
-                step,
-            } => {
-                let len = small_len(*start, self.stop_i64().unwrap(), *step);
-                let last = self.get((len - 1) as i64).unwrap();
-                RangeObject::from_bigints(
-                    BigInt::from(last),
-                    BigInt::from(*start) - BigInt::from(*step),
-                    -BigInt::from(*step),
-                )
-            }
-            RangeRepr::Big {
-                start,
-                stop: _,
-                step,
-            } => {
-                let len = big_len(
-                    start,
-                    match &self.repr {
-                        RangeRepr::Big { stop, .. } => stop,
-                        RangeRepr::Small { .. } => unreachable!(),
-                    },
-                    step,
-                );
-                let last = start + (&len - BigInt::one()) * step;
-                RangeObject::from_bigints(last, start - step, -step.clone())
-            }
-        }
+        let step = self.step_bigint();
+        let len = self.len_bigint();
+        let last = self.value_at_index_bigint(&(len - BigInt::one()));
+        RangeObject::from_bigints(last, self.start_bigint() - &step, -step)
     }
 
     /// Materialize the range into a vector of Python values.
@@ -456,11 +431,13 @@ impl PyObject for RangeObject {
 #[derive(Clone, Debug)]
 pub enum RangeIterator {
     Small {
+        start: i64,
         current: i64,
         stop: i64,
         step: i64,
     },
     Big {
+        start: BigInt,
         current: BigInt,
         stop: BigInt,
         step: BigInt,
@@ -473,15 +450,98 @@ impl RangeIterator {
     pub fn remaining_len(&self) -> Option<usize> {
         match self {
             Self::Small {
+                start: _,
                 current,
                 stop,
                 step,
             } => Some(small_len(*current, *stop, *step)),
             Self::Big {
+                start: _,
                 current,
                 stop,
                 step,
             } => big_len(current, stop, step).to_usize(),
+        }
+    }
+
+    /// Return the original range bounds represented by this iterator.
+    #[inline]
+    pub fn bounds_bigint(&self) -> (BigInt, BigInt, BigInt) {
+        match self {
+            Self::Small {
+                start, stop, step, ..
+            } => (
+                BigInt::from(*start),
+                BigInt::from(*stop),
+                BigInt::from(*step),
+            ),
+            Self::Big {
+                start, stop, step, ..
+            } => (start.clone(), stop.clone(), step.clone()),
+        }
+    }
+
+    /// Return the current zero-based iterator position.
+    #[inline]
+    pub fn state_bigint(&self) -> BigInt {
+        match self {
+            Self::Small {
+                start,
+                current,
+                step,
+                ..
+            } => (BigInt::from(*current) - BigInt::from(*start)) / BigInt::from(*step),
+            Self::Big {
+                start,
+                current,
+                step,
+                ..
+            } => (current - start) / step,
+        }
+    }
+
+    /// Restore an absolute iterator position and report whether it is exhausted.
+    pub fn set_state_bigint(&mut self, raw_state: &BigInt) -> bool {
+        let state = if raw_state.is_negative() {
+            BigInt::zero()
+        } else {
+            raw_state.clone()
+        };
+
+        match self {
+            Self::Small {
+                start,
+                current,
+                stop,
+                step,
+            } => {
+                let len = BigInt::from(small_len(*start, *stop, *step));
+                if state >= len {
+                    *current = *stop;
+                    return true;
+                }
+
+                let next = BigInt::from(*start) + state * BigInt::from(*step);
+                *current = next
+                    .to_i64()
+                    .expect("valid compact range element should fit in i64");
+                false
+            }
+            Self::Big {
+                start,
+                current,
+                stop,
+                step,
+            } => {
+                let len = big_len(start, stop, step);
+                if state >= len {
+                    *current = stop.clone();
+                    return true;
+                }
+
+                *current = start.clone() + state * step.clone();
+                false
+            }
         }
     }
 }
@@ -492,6 +552,7 @@ impl Iterator for RangeIterator {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Small {
+                start: _,
                 current,
                 stop,
                 step,
@@ -507,6 +568,7 @@ impl Iterator for RangeIterator {
                 Some(bigint_to_value(BigInt::from(value)))
             }
             Self::Big {
+                start: _,
                 current,
                 stop,
                 step,

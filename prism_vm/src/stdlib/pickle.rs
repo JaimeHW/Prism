@@ -836,9 +836,8 @@ fn restore_reduce_state(
 ) -> Result<(), BuiltinError> {
     if let Some(iter) = get_iterator_mut(&object) {
         let state = value_to_bigint(state)
-            .and_then(|value| value.to_i64())
             .ok_or_else(|| invalid_pickle("iterator reducer state is not an integer"))?;
-        iter.set_state(state);
+        iter.set_state_bigint(&state);
         return Ok(());
     }
 
