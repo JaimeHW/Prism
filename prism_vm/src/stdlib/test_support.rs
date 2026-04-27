@@ -115,6 +115,12 @@ static REQUIRES_DOCSTRINGS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock:
         identity_decorator,
     )
 });
+static REQUIRES_IEEE_754_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.requires_IEEE_754"),
+        identity_decorator,
+    )
+});
 static REQUIRES_RESOURCE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("test.support.requires_resource"),
@@ -285,6 +291,7 @@ impl SupportModule {
                 Arc::from("requires_resource"),
                 Arc::from("requires_limited_api"),
                 Arc::from("requires_docstrings"),
+                Arc::from("requires_IEEE_754"),
                 Arc::from("run_with_locale"),
                 Arc::from("run_with_locales"),
                 Arc::from("skip_if_pgo_task"),
@@ -345,6 +352,7 @@ impl Module for SupportModule {
             "requires_resource" => Ok(builtin_value(&REQUIRES_RESOURCE_FUNCTION)),
             "requires_limited_api" => Ok(builtin_value(&REQUIRES_LIMITED_API_FUNCTION)),
             "requires_docstrings" => Ok(builtin_value(&REQUIRES_DOCSTRINGS_FUNCTION)),
+            "requires_IEEE_754" => Ok(builtin_value(&REQUIRES_IEEE_754_FUNCTION)),
             "run_with_locale" => Ok(builtin_value(&RUN_WITH_LOCALE_FUNCTION)),
             "run_with_locales" => Ok(builtin_value(&RUN_WITH_LOCALES_FUNCTION)),
             "skip_if_pgo_task" => Ok(builtin_value(&SKIP_IF_PGO_TASK_FUNCTION)),
