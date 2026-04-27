@@ -202,13 +202,19 @@ pub fn load_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             return apply_cached_method(vm, dst, obj, cached);
         }
 
-        // Resolve method on primitive type
-        match resolve_primitive_method(obj, prim_type_id, &name) {
+        // Resolve cacheable primitive builtin methods first. Attribute fallback
+        // may materialize a value bound to the receiver, so it must not enter
+        // the global type+name cache.
+        match resolve_primitive_method(prim_type_id, &name) {
             Ok(cached) => {
                 method_cache().insert(prim_type_id, name_ptr, cache_version, cached);
                 apply_cached_method(vm, dst, obj, cached)
             }
-            Err(e) => ControlFlow::Error(e),
+            Err(err) => match resolve_primitive_fallback_target(obj, prim_type_id, &name) {
+                Ok(Some(bound)) => apply_bound_method_target(vm, dst, bound),
+                Ok(None) => ControlFlow::Error(err),
+                Err(fallback) => ControlFlow::Error(fallback),
+            },
         }
     }
 }
@@ -313,8 +319,13 @@ pub(crate) fn resolve_special_method(
     }
 
     let type_id = get_primitive_type_id(obj);
-    let cached = resolve_primitive_method(obj, type_id, name)?;
-    Ok(bind_cached_method_target(obj, cached))
+    match resolve_primitive_method(type_id, name) {
+        Ok(cached) => Ok(bind_cached_method_target(obj, cached)),
+        Err(err) => match resolve_primitive_fallback_target(obj, type_id, name)? {
+            Some(bound) => Ok(bound),
+            None => Err(err),
+        },
+    }
 }
 
 fn resolve_type_object_special_method(
@@ -553,24 +564,22 @@ fn resolve_type_object_method(obj: Value, name: &str) -> Result<CachedMethod, Ru
 }
 
 /// Resolve a method on a primitive value.
-fn resolve_primitive_method(
-    obj: Value,
-    type_id: TypeId,
-    name: &str,
-) -> Result<CachedMethod, RuntimeError> {
-    let direct = match type_id {
+fn resolve_primitive_method(type_id: TypeId, name: &str) -> Result<CachedMethod, RuntimeError> {
+    match type_id {
         TypeId::STR => resolve_str_method(name),
         TypeId::INT => resolve_int_method(name),
         TypeId::FLOAT => resolve_float_method(name),
         TypeId::BOOL => resolve_bool_method(name),
         TypeId::NONE => Err(RuntimeError::attribute_error("NoneType", name)),
         _ => Err(RuntimeError::attribute_error(type_id.name(), name)),
-    };
-
-    if direct.is_ok() {
-        return direct;
     }
+}
 
+fn resolve_primitive_fallback_target(
+    obj: Value,
+    type_id: TypeId,
+    name: &str,
+) -> Result<Option<BoundMethodTarget>, RuntimeError> {
     let interned_name = prism_core::intern::intern(name);
     for class_id in builtin_class_mro(type_id) {
         let builtin_owner = class_id_to_type_id(class_id);
@@ -579,11 +588,14 @@ fn resolve_primitive_method(
             obj,
             &interned_name,
         )? {
-            return Ok(CachedMethod::descriptor(value));
+            return Ok(Some(BoundMethodTarget {
+                callable: value,
+                implicit_self: None,
+            }));
         }
     }
 
-    direct
+    Ok(None)
 }
 
 // =============================================================================
@@ -766,6 +778,10 @@ fn resolve_int_method(name: &str) -> Result<CachedMethod, RuntimeError> {
 
 /// Resolve builtin float methods.
 fn resolve_float_method(name: &str) -> Result<CachedMethod, RuntimeError> {
+    if let Some(cached) = builtin_methods::resolve_float_method(name) {
+        return Ok(cached);
+    }
+
     match name {
         "is_integer" | "hex" | "fromhex" | "conjugate" | "real" | "imag" => Err(
             RuntimeError::attribute_error("float", format!("{} (not yet implemented)", name)),
