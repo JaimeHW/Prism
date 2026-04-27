@@ -18,6 +18,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::{InternedString, interned_by_ptr};
+use smallvec::SmallVec;
 use std::fmt;
 
 /// Host-provided fast mutation token reader for guarded snapshot iterators.
@@ -137,6 +138,141 @@ fn create_tuple_pair_values(key: Value, value: Value) -> Value {
     let tuple = TupleObject::from_slice(&[key, value]);
     let ptr = Box::leak(Box::new(tuple)) as *mut TupleObject as *const ();
     Value::object_ptr(ptr)
+}
+
+const COMBINATORIC_SMALL_INDEX: usize = 8;
+type CombinatoricIndexVec = SmallVec<[usize; COMBINATORIC_SMALL_INDEX]>;
+
+#[inline]
+fn checked_binomial(n: usize, k: usize) -> Option<usize> {
+    if k > n {
+        return Some(0);
+    }
+
+    let k = k.min(n - k);
+    let mut result = 1u128;
+    for i in 1..=k {
+        result = (result * (n - k + i) as u128) / i as u128;
+        if result > usize::MAX as u128 {
+            return None;
+        }
+    }
+
+    Some(result as usize)
+}
+
+#[inline]
+fn decrement_remaining(remaining: &mut Option<usize>) {
+    if let Some(value) = remaining {
+        *value = value.saturating_sub(1);
+    }
+}
+
+#[inline]
+fn create_tuple_from_indices(pool: &[Value], indices: &[usize]) -> Value {
+    create_tuple_from_values(indices.iter().map(|&index| pool[index]).collect())
+}
+
+#[inline]
+fn initial_combination_indices(r: usize) -> CombinatoricIndexVec {
+    let mut indices = CombinatoricIndexVec::with_capacity(r);
+    indices.extend(0..r);
+    indices
+}
+
+#[inline]
+fn initial_repeated_combination_indices(r: usize) -> CombinatoricIndexVec {
+    let mut indices = CombinatoricIndexVec::with_capacity(r);
+    indices.resize(r, 0);
+    indices
+}
+
+fn collect_remaining_combinations(
+    pool: &[Value],
+    indices: &[usize],
+    r: usize,
+    first: bool,
+    exhausted: bool,
+) -> Vec<Value> {
+    if exhausted {
+        return Vec::new();
+    }
+
+    let mut indices: CombinatoricIndexVec = indices.iter().copied().collect();
+    let mut first = first;
+    let mut values = Vec::new();
+
+    loop {
+        if first {
+            first = false;
+            values.push(create_tuple_from_indices(pool, &indices));
+            if r == 0 {
+                return values;
+            }
+            continue;
+        }
+
+        let mut i = r;
+        loop {
+            if i == 0 {
+                return values;
+            }
+            i -= 1;
+            if indices[i] != i + pool.len() - r {
+                break;
+            }
+        }
+
+        indices[i] += 1;
+        for j in i + 1..r {
+            indices[j] = indices[j - 1] + 1;
+        }
+        values.push(create_tuple_from_indices(pool, &indices));
+    }
+}
+
+fn collect_remaining_repeated_combinations(
+    pool: &[Value],
+    indices: &[usize],
+    r: usize,
+    first: bool,
+    exhausted: bool,
+) -> Vec<Value> {
+    if exhausted {
+        return Vec::new();
+    }
+
+    let mut indices: CombinatoricIndexVec = indices.iter().copied().collect();
+    let mut first = first;
+    let mut values = Vec::new();
+
+    loop {
+        if first {
+            first = false;
+            values.push(create_tuple_from_indices(pool, &indices));
+            if r == 0 {
+                return values;
+            }
+            continue;
+        }
+
+        let mut i = r;
+        loop {
+            if i == 0 {
+                return values;
+            }
+            i -= 1;
+            if indices[i] != pool.len() - 1 {
+                break;
+            }
+        }
+
+        let new_index = indices[i] + 1;
+        for index in &mut indices[i..r] {
+            *index = new_index;
+        }
+        values.push(create_tuple_from_indices(pool, &indices));
+    }
 }
 
 // =============================================================================
@@ -312,6 +448,34 @@ enum IterKind {
     Filter {
         func: Option<Value>,
         inner: Box<IteratorObject>,
+    },
+
+    /// Lazy r-length combinations over a captured input pool.
+    ///
+    /// # Performance
+    /// - O(r) per yielded tuple
+    /// - O(n + r) retained state
+    /// - No materialization of the output space
+    Combinations {
+        pool: Vec<Value>,
+        indices: CombinatoricIndexVec,
+        r: usize,
+        first: bool,
+        remaining: Option<usize>,
+    },
+
+    /// Lazy r-length combinations with replacement over a captured input pool.
+    ///
+    /// # Performance
+    /// - O(r) per yielded tuple
+    /// - O(n + r) retained state
+    /// - No materialization of the output space
+    CombinationsWithReplacement {
+        pool: Vec<Value>,
+        indices: CombinatoricIndexVec,
+        r: usize,
+        first: bool,
+        remaining: Option<usize>,
     },
 
     /// Islice iterator - yields a stepped slice of another iterator.
@@ -773,6 +937,57 @@ impl IteratorObject {
     // =========================================================================
     // Composite iterator constructors (Phase 3.4)
     // =========================================================================
+
+    /// Create a lazy `itertools.combinations` iterator.
+    #[inline]
+    pub fn combinations(pool: Vec<Value>, r: usize) -> Self {
+        let exhausted = r > pool.len();
+        let remaining = if exhausted {
+            Some(0)
+        } else {
+            checked_binomial(pool.len(), r)
+        };
+
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::Combinations {
+                pool,
+                indices: initial_combination_indices(r),
+                r,
+                first: true,
+                remaining,
+            },
+            exhausted,
+        }
+    }
+
+    /// Create a lazy `itertools.combinations_with_replacement` iterator.
+    #[inline]
+    pub fn combinations_with_replacement(pool: Vec<Value>, r: usize) -> Self {
+        let exhausted = pool.is_empty() && r > 0;
+        let remaining = if exhausted {
+            Some(0)
+        } else if r == 0 {
+            Some(1)
+        } else {
+            pool.len()
+                .checked_add(r)
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|n| checked_binomial(n, r))
+        };
+
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::CombinationsWithReplacement {
+                pool,
+                indices: initial_repeated_combination_indices(r),
+                r,
+                first: true,
+                remaining,
+            },
+            exhausted,
+        }
+    }
 
     /// Create an enumerate iterator.
     ///
@@ -1299,6 +1514,24 @@ impl IteratorObject {
                     "enumerate inner iterator cannot be snapshotted",
                 )),
             },
+            IterKind::Combinations {
+                pool,
+                indices,
+                r,
+                first,
+                ..
+            } => Ok(IteratorReduction::RemainingValues(
+                collect_remaining_combinations(pool, indices, *r, *first, self.exhausted),
+            )),
+            IterKind::CombinationsWithReplacement {
+                pool,
+                indices,
+                r,
+                first,
+                ..
+            } => Ok(IteratorReduction::RemainingValues(
+                collect_remaining_repeated_combinations(pool, indices, *r, *first, self.exhausted),
+            )),
             IterKind::Chain { .. }
             | IterKind::Zip { .. }
             | IterKind::ZipLongest { .. }
@@ -1692,6 +1925,78 @@ impl IteratorObject {
                 }
             }
 
+            IterKind::Combinations {
+                pool,
+                indices,
+                r,
+                first,
+                remaining,
+            } => {
+                if *first {
+                    *first = false;
+                    decrement_remaining(remaining);
+                    if *r == 0 {
+                        self.exhausted = true;
+                    }
+                    Some(create_tuple_from_indices(pool, indices))
+                } else {
+                    let mut i = *r;
+                    loop {
+                        if i == 0 {
+                            self.exhausted = true;
+                            return Ok(None);
+                        }
+                        i -= 1;
+                        if indices[i] != i + pool.len() - *r {
+                            break;
+                        }
+                    }
+
+                    indices[i] += 1;
+                    for j in i + 1..*r {
+                        indices[j] = indices[j - 1] + 1;
+                    }
+                    decrement_remaining(remaining);
+                    Some(create_tuple_from_indices(pool, indices))
+                }
+            }
+
+            IterKind::CombinationsWithReplacement {
+                pool,
+                indices,
+                r,
+                first,
+                remaining,
+            } => {
+                if *first {
+                    *first = false;
+                    decrement_remaining(remaining);
+                    if *r == 0 {
+                        self.exhausted = true;
+                    }
+                    Some(create_tuple_from_indices(pool, indices))
+                } else {
+                    let mut i = *r;
+                    loop {
+                        if i == 0 {
+                            self.exhausted = true;
+                            return Ok(None);
+                        }
+                        i -= 1;
+                        if indices[i] != pool.len() - 1 {
+                            break;
+                        }
+                    }
+
+                    let new_index = indices[i] + 1;
+                    for index in &mut indices[i..*r] {
+                        *index = new_index;
+                    }
+                    decrement_remaining(remaining);
+                    Some(create_tuple_from_indices(pool, indices))
+                }
+            }
+
             IterKind::ISlice {
                 inner,
                 next_yield,
@@ -1926,6 +2231,8 @@ impl IteratorObject {
             }
             IterKind::Map { inner, .. } => inner.size_hint(),
             IterKind::Filter { .. } => None, // Cannot know without evaluating predicate
+            IterKind::Combinations { remaining, .. }
+            | IterKind::CombinationsWithReplacement { remaining, .. } => *remaining,
             IterKind::ISlice {
                 next_yield,
                 stop,
@@ -2088,6 +2395,32 @@ impl IteratorObject {
                     .collect();
                 Some(values)
             }
+            IterKind::Combinations {
+                pool,
+                indices,
+                r,
+                first,
+                ..
+            } => Some(collect_remaining_combinations(
+                pool,
+                indices,
+                *r,
+                *first,
+                self.exhausted,
+            )),
+            IterKind::CombinationsWithReplacement {
+                pool,
+                indices,
+                r,
+                first,
+                ..
+            } => Some(collect_remaining_repeated_combinations(
+                pool,
+                indices,
+                *r,
+                *first,
+                self.exhausted,
+            )),
             IterKind::Reversed {
                 values,
                 reverse_index,
@@ -2477,6 +2810,8 @@ impl fmt::Debug for IteratorObject {
             IterKind::ZipLongest { .. } => "zip_longest",
             IterKind::Map { .. } => "map",
             IterKind::Filter { .. } => "filter",
+            IterKind::Combinations { .. } => "combinations",
+            IterKind::CombinationsWithReplacement { .. } => "combinations_with_replacement",
             IterKind::ISlice { .. } => "islice",
             IterKind::Reversed { .. } => "reversed",
             IterKind::ReversedList { .. } => "list_reverseiterator",

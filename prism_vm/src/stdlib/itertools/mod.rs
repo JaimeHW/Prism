@@ -35,7 +35,9 @@ pub use terminating::{
 };
 
 use crate::builtins::{BuiltinError, BuiltinFunctionObject};
-use crate::ops::iteration::ensure_iterator_value;
+use crate::ops::iteration::{
+    collect_iterable_values as collect_iterable_values_vm, ensure_iterator_value,
+};
 use crate::stdlib::{Module, ModuleResult};
 use prism_core::Value;
 use prism_core::intern::intern;
@@ -116,18 +118,15 @@ static PRODUCT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 static PERMUTATIONS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("itertools.permutations"), builtin_permutations)
 });
-itertools_stub!(
-    COMBINATIONS_FUNCTION,
-    builtin_combinations,
-    "itertools.combinations",
-    "combinations"
-);
-itertools_stub!(
-    COMBINATIONS_WR_FUNCTION,
-    builtin_combinations_with_replacement,
-    "itertools.combinations_with_replacement",
-    "combinations_with_replacement"
-);
+static COMBINATIONS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("itertools.combinations"), builtin_combinations)
+});
+static COMBINATIONS_WR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("itertools.combinations_with_replacement"),
+        builtin_combinations_with_replacement,
+    )
+});
 itertools_stub!(
     GROUPBY_FUNCTION,
     builtin_groupby,
@@ -447,4 +446,40 @@ fn builtin_permutations(args: &[Value]) -> Result<Value, BuiltinError> {
         .map(tuple_value)
         .collect::<Vec<_>>();
     Ok(iterator_value(IteratorObject::from_values(tuples)))
+}
+
+fn builtin_combinations(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "combinations expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let pool = collect_iterable_values_vm(vm, args[0])
+        .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+    let r = parse_non_negative_usize(args[1], "r")?;
+    Ok(iterator_value(IteratorObject::combinations(pool, r)))
+}
+
+fn builtin_combinations_with_replacement(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "combinations_with_replacement expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let pool = collect_iterable_values_vm(vm, args[0])
+        .map_err(crate::builtins::runtime_error_to_builtin_error)?;
+    let r = parse_non_negative_usize(args[1], "r")?;
+    Ok(iterator_value(
+        IteratorObject::combinations_with_replacement(pool, r),
+    ))
 }
