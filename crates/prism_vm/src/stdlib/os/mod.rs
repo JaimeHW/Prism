@@ -43,6 +43,7 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::value_as_bytes_ref;
+use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::value_as_string_ref;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -55,6 +56,18 @@ static OS_REMOVE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.remove"), os_remove));
 static OS_UNLINK_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.unlink"), os_unlink));
+static OS_GETCWD_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.getcwd"), os_getcwd));
+static OS_GETPID_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.getpid"), os_getpid));
+static OS_GETPPID_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.getppid"), os_getppid));
+static OS_GETENV_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.getenv"), os_getenv));
+static OS_PUTENV_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.putenv"), os_putenv));
+static OS_UNSETENV_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("os.unsetenv"), os_unsetenv));
 
 /// The os module providing operating system interface.
 pub struct OsModule {
@@ -110,12 +123,17 @@ impl Module for OsModule {
                 .unwrap_or_else(Value::none)),
             "devnull" => Ok(string_value(DEVNULL)),
 
-            // Functions (return None placeholders for now)
+            // Functions
             "remove" => Ok(builtin_value(&OS_REMOVE_FUNCTION)),
             "unlink" => Ok(builtin_value(&OS_UNLINK_FUNCTION)),
-            "getcwd" | "chdir" | "mkdir" | "makedirs" | "rmdir" | "removedirs" | "rename"
-            | "replace" | "stat" | "lstat" | "listdir" | "scandir" | "walk" | "fwalk"
-            | "getenv" | "putenv" | "unsetenv" | "getpid" | "getppid" | "kill" | "system"
+            "getcwd" => Ok(builtin_value(&OS_GETCWD_FUNCTION)),
+            "getpid" => Ok(builtin_value(&OS_GETPID_FUNCTION)),
+            "getppid" => Ok(builtin_value(&OS_GETPPID_FUNCTION)),
+            "getenv" => Ok(builtin_value(&OS_GETENV_FUNCTION)),
+            "putenv" => Ok(builtin_value(&OS_PUTENV_FUNCTION)),
+            "unsetenv" => Ok(builtin_value(&OS_UNSETENV_FUNCTION)),
+            "chdir" | "mkdir" | "makedirs" | "rmdir" | "removedirs" | "rename" | "replace"
+            | "stat" | "lstat" | "listdir" | "scandir" | "walk" | "fwalk" | "kill" | "system"
             | "popen" | "access" | "chmod" | "chown" | "link" | "symlink" | "readlink" => {
                 Ok(Value::none()) // Placeholder for callable
             }
@@ -126,7 +144,7 @@ impl Module for OsModule {
             "path" => Ok(Value::none()), // TODO: Return os.path module
 
             // Environ dict
-            "environ" => Ok(Value::none()), // TODO: Return environ dict
+            "environ" => Ok(environ_dict_value()),
 
             // O_* flags as integers
             "O_RDONLY" => Ok(Value::int(O_RDONLY as i64).unwrap()),
@@ -217,6 +235,15 @@ fn string_value(value: &str) -> Value {
     Value::string(intern(value))
 }
 
+fn environ_dict_value() -> Value {
+    let vars = std::env::vars().collect::<Vec<_>>();
+    let mut dict = DictObject::with_capacity(vars.len());
+    for (key, value) in vars {
+        dict.set(string_value(&key), string_value(&value));
+    }
+    crate::alloc_managed_value(dict)
+}
+
 fn os_urandom(args: &[Value]) -> Result<Value, BuiltinError> {
     urandom_value_from_args(args, "urandom")
 }
@@ -227,6 +254,122 @@ fn os_remove(args: &[Value]) -> Result<Value, BuiltinError> {
 
 fn os_unlink(args: &[Value]) -> Result<Value, BuiltinError> {
     remove_path(args, "unlink")
+}
+
+fn os_getcwd(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getcwd() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let cwd = getcwd().map_err(|err| BuiltinError::OSError(format!("getcwd() failed: {err}")))?;
+    Ok(Value::string(intern(cwd.as_ref())))
+}
+
+fn os_getpid(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getpid() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::int(getpid() as i64).expect("process id fits in i64"))
+}
+
+fn os_getppid(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "getppid() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::int(getppid() as i64).expect("parent process id fits in i64"))
+}
+
+fn os_getenv(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "getenv() takes from 1 to 2 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let key = value_as_string_ref(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("getenv() key must be str".to_string()))?;
+    validate_env_key(key.as_str(), "getenv")?;
+
+    match environ::getenv(key.as_str()) {
+        Some(value) => Ok(Value::string(intern(&value))),
+        None if args.len() == 2 => Ok(args[1]),
+        None => Ok(Value::none()),
+    }
+}
+
+fn os_putenv(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "putenv() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let key = value_as_string_ref(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("putenv() key must be str".to_string()))?;
+    let value = value_as_string_ref(args[1])
+        .ok_or_else(|| BuiltinError::TypeError("putenv() value must be str".to_string()))?;
+    validate_env_key(key.as_str(), "putenv")?;
+    validate_env_value(value.as_str(), "putenv")?;
+
+    environ::putenv(key.as_str(), value.as_str());
+    Ok(Value::none())
+}
+
+fn os_unsetenv(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "unsetenv() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let key = value_as_string_ref(args[0])
+        .ok_or_else(|| BuiltinError::TypeError("unsetenv() key must be str".to_string()))?;
+    validate_env_key(key.as_str(), "unsetenv")?;
+
+    environ::unsetenv(key.as_str());
+    Ok(Value::none())
+}
+
+fn validate_env_key(key: &str, function: &str) -> Result<(), BuiltinError> {
+    if key.is_empty() {
+        return Err(BuiltinError::ValueError(format!(
+            "{function}() environment variable name cannot be empty"
+        )));
+    }
+    if key.contains('=') {
+        return Err(BuiltinError::ValueError(format!(
+            "{function}() environment variable name cannot contain '='"
+        )));
+    }
+    if key.contains('\0') {
+        return Err(BuiltinError::ValueError(format!(
+            "{function}() embedded null character in environment variable name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_env_value(value: &str, function: &str) -> Result<(), BuiltinError> {
+    if value.contains('\0') {
+        return Err(BuiltinError::ValueError(format!(
+            "{function}() embedded null character in environment variable value"
+        )));
+    }
+    Ok(())
 }
 
 fn remove_path(args: &[Value], function: &str) -> Result<Value, BuiltinError> {
