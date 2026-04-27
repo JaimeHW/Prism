@@ -115,8 +115,27 @@ class _SubTestContext:
         return False
 
 
+def _enter_context(cm, addcleanup):
+    cls = type(cm)
+    try:
+        enter = cls.__enter__
+        exit = cls.__exit__
+    except AttributeError:
+        module = getattr(cls, "__module__", "")
+        qualname = getattr(cls, "__qualname__", getattr(cls, "__name__", type(cls).__name__))
+        if module:
+            name = module + "." + qualname
+        else:
+            name = qualname
+        raise TypeError("'" + name + "' object does not support the context manager protocol")
+    result = enter(cm)
+    addcleanup(exit, cm, None, None, None)
+    return result
+
+
 class TestCase:
     failureException = AssertionError
+    _class_cleanups = []
 
     def __init__(self, methodName="runTest"):
         self._testMethodName = methodName
@@ -137,14 +156,25 @@ class TestCase:
     def runTest(self):
         pass
 
-    def addCleanup(self, function, *args):
-        self._cleanups.append((function, args))
+    def addCleanup(self, function, *args, **kwargs):
+        self._cleanups.append((function, args, kwargs))
+
+    def enterContext(self, cm):
+        return _enter_context(cm, self.addCleanup)
+
+    @classmethod
+    def addClassCleanup(cls, function, *args, **kwargs):
+        cls._class_cleanups.append((function, args, kwargs))
+
+    @classmethod
+    def enterClassContext(cls, cm):
+        return _enter_context(cm, cls.addClassCleanup)
 
     def doCleanups(self):
         ok = True
         while self._cleanups:
-            function, args = self._cleanups.pop()
-            function(*args)
+            function, args, kwargs = self._cleanups.pop()
+            function(*args, **kwargs)
         return ok
 
     def run(self, result=None):
