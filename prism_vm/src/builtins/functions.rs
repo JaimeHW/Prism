@@ -1433,8 +1433,17 @@ pub(crate) fn hash_value(value: Value) -> Result<i64, BuiltinError> {
         .as_object_ptr()
         .ok_or_else(|| BuiltinError::TypeError("unhashable type".to_string()))?;
     let type_id = crate::ops::objects::extract_type_id(ptr);
+    if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
+        return match set.header.type_id {
+            TypeId::FROZENSET => hash_frozenset(set),
+            TypeId::SET => Err(BuiltinError::TypeError(
+                "unhashable type: 'set'".to_string(),
+            )),
+            _ => unreachable!("set storage must be set or frozenset"),
+        };
+    }
     match type_id {
-        TypeId::LIST | TypeId::DICT | TypeId::SET => Err(BuiltinError::TypeError(format!(
+        TypeId::LIST | TypeId::DICT => Err(BuiltinError::TypeError(format!(
             "unhashable type: '{}'",
             type_id.name()
         ))),
@@ -1494,6 +1503,10 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
             "unhashable type: '{}'",
             type_id.name()
         ))),
+        TypeId::FROZENSET => {
+            let set = unsafe { &*(ptr as *const SetObject) };
+            hash_frozenset_vm(vm, set)
+        }
         TypeId::TUPLE => {
             let tuple = unsafe { &*(ptr as *const TupleObject) };
             hash_tuple_vm(vm, tuple)
@@ -1518,6 +1531,15 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
                 hash_user_result(result, type_id)
             }
             Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+                if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
+                    return match set.header.type_id {
+                        TypeId::FROZENSET => hash_frozenset_vm(vm, set),
+                        TypeId::SET => Err(BuiltinError::TypeError(
+                            "unhashable type: 'set'".to_string(),
+                        )),
+                        _ => unreachable!("set storage must be set or frozenset"),
+                    };
+                }
                 Ok(hash_with_default_hasher(&(ptr as usize)))
             }
             Err(err) => Err(super::runtime_error_to_builtin_error(err)),
@@ -1607,6 +1629,48 @@ fn hash_tuple_vm(vm: &mut VirtualMachine, tuple: &TupleObject) -> Result<i64, Bu
         return Ok(1_546_275_796);
     }
     Ok(acc as i64)
+}
+
+#[inline]
+fn hash_frozenset(set: &SetObject) -> Result<i64, BuiltinError> {
+    hash_frozenset_with(set, hash_value)
+}
+
+#[inline]
+fn hash_frozenset_vm(vm: &mut VirtualMachine, set: &SetObject) -> Result<i64, BuiltinError> {
+    hash_frozenset_with(set, |value| hash_value_vm(vm, value))
+}
+
+fn hash_frozenset_with(
+    set: &SetObject,
+    mut hash_element: impl FnMut(Value) -> Result<i64, BuiltinError>,
+) -> Result<i64, BuiltinError> {
+    if let Some(hash) = set.cached_hash() {
+        return Ok(hash);
+    }
+
+    let mut xor = 0u64;
+    let mut sum = 0u64;
+    let mut product = 1u64;
+    for item in set.iter() {
+        let lane = hash_element(item)? as u64;
+        let mixed = lane ^ 0x9e37_79b9_7f4a_7c15u64;
+        xor ^= mixed;
+        sum = sum.wrapping_add(mixed);
+        product = product.wrapping_mul(mixed | 1);
+    }
+
+    let len = set.len() as u64;
+    let hash = xor
+        .wrapping_add(sum.rotate_left(7))
+        .wrapping_add(product.rotate_left(17))
+        .wrapping_add(len.wrapping_mul(0x9e37_79b9_7f4a_7c15u64));
+    let mut hash = normalize_python_hash(hash as i64);
+    if hash == i64::MIN {
+        hash = i64::MAX;
+    }
+    set.set_cached_hash(hash);
+    Ok(hash)
 }
 
 #[inline]

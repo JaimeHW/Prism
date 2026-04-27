@@ -7,6 +7,9 @@ use crate::object::{ObjectHeader, PyObject};
 use crate::types::hashable::HashableValue;
 use prism_core::Value;
 use rustc_hash::FxHashSet;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+const HASH_CACHE_EMPTY: i64 = i64::MIN;
 
 // =============================================================================
 // SetObject
@@ -30,6 +33,8 @@ pub struct SetObject {
     pub header: ObjectHeader,
     /// Set items.
     items: FxHashSet<HashableValue>,
+    /// Cached hash for immutable frozenset views of this storage.
+    hash_cache: AtomicI64,
 }
 
 impl SetObject {
@@ -39,6 +44,7 @@ impl SetObject {
         Self {
             header: ObjectHeader::new(TypeId::SET),
             items: FxHashSet::default(),
+            hash_cache: AtomicI64::new(HASH_CACHE_EMPTY),
         }
     }
 
@@ -48,6 +54,7 @@ impl SetObject {
         Self {
             header: ObjectHeader::new(TypeId::SET),
             items: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
+            hash_cache: AtomicI64::new(HASH_CACHE_EMPTY),
         }
     }
 
@@ -88,7 +95,11 @@ impl SetObject {
     /// Returns true if the element was not already present.
     #[inline]
     pub fn add(&mut self, value: Value) -> bool {
-        self.items.insert(HashableValue(value))
+        let inserted = self.items.insert(HashableValue(value));
+        if inserted {
+            self.clear_hash_cache();
+        }
+        inserted
     }
 
     /// Remove an element from the set.
@@ -96,13 +107,19 @@ impl SetObject {
     /// Returns true if the element was present.
     #[inline]
     pub fn remove(&mut self, value: Value) -> bool {
-        self.items.remove(&HashableValue(value))
+        let removed = self.items.remove(&HashableValue(value));
+        if removed {
+            self.clear_hash_cache();
+        }
+        removed
     }
 
     /// Discard an element (same as remove, but doesn't error if missing).
     #[inline]
     pub fn discard(&mut self, value: Value) {
-        self.items.remove(&HashableValue(value));
+        if self.items.remove(&HashableValue(value)) {
+            self.clear_hash_cache();
+        }
     }
 
     /// Check if the set contains an element.
@@ -126,7 +143,10 @@ impl SetObject {
     /// Clear all elements from the set.
     #[inline]
     pub fn clear(&mut self) {
-        self.items.clear();
+        if !self.items.is_empty() {
+            self.items.clear();
+            self.clear_hash_cache();
+        }
     }
 
     /// Get an iterator over the elements.
@@ -216,18 +236,27 @@ impl SetObject {
 
     /// Update self with the intersection of self and other.
     pub fn intersection_update(&mut self, other: &SetObject) {
+        let old_len = self.items.len();
         self.items.retain(|hv| other.items.contains(hv));
+        if self.items.len() != old_len {
+            self.clear_hash_cache();
+        }
     }
 
     /// Update self with the difference of self and other.
     pub fn difference_update(&mut self, other: &SetObject) {
+        let old_len = self.items.len();
         for hv in other.items.iter() {
             self.items.remove(hv);
+        }
+        if self.items.len() != old_len {
+            self.clear_hash_cache();
         }
     }
 
     /// Update self with the symmetric difference of self and other.
     pub fn symmetric_difference_update(&mut self, other: &SetObject) {
+        let old_len = self.items.len();
         for hv in other.items.iter() {
             if self.items.contains(hv) {
                 self.items.remove(hv);
@@ -235,6 +264,29 @@ impl SetObject {
                 self.items.insert(*hv);
             }
         }
+        if self.items.len() != old_len || !other.items.is_empty() {
+            self.clear_hash_cache();
+        }
+    }
+
+    /// Return the cached frozenset hash, if one has been computed.
+    #[inline]
+    pub fn cached_hash(&self) -> Option<i64> {
+        match self.hash_cache.load(Ordering::Relaxed) {
+            HASH_CACHE_EMPTY => None,
+            hash => Some(hash),
+        }
+    }
+
+    /// Cache the frozenset hash for immutable users of this storage.
+    #[inline]
+    pub fn set_cached_hash(&self, hash: i64) {
+        self.hash_cache.store(hash, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn clear_hash_cache(&self) {
+        self.hash_cache.store(HASH_CACHE_EMPTY, Ordering::Relaxed);
     }
 
     /// Clone the set.
@@ -242,6 +294,7 @@ impl SetObject {
         SetObject {
             header: ObjectHeader::new(TypeId::SET),
             items: self.items.clone(),
+            hash_cache: AtomicI64::new(self.hash_cache.load(Ordering::Relaxed)),
         }
     }
 }
