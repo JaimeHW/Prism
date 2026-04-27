@@ -25,7 +25,9 @@ use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::BoundMethod;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::object::views::UnionTypeObject;
+use prism_runtime::object::views::{
+    DictViewKind, DictViewObject, MappingProxyObject, UnionTypeObject,
+};
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::value_as_list_ref;
@@ -229,6 +231,14 @@ enum SetRelation {
     Superset,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SetLikeBinaryOp {
+    Intersection,
+    Union,
+    Difference,
+    SymmetricDifference,
+}
+
 #[inline]
 fn compare_set_relation(left: Value, right: Value, relation: SetRelation) -> Option<bool> {
     let left_ptr = left.as_object_ptr()?;
@@ -258,6 +268,39 @@ fn compare_set_relation(left: Value, right: Value, relation: SetRelation) -> Opt
     })
 }
 
+fn compare_set_like_relation(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    relation: SetRelation,
+) -> Result<Option<bool>, RuntimeError> {
+    if let Some(result) = compare_dict_items_view_relation(vm, left, right, relation)? {
+        return Ok(Some(result));
+    }
+
+    if !is_dict_view_set_operand(left) && !is_dict_view_set_operand(right) {
+        return Ok(None);
+    }
+
+    let Some(left_set) = materialize_set_like(left)? else {
+        return Ok(None);
+    };
+    let Some(right_set) = materialize_set_like(right)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(match relation {
+        SetRelation::StrictSubset => {
+            left_set.len() < right_set.len() && left_set.is_subset(&right_set)
+        }
+        SetRelation::Subset => left_set.is_subset(&right_set),
+        SetRelation::StrictSuperset => {
+            left_set.len() > right_set.len() && left_set.is_superset(&right_set)
+        }
+        SetRelation::Superset => left_set.is_superset(&right_set),
+    }))
+}
+
 #[inline]
 pub(crate) fn set_binary_operands(
     left: Value,
@@ -277,6 +320,163 @@ pub(crate) fn set_binary_operands(
     let left_set = unsafe { &*(left_ptr as *const SetObject) };
     let right_set = unsafe { &*(right_ptr as *const SetObject) };
     Some((left_set, right_set, left_type))
+}
+
+pub(crate) fn dict_view_set_binary_result(
+    left: Value,
+    right: Value,
+    op: SetLikeBinaryOp,
+) -> Result<Option<Value>, RuntimeError> {
+    if !is_dict_view_set_operand(left) && !is_dict_view_set_operand(right) {
+        return Ok(None);
+    }
+
+    let Some(left_set) = materialize_set_like(left)? else {
+        return Ok(None);
+    };
+    let Some(right_set) = materialize_set_like(right)? else {
+        return Ok(None);
+    };
+
+    let result = match op {
+        SetLikeBinaryOp::Intersection => left_set.intersection(&right_set),
+        SetLikeBinaryOp::Union => left_set.union(&right_set),
+        SetLikeBinaryOp::Difference => left_set.difference(&right_set),
+        SetLikeBinaryOp::SymmetricDifference => left_set.symmetric_difference(&right_set),
+    };
+    Ok(Some(boxed_set_result(result, TypeId::SET)))
+}
+
+#[inline]
+fn is_dict_view_set_operand(value: Value) -> bool {
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    matches!(
+        unsafe { (*(ptr as *const ObjectHeader)).type_id },
+        TypeId::DICT_KEYS | TypeId::DICT_ITEMS
+    )
+}
+
+fn materialize_set_like(value: Value) -> Result<Option<SetObject>, RuntimeError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(None);
+    };
+
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::SET | TypeId::FROZENSET => Ok(Some(unsafe { &*(ptr as *const SetObject) }.clone())),
+        TypeId::DICT_KEYS | TypeId::DICT_ITEMS => {
+            let view = unsafe { &*(ptr as *const DictViewObject) };
+            materialize_dict_view_set(view)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn materialize_dict_view_set(view: &DictViewObject) -> Result<Option<SetObject>, RuntimeError> {
+    if view.kind() == DictViewKind::Values {
+        return Ok(None);
+    }
+
+    let entries = dict_view_entries(view)?;
+    let mut set = SetObject::with_capacity(entries.len());
+    for (key, value) in entries {
+        match view.kind() {
+            DictViewKind::Keys => {
+                set.add(key);
+            }
+            DictViewKind::Items => {
+                set.add(crate::alloc_managed_value(TupleObject::from_slice(&[
+                    key, value,
+                ])));
+            }
+            DictViewKind::Values => unreachable!(),
+        }
+    }
+    Ok(Some(set))
+}
+
+fn dict_view_entries(view: &DictViewObject) -> Result<Vec<(Value, Value)>, RuntimeError> {
+    let Some(ptr) = view.dict().as_object_ptr() else {
+        return Err(RuntimeError::type_error(
+            "invalid dictionary view backing object",
+        ));
+    };
+
+    match unsafe { (*(ptr as *const ObjectHeader)).type_id } {
+        TypeId::DICT => Ok(unsafe { &*(ptr as *const DictObject) }.iter().collect()),
+        TypeId::MAPPING_PROXY => {
+            let proxy = unsafe { &*(ptr as *const MappingProxyObject) };
+            crate::builtins::builtin_mapping_proxy_entries_static(proxy)
+        }
+        _ => Err(RuntimeError::type_error(
+            "invalid dictionary view backing object",
+        )),
+    }
+}
+
+fn exact_dict_items_view(value: Value) -> Option<(*const (), &'static DictObject)> {
+    let view_ptr = value.as_object_ptr()?;
+    if unsafe { (*(view_ptr as *const ObjectHeader)).type_id } != TypeId::DICT_ITEMS {
+        return None;
+    }
+
+    let view = unsafe { &*(view_ptr as *const DictViewObject) };
+    let dict_ptr = view.dict().as_object_ptr()?;
+    if unsafe { (*(dict_ptr as *const ObjectHeader)).type_id } != TypeId::DICT {
+        return None;
+    }
+
+    Some((dict_ptr, unsafe { &*(dict_ptr as *const DictObject) }))
+}
+
+fn compare_dict_items_view_relation(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    relation: SetRelation,
+) -> Result<Option<bool>, RuntimeError> {
+    let Some((_, left_dict)) = exact_dict_items_view(left) else {
+        return Ok(None);
+    };
+    let Some((_, right_dict)) = exact_dict_items_view(right) else {
+        return Ok(None);
+    };
+
+    Ok(Some(match relation {
+        SetRelation::StrictSubset => {
+            left_dict.len() < right_dict.len()
+                && dict_items_subset_result(vm, left_dict, right_dict)?
+        }
+        SetRelation::Subset => dict_items_subset_result(vm, left_dict, right_dict)?,
+        SetRelation::StrictSuperset => {
+            left_dict.len() > right_dict.len()
+                && dict_items_subset_result(vm, right_dict, left_dict)?
+        }
+        SetRelation::Superset => dict_items_subset_result(vm, right_dict, left_dict)?,
+    }))
+}
+
+fn dict_items_subset_result(
+    vm: &mut VirtualMachine,
+    left: &DictObject,
+    right: &DictObject,
+) -> Result<bool, RuntimeError> {
+    if left.len() > right.len() {
+        return Ok(false);
+    }
+
+    let mut seen_pairs = FxHashSet::default();
+    for (key, left_value) in left.iter().collect::<Vec<_>>() {
+        let Some(right_value) = crate::ops::dict_access::dict_get_item(vm, right, key)? else {
+            return Ok(false);
+        };
+        if !eq_result_inner(vm, left_value, right_value, &mut seen_pairs)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 #[inline]
@@ -559,6 +759,10 @@ fn eq_result_inner(
         return Ok(equal);
     }
 
+    if let Some(equal) = dict_view_eq_result(vm, a, b, seen_pairs)? {
+        return Ok(equal);
+    }
+
     if let (Some((left_ptr, left)), Some((right_ptr, right))) =
         (exact_dict_operand(a), exact_dict_operand(b))
     {
@@ -639,6 +843,10 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
         return Ok(!equal);
     }
 
+    if let Some(equal) = dict_view_eq_result(vm, a, b, &mut seen_pairs)? {
+        return Ok(!equal);
+    }
+
     if let (Some((left_ptr, left)), Some((right_ptr, right))) =
         (exact_dict_operand(a), exact_dict_operand(b))
     {
@@ -658,6 +866,38 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
     }
 
     Ok(!values_equal(a, b))
+}
+
+fn dict_view_eq_result(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<Option<bool>, RuntimeError> {
+    if let (Some((left_ptr, left_dict)), Some((right_ptr, right_dict))) =
+        (exact_dict_items_view(left), exact_dict_items_view(right))
+    {
+        let pair = ordered_object_pair(left_ptr, right_ptr);
+        if !seen_pairs.insert(pair) {
+            return Ok(Some(true));
+        }
+        return dict_eq_result(vm, left_dict, right_dict, seen_pairs).map(Some);
+    }
+
+    if !is_dict_view_set_operand(left) && !is_dict_view_set_operand(right) {
+        return Ok(None);
+    }
+
+    let Some(left_set) = materialize_set_like(left)? else {
+        return Ok(None);
+    };
+    let Some(right_set) = materialize_set_like(right)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        left_set.len() == right_set.len() && left_set.is_subset(&right_set),
+    ))
 }
 
 fn dict_eq_result(
@@ -810,6 +1050,11 @@ pub(crate) fn compare_order_result(
     };
     if let Some(relation) = set_relation
         && let Some(result) = compare_set_relation(a, b, relation)
+    {
+        return Ok(result);
+    }
+    if let Some(relation) = set_relation
+        && let Some(result) = compare_set_like_relation(vm, a, b, relation)?
     {
         return Ok(result);
     }
@@ -1798,6 +2043,14 @@ pub fn bitwise_and(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.current_frame_mut().set_reg(dst, value);
         return ControlFlow::Continue;
     }
+    match dict_view_set_binary_result(a, b, SetLikeBinaryOp::Intersection) {
+        Ok(Some(value)) => {
+            vm.current_frame_mut().set_reg(dst, value);
+            return ControlFlow::Continue;
+        }
+        Ok(None) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
 
     match bitwise_int_result("&", a, b, |x, y| x & y) {
         Ok(value) => {
@@ -1855,6 +2108,14 @@ pub fn bitwise_or(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.current_frame_mut().set_reg(dst, value);
         return ControlFlow::Continue;
     }
+    match dict_view_set_binary_result(a, b, SetLikeBinaryOp::Union) {
+        Ok(Some(value)) => {
+            vm.current_frame_mut().set_reg(dst, value);
+            return ControlFlow::Continue;
+        }
+        Ok(None) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
 
     if let Some((left, right)) = dict_binary_operands(a, b) {
         let mut merged = DictObject::with_capacity(left.len() + right.len());
@@ -1893,6 +2154,14 @@ pub fn bitwise_xor(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         let value = boxed_set_result(left.symmetric_difference(right), result_type);
         vm.current_frame_mut().set_reg(dst, value);
         return ControlFlow::Continue;
+    }
+    match dict_view_set_binary_result(a, b, SetLikeBinaryOp::SymmetricDifference) {
+        Ok(Some(value)) => {
+            vm.current_frame_mut().set_reg(dst, value);
+            return ControlFlow::Continue;
+        }
+        Ok(None) => {}
+        Err(err) => return ControlFlow::Error(err),
     }
 
     match bitwise_int_result("^", a, b, |x, y| x ^ y) {

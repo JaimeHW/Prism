@@ -837,6 +837,18 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.current_frame_mut().set_reg(inst.dst().0, value);
         return ControlFlow::Continue;
     }
+    match crate::ops::comparison::dict_view_set_binary_result(
+        a,
+        b,
+        crate::ops::comparison::SetLikeBinaryOp::Difference,
+    ) {
+        Ok(Some(value)) => {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            return ControlFlow::Continue;
+        }
+        Ok(None) => {}
+        Err(err) => return ControlFlow::Error(err),
+    }
 
     match try_binary_special_method_result(vm, inst.dst().0, a, b, "__sub__", "__rsub__") {
         Ok(true) => return ControlFlow::Continue,
