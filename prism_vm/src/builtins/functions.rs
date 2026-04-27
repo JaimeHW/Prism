@@ -14,6 +14,8 @@ use prism_core::Value;
 use prism_core::intern::intern;
 use prism_core::python_unicode::{is_surrogate_carrier, python_char_escape};
 use prism_runtime::object::descriptor::{ClassMethodDescriptor, StaticMethodDescriptor};
+use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{DictViewKind, DictViewObject, MappingProxyObject};
 use prism_runtime::types::bytes::BytesObject;
@@ -2002,11 +2004,14 @@ impl<'vm> ReprState<'vm> {
         let ptr = value
             .as_object_ptr()
             .ok_or_else(|| BuiltinError::TypeError("invalid object reference".to_string()))?;
+        let type_id = crate::ops::objects::extract_type_id(ptr);
         if crate::ops::objects::list_storage_ref_from_ptr(ptr).is_some() {
             return self.repr_list_like(ptr);
         }
+        if let Some(set) = crate::ops::objects::set_storage_ref_from_ptr(ptr) {
+            return self.repr_set_container(ptr, type_id, set);
+        }
 
-        let type_id = crate::ops::objects::extract_type_id(ptr);
         match type_id {
             TypeId::BYTES => {
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
@@ -2042,12 +2047,7 @@ impl<'vm> ReprState<'vm> {
                     state.repr_dict_view(view)
                 })
             }
-            TypeId::SET | TypeId::FROZENSET => {
-                self.with_container(ptr, set_recursive_repr(type_id), |state| {
-                    let set = unsafe { &*(ptr as *const SetObject) };
-                    state.repr_set(set)
-                })
-            }
+            TypeId::SET | TypeId::FROZENSET => unreachable!("set storage handled above"),
             TypeId::RANGE => {
                 let range = unsafe { &*(ptr as *const RangeObject) };
                 Ok(range.to_string())
@@ -2105,6 +2105,14 @@ impl<'vm> ReprState<'vm> {
 
         match resolve_special_method(value, "__repr__") {
             Ok(target) => {
+                let has_native_set_repr = value
+                    .as_object_ptr()
+                    .and_then(crate::ops::objects::set_storage_ref_from_ptr)
+                    .is_some();
+                if has_native_set_repr && bound_method_target_is_inherited_set_repr(&target) {
+                    return Ok(None);
+                }
+
                 let rendered = invoke_zero_arg_bound_method(vm, target)
                     .map_err(super::runtime_error_to_builtin_error)?;
                 let Some(text) = value_as_string_ref(rendered) else {
@@ -2132,6 +2140,27 @@ impl<'vm> ReprState<'vm> {
         let key = ptr as usize;
         if self.active.contains(&key) {
             return Ok(recursive_repr.to_string());
+        }
+
+        self.active.push(key);
+        let _thread_guard = ReprThreadActiveGuard::push(key);
+        let result = render(self);
+        self.active.pop();
+        result
+    }
+
+    fn with_container_owned<F>(
+        &mut self,
+        ptr: *const (),
+        recursive_repr: String,
+        render: F,
+    ) -> Result<String, BuiltinError>
+    where
+        F: FnOnce(&mut Self) -> Result<String, BuiltinError>,
+    {
+        let key = ptr as usize;
+        if self.active.contains(&key) {
+            return Ok(recursive_repr);
         }
 
         self.active.push(key);
@@ -2316,11 +2345,34 @@ impl<'vm> ReprState<'vm> {
         Ok(out)
     }
 
-    fn repr_set(&mut self, set: &SetObject) -> Result<String, BuiltinError> {
+    fn repr_set_container(
+        &mut self,
+        ptr: *const (),
+        owner_type: TypeId,
+        set: &SetObject,
+    ) -> Result<String, BuiltinError> {
+        if owner_type == set.header.type_id {
+            return self.with_container(ptr, set_recursive_repr(set.header.type_id), |state| {
+                state.repr_set(set, owner_type)
+            });
+        }
+
+        let recursive_repr = format!("{}(...)", type_display_name(owner_type));
+        self.with_container_owned(ptr, recursive_repr, |state| state.repr_set(set, owner_type))
+    }
+
+    fn repr_set(&mut self, set: &SetObject, owner_type: TypeId) -> Result<String, BuiltinError> {
+        let storage_type = set.header.type_id;
+        let exact_builtin = owner_type == storage_type;
+
         if set.is_empty() {
-            return Ok(match set.header.type_id {
-                TypeId::FROZENSET => "frozenset()".to_string(),
-                _ => "set()".to_string(),
+            return Ok(if exact_builtin {
+                match storage_type {
+                    TypeId::FROZENSET => "frozenset()".to_string(),
+                    _ => "set()".to_string(),
+                }
+            } else {
+                format!("{}()", type_display_name(owner_type))
             });
         }
 
@@ -2334,9 +2386,13 @@ impl<'vm> ReprState<'vm> {
             out.push_str(&self.repr_value(value)?);
         }
         out.push('}');
-        Ok(match set.header.type_id {
-            TypeId::FROZENSET => format!("frozenset({out})"),
-            _ => out,
+        Ok(if exact_builtin {
+            match storage_type {
+                TypeId::FROZENSET => format!("frozenset({out})"),
+                _ => out,
+            }
+        } else {
+            format!("{}({out})", type_display_name(owner_type))
         })
     }
 }
@@ -2351,6 +2407,35 @@ fn set_recursive_repr(type_id: TypeId) -> &'static str {
         TypeId::FROZENSET => "frozenset(...)",
         _ => "set(...)",
     }
+}
+
+fn type_display_name(type_id: TypeId) -> String {
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE {
+        return global_class(ClassId(type_id.raw()))
+            .map(|class| class.name().as_str().to_string())
+            .unwrap_or_else(|| type_id.name().to_string());
+    }
+
+    type_id.name().to_string()
+}
+
+fn bound_method_target_builtin_name(target: &BoundMethodTarget) -> Option<&str> {
+    let Some(ptr) = target.callable.as_object_ptr() else {
+        return None;
+    };
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION {
+        return None;
+    }
+
+    let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    Some(function.name())
+}
+
+fn bound_method_target_is_inherited_set_repr(target: &BoundMethodTarget) -> bool {
+    matches!(
+        bound_method_target_builtin_name(target),
+        Some("object.__repr__" | "set.__repr__" | "frozenset.__repr__")
+    )
 }
 
 #[inline]
