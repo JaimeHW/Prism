@@ -117,6 +117,30 @@ static BYTES_RPARTITION_METHOD: LazyLock<BuiltinFunctionObject> =
 
 static BYTEARRAY_COPY_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("bytearray.copy"), bytearray_copy));
+static BYTEARRAY_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("bytearray.__getitem__"),
+        bytearray_getitem_with_vm,
+    )
+});
+static BYTEARRAY_SETITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("bytearray.__setitem__"),
+        bytearray_setitem_with_vm,
+    )
+});
+static BYTEARRAY_DELITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("bytearray.__delitem__"),
+        bytearray_delitem_with_vm,
+    )
+});
+static BYTEARRAY_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("bytearray.__init__"),
+        crate::builtins::builtin_bytearray_init_vm_kw,
+    )
+});
 static BYTEARRAY_HEX_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_kw(Arc::from("bytearray.hex"), bytearray_hex_kw));
 static BYTEARRAY_APPEND_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -373,6 +397,18 @@ pub fn resolve_bytes_method(name: &str) -> Option<CachedMethod> {
 /// Resolve builtin bytearray methods backed by static builtin function objects.
 pub fn resolve_bytearray_method(name: &str) -> Option<CachedMethod> {
     match name {
+        "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_GETITEM_METHOD,
+        ))),
+        "__setitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_SETITEM_METHOD,
+        ))),
+        "__delitem__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_DELITEM_METHOD,
+        ))),
+        "__init__" => Some(CachedMethod::simple(builtin_method_value(
+            &BYTEARRAY_INIT_METHOD,
+        ))),
         "copy" => Some(CachedMethod::simple(builtin_method_value(
             &BYTEARRAY_COPY_METHOD,
         ))),
@@ -3111,6 +3147,84 @@ pub(super) fn bytearray_copy(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("bytearray", "copy", args, 0)?;
     let bytearray = expect_bytearray_ref(args[0], "copy")?;
     Ok(to_object_value(bytearray.clone()))
+}
+
+pub(super) fn bytearray_getitem_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "__getitem__", args, 1)?;
+    let bytearray = expect_bytearray_ref(args[0], "__getitem__")?;
+
+    if let Some(slice) = args[1]
+        .as_object_ptr()
+        .and_then(slice_object_from_value_ptr)
+    {
+        reject_zero_step_slice_builtin(slice)?;
+        return Ok(to_object_value(bytearray.slice(slice)));
+    }
+
+    let index = bytearray_index_value_vm(vm, args[1])?;
+    let byte = bytearray
+        .get(index)
+        .ok_or_else(|| BuiltinError::IndexError("bytearray index out of range".to_string()))?;
+    Ok(Value::int(i64::from(byte)).expect("byte value should fit int"))
+}
+
+pub(super) fn bytearray_setitem_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "__setitem__", args, 2)?;
+
+    if let Some(slice) = args[1]
+        .as_object_ptr()
+        .and_then(slice_object_from_value_ptr)
+    {
+        reject_zero_step_slice_builtin(slice)?;
+        let incoming = collect_bytearray_extend_data(vm, args[2])?;
+        let bytearray = expect_bytearray_mut(args[0], "__setitem__")?;
+        bytearray
+            .assign_slice(slice, &incoming)
+            .map_err(|err| BuiltinError::ValueError(err.to_string()))?;
+        return Ok(Value::none());
+    }
+
+    let index = bytearray_index_value_vm(vm, args[1])?;
+    let byte = bytearray_element_byte_vm(vm, args[2])?;
+    let bytearray = expect_bytearray_mut(args[0], "__setitem__")?;
+    if !bytearray.set(index, byte) {
+        return Err(BuiltinError::IndexError(
+            "bytearray index out of range".to_string(),
+        ));
+    }
+    Ok(Value::none())
+}
+
+pub(super) fn bytearray_delitem_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("bytearray", "__delitem__", args, 1)?;
+
+    if let Some(slice) = args[1]
+        .as_object_ptr()
+        .and_then(slice_object_from_value_ptr)
+    {
+        reject_zero_step_slice_builtin(slice)?;
+        let bytearray = expect_bytearray_mut(args[0], "__delitem__")?;
+        bytearray.delete_slice(slice);
+        return Ok(Value::none());
+    }
+
+    let index = bytearray_index_value_vm(vm, args[1])?;
+    let bytearray = expect_bytearray_mut(args[0], "__delitem__")?;
+    if !bytearray.delete(index) {
+        return Err(BuiltinError::IndexError(
+            "bytearray index out of range".to_string(),
+        ));
+    }
+    Ok(Value::none())
 }
 
 pub(super) fn bytearray_append_with_vm(

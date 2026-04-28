@@ -1061,6 +1061,28 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         }
 
         match header.type_id {
+            TypeId::BYTEARRAY => {
+                let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
+                if let Some(index) = key.as_int() {
+                    if bytes.delete(index) {
+                        return ControlFlow::Continue;
+                    }
+                    let len = bytes.len();
+                    return ControlFlow::Error(RuntimeError::index_error(index, len));
+                }
+
+                if let Some(slice) = slice_from_value(key) {
+                    if let Err(err) = reject_zero_step_slice(slice) {
+                        return err;
+                    }
+                    bytes.delete_slice(slice);
+                    return ControlFlow::Continue;
+                }
+
+                return ControlFlow::Error(RuntimeError::type_error(
+                    "bytearray indices must be integers or slices",
+                ));
+            }
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
                 match dict_remove_item(vm, dict, key) {

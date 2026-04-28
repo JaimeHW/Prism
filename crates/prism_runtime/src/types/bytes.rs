@@ -219,6 +219,12 @@ impl BytesObject {
         Some(self.data.remove(index))
     }
 
+    /// Delete one byte at a Python index for mutable instances.
+    #[inline]
+    pub fn delete(&mut self, index: i64) -> bool {
+        self.pop(index).is_some()
+    }
+
     /// Remove the first matching byte for mutable instances.
     #[inline]
     pub fn remove(&mut self, byte: u8) -> bool {
@@ -319,6 +325,39 @@ impl BytesObject {
         }
 
         Ok(())
+    }
+
+    /// Delete the bytes selected by `slice`, matching Python's bytearray slice
+    /// deletion semantics for both contiguous and extended slices.
+    #[inline]
+    pub fn delete_slice(&mut self, slice: &SliceObject) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+
+        let indices = slice.indices(self.data.len());
+        if indices.length == 0 {
+            return true;
+        }
+
+        if indices.step == 1 {
+            let end = indices.stop.max(indices.start);
+            self.data.drain(indices.start..end);
+            return true;
+        }
+
+        if indices.step < 0 {
+            for index in indices.iter() {
+                self.data.remove(index);
+            }
+            return true;
+        }
+
+        let removal_indices: Vec<usize> = indices.iter().collect();
+        for index in removal_indices.into_iter().rev() {
+            self.data.remove(index);
+        }
+        true
     }
 
     /// Clone bytes into a new vector.
