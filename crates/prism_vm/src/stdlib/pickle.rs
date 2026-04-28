@@ -27,7 +27,7 @@ use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::GenericAliasObject;
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::iter::is_native_iterator_type_id;
@@ -99,6 +99,7 @@ const TAG_GENERIC_ALIAS: u8 = 16;
 const TAG_SLICE: u8 = 17;
 const TAG_RANGE: u8 = 18;
 const TAG_DICT_BACKED_USER_OBJECT: u8 = 19;
+const TAG_BYTES_BACKED_USER_OBJECT: u8 = 20;
 
 const TYPE_KIND_BUILTIN: u8 = 0;
 const TYPE_KIND_USER: u8 = 1;
@@ -274,6 +275,12 @@ impl<'vm> PickleWriter<'vm> {
             {
                 self.write_dict_backed_user_object(ptr, type_id)
             }
+            type_id
+                if type_id.raw() >= TypeId::FIRST_USER_TYPE
+                    && value_as_bytes_ref(value).is_some() =>
+            {
+                self.write_bytes_backed_user_object(value, ptr, type_id)
+            }
             type_id if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
                 self.write_user_object(ptr, type_id)
             }
@@ -433,6 +440,48 @@ impl<'vm> PickleWriter<'vm> {
         self.write_len(entries.len(), "dictionary entry count")?;
         for (key, value) in entries {
             self.write_value(key)?;
+            self.write_value(value)?;
+        }
+        Ok(())
+    }
+
+    fn write_bytes_backed_user_object(
+        &mut self,
+        value: Value,
+        ptr: *const (),
+        type_id: TypeId,
+    ) -> Result<(), BuiltinError> {
+        let Some(id) = self.begin_memo(ptr)? else {
+            return Ok(());
+        };
+        let class = global_class(ClassId(type_id.raw())).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "cannot pickle bytes-backed instance of unpublished type '{}'",
+                type_id.name()
+            ))
+        })?;
+        let (module, name) = class_export_name(class.as_ref());
+        let bytes = value_as_bytes_ref(value).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "cannot pickle bytes-backed instance of '{}'",
+                type_id.name()
+            ))
+        })?;
+        let is_bytearray = bytes.is_bytearray();
+        let data = bytes.to_vec();
+        let shaped = unsafe { &*(ptr as *const ShapedObject) };
+        let attrs = shaped.iter_properties().collect::<Vec<_>>();
+
+        self.write_tag(TAG_BYTES_BACKED_USER_OBJECT);
+        self.write_u32(id);
+        self.write_u32(type_id.raw());
+        self.write_str(&module)?;
+        self.write_str(&name)?;
+        self.write_u8(u8::from(is_bytearray));
+        self.write_bytes(&data)?;
+        self.write_len(attrs.len(), "attribute count")?;
+        for (name, value) in attrs {
+            self.write_str(name.as_str())?;
             self.write_value(value)?;
         }
         Ok(())
@@ -602,6 +651,7 @@ impl<'bytes> PickleReader<'bytes> {
             TAG_TYPE => self.read_type(vm),
             TAG_USER_OBJECT => self.read_user_object(vm),
             TAG_DICT_BACKED_USER_OBJECT => self.read_dict_backed_user_object(vm),
+            TAG_BYTES_BACKED_USER_OBJECT => self.read_bytes_backed_user_object(vm),
             TAG_REDUCE => self.read_reduce(vm),
             TAG_GENERIC_ALIAS => self.read_generic_alias(vm),
             TAG_SLICE => self.read_slice(vm),
@@ -750,6 +800,41 @@ impl<'bytes> PickleReader<'bytes> {
             let dict = dict_storage_mut_from_ptr(ptr)
                 .ok_or_else(|| invalid_pickle("class is not dict-backed"))?;
             dict.set(key, item);
+        }
+
+        Ok(value)
+    }
+
+    fn read_bytes_backed_user_object(
+        &mut self,
+        vm: &mut VirtualMachine,
+    ) -> Result<Value, BuiltinError> {
+        let id = self.read_u32()?;
+        let class_id = self.read_u32()?;
+        let module = self.read_string()?;
+        let name = self.read_string()?;
+        let backing_kind = self.read_u8()?;
+        let data = self.read_bytes()?.to_vec();
+        let attr_count = self.read_len()?;
+        let class = resolve_user_class(vm, class_id, &module, &name)?;
+        let mut object = allocate_heap_instance_for_class(class.as_ref());
+        let backing = match backing_kind {
+            0 => BytesObject::from_vec(data),
+            1 => BytesObject::from_vec_with_type(data, TypeId::BYTEARRAY),
+            _ => return Err(invalid_pickle("unknown bytes-backed object kind")),
+        };
+        object.set_bytes_backing(backing);
+        let value = crate::alloc_managed_value(object);
+        self.insert_memo(id, value)?;
+
+        for _ in 0..attr_count {
+            let name = self.read_string()?;
+            let attr_value = self.read_value(vm)?;
+            let ptr = value
+                .as_object_ptr()
+                .expect("new heap instances are object values");
+            let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+            shaped.set_property(intern(&name), attr_value, shape_registry());
         }
 
         Ok(value)
