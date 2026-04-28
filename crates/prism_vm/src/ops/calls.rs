@@ -141,15 +141,15 @@ static BOOL_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
     BuiltinFunctionObject::new(Arc::from("bool.__new__"), crate::builtins::builtin_bool_new)
 });
 static BYTES_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("bytes.__new__"),
-        crate::builtins::builtin_bytes_new,
+        crate::builtins::builtin_bytes_new_vm,
     )
 });
 static BYTEARRAY_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("bytearray.__new__"),
-        crate::builtins::builtin_bytearray_new,
+        crate::builtins::builtin_bytearray_new_vm,
     )
 });
 static ENUMERATE_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {

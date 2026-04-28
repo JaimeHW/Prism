@@ -308,15 +308,15 @@ impl BuiltinRegistry {
             prism_runtime::object::type_obj::TypeId::BOOL,
             types::builtin_bool,
         );
-        registry.register_callable_type(
+        registry.register_callable_type_vm(
             "bytes",
             prism_runtime::object::type_obj::TypeId::BYTES,
-            string::builtin_bytes,
+            string::builtin_bytes_vm,
         );
-        registry.register_callable_type(
+        registry.register_callable_type_vm(
             "bytearray",
             prism_runtime::object::type_obj::TypeId::BYTEARRAY,
-            string::builtin_bytearray,
+            string::builtin_bytearray_vm,
         );
         registry.register_callable_type(
             "memoryview",

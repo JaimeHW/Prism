@@ -19,7 +19,11 @@
 
 use super::BuiltinError;
 use super::float_format::{FloatFormatSign, FloatFormatSpec, format_python_float};
+use crate::VirtualMachine;
 use crate::error::RuntimeError;
+use crate::ops::iteration::{
+    IterStep, ensure_iterator_value, next_step, reserve_advisory_length_hint,
+};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
@@ -328,6 +332,10 @@ pub fn builtin_bytes(args: &[Value]) -> Result<Value, BuiltinError> {
     build_byte_sequence(args, ByteSequenceKind::Bytes)
 }
 
+pub fn builtin_bytes_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    build_byte_sequence_with_vm(vm, args, ByteSequenceKind::Bytes)
+}
+
 // =============================================================================
 // bytearray() - Mutable Byte Sequence
 // =============================================================================
@@ -344,7 +352,30 @@ pub fn builtin_bytearray(args: &[Value]) -> Result<Value, BuiltinError> {
     build_byte_sequence(args, ByteSequenceKind::ByteArray)
 }
 
+pub fn builtin_bytearray_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    build_byte_sequence_with_vm(vm, args, ByteSequenceKind::ByteArray)
+}
+
 fn build_byte_sequence(args: &[Value], kind: ByteSequenceKind) -> Result<Value, BuiltinError> {
+    build_byte_sequence_impl(args, kind, None)
+}
+
+fn build_byte_sequence_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    kind: ByteSequenceKind,
+) -> Result<Value, BuiltinError> {
+    build_byte_sequence_impl(args, kind, Some(vm))
+}
+
+fn build_byte_sequence_impl(
+    args: &[Value],
+    kind: ByteSequenceKind,
+    vm: Option<&mut VirtualMachine>,
+) -> Result<Value, BuiltinError> {
     let fn_name = kind.fn_name();
     if args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -437,7 +468,10 @@ fn build_byte_sequence(args: &[Value], kind: ByteSequenceKind) -> Result<Value, 
         }
     }
 
-    let data = sequence_from_iterable(source, kind)?;
+    let data = match vm {
+        Some(vm) => sequence_from_iterable_with_vm(vm, source, kind)?,
+        None => sequence_from_iterable(source, kind)?,
+    };
     Ok(kind.from_data(data))
 }
 
@@ -470,6 +504,28 @@ fn sequence_from_iterable(source: Value, kind: ByteSequenceKind) -> Result<Vec<u
         data.push(value_to_byte(value, kind)?);
     }
     Ok(data)
+}
+
+#[inline]
+fn sequence_from_iterable_with_vm(
+    vm: &mut VirtualMachine,
+    source: Value,
+    kind: ByteSequenceKind,
+) -> Result<Vec<u8>, BuiltinError> {
+    let capacity = super::functions::try_length_hint(vm, source, 0)
+        .map_err(super::runtime_error_to_builtin_error)?;
+    let iterator =
+        ensure_iterator_value(vm, source).map_err(super::runtime_error_to_builtin_error)?;
+    let mut data = Vec::new();
+    reserve_advisory_length_hint(&mut data, capacity)
+        .map_err(super::runtime_error_to_builtin_error)?;
+
+    loop {
+        match next_step(vm, iterator).map_err(super::runtime_error_to_builtin_error)? {
+            IterStep::Yielded(value) => data.push(value_to_byte(value, kind)?),
+            IterStep::Exhausted => return Ok(data),
+        }
+    }
 }
 
 #[inline]

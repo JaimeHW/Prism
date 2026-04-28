@@ -108,7 +108,10 @@ static BOOL_FROM_BYTES_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
     )
 });
 static BYTES_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("bytes.__new__"), super::types::builtin_bytes_new)
+    BuiltinFunctionObject::new_vm(
+        Arc::from("bytes.__new__"),
+        super::types::builtin_bytes_new_vm,
+    )
 });
 static BYTES_MAKETRANS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -117,9 +120,9 @@ static BYTES_MAKETRANS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
     )
 });
 static BYTEARRAY_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("bytearray.__new__"),
-        super::types::builtin_bytearray_new,
+        super::types::builtin_bytearray_new_vm,
     )
 });
 static BYTEARRAY_MAKETRANS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {

@@ -1423,6 +1423,8 @@ pub(crate) fn call_builtin_type_with_vm(
         TypeId::BOOL => builtin_bool_vm(vm, args),
         TypeId::FLOAT => builtin_float_vm(vm, args),
         TypeId::STR => builtin_str_vm(vm, args),
+        TypeId::BYTES => super::string::builtin_bytes_vm(vm, args),
+        TypeId::BYTEARRAY => super::string::builtin_bytearray_vm(vm, args),
         TypeId::RANGE => super::itertools::builtin_range_vm(vm, args),
         TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm(vm, args),
         TypeId::LIST => {
@@ -3320,6 +3322,15 @@ pub(crate) fn builtin_bytes_new(args: &[Value]) -> Result<Value, BuiltinError> {
     builtin_byte_sequence_new(args, TypeId::BYTES, "bytes", super::string::builtin_bytes)
 }
 
+pub(crate) fn builtin_bytes_new_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    builtin_byte_sequence_new(args, TypeId::BYTES, "bytes", |args| {
+        super::string::builtin_bytes_vm(vm, args)
+    })
+}
+
 pub(crate) fn builtin_bytearray_new(args: &[Value]) -> Result<Value, BuiltinError> {
     builtin_byte_sequence_new(
         args,
@@ -3329,12 +3340,24 @@ pub(crate) fn builtin_bytearray_new(args: &[Value]) -> Result<Value, BuiltinErro
     )
 }
 
-fn builtin_byte_sequence_new(
+pub(crate) fn builtin_bytearray_new_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    builtin_byte_sequence_new(args, TypeId::BYTEARRAY, "bytearray", |args| {
+        super::string::builtin_bytearray_vm(vm, args)
+    })
+}
+
+fn builtin_byte_sequence_new<F>(
     args: &[Value],
     target: TypeId,
     type_name: &'static str,
-    constructor: fn(&[Value]) -> Result<Value, BuiltinError>,
-) -> Result<Value, BuiltinError> {
+    mut constructor: F,
+) -> Result<Value, BuiltinError>
+where
+    F: FnMut(&[Value]) -> Result<Value, BuiltinError>,
+{
     if args.is_empty() {
         return Err(BuiltinError::TypeError(format!(
             "{type_name}.__new__() takes at least 1 argument (0 given)"
