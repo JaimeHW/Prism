@@ -538,6 +538,14 @@ pub(crate) fn add_values(
         return Ok(value);
     }
 
+    let tried_special =
+        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
+    if tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__add__", "__radd__")?
+    {
+        return Ok(value);
+    }
+
     if let Some(value) = concat_string_value_in_vm(vm, left, right)? {
         return Ok(value);
     }
@@ -564,7 +572,9 @@ pub(crate) fn add_values(
         }
     }
 
-    if let Some(value) = binary_special_method(vm, left, right, "__add__", "__radd__")? {
+    if !tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__add__", "__radd__")?
+    {
         return Ok(value);
     }
 
@@ -764,12 +774,7 @@ fn modulo_needs_user_slot_dispatch(left: Value, right: Value) -> bool {
 
 #[inline]
 fn value_as_byte_sequence_ref(value: Value) -> Option<&'static BytesObject> {
-    let ptr = value.as_object_ptr()?;
-    let header = unsafe { &*(ptr as *const ObjectHeader) };
-    match header.type_id {
-        TypeId::BYTES | TypeId::BYTEARRAY => Some(unsafe { &*(ptr as *const BytesObject) }),
-        _ => None,
-    }
+    value_as_bytes_ref(value)
 }
 
 /// Sub: dst = src1 - src2 (generic with speculative fast-path)
@@ -977,6 +982,16 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
+    let tried_special =
+        user_defined_binary_slot_candidate(a) || user_defined_binary_slot_candidate(b);
+    if tried_special {
+        match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mul__", "__rmul__") {
+            Ok(true) => return ControlFlow::Continue,
+            Ok(false) => {}
+            Err(err) => return ControlFlow::Error(err),
+        }
+    }
+
     if let Some(n) = int_like_value(b) {
         match repeat_string_value_in_vm(vm, a, n) {
             Ok(Some(value)) => {
@@ -1014,10 +1029,12 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
     }
 
-    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mul__", "__rmul__") {
-        Ok(true) => return ControlFlow::Continue,
-        Ok(false) => {}
-        Err(err) => return ControlFlow::Error(err),
+    if !tried_special {
+        match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mul__", "__rmul__") {
+            Ok(true) => return ControlFlow::Continue,
+            Ok(false) => {}
+            Err(err) => return ControlFlow::Error(err),
+        }
     }
 
     let Some(x) = float_like_value(a) else {
@@ -1067,17 +1084,15 @@ fn repeat_sequence_value(value: Value, count: i64) -> Result<Option<Value>, Runt
         return Ok(Some(boxed_tuple_value(repeated)));
     }
 
-    match header.type_id {
-        TypeId::BYTES | TypeId::BYTEARRAY => {
-            let bytes = unsafe { &*(ptr as *const BytesObject) };
-            ensure_repeated_sequence_len(bytes.len(), repeat)?;
-            let repeated = bytes
-                .repeat_sequence(repeat)
-                .ok_or_else(sequence_repeat_memory_error)?;
-            Ok(Some(boxed_bytes_value(repeated)))
-        }
-        _ => Ok(None),
+    if let Some(bytes) = value_as_bytes_ref(value) {
+        ensure_repeated_sequence_len(bytes.len(), repeat)?;
+        let repeated = bytes
+            .repeat_sequence(repeat)
+            .ok_or_else(sequence_repeat_memory_error)?;
+        return Ok(Some(boxed_bytes_value(repeated)));
     }
+
+    Ok(None)
 }
 
 #[inline]
