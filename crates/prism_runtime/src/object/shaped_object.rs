@@ -548,6 +548,13 @@ impl ShapedObject {
         self.bytes_backing.as_deref_mut()
     }
 
+    /// Replace native bytes storage for heap subclasses of `bytes` and
+    /// `bytearray`.
+    #[inline]
+    pub fn set_bytes_backing(&mut self, bytes: BytesObject) {
+        self.bytes_backing = Some(Box::new(bytes));
+    }
+
     /// Check whether this heap instance carries native integer storage.
     #[inline]
     pub fn has_int_backing(&self) -> bool {

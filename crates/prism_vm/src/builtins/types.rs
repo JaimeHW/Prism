@@ -3038,10 +3038,15 @@ pub(crate) fn allocate_heap_instance_for_class(class: &PyClassObject) -> ShapedO
             TupleObject::empty(),
         )
     } else if class_uses_native_bytes_storage(class) {
+        let backing = if class_uses_native_storage(class, TypeId::BYTEARRAY) {
+            BytesObject::new_bytearray()
+        } else {
+            BytesObject::new()
+        };
         ShapedObject::new_bytes_backed(
             class.class_type_id(),
             class.instance_shape().clone(),
-            BytesObject::new(),
+            backing,
         )
     } else if class_uses_native_int_storage(class) {
         ShapedObject::new_int_backed(
