@@ -29,7 +29,7 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::set::SetObject;
@@ -617,6 +617,9 @@ fn call_reduce(vm: &mut VirtualMachine, value: Value) -> Result<Option<Value>, B
         }
         Err(err) => return Err(runtime_error_to_builtin_error(err)),
     };
+    if is_builtin_function_named(method, "object.__reduce__") {
+        return Ok(None);
+    }
     invoke_callable_value(vm, method, &[])
         .map(Some)
         .map_err(runtime_error_to_builtin_error)
@@ -793,10 +796,12 @@ fn copy_native_backed_user(
     if type_id.raw() < TypeId::FIRST_USER_TYPE {
         return Ok(None);
     }
+    let source_bytes = value_as_bytes_ref(value);
     if list_storage_ref_from_ptr(ptr).is_none()
         && tuple_storage_ref_from_ptr(ptr).is_none()
         && dict_storage_ref_from_ptr(ptr).is_none()
         && set_storage_ref_from_ptr(ptr).is_none()
+        && source_bytes.is_none()
     {
         return Ok(None);
     }
@@ -835,6 +840,10 @@ fn copy_native_backed_user(
         for item in source.iter() {
             target.add(item);
         }
+    }
+    if let Some(source) = source_bytes {
+        let target = unsafe { &mut *(copied_ptr as *mut ShapedObject) };
+        target.set_bytes_backing(source.clone());
     }
 
     Ok(Some(copied))
@@ -880,10 +889,12 @@ fn deepcopy_native_backed_user(
     if type_id.raw() < TypeId::FIRST_USER_TYPE {
         return Ok(None);
     }
+    let source_bytes = value_as_bytes_ref(value);
     if list_storage_ref_from_ptr(ptr).is_none()
         && tuple_storage_ref_from_ptr(ptr).is_none()
         && dict_storage_ref_from_ptr(ptr).is_none()
         && set_storage_ref_from_ptr(ptr).is_none()
+        && source_bytes.is_none()
     {
         return Ok(None);
     }
@@ -929,6 +940,10 @@ fn deepcopy_native_backed_user(
                 .expect("set-backed class should allocate set backing");
             set_add_item(vm, target, item).map_err(runtime_error_to_builtin_error)?;
         }
+    }
+    if let Some(source) = source_bytes {
+        let target = unsafe { &mut *(copied_ptr as *mut ShapedObject) };
+        target.set_bytes_backing(source.clone());
     }
 
     deepcopy_user_attribute_state(vm, value, copied, memo)?;
@@ -1091,11 +1106,24 @@ fn is_builtin_function_named(value: Value, expected: &'static str) -> bool {
     let Some(ptr) = value.as_object_ptr() else {
         return false;
     };
-    if extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION {
-        return false;
+    match extract_type_id(ptr) {
+        TypeId::BUILTIN_FUNCTION => {
+            let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+            builtin_name_matches(function.name(), expected)
+        }
+        TypeId::METHOD => {
+            let method = unsafe { &*(ptr as *const BoundMethod) };
+            is_builtin_function_named(method.function(), expected)
+        }
+        _ => false,
     }
-    let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
-    function.name() == expected
+}
+
+fn builtin_name_matches(actual: &str, expected: &'static str) -> bool {
+    actual == expected
+        || expected
+            .rsplit_once('.')
+            .is_some_and(|(_, short)| actual == short)
 }
 
 fn reconstruct_reduce(
