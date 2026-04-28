@@ -337,7 +337,9 @@ fn subscr_index_protocol(
     }
 
     let Some(index) = subscript_index_bigint(vm, key)? else {
-        return Ok(None);
+        return Err(ControlFlow::Error(builtin_integer_subscript_type_error(
+            container, key,
+        )));
     };
 
     if let Some(index) = index.to_i64() {
@@ -369,6 +371,59 @@ fn has_builtin_integer_subscript(container: Value) -> Result<bool, ControlFlow> 
         header.type_id,
         TypeId::BYTES | TypeId::BYTEARRAY | TypeId::MEMORYVIEW | TypeId::STR | TypeId::RANGE
     ))
+}
+
+#[inline]
+fn builtin_integer_subscript_type_error(container: Value, key: Value) -> RuntimeError {
+    if tagged_interned_string(container).ok().flatten().is_some() {
+        return RuntimeError::type_error(format!(
+            "string indices must be integers, not '{}'",
+            key.type_name()
+        ));
+    }
+
+    let Some(ptr) = container.as_object_ptr() else {
+        return RuntimeError::type_error(format!(
+            "'{}' object is not subscriptable",
+            container.type_name()
+        ));
+    };
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+
+    let has_builtin_sequence_layout = header.type_id.raw() < TypeId::FIRST_USER_TYPE;
+    if has_builtin_sequence_layout && list_storage_ref_from_ptr(ptr).is_some() {
+        return RuntimeError::type_error(format!(
+            "list indices must be integers or slices, not {}",
+            key.type_name()
+        ));
+    }
+    if has_builtin_sequence_layout && tuple_storage_ref_from_ptr(ptr).is_some() {
+        return RuntimeError::type_error(format!(
+            "tuple indices must be integers or slices, not {}",
+            key.type_name()
+        ));
+    }
+
+    let key_type = key.type_name();
+    match header.type_id {
+        TypeId::BYTES => RuntimeError::type_error(format!(
+            "byte indices must be integers or slices, not {key_type}"
+        )),
+        TypeId::BYTEARRAY => RuntimeError::type_error(format!(
+            "bytearray indices must be integers or slices, not {key_type}"
+        )),
+        TypeId::MEMORYVIEW => RuntimeError::type_error("memoryview: invalid slice key"),
+        TypeId::STR => {
+            RuntimeError::type_error(format!("string indices must be integers, not '{key_type}'"))
+        }
+        TypeId::RANGE => RuntimeError::type_error(format!(
+            "range indices must be integers or slices, not {key_type}"
+        )),
+        _ => RuntimeError::type_error(format!(
+            "'{}' object is not subscriptable",
+            container.type_name()
+        )),
+    }
 }
 
 fn subscript_index_bigint(
@@ -870,16 +925,39 @@ fn string_slice_str(
 }
 
 #[inline]
-fn bytearray_assignment_byte(value: Value) -> Result<u8, RuntimeError> {
-    let integer = if let Some(flag) = value.as_bool() {
-        if flag { 1 } else { 0 }
-    } else {
-        value_to_bigint(value)
-            .and_then(|integer| integer.to_i64())
-            .ok_or_else(|| RuntimeError::type_error("an integer is required"))?
-    };
+fn bytearray_assignment_byte(vm: &mut VirtualMachine, value: Value) -> Result<u8, RuntimeError> {
+    let integer = bytearray_index_bigint(vm, value, "an integer is required")?;
+    integer
+        .to_i64()
+        .and_then(|integer| u8::try_from(integer).ok())
+        .ok_or_else(|| RuntimeError::value_error("byte must be in range(0, 256)"))
+}
 
-    u8::try_from(integer).map_err(|_| RuntimeError::value_error("byte must be in range(0, 256)"))
+fn bytearray_index_i64(
+    vm: &mut VirtualMachine,
+    value: Value,
+    len: usize,
+    type_error: &'static str,
+) -> Result<i64, RuntimeError> {
+    let index = bytearray_index_bigint(vm, value, type_error)?;
+    index
+        .to_i64()
+        .ok_or_else(|| RuntimeError::index_error(bigint_to_saturated_i64(&index), len))
+}
+
+fn bytearray_index_bigint(
+    vm: &mut VirtualMachine,
+    value: Value,
+    type_error: &'static str,
+) -> Result<BigInt, RuntimeError> {
+    match subscript_index_bigint(vm, value) {
+        Ok(Some(index)) => Ok(index),
+        Ok(None) => Err(RuntimeError::type_error(type_error)),
+        Err(ControlFlow::Error(err)) => Err(err),
+        Err(other) => Err(RuntimeError::internal(format!(
+            "unexpected control flow while resolving bytearray index: {other:?}"
+        ))),
+    }
 }
 
 fn bytearray_replacement_bytes(
@@ -903,10 +981,12 @@ fn bytearray_replacement_bytes(
         }
     }
 
-    collect_iterable_values(vm, value)?
-        .into_iter()
-        .map(bytearray_assignment_byte)
-        .collect()
+    let values = collect_iterable_values(vm, value)?;
+    let mut bytes = Vec::with_capacity(values.len());
+    for value in values {
+        bytes.push(bytearray_assignment_byte(vm, value)?);
+    }
+    Ok(bytes)
 }
 
 // =============================================================================
@@ -962,12 +1042,12 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
         match header.type_id {
             TypeId::BYTEARRAY => {
-                let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
                 if let Some(index) = key.as_int() {
-                    let byte = match bytearray_assignment_byte(value) {
+                    let byte = match bytearray_assignment_byte(vm, value) {
                         Ok(byte) => byte,
                         Err(err) => return ControlFlow::Error(err),
                     };
+                    let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
                     if bytes.set(index, byte) {
                         return ControlFlow::Continue;
                     }
@@ -983,15 +1063,32 @@ pub fn store_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         Ok(bytes) => bytes,
                         Err(err) => return ControlFlow::Error(err),
                     };
+                    let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
                     return match bytes.assign_slice(slice, &replacement) {
                         Ok(()) => ControlFlow::Continue,
                         Err(err) => ControlFlow::Error(RuntimeError::value_error(err.to_string())),
                     };
                 }
 
-                return ControlFlow::Error(RuntimeError::type_error(
+                let len = unsafe { (&*(ptr as *const BytesObject)).len() };
+                let index = match bytearray_index_i64(
+                    vm,
+                    key,
+                    len,
                     "bytearray indices must be integers or slices",
-                ));
+                ) {
+                    Ok(index) => index,
+                    Err(err) => return ControlFlow::Error(err),
+                };
+                let byte = match bytearray_assignment_byte(vm, value) {
+                    Ok(byte) => byte,
+                    Err(err) => return ControlFlow::Error(err),
+                };
+                let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
+                if bytes.set(index, byte) {
+                    return ControlFlow::Continue;
+                }
+                return ControlFlow::Error(RuntimeError::index_error(index, len));
             }
             TypeId::DICT => {
                 // Dict[key] = value
@@ -1062,8 +1159,8 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 
         match header.type_id {
             TypeId::BYTEARRAY => {
-                let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
                 if let Some(index) = key.as_int() {
+                    let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
                     if bytes.delete(index) {
                         return ControlFlow::Continue;
                     }
@@ -1075,13 +1172,26 @@ pub fn delete_subscr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
                     if let Err(err) = reject_zero_step_slice(slice) {
                         return err;
                     }
+                    let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
                     bytes.delete_slice(slice);
                     return ControlFlow::Continue;
                 }
 
-                return ControlFlow::Error(RuntimeError::type_error(
+                let len = unsafe { (&*(ptr as *const BytesObject)).len() };
+                let index = match bytearray_index_i64(
+                    vm,
+                    key,
+                    len,
                     "bytearray indices must be integers or slices",
-                ));
+                ) {
+                    Ok(index) => index,
+                    Err(err) => return ControlFlow::Error(err),
+                };
+                let bytes = unsafe { &mut *(ptr as *mut BytesObject) };
+                if bytes.delete(index) {
+                    return ControlFlow::Continue;
+                }
+                return ControlFlow::Error(RuntimeError::index_error(index, len));
             }
             TypeId::DICT => {
                 let dict = unsafe { &mut *(ptr as *mut DictObject) };
