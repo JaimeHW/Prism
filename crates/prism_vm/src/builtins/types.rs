@@ -31,7 +31,9 @@ use prism_runtime::object::type_builtins::{
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{MappingProxyObject, UnionTypeObject};
-use prism_runtime::types::bytes::{BytesObject, clone_bytes_value, value_as_bytes_ref};
+use prism_runtime::types::bytes::{
+    BytesObject, clone_bytes_value, value_as_bytes_mut, value_as_bytes_ref,
+};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::int::{bigint_to_value, value_as_heap_int, value_to_bigint};
@@ -1836,6 +1838,7 @@ pub(crate) fn call_builtin_type_kw_with_vm(
         TypeId::PROPERTY => builtin_property_kw(positional, keywords),
         TypeId::DICT => builtin_dict_kw_vm(vm, positional, keywords),
         TypeId::STR => builtin_str_kw_vm(vm, positional, keywords),
+        TypeId::BYTEARRAY => builtin_bytearray_kw_vm(vm, positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
         TypeId::ENUMERATE => super::itertools::builtin_enumerate_vm_kw(vm, positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
@@ -1859,6 +1862,7 @@ pub(crate) fn call_builtin_type_kw(
         TypeId::PROPERTY => builtin_property_kw(positional, keywords),
         TypeId::DICT => builtin_dict_kw(positional, keywords),
         TypeId::STR => builtin_str_kw(positional, keywords),
+        TypeId::BYTEARRAY => builtin_bytearray_kw(positional, keywords),
         TypeId::DEQUE => builtin_deque_kw(positional, keywords),
         TypeId::ENUMERATE => super::itertools::builtin_enumerate_kw(positional, keywords),
         _ => Err(BuiltinError::TypeError(format!(
@@ -3339,21 +3343,164 @@ pub(crate) fn builtin_bytes_fromhex_vm(
 }
 
 pub(crate) fn builtin_bytearray_new(args: &[Value]) -> Result<Value, BuiltinError> {
-    builtin_byte_sequence_new(
-        args,
-        TypeId::BYTEARRAY,
-        "bytearray",
-        super::string::builtin_bytearray,
-    )
+    builtin_bytearray_new_impl(args)
 }
 
 pub(crate) fn builtin_bytearray_new_vm(
+    _vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    builtin_bytearray_new_impl(args)
+}
+
+pub(crate) fn builtin_bytearray_new_vm_kw(
+    _vm: &mut VirtualMachine,
+    args: &[Value],
+    _keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    builtin_bytearray_new_impl(args)
+}
+
+fn builtin_bytearray_new_impl(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() {
+        return Err(BuiltinError::TypeError(
+            "bytearray.__new__() takes at least 1 argument (0 given)".to_string(),
+        ));
+    }
+
+    let receiver = args[0];
+    let class_type = class_value_to_type_id(receiver).ok_or_else(|| {
+        BuiltinError::TypeError("bytearray.__new__(X): X must be a type".to_string())
+    })?;
+    if class_type == TypeId::BYTEARRAY {
+        return Ok(to_object_value(BytesObject::new_bytearray()));
+    }
+
+    if !class_value_is_subtype(receiver, TypeId::BYTEARRAY) {
+        return Err(BuiltinError::TypeError(
+            "bytearray.__new__(X): X is not a subtype of bytearray".to_string(),
+        ));
+    }
+
+    let class_ptr = receiver.as_object_ptr().ok_or_else(|| {
+        BuiltinError::TypeError("bytearray.__new__(X): X must be a type".to_string())
+    })?;
+    let class = class_object_from_ptr(class_ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "bytearray.__new__() for builtin bytearray subclasses is unsupported".to_string(),
+        )
+    })?;
+
+    Ok(to_object_value(ShapedObject::new_bytes_backed(
+        class.class_type_id(),
+        class.instance_shape().clone(),
+        BytesObject::new_bytearray(),
+    )))
+}
+
+pub(crate) fn builtin_bytearray_init_vm(
     vm: &mut VirtualMachine,
     args: &[Value],
 ) -> Result<Value, BuiltinError> {
-    builtin_byte_sequence_new(args, TypeId::BYTEARRAY, "bytearray", |args| {
-        super::string::builtin_bytearray_vm(vm, args)
-    })
+    if args.is_empty() || args.len() > 4 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "bytearray.__init__() takes at most 3 arguments ({given} given)"
+        )));
+    }
+
+    if !value_as_bytes_ref(args[0]).is_some_and(BytesObject::is_bytearray) {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__init__' requires a 'bytearray' object".to_string(),
+        ));
+    }
+
+    let data = super::string::bytearray_data_with_vm(vm, &args[1..])?;
+    let bytes = value_as_bytes_mut(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires a 'bytearray' object".to_string())
+    })?;
+    if !bytes.replace_all(data) {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__init__' requires a 'bytearray' object".to_string(),
+        ));
+    }
+
+    Ok(Value::none())
+}
+
+pub(crate) fn builtin_bytearray_init_vm_kw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let bound = bind_bytearray_constructor_keywords(args, keywords, "bytearray.__init__", 1)?;
+    builtin_bytearray_init_vm(vm, &bound)
+}
+
+pub(crate) fn builtin_bytearray_kw(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let bound = bind_bytearray_constructor_keywords(args, keywords, "bytearray", 0)?;
+    super::string::builtin_bytearray(&bound)
+}
+
+pub(crate) fn builtin_bytearray_kw_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let bound = bind_bytearray_constructor_keywords(args, keywords, "bytearray", 0)?;
+    super::string::builtin_bytearray_vm(vm, &bound)
+}
+
+fn bind_bytearray_constructor_keywords(
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+    fn_name: &'static str,
+    leading_positional: usize,
+) -> Result<Vec<Value>, BuiltinError> {
+    let payload_positional = positional.len().saturating_sub(leading_positional);
+    if positional.len() < leading_positional || payload_positional > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "{fn_name}() takes at most 3 arguments ({payload_positional} given)"
+        )));
+    }
+
+    let mut slots: [Option<Value>; 3] = [None, None, None];
+    for &(name, value) in keywords {
+        let index = match name {
+            "source" => 0,
+            "encoding" => 1,
+            "errors" => 2,
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "{fn_name}() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        };
+
+        if payload_positional > index || slots[index].replace(value).is_some() {
+            return Err(BuiltinError::TypeError(format!(
+                "{fn_name}() got multiple values for argument '{name}'"
+            )));
+        }
+    }
+
+    let mut payload_len = payload_positional;
+    for (index, value) in slots.iter().enumerate() {
+        if value.is_some() {
+            payload_len = payload_len.max(index + 1);
+        }
+    }
+
+    let mut bound = Vec::with_capacity(leading_positional + payload_len);
+    bound.extend_from_slice(&positional[..leading_positional]);
+    bound.extend_from_slice(&positional[leading_positional..]);
+    for value in slots.iter().take(payload_len).skip(payload_positional) {
+        bound.push(value.unwrap_or_else(Value::none));
+    }
+    Ok(bound)
 }
 
 pub(crate) fn builtin_bytearray_fromhex_vm(

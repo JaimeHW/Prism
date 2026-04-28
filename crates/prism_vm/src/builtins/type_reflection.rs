@@ -126,9 +126,15 @@ static BYTES_FROMHEX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| 
     )
 });
 static BYTEARRAY_NEW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new_vm(
+    BuiltinFunctionObject::new_vm_kw(
         Arc::from("bytearray.__new__"),
-        super::types::builtin_bytearray_new_vm,
+        super::types::builtin_bytearray_new_vm_kw,
+    )
+});
+static BYTEARRAY_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("bytearray.__init__"),
+        super::types::builtin_bytearray_init_vm_kw,
     )
 });
 static BYTEARRAY_MAKETRANS_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -335,6 +341,10 @@ const BYTES_TYPE_ATTRS: &[AttrSpec] = &[
 
 const BYTEARRAY_TYPE_ATTRS: &[AttrSpec] = &[
     NEW_WRAPPER_ATTR,
+    AttrSpec {
+        name: "__init__",
+        kind: ReflectedValueKind::WrapperDescriptor,
+    },
     AttrSpec {
         name: "fromhex",
         kind: ReflectedValueKind::ClassMethodDescriptor,
@@ -1124,6 +1134,7 @@ pub(crate) fn reflected_descriptor_callable_value(
         TypeId::WRAPPER_DESCRIPTOR => match (owner, name.as_str()) {
             (TypeId::OBJECT, "__init__") => Some(builtin_method_value(&OBJECT_INIT_METHOD)),
             (TypeId::TYPE, "__init__") => Some(builtin_method_value(&TYPE_INIT_METHOD)),
+            (TypeId::BYTEARRAY, "__init__") => Some(builtin_method_value(&BYTEARRAY_INIT_METHOD)),
             (TypeId::DICT, "__init__") => Some(builtin_method_value(&DICT_INIT_METHOD)),
             (TypeId::SET, "__init__") => Some(builtin_method_value(&SET_INIT_METHOD)),
             (TypeId::FROZENSET, "__init__") => Some(builtin_method_value(&FROZENSET_INIT_METHOD)),

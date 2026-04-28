@@ -174,6 +174,17 @@ impl BytesObject {
         true
     }
 
+    /// Replace all bytes for mutable instances, taking ownership of the new
+    /// storage without an intermediate copy.
+    #[inline]
+    pub fn replace_all(&mut self, data: Vec<u8>) -> bool {
+        if !self.is_bytearray() {
+            return false;
+        }
+        self.data = data;
+        true
+    }
+
     /// Return the underlying vector capacity.
     #[inline]
     pub fn capacity(&self) -> usize {

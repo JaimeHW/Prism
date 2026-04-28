@@ -93,6 +93,31 @@ impl ByteSequenceKind {
     }
 }
 
+enum ByteSequencePayload {
+    BorrowedExact(Value),
+    Owned(Vec<u8>),
+}
+
+impl ByteSequencePayload {
+    #[inline]
+    fn into_value(self, kind: ByteSequenceKind) -> Value {
+        match self {
+            Self::BorrowedExact(value) => value,
+            Self::Owned(data) => kind.from_data(data),
+        }
+    }
+
+    #[inline]
+    fn into_data(self) -> Result<Vec<u8>, BuiltinError> {
+        match self {
+            Self::BorrowedExact(value) => value_as_bytes_ref(value)
+                .map(BytesObject::to_vec)
+                .ok_or_else(|| BuiltinError::TypeError("bytes payload unavailable".to_string())),
+            Self::Owned(data) => Ok(data),
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn byte_sequence_value(type_id: TypeId, data: Vec<u8>) -> Value {
     let obj = BytesObject::from_vec_with_type(data, type_id);
@@ -359,6 +384,13 @@ pub fn builtin_bytearray_vm(
     build_byte_sequence_with_vm(vm, args, ByteSequenceKind::ByteArray)
 }
 
+pub(crate) fn bytearray_data_with_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Vec<u8>, BuiltinError> {
+    build_byte_sequence_payload_impl(args, ByteSequenceKind::ByteArray, Some(vm))?.into_data()
+}
+
 fn build_byte_sequence(args: &[Value], kind: ByteSequenceKind) -> Result<Value, BuiltinError> {
     build_byte_sequence_impl(args, kind, None)
 }
@@ -376,6 +408,14 @@ fn build_byte_sequence_impl(
     kind: ByteSequenceKind,
     vm: Option<&mut VirtualMachine>,
 ) -> Result<Value, BuiltinError> {
+    Ok(build_byte_sequence_payload_impl(args, kind, vm)?.into_value(kind))
+}
+
+fn build_byte_sequence_payload_impl(
+    args: &[Value],
+    kind: ByteSequenceKind,
+    vm: Option<&mut VirtualMachine>,
+) -> Result<ByteSequencePayload, BuiltinError> {
     let fn_name = kind.fn_name();
     if args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -386,7 +426,7 @@ fn build_byte_sequence_impl(
     }
 
     if args.is_empty() {
-        return Ok(kind.from_data(Vec::new()));
+        return Ok(ByteSequencePayload::Owned(Vec::new()));
     }
 
     // source + encoding[, errors]
@@ -413,16 +453,20 @@ fn build_byte_sequence_impl(
             "strict".to_string()
         };
 
-        return encode_text_to_value(&source, Some(&encoding), Some(&errors), kind.type_id());
+        return Ok(ByteSequencePayload::Owned(encode_text_to_data(
+            &source,
+            Some(&encoding),
+            Some(&errors),
+        )?));
     }
 
     // Single-argument form.
     let source = args[0];
     if let Some(count) = source.as_int() {
-        return sequence_from_count(kind, count);
+        return sequence_from_count(kind, count).map(ByteSequencePayload::Owned);
     }
     if let Some(b) = source.as_bool() {
-        return sequence_from_count(kind, if b { 1 } else { 0 });
+        return sequence_from_count(kind, if b { 1 } else { 0 }).map(ByteSequencePayload::Owned);
     }
 
     if source.is_string() {
@@ -440,14 +484,14 @@ fn build_byte_sequence_impl(
             }
             TypeId::BYTES => {
                 if kind == ByteSequenceKind::Bytes {
-                    return Ok(source);
+                    return Ok(ByteSequencePayload::BorrowedExact(source));
                 }
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
-                return Ok(kind.from_data(bytes.to_vec()));
+                return Ok(ByteSequencePayload::Owned(bytes.to_vec()));
             }
             TypeId::BYTEARRAY => {
                 let bytes = unsafe { &*(ptr as *const BytesObject) };
-                return Ok(kind.from_data(bytes.to_vec()));
+                return Ok(ByteSequencePayload::Owned(bytes.to_vec()));
             }
             TypeId::MEMORYVIEW => {
                 let view = value_as_memoryview_ref(source).ok_or_else(|| {
@@ -458,13 +502,13 @@ fn build_byte_sequence_impl(
                         "operation forbidden on released memoryview object".to_string(),
                     ));
                 }
-                return Ok(kind.from_data(view.to_vec()));
+                return Ok(ByteSequencePayload::Owned(view.to_vec()));
             }
             _ => {}
         }
 
         if let Some(bytes) = value_as_bytes_ref(source) {
-            return Ok(kind.from_data(bytes.to_vec()));
+            return Ok(ByteSequencePayload::Owned(bytes.to_vec()));
         }
     }
 
@@ -472,11 +516,11 @@ fn build_byte_sequence_impl(
         Some(vm) => sequence_from_iterable_with_vm(vm, source, kind)?,
         None => sequence_from_iterable(source, kind)?,
     };
-    Ok(kind.from_data(data))
+    Ok(ByteSequencePayload::Owned(data))
 }
 
 #[inline]
-fn sequence_from_count(kind: ByteSequenceKind, count: i64) -> Result<Value, BuiltinError> {
+fn sequence_from_count(kind: ByteSequenceKind, count: i64) -> Result<Vec<u8>, BuiltinError> {
     if count < 0 {
         return Err(BuiltinError::ValueError("negative count".to_string()));
     }
@@ -486,7 +530,7 @@ fn sequence_from_count(kind: ByteSequenceKind, count: i64) -> Result<Value, Buil
             kind.fn_name()
         )));
     }
-    Ok(kind.from_data(vec![0; count as usize]))
+    Ok(vec![0; count as usize])
 }
 
 #[inline]

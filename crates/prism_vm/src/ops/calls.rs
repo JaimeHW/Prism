@@ -147,9 +147,15 @@ static BYTES_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(
     )
 });
 static BYTEARRAY_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new_vm(
+    BuiltinFunctionObject::new_vm_kw(
         Arc::from("bytearray.__new__"),
-        crate::builtins::builtin_bytearray_new_vm,
+        crate::builtins::builtin_bytearray_new_vm_kw,
+    )
+});
+static BYTEARRAY_INIT_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("bytearray.__init__"),
+        crate::builtins::builtin_bytearray_init_vm_kw,
     )
 });
 static ENUMERATE_NEW_SLOT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -545,6 +551,7 @@ fn builtin_instantiation_slot_value(owner: TypeId, name: &str) -> Option<Value> 
         (TypeId::BOOL, "__new__") => Some(builtin_slot_value(&BOOL_NEW_SLOT_FUNCTION)),
         (TypeId::BYTES, "__new__") => Some(builtin_slot_value(&BYTES_NEW_SLOT_FUNCTION)),
         (TypeId::BYTEARRAY, "__new__") => Some(builtin_slot_value(&BYTEARRAY_NEW_SLOT_FUNCTION)),
+        (TypeId::BYTEARRAY, "__init__") => Some(builtin_slot_value(&BYTEARRAY_INIT_SLOT_FUNCTION)),
         (TypeId::ENUMERATE, "__new__") => Some(builtin_slot_value(&ENUMERATE_NEW_SLOT_FUNCTION)),
         _ => None,
     }
