@@ -3,6 +3,14 @@
 //! Provides low-level access to interpreter internals.
 
 use prism_core::Value;
+use prism_core::intern::interned_by_ptr;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::list::ListObject;
+use prism_runtime::types::string::StringObject;
+use prism_runtime::types::tuple::TupleObject;
 use std::collections::HashSet;
 use std::sync::RwLock;
 
@@ -30,16 +38,43 @@ pub fn getrefcount(_value: &Value) -> usize {
 /// Returns the approximate memory usage of the value.
 #[inline]
 pub fn getsizeof(value: &Value) -> usize {
-    // Base size of Value (8 bytes for NaN-boxed)
-    let base = std::mem::size_of::<Value>();
-
-    // For now, just return the base size
-    // String content size would require accessing the string data
     if value.is_string() {
-        // Placeholder - would need to access actual string length
-        base + 32 // Estimate
-    } else {
-        base
+        let payload = value
+            .as_string_object_ptr()
+            .and_then(|ptr| interned_by_ptr(ptr as *const u8))
+            .map(|text| text.as_str().len())
+            .unwrap_or(0);
+        return std::mem::size_of::<Value>() + payload;
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return std::mem::size_of::<Value>();
+    };
+
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match header.type_id {
+        TypeId::BYTES | TypeId::BYTEARRAY => {
+            let bytes = unsafe { &*(ptr as *const BytesObject) };
+            std::mem::size_of::<BytesObject>() + bytes.capacity().max(bytes.len())
+        }
+        TypeId::LIST => {
+            let list = unsafe { &*(ptr as *const ListObject) };
+            std::mem::size_of::<ListObject>() + list.len() * std::mem::size_of::<Value>()
+        }
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            std::mem::size_of::<TupleObject>() + tuple.len() * std::mem::size_of::<Value>()
+        }
+        TypeId::DICT => {
+            let dict = unsafe { &*(ptr as *const DictObject) };
+            std::mem::size_of::<DictObject>()
+                + dict.len() * (std::mem::size_of::<Value>() * 2 + std::mem::size_of::<u64>())
+        }
+        TypeId::STR => {
+            let string = unsafe { &*(ptr as *const StringObject) };
+            std::mem::size_of::<StringObject>() + string.len()
+        }
+        _ => std::mem::size_of::<ObjectHeader>(),
     }
 }
 

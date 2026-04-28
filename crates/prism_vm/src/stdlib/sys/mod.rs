@@ -145,6 +145,8 @@ static GETWINDOWSVERSION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::n
 });
 static GETREFCOUNT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.getrefcount"), sys_getrefcount));
+static GETSIZEOF_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("sys.getsizeof"), sys_getsizeof));
 static CURRENT_TRACE_FUNCTION: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(Value::none()));
 static CURRENT_PROFILE_FUNCTION: LazyLock<Mutex<Value>> =
     LazyLock::new(|| Mutex::new(Value::none()));
@@ -297,10 +299,11 @@ impl Module for SysModule {
             "recursion_limit" => Ok(Value::int(self.recursion_limit.get() as i64).unwrap()),
 
             // Functions - return None placeholder (would be callable)
-            "getrecursionlimit" | "setrecursionlimit" | "getsizeof" => {
+            "getrecursionlimit" | "setrecursionlimit" => {
                 Ok(Value::none()) // Placeholder for callable
             }
 
+            "getsizeof" => Ok(builtin_value(&GETSIZEOF_FUNCTION)),
             "getrefcount" => Ok(builtin_value(&GETREFCOUNT_FUNCTION)),
             "exit" => Ok(builtin_value(&EXIT_FUNCTION)),
             "exc_info" => Ok(builtin_value(&EXC_INFO_FUNCTION)),
@@ -687,6 +690,18 @@ fn sys_getrefcount(args: &[Value]) -> Result<Value, BuiltinError> {
     // argument reference in this value, so return a conservative positive count
     // that preserves API shape without exposing false GC internals.
     Ok(Value::int(2).expect("small refcount fits in Value::int"))
+}
+
+fn sys_getsizeof(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(BuiltinError::TypeError(format!(
+            "getsizeof() takes 1 or 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let size = getsizeof(&args[0]);
+    Ok(Value::int(size as i64).unwrap_or_else(|| bigint_to_value(BigInt::from(size))))
 }
 
 fn sys_settrace_all_threads(args: &[Value]) -> Result<Value, BuiltinError> {
