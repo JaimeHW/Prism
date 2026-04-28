@@ -3331,6 +3331,13 @@ pub(crate) fn builtin_bytes_new_vm(
     })
 }
 
+pub(crate) fn builtin_bytes_fromhex_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    builtin_byte_sequence_fromhex_vm(vm, args, TypeId::BYTES, "bytes")
+}
+
 pub(crate) fn builtin_bytearray_new(args: &[Value]) -> Result<Value, BuiltinError> {
     builtin_byte_sequence_new(
         args,
@@ -3347,6 +3354,13 @@ pub(crate) fn builtin_bytearray_new_vm(
     builtin_byte_sequence_new(args, TypeId::BYTEARRAY, "bytearray", |args| {
         super::string::builtin_bytearray_vm(vm, args)
     })
+}
+
+pub(crate) fn builtin_bytearray_fromhex_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    builtin_byte_sequence_fromhex_vm(vm, args, TypeId::BYTEARRAY, "bytearray")
 }
 
 fn builtin_byte_sequence_new<F>(
@@ -3401,6 +3415,44 @@ where
         bytes_object,
     );
     Ok(to_object_value(instance))
+}
+
+fn builtin_byte_sequence_fromhex_vm(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    target: TypeId,
+    type_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "{type_name}.fromhex() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    let class_type = class_value_to_type_id(receiver).ok_or_else(|| {
+        BuiltinError::TypeError(format!("{type_name}.fromhex() descriptor requires a type"))
+    })?;
+    if !class_value_is_subtype(receiver, target) {
+        return Err(BuiltinError::TypeError(format!(
+            "{type_name}.fromhex() receiver is not a subtype of {type_name}"
+        )));
+    }
+
+    let text = value_as_string_ref(args[1]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "fromhex() argument must be str, not {}",
+            get_type_name(args[1])
+        ))
+    })?;
+    let data = super::string::parse_byte_sequence_hex_text(text.as_str())?;
+    let exact = super::string::byte_sequence_value(target, data);
+    if class_type == target {
+        return Ok(exact);
+    }
+
+    invoke_callable_value(vm, receiver, &[exact]).map_err(runtime_error_to_builtin_error)
 }
 
 pub(crate) fn builtin_list_new(args: &[Value]) -> Result<Value, BuiltinError> {

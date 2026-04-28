@@ -528,6 +528,54 @@ fn sequence_from_iterable_with_vm(
     }
 }
 
+pub(crate) fn parse_byte_sequence_hex_text(text: &str) -> Result<Vec<u8>, BuiltinError> {
+    let bytes = text.as_bytes();
+    let mut data = Vec::with_capacity(text.len() / 2);
+    let mut offset = 0usize;
+
+    while offset < bytes.len() {
+        while offset < bytes.len() && is_fromhex_whitespace(bytes[offset]) {
+            offset += 1;
+        }
+
+        if offset == bytes.len() {
+            break;
+        }
+
+        let high_offset = offset;
+        let Some(high) = hex_nibble(bytes[offset]) else {
+            return Err(invalid_fromhex_position(text[..offset].chars().count()));
+        };
+        offset += 1;
+
+        if offset == bytes.len() {
+            return Err(invalid_fromhex_position(
+                text[..high_offset].chars().count() + 1,
+            ));
+        }
+        let Some(low) = hex_nibble(bytes[offset]) else {
+            return Err(invalid_fromhex_position(text[..offset].chars().count()));
+        };
+        offset += 1;
+
+        data.push((high << 4) | low);
+    }
+
+    Ok(data)
+}
+
+#[inline]
+fn is_fromhex_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ')
+}
+
+#[inline]
+fn invalid_fromhex_position(position: usize) -> BuiltinError {
+    BuiltinError::ValueError(format!(
+        "non-hexadecimal number found in fromhex() arg at position {position}"
+    ))
+}
+
 #[inline]
 fn value_to_byte(value: Value, kind: ByteSequenceKind) -> Result<u8, BuiltinError> {
     if let Some(i) = value.as_int() {
