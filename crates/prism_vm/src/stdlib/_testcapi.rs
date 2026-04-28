@@ -12,7 +12,10 @@ use crate::builtins::{
 };
 use crate::import::ModuleObject;
 use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
-use crate::ops::objects::{dict_storage_ref_from_ptr, get_attribute_value};
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::objects::{
+    dict_storage_ref_from_ptr, get_attribute_value, list_storage_ref_from_ptr,
+};
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
@@ -116,6 +119,15 @@ static OBJECT_HASATTRSTRING: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| 
         Arc::from("_testcapi.object_hasattrstring"),
         object_hasattrstring,
     )
+});
+static SEQUENCE_GETITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_testcapi.sequence_getitem"), sequence_getitem)
+});
+static SEQUENCE_SETITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_testcapi.sequence_setitem"), sequence_setitem)
+});
+static SEQUENCE_DELITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_testcapi.sequence_delitem"), sequence_delitem)
 });
 
 static METHOD_DESCRIPTOR_CALL: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -232,6 +244,9 @@ impl TestCapiModule {
                 "make_vectorcall_class",
                 "has_vectorcall_flag",
                 "object_hasattrstring",
+                "sequence_getitem",
+                "sequence_setitem",
+                "sequence_delitem",
                 "MethodDescriptorBase",
                 "MethodDescriptorDerived",
                 "MethodDescriptorNopGet",
@@ -272,6 +287,9 @@ impl Module for TestCapiModule {
             "make_vectorcall_class" => Ok(builtin_value(&MAKE_VECTORCALL_CLASS)),
             "has_vectorcall_flag" => Ok(builtin_value(&HAS_VECTORCALL_FLAG)),
             "object_hasattrstring" => Ok(builtin_value(&OBJECT_HASATTRSTRING)),
+            "sequence_getitem" => Ok(builtin_value(&SEQUENCE_GETITEM)),
+            "sequence_setitem" => Ok(builtin_value(&SEQUENCE_SETITEM)),
+            "sequence_delitem" => Ok(builtin_value(&SEQUENCE_DELITEM)),
             "MethodDescriptorBase" => Ok(class_value(&METHOD_DESCRIPTOR_BASE_CLASS)),
             "MethodDescriptorDerived" => Ok(class_value(&METHOD_DESCRIPTOR_DERIVED_CLASS)),
             "MethodDescriptorNopGet" => Ok(class_value(&METHOD_DESCRIPTOR_NOP_GET_CLASS)),
@@ -334,6 +352,9 @@ impl Module for TestCapiModule {
         );
         module.set_attr("has_vectorcall_flag", builtin_value(&HAS_VECTORCALL_FLAG));
         module.set_attr("object_hasattrstring", builtin_value(&OBJECT_HASATTRSTRING));
+        module.set_attr("sequence_getitem", builtin_value(&SEQUENCE_GETITEM));
+        module.set_attr("sequence_setitem", builtin_value(&SEQUENCE_SETITEM));
+        module.set_attr("sequence_delitem", builtin_value(&SEQUENCE_DELITEM));
         module.set_attr(
             "MethodDescriptorBase",
             class_value(&METHOD_DESCRIPTOR_BASE_CLASS),
@@ -871,6 +892,119 @@ fn object_hasattrstring(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value
         Err(err) if err.is_attribute_error() => Ok(Value::int(0).expect("0 fits in tagged int")),
         Err(err) => Err(runtime_error_to_builtin_error(err)),
     }
+}
+
+fn sequence_getitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "sequence_getitem() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let index = sequence_index(args[1], "sequence_getitem")?;
+    if let Some(value) = sequence_getitem_fast(args[0], index)? {
+        return Ok(value);
+    }
+
+    let index_value = Value::int(index).expect("i64 sequence index should fit tagged int");
+    invoke_bound_special(vm, args[0], "__getitem__", &[index_value])
+}
+
+fn sequence_setitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "sequence_setitem() takes exactly 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let index = sequence_index(args[1], "sequence_setitem")?;
+    let index_value = Value::int(index).expect("i64 sequence index should fit tagged int");
+    invoke_bound_special(vm, args[0], "__setitem__", &[index_value, args[2]])?;
+    Ok(Value::none())
+}
+
+fn sequence_delitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "sequence_delitem() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let index = sequence_index(args[1], "sequence_delitem")?;
+    let index_value = Value::int(index).expect("i64 sequence index should fit tagged int");
+    invoke_bound_special(vm, args[0], "__delitem__", &[index_value])?;
+    Ok(Value::none())
+}
+
+fn sequence_getitem_fast(value: Value, index: i64) -> Result<Option<Value>, BuiltinError> {
+    if let Some(bytes) = value_as_bytes_ref(value) {
+        let byte = bytes
+            .get(index)
+            .ok_or_else(|| BuiltinError::IndexError("sequence index out of range".to_string()))?;
+        return Ok(Some(
+            Value::int(i64::from(byte)).expect("byte should fit tagged int"),
+        ));
+    }
+
+    let Some(ptr) = value.as_object_ptr() else {
+        return Ok(None);
+    };
+
+    if let Some(list) = list_storage_ref_from_ptr(ptr) {
+        return list
+            .get(index)
+            .map(Some)
+            .ok_or_else(|| BuiltinError::IndexError("sequence index out of range".to_string()));
+    }
+
+    if object_type_id(ptr) == TypeId::TUPLE {
+        let tuple = unsafe { &*(ptr as *const TupleObject) };
+        return tuple
+            .get(index)
+            .map(Some)
+            .ok_or_else(|| BuiltinError::IndexError("sequence index out of range".to_string()));
+    }
+
+    Ok(None)
+}
+
+fn sequence_index(value: Value, function: &str) -> Result<i64, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(i64::from(boolean));
+    }
+    value
+        .as_int()
+        .ok_or_else(|| BuiltinError::TypeError(format!("{function}() index must be an integer")))
+}
+
+fn invoke_bound_special(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let target = resolve_special_method(receiver, name).map_err(runtime_error_to_builtin_error)?;
+    invoke_bound_target(vm, target, args)
+}
+
+fn invoke_bound_target(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => {
+            let mut full_args = Vec::with_capacity(args.len() + 1);
+            full_args.push(implicit_self);
+            full_args.extend_from_slice(args);
+            invoke_callable_value(vm, target.callable, &full_args)
+        }
+        None => invoke_callable_value(vm, target.callable, args),
+    }
+    .map_err(runtime_error_to_builtin_error)
 }
 
 fn make_vectorcall_class(args: &[Value]) -> Result<Value, BuiltinError> {
