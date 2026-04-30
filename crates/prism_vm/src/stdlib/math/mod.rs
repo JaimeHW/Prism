@@ -45,6 +45,8 @@ use super::{Module, ModuleError, ModuleResult};
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use num_bigint::BigInt;
+use num_traits::{Signed, Zero};
 use prism_core::Value;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint, value_to_saturated_i64};
 use std::sync::{Arc, LazyLock};
@@ -276,11 +278,6 @@ fn expect_math_arg_count(
 #[inline]
 fn extract_float_builtin(value: &Value) -> Result<f64, BuiltinError> {
     extract_float(value).map_err(map_math_error)
-}
-
-#[inline]
-fn extract_int_builtin(value: &Value) -> Result<i64, BuiltinError> {
-    extract_int(value).map_err(map_math_error)
 }
 
 #[derive(Clone, Copy)]
@@ -520,12 +517,11 @@ fn math_isnan_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
 
 #[inline]
 fn math_gcd_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
-    let mut current = 0i64;
+    let mut current = BigInt::zero();
     for arg in args {
-        current = gcd(current, extract_int_builtin(arg)?);
+        current = gcd_bigint(current, extract_integer_bigint(*arg)?);
     }
-    Value::int(current)
-        .ok_or_else(|| BuiltinError::OverflowError("math result out of range".to_string()))
+    Ok(bigint_to_value(current))
 }
 
 #[inline]
@@ -593,4 +589,41 @@ pub fn extract_int(value: &Value) -> Result<i64, ModuleError> {
             "'NoneType' object cannot be interpreted as an integer".to_string(),
         ))
     }
+}
+
+#[inline]
+fn extract_integer_bigint(value: Value) -> Result<BigInt, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(BigInt::from(u8::from(boolean)));
+    }
+    value_to_bigint(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "'{}' object cannot be interpreted as an integer",
+            integer_type_name(value)
+        ))
+    })
+}
+
+#[inline]
+fn integer_type_name(value: Value) -> &'static str {
+    if value.is_none() {
+        "NoneType"
+    } else if value.is_float() {
+        "float"
+    } else {
+        value.type_name()
+    }
+}
+
+fn gcd_bigint(mut left: BigInt, mut right: BigInt) -> BigInt {
+    left = left.abs();
+    right = right.abs();
+
+    while !right.is_zero() {
+        let remainder = left % &right;
+        left = right;
+        right = remainder;
+    }
+
+    left
 }
