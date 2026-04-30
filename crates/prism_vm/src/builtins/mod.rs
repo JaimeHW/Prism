@@ -229,7 +229,7 @@ impl BuiltinRegistry {
         registry.register_function_vm_kw("max", functions::builtin_max_vm_kw);
         registry.register_function_vm_kw("sum", functions::builtin_sum_vm_kw);
         registry.register_function_vm("pow", functions::builtin_pow_vm);
-        registry.register_function_kw("round", functions::builtin_round_kw);
+        registry.register_function_vm_kw("round", functions::builtin_round_vm_kw);
         registry.register_function_vm("divmod", functions::builtin_divmod_vm);
         registry.register_function_vm("hash", functions::builtin_hash_vm);
         registry.register_function("id", functions::builtin_id);

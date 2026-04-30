@@ -1290,12 +1290,55 @@ pub fn builtin_round(args: &[Value]) -> Result<Value, BuiltinError> {
     builtin_round_impl(number, ndigits.as_ref())
 }
 
+pub fn builtin_round_vm_kw(
+    vm: &mut VirtualMachine,
+    positional: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let args = collect_round_args(positional, keywords)?;
+    builtin_round_vm(vm, &args)
+}
+
 pub fn builtin_round_kw(
     positional: &[Value],
     keywords: &[(&str, Value)],
 ) -> Result<Value, BuiltinError> {
     let args = collect_round_args(positional, keywords)?;
     builtin_round(&args)
+}
+
+pub fn builtin_round_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "round expected 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let number = args[0];
+    if let Some(integer) = numeric_value_to_bigint(number) {
+        let ndigits = round_native_ndigits_arg(args.get(1).copied())?;
+        return round_integer_value(integer, ndigits.as_ref());
+    }
+
+    if let Some(float) = number.as_float() {
+        let ndigits = round_native_ndigits_arg(args.get(1).copied())?;
+        return round_float_value(float, ndigits.as_ref());
+    }
+
+    let target = match resolve_special_method(number, "__round__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => {
+            return Err(BuiltinError::TypeError(format!(
+                "type {} doesn't define __round__ method",
+                number.type_name()
+            )));
+        }
+        Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
+    };
+
+    let method_arg = args.get(1).copied().filter(|value| !value.is_none());
+    invoke_round_method(vm, target, method_arg)
 }
 
 fn collect_round_args(
@@ -1364,6 +1407,26 @@ fn round_ndigits_arg(value: Value) -> Result<Option<BigInt>, BuiltinError> {
             value_type_name(value)
         ))
     })
+}
+
+fn round_native_ndigits_arg(value: Option<Value>) -> Result<Option<BigInt>, BuiltinError> {
+    value.map(round_ndigits_arg).unwrap_or(Ok(None))
+}
+
+fn invoke_round_method(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+    arg: Option<Value>,
+) -> Result<Value, BuiltinError> {
+    let result = match (target.implicit_self, arg) {
+        (Some(implicit_self), Some(arg)) => {
+            invoke_callable_value(vm, target.callable, &[implicit_self, arg])
+        }
+        (Some(implicit_self), None) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        (None, Some(arg)) => invoke_callable_value(vm, target.callable, &[arg]),
+        (None, None) => invoke_callable_value(vm, target.callable, &[]),
+    };
+    result.map_err(super::runtime_error_to_builtin_error)
 }
 
 fn builtin_round_impl(number: Value, ndigits: Option<&BigInt>) -> Result<Value, BuiltinError> {

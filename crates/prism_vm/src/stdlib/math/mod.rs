@@ -46,15 +46,15 @@ use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_buil
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use num_bigint::BigInt;
-use num_traits::{Signed, Zero};
+use num_traits::{One, Signed, Zero};
 use prism_core::Value;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint, value_to_saturated_i64};
 use std::sync::{Arc, LazyLock};
 
 static CEIL_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.ceil"), math_ceil_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.ceil"), math_ceil_builtin));
 static FLOOR_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.floor"), math_floor_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.floor"), math_floor_builtin));
 static TRUNC_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.trunc"), math_trunc_builtin));
 static FABS_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -322,26 +322,80 @@ fn float_to_integral_value(value: f64) -> Result<Value, BuiltinError> {
             "cannot convert float infinity to integer".to_string(),
         ));
     }
-    if value < i64::MIN as f64 || value > i64::MAX as f64 {
-        return Err(BuiltinError::OverflowError(
-            "math result out of range".to_string(),
-        ));
+
+    Ok(bigint_to_value(float_integer_to_bigint(value)))
+}
+
+fn float_integer_to_bigint(value: f64) -> BigInt {
+    debug_assert!(value.is_finite());
+
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i64;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    if exponent_bits == 0 {
+        return BigInt::zero();
     }
 
-    Value::int(value as i64)
-        .ok_or_else(|| BuiltinError::OverflowError("math result out of range".to_string()))
+    let mut integer = BigInt::from((1_u64 << 52) | fraction);
+    let shift = exponent_bits - 1023 - 52;
+    if shift >= 0 {
+        integer <<= shift as usize;
+    } else {
+        integer >>= (-shift) as usize;
+    }
+
+    if negative { -integer } else { integer }
 }
 
-#[inline]
-fn math_ceil_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
-    expect_math_arg_count(args, "ceil", 1)?;
-    float_to_integral_value(ceil(extract_float_builtin(&args[0])?))
+fn math_ceil_builtin(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    math_integral_builtin(vm, args, "ceil", "__ceil__", ceil)
 }
 
-#[inline]
-fn math_floor_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
-    expect_math_arg_count(args, "floor", 1)?;
-    float_to_integral_value(floor(extract_float_builtin(&args[0])?))
+fn math_floor_builtin(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    math_integral_builtin(vm, args, "floor", "__floor__", floor)
+}
+
+fn math_integral_builtin(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+    fn_name: &'static str,
+    method_name: &'static str,
+    operation: fn(f64) -> f64,
+) -> Result<Value, BuiltinError> {
+    expect_math_arg_count(args, fn_name, 1)?;
+    let value = args[0];
+
+    if let Some(boolean) = value.as_bool() {
+        return Ok(Value::int(i64::from(boolean)).expect("bool integral result should fit"));
+    }
+    if let Some(integer) = value_to_bigint(value) {
+        return Ok(bigint_to_value(integer));
+    }
+    if let Some(float) = value.as_float() {
+        return float_to_integral_value(operation(float));
+    }
+
+    match resolve_special_method(value, method_name) {
+        Ok(target) => return invoke_bound_method_no_args(vm, target),
+        Err(err) if err.is_attribute_error() => {}
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    }
+
+    let float_value = crate::builtins::builtin_float_vm(vm, &[value])?;
+    let Some(float) = float_value.as_float() else {
+        return Err(BuiltinError::TypeError(format!(
+            "must be real number, not '{}'",
+            value.type_name()
+        )));
+    };
+    float_to_integral_value(operation(float))
 }
 
 fn math_trunc_builtin(
