@@ -8,7 +8,9 @@ use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::protocols::binary_special_method;
-use crate::python_numeric::{int_like_value, python_complex_pow_value, python_float_pow_value};
+use crate::python_numeric::{
+    int_like_value, is_complex_value, python_complex_pow_value, python_float_pow_value,
+};
 use crate::stdlib::collections::deque::DequeObject;
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -1140,6 +1142,18 @@ pub fn builtin_pow(args: &[Value]) -> Result<Value, BuiltinError> {
 
 /// VM-aware pow builtin that allocates promoted integer results in the managed heap.
 pub fn builtin_pow_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() == 2 {
+        let base = args[0];
+        let exp = args[1];
+        if pow_should_try_special_method(base, exp) {
+            match binary_special_method(vm, base, exp, "__pow__", "__rpow__") {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => {}
+                Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
+            }
+        }
+    }
+
     builtin_pow_impl(Some(vm), args)
 }
 
@@ -1203,6 +1217,18 @@ fn builtin_pow_impl(vm: Option<&VirtualMachine>, args: &[Value]) -> Result<Value
     Err(BuiltinError::TypeError(
         "pow() arguments must be numeric".to_string(),
     ))
+}
+
+#[inline]
+fn pow_should_try_special_method(base: Value, exp: Value) -> bool {
+    !is_native_pow_operand(base) || !is_native_pow_operand(exp)
+}
+
+#[inline]
+fn is_native_pow_operand(value: Value) -> bool {
+    numeric_value_to_bigint(value).is_some()
+        || value.as_float().is_some()
+        || is_complex_value(value)
 }
 
 #[inline]
