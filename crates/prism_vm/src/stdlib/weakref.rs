@@ -44,6 +44,9 @@ static WEAKDICT_LEN_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(||
 static WEAKDICT_ITEMS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("weakref.WeakDictionary.items"), weak_dict_items)
 });
+static WEAKDICT_CLEAR_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("weakref.WeakDictionary.clear"), weak_dict_clear)
+});
 static FINALIZE_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("weakref.finalize"), builtin_finalize));
 static PROXY_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -213,6 +216,7 @@ fn build_weak_dict_type(name: &str) -> Arc<PyClassObject> {
     class.set_attr(intern("__module__"), Value::string(intern("weakref")));
     class.set_attr(intern("__len__"), builtin_value(&WEAKDICT_LEN_FUNCTION));
     class.set_attr(intern("items"), builtin_value(&WEAKDICT_ITEMS_FUNCTION));
+    class.set_attr(intern("clear"), builtin_value(&WEAKDICT_CLEAR_FUNCTION));
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
 
     let mut bitmap = SubclassBitmap::new();
@@ -318,6 +322,19 @@ fn weak_dict_items(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(leak_object_value(items))
 }
 
+fn weak_dict_clear(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "clear() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let dict = weak_dict_storage_mut(args[0], "clear")?;
+    dict.clear();
+    Ok(Value::none())
+}
+
 fn weak_dict_storage(value: Value, method_name: &str) -> Result<&'static DictObject, BuiltinError> {
     let Some(ptr) = value.as_object_ptr() else {
         return Err(BuiltinError::TypeError(format!(
@@ -325,6 +342,22 @@ fn weak_dict_storage(value: Value, method_name: &str) -> Result<&'static DictObj
         )));
     };
     dict_storage_ref_from_ptr(ptr).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor '{method_name}' requires a weak dictionary"
+        ))
+    })
+}
+
+fn weak_dict_storage_mut(
+    value: Value,
+    method_name: &str,
+) -> Result<&'static mut DictObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor '{method_name}' requires a weak dictionary"
+        )));
+    };
+    dict_storage_mut_from_ptr(ptr).ok_or_else(|| {
         BuiltinError::TypeError(format!(
             "descriptor '{method_name}' requires a weak dictionary"
         ))
