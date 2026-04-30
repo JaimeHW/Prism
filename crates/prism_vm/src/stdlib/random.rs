@@ -179,7 +179,7 @@ fn randrange_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     };
 
     let width = range_len(&start, &stop, &step)?;
-    let offset = BigInt::from(random_below_u128(width));
+    let offset = random_below_bigint(&width);
     Ok(bigint_to_value(start + step * offset))
 }
 
@@ -188,9 +188,7 @@ fn randint_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     let start = int_value(args[0], "start")?;
     let stop = int_value(args[1], "stop")? + BigInt::from(1);
     let width = range_len(&start, &stop, &BigInt::from(1))?;
-    Ok(bigint_to_value(
-        start + BigInt::from(random_below_u128(width)),
-    ))
+    Ok(bigint_to_value(start + random_below_bigint(&width)))
 }
 
 fn choice_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -422,7 +420,7 @@ fn numeric_sequence_values(value: Value, name: &'static str) -> Result<Vec<Value
     )))
 }
 
-fn range_len(start: &BigInt, stop: &BigInt, step: &BigInt) -> Result<u128, BuiltinError> {
+fn range_len(start: &BigInt, stop: &BigInt, step: &BigInt) -> Result<BigInt, BuiltinError> {
     if step.sign() == Sign::NoSign {
         return Err(BuiltinError::ValueError(
             "step argument must not be zero".to_string(),
@@ -447,8 +445,7 @@ fn range_len(start: &BigInt, stop: &BigInt, step: &BigInt) -> Result<u128, Built
             "empty range for randrange()".to_string(),
         ));
     }
-    len.to_u128()
-        .ok_or_else(|| BuiltinError::OverflowError("range is too large".to_string()))
+    Ok(len)
 }
 
 fn int_value(value: Value, name: &'static str) -> Result<BigInt, BuiltinError> {
@@ -555,6 +552,44 @@ fn random_below_u128(upper: u128) -> u128 {
             return value % upper;
         }
     }
+}
+
+fn random_below_bigint(upper: &BigInt) -> BigInt {
+    debug_assert!(upper.sign() == Sign::Plus);
+
+    if let Some(upper) = upper.to_u128() {
+        return BigInt::from(random_below_u128(upper));
+    }
+
+    let bit_len = positive_bigint_bit_len(upper);
+    let byte_len = bit_len.div_ceil(8);
+    let excess_bits = (byte_len * 8) - bit_len;
+
+    loop {
+        let mut bytes = vec![0_u8; byte_len];
+        for chunk in bytes.chunks_mut(8) {
+            let random = next_u64().to_le_bytes();
+            chunk.copy_from_slice(&random[..chunk.len()]);
+        }
+        if excess_bits > 0 {
+            *bytes
+                .last_mut()
+                .expect("positive bit length should allocate bytes") &= 0xFF_u8 >> excess_bits;
+        }
+
+        let candidate = BigInt::from_bytes_le(Sign::Plus, &bytes);
+        if &candidate < upper {
+            return candidate;
+        }
+    }
+}
+
+fn positive_bigint_bit_len(value: &BigInt) -> usize {
+    let (_, bytes) = value.to_bytes_le();
+    let last = *bytes
+        .last()
+        .expect("positive BigInt should have at least one byte");
+    ((bytes.len() - 1) * 8) + (u8::BITS as usize - last.leading_zeros() as usize)
 }
 
 #[inline]
