@@ -121,6 +121,117 @@ pub fn python_float_pow_value(base: f64, exponent: f64) -> Result<Value, Runtime
     )))
 }
 
+/// Exact complex multiplication for Python's numeric tower.
+///
+/// Returns `None` unless at least one operand is an exact native complex. That
+/// keeps int/float fast paths in their native representation and leaves user
+/// numeric classes to the special-method protocol.
+#[inline]
+pub fn python_complex_mul_value(left: Value, right: Value) -> Option<Value> {
+    let (left, right) = exact_complex_operands(left, right)?;
+    Some(complex_parts_to_value(ComplexParts {
+        real: left.real.mul_add(right.real, -(left.imag * right.imag)),
+        imag: left.real.mul_add(right.imag, left.imag * right.real),
+    }))
+}
+
+/// Exact complex true division for Python's numeric tower.
+#[inline]
+pub fn python_complex_true_div_value(
+    left: Value,
+    right: Value,
+) -> Option<Result<Value, RuntimeError>> {
+    let (left, right) = exact_complex_operands(left, right)?;
+    Some(complex_div_parts(left, right).map(complex_parts_to_value))
+}
+
+/// Exact complex exponentiation for Python's numeric tower.
+#[inline]
+pub fn python_complex_pow_value(
+    base: Value,
+    exponent: Value,
+) -> Option<Result<Value, RuntimeError>> {
+    let (base, exponent) = exact_complex_operands(base, exponent)?;
+    Some(complex_pow_parts(base, exponent).map(complex_parts_to_value))
+}
+
+#[inline]
+fn exact_complex_operands(left: Value, right: Value) -> Option<(ComplexParts, ComplexParts)> {
+    if !is_complex_value(left) && !is_complex_value(right) {
+        return None;
+    }
+
+    Some((complex_like_parts(left)?, complex_like_parts(right)?))
+}
+
+#[inline]
+fn complex_parts_to_value(value: ComplexParts) -> Value {
+    crate::alloc_managed_value(ComplexObject::new(value.real, value.imag))
+}
+
+#[inline]
+fn complex_div_parts(
+    left: ComplexParts,
+    right: ComplexParts,
+) -> Result<ComplexParts, RuntimeError> {
+    let denominator = right.real.mul_add(right.real, right.imag * right.imag);
+    if denominator == 0.0 {
+        return Err(RuntimeError::zero_division_with_message(
+            "complex division by zero",
+        ));
+    }
+
+    Ok(ComplexParts {
+        real: left.real.mul_add(right.real, left.imag * right.imag) / denominator,
+        imag: left.imag.mul_add(right.real, -(left.real * right.imag)) / denominator,
+    })
+}
+
+fn complex_pow_parts(
+    base: ComplexParts,
+    exponent: ComplexParts,
+) -> Result<ComplexParts, RuntimeError> {
+    if exponent.real == 0.0 && exponent.imag == 0.0 {
+        return Ok(ComplexParts {
+            real: 1.0,
+            imag: 0.0,
+        });
+    }
+
+    if base.real == 0.0 && base.imag == 0.0 {
+        if exponent.imag != 0.0 || exponent.real < 0.0 {
+            return Err(RuntimeError::zero_division_with_message(
+                "0.0 to a negative or complex power",
+            ));
+        }
+        return Ok(ComplexParts {
+            real: 0.0,
+            imag: 0.0,
+        });
+    }
+
+    if exponent.imag == 0.0
+        && base.imag == 0.0
+        && (base.real >= 0.0 || exponent.real.trunc() == exponent.real)
+    {
+        return Ok(ComplexParts {
+            real: base.real.powf(exponent.real),
+            imag: 0.0,
+        });
+    }
+
+    let log_abs = base.real.hypot(base.imag).ln();
+    let phase = base.imag.atan2(base.real);
+    let scaled_real = exponent.real.mul_add(log_abs, -(exponent.imag * phase));
+    let scaled_imag = exponent.real.mul_add(phase, exponent.imag * log_abs);
+    let magnitude = scaled_real.exp();
+
+    Ok(ComplexParts {
+        real: magnitude * scaled_imag.cos(),
+        imag: magnitude * scaled_imag.sin(),
+    })
+}
+
 #[inline(always)]
 fn float_pow_needs_runtime_path(base: f64, exponent: f64) -> bool {
     (base == 0.0 && exponent.is_finite() && exponent < 0.0)

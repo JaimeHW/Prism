@@ -8,7 +8,7 @@ use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::protocols::binary_special_method;
-use crate::python_numeric::{int_like_value, python_float_pow_value};
+use crate::python_numeric::{int_like_value, python_complex_pow_value, python_float_pow_value};
 use crate::stdlib::collections::deque::DequeObject;
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -1190,6 +1190,10 @@ fn builtin_pow_impl(vm: Option<&VirtualMachine>, args: &[Value]) -> Result<Value
         return Err(BuiltinError::TypeError(
             "pow() 3rd argument not allowed unless all arguments are integers".to_string(),
         ));
+    }
+
+    if let Some(result) = python_complex_pow_value(base, exp) {
+        return result.map_err(super::runtime_error_to_builtin_error);
     }
 
     if let (Some(b), Some(e)) = (base.as_float_coerce(), exp.as_float_coerce()) {

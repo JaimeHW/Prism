@@ -18,7 +18,9 @@ use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_specia
 use crate::ops::objects::{list_storage_ref_from_ptr, tuple_storage_ref_from_ptr};
 use crate::ops::protocols::{binary_special_method, inplace_special_method};
 use crate::python_numeric::{
-    complex_like_parts, float_like_value, int_like_value, is_complex_value, python_float_pow_value,
+    complex_like_parts, float_like_value, int_like_value, is_complex_value,
+    python_complex_mul_value, python_complex_pow_value, python_complex_true_div_value,
+    python_float_pow_value,
 };
 use crate::type_feedback::BinaryOpFeedback;
 use num_bigint::BigInt;
@@ -670,6 +672,10 @@ pub(crate) fn mul_values(
         return Ok(bigint_to_value(x * y));
     }
 
+    if let Some(value) = python_complex_mul_value(left, right) {
+        return Ok(value);
+    }
+
     let tried_special =
         user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
     if tried_special
@@ -725,6 +731,10 @@ pub(crate) fn true_div_values(
     left: Value,
     right: Value,
 ) -> Result<Value, RuntimeError> {
+    if let Some(result) = python_complex_true_div_value(left, right) {
+        return result;
+    }
+
     if let Some(value) = binary_special_method(vm, left, right, "__truediv__", "__rtruediv__")? {
         return Ok(value);
     }
@@ -1591,6 +1601,16 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 return ControlFlow::Continue;
             }
             Err(err) => return ControlFlow::Error(err.into()),
+        }
+    }
+
+    if let Some(result) = python_complex_pow_value(a, b) {
+        match result {
+            Ok(value) => {
+                vm.current_frame_mut().set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            Err(err) => return ControlFlow::Error(err),
         }
     }
 
