@@ -14,6 +14,7 @@ use crate::builtins::{
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::dict_access::{dict_get_item, dict_remove_item, dict_set_item};
+use crate::ops::iteration::collect_iterable_values;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::{dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id};
 use crate::stdlib::exceptions::ExceptionTypeId;
@@ -257,6 +258,12 @@ static IMPORT_MODULE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
     BuiltinFunctionObject::new_vm(
         Arc::from("test.support.import_helper.import_module"),
         import_module,
+    )
+});
+static IMPORT_FRESH_MODULE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("test.support.import_helper.import_fresh_module"),
+        import_fresh_module,
     )
 });
 static MAKE_LEGACY_PYC_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -1363,6 +1370,7 @@ impl ImportHelperModule {
         Self {
             attrs: vec![
                 Arc::from("forget"),
+                Arc::from("import_fresh_module"),
                 Arc::from("import_module"),
                 Arc::from("make_legacy_pyc"),
             ],
@@ -1384,6 +1392,7 @@ impl Module for ImportHelperModule {
     fn get_attr(&self, name: &str) -> ModuleResult {
         match name {
             "forget" => Ok(builtin_value(&FORGET_FUNCTION)),
+            "import_fresh_module" => Ok(builtin_value(&IMPORT_FRESH_MODULE_FUNCTION)),
             "import_module" => Ok(builtin_value(&IMPORT_MODULE_FUNCTION)),
             "make_legacy_pyc" => Ok(builtin_value(&MAKE_LEGACY_PYC_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
@@ -1426,6 +1435,125 @@ fn import_module(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Built
         .import_module_named(name.as_str())
         .map_err(runtime_error_to_builtin_error)?;
     Ok(Value::object_ptr(Arc::as_ptr(&module) as *const ()))
+}
+
+fn import_fresh_module(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "import_fresh_module() takes from 1 to 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let name = value_as_string_ref(args[0]).ok_or_else(|| {
+        BuiltinError::TypeError("import_fresh_module() name must be str".to_string())
+    })?;
+    let name = name.as_str().to_string();
+
+    let mut fresh = if args.len() >= 2 {
+        parse_module_name_iterable(vm, args[1], "fresh")?
+    } else {
+        Vec::new()
+    };
+    let mut blocked = if args.len() >= 3 {
+        parse_module_name_iterable(vm, args[2], "blocked")?
+    } else {
+        Vec::new()
+    };
+
+    for (keyword, value) in keywords {
+        match *keyword {
+            "fresh" => {
+                if args.len() >= 2 {
+                    return Err(BuiltinError::TypeError(
+                        "import_fresh_module() got multiple values for argument 'fresh'"
+                            .to_string(),
+                    ));
+                }
+                fresh = parse_module_name_iterable(vm, *value, "fresh")?;
+            }
+            "blocked" => {
+                if args.len() >= 3 {
+                    return Err(BuiltinError::TypeError(
+                        "import_fresh_module() got multiple values for argument 'blocked'"
+                            .to_string(),
+                    ));
+                }
+                blocked = parse_module_name_iterable(vm, *value, "blocked")?;
+            }
+            "deprecated" | "usefrozen" => {}
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "import_fresh_module() got an unexpected keyword argument '{keyword}'"
+                )));
+            }
+        }
+    }
+
+    let mut module_names = Vec::with_capacity(1 + fresh.len() + blocked.len());
+    push_unique_module_name(&mut module_names, name.clone());
+    for module_name in fresh.iter().chain(blocked.iter()) {
+        push_unique_module_name(&mut module_names, module_name.clone());
+    }
+
+    let mut saved_modules = Vec::with_capacity(module_names.len());
+    for module_name in &module_names {
+        let saved = vm.import_resolver.remove_module(module_name);
+        saved_modules.push((module_name.clone(), saved));
+    }
+
+    let result = (|| {
+        for module_name in &fresh {
+            if vm.import_module_named(module_name).is_err() {
+                return Ok(Value::none());
+            }
+        }
+        let module = vm
+            .import_module_named(&name)
+            .map_err(runtime_error_to_builtin_error)?;
+        Ok(Value::object_ptr(Arc::as_ptr(&module) as *const ()))
+    })();
+
+    for (module_name, saved) in saved_modules {
+        vm.import_resolver.remove_module(&module_name);
+        if let Some(module) = saved {
+            vm.import_resolver.insert_module(&module_name, module);
+        }
+    }
+
+    result
+}
+
+fn parse_module_name_iterable(
+    vm: &mut VirtualMachine,
+    value: Value,
+    argument: &'static str,
+) -> Result<Vec<String>, BuiltinError> {
+    if value.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let values = collect_iterable_values(vm, value).map_err(runtime_error_to_builtin_error)?;
+    let mut names = Vec::with_capacity(values.len());
+    for value in values {
+        let name = value_as_string_ref(value).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "import_fresh_module() {argument} entries must be str"
+            ))
+        })?;
+        names.push(name.as_str().to_string());
+    }
+    Ok(names)
+}
+
+fn push_unique_module_name(names: &mut Vec<String>, name: String) {
+    if !names.iter().any(|existing| existing == &name) {
+        names.push(name);
+    }
 }
 
 fn make_legacy_pyc(args: &[Value]) -> Result<Value, BuiltinError> {
