@@ -6,8 +6,12 @@
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
+use crate::builtins::{
+    BuiltinError, BuiltinFunctionObject, builtin_not_implemented_value, builtin_repr_vm,
+    runtime_error_to_builtin_error,
+};
 use crate::ops::calls::invoke_callable_value;
+use crate::ops::comparison::eq_result;
 use crate::ops::objects::{
     dict_storage_ref_from_ptr, extract_type_id, get_attribute_value, set_attribute_value,
 };
@@ -18,18 +22,21 @@ use prism_runtime::object::class::{ClassFlags, PyClassObject};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
-    SubclassBitmap, class_id_to_type_id, global_class_bitmap, register_global_class,
+    SubclassBitmap, class_id_to_type_id, global_class, global_class_bitmap, register_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
+use std::cell::RefCell;
 use std::sync::{Arc, LazyLock};
 
 static NEW_CLASS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm_kw(Arc::from("types.new_class"), new_class));
 static DYNAMIC_CLASS_ATTRIBUTE_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(build_dynamic_class_attribute_class);
+static SIMPLE_NAMESPACE_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(build_simple_namespace_class);
 static DYNAMIC_CLASS_ATTRIBUTE_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm_kw(
         Arc::from("types.DynamicClassAttribute.__init__"),
@@ -76,6 +83,35 @@ static DYNAMIC_CLASS_ATTRIBUTE_DELETER_METHOD: LazyLock<BuiltinFunctionObject> =
             dynamic_class_attribute_deleter,
         )
     });
+static SIMPLE_NAMESPACE_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("types.SimpleNamespace.__init__"),
+        simple_namespace_init,
+    )
+});
+static SIMPLE_NAMESPACE_REPR_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("types.SimpleNamespace.__repr__"),
+        simple_namespace_repr,
+    )
+});
+static SIMPLE_NAMESPACE_EQ_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("types.SimpleNamespace.__eq__"),
+        simple_namespace_eq,
+    )
+});
+static SIMPLE_NAMESPACE_NE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("types.SimpleNamespace.__ne__"),
+        simple_namespace_ne,
+    )
+});
+
+thread_local! {
+    static SIMPLE_NAMESPACE_REPR_ACTIVE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static SIMPLE_NAMESPACE_COMPARE_ACTIVE: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
 
 const TYPE_ALIASES: &[(&str, TypeId)] = &[
     ("BuiltinFunctionType", TypeId::BUILTIN_FUNCTION),
@@ -107,6 +143,7 @@ impl TypesModule {
             .map(|(name, _)| Arc::from(*name))
             .collect::<Vec<_>>();
         attrs.push(Arc::from("DynamicClassAttribute"));
+        attrs.push(Arc::from("SimpleNamespace"));
         attrs.push(Arc::from("new_class"));
 
         Self { attrs }
@@ -131,6 +168,7 @@ impl Module for TypesModule {
 
         match name {
             "DynamicClassAttribute" => Ok(dynamic_class_attribute_class_value()),
+            "SimpleNamespace" => Ok(simple_namespace_class_value()),
             "new_class" => Ok(builtin_value(&NEW_CLASS_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'types' has no attribute '{}'",
@@ -157,6 +195,11 @@ fn type_value(type_id: TypeId) -> Value {
 #[inline]
 fn dynamic_class_attribute_class_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&DYNAMIC_CLASS_ATTRIBUTE_CLASS) as *const ())
+}
+
+#[inline]
+fn simple_namespace_class_value() -> Value {
+    Value::object_ptr(Arc::as_ptr(&SIMPLE_NAMESPACE_CLASS) as *const ())
 }
 
 fn build_dynamic_class_attribute_class() -> Arc<PyClassObject> {
@@ -207,6 +250,353 @@ fn build_dynamic_class_attribute_class() -> Arc<PyClassObject> {
     let class = Arc::new(class);
     register_global_class(Arc::clone(&class), bitmap);
     class
+}
+
+fn build_simple_namespace_class() -> Arc<PyClassObject> {
+    let mut class = PyClassObject::new_simple(intern("SimpleNamespace"));
+    class.set_attr(intern("__module__"), Value::string(intern("types")));
+    class.set_attr(
+        intern("__qualname__"),
+        Value::string(intern("SimpleNamespace")),
+    );
+    class.set_attr(
+        intern("__doc__"),
+        Value::string(intern("A simple attribute-based namespace.")),
+    );
+    class.set_attr(
+        intern("__init__"),
+        builtin_value(&SIMPLE_NAMESPACE_INIT_METHOD),
+    );
+    class.set_attr(
+        intern("__repr__"),
+        builtin_value(&SIMPLE_NAMESPACE_REPR_METHOD),
+    );
+    class.set_attr(intern("__eq__"), builtin_value(&SIMPLE_NAMESPACE_EQ_METHOD));
+    class.set_attr(intern("__ne__"), builtin_value(&SIMPLE_NAMESPACE_NE_METHOD));
+    class.set_attr(intern("__hash__"), Value::none());
+    class.add_flags(
+        ClassFlags::INITIALIZED
+            | ClassFlags::HAS_INIT
+            | ClassFlags::HAS_EQ
+            | ClassFlags::NATIVE_HEAPTYPE,
+    );
+
+    let mut bitmap = SubclassBitmap::new();
+    for &class_id in class.mro() {
+        bitmap.set_bit(class_id_to_type_id(class_id));
+    }
+    let class = Arc::new(class);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
+}
+
+struct SimpleNamespaceReprGuard {
+    key: usize,
+}
+
+impl SimpleNamespaceReprGuard {
+    #[inline]
+    fn try_enter(key: usize) -> Option<Self> {
+        SIMPLE_NAMESPACE_REPR_ACTIVE.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.contains(&key) {
+                None
+            } else {
+                stack.push(key);
+                Some(Self { key })
+            }
+        })
+    }
+}
+
+impl Drop for SimpleNamespaceReprGuard {
+    fn drop(&mut self) {
+        SIMPLE_NAMESPACE_REPR_ACTIVE.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.last().copied() == Some(self.key) {
+                stack.pop();
+            } else if let Some(index) = stack.iter().rposition(|key| *key == self.key) {
+                stack.remove(index);
+            }
+        });
+    }
+}
+
+struct SimpleNamespaceCompareGuard {
+    pair: (usize, usize),
+}
+
+impl SimpleNamespaceCompareGuard {
+    #[inline]
+    fn try_enter(left: usize, right: usize) -> Option<Self> {
+        let pair = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+
+        SIMPLE_NAMESPACE_COMPARE_ACTIVE.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.contains(&pair) {
+                None
+            } else {
+                stack.push(pair);
+                Some(Self { pair })
+            }
+        })
+    }
+}
+
+impl Drop for SimpleNamespaceCompareGuard {
+    fn drop(&mut self) {
+        SIMPLE_NAMESPACE_COMPARE_ACTIVE.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.last().copied() == Some(self.pair) {
+                stack.pop();
+            } else if let Some(index) = stack.iter().rposition(|pair| *pair == self.pair) {
+                stack.remove(index);
+            }
+        });
+    }
+}
+
+fn simple_namespace_init(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let Some(&self_value) = args.first() else {
+        return Err(BuiltinError::TypeError(
+            "SimpleNamespace.__init__() missing required self argument".to_string(),
+        ));
+    };
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "SimpleNamespace expected 0 positional arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
+    simple_namespace_object(self_value, "__init__")?;
+
+    for &(name, value) in keywords {
+        set_attribute_value(vm, self_value, &intern(name), value)
+            .map_err(runtime_error_to_builtin_error)?;
+    }
+
+    Ok(Value::none())
+}
+
+fn simple_namespace_repr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_simple_namespace_arg_count("__repr__", args, 1)?;
+    let self_value = args[0];
+    let object = simple_namespace_object(self_value, "__repr__")?;
+    let ptr = self_value
+        .as_object_ptr()
+        .expect("SimpleNamespace object must be heap allocated");
+    let name = simple_namespace_repr_name(extract_type_id(ptr));
+    let Some(_guard) = SimpleNamespaceReprGuard::try_enter(ptr as usize) else {
+        return Ok(Value::string(intern(&format!("{name}(...)"))));
+    };
+
+    let items = simple_namespace_items(object)?;
+    let mut rendered = String::with_capacity(name.len() + 2 + items.len() * 8);
+    rendered.push_str(&name);
+    rendered.push('(');
+    for (index, (attr_name, attr_value)) in items.into_iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(attr_name.as_str());
+        rendered.push('=');
+        rendered.push_str(&simple_namespace_value_repr(vm, attr_value)?);
+    }
+    rendered.push(')');
+
+    Ok(Value::string(intern(&rendered)))
+}
+
+fn simple_namespace_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_simple_namespace_arg_count("__eq__", args, 2)?;
+    let Some(left) = simple_namespace_object_or_none(args[0]) else {
+        return Err(BuiltinError::TypeError(
+            "SimpleNamespace.__eq__ requires a SimpleNamespace object".to_string(),
+        ));
+    };
+    let Some(right) = simple_namespace_object_or_none(args[1]) else {
+        return Ok(builtin_not_implemented_value());
+    };
+
+    simple_namespace_attrs_equal(vm, left, right).map(Value::bool)
+}
+
+fn simple_namespace_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_simple_namespace_arg_count("__ne__", args, 2)?;
+    let Some(left) = simple_namespace_object_or_none(args[0]) else {
+        return Err(BuiltinError::TypeError(
+            "SimpleNamespace.__ne__ requires a SimpleNamespace object".to_string(),
+        ));
+    };
+    let Some(right) = simple_namespace_object_or_none(args[1]) else {
+        return Ok(builtin_not_implemented_value());
+    };
+
+    simple_namespace_attrs_equal(vm, left, right).map(|equal| Value::bool(!equal))
+}
+
+fn simple_namespace_attrs_equal(
+    vm: &mut VirtualMachine,
+    left: &'static ShapedObject,
+    right: &'static ShapedObject,
+) -> Result<bool, BuiltinError> {
+    let left_key = left as *const ShapedObject as usize;
+    let right_key = right as *const ShapedObject as usize;
+    if left_key == right_key {
+        return Ok(true);
+    }
+    let Some(_guard) = SimpleNamespaceCompareGuard::try_enter(left_key, right_key) else {
+        return Ok(true);
+    };
+
+    let left_items = simple_namespace_items(left)?;
+    if left_items.len() != simple_namespace_len(right)? {
+        return Ok(false);
+    }
+
+    for (name, left_value) in left_items {
+        let Some(right_value) = simple_namespace_attr_value(right, &name)? else {
+            return Ok(false);
+        };
+        if !eq_result(vm, left_value, right_value).map_err(runtime_error_to_builtin_error)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn simple_namespace_items(
+    object: &'static ShapedObject,
+) -> Result<Vec<(InternedString, Value)>, BuiltinError> {
+    if let Some(dict_value) = object.instance_dict_value() {
+        let dict = simple_namespace_instance_dict(dict_value)?;
+        let mut items = Vec::with_capacity(dict.len());
+        for (key, value) in dict.iter() {
+            let Some(name) = value_as_string_ref(key) else {
+                return Err(BuiltinError::TypeError(
+                    "SimpleNamespace attribute names must be strings".to_string(),
+                ));
+            };
+            items.push((intern(name.as_str()), value));
+        }
+        return Ok(items);
+    }
+
+    Ok(object.iter_properties().collect())
+}
+
+fn simple_namespace_len(object: &'static ShapedObject) -> Result<usize, BuiltinError> {
+    if let Some(dict_value) = object.instance_dict_value() {
+        return Ok(simple_namespace_instance_dict(dict_value)?.len());
+    }
+    Ok(object.property_count())
+}
+
+fn simple_namespace_attr_value(
+    object: &'static ShapedObject,
+    name: &InternedString,
+) -> Result<Option<Value>, BuiltinError> {
+    if let Some(dict_value) = object.instance_dict_value() {
+        let dict = simple_namespace_instance_dict(dict_value)?;
+        return Ok(dict.get(Value::string(name.clone())));
+    }
+
+    Ok(object.get_property_interned(name))
+}
+
+fn simple_namespace_instance_dict(dict_value: Value) -> Result<&'static DictObject, BuiltinError> {
+    let Some(ptr) = dict_value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(
+            "SimpleNamespace instance __dict__ storage is not a dictionary".to_string(),
+        ));
+    };
+    dict_storage_ref_from_ptr(ptr).ok_or_else(|| {
+        BuiltinError::TypeError(
+            "SimpleNamespace instance __dict__ storage is not a dictionary".to_string(),
+        )
+    })
+}
+
+fn simple_namespace_value_repr(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<String, BuiltinError> {
+    let rendered = builtin_repr_vm(vm, &[value])?;
+    let Some(text) = value_as_string_ref(rendered) else {
+        return Err(BuiltinError::TypeError(
+            "repr() returned non-string".to_string(),
+        ));
+    };
+    Ok(text.as_str().to_string())
+}
+
+fn simple_namespace_object(
+    value: Value,
+    context: &'static str,
+) -> Result<&'static ShapedObject, BuiltinError> {
+    simple_namespace_object_or_none(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "SimpleNamespace.{context} requires a SimpleNamespace object"
+        ))
+    })
+}
+
+fn simple_namespace_object_or_none(value: Value) -> Option<&'static ShapedObject> {
+    let ptr = value.as_object_ptr()?;
+    is_simple_namespace_type(extract_type_id(ptr))
+        .then(|| unsafe { &*(ptr as *const ShapedObject) })
+}
+
+#[inline]
+fn is_simple_namespace_type(type_id: TypeId) -> bool {
+    type_id == simple_namespace_type_id()
+        || (type_id.raw() >= TypeId::FIRST_USER_TYPE
+            && global_class_bitmap(ClassId(type_id.raw()))
+                .is_some_and(|bitmap| bitmap.is_subclass_of(simple_namespace_type_id())))
+}
+
+#[inline]
+fn simple_namespace_type_id() -> TypeId {
+    SIMPLE_NAMESPACE_CLASS.class_type_id()
+}
+
+fn simple_namespace_repr_name(type_id: TypeId) -> String {
+    if type_id == simple_namespace_type_id() {
+        return "namespace".to_string();
+    }
+
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && let Some(class) = global_class(ClassId(type_id.raw()))
+    {
+        return class.name().as_str().to_string();
+    }
+
+    "namespace".to_string()
+}
+
+fn expect_simple_namespace_arg_count(
+    method: &'static str,
+    args: &[Value],
+    expected: usize,
+) -> Result<(), BuiltinError> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "SimpleNamespace.{method}() takes exactly {} arguments ({} given)",
+            expected.saturating_sub(1),
+            args.len().saturating_sub(1)
+        )))
+    }
 }
 
 #[derive(Clone, Copy)]
