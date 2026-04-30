@@ -191,7 +191,7 @@ policy = "prefer_native"
 
 [[module]]
 name = "http"
-policy = "prefer_native"
+policy = "prefer_source_when_available"
 
 [[module]]
 name = "http.cookies"
