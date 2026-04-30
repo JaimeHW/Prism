@@ -1614,44 +1614,25 @@ pub fn builtin_divmod(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // Integer divmod (includes bool as int subclass semantics).
+    // Integer divmod (includes bool and arbitrary-precision int semantics).
     if args[0].as_float().is_none() && args[1].as_float().is_none() {
-        let a = if let Some(i) = args[0].as_int() {
-            i
-        } else if let Some(b) = args[0].as_bool() {
-            if b { 1 } else { 0 }
-        } else {
-            return Err(BuiltinError::TypeError(
-                "divmod() arguments must be numeric".to_string(),
-            ));
-        };
-        let b = if let Some(i) = args[1].as_int() {
-            i
-        } else if let Some(b) = args[1].as_bool() {
-            if b { 1 } else { 0 }
-        } else {
-            return Err(BuiltinError::TypeError(
-                "divmod() arguments must be numeric".to_string(),
-            ));
-        };
+        let a = numeric_value_to_bigint(args[0]).ok_or_else(|| {
+            BuiltinError::TypeError("divmod() arguments must be numeric".to_string())
+        })?;
+        let b = numeric_value_to_bigint(args[1]).ok_or_else(|| {
+            BuiltinError::TypeError("divmod() arguments must be numeric".to_string())
+        })?;
 
-        if b == 0 {
+        let Some((quotient, remainder)) = bigint_floor_divmod_values(&a, &b) else {
             return Err(BuiltinError::ValueError(
                 "integer division or modulo by zero".to_string(),
             ));
-        }
+        };
 
-        let mut quotient = a / b;
-        let mut remainder = a % b;
-        if remainder != 0 && (remainder < 0) != (b < 0) {
-            quotient -= 1;
-            remainder += b;
-        }
-        let q = Value::int(quotient)
-            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in divmod".to_string()))?;
-        let r = Value::int(remainder)
-            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in divmod".to_string()))?;
-        return Ok(make_tuple2(q, r));
+        return Ok(make_tuple2(
+            bigint_to_value(quotient),
+            bigint_to_value(remainder),
+        ));
     }
 
     let a = if let Some(f) = args[0].as_float() {
@@ -1717,6 +1698,21 @@ fn is_native_divmod_operand(value: Value) -> bool {
         || value.as_int().is_some()
         || value.as_bool().is_some()
         || value_to_bigint(value).is_some()
+}
+
+fn bigint_floor_divmod_values(left: &BigInt, right: &BigInt) -> Option<(BigInt, BigInt)> {
+    if right.is_zero() {
+        return None;
+    }
+
+    let mut quotient = left / right;
+    let mut remainder = left % right;
+    if !remainder.is_zero() && remainder.sign() != right.sign() {
+        quotient -= 1;
+        remainder += right;
+    }
+
+    Some((quotient, remainder))
 }
 
 #[inline]

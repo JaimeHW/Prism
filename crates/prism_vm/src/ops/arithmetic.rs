@@ -24,7 +24,7 @@ use crate::python_numeric::{
 };
 use crate::type_feedback::BinaryOpFeedback;
 use num_bigint::BigInt;
-use num_traits::Zero;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_code::Instruction;
 use prism_core::Value;
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
@@ -739,6 +739,10 @@ pub(crate) fn true_div_values(
         return Ok(value);
     }
 
+    if let Some((x, y)) = integer_bigint_operands(left, right) {
+        return bigint_true_div_value(&x, &y).map(Value::float);
+    }
+
     let Some(x) = float_like_value(left) else {
         return Err(RuntimeError::unsupported_operand(
             "/",
@@ -883,6 +887,131 @@ fn bigint_floor_divmod(left: &BigInt, right: &BigInt) -> Option<(BigInt, BigInt)
     }
 
     Some((quotient, remainder))
+}
+
+fn bigint_true_div_value(left: &BigInt, right: &BigInt) -> Result<f64, RuntimeError> {
+    if right.is_zero() {
+        return Err(RuntimeError::zero_division());
+    }
+    if left.is_zero() {
+        return Ok(0.0);
+    }
+
+    let negative = left.sign() != right.sign();
+    let numerator = left.abs();
+    let denominator = right.abs();
+    let mut exponent = numerator.bits() as i64 - denominator.bits() as i64;
+    if compare_bigint_with_power_scaled(&numerator, &denominator, exponent)
+        == std::cmp::Ordering::Less
+    {
+        exponent -= 1;
+    }
+
+    if exponent > 1023 {
+        return Err(RuntimeError::overflow_error(
+            "integer division result too large for a float",
+        ));
+    }
+
+    let magnitude = if exponent >= -1022 {
+        normal_bigint_ratio_to_f64(&numerator, &denominator, exponent)?
+    } else {
+        subnormal_bigint_ratio_to_f64(&numerator, &denominator, exponent)?
+    };
+
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
+fn compare_bigint_with_power_scaled(
+    numerator: &BigInt,
+    denominator: &BigInt,
+    exponent: i64,
+) -> std::cmp::Ordering {
+    if exponent >= 0 {
+        numerator.cmp(&(denominator << exponent as usize))
+    } else {
+        (numerator << (-exponent) as usize).cmp(denominator)
+    }
+}
+
+fn normal_bigint_ratio_to_f64(
+    numerator: &BigInt,
+    denominator: &BigInt,
+    mut exponent: i64,
+) -> Result<f64, RuntimeError> {
+    let scale = 52 - exponent;
+    let significand = if scale >= 0 {
+        round_div_nearest_even(numerator << scale as usize, denominator)
+    } else {
+        round_div_nearest_even(numerator.clone(), &(denominator << (-scale) as usize))
+    };
+
+    let mut significand = significand;
+    let two_to_53 = BigInt::one() << 53usize;
+    if significand == two_to_53 {
+        significand >>= 1usize;
+        exponent += 1;
+        if exponent > 1023 {
+            return Err(RuntimeError::overflow_error(
+                "integer division result too large for a float",
+            ));
+        }
+    }
+
+    let significand = significand
+        .to_u64()
+        .expect("rounded normal significand should fit in u64");
+    let exponent_bits = ((exponent + 1023) as u64) << 52;
+    let fraction_bits = significand & ((1_u64 << 52) - 1);
+    Ok(f64::from_bits(exponent_bits | fraction_bits))
+}
+
+fn subnormal_bigint_ratio_to_f64(
+    numerator: &BigInt,
+    denominator: &BigInt,
+    exponent: i64,
+) -> Result<f64, RuntimeError> {
+    if exponent < -1075 {
+        return Ok(0.0);
+    }
+
+    let significand = round_div_nearest_even(numerator << 1074usize, denominator);
+    if significand.is_zero() {
+        return Ok(0.0);
+    }
+
+    let min_normal = BigInt::one() << 52usize;
+    if significand >= min_normal {
+        return Ok(f64::from_bits(1_u64 << 52));
+    }
+
+    let fraction_bits = significand
+        .to_u64()
+        .expect("rounded subnormal significand should fit in u64");
+    Ok(f64::from_bits(fraction_bits))
+}
+
+fn round_div_nearest_even(numerator: BigInt, denominator: &BigInt) -> BigInt {
+    debug_assert!(!denominator.is_zero());
+
+    let quotient = &numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.is_zero() {
+        return quotient;
+    }
+
+    let twice_remainder = remainder << 1usize;
+    match twice_remainder.cmp(denominator) {
+        std::cmp::Ordering::Less => quotient,
+        std::cmp::Ordering::Greater => quotient + 1,
+        std::cmp::Ordering::Equal => {
+            if (&quotient & BigInt::one()).is_zero() {
+                quotient
+            } else {
+                quotient + 1
+            }
+        }
+    }
 }
 
 #[inline]
