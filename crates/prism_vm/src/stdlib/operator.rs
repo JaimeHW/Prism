@@ -22,7 +22,7 @@ use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::extract_type_id;
 use crate::ops::protocols::RichCompareOp;
-use crate::python_numeric::float_like_value;
+use crate::python_numeric::{float_like_value, python_float_modulo};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::truthiness::try_is_truthy;
 use num_bigint::{BigInt, Sign};
@@ -602,7 +602,9 @@ fn numeric_mod_values(left: Value, right: Value) -> Result<Option<Value>, Builti
         let Some(y) = float_like_value(right) else {
             return Ok(None);
         };
-        return python_float_mod(x, y).map(|value| Some(Value::float(value)));
+        return python_float_modulo(x, y)
+            .map(|value| Some(Value::float(value)))
+            .map_err(runtime_error_to_builtin_error);
     }
 
     let Some(x) = integer_value(left) else {
@@ -636,24 +638,6 @@ fn python_int_mod(left: BigInt, right: BigInt) -> BigInt {
         remainder += right;
     }
     remainder
-}
-
-fn python_float_mod(left: f64, right: f64) -> Result<f64, BuiltinError> {
-    if right == 0.0 {
-        return Err(runtime_error_to_builtin_error(
-            RuntimeError::zero_division_with_message("float modulo"),
-        ));
-    }
-
-    let mut result = left % right;
-    if result != 0.0 {
-        if (right < 0.0) != (result < 0.0) {
-            result += right;
-        }
-    } else {
-        result = 0.0_f64.copysign(right);
-    }
-    Ok(result)
 }
 
 fn invoke_binary_operator_method(

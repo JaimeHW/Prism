@@ -83,6 +83,33 @@ pub fn complex_like_parts(value: Value) -> Option<ComplexParts> {
     })
 }
 
+/// Python-compatible float modulo for `%`, `operator.mod`, and speculative
+/// numeric fast paths.
+#[inline]
+pub fn python_float_modulo(left: f64, right: f64) -> Result<f64, RuntimeError> {
+    if right == 0.0 {
+        return Err(RuntimeError::zero_division_with_message("float modulo"));
+    }
+
+    if right.is_infinite() && left.is_finite() {
+        if left == 0.0 {
+            return Ok(0.0_f64.copysign(right));
+        }
+        return Ok(if (left < 0.0) != (right < 0.0) {
+            right
+        } else {
+            left
+        });
+    }
+
+    let result = left - right * (left / right).floor();
+    if result == 0.0 {
+        Ok(0.0_f64.copysign(right))
+    } else {
+        Ok(result)
+    }
+}
+
 /// Fast-path IEEE float power when CPython does not require non-libm behavior.
 #[inline(always)]
 pub fn python_float_pow_fast_path(base: f64, exponent: f64) -> Option<f64> {

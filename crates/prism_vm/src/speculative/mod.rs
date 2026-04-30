@@ -25,7 +25,7 @@
 //! - **Memory**: Fixed 256-slot cache (4KB total)
 
 use crate::ic_manager::ICSiteId;
-use crate::python_numeric::python_float_pow_fast_path;
+use crate::python_numeric::{python_float_modulo, python_float_pow_fast_path};
 use crate::type_feedback::OperandPair;
 
 // =============================================================================
@@ -510,9 +510,10 @@ pub fn spec_mod_float(a: Value, b: Value) -> (SpecResult, Value) {
         if y == 0.0 {
             return (SpecResult::Overflow, Value::none());
         }
-        // Python modulo: x - y * floor(x/y)
-        let result = x - y * (x / y).floor();
-        return (SpecResult::Success, Value::float(result));
+        if let Ok(result) = python_float_modulo(x, y) {
+            return (SpecResult::Success, Value::float(result));
+        }
+        return (SpecResult::Overflow, Value::none());
     }
     (SpecResult::Deopt, Value::none())
 }

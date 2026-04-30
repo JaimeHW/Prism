@@ -20,7 +20,7 @@ use crate::ops::protocols::{binary_special_method, inplace_special_method};
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
     python_complex_mul_value, python_complex_pow_value, python_complex_true_div_value,
-    python_float_pow_value,
+    python_float_modulo, python_float_pow_value,
 };
 use crate::type_feedback::BinaryOpFeedback;
 use num_bigint::BigInt;
@@ -374,12 +374,13 @@ pub fn mod_float(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     match (a.as_float(), b.as_float()) {
         (Some(_), Some(y)) if y == 0.0 => ControlFlow::Error(RuntimeError::zero_division()),
-        (Some(x), Some(y)) => {
-            // Python-style modulo
-            let result = x - y * (x / y).floor();
-            frame.set_reg(inst.dst().0, Value::float(result));
-            ControlFlow::Continue
-        }
+        (Some(x), Some(y)) => match python_float_modulo(x, y) {
+            Ok(result) => {
+                frame.set_reg(inst.dst().0, Value::float(result));
+                ControlFlow::Continue
+            }
+            Err(err) => ControlFlow::Error(err),
+        },
         _ => ControlFlow::Error(RuntimeError::type_error("ModFloat requires floats")),
     }
 }
@@ -1658,9 +1659,13 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         return ControlFlow::Error(RuntimeError::zero_division());
     }
 
-    let result = x - y * (x / y).floor();
-    frame.set_reg(inst.dst().0, Value::float(result));
-    ControlFlow::Continue
+    match python_float_modulo(x, y) {
+        Ok(result) => {
+            frame.set_reg(inst.dst().0, Value::float(result));
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
+    }
 }
 
 /// Pow: dst = src1 ** src2 (generic with speculative fast-path)
