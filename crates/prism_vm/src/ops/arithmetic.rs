@@ -596,6 +596,161 @@ pub(crate) fn add_values(
     Ok(Value::float(x + y))
 }
 
+/// Python `-` semantics as a reusable value-level operation.
+pub(crate) fn sub_values(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Value, RuntimeError> {
+    if let (Some(x), Some(y)) = (int_like_value(left), int_like_value(right))
+        && let Some(value) = x.checked_sub(y).and_then(Value::int)
+    {
+        return Ok(value);
+    }
+
+    if let Some((x, y)) = integer_bigint_operands(left, right) {
+        return Ok(bigint_to_value(x - y));
+    }
+
+    if let Some(value) = try_sub_complex_values(left, right) {
+        return Ok(value);
+    }
+
+    if let Some((left_set, right_set, result_type)) =
+        crate::ops::comparison::set_binary_operands(left, right)
+    {
+        return Ok(crate::ops::comparison::boxed_set_result(
+            left_set.difference(right_set),
+            result_type,
+        ));
+    }
+    if let Some(value) = crate::ops::comparison::dict_view_set_binary_result(
+        left,
+        right,
+        crate::ops::comparison::SetLikeBinaryOp::Difference,
+    )? {
+        return Ok(value);
+    }
+
+    if let Some(value) = binary_special_method(vm, left, right, "__sub__", "__rsub__")? {
+        return Ok(value);
+    }
+
+    let Some(x) = float_like_value(left) else {
+        return Err(RuntimeError::unsupported_operand(
+            "-",
+            left.type_name(),
+            right.type_name(),
+        ));
+    };
+    let Some(y) = float_like_value(right) else {
+        return Err(RuntimeError::unsupported_operand(
+            "-",
+            left.type_name(),
+            right.type_name(),
+        ));
+    };
+
+    Ok(Value::float(x - y))
+}
+
+/// Python `*` semantics as a reusable value-level operation.
+pub(crate) fn mul_values(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Value, RuntimeError> {
+    if let (Some(x), Some(y)) = (int_like_value(left), int_like_value(right))
+        && let Some(value) = x.checked_mul(y).and_then(Value::int)
+    {
+        return Ok(value);
+    }
+
+    if let Some((x, y)) = integer_bigint_operands(left, right) {
+        return Ok(bigint_to_value(x * y));
+    }
+
+    let tried_special =
+        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
+    if tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__mul__", "__rmul__")?
+    {
+        return Ok(value);
+    }
+
+    if let Some(count) = int_like_value(right) {
+        if let Some(value) = repeat_string_value_in_vm(vm, left, count)? {
+            return Ok(value);
+        }
+        if let Some(value) = repeat_sequence_value(left, count)? {
+            return Ok(value);
+        }
+    }
+    if let Some(count) = int_like_value(left) {
+        if let Some(value) = repeat_string_value_in_vm(vm, right, count)? {
+            return Ok(value);
+        }
+        if let Some(value) = repeat_sequence_value(right, count)? {
+            return Ok(value);
+        }
+    }
+
+    if !tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__mul__", "__rmul__")?
+    {
+        return Ok(value);
+    }
+
+    let Some(x) = float_like_value(left) else {
+        return Err(RuntimeError::unsupported_operand(
+            "*",
+            left.type_name(),
+            right.type_name(),
+        ));
+    };
+    let Some(y) = float_like_value(right) else {
+        return Err(RuntimeError::unsupported_operand(
+            "*",
+            left.type_name(),
+            right.type_name(),
+        ));
+    };
+
+    Ok(Value::float(x * y))
+}
+
+/// Python `/` semantics as a reusable value-level operation.
+pub(crate) fn true_div_values(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+) -> Result<Value, RuntimeError> {
+    if let Some(value) = binary_special_method(vm, left, right, "__truediv__", "__rtruediv__")? {
+        return Ok(value);
+    }
+
+    let Some(x) = float_like_value(left) else {
+        return Err(RuntimeError::unsupported_operand(
+            "/",
+            left.type_name(),
+            right.type_name(),
+        ));
+    };
+    let Some(y) = float_like_value(right) else {
+        return Err(RuntimeError::unsupported_operand(
+            "/",
+            left.type_name(),
+            right.type_name(),
+        ));
+    };
+
+    if y == 0.0 {
+        return Err(RuntimeError::zero_division());
+    }
+
+    Ok(Value::float(x / y))
+}
+
 #[inline]
 fn concat_byte_sequence_values(left: Value, right: Value) -> Option<Value> {
     let left_bytes = value_as_byte_sequence_ref(left)?;
@@ -833,67 +988,13 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
-        if let Some(value) = x.checked_sub(y).and_then(Value::int) {
+    match sub_values(vm, a, b) {
+        Ok(value) => {
             vm.current_frame_mut().set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
+            ControlFlow::Continue
         }
+        Err(err) => ControlFlow::Error(err),
     }
-
-    if let Some((x, y)) = integer_bigint_operands(a, b) {
-        vm.current_frame_mut()
-            .set_reg(inst.dst().0, bigint_to_value(x - y));
-        return ControlFlow::Continue;
-    }
-
-    if let Some(value) = try_sub_complex_values(a, b) {
-        vm.current_frame_mut().set_reg(inst.dst().0, value);
-        return ControlFlow::Continue;
-    }
-
-    if let Some((left, right, result_type)) = crate::ops::comparison::set_binary_operands(a, b) {
-        let value = crate::ops::comparison::boxed_set_result(left.difference(right), result_type);
-        vm.current_frame_mut().set_reg(inst.dst().0, value);
-        return ControlFlow::Continue;
-    }
-    match crate::ops::comparison::dict_view_set_binary_result(
-        a,
-        b,
-        crate::ops::comparison::SetLikeBinaryOp::Difference,
-    ) {
-        Ok(Some(value)) => {
-            vm.current_frame_mut().set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
-        }
-        Ok(None) => {}
-        Err(err) => return ControlFlow::Error(err),
-    }
-
-    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__sub__", "__rsub__") {
-        Ok(true) => return ControlFlow::Continue,
-        Ok(false) => {}
-        Err(err) => return ControlFlow::Error(err),
-    }
-
-    let frame = vm.current_frame_mut();
-
-    let Some(x) = float_like_value(a) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
-            "-",
-            a.type_name(),
-            b.type_name(),
-        ));
-    };
-    let Some(y) = float_like_value(b) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
-            "-",
-            a.type_name(),
-            b.type_name(),
-        ));
-    };
-
-    frame.set_reg(inst.dst().0, Value::float(x - y));
-    ControlFlow::Continue
 }
 
 /// Mul: dst = src1 * src2 (generic with speculative fast-path)
@@ -969,92 +1070,13 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    if let (Some(x), Some(y)) = (int_like_value(a), int_like_value(b)) {
-        if let Some(value) = x.checked_mul(y).and_then(Value::int) {
+    match mul_values(vm, a, b) {
+        Ok(value) => {
             vm.current_frame_mut().set_reg(inst.dst().0, value);
-            return ControlFlow::Continue;
+            ControlFlow::Continue
         }
+        Err(err) => ControlFlow::Error(err),
     }
-
-    if let Some((x, y)) = integer_bigint_operands(a, b) {
-        vm.current_frame_mut()
-            .set_reg(inst.dst().0, bigint_to_value(x * y));
-        return ControlFlow::Continue;
-    }
-
-    let tried_special =
-        user_defined_binary_slot_candidate(a) || user_defined_binary_slot_candidate(b);
-    if tried_special {
-        match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mul__", "__rmul__") {
-            Ok(true) => return ControlFlow::Continue,
-            Ok(false) => {}
-            Err(err) => return ControlFlow::Error(err),
-        }
-    }
-
-    if let Some(n) = int_like_value(b) {
-        match repeat_string_value_in_vm(vm, a, n) {
-            Ok(Some(value)) => {
-                vm.current_frame_mut().set_reg(inst.dst().0, value);
-                return ControlFlow::Continue;
-            }
-            Ok(None) => {}
-            Err(err) => return ControlFlow::Error(err),
-        }
-        match repeat_sequence_value(a, n) {
-            Ok(Some(value)) => {
-                vm.current_frame_mut().set_reg(inst.dst().0, value);
-                return ControlFlow::Continue;
-            }
-            Ok(None) => {}
-            Err(err) => return ControlFlow::Error(err),
-        }
-    }
-    if let Some(n) = int_like_value(a) {
-        match repeat_string_value_in_vm(vm, b, n) {
-            Ok(Some(value)) => {
-                vm.current_frame_mut().set_reg(inst.dst().0, value);
-                return ControlFlow::Continue;
-            }
-            Ok(None) => {}
-            Err(err) => return ControlFlow::Error(err),
-        }
-        match repeat_sequence_value(b, n) {
-            Ok(Some(value)) => {
-                vm.current_frame_mut().set_reg(inst.dst().0, value);
-                return ControlFlow::Continue;
-            }
-            Ok(None) => {}
-            Err(err) => return ControlFlow::Error(err),
-        }
-    }
-
-    if !tried_special {
-        match try_binary_special_method_result(vm, inst.dst().0, a, b, "__mul__", "__rmul__") {
-            Ok(true) => return ControlFlow::Continue,
-            Ok(false) => {}
-            Err(err) => return ControlFlow::Error(err),
-        }
-    }
-
-    let Some(x) = float_like_value(a) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
-            "*",
-            a.type_name(),
-            b.type_name(),
-        ));
-    };
-    let Some(y) = float_like_value(b) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
-            "*",
-            a.type_name(),
-            b.type_name(),
-        ));
-    };
-
-    vm.current_frame_mut()
-        .set_reg(inst.dst().0, Value::float(x * y));
-    ControlFlow::Continue
 }
 
 fn repeat_sequence_value(value: Value, count: i64) -> Result<Option<Value>, RuntimeError> {
@@ -1175,35 +1197,13 @@ pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__truediv__", "__rtruediv__") {
-        Ok(true) => return ControlFlow::Continue,
-        Ok(false) => {}
-        Err(err) => return ControlFlow::Error(err),
+    match true_div_values(vm, a, b) {
+        Ok(value) => {
+            vm.current_frame_mut().set_reg(inst.dst().0, value);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
     }
-
-    let frame = vm.current_frame_mut();
-
-    let Some(x) = float_like_value(a) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
-            "/",
-            a.type_name(),
-            b.type_name(),
-        ));
-    };
-    let Some(y) = float_like_value(b) else {
-        return ControlFlow::Error(RuntimeError::unsupported_operand(
-            "/",
-            a.type_name(),
-            b.type_name(),
-        ));
-    };
-
-    if y == 0.0 {
-        return ControlFlow::Error(RuntimeError::zero_division());
-    }
-
-    frame.set_reg(inst.dst().0, Value::float(x / y));
-    ControlFlow::Continue
 }
 
 /// FloorDiv: dst = src1 // src2 (generic with speculative fast-path)

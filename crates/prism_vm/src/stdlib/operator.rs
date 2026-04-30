@@ -12,7 +12,7 @@ use crate::builtins::{
     runtime_error_to_builtin_error, try_len_value,
 };
 use crate::error::{RuntimeError, RuntimeErrorKind};
-use crate::ops::arithmetic::add_values;
+use crate::ops::arithmetic::{add_values, mul_values, sub_values, true_div_values};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::{
     bitwise_or_value, compare_order_result, contains_value, eq_result, ne_result,
@@ -67,6 +67,13 @@ static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
 static ADD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.add"), operator_add));
+static SUB_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.sub"), operator_sub));
+static MUL_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.mul"), operator_mul));
+static TRUE_DIV_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("operator.truediv"), operator_truediv)
+});
 static OR_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.or_"), operator_or));
 static FLOOR_DIV_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -93,11 +100,14 @@ const EXPORTS: &[&str] = &[
     "length_hint",
     "lt",
     "mod",
+    "mul",
     "ne",
     "not_",
     "or_",
     "pow",
+    "sub",
     "truth",
+    "truediv",
 ];
 
 /// Native `operator` module descriptor.
@@ -118,8 +128,11 @@ impl OperatorModule {
                     "__add__",
                     "__floordiv__",
                     "__mod__",
+                    "__mul__",
                     "__or__",
                     "__pow__",
+                    "__sub__",
+                    "__truediv__",
                     "__all__",
                 ])
                 .map(Arc::from)
@@ -159,6 +172,9 @@ impl Module for OperatorModule {
             "is_" => Ok(builtin_value(&IS_FUNCTION)),
             "is_not" => Ok(builtin_value(&IS_NOT_FUNCTION)),
             "add" | "__add__" => Ok(builtin_value(&ADD_FUNCTION)),
+            "sub" | "__sub__" => Ok(builtin_value(&SUB_FUNCTION)),
+            "mul" | "__mul__" => Ok(builtin_value(&MUL_FUNCTION)),
+            "truediv" | "__truediv__" => Ok(builtin_value(&TRUE_DIV_FUNCTION)),
             "or_" | "__or__" => Ok(builtin_value(&OR_FUNCTION)),
             "floordiv" | "__floordiv__" => Ok(builtin_value(&FLOOR_DIV_FUNCTION)),
             "mod" | "__mod__" => Ok(builtin_value(&MOD_FUNCTION)),
@@ -494,6 +510,21 @@ fn operator_is_not(args: &[Value]) -> Result<Value, BuiltinError> {
 fn operator_add(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("add", args, 2)?;
     add_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
+}
+
+fn operator_sub(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("sub", args, 2)?;
+    sub_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
+}
+
+fn operator_mul(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("mul", args, 2)?;
+    mul_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
+}
+
+fn operator_truediv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("truediv", args, 2)?;
+    true_div_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
 }
 
 fn operator_or(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
