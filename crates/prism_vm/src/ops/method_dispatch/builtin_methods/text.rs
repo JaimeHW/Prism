@@ -16,6 +16,14 @@ static STR_FORMAT_CALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
 });
 static STR_ENCODE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.encode"), str_encode));
+static STR_CENTER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.center"), str_center));
+static STR_LJUST_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.ljust"), str_ljust));
+static STR_RJUST_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.rjust"), str_rjust));
+static STR_ZFILL_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.zfill"), str_zfill));
 
 static STR_UPPER_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("str.upper"), str_upper));
@@ -100,6 +108,18 @@ pub fn resolve_str_method(name: &str) -> Option<CachedMethod> {
         ))),
         "encode" => Some(CachedMethod::simple(builtin_method_value(
             &STR_ENCODE_METHOD,
+        ))),
+        "center" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_CENTER_METHOD,
+        ))),
+        "ljust" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_LJUST_METHOD,
+        ))),
+        "rjust" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_RJUST_METHOD,
+        ))),
+        "zfill" => Some(CachedMethod::simple(builtin_method_value(
+            &STR_ZFILL_METHOD,
         ))),
         "upper" => Some(CachedMethod::simple(builtin_method_value(
             &STR_UPPER_METHOD,
@@ -234,6 +254,146 @@ pub(super) fn str_encode(args: &[Value]) -> Result<Value, BuiltinError> {
             TypeId::BYTES,
         )
     })
+}
+
+#[derive(Clone, Copy)]
+enum TextJustifyMode {
+    Left,
+    Right,
+    Center,
+}
+
+#[inline]
+pub(super) fn str_center(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_justify(args, "center", TextJustifyMode::Center)
+}
+
+#[inline]
+pub(super) fn str_ljust(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_justify(args, "ljust", TextJustifyMode::Left)
+}
+
+#[inline]
+pub(super) fn str_rjust(args: &[Value]) -> Result<Value, BuiltinError> {
+    str_justify(args, "rjust", TextJustifyMode::Right)
+}
+
+#[inline]
+pub(super) fn str_zfill(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("str", "zfill", args, 1)?;
+    let width = parse_text_width(args[1], "zfill", 1)?;
+    with_str_receiver(args[0], "zfill", |value| {
+        let char_len = text_char_len(value);
+        if width <= char_len {
+            return Ok(args[0]);
+        }
+
+        let padding = width - char_len;
+        let mut result = String::with_capacity(value.len() + padding);
+        if matches!(value.as_bytes().first(), Some(b'+' | b'-')) {
+            result.push(value.as_bytes()[0] as char);
+            push_repeated_char(&mut result, '0', padding);
+            result.push_str(&value[1..]);
+        } else {
+            push_repeated_char(&mut result, '0', padding);
+            result.push_str(value);
+        }
+        Ok(Value::string(intern(&result)))
+    })
+}
+
+fn str_justify(
+    args: &[Value],
+    method_name: &'static str,
+    mode: TextJustifyMode,
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("str", method_name, args, 1, 2)?;
+    let width = parse_text_width(args[1], method_name, 1)?;
+    let fill = parse_text_fill_char(args.get(2).copied(), method_name)?;
+
+    with_str_receiver(args[0], method_name, |value| {
+        let char_len = text_char_len(value);
+        if width <= char_len {
+            return Ok(args[0]);
+        }
+
+        let padding = width - char_len;
+        let (left, right) = match mode {
+            TextJustifyMode::Left => (0, padding),
+            TextJustifyMode::Right => (padding, 0),
+            TextJustifyMode::Center => (padding / 2, padding - (padding / 2)),
+        };
+
+        let mut result =
+            String::with_capacity(value.len() + padding.saturating_mul(fill.len_utf8()));
+        push_repeated_char(&mut result, fill, left);
+        result.push_str(value);
+        push_repeated_char(&mut result, fill, right);
+        Ok(Value::string(intern(&result)))
+    })
+}
+
+#[inline]
+fn parse_text_width(
+    value: Value,
+    method_name: &'static str,
+    position: usize,
+) -> Result<usize, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(usize::from(flag));
+    }
+
+    let Some(width) = value_to_bigint(value) else {
+        return Err(BuiltinError::TypeError(format!(
+            "{method_name}() argument {position} must be int, not {}",
+            value.type_name()
+        )));
+    };
+
+    if width <= BigInt::zero() {
+        return Ok(0);
+    }
+    width
+        .to_usize()
+        .ok_or_else(|| BuiltinError::OverflowError("result too large".to_string()))
+}
+
+fn parse_text_fill_char(
+    fill: Option<Value>,
+    method_name: &'static str,
+) -> Result<char, BuiltinError> {
+    let Some(fill) = fill else {
+        return Ok(' ');
+    };
+    let fill = expect_str_method_string_arg(fill, method_name, 2)?;
+    let mut chars = fill.chars();
+    let Some(ch) = chars.next() else {
+        return Err(BuiltinError::TypeError(
+            "The fill character must be exactly one character long".to_string(),
+        ));
+    };
+    if chars.next().is_some() {
+        return Err(BuiltinError::TypeError(
+            "The fill character must be exactly one character long".to_string(),
+        ));
+    }
+    Ok(ch)
+}
+
+#[inline]
+fn text_char_len(value: &str) -> usize {
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.chars().count()
+    }
+}
+
+#[inline]
+fn push_repeated_char(output: &mut String, ch: char, count: usize) {
+    for _ in 0..count {
+        output.push(ch);
+    }
 }
 
 #[inline]

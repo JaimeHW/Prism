@@ -498,14 +498,18 @@ const INT_METHOD_NAMES: &[&str] = &[
     "to_bytes",
 ];
 const STR_METHOD_NAMES: &[&str] = &[
+    "center",
     "upper",
     "replace",
     "join",
     "isidentifier",
     "isascii",
+    "ljust",
     "startswith",
     "endswith",
+    "rjust",
     "rpartition",
+    "zfill",
 ];
 const SET_METHOD_NAMES: &[&str] = &[
     "add",
