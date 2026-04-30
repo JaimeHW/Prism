@@ -9,7 +9,8 @@ use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::protocols::binary_special_method;
 use crate::python_numeric::{
-    int_like_value, is_complex_value, python_complex_pow_value, python_float_pow_value,
+    complex_like_parts, int_like_value, is_complex_value, python_complex_pow_value,
+    python_float_pow_value,
 };
 use crate::stdlib::collections::deque::DequeObject;
 use num_bigint::{BigInt, Sign};
@@ -344,6 +345,11 @@ pub fn builtin_abs(args: &[Value]) -> Result<Value, BuiltinError> {
         return Ok(Value::float(f.abs()));
     }
 
+    if is_complex_value(arg) {
+        let parts = complex_like_parts(arg).expect("complex value should expose parts");
+        return Ok(Value::float(parts.real.hypot(parts.imag)));
+    }
+
     Err(BuiltinError::TypeError(
         "bad operand type for abs(): expected number".to_string(),
     ))
@@ -365,6 +371,11 @@ pub fn builtin_abs_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
 
     if let Some(f) = arg.as_float() {
         return Ok(Value::float(f.abs()));
+    }
+
+    if is_complex_value(arg) {
+        let parts = complex_like_parts(arg).expect("complex value should expose parts");
+        return Ok(Value::float(parts.real.hypot(parts.imag)));
     }
 
     let target = match resolve_special_method(arg, "__abs__") {

@@ -1192,7 +1192,10 @@ fn builtin_special_method_status(type_id: TypeId, name: &InternedString) -> Opti
 #[inline]
 fn builtin_native_special_method_slot(type_id: TypeId, name: &str) -> bool {
     match name {
-        "__abs__" => matches!(type_id, TypeId::INT | TypeId::BOOL | TypeId::FLOAT),
+        "__abs__" => matches!(
+            type_id,
+            TypeId::INT | TypeId::BOOL | TypeId::FLOAT | TypeId::COMPLEX
+        ),
         "__bytes__" => matches!(type_id, TypeId::BYTES),
         "__complex__" => matches!(type_id, TypeId::COMPLEX),
         "__float__" => matches!(type_id, TypeId::INT | TypeId::BOOL | TypeId::FLOAT),
