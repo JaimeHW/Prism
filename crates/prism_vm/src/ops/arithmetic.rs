@@ -531,6 +531,14 @@ pub(crate) fn add_values(
 ) -> Result<Value, RuntimeError> {
     use crate::speculative::{SpecResult, spec_list_concat};
 
+    let tried_special =
+        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
+    if tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__add__", "__radd__")?
+    {
+        return Ok(value);
+    }
+
     if let (Some(x), Some(y)) = (int_like_value(left), int_like_value(right))
         && let Some(value) = x.checked_add(y).and_then(Value::int)
     {
@@ -542,14 +550,6 @@ pub(crate) fn add_values(
     }
 
     if let Some(value) = try_add_complex_values(left, right) {
-        return Ok(value);
-    }
-
-    let tried_special =
-        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
-    if tried_special
-        && let Some(value) = binary_special_method(vm, left, right, "__add__", "__radd__")?
-    {
         return Ok(value);
     }
 
@@ -609,6 +609,14 @@ pub(crate) fn sub_values(
     left: Value,
     right: Value,
 ) -> Result<Value, RuntimeError> {
+    let tried_special =
+        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
+    if tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__sub__", "__rsub__")?
+    {
+        return Ok(value);
+    }
+
     if let (Some(x), Some(y)) = (int_like_value(left), int_like_value(right))
         && let Some(value) = x.checked_sub(y).and_then(Value::int)
     {
@@ -639,7 +647,9 @@ pub(crate) fn sub_values(
         return Ok(value);
     }
 
-    if let Some(value) = binary_special_method(vm, left, right, "__sub__", "__rsub__")? {
+    if !tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__sub__", "__rsub__")?
+    {
         return Ok(value);
     }
 
@@ -667,6 +677,14 @@ pub(crate) fn mul_values(
     left: Value,
     right: Value,
 ) -> Result<Value, RuntimeError> {
+    let tried_special =
+        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
+    if tried_special
+        && let Some(value) = binary_special_method(vm, left, right, "__mul__", "__rmul__")?
+    {
+        return Ok(value);
+    }
+
     if let (Some(x), Some(y)) = (int_like_value(left), int_like_value(right))
         && let Some(value) = x.checked_mul(y).and_then(Value::int)
     {
@@ -678,14 +696,6 @@ pub(crate) fn mul_values(
     }
 
     if let Some(value) = python_complex_mul_value(left, right) {
-        return Ok(value);
-    }
-
-    let tried_special =
-        user_defined_binary_slot_candidate(left) || user_defined_binary_slot_candidate(right);
-    if tried_special
-        && let Some(value) = binary_special_method(vm, left, right, "__mul__", "__rmul__")?
-    {
         return Ok(value);
     }
 
@@ -1439,6 +1449,23 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
+    let tried_special =
+        user_defined_binary_slot_candidate(a) || user_defined_binary_slot_candidate(b);
+    if tried_special {
+        match try_binary_special_method_result(
+            vm,
+            inst.dst().0,
+            a,
+            b,
+            "__floordiv__",
+            "__rfloordiv__",
+        ) {
+            Ok(true) => return ControlFlow::Continue,
+            Ok(false) => {}
+            Err(err) => return ControlFlow::Error(err),
+        }
+    }
+
     let frame = vm.current_frame_mut();
 
     // Int // int returns int
@@ -1465,11 +1492,19 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     let _ = frame;
 
-    match try_binary_special_method_result(vm, inst.dst().0, a, b, "__floordiv__", "__rfloordiv__")
-    {
-        Ok(true) => return ControlFlow::Continue,
-        Ok(false) => {}
-        Err(err) => return ControlFlow::Error(err),
+    if !tried_special {
+        match try_binary_special_method_result(
+            vm,
+            inst.dst().0,
+            a,
+            b,
+            "__floordiv__",
+            "__rfloordiv__",
+        ) {
+            Ok(true) => return ControlFlow::Continue,
+            Ok(false) => {}
+            Err(err) => return ControlFlow::Error(err),
+        }
     }
 
     let frame = vm.current_frame_mut();

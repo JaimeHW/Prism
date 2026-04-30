@@ -28,6 +28,7 @@ use crate::truthiness::try_is_truthy;
 use num_bigint::{BigInt, Sign};
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use std::sync::{Arc, LazyLock};
@@ -538,11 +539,38 @@ fn operator_or(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
 
 fn operator_floordiv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("floordiv", args, 2)?;
+    let tried_special =
+        user_defined_binary_slot_candidate(args[0]) || user_defined_binary_slot_candidate(args[1]);
+    if tried_special
+        && let Some(result) = try_invoke_binary_operator_methods(
+            vm,
+            args[0],
+            args[1],
+            "__floordiv__",
+            "__rfloordiv__",
+        )?
+    {
+        return Ok(result);
+    }
+
     if let Some(result) = numeric_floor_div_values(args[0], args[1])? {
         return Ok(result);
     }
 
-    invoke_binary_operator_method(vm, args[0], args[1], "__floordiv__", "__rfloordiv__", "//")
+    if !tried_special {
+        return invoke_binary_operator_method(
+            vm,
+            args[0],
+            args[1],
+            "__floordiv__",
+            "__rfloordiv__",
+            "//",
+        );
+    }
+
+    Err(runtime_error_to_builtin_error(
+        RuntimeError::unsupported_operand("//", value_type_name(args[0]), value_type_name(args[1])),
+    ))
 }
 
 fn operator_mod(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
@@ -627,6 +655,13 @@ fn integer_value(value: Value) -> Option<BigInt> {
         .or_else(|| value_to_bigint(value))
 }
 
+#[inline]
+fn user_defined_binary_slot_candidate(value: Value) -> bool {
+    value
+        .as_object_ptr()
+        .is_some_and(|ptr| extract_type_id(ptr).raw() >= TypeId::FIRST_USER_TYPE)
+}
+
 fn python_int_floor_div(left: BigInt, right: BigInt) -> BigInt {
     let remainder = python_int_mod(left.clone(), right.clone());
     (left - remainder) / right
@@ -648,16 +683,29 @@ fn invoke_binary_operator_method(
     reflected: &'static str,
     op: &'static str,
 ) -> Result<Value, BuiltinError> {
-    if let Some(result) = try_invoke_binary_operator_method(vm, left, right, primary)? {
-        return Ok(result);
-    }
-    if let Some(result) = try_invoke_binary_operator_method(vm, right, left, reflected)? {
+    if let Some(result) = try_invoke_binary_operator_methods(vm, left, right, primary, reflected)? {
         return Ok(result);
     }
 
     Err(runtime_error_to_builtin_error(
         RuntimeError::unsupported_operand(op, value_type_name(left), value_type_name(right)),
     ))
+}
+
+fn try_invoke_binary_operator_methods(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    primary: &'static str,
+    reflected: &'static str,
+) -> Result<Option<Value>, BuiltinError> {
+    if let Some(result) = try_invoke_binary_operator_method(vm, left, right, primary)? {
+        return Ok(Some(result));
+    }
+    if let Some(result) = try_invoke_binary_operator_method(vm, right, left, reflected)? {
+        return Ok(Some(result));
+    }
+    Ok(None)
 }
 
 fn try_invoke_binary_operator_method(
