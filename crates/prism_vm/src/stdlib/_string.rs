@@ -316,7 +316,7 @@ fn split_field_name(input: &str) -> (Value, Vec<Value>) {
     (first_value, rest)
 }
 
-fn formatter_parser_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+pub(crate) fn formatter_parser_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "formatter_parser() takes exactly 1 argument ({} given)",
@@ -344,7 +344,7 @@ fn formatter_parser_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(list_value(values))
 }
 
-fn formatter_field_name_split_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+pub(crate) fn formatter_field_name_split_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "formatter_field_name_split() takes exactly 1 argument ({} given)",
