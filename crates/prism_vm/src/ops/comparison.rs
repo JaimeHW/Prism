@@ -2344,6 +2344,20 @@ pub fn bitwise_or(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, inst.dst().0)
     };
 
+    match bitwise_or_value(vm, a, b) {
+        Ok(value) => {
+            vm.current_frame_mut().set_reg(dst, value);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(err),
+    }
+}
+
+pub(crate) fn bitwise_or_value(
+    vm: &mut VirtualMachine,
+    a: Value,
+    b: Value,
+) -> Result<Value, RuntimeError> {
     if let (Some(mut members), Some(rhs_members)) =
         (union_member_type_ids(a), union_member_type_ids(b))
     {
@@ -2354,58 +2368,39 @@ pub fn bitwise_or(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
 
         if members.len() == 1 {
-            vm.current_frame_mut().set_reg(dst, a);
-            return ControlFlow::Continue;
+            return Ok(a);
         }
 
         let union = UnionTypeObject::new(members);
-        let value = match vm.allocator().alloc(union) {
-            Some(ptr) => Value::object_ptr(ptr as *const ()),
-            None => {
-                return ControlFlow::Error(RuntimeError::internal(
-                    "out of memory: failed to allocate union type",
-                ));
-            }
-        };
-        vm.current_frame_mut().set_reg(dst, value);
-        return ControlFlow::Continue;
+        return vm
+            .allocator()
+            .alloc(union)
+            .map(|ptr| Value::object_ptr(ptr as *const ()))
+            .ok_or_else(|| RuntimeError::internal("out of memory: failed to allocate union type"));
     }
 
     if let Some((left, right, result_type)) = set_binary_operands(a, b) {
-        let value = boxed_set_result(left.union(right), result_type);
-        vm.current_frame_mut().set_reg(dst, value);
-        return ControlFlow::Continue;
+        return Ok(boxed_set_result(left.union(right), result_type));
     }
     match dict_view_set_binary_result(a, b, SetLikeBinaryOp::Union) {
-        Ok(Some(value)) => {
-            vm.current_frame_mut().set_reg(dst, value);
-            return ControlFlow::Continue;
-        }
+        Ok(Some(value)) => return Ok(value),
         Ok(None) => {}
-        Err(err) => return ControlFlow::Error(err),
+        Err(err) => return Err(err),
     }
 
     if let Some((left, right)) = dict_binary_operands(a, b) {
         let mut merged = DictObject::with_capacity(left.len() + right.len());
         merged.update(left);
         merged.update(right);
-        vm.current_frame_mut()
-            .set_reg(dst, boxed_dict_result(merged));
-        return ControlFlow::Continue;
+        return Ok(boxed_dict_result(merged));
     }
 
     match bitwise_int_result("|", a, b, |x, y| x | y) {
-        Ok(value) => {
-            vm.current_frame_mut().set_reg(dst, value);
-            ControlFlow::Continue
-        }
-        Err(int_err) => {
-            match try_binary_special_method_result(vm, dst, a, b, "__or__", "__ror__") {
-                Ok(true) => ControlFlow::Continue,
-                Ok(false) => ControlFlow::Error(int_err),
-                Err(err) => ControlFlow::Error(err),
-            }
-        }
+        Ok(value) => Ok(value),
+        Err(int_err) => match binary_special_method(vm, a, b, "__or__", "__ror__")? {
+            Some(value) => Ok(value),
+            None => Err(int_err),
+        },
     }
 }
 

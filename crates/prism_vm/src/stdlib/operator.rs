@@ -14,7 +14,9 @@ use crate::builtins::{
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::arithmetic::add_values;
 use crate::ops::calls::invoke_callable_value;
-use crate::ops::comparison::{compare_order_result, contains_value, eq_result, ne_result};
+use crate::ops::comparison::{
+    bitwise_or_value, compare_order_result, contains_value, eq_result, ne_result,
+};
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::objects::extract_type_id;
@@ -65,6 +67,8 @@ static IS_NOT_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("operator.is_not"), operator_is_not));
 static ADD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.add"), operator_add));
+static OR_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("operator.or_"), operator_or));
 static FLOOR_DIV_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("operator.floordiv"), operator_floordiv)
 });
@@ -91,6 +95,7 @@ const EXPORTS: &[&str] = &[
     "mod",
     "ne",
     "not_",
+    "or_",
     "pow",
     "truth",
 ];
@@ -109,7 +114,14 @@ impl OperatorModule {
             attrs: EXPORTS
                 .iter()
                 .copied()
-                .chain(["__add__", "__floordiv__", "__mod__", "__pow__", "__all__"])
+                .chain([
+                    "__add__",
+                    "__floordiv__",
+                    "__mod__",
+                    "__or__",
+                    "__pow__",
+                    "__all__",
+                ])
                 .map(Arc::from)
                 .collect(),
             all: string_list_value(EXPORTS),
@@ -147,6 +159,7 @@ impl Module for OperatorModule {
             "is_" => Ok(builtin_value(&IS_FUNCTION)),
             "is_not" => Ok(builtin_value(&IS_NOT_FUNCTION)),
             "add" | "__add__" => Ok(builtin_value(&ADD_FUNCTION)),
+            "or_" | "__or__" => Ok(builtin_value(&OR_FUNCTION)),
             "floordiv" | "__floordiv__" => Ok(builtin_value(&FLOOR_DIV_FUNCTION)),
             "mod" | "__mod__" => Ok(builtin_value(&MOD_FUNCTION)),
             "pow" | "__pow__" => Ok(builtin_value(&POW_FUNCTION)),
@@ -481,6 +494,11 @@ fn operator_is_not(args: &[Value]) -> Result<Value, BuiltinError> {
 fn operator_add(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("add", args, 2)?;
     add_values(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
+}
+
+fn operator_or(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_arg_count("or_", args, 2)?;
+    bitwise_or_value(vm, args[0], args[1]).map_err(runtime_error_to_builtin_error)
 }
 
 fn operator_floordiv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
