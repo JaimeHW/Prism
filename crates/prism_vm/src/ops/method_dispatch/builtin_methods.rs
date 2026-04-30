@@ -40,7 +40,9 @@ use crate::ops::protocols::value_type_id;
 use crate::python_numeric::{complex_like_parts, float_like_value};
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
-use crate::stdlib::generators::{CloseResult, GeneratorObject, prepare_close};
+use crate::stdlib::generators::{
+    CloseResult, GeneratorObject, is_generator_storage_type_id, prepare_close,
+};
 use crate::vm::GeneratorResumeOutcome;
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -4419,7 +4421,7 @@ fn expect_generator_mut(
     };
 
     let header = unsafe { &*(ptr as *const ObjectHeader) };
-    if header.type_id != TypeId::GENERATOR {
+    if !is_generator_storage_type_id(header.type_id) {
         return Err(BuiltinError::TypeError(format!(
             "descriptor 'generator.{method_name}' requires a 'generator' object but received '{}'",
             header.type_id.name()

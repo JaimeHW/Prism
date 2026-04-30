@@ -33,7 +33,7 @@ pub use methods::{
     complete_throw_propagated, complete_throw_returned, complete_throw_yielded, generator_exit,
     prepare_close, prepare_send, prepare_throw, stop_iteration,
 };
-pub use object::{GeneratorFlags, GeneratorObject};
+pub use object::{GeneratorFlags, GeneratorObject, is_generator_storage_type_id};
 pub use resume::{
     MAX_RESUME_POINTS, ResumeAction, ResumePoint, ResumeTable, ResumeTableBuilder, can_resume,
     exhaust_generator, prepare_resume, restore_generator_state, suspend_at_yield,

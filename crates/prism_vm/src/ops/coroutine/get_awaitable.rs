@@ -20,7 +20,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
+use crate::stdlib::generators::GeneratorObject;
 use prism_code::Instruction;
 use prism_core::Value;
 
@@ -100,10 +100,7 @@ pub fn get_awaitable(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 /// These types are inherently awaitable and need no conversion.
 #[inline(always)]
 fn is_native_awaitable(value: &Value) -> bool {
-    GeneratorObject::from_value(*value).is_some_and(|generator| {
-        generator.flags().contains(GeneratorFlags::IS_COROUTINE)
-            || generator.flags().contains(GeneratorFlags::IS_ASYNC)
-    })
+    GeneratorObject::from_value(*value).is_some_and(GeneratorObject::is_coroutine)
 }
 
 /// Check if value is a generator with CO_ITERABLE_COROUTINE flag.

@@ -114,12 +114,15 @@ thread_local! {
 }
 
 const TYPE_ALIASES: &[(&str, TypeId)] = &[
+    ("AsyncGeneratorType", TypeId::ASYNC_GENERATOR),
     ("BuiltinFunctionType", TypeId::BUILTIN_FUNCTION),
     ("BuiltinMethodType", TypeId::BUILTIN_FUNCTION),
     ("CodeType", TypeId::CODE),
+    ("CoroutineType", TypeId::COROUTINE),
     ("EllipsisType", TypeId::ELLIPSIS),
     ("FunctionType", TypeId::FUNCTION),
     ("GenericAlias", TypeId::GENERIC_ALIAS),
+    ("GeneratorType", TypeId::GENERATOR),
     ("LambdaType", TypeId::FUNCTION),
     ("MappingProxyType", TypeId::MAPPING_PROXY),
     ("MemberDescriptorType", TypeId::MEMBER_DESCRIPTOR),

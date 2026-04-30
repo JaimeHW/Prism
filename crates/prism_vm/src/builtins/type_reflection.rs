@@ -615,6 +615,8 @@ const TUPLE_METHOD_NAMES: &[&str] = &[
 const SLICE_METHOD_NAMES: &[&str] = &["__hash__", "indices"];
 const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
+const COROUTINE_METHOD_NAMES: &[&str] = &["close", "throw"];
+const ASYNC_GENERATOR_METHOD_NAMES: &[&str] = &["close", "throw"];
 const PROPERTY_METHOD_NAMES: &[&str] = &[
     "__get__",
     "__set__",
@@ -693,6 +695,8 @@ fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
         TypeId::SLICE => SLICE_METHOD_NAMES,
         TypeId::ITERATOR | TypeId::ENUMERATE => ITERATOR_METHOD_NAMES,
         TypeId::GENERATOR => GENERATOR_METHOD_NAMES,
+        TypeId::COROUTINE => COROUTINE_METHOD_NAMES,
+        TypeId::ASYNC_GENERATOR => ASYNC_GENERATOR_METHOD_NAMES,
         TypeId::PROPERTY => PROPERTY_METHOD_NAMES,
         TypeId::REGEX_PATTERN => REGEX_PATTERN_METHOD_NAMES,
         TypeId::REGEX_MATCH => REGEX_MATCH_METHOD_NAMES,

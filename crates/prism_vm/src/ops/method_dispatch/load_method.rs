@@ -503,7 +503,9 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
         TypeId::SET | TypeId::FROZENSET => resolve_set_method(type_id, name),
         TypeId::INT => resolve_int_method(name),
         TypeId::FLOAT => resolve_float_method(name),
-        TypeId::GENERATOR => resolve_generator_method(name),
+        TypeId::GENERATOR | TypeId::COROUTINE | TypeId::ASYNC_GENERATOR => {
+            resolve_generator_method(name)
+        }
         TypeId::FUNCTION | TypeId::CLOSURE => resolve_function_method(name),
         TypeId::CLASSMETHOD | TypeId::STATICMETHOD => {
             super::resolve_builtin_instance_method(type_id, name)

@@ -78,6 +78,25 @@ impl GeneratorFlags {
     }
 }
 
+#[inline(always)]
+pub fn is_generator_storage_type_id(type_id: TypeId) -> bool {
+    matches!(
+        type_id,
+        TypeId::GENERATOR | TypeId::COROUTINE | TypeId::ASYNC_GENERATOR
+    )
+}
+
+#[inline(always)]
+fn type_id_for_flags(flags: GeneratorFlags) -> TypeId {
+    if flags.contains(GeneratorFlags::IS_ASYNC) {
+        TypeId::ASYNC_GENERATOR
+    } else if flags.contains(GeneratorFlags::IS_COROUTINE) {
+        TypeId::COROUTINE
+    } else {
+        TypeId::GENERATOR
+    }
+}
+
 impl std::ops::BitOr for GeneratorFlags {
     type Output = Self;
 
@@ -178,7 +197,7 @@ impl GeneratorObject {
     #[inline]
     pub fn with_flags(code: Arc<CodeObject>, flags: GeneratorFlags) -> Self {
         Self {
-            header: ObjectHeader::new(TypeId::GENERATOR),
+            header: ObjectHeader::new(type_id_for_flags(flags)),
             state_header: GeneratorHeader::new(),
             flags,
             _pad: 0,
@@ -219,7 +238,7 @@ impl GeneratorObject {
     #[inline]
     pub fn from_value_mut(value: Value) -> Option<&'static mut Self> {
         let ptr = value.as_object_ptr()?;
-        if object_type_id(ptr) != TypeId::GENERATOR {
+        if !is_generator_storage_type_id(object_type_id(ptr)) {
             return None;
         }
         Some(unsafe { &mut *(ptr as *mut Self) })
@@ -228,7 +247,7 @@ impl GeneratorObject {
     /// Returns a shared generator reference from a raw object pointer.
     #[inline]
     pub fn from_object_ptr(ptr: *const ()) -> Option<&'static Self> {
-        if object_type_id(ptr) != TypeId::GENERATOR {
+        if !is_generator_storage_type_id(object_type_id(ptr)) {
             return None;
         }
         Some(unsafe { &*(ptr as *const Self) })
@@ -435,7 +454,7 @@ impl GeneratorObject {
     /// Returns true if this is a coroutine.
     #[inline]
     pub fn is_coroutine(&self) -> bool {
-        self.flags.contains(GeneratorFlags::IS_COROUTINE)
+        self.flags.contains(GeneratorFlags::IS_COROUTINE) && !self.is_async()
     }
 
     /// Returns true if this is an async generator.
@@ -448,7 +467,7 @@ impl GeneratorObject {
 impl Clone for GeneratorObject {
     fn clone(&self) -> Self {
         Self {
-            header: ObjectHeader::new(TypeId::GENERATOR),
+            header: ObjectHeader::new(type_id_for_flags(self.flags)),
             state_header: self.state_header.clone(),
             flags: self.flags,
             _pad: 0,
