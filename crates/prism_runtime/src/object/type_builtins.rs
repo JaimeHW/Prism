@@ -560,7 +560,7 @@ use crate::types::tuple::TupleObject;
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use prism_core::intern::InternedString;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -830,7 +830,11 @@ where
 
     if let Some(slot_names) = slot_names {
         class.set_slots(slot_names.clone());
+        let mut emitted_descriptors = FxHashSet::default();
         for (index, slot_name) in slot_names.into_iter().enumerate() {
+            if !emitted_descriptors.insert(slot_name.clone()) {
+                continue;
+            }
             let descriptor = SlotDescriptor::read_write(
                 slot_name.clone(),
                 index as u16,
@@ -876,11 +880,8 @@ fn extract_slot_names(
             });
         }
 
-        if names[..i].iter().any(|existing| existing == &names[i]) {
-            return Err(TypeCreationError::SlotsConflict {
-                message: format!("duplicate slot name '{}'", names[i].as_str()),
-            });
-        }
+        // Repeated slot names are legal. The resulting class keeps the declared
+        // metadata while attribute lookup exposes one descriptor for that name.
     }
 
     Ok(names)
@@ -934,6 +935,32 @@ fn collect_single_slot_name(
 fn invalid_slots_value() -> TypeCreationError {
     TypeCreationError::SlotsConflict {
         message: "__slots__ must be a string or an iterable of strings".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_core::intern::intern;
+
+    fn interned_string_value(name: &str) -> Value {
+        Value::string(intern(name))
+    }
+
+    #[test]
+    fn slot_name_extraction_preserves_duplicate_entries() {
+        let slots = TupleObject::from_slice(&[
+            interned_string_value("_year"),
+            interned_string_value("_hashcode"),
+            interned_string_value("_hashcode"),
+        ]);
+        let slots_value = alloc_value_in_current_heap_or_box(slots);
+        let namespace = ClassDict::new();
+
+        let names = extract_slot_names(slots_value, &namespace).unwrap();
+        let names = names.iter().map(|name| name.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(names, ["_year", "_hashcode", "_hashcode"]);
     }
 }
 
