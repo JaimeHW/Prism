@@ -4072,11 +4072,10 @@ pub(crate) fn builtin_object_new(args: &[Value]) -> Result<Value, BuiltinError> 
 }
 
 pub(crate) fn builtin_object_init(args: &[Value]) -> Result<Value, BuiltinError> {
-    if args.len() != 1 {
-        return Err(object_init_extra_args_error(args));
-    }
-
-    let self_ptr = args[0].as_object_ptr().ok_or_else(|| {
+    let self_value = args.first().copied().ok_or_else(|| {
+        BuiltinError::TypeError("descriptor '__init__' requires an object instance".to_string())
+    })?;
+    let self_ptr = self_value.as_object_ptr().ok_or_else(|| {
         BuiltinError::TypeError("descriptor '__init__' requires an object instance".to_string())
     })?;
 
@@ -4084,6 +4083,12 @@ pub(crate) fn builtin_object_init(args: &[Value]) -> Result<Value, BuiltinError>
         return Err(BuiltinError::TypeError(
             "object.__init__() is not valid for type instances".to_string(),
         ));
+    }
+
+    if args.len() != 1 {
+        if let Some(error) = object_init_extra_args_error(self_value) {
+            return Err(error);
+        }
     }
 
     Ok(Value::none())
@@ -4101,23 +4106,27 @@ fn object_new_extra_args_error(args: &[Value]) -> BuiltinError {
     )
 }
 
-fn object_init_extra_args_error(args: &[Value]) -> BuiltinError {
-    if let Some(class) = args
-        .first()
-        .copied()
-        .and_then(heap_class_from_instance_value)
-    {
-        if heap_class_uses_object_new_and_init(class.as_ref()) {
-            return BuiltinError::TypeError(format!(
-                "{}.__init__() takes exactly one argument (the instance to initialize)",
-                class.name()
-            ));
-        }
+fn object_init_extra_args_error(self_value: Value) -> Option<BuiltinError> {
+    let Some(class) = heap_class_from_instance_value(self_value) else {
+        return Some(BuiltinError::TypeError(
+            "object.__init__() takes exactly one argument (the instance to initialize)".to_string(),
+        ));
+    };
+
+    if !heap_class_slot_resolves_to_object(class.as_ref(), "__init__") {
+        return Some(BuiltinError::TypeError(
+            "object.__init__() takes exactly one argument (the instance to initialize)".to_string(),
+        ));
     }
 
-    BuiltinError::TypeError(
-        "object.__init__() takes exactly one argument (the instance to initialize)".to_string(),
-    )
+    if heap_class_slot_resolves_to_object(class.as_ref(), "__new__") {
+        return Some(BuiltinError::TypeError(format!(
+            "{}.__init__() takes exactly one argument (the instance to initialize)",
+            class.name()
+        )));
+    }
+
+    None
 }
 
 fn heap_class_from_type_value(value: Value) -> Option<&'static PyClassObject> {
