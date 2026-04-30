@@ -172,12 +172,14 @@ fn event(_args: &[Value]) -> Result<Value, BuiltinError> {
     Err(unsupported("Event"))
 }
 
-fn lock(_args: &[Value]) -> Result<Value, BuiltinError> {
-    Err(unsupported("Lock"))
+fn lock(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args("Lock", args)?;
+    super::_thread::new_lock_value()
 }
 
-fn rlock(_args: &[Value]) -> Result<Value, BuiltinError> {
-    Err(unsupported("RLock"))
+fn rlock(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_no_args("RLock", args)?;
+    super::_thread::new_rlock_value()
 }
 
 fn semaphore(_args: &[Value]) -> Result<Value, BuiltinError> {

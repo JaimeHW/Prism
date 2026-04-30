@@ -817,6 +817,10 @@ fn new_lock_object() -> Result<Value, BuiltinError> {
     new_lock_object_with_state().map(|(value, _)| value)
 }
 
+pub(crate) fn new_lock_value() -> Result<Value, BuiltinError> {
+    new_lock_object()
+}
+
 fn new_lock_object_with_state() -> Result<(Value, Arc<NativeLock>), BuiltinError> {
     let registry = shape_registry();
     let mut object = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
@@ -868,14 +872,7 @@ fn new_lock_object_with_state() -> Result<(Value, Arc<NativeLock>), BuiltinError
     Ok((value, lock))
 }
 
-fn thread_rlock(args: &[Value]) -> Result<Value, BuiltinError> {
-    if !args.is_empty() {
-        return Err(BuiltinError::TypeError(format!(
-            "_thread.RLock() takes 0 positional arguments but {} were given",
-            args.len()
-        )));
-    }
-
+pub(crate) fn new_rlock_value() -> Result<Value, BuiltinError> {
     let registry = shape_registry();
     let mut object = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
     let ptr = object.as_mut() as *mut ShapedObject;
@@ -943,6 +940,16 @@ fn thread_rlock(args: &[Value]) -> Result<Value, BuiltinError> {
         .expect("RLock registry lock poisoned")
         .insert(ptr as usize, Arc::new(NativeRLock::default()));
     Ok(value)
+}
+
+fn thread_rlock(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "_thread.RLock() takes 0 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    new_rlock_value()
 }
 
 fn rlock_for_value(receiver: Value) -> Result<Arc<NativeRLock>, BuiltinError> {
