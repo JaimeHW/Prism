@@ -425,7 +425,9 @@ fn parse_class_spec_values(
     value: Value,
     fn_name: &'static str,
 ) -> Result<Vec<Value>, BuiltinError> {
-    if class_value_to_type_id(value).is_some() {
+    if class_value_to_type_id(value).is_some()
+        || crate::stdlib::typing::typing_runtime_protocol_method(value).is_some()
+    {
         return Ok(vec![value]);
     }
 
@@ -455,7 +457,9 @@ fn parse_class_spec_values(
     let tuple = unsafe { &*(ptr as *const TupleObject) };
     let mut out = Vec::new();
     for item in tuple.as_slice() {
-        if class_value_to_type_id(*item).is_some() {
+        if class_value_to_type_id(*item).is_some()
+            || crate::stdlib::typing::typing_runtime_protocol_method(*item).is_some()
+        {
             out.push(*item);
             continue;
         }
@@ -562,7 +566,9 @@ fn collect_class_spec_values_vm(
         return Err(recursion_limit_error(depth));
     }
 
-    if class_value_to_type_id(value).is_some() {
+    if class_value_to_type_id(value).is_some()
+        || crate::stdlib::typing::typing_runtime_protocol_method(value).is_some()
+    {
         out.push(value);
         return Ok(());
     }
@@ -607,7 +613,9 @@ fn parse_class_spec_values_vm(
 }
 
 fn validate_issubclass_arg_vm(vm: &mut VirtualMachine, value: Value) -> Result<(), BuiltinError> {
-    if class_value_to_type_id(value).is_some() {
+    if class_value_to_type_id(value).is_some()
+        || crate::stdlib::typing::typing_runtime_protocol_method(value).is_some()
+    {
         return Ok(());
     }
 
@@ -685,6 +693,9 @@ fn isinstance_single_target_vm(
     if let Some(result) = collections_abc_isinstance_result(instance, target) {
         return Ok(result);
     }
+    if let Some(result) = typing_protocol_isinstance_result(instance, target) {
+        return Ok(result);
+    }
     if let Some(result) = invoke_metaclass_check(vm, target, "__instancecheck__", instance)? {
         return Ok(result);
     }
@@ -708,6 +719,9 @@ fn issubclass_single_target_vm(
     if let Some(result) = collections_abc_issubclass_result(subclass, target) {
         return Ok(result);
     }
+    if let Some(result) = typing_protocol_issubclass_result(subclass, target) {
+        return Ok(result);
+    }
     if let Some(result) = invoke_metaclass_check(vm, target, "__subclasscheck__", subclass)? {
         return Ok(result);
     }
@@ -720,6 +734,17 @@ fn issubclass_single_target_vm(
 
     let mut active = FxHashSet::default();
     abstract_issubclass_value_vm(vm, subclass, target, 0, &mut active)
+}
+
+fn typing_protocol_issubclass_result(subclass: Value, target: Value) -> Option<bool> {
+    let method_name = crate::stdlib::typing::typing_runtime_protocol_method(target)?;
+    Some(class_defines_all_specials(subclass, &[method_name]))
+}
+
+fn typing_protocol_isinstance_result(instance: Value, target: Value) -> Option<bool> {
+    let method_name = crate::stdlib::typing::typing_runtime_protocol_method(target)?;
+    let class_value = value_type_object(instance);
+    Some(class_defines_all_specials(class_value, &[method_name]))
 }
 
 #[inline]
@@ -1151,12 +1176,30 @@ fn builtin_special_method_status(type_id: TypeId, name: &InternedString) -> Opti
         ));
     }
 
+    if builtin_native_special_method_slot(type_id, name.as_str()) {
+        return Some(true);
+    }
+
     if crate::ops::objects::builtin_instance_method_attr_exists(type_id, name)
         || builtin_instance_has_attribute(type_id, name)
     {
         Some(true)
     } else {
         None
+    }
+}
+
+#[inline]
+fn builtin_native_special_method_slot(type_id: TypeId, name: &str) -> bool {
+    match name {
+        "__abs__" => matches!(type_id, TypeId::INT | TypeId::BOOL | TypeId::FLOAT),
+        "__bytes__" => matches!(type_id, TypeId::BYTES),
+        "__complex__" => matches!(type_id, TypeId::COMPLEX),
+        "__float__" => matches!(type_id, TypeId::INT | TypeId::BOOL | TypeId::FLOAT),
+        "__index__" => matches!(type_id, TypeId::INT | TypeId::BOOL),
+        "__int__" => matches!(type_id, TypeId::INT | TypeId::BOOL | TypeId::FLOAT),
+        "__round__" => matches!(type_id, TypeId::INT | TypeId::BOOL | TypeId::FLOAT),
+        _ => false,
     }
 }
 

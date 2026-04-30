@@ -81,6 +81,15 @@ const FUNCTION_EXPORTS: &[&str] = &[
 
 const FACTORY_EXPORTS: &[&str] = &["NewType", "ParamSpec", "TypeVar", "TypeVarTuple"];
 const CLASS_EXPORTS: &[&str] = &["Protocol"];
+const RUNTIME_PROTOCOL_EXPORTS: &[(&str, &str)] = &[
+    ("SupportsAbs", "__abs__"),
+    ("SupportsBytes", "__bytes__"),
+    ("SupportsComplex", "__complex__"),
+    ("SupportsFloat", "__float__"),
+    ("SupportsIndex", "__index__"),
+    ("SupportsInt", "__int__"),
+    ("SupportsRound", "__round__"),
+];
 
 static TYPING_FORM_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_typing_form_class);
 static PROTOCOL_CLASS: LazyLock<Arc<PyClassObject>> =
@@ -145,6 +154,11 @@ impl TypingModule {
         names.extend(FUNCTION_EXPORTS.iter().copied().map(Arc::from));
         names.extend(FACTORY_EXPORTS.iter().copied().map(Arc::from));
         names.extend(CLASS_EXPORTS.iter().copied().map(Arc::from));
+        names.extend(
+            RUNTIME_PROTOCOL_EXPORTS
+                .iter()
+                .map(|(name, _)| Arc::from(*name)),
+        );
 
         Self {
             attrs: names,
@@ -170,6 +184,9 @@ impl Module for TypingModule {
             "TYPE_CHECKING" => Ok(Value::bool(false)),
 
             "Protocol" => Ok(class_value(&PROTOCOL_CLASS)),
+            name if runtime_protocol_special_method_by_name(name).is_some() => Ok(
+                cached_marker_value(runtime_protocol_export_name(name).unwrap()),
+            ),
 
             "final"
             | "no_type_check"
@@ -253,13 +270,15 @@ fn export_names_value() -> Value {
             + DECORATOR_EXPORTS.len()
             + FUNCTION_EXPORTS.len()
             + FACTORY_EXPORTS.len()
-            + CLASS_EXPORTS.len(),
+            + CLASS_EXPORTS.len()
+            + RUNTIME_PROTOCOL_EXPORTS.len(),
     );
     names.extend(MARKER_EXPORTS.iter().copied());
     names.extend(DECORATOR_EXPORTS.iter().copied());
     names.extend(FUNCTION_EXPORTS.iter().copied());
     names.extend(FACTORY_EXPORTS.iter().copied());
     names.extend(CLASS_EXPORTS.iter().copied());
+    names.extend(RUNTIME_PROTOCOL_EXPORTS.iter().map(|(name, _)| *name));
 
     crate::alloc_managed_value(TupleObject::from_vec(
         names
@@ -383,6 +402,29 @@ pub(crate) fn typing_marker_type_id(value: Value) -> Option<TypeId> {
         "Type" => Some(TypeId::TYPE),
         _ => None,
     }
+}
+
+pub(crate) fn typing_runtime_protocol_method(value: Value) -> Option<&'static str> {
+    let ptr = value.as_object_ptr()?;
+    if crate::ops::objects::extract_type_id(ptr).raw() < TypeId::FIRST_USER_TYPE {
+        return None;
+    }
+
+    let object = unsafe { &*(ptr as *const ShapedObject) };
+    let name = marker_text(object.get_property("__typing_name__")?).ok()?;
+    runtime_protocol_special_method_by_name(name.as_str())
+}
+
+fn runtime_protocol_special_method_by_name(name: &str) -> Option<&'static str> {
+    RUNTIME_PROTOCOL_EXPORTS
+        .iter()
+        .find_map(|(candidate, method)| (*candidate == name).then_some(*method))
+}
+
+fn runtime_protocol_export_name(name: &str) -> Option<&'static str> {
+    RUNTIME_PROTOCOL_EXPORTS
+        .iter()
+        .find_map(|(candidate, _)| (*candidate == name).then_some(*candidate))
 }
 
 fn typing_form_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
