@@ -445,7 +445,7 @@ fn build_local_class() -> Arc<PyClassObject> {
 }
 
 #[inline]
-fn local_type_value() -> Value {
+pub(crate) fn local_type_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&LOCAL_CLASS) as *const ())
 }
 
