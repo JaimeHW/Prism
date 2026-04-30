@@ -436,56 +436,61 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // =========================================================================
     // Speculative Fast Path (O(1) cache lookup)
     // =========================================================================
     if let Some(spec) = vm.speculation_cache.get(site) {
-        match spec {
-            Speculation::IntInt => {
-                let (result, value) = spec_add_int(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else {
+            match spec {
+                Speculation::IntInt => {
+                    let (result, value) = spec_add_int(a, b);
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    // Deopt: invalidate cache and fall through to slow path
+                    vm.speculation_cache.invalidate(site);
                 }
-                // Deopt: invalidate cache and fall through to slow path
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
-                let (result, value) = spec_add_float(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
+                Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                    let (result, value) = spec_add_float(a, b);
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::StrStr => {
-                // String concatenation fast path
-                let (result, value) = match spec_str_concat(vm, a, b) {
-                    Ok(result) => result,
-                    Err(err) => return ControlFlow::Error(err),
-                };
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
+                Speculation::StrStr => {
+                    // String concatenation fast path
+                    let (result, value) = match spec_str_concat(vm, a, b) {
+                        Ok(result) => result,
+                        Err(err) => return ControlFlow::Error(err),
+                    };
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::ListList => {
-                // List concatenation fast path
-                let (result, value) = spec_list_concat(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
+                Speculation::ListList => {
+                    // List concatenation fast path
+                    let (result, value) = spec_list_concat(a, b);
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::None | Speculation::StrInt | Speculation::IntStr => {
-                // StrInt/IntStr don't apply to addition (only mul for repetition)
+                Speculation::None | Speculation::StrInt | Speculation::IntStr => {
+                    // StrInt/IntStr don't apply to addition (only mul for repetition)
+                }
             }
         }
     }
@@ -495,7 +500,6 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // =========================================================================
 
     // Record type feedback for future speculation
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
@@ -1087,38 +1091,42 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // Speculative Fast Path
     if let Some(spec) = vm.speculation_cache.get(site) {
-        match spec {
-            Speculation::IntInt => {
-                let (result, value) = spec_sub_int(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else {
+            match spec {
+                Speculation::IntInt => {
+                    let (result, value) = spec_sub_int(a, b);
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
-                let (result, value) = spec_sub_float(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
+                Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                    let (result, value) = spec_sub_float(a, b);
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
+                Speculation::None
+                | Speculation::StrStr
+                | Speculation::StrInt
+                | Speculation::IntStr
+                | Speculation::ListList => {}
             }
-            Speculation::None
-            | Speculation::StrStr
-            | Speculation::StrInt
-            | Speculation::IntStr
-            | Speculation::ListList => {}
         }
     }
 
     // Slow Path
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
@@ -1153,54 +1161,58 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // Speculative Fast Path
     if let Some(spec) = vm.speculation_cache.get(site) {
-        match spec {
-            Speculation::IntInt => {
-                let (result, value) = spec_mul_int(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
-                }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
-                let (result, value) = spec_mul_float(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
-                }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::StrInt | Speculation::IntStr => {
-                // String repetition fast path (str * int or int * str)
-                let (result, value) = match spec_str_repeat(vm, a, b) {
-                    Ok(result) => result,
-                    Err(err) => return ControlFlow::Error(err),
-                };
-                match result {
-                    SpecResult::Success => {
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else {
+            match spec {
+                Speculation::IntInt => {
+                    let (result, value) = spec_mul_int(a, b);
+                    if result == SpecResult::Success {
                         let frame = vm.current_frame_mut();
                         frame.set_reg(inst.dst().0, value);
                         return ControlFlow::Continue;
                     }
-                    SpecResult::Overflow => {}
-                    SpecResult::Deopt => {
-                        vm.speculation_cache.invalidate(site);
+                    vm.speculation_cache.invalidate(site);
+                }
+                Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                    let (result, value) = spec_mul_float(a, b);
+                    if result == SpecResult::Success {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    vm.speculation_cache.invalidate(site);
+                }
+                Speculation::StrInt | Speculation::IntStr => {
+                    // String repetition fast path (str * int or int * str)
+                    let (result, value) = match spec_str_repeat(vm, a, b) {
+                        Ok(result) => result,
+                        Err(err) => return ControlFlow::Error(err),
+                    };
+                    match result {
+                        SpecResult::Success => {
+                            let frame = vm.current_frame_mut();
+                            frame.set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
+                        }
+                        SpecResult::Overflow => {}
+                        SpecResult::Deopt => {
+                            vm.speculation_cache.invalidate(site);
+                        }
                     }
                 }
-            }
-            Speculation::None | Speculation::StrStr | Speculation::ListList => {
-                // StrStr and ListList don't apply to multiplication
+                Speculation::None | Speculation::StrStr | Speculation::ListList => {
+                    // StrStr and ListList don't apply to multiplication
+                }
             }
         }
     }
 
     // Slow Path
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
@@ -1308,10 +1320,13 @@ pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // Speculative Fast Path (true_div always returns float)
     if let Some(spec) = vm.speculation_cache.get(site) {
-        if spec.is_float() || spec == Speculation::IntInt {
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else if spec.is_float() || spec == Speculation::IntInt {
             let (result, value) = spec_div_float(a, b);
             if result == SpecResult::Success {
                 let frame = vm.current_frame_mut();
@@ -1327,7 +1342,6 @@ pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 
     // Slow Path
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
@@ -1361,57 +1375,61 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // =========================================================================
     // Speculative Fast Path (O(1) cache lookup)
     // =========================================================================
     if let Some(spec) = vm.speculation_cache.get(site) {
-        match spec {
-            Speculation::IntInt => {
-                let (result, value) = spec_floor_div_int(a, b);
-                match result {
-                    SpecResult::Success => {
-                        let frame = vm.current_frame_mut();
-                        frame.set_reg(inst.dst().0, value);
-                        return ControlFlow::Continue;
-                    }
-                    SpecResult::Overflow => {
-                        // Division by zero
-                        return ControlFlow::Error(RuntimeError::zero_division());
-                    }
-                    SpecResult::Deopt => {
-                        vm.speculation_cache.invalidate(site);
-                    }
-                }
-            }
-            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
-                let (result, value) = spec_floor_div_float(a, b);
-                match result {
-                    SpecResult::Success => {
-                        let frame = vm.current_frame_mut();
-                        frame.set_reg(inst.dst().0, value);
-                        return ControlFlow::Continue;
-                    }
-                    SpecResult::Overflow => {
-                        return ControlFlow::Error(RuntimeError::zero_division());
-                    }
-                    SpecResult::Deopt => {
-                        vm.speculation_cache.invalidate(site);
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else {
+            match spec {
+                Speculation::IntInt => {
+                    let (result, value) = spec_floor_div_int(a, b);
+                    match result {
+                        SpecResult::Success => {
+                            let frame = vm.current_frame_mut();
+                            frame.set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
+                        }
+                        SpecResult::Overflow => {
+                            // Division by zero
+                            return ControlFlow::Error(RuntimeError::zero_division());
+                        }
+                        SpecResult::Deopt => {
+                            vm.speculation_cache.invalidate(site);
+                        }
                     }
                 }
+                Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                    let (result, value) = spec_floor_div_float(a, b);
+                    match result {
+                        SpecResult::Success => {
+                            let frame = vm.current_frame_mut();
+                            frame.set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
+                        }
+                        SpecResult::Overflow => {
+                            return ControlFlow::Error(RuntimeError::zero_division());
+                        }
+                        SpecResult::Deopt => {
+                            vm.speculation_cache.invalidate(site);
+                        }
+                    }
+                }
+                Speculation::None
+                | Speculation::StrStr
+                | Speculation::StrInt
+                | Speculation::IntStr
+                | Speculation::ListList => {}
             }
-            Speculation::None
-            | Speculation::StrStr
-            | Speculation::StrInt
-            | Speculation::IntStr
-            | Speculation::ListList => {}
         }
     }
 
     // =========================================================================
     // Slow Path: Full type check + feedback recording
     // =========================================================================
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
@@ -1495,56 +1513,60 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // =========================================================================
     // Speculative Fast Path (O(1) cache lookup)
     // =========================================================================
     if let Some(spec) = vm.speculation_cache.get(site) {
-        match spec {
-            Speculation::IntInt => {
-                let (result, value) = spec_mod_int(a, b);
-                match result {
-                    SpecResult::Success => {
-                        let frame = vm.current_frame_mut();
-                        frame.set_reg(inst.dst().0, value);
-                        return ControlFlow::Continue;
-                    }
-                    SpecResult::Overflow => {
-                        return ControlFlow::Error(RuntimeError::zero_division());
-                    }
-                    SpecResult::Deopt => {
-                        vm.speculation_cache.invalidate(site);
-                    }
-                }
-            }
-            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
-                let (result, value) = spec_mod_float(a, b);
-                match result {
-                    SpecResult::Success => {
-                        let frame = vm.current_frame_mut();
-                        frame.set_reg(inst.dst().0, value);
-                        return ControlFlow::Continue;
-                    }
-                    SpecResult::Overflow => {
-                        return ControlFlow::Error(RuntimeError::zero_division());
-                    }
-                    SpecResult::Deopt => {
-                        vm.speculation_cache.invalidate(site);
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else {
+            match spec {
+                Speculation::IntInt => {
+                    let (result, value) = spec_mod_int(a, b);
+                    match result {
+                        SpecResult::Success => {
+                            let frame = vm.current_frame_mut();
+                            frame.set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
+                        }
+                        SpecResult::Overflow => {
+                            return ControlFlow::Error(RuntimeError::zero_division());
+                        }
+                        SpecResult::Deopt => {
+                            vm.speculation_cache.invalidate(site);
+                        }
                     }
                 }
+                Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                    let (result, value) = spec_mod_float(a, b);
+                    match result {
+                        SpecResult::Success => {
+                            let frame = vm.current_frame_mut();
+                            frame.set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
+                        }
+                        SpecResult::Overflow => {
+                            return ControlFlow::Error(RuntimeError::zero_division());
+                        }
+                        SpecResult::Deopt => {
+                            vm.speculation_cache.invalidate(site);
+                        }
+                    }
+                }
+                Speculation::None
+                | Speculation::StrStr
+                | Speculation::StrInt
+                | Speculation::IntStr
+                | Speculation::ListList => {}
             }
-            Speculation::None
-            | Speculation::StrStr
-            | Speculation::StrInt
-            | Speculation::IntStr
-            | Speculation::ListList => {}
         }
     }
 
     // =========================================================================
     // Slow Path: Full type check + feedback recording
     // =========================================================================
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
@@ -1657,50 +1679,54 @@ pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         (a, b, frame.code_id(), frame.ip.saturating_sub(1) as u32)
     };
     let site = ICSiteId::new(code_id, bc_offset);
+    let pair = OperandPair::from_values(a, b);
 
     // =========================================================================
     // Speculative Fast Path (O(1) cache lookup)
     // =========================================================================
     if let Some(spec) = vm.speculation_cache.get(site) {
-        match spec {
-            Speculation::IntInt => {
-                let (result, value) = spec_pow_int(a, b);
-                match result {
-                    SpecResult::Success => {
+        if spec != Speculation::from_operand_pair(pair) {
+            vm.speculation_cache.invalidate(site);
+        } else {
+            match spec {
+                Speculation::IntInt => {
+                    let (result, value) = spec_pow_int(a, b);
+                    match result {
+                        SpecResult::Success => {
+                            let frame = vm.current_frame_mut();
+                            frame.set_reg(inst.dst().0, value);
+                            return ControlFlow::Continue;
+                        }
+                        SpecResult::Overflow => {
+                            // Overflow: fall through to slow path which converts to float
+                            // Don't invalidate - this is expected behavior
+                        }
+                        SpecResult::Deopt => {
+                            vm.speculation_cache.invalidate(site);
+                        }
+                    }
+                }
+                Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                    let (result, value) = spec_pow_float(a, b);
+                    if result == SpecResult::Success {
                         let frame = vm.current_frame_mut();
                         frame.set_reg(inst.dst().0, value);
                         return ControlFlow::Continue;
                     }
-                    SpecResult::Overflow => {
-                        // Overflow: fall through to slow path which converts to float
-                        // Don't invalidate - this is expected behavior
-                    }
-                    SpecResult::Deopt => {
-                        vm.speculation_cache.invalidate(site);
-                    }
+                    vm.speculation_cache.invalidate(site);
                 }
+                Speculation::None
+                | Speculation::StrStr
+                | Speculation::StrInt
+                | Speculation::IntStr
+                | Speculation::ListList => {}
             }
-            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
-                let (result, value) = spec_pow_float(a, b);
-                if result == SpecResult::Success {
-                    let frame = vm.current_frame_mut();
-                    frame.set_reg(inst.dst().0, value);
-                    return ControlFlow::Continue;
-                }
-                vm.speculation_cache.invalidate(site);
-            }
-            Speculation::None
-            | Speculation::StrStr
-            | Speculation::StrInt
-            | Speculation::IntStr
-            | Speculation::ListList => {}
         }
     }
 
     // =========================================================================
     // Slow Path: Full type check + feedback recording
     // =========================================================================
-    let pair = OperandPair::from_values(a, b);
     let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
     feedback.record(&mut vm.ic_manager);
 
