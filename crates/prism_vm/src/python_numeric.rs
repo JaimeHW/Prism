@@ -174,17 +174,27 @@ fn complex_div_parts(
     left: ComplexParts,
     right: ComplexParts,
 ) -> Result<ComplexParts, RuntimeError> {
-    let denominator = right.real.mul_add(right.real, right.imag * right.imag);
-    if denominator == 0.0 {
+    if right.real == 0.0 && right.imag == 0.0 {
         return Err(RuntimeError::zero_division_with_message(
             "complex division by zero",
         ));
     }
 
-    Ok(ComplexParts {
-        real: left.real.mul_add(right.real, left.imag * right.imag) / denominator,
-        imag: left.imag.mul_add(right.real, -(left.real * right.imag)) / denominator,
-    })
+    if right.real.abs() >= right.imag.abs() {
+        let ratio = right.imag / right.real;
+        let denominator = right.real + right.imag * ratio;
+        Ok(ComplexParts {
+            real: (left.real + left.imag * ratio) / denominator,
+            imag: (left.imag - left.real * ratio) / denominator,
+        })
+    } else {
+        let ratio = right.real / right.imag;
+        let denominator = right.real * ratio + right.imag;
+        Ok(ComplexParts {
+            real: (left.real * ratio + left.imag) / denominator,
+            imag: (left.imag * ratio - left.real) / denominator,
+        })
+    }
 }
 
 fn complex_pow_parts(
