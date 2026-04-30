@@ -42,11 +42,12 @@ pub use special::*;
 pub use trig::*;
 
 use super::{Module, ModuleError, ModuleResult};
+use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use num_bigint::BigInt;
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_core::Value;
 use prism_runtime::types::int::{bigint_to_value, value_to_bigint, value_to_saturated_i64};
 use std::sync::{Arc, LazyLock};
@@ -58,43 +59,45 @@ static FLOOR_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static TRUNC_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.trunc"), math_trunc_builtin));
 static FABS_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.fabs"), math_fabs_builtin));
-static COPYSIGN_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.copysign"), math_copysign_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.fabs"), math_fabs_builtin));
+static COPYSIGN_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("math.copysign"), math_copysign_builtin)
+});
 static SIN_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.sin"), math_sin_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.sin"), math_sin_builtin));
 static COS_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.cos"), math_cos_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.cos"), math_cos_builtin));
 static ACOS_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.acos"), math_acos_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.acos"), math_acos_builtin));
 static EXP_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.exp"), math_exp_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.exp"), math_exp_builtin));
 static LOG_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.log"), math_log_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.log"), math_log_builtin));
 static LOG2_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.log2"), math_log2_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.log2"), math_log2_builtin));
 static LOG10_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.log10"), math_log10_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.log10"), math_log10_builtin));
 static SQRT_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.sqrt"), math_sqrt_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.sqrt"), math_sqrt_builtin));
 static GAMMA_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.gamma"), math_gamma_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.gamma"), math_gamma_builtin));
 static LGAMMA_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.lgamma"), math_lgamma_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.lgamma"), math_lgamma_builtin));
 static ERF_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.erf"), math_erf_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.erf"), math_erf_builtin));
 static ERFC_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.erfc"), math_erfc_builtin));
-static ISFINITE_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isfinite"), math_isfinite_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.erfc"), math_erfc_builtin));
+static ISFINITE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("math.isfinite"), math_isfinite_builtin)
+});
 static ISINF_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isinf"), math_isinf_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.isinf"), math_isinf_builtin));
 static ISNAN_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.isnan"), math_isnan_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.isnan"), math_isnan_builtin));
 static GCD_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.gcd"), math_gcd_builtin));
 static LDEXP_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("math.ldexp"), math_ldexp_builtin));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("math.ldexp"), math_ldexp_builtin));
 
 /// The math module instance.
 pub struct MathModule;
@@ -276,8 +279,76 @@ fn expect_math_arg_count(
 }
 
 #[inline]
-fn extract_float_builtin(value: &Value) -> Result<f64, BuiltinError> {
-    extract_float(value).map_err(map_math_error)
+fn extract_float_builtin(vm: &mut VirtualMachine, value: Value) -> Result<f64, BuiltinError> {
+    if let Some(float) = value.as_float() {
+        return Ok(float);
+    }
+    if let Some(integer) = value.as_int() {
+        return Ok(integer as f64);
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Ok(if boolean { 1.0 } else { 0.0 });
+    }
+
+    if let Some(result) = invoke_optional_float_protocol(vm, value)? {
+        return prism_runtime::types::float::value_to_f64(result).ok_or_else(|| {
+            BuiltinError::TypeError(format!(
+                "__float__ returned non-float (type {})",
+                result.type_name()
+            ))
+        });
+    }
+
+    if let Some(result) = invoke_optional_float_protocol_index(vm, value)? {
+        return integer_value_to_float(result);
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "must be real number, not '{}'",
+        value.type_name()
+    )))
+}
+
+fn invoke_optional_float_protocol(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<Value>, BuiltinError> {
+    match resolve_special_method(value, "__float__") {
+        Ok(target) => invoke_bound_method_no_args(vm, target).map(Some),
+        Err(err) if err.is_attribute_error() => Ok(None),
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
+    }
+}
+
+fn invoke_optional_float_protocol_index(
+    vm: &mut VirtualMachine,
+    value: Value,
+) -> Result<Option<Value>, BuiltinError> {
+    match resolve_special_method(value, "__index__") {
+        Ok(target) => invoke_bound_method_no_args(vm, target).map(Some),
+        Err(err) if err.is_attribute_error() => Ok(None),
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
+    }
+}
+
+fn integer_value_to_float(value: Value) -> Result<f64, BuiltinError> {
+    if let Some(boolean) = value.as_bool() {
+        return Ok(if boolean { 1.0 } else { 0.0 });
+    }
+    if let Some(integer) = value.as_int() {
+        return Ok(integer as f64);
+    }
+
+    let bigint = value_to_bigint(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            value.type_name()
+        ))
+    })?;
+    bigint
+        .to_f64()
+        .filter(|float| float.is_finite())
+        .ok_or_else(|| BuiltinError::OverflowError("int too large to convert to float".to_string()))
 }
 
 #[derive(Clone, Copy)]
@@ -441,48 +512,48 @@ fn invoke_bound_method_no_args(
 }
 
 #[inline]
-fn math_fabs_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_fabs_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "fabs", 1)?;
-    Ok(Value::float(extract_float_builtin(&args[0])?.abs()))
+    Ok(Value::float(extract_float_builtin(vm, args[0])?.abs()))
 }
 
 #[inline]
-fn math_copysign_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_copysign_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "copysign", 2)?;
     Ok(Value::float(copysign(
-        extract_float_builtin(&args[0])?,
-        extract_float_builtin(&args[1])?,
+        extract_float_builtin(vm, args[0])?,
+        extract_float_builtin(vm, args[1])?,
     )))
 }
 
 #[inline]
-fn math_sin_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_sin_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "sin", 1)?;
-    Ok(Value::float(sin(extract_float_builtin(&args[0])?)))
+    Ok(Value::float(sin(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_cos_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_cos_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "cos", 1)?;
-    Ok(Value::float(cos(extract_float_builtin(&args[0])?)))
+    Ok(Value::float(cos(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_acos_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_acos_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "acos", 1)?;
     Ok(Value::float(
-        acos(extract_float_builtin(&args[0])?).map_err(map_math_error)?,
+        acos(extract_float_builtin(vm, args[0])?).map_err(map_math_error)?,
     ))
 }
 
 #[inline]
-fn math_exp_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_exp_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "exp", 1)?;
-    Ok(Value::float(exp(extract_float_builtin(&args[0])?)))
+    Ok(Value::float(exp(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_log_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_log_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.is_empty() || args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
             "math.log() takes 1 or 2 arguments ({} given)",
@@ -490,9 +561,9 @@ fn math_log_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let value = extract_float_builtin(&args[0])?;
+    let value = extract_float_builtin(vm, args[0])?;
     let result = match args.get(1) {
-        Some(base_value) => log_base(value, extract_float_builtin(base_value)?),
+        Some(base_value) => log_base(value, extract_float_builtin(vm, *base_value)?),
         None => log(value),
     }
     .map_err(map_math_error)?;
@@ -500,73 +571,73 @@ fn math_log_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn math_log2_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_log2_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "log2", 1)?;
     Ok(Value::float(
-        log2(extract_float_builtin(&args[0])?).map_err(map_math_error)?,
+        log2(extract_float_builtin(vm, args[0])?).map_err(map_math_error)?,
     ))
 }
 
 #[inline]
-fn math_log10_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_log10_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "log10", 1)?;
     Ok(Value::float(
-        log10(extract_float_builtin(&args[0])?).map_err(map_math_error)?,
+        log10(extract_float_builtin(vm, args[0])?).map_err(map_math_error)?,
     ))
 }
 
 #[inline]
-fn math_sqrt_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_sqrt_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "sqrt", 1)?;
     Ok(Value::float(
-        sqrt(extract_float_builtin(&args[0])?).map_err(map_math_error)?,
+        sqrt(extract_float_builtin(vm, args[0])?).map_err(map_math_error)?,
     ))
 }
 
 #[inline]
-fn math_gamma_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_gamma_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "gamma", 1)?;
     Ok(Value::float(
-        gamma(extract_float_builtin(&args[0])?).map_err(map_math_error)?,
+        gamma(extract_float_builtin(vm, args[0])?).map_err(map_math_error)?,
     ))
 }
 
 #[inline]
-fn math_lgamma_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_lgamma_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "lgamma", 1)?;
     Ok(Value::float(
-        lgamma(extract_float_builtin(&args[0])?).map_err(map_math_error)?,
+        lgamma(extract_float_builtin(vm, args[0])?).map_err(map_math_error)?,
     ))
 }
 
 #[inline]
-fn math_erf_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_erf_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "erf", 1)?;
-    Ok(Value::float(erf(extract_float_builtin(&args[0])?)))
+    Ok(Value::float(erf(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_erfc_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_erfc_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "erfc", 1)?;
-    Ok(Value::float(erfc(extract_float_builtin(&args[0])?)))
+    Ok(Value::float(erfc(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_isfinite_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_isfinite_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "isfinite", 1)?;
-    Ok(Value::bool(isfinite(extract_float_builtin(&args[0])?)))
+    Ok(Value::bool(isfinite(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_isinf_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_isinf_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "isinf", 1)?;
-    Ok(Value::bool(isinf(extract_float_builtin(&args[0])?)))
+    Ok(Value::bool(isinf(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
-fn math_isnan_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_isnan_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "isnan", 1)?;
-    Ok(Value::bool(isnan(extract_float_builtin(&args[0])?)))
+    Ok(Value::bool(isnan(extract_float_builtin(vm, args[0])?)))
 }
 
 #[inline]
@@ -579,9 +650,9 @@ fn math_gcd_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 #[inline]
-fn math_ldexp_builtin(args: &[Value]) -> Result<Value, BuiltinError> {
+fn math_ldexp_builtin(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_math_arg_count(args, "ldexp", 2)?;
-    let mantissa = extract_float_builtin(&args[0])?;
+    let mantissa = extract_float_builtin(vm, args[0])?;
     let exponent = extract_ldexp_exponent(args[1])?;
 
     if mantissa == 0.0 || !mantissa.is_finite() {
