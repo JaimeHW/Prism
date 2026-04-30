@@ -78,10 +78,19 @@ static DYNAMIC_CLASS_ATTRIBUTE_DELETER_METHOD: LazyLock<BuiltinFunctionObject> =
     });
 
 const TYPE_ALIASES: &[(&str, TypeId)] = &[
+    ("BuiltinFunctionType", TypeId::BUILTIN_FUNCTION),
+    ("BuiltinMethodType", TypeId::BUILTIN_FUNCTION),
+    ("CodeType", TypeId::CODE),
+    ("EllipsisType", TypeId::ELLIPSIS),
+    ("FunctionType", TypeId::FUNCTION),
     ("GenericAlias", TypeId::GENERIC_ALIAS),
+    ("LambdaType", TypeId::FUNCTION),
     ("MappingProxyType", TypeId::MAPPING_PROXY),
+    ("MemberDescriptorType", TypeId::MEMBER_DESCRIPTOR),
     ("MethodType", TypeId::METHOD),
     ("ModuleType", TypeId::MODULE),
+    ("NoneType", TypeId::NONE),
+    ("NotImplementedType", TypeId::NOT_IMPLEMENTED),
 ];
 
 /// Native `types` module descriptor.
