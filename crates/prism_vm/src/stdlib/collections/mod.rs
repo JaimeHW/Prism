@@ -47,13 +47,16 @@ use crate::builtins::{
 };
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
+use crate::ops::comparison::{compare_order_result, contains_value, eq_result, ne_result};
 use crate::ops::dict_access::{
     dict_contains_key, dict_get_item, dict_remove_item, dict_set_item, missing_key_error,
 };
 use crate::ops::objects::{
-    dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id, get_attribute_value,
-    list_storage_ref_from_ptr, tuple_storage_ref_from_ptr,
+    delete_list_item_value, dict_storage_mut_from_ptr, dict_storage_ref_from_ptr, extract_type_id,
+    get_attribute_value, list_storage_mut_from_ptr, list_storage_ref_from_ptr, set_list_item_value,
+    tuple_storage_ref_from_ptr,
 };
+use crate::ops::protocols::RichCompareOp;
 use crate::stdlib::exceptions::types::ExceptionTypeId;
 use crate::truthiness::try_is_truthy;
 use prism_core::Value;
@@ -74,8 +77,10 @@ use prism_runtime::object::views::{DictViewKind, DictViewObject};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -376,8 +381,77 @@ static USERDICT_FROMKEYS: LazyLock<Value> = LazyLock::new(|| {
     )));
     Value::object_ptr(Box::into_raw(descriptor) as *const ())
 });
+static USERLIST_INIT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("collections.UserList.__init__"), userlist_init)
+});
 static USERLIST_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("collections.UserList.__repr__"), userlist_repr)
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__repr__"), userlist_repr)
+});
+static USERLIST_LEN: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__len__"), userlist_len)
+});
+static USERLIST_ITER: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__iter__"), userlist_iter)
+});
+static USERLIST_GETITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserList.__getitem__"),
+        userlist_getitem,
+    )
+});
+static USERLIST_SETITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserList.__setitem__"),
+        userlist_setitem,
+    )
+});
+static USERLIST_DELITEM: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserList.__delitem__"),
+        userlist_delitem,
+    )
+});
+static USERLIST_CONTAINS: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("collections.UserList.__contains__"),
+        userlist_contains,
+    )
+});
+static USERLIST_APPEND: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.append"), userlist_append)
+});
+static USERLIST_INSERT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.insert"), userlist_insert)
+});
+static USERLIST_EXTEND: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.extend"), userlist_extend)
+});
+static USERLIST_POP: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.pop"), userlist_pop)
+});
+static USERLIST_CLEAR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.clear"), userlist_clear)
+});
+static USERLIST_COPY: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.copy"), userlist_copy)
+});
+static USERLIST_EQ: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__eq__"), userlist_eq)
+});
+static USERLIST_NE: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__ne__"), userlist_ne)
+});
+static USERLIST_LT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__lt__"), userlist_lt)
+});
+static USERLIST_LE: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__le__"), userlist_le)
+});
+static USERLIST_GT: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__gt__"), userlist_gt)
+});
+static USERLIST_GE: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("collections.UserList.__ge__"), userlist_ge)
 });
 static USERSTRING_REPR: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -475,7 +549,30 @@ static USERLIST_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
     build_native_collection_class(
         "UserList",
         &[],
-        &[("__repr__", builtin_value(&USERLIST_REPR))],
+        &[
+            ("__init__", builtin_value(&USERLIST_INIT)),
+            ("__repr__", builtin_value(&USERLIST_REPR)),
+            ("__str__", builtin_value(&USERLIST_REPR)),
+            ("__len__", builtin_value(&USERLIST_LEN)),
+            ("__iter__", builtin_value(&USERLIST_ITER)),
+            ("__getitem__", builtin_value(&USERLIST_GETITEM)),
+            ("__setitem__", builtin_value(&USERLIST_SETITEM)),
+            ("__delitem__", builtin_value(&USERLIST_DELITEM)),
+            ("__contains__", builtin_value(&USERLIST_CONTAINS)),
+            ("append", builtin_value(&USERLIST_APPEND)),
+            ("insert", builtin_value(&USERLIST_INSERT)),
+            ("extend", builtin_value(&USERLIST_EXTEND)),
+            ("pop", builtin_value(&USERLIST_POP)),
+            ("clear", builtin_value(&USERLIST_CLEAR)),
+            ("copy", builtin_value(&USERLIST_COPY)),
+            ("__copy__", builtin_value(&USERLIST_COPY)),
+            ("__eq__", builtin_value(&USERLIST_EQ)),
+            ("__ne__", builtin_value(&USERLIST_NE)),
+            ("__lt__", builtin_value(&USERLIST_LT)),
+            ("__le__", builtin_value(&USERLIST_LE)),
+            ("__gt__", builtin_value(&USERLIST_GT)),
+            ("__ge__", builtin_value(&USERLIST_GE)),
+        ],
     )
 });
 static USERSTRING_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
@@ -2903,10 +3000,436 @@ fn len_to_value(len: usize, type_name: &str) -> Result<Value, BuiltinError> {
         .ok_or_else(|| BuiltinError::OverflowError(format!("{type_name} length overflow")))
 }
 
-fn userlist_repr(args: &[Value]) -> Result<Value, BuiltinError> {
-    let ptr = expect_collection_instance(args, "__repr__")?;
-    let data_repr = shaped_property_repr(ptr, "data")?.unwrap_or_else(|| "[]".to_string());
-    Ok(Value::string(intern(&format!("UserList({data_repr})"))))
+thread_local! {
+    static USERLIST_ACTIVE_COMPARE_PAIRS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn userlist_init(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let initlist = parse_userlist_init_args(args, keywords)?;
+    let ptr = expect_userlist_instance_value(args[0], "__init__")?;
+    let data = leak_object_value(ListObject::new());
+    expect_user_collection_from_ptr_mut(ptr, "__init__")?.set_property(
+        intern("data"),
+        data,
+        shape_registry(),
+    );
+
+    let Some(initlist) = initlist.filter(|value| !value.is_none()) else {
+        return Ok(Value::none());
+    };
+
+    let values = userlist_values_from_initlist(vm, initlist)?;
+    let data_ptr = data
+        .as_object_ptr()
+        .expect("newly allocated list value must be an object pointer");
+    list_storage_mut_from_ptr(data_ptr)
+        .expect("newly allocated UserList data must be list-backed")
+        .extend(values);
+    Ok(Value::none())
+}
+
+fn parse_userlist_init_args(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Option<Value>, BuiltinError> {
+    if args.is_empty() || args.len() > 2 {
+        let given = args.len().saturating_sub(1);
+        return Err(BuiltinError::TypeError(format!(
+            "UserList expected at most 1 argument, got {given}"
+        )));
+    }
+
+    let mut initlist = args.get(1).copied();
+    for &(name, value) in keywords {
+        if name != "initlist" {
+            return Err(BuiltinError::TypeError(format!(
+                "UserList.__init__() got an unexpected keyword argument '{name}'"
+            )));
+        }
+        if initlist.is_some() {
+            return Err(BuiltinError::TypeError(
+                "UserList.__init__() got multiple values for argument 'initlist'".to_string(),
+            ));
+        }
+        initlist = Some(value);
+    }
+
+    Ok(initlist)
+}
+
+fn userlist_values_from_initlist(
+    vm: &mut VirtualMachine,
+    initlist: Value,
+) -> Result<Vec<Value>, BuiltinError> {
+    let source = userlist_data_value_if_userlist(initlist, "__init__")?.unwrap_or(initlist);
+    if let Some(ptr) = source.as_object_ptr()
+        && let Some(list) = list_storage_ref_from_ptr(ptr)
+    {
+        return Ok(list.as_slice().to_vec());
+    }
+
+    collect_iterable_values_runtime(vm, source).map_err(BuiltinError::Raised)
+}
+
+fn userlist_repr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__repr__", 1)?;
+    let data_repr = match userlist_data_value(args[0], "__repr__") {
+        Ok(data) => collection_repr_text_vm(vm, data)?,
+        Err(BuiltinError::AttributeError(_)) => "[]".to_string(),
+        Err(err) => return Err(err),
+    };
+    Ok(Value::string(intern(&data_repr)))
+}
+
+fn userlist_len(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__len__", 1)?;
+    let data = userlist_data_value(args[0], "__len__")?;
+    let len = crate::builtins::try_len_value(vm, data).map_err(BuiltinError::Raised)?;
+    len_to_value(len, "UserList")
+}
+
+fn userlist_iter(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__iter__", 1)?;
+    let data = userlist_data_value(args[0], "__iter__")?;
+    crate::builtins::builtin_iter_vm(vm, &[data])
+}
+
+fn userlist_getitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__getitem__", 2)?;
+    let data = userlist_data_value(args[0], "__getitem__")?;
+    let value = invoke_value_method(vm, data, "__getitem__", &[args[1]])?;
+    if slice_object_from_value(args[1]).is_some() {
+        return new_userlist_like(vm, args[0], value, "__getitem__");
+    }
+    Ok(value)
+}
+
+fn userlist_setitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__setitem__", 3)?;
+    let data = userlist_data_value(args[0], "__setitem__")?;
+    if let Some(ptr) = data.as_object_ptr()
+        && list_storage_ref_from_ptr(ptr).is_some()
+    {
+        set_list_item_value(vm, ptr, args[1], args[2]).map_err(BuiltinError::Raised)?;
+        return Ok(Value::none());
+    }
+
+    invoke_value_method(vm, data, "__setitem__", &[args[1], args[2]])?;
+    Ok(Value::none())
+}
+
+fn userlist_delitem(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__delitem__", 2)?;
+    let data = userlist_data_value(args[0], "__delitem__")?;
+    if let Some(ptr) = data.as_object_ptr()
+        && list_storage_ref_from_ptr(ptr).is_some()
+    {
+        delete_list_item_value(ptr, args[1]).map_err(BuiltinError::Raised)?;
+        return Ok(Value::none());
+    }
+
+    invoke_value_method(vm, data, "__delitem__", &[args[1]])?;
+    Ok(Value::none())
+}
+
+fn userlist_contains(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "__contains__", 2)?;
+    let data = userlist_data_value(args[0], "__contains__")?;
+    contains_value(vm, args[1], data)
+        .map(Value::bool)
+        .map_err(BuiltinError::Raised)
+}
+
+fn userlist_append(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "append", 2)?;
+    let data = userlist_data_value(args[0], "append")?;
+    if let Some(ptr) = data.as_object_ptr()
+        && let Some(list) = list_storage_mut_from_ptr(ptr)
+    {
+        list.push(args[1]);
+        return Ok(Value::none());
+    }
+
+    invoke_value_method(vm, data, "append", &[args[1]])?;
+    Ok(Value::none())
+}
+
+fn userlist_insert(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "insert", 3)?;
+    let data = userlist_data_value(args[0], "insert")?;
+    invoke_value_method(vm, data, "insert", &[args[1], args[2]])?;
+    Ok(Value::none())
+}
+
+fn userlist_extend(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "extend", 2)?;
+    let data = userlist_data_value(args[0], "extend")?;
+    let source = userlist_data_value_if_userlist(args[1], "extend")?.unwrap_or(args[1]);
+    if let Some(ptr) = data.as_object_ptr()
+        && let Some(list) = list_storage_mut_from_ptr(ptr)
+    {
+        let values = collect_iterable_values_runtime(vm, source).map_err(BuiltinError::Raised)?;
+        list.extend(values);
+        return Ok(Value::none());
+    }
+
+    invoke_value_method(vm, data, "extend", &[source])?;
+    Ok(Value::none())
+}
+
+fn userlist_pop(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    let given = args.len().saturating_sub(1);
+    if given > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "UserList.pop() takes at most 1 argument ({given} given)"
+        )));
+    }
+
+    let data = userlist_data_value(args[0], "pop")?;
+    if let Some(index) = args.get(1).copied() {
+        invoke_value_method(vm, data, "pop", &[index])
+    } else {
+        invoke_value_method(vm, data, "pop", &[])
+    }
+}
+
+fn userlist_clear(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "clear", 1)?;
+    let data = userlist_data_value(args[0], "clear")?;
+    if let Some(ptr) = data.as_object_ptr()
+        && let Some(list) = list_storage_mut_from_ptr(ptr)
+    {
+        list.clear();
+        return Ok(Value::none());
+    }
+
+    invoke_value_method(vm, data, "clear", &[])?;
+    Ok(Value::none())
+}
+
+fn userlist_copy(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, "copy", 1)?;
+    let data = userlist_data_value(args[0], "copy")?;
+    let copied_data = if let Some(ptr) = data.as_object_ptr() {
+        list_storage_ref_from_ptr(ptr)
+            .map(|list| leak_object_value(ListObject::from_slice(list.as_slice())))
+    } else {
+        None
+    };
+    let copied_data = match copied_data {
+        Some(value) => value,
+        None => invoke_value_method(vm, data, "copy", &[])?,
+    };
+    new_userlist_like(vm, args[0], copied_data, "copy")
+}
+
+fn userlist_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userlist_compare(vm, args, UserListCompareOp::Eq)
+}
+
+fn userlist_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userlist_compare(vm, args, UserListCompareOp::Ne)
+}
+
+fn userlist_lt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userlist_compare(vm, args, UserListCompareOp::Order(RichCompareOp::Lt))
+}
+
+fn userlist_le(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userlist_compare(vm, args, UserListCompareOp::Order(RichCompareOp::Le))
+}
+
+fn userlist_gt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userlist_compare(vm, args, UserListCompareOp::Order(RichCompareOp::Gt))
+}
+
+fn userlist_ge(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    userlist_compare(vm, args, UserListCompareOp::Order(RichCompareOp::Ge))
+}
+
+#[derive(Clone, Copy)]
+enum UserListCompareOp {
+    Eq,
+    Ne,
+    Order(RichCompareOp),
+}
+
+fn userlist_compare(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    op: UserListCompareOp,
+) -> Result<Value, BuiltinError> {
+    expect_userlist_arg_count(args, userlist_compare_name(op), 2)?;
+    let left_ptr = expect_userlist_instance_value(args[0], userlist_compare_name(op))?;
+    if args[0].raw_bits() == args[1].raw_bits() {
+        return Ok(Value::bool(match op {
+            UserListCompareOp::Eq => true,
+            UserListCompareOp::Ne => false,
+            UserListCompareOp::Order(RichCompareOp::Le | RichCompareOp::Ge) => true,
+            UserListCompareOp::Order(RichCompareOp::Lt | RichCompareOp::Gt) => false,
+            UserListCompareOp::Order(RichCompareOp::Eq | RichCompareOp::Ne) => unreachable!(),
+        }));
+    }
+
+    let mut compare = || {
+        let left_data = userlist_data_value(args[0], userlist_compare_name(op))?;
+        let right_data =
+            userlist_data_value_if_userlist(args[1], userlist_compare_name(op))?.unwrap_or(args[1]);
+        let result = match op {
+            UserListCompareOp::Eq => eq_result(vm, left_data, right_data),
+            UserListCompareOp::Ne => ne_result(vm, left_data, right_data),
+            UserListCompareOp::Order(op) => compare_order_result(vm, left_data, right_data, op),
+        }
+        .map_err(BuiltinError::Raised)?;
+        Ok(Value::bool(result))
+    };
+
+    if let Some(right_ptr) = userlist_ptr_if_userlist(args[1]) {
+        with_userlist_active_compare_pair(left_ptr, right_ptr, compare)
+    } else {
+        compare()
+    }
+}
+
+fn userlist_compare_name(op: UserListCompareOp) -> &'static str {
+    match op {
+        UserListCompareOp::Eq => "__eq__",
+        UserListCompareOp::Ne => "__ne__",
+        UserListCompareOp::Order(RichCompareOp::Lt) => "__lt__",
+        UserListCompareOp::Order(RichCompareOp::Le) => "__le__",
+        UserListCompareOp::Order(RichCompareOp::Gt) => "__gt__",
+        UserListCompareOp::Order(RichCompareOp::Ge) => "__ge__",
+        UserListCompareOp::Order(RichCompareOp::Eq | RichCompareOp::Ne) => unreachable!(),
+    }
+}
+
+fn with_userlist_active_compare_pair<T>(
+    left: *const (),
+    right: *const (),
+    compare: impl FnOnce() -> Result<T, BuiltinError>,
+) -> Result<T, BuiltinError> {
+    let pair = ordered_compare_pair(left, right);
+    USERLIST_ACTIVE_COMPARE_PAIRS.with(|active| {
+        {
+            let mut active = active.borrow_mut();
+            if active.contains(&pair) {
+                return Err(BuiltinError::Raised(RuntimeError::recursion_error(
+                    active.len() + 1,
+                )));
+            }
+            active.push(pair);
+        }
+
+        let result = compare();
+        active.borrow_mut().pop();
+        result
+    })
+}
+
+#[inline]
+fn ordered_compare_pair(left: *const (), right: *const ()) -> (usize, usize) {
+    let left = left as usize;
+    let right = right as usize;
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn new_userlist_like(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    data: Value,
+    descriptor_name: &'static str,
+) -> Result<Value, BuiltinError> {
+    let ptr = expect_userlist_instance_value(receiver, descriptor_name)?;
+    let class_value = heap_class_value_for_ptr(ptr, descriptor_name)?;
+    invoke_callable_value(vm, class_value, &[data]).map_err(BuiltinError::Raised)
+}
+
+fn expect_userlist_arg_count(
+    args: &[Value],
+    method_name: &str,
+    expected: usize,
+) -> Result<(), BuiltinError> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "UserList.{method_name}() takes exactly {expected} arguments ({} given)",
+            args.len()
+        )))
+    }
+}
+
+fn expect_userlist_instance_value(
+    value: Value,
+    descriptor_name: &str,
+) -> Result<*const (), BuiltinError> {
+    let ptr = expect_collection_instance(&[value], descriptor_name)?;
+    let type_id = extract_type_id(ptr);
+    if type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && global_class_bitmap(ClassId(type_id.raw()))
+            .is_some_and(|bitmap| bitmap.is_subclass_of(USERLIST_CLASS.class_type_id()))
+    {
+        Ok(ptr)
+    } else {
+        Err(BuiltinError::TypeError(format!(
+            "descriptor '{descriptor_name}' requires a collections.UserList object"
+        )))
+    }
+}
+
+fn userlist_ptr_if_userlist(value: Value) -> Option<*const ()> {
+    let ptr = value.as_object_ptr()?;
+    let type_id = extract_type_id(ptr);
+    (type_id.raw() >= TypeId::FIRST_USER_TYPE
+        && global_class_bitmap(ClassId(type_id.raw()))
+            .is_some_and(|bitmap| bitmap.is_subclass_of(USERLIST_CLASS.class_type_id())))
+    .then_some(ptr)
+}
+
+fn userlist_data_value(value: Value, descriptor_name: &str) -> Result<Value, BuiltinError> {
+    let ptr = expect_userlist_instance_value(value, descriptor_name)?;
+    expect_user_collection_from_ptr(ptr, descriptor_name)?
+        .get_property("data")
+        .ok_or_else(|| {
+            BuiltinError::AttributeError(
+                "collections.UserList instance has no 'data' attribute".to_string(),
+            )
+        })
+}
+
+fn userlist_data_value_if_userlist(
+    value: Value,
+    descriptor_name: &str,
+) -> Result<Option<Value>, BuiltinError> {
+    let Some(_) = userlist_ptr_if_userlist(value) else {
+        return Ok(None);
+    };
+    userlist_data_value(value, descriptor_name).map(Some)
+}
+
+fn invoke_value_method(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    method_name: &'static str,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let method =
+        get_attribute_value(vm, receiver, &intern(method_name)).map_err(BuiltinError::Raised)?;
+    invoke_callable_value(vm, method, args).map_err(BuiltinError::Raised)
+}
+
+#[inline]
+fn slice_object_from_value(value: Value) -> Option<&'static SliceObject> {
+    let ptr = value.as_object_ptr()?;
+    (extract_type_id(ptr) == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
 }
 
 fn userstring_repr(args: &[Value]) -> Result<Value, BuiltinError> {
