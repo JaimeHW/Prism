@@ -39,6 +39,7 @@ pub mod array;
 pub mod ast;
 pub mod atexit;
 pub mod binascii;
+pub mod cmath;
 pub mod collections;
 pub mod copy;
 pub mod copyreg;
@@ -387,6 +388,7 @@ impl StdlibRegistry {
             Box::new(marshal::MarshalModule::new()),
         );
 
+        Self::insert_module(&mut modules, "cmath", Box::new(cmath::CMathModule::new()));
         Self::insert_module(&mut modules, "math", Box::new(math::MathModule::new()));
 
         Self::insert_module(

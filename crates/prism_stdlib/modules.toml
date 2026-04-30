@@ -144,6 +144,11 @@ builtin = ["all"]
 policy = "prefer_native"
 
 [[module]]
+name = "cmath"
+builtin = ["all"]
+policy = "prefer_native"
+
+[[module]]
 name = "collections"
 policy = "prefer_native"
 
