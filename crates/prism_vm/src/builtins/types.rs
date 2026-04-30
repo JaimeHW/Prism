@@ -30,7 +30,7 @@ use prism_runtime::object::type_builtins::{
     unregister_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::object::views::{MappingProxyObject, UnionTypeObject};
+use prism_runtime::object::views::{GenericAliasObject, MappingProxyObject, UnionTypeObject};
 use prism_runtime::types::bytes::{
     BytesObject, clone_bytes_value, value_as_bytes_mut, value_as_bytes_ref,
 };
@@ -1390,6 +1390,7 @@ pub(crate) fn call_builtin_type(type_id: TypeId, args: &[Value]) -> Result<Value
         TypeId::ENUMERATE => super::itertools::builtin_enumerate(args),
         TypeId::BYTEARRAY => super::string::builtin_bytearray(args),
         TypeId::MEMORYVIEW => builtin_memoryview(args),
+        TypeId::GENERIC_ALIAS => builtin_generic_alias(args),
         TypeId::MAPPING_PROXY => builtin_mappingproxy(args),
         TypeId::DEQUE => builtin_deque(args),
         TypeId::METHOD => builtin_methodtype(args),
@@ -1578,6 +1579,30 @@ fn builtin_mappingproxy(args: &[Value]) -> Result<Value, BuiltinError> {
             "mappingproxy() argument must be a mapping".to_string(),
         )),
     }
+}
+
+fn builtin_generic_alias(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "GenericAlias() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let alias_args = if let Some(ptr) = args[1].as_object_ptr() {
+        if crate::ops::objects::extract_type_id(ptr) == TypeId::TUPLE {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            tuple.as_slice().to_vec()
+        } else {
+            vec![args[1]]
+        }
+    } else {
+        vec![args[1]]
+    };
+
+    Ok(to_object_value(GenericAliasObject::new(
+        args[0], alias_args,
+    )))
 }
 
 pub(crate) fn builtin_module(args: &[Value]) -> Result<Value, BuiltinError> {

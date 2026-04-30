@@ -9,7 +9,9 @@ use prism_runtime::object::type_builtins::{
     builtin_class_mro, class_id_to_type_id, global_class, global_direct_subclasses,
 };
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::object::views::{DescriptorViewObject, MappingProxyObject, MethodWrapperObject};
+use prism_runtime::object::views::{
+    DescriptorViewObject, GenericAliasObject, MappingProxyObject, MethodWrapperObject,
+};
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::int::bigint_to_value;
 use prism_runtime::types::list::ListObject;
@@ -2005,6 +2007,7 @@ pub(crate) fn builtin_instance_attribute_value(
         (TypeId::FLOAT, "imag") => Ok(Some(Value::float(0.0))),
         (TypeId::RANGE, attr) => range_instance_attr_value(receiver, attr),
         (TypeId::SLICE, attr) => slice_instance_attr_value(receiver, attr),
+        (TypeId::GENERIC_ALIAS, attr) => generic_alias_instance_attr_value(vm, receiver, attr),
         (TypeId::MEMORYVIEW, attr) => memoryview_instance_attr_value(vm, receiver, attr),
         (TypeId::OBJECT, "__str__") => alloc_view(
             vm,
@@ -2034,6 +2037,7 @@ pub(crate) fn builtin_instance_has_attribute(type_id: TypeId, name: &InternedStr
             | (TypeId::FLOAT, "real" | "imag")
             | (TypeId::RANGE, "start" | "stop" | "step")
             | (TypeId::SLICE, "start" | "stop" | "step")
+            | (TypeId::GENERIC_ALIAS, "__origin__" | "__args__")
             | (
                 TypeId::MEMORYVIEW,
                 "format"
@@ -2070,6 +2074,26 @@ fn slice_instance_attr_value(receiver: Value, attr: &str) -> Result<Option<Value
         "start" => Some(slice.start_value()),
         "stop" => Some(slice.stop_value()),
         "step" => Some(slice.step_value()),
+        _ => None,
+    })
+}
+
+fn generic_alias_instance_attr_value(
+    vm: &mut VirtualMachine,
+    receiver: Value,
+    attr: &str,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(ptr) = receiver.as_object_ptr() else {
+        return Ok(None);
+    };
+    let alias = unsafe { &*(ptr as *const GenericAliasObject) };
+    Ok(match attr {
+        "__origin__" => Some(alias.origin()),
+        "__args__" => Some(alloc_view(
+            vm,
+            TupleObject::from_slice(alias.args()),
+            "generic alias args",
+        )?),
         _ => None,
     })
 }

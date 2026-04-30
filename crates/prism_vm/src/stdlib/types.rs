@@ -10,25 +10,21 @@ use crate::builtins::{BuiltinError, BuiltinFunctionObject};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::objects::dict_storage_ref_from_ptr;
 use prism_core::Value;
+use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
 
-static MODULE_TYPE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
-        Arc::from("types.ModuleType"),
-        crate::builtins::builtin_module,
-    )
-});
-static METHOD_TYPE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
-        Arc::from("types.MethodType"),
-        crate::builtins::builtin_methodtype,
-    )
-});
 static NEW_CLASS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm_kw(Arc::from("types.new_class"), new_class));
+
+const TYPE_ALIASES: &[(&str, TypeId)] = &[
+    ("GenericAlias", TypeId::GENERIC_ALIAS),
+    ("MappingProxyType", TypeId::MAPPING_PROXY),
+    ("MethodType", TypeId::METHOD),
+    ("ModuleType", TypeId::MODULE),
+];
 
 /// Native `types` module descriptor.
 #[derive(Debug, Clone)]
@@ -39,13 +35,13 @@ pub struct TypesModule {
 impl TypesModule {
     /// Create a new `types` module descriptor.
     pub fn new() -> Self {
-        Self {
-            attrs: vec![
-                Arc::from("ModuleType"),
-                Arc::from("MethodType"),
-                Arc::from("new_class"),
-            ],
-        }
+        let mut attrs = TYPE_ALIASES
+            .iter()
+            .map(|(name, _)| Arc::from(*name))
+            .collect::<Vec<_>>();
+        attrs.push(Arc::from("new_class"));
+
+        Self { attrs }
     }
 }
 
@@ -61,9 +57,11 @@ impl Module for TypesModule {
     }
 
     fn get_attr(&self, name: &str) -> ModuleResult {
+        if let Some((_, type_id)) = TYPE_ALIASES.iter().find(|(alias, _)| *alias == name) {
+            return Ok(type_value(*type_id));
+        }
+
         match name {
-            "ModuleType" => Ok(builtin_value(&MODULE_TYPE_FUNCTION)),
-            "MethodType" => Ok(builtin_value(&METHOD_TYPE_FUNCTION)),
             "new_class" => Ok(builtin_value(&NEW_CLASS_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'types' has no attribute '{}'",
@@ -80,6 +78,11 @@ impl Module for TypesModule {
 #[inline]
 fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
     Value::object_ptr(function as *const BuiltinFunctionObject as *const ())
+}
+
+#[inline]
+fn type_value(type_id: TypeId) -> Value {
+    crate::builtins::builtin_type_object_for_type_id(type_id)
 }
 
 #[derive(Clone, Copy)]
