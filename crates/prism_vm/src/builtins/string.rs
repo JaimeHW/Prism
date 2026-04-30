@@ -27,6 +27,8 @@ use crate::ops::iteration::{
 };
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::exceptions::ExceptionTypeId;
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive};
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
 use prism_core::python_unicode::{
@@ -36,6 +38,7 @@ use prism_core::python_unicode::{
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
+use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
 
@@ -1447,12 +1450,16 @@ fn format_value(value: Value, format_spec: &str) -> Result<Value, BuiltinError> 
     }
 
     if let Some(boolean) = value.as_bool() {
-        return format_int(if boolean { 1 } else { 0 }, format_spec);
+        return format_int(if boolean { 1 } else { 0 }, format_spec, "bool");
     }
 
     // Integer formatting
     if let Some(i) = value.as_int() {
-        return format_int(i, format_spec);
+        return format_int(i, format_spec, "int");
+    }
+
+    if let Some(integer) = value_to_bigint(value) {
+        return format_bigint_int(&integer, format_spec, type_name_of(value));
     }
 
     // Float formatting
@@ -1480,7 +1487,30 @@ fn format_value_vm(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatAlign {
+    Left,
+    Right,
+    Center,
+    AfterSign,
+}
+
+impl FormatAlign {
+    #[inline]
+    fn from_char(ch: char) -> Option<Self> {
+        match ch {
+            '<' => Some(Self::Left),
+            '>' => Some(Self::Right),
+            '^' => Some(Self::Center),
+            '=' => Some(Self::AfterSign),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NumericFormatSpec {
+    fill: char,
+    align: FormatAlign,
     alternate_form: bool,
     zero_pad: bool,
     left_adjust: bool,
@@ -1495,15 +1525,24 @@ impl NumericFormatSpec {
     #[inline]
     fn parse(format_spec: &str) -> Result<Self, BuiltinError> {
         let mut chars = format_spec.chars().peekable();
-        let mut left_adjust = false;
+        let mut fill = ' ';
+        let mut align = FormatAlign::Right;
+        let mut align_explicit = false;
 
-        if matches!(chars.clone().nth(1), Some('<' | '>' | '^' | '=')) {
+        if let Some(parsed_align) = chars.clone().nth(1).and_then(FormatAlign::from_char) {
+            fill = chars
+                .next()
+                .expect("fill character must exist before align");
             chars.next();
-            left_adjust = matches!(chars.next(), Some('<'));
-        } else if matches!(chars.peek(), Some('<' | '>' | '^' | '=')) {
-            left_adjust = matches!(chars.next(), Some('<'));
+            align = parsed_align;
+            align_explicit = true;
+        } else if let Some(parsed_align) = chars.peek().copied().and_then(FormatAlign::from_char) {
+            chars.next();
+            align = parsed_align;
+            align_explicit = true;
         }
 
+        let left_adjust = align == FormatAlign::Left;
         let sign = match chars.peek().copied() {
             Some('+') => {
                 chars.next();
@@ -1528,6 +1567,10 @@ impl NumericFormatSpec {
         let zero_pad = matches!(chars.peek(), Some('0'));
         if zero_pad {
             chars.next();
+            if !align_explicit {
+                fill = '0';
+                align = FormatAlign::AfterSign;
+            }
         }
 
         let mut width_digits = String::new();
@@ -1568,6 +1611,8 @@ impl NumericFormatSpec {
         }
 
         Ok(Self {
+            fill,
+            align,
             alternate_form,
             zero_pad,
             left_adjust,
@@ -1582,18 +1627,48 @@ impl NumericFormatSpec {
 
 /// Format an integer according to format_spec.
 #[inline]
-fn format_int(n: i64, format_spec: &str) -> Result<Value, BuiltinError> {
+fn format_int(n: i64, format_spec: &str, type_name: &str) -> Result<Value, BuiltinError> {
     let spec = NumericFormatSpec::parse(format_spec)?;
     let negative = n < 0;
-    let magnitude = if negative {
-        n.checked_abs().ok_or_else(|| {
-            BuiltinError::OverflowError("integer absolute value overflow".to_string())
-        })? as u64
-    } else {
-        n as u64
-    };
+    let magnitude = n.unsigned_abs();
+    let rendered = format_unsigned_integer_magnitude(negative, magnitude, &spec, type_name)?;
+    Ok(Value::string(intern(&rendered)))
+}
 
-    let (mut prefix, mut digits) = match spec.ty.unwrap_or('d') {
+#[inline]
+fn format_bigint_int(
+    value: &BigInt,
+    format_spec: &str,
+    type_name: &str,
+) -> Result<Value, BuiltinError> {
+    let spec = NumericFormatSpec::parse(format_spec)?;
+    let rendered = format_bigint_integer_magnitude(value, &spec, type_name)?;
+    Ok(Value::string(intern(&rendered)))
+}
+
+#[inline]
+fn format_unsigned_integer_magnitude(
+    negative: bool,
+    magnitude: u64,
+    spec: &NumericFormatSpec,
+    type_name: &str,
+) -> Result<String, BuiltinError> {
+    let ty = spec.ty.unwrap_or('d');
+    validate_integer_format_spec(spec, ty, type_name)?;
+
+    if ty == 'c' {
+        if negative || magnitude > u64::from(MAX_UNICODE_CODE_POINT) {
+            return Err(BuiltinError::OverflowError(
+                "%c arg not in range(0x110000)".to_string(),
+            ));
+        }
+        let ch = char::from_u32(magnitude as u32).ok_or_else(|| {
+            BuiltinError::OverflowError("%c arg not in range(0x110000)".to_string())
+        })?;
+        return Ok(apply_integer_width("", "", &ch.to_string(), spec));
+    }
+
+    let (prefix, digits) = match ty {
         'b' => (
             if spec.alternate_form { "0b" } else { "" },
             format!("{:b}", magnitude),
@@ -1610,48 +1685,211 @@ fn format_int(n: i64, format_spec: &str) -> Result<Value, BuiltinError> {
             if spec.alternate_form { "0X" } else { "" },
             format!("{:X}", magnitude),
         ),
-        'c' => {
-            if n < 0 || n > MAX_UNICODE_CODE_POINT as i64 {
-                return Err(BuiltinError::OverflowError(
-                    "%c arg not in range(0x110000)".to_string(),
-                ));
-            }
-            let ch = char::from_u32(n as u32).ok_or_else(|| {
-                BuiltinError::OverflowError("%c arg not in range(0x110000)".to_string())
-            })?;
-            ("", ch.to_string())
-        }
-        'd' | 'n' => ("", format_decimal_digits(magnitude, spec.grouping)),
+        'd' | 'n' => (
+            "",
+            format_digits_with_grouping(magnitude.to_string(), spec.grouping, 3),
+        ),
         other => {
             return Err(BuiltinError::ValueError(format!(
-                "unknown format code '{other}' for object of type 'int'"
+                "unknown format code '{other}' for object of type '{type_name}'"
             )));
         }
     };
 
-    if let Some(precision) = spec.precision {
-        digits = format!(
-            "{}{digits}",
-            "0".repeat(precision.saturating_sub(digits.len()))
-        );
+    let digits = match (spec.grouping, ty) {
+        (Some('_'), 'b' | 'o' | 'x' | 'X') => format_digits_with_grouping(digits, Some('_'), 4),
+        _ => digits,
+    };
+    let sign = integer_sign(negative, spec.sign);
+    Ok(apply_integer_width(sign, prefix, &digits, spec))
+}
+
+#[inline]
+fn format_bigint_integer_magnitude(
+    value: &BigInt,
+    spec: &NumericFormatSpec,
+    type_name: &str,
+) -> Result<String, BuiltinError> {
+    let ty = spec.ty.unwrap_or('d');
+    validate_integer_format_spec(spec, ty, type_name)?;
+
+    if ty == 'c' {
+        let Some(code_point) = value.to_u32() else {
+            return Err(BuiltinError::OverflowError(
+                "%c arg not in range(0x110000)".to_string(),
+            ));
+        };
+        if code_point > MAX_UNICODE_CODE_POINT {
+            return Err(BuiltinError::OverflowError(
+                "%c arg not in range(0x110000)".to_string(),
+            ));
+        }
+        let ch = char::from_u32(code_point).ok_or_else(|| {
+            BuiltinError::OverflowError("%c arg not in range(0x110000)".to_string())
+        })?;
+        return Ok(apply_integer_width("", "", &ch.to_string(), spec));
     }
 
-    let sign = if negative { "-" } else { "" };
-    let core_len = sign.len() + prefix.len() + digits.len();
-    let width = spec.width.unwrap_or(0);
-    let padding_len = width.saturating_sub(core_len);
-    let formatted = if spec.zero_pad && spec.precision.is_none() && spec.ty != Some('c') {
-        format!("{sign}{prefix}{}{digits}", "0".repeat(padding_len))
-    } else {
-        let mut rendered = String::with_capacity(width.max(core_len));
-        rendered.push_str(&" ".repeat(padding_len));
-        rendered.push_str(sign);
-        rendered.push_str(prefix);
-        rendered.push_str(&digits);
-        rendered
+    let negative = value.is_negative();
+    let magnitude = value.abs();
+    let (prefix, mut digits) = match ty {
+        'b' => (
+            if spec.alternate_form { "0b" } else { "" },
+            magnitude.to_str_radix(2),
+        ),
+        'o' => (
+            if spec.alternate_form { "0o" } else { "" },
+            magnitude.to_str_radix(8),
+        ),
+        'x' => (
+            if spec.alternate_form { "0x" } else { "" },
+            magnitude.to_str_radix(16),
+        ),
+        'X' => (
+            if spec.alternate_form { "0X" } else { "" },
+            magnitude.to_str_radix(16).to_ascii_uppercase(),
+        ),
+        'd' | 'n' => ("", magnitude.to_str_radix(10)),
+        other => {
+            return Err(BuiltinError::ValueError(format!(
+                "unknown format code '{other}' for object of type '{type_name}'"
+            )));
+        }
     };
 
-    Ok(Value::string(intern(&formatted)))
+    digits = match (spec.grouping, ty) {
+        (Some(',' | '_'), 'd' | 'n') => format_digits_with_grouping(digits, spec.grouping, 3),
+        (Some('_'), 'b' | 'o' | 'x' | 'X') => format_digits_with_grouping(digits, Some('_'), 4),
+        _ => digits,
+    };
+
+    let sign = integer_sign(negative, spec.sign);
+    Ok(apply_integer_width(sign, prefix, &digits, spec))
+}
+
+#[inline]
+fn validate_integer_format_spec(
+    spec: &NumericFormatSpec,
+    ty: char,
+    type_name: &str,
+) -> Result<(), BuiltinError> {
+    if spec.precision.is_some() {
+        return Err(BuiltinError::ValueError(
+            "Precision not allowed in integer format specifier".to_string(),
+        ));
+    }
+
+    if ty == 'c' {
+        if !matches!(spec.sign, FloatFormatSign::MinusOnly) {
+            return Err(BuiltinError::ValueError(
+                "Sign not allowed with integer format specifier 'c'".to_string(),
+            ));
+        }
+        if spec.alternate_form {
+            return Err(BuiltinError::ValueError(
+                "Alternate form (#) not allowed with integer format specifier 'c'".to_string(),
+            ));
+        }
+    }
+
+    match (spec.grouping, ty) {
+        (Some(','), 'b' | 'c' | 'o' | 'x' | 'X') => Err(BuiltinError::ValueError(format!(
+            "Cannot specify ',' with '{ty}'."
+        ))),
+        (Some('_'), 'c') => Err(BuiltinError::ValueError(
+            "Cannot specify '_' with 'c'.".to_string(),
+        )),
+        (Some(grouping), _) if grouping != ',' && grouping != '_' => Err(BuiltinError::ValueError(
+            format!("Cannot specify '{grouping}' with '{ty}'."),
+        )),
+        _ if !matches!(ty, 'b' | 'c' | 'd' | 'n' | 'o' | 'x' | 'X') => {
+            Err(BuiltinError::ValueError(format!(
+                "unknown format code '{ty}' for object of type '{type_name}'"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[inline]
+fn integer_sign(negative: bool, sign: FloatFormatSign) -> &'static str {
+    if negative {
+        "-"
+    } else {
+        match sign {
+            FloatFormatSign::Plus => "+",
+            FloatFormatSign::Space => " ",
+            FloatFormatSign::MinusOnly => "",
+        }
+    }
+}
+
+fn apply_integer_width(sign: &str, prefix: &str, digits: &str, spec: &NumericFormatSpec) -> String {
+    let content_len = sign.chars().count() + prefix.chars().count() + digits.chars().count();
+    let width = spec.width.unwrap_or(0);
+    let padding_len = width.saturating_sub(content_len);
+
+    let mut rendered = String::with_capacity(
+        sign.len() + prefix.len() + digits.len() + padding_len * spec.fill.len_utf8(),
+    );
+
+    match spec.align {
+        FormatAlign::Left => {
+            rendered.push_str(sign);
+            rendered.push_str(prefix);
+            rendered.push_str(digits);
+            push_repeated_char(&mut rendered, spec.fill, padding_len);
+        }
+        FormatAlign::Center => {
+            let left_padding = padding_len / 2;
+            push_repeated_char(&mut rendered, spec.fill, left_padding);
+            rendered.push_str(sign);
+            rendered.push_str(prefix);
+            rendered.push_str(digits);
+            push_repeated_char(&mut rendered, spec.fill, padding_len - left_padding);
+        }
+        FormatAlign::AfterSign => {
+            rendered.push_str(sign);
+            rendered.push_str(prefix);
+            push_repeated_char(&mut rendered, spec.fill, padding_len);
+            rendered.push_str(digits);
+        }
+        FormatAlign::Right => {
+            push_repeated_char(&mut rendered, spec.fill, padding_len);
+            rendered.push_str(sign);
+            rendered.push_str(prefix);
+            rendered.push_str(digits);
+        }
+    }
+
+    rendered
+}
+
+#[inline]
+fn push_repeated_char(output: &mut String, ch: char, count: usize) {
+    for _ in 0..count {
+        output.push(ch);
+    }
+}
+
+#[inline]
+fn format_digits_with_grouping(
+    digits: String,
+    grouping: Option<char>,
+    group_size: usize,
+) -> String {
+    let Some(separator) = grouping else {
+        return digits;
+    };
+
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / group_size);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % group_size == 0 {
+            grouped.push(separator);
+        }
+        grouped.push(ch);
+    }
+    grouped
 }
 
 /// Format a float according to format_spec.
@@ -1671,72 +1909,6 @@ fn format_float(f: f64, format_spec: &str) -> Result<Value, BuiltinError> {
         },
     )?;
     Ok(Value::string(intern(&formatted)))
-}
-
-/// Format integer with thousands separator (,).
-#[inline]
-fn format_with_thousands_separator(n: i64) -> String {
-    let s = n.abs().to_string();
-    let negative = n < 0;
-
-    let mut result = String::with_capacity(s.len() + s.len() / 3 + 1);
-    if negative {
-        result.push('-');
-    }
-
-    let chars: Vec<char> = s.chars().collect();
-    for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 {
-            result.push(',');
-        }
-        result.push(*c);
-    }
-
-    result
-}
-
-/// Format integer with underscore separator (_).
-#[inline]
-fn format_with_underscore_separator(n: i64) -> String {
-    let s = n.abs().to_string();
-    let negative = n < 0;
-
-    let mut result = String::with_capacity(s.len() + s.len() / 3 + 1);
-    if negative {
-        result.push('-');
-    }
-
-    let chars: Vec<char> = s.chars().collect();
-    for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 {
-            result.push('_');
-        }
-        result.push(*c);
-    }
-
-    result
-}
-
-#[inline]
-fn format_decimal_digits(n: u64, grouping: Option<char>) -> String {
-    match grouping {
-        Some(',') => format_unsigned_with_separator(n, ','),
-        Some('_') => format_unsigned_with_separator(n, '_'),
-        _ => n.to_string(),
-    }
-}
-
-#[inline]
-fn format_unsigned_with_separator(n: u64, separator: char) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (index, ch) in s.chars().enumerate() {
-        if index > 0 && (s.len() - index) % 3 == 0 {
-            result.push(separator);
-        }
-        result.push(ch);
-    }
-    result
 }
 
 // =============================================================================
