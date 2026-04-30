@@ -506,7 +506,7 @@ fn inspect_isawaitable(
     let value = exact_arity("isawaitable", args, 1)?;
 
     if let Some(generator) = GeneratorObject::from_value(value)
-        && generator.is_coroutine()
+        && (generator.is_coroutine() || generator.is_iterable_coroutine())
     {
         return Ok(Value::bool(true));
     }

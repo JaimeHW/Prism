@@ -15,6 +15,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+const RUNTIME_ITERABLE_COROUTINE: u8 = 1 << 0;
+
 // =============================================================================
 // Closure Environment
 // =============================================================================
@@ -331,6 +333,11 @@ pub struct FunctionObject {
     /// normal frame setup. Keeping it out of the attribute dictionary avoids a
     /// lock and keeps the default path branch-predictable.
     vectorcall_override: AtomicU8,
+    /// Runtime-only call semantics that should not live in `__dict__`.
+    ///
+    /// This keeps decorator-driven function behavior visible to the VM without
+    /// adding attribute lookups to normal function calls.
+    runtime_flags: AtomicU8,
 }
 
 // Safety: FunctionObject is Send + Sync because:
@@ -357,6 +364,7 @@ impl FunctionObject {
             globals_ptr: std::ptr::null(),
             attrs: RwLock::new(FunctionAttrs::default()),
             vectorcall_override: AtomicU8::new(0),
+            runtime_flags: AtomicU8::new(0),
         }
     }
 
@@ -379,6 +387,7 @@ impl FunctionObject {
             globals_ptr,
             attrs: RwLock::new(FunctionAttrs::default()),
             vectorcall_override: AtomicU8::new(0),
+            runtime_flags: AtomicU8::new(0),
         }
     }
 
@@ -506,6 +515,19 @@ impl FunctionObject {
     #[inline]
     pub fn has_test_vectorcall_override(&self) -> bool {
         self.vectorcall_override.load(Ordering::Acquire) != 0
+    }
+
+    /// Mark generator objects produced by this function as iterable coroutines.
+    #[inline]
+    pub fn mark_iterable_coroutine(&self) {
+        self.runtime_flags
+            .fetch_or(RUNTIME_ITERABLE_COROUTINE, Ordering::Release);
+    }
+
+    /// Whether generated objects should participate in `await` directly.
+    #[inline]
+    pub fn is_iterable_coroutine(&self) -> bool {
+        self.runtime_flags.load(Ordering::Acquire) & RUNTIME_ITERABLE_COROUTINE != 0
     }
 }
 

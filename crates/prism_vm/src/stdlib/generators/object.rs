@@ -56,6 +56,8 @@ impl GeneratorFlags {
     pub const IS_ASYNC: Self = Self(0b0001_0000);
     /// Generator has been started at least once.
     pub const STARTED: Self = Self(0b0010_0000);
+    /// Generator can be awaited through the legacy iterable-coroutine protocol.
+    pub const IS_ITERABLE_COROUTINE: Self = Self(0b0100_0000);
     /// Empty flag set.
     pub const EMPTY: Self = Self(0);
 
@@ -455,6 +457,20 @@ impl GeneratorObject {
     #[inline]
     pub fn is_coroutine(&self) -> bool {
         self.flags.contains(GeneratorFlags::IS_COROUTINE) && !self.is_async()
+    }
+
+    /// Marks this generator as an iterable coroutine.
+    #[inline]
+    pub fn mark_iterable_coroutine(&mut self) {
+        self.flags |= GeneratorFlags::IS_ITERABLE_COROUTINE;
+    }
+
+    /// Returns true if this generator uses the iterable-coroutine protocol.
+    #[inline]
+    pub fn is_iterable_coroutine(&self) -> bool {
+        self.flags.contains(GeneratorFlags::IS_ITERABLE_COROUTINE)
+            && !self.is_coroutine()
+            && !self.is_async()
     }
 
     /// Returns true if this is an async generator.

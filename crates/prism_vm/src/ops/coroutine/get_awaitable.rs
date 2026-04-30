@@ -108,10 +108,7 @@ fn is_native_awaitable(value: &Value) -> bool {
 /// This is set by the `@types.coroutine` decorator for backward compatibility.
 #[inline(always)]
 fn is_iterable_coroutine(value: &Value) -> bool {
-    // Prism does not yet expose a distinct iterable-coroutine runtime flag.
-    // Keep this path strict until legacy coroutine decoration metadata is wired.
-    let _ = value;
-    false
+    GeneratorObject::from_value(*value).is_some_and(GeneratorObject::is_iterable_coroutine)
 }
 
 /// Check if value is an iterator (has __next__ method).

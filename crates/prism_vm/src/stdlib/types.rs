@@ -10,22 +10,27 @@ use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, builtin_not_implemented_value, builtin_repr_vm,
     runtime_error_to_builtin_error,
 };
-use crate::ops::calls::invoke_callable_value;
+use crate::ops::calls::{
+    invoke_callable_value, invoke_callable_value_with_keywords, value_supports_call_protocol,
+};
 use crate::ops::comparison::eq_result;
 use crate::ops::objects::{
     dict_storage_ref_from_ptr, extract_type_id, get_attribute_value, set_attribute_value,
 };
+use crate::stdlib::generators::GeneratorObject;
 use crate::truthiness::try_is_truthy;
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
 use prism_runtime::object::mro::ClassId;
+use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
     SubclassBitmap, class_id_to_type_id, global_class, global_class_bitmap, register_global_class,
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::function::FunctionObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
 use std::cell::RefCell;
@@ -33,6 +38,16 @@ use std::sync::{Arc, LazyLock};
 
 static NEW_CLASS_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm_kw(Arc::from("types.new_class"), new_class));
+static COROUTINE_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("types.coroutine"), coroutine));
+static COROUTINE_WRAPPER_CLASS: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(build_coroutine_wrapper_class);
+static COROUTINE_WRAPPER_CALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(
+        Arc::from("types._CoroutineWrapper.__call__"),
+        coroutine_wrapper_call,
+    )
+});
 static DYNAMIC_CLASS_ATTRIBUTE_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(build_dynamic_class_attribute_class);
 static SIMPLE_NAMESPACE_CLASS: LazyLock<Arc<PyClassObject>> =
@@ -156,6 +171,7 @@ impl TypesModule {
             .collect::<Vec<_>>();
         attrs.push(Arc::from("DynamicClassAttribute"));
         attrs.push(Arc::from("SimpleNamespace"));
+        attrs.push(Arc::from("coroutine"));
         attrs.push(Arc::from("new_class"));
 
         Self { attrs }
@@ -181,6 +197,7 @@ impl Module for TypesModule {
         match name {
             "DynamicClassAttribute" => Ok(dynamic_class_attribute_class_value()),
             "SimpleNamespace" => Ok(simple_namespace_class_value()),
+            "coroutine" => Ok(builtin_value(&COROUTINE_FUNCTION)),
             "new_class" => Ok(builtin_value(&NEW_CLASS_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'types' has no attribute '{}'",
@@ -212,6 +229,122 @@ fn dynamic_class_attribute_class_value() -> Value {
 #[inline]
 fn simple_namespace_class_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&SIMPLE_NAMESPACE_CLASS) as *const ())
+}
+
+fn coroutine(args: &[Value]) -> Result<Value, BuiltinError> {
+    let func = match args {
+        [func] => *func,
+        _ => {
+            return Err(BuiltinError::TypeError(format!(
+                "coroutine() takes exactly one argument ({} given)",
+                args.len()
+            )));
+        }
+    };
+
+    if !value_supports_call_protocol(func) {
+        return Err(BuiltinError::TypeError(
+            "types.coroutine() expects a callable".to_string(),
+        ));
+    }
+
+    if let Some(function) = function_object(func) {
+        if function.code.is_coroutine() || function.is_iterable_coroutine() {
+            return Ok(func);
+        }
+        if function.code.is_generator() {
+            function.mark_iterable_coroutine();
+            return Ok(func);
+        }
+    }
+
+    Ok(new_coroutine_wrapper_value(func))
+}
+
+fn build_coroutine_wrapper_class() -> Arc<PyClassObject> {
+    let mut class = PyClassObject::new_simple(intern("_CoroutineWrapper"));
+    class.set_attr(intern("__module__"), Value::string(intern("types")));
+    class.set_attr(
+        intern("__qualname__"),
+        Value::string(intern("_CoroutineWrapper")),
+    );
+    class.set_attr(
+        intern("__call__"),
+        builtin_value(&COROUTINE_WRAPPER_CALL_METHOD),
+    );
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
+
+    let mut bitmap = SubclassBitmap::new();
+    for &class_id in class.mro() {
+        bitmap.set_bit(class_id_to_type_id(class_id));
+    }
+    let class = Arc::new(class);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
+}
+
+fn new_coroutine_wrapper_value(func: Value) -> Value {
+    let class = &*COROUTINE_WRAPPER_CLASS;
+    let mut wrapper = ShapedObject::new(class.class_type_id(), Arc::clone(class.instance_shape()));
+    wrapper.set_property(coroutine_wrapped_attr(), func, shape_registry());
+    crate::alloc_managed_value(wrapper)
+}
+
+fn coroutine_wrapper_call(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let Some((&self_value, call_args)) = args.split_first() else {
+        return Err(BuiltinError::TypeError(
+            "_CoroutineWrapper.__call__() missing required self argument".to_string(),
+        ));
+    };
+    let wrapper = coroutine_wrapper_object(self_value)?;
+    let func = wrapper
+        .get_property_interned(&coroutine_wrapped_attr())
+        .ok_or_else(|| {
+            BuiltinError::TypeError("coroutine wrapper is missing __wrapped__".into())
+        })?;
+    let result = invoke_callable_value_with_keywords(vm, func, call_args, keywords)
+        .map_err(runtime_error_to_builtin_error)?;
+    Ok(mark_iterable_coroutine_result(result))
+}
+
+fn mark_iterable_coroutine_result(result: Value) -> Value {
+    if let Some(generator) = GeneratorObject::from_value_mut(result)
+        && !generator.is_coroutine()
+        && !generator.is_iterable_coroutine()
+        && !generator.is_async()
+    {
+        generator.mark_iterable_coroutine();
+    }
+    result
+}
+
+fn coroutine_wrapper_object(value: Value) -> Result<&'static ShapedObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(
+            "_CoroutineWrapper.__call__ requires a _CoroutineWrapper object".to_string(),
+        ));
+    };
+    if extract_type_id(ptr) != COROUTINE_WRAPPER_CLASS.class_type_id() {
+        return Err(BuiltinError::TypeError(
+            "_CoroutineWrapper.__call__ requires a _CoroutineWrapper object".to_string(),
+        ));
+    }
+    Ok(unsafe { &*(ptr as *const ShapedObject) })
+}
+
+fn function_object(value: Value) -> Option<&'static FunctionObject> {
+    let ptr = value.as_object_ptr()?;
+    matches!(extract_type_id(ptr), TypeId::FUNCTION | TypeId::CLOSURE)
+        .then(|| unsafe { &*(ptr as *const FunctionObject) })
+}
+
+#[inline]
+fn coroutine_wrapped_attr() -> InternedString {
+    intern("__wrapped__")
 }
 
 fn build_dynamic_class_attribute_class() -> Arc<PyClassObject> {

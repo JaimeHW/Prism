@@ -1540,6 +1540,7 @@ fn invoke_user_function_with_implicit_self(
             &bound,
             varargs_value,
             varkw_value,
+            func.is_iterable_coroutine(),
         );
     }
 
@@ -1623,6 +1624,7 @@ fn create_generator_from_bound_arguments(
     bound: &BoundArguments,
     varargs_value: Option<Value>,
     varkw_value: Option<Value>,
+    iterable_coroutine: bool,
 ) -> ControlFlow {
     let value = match generator_value_from_bound_arguments(
         vm,
@@ -1632,6 +1634,7 @@ fn create_generator_from_bound_arguments(
         bound,
         varargs_value,
         varkw_value,
+        iterable_coroutine,
     ) {
         Ok(value) => value,
         Err(err) => return ControlFlow::Error(err),
@@ -1648,6 +1651,7 @@ fn generator_value_from_bound_arguments(
     bound: &BoundArguments,
     varargs_value: Option<Value>,
     varkw_value: Option<Value>,
+    iterable_coroutine: bool,
 ) -> Result<Value, RuntimeError> {
     let arg_count = code.arg_count as usize;
     let mut locals = [Value::none(); 256];
@@ -1673,7 +1677,7 @@ fn generator_value_from_bound_arguments(
         local_idx += 1;
     }
 
-    let mut generator = GeneratorObject::from_code(Arc::clone(code));
+    let mut generator = generator_from_code(code, iterable_coroutine);
     generator.set_module_ptr(module_ptr);
     if let Some(closure) = closure {
         generator.set_closure(closure);
@@ -1689,13 +1693,14 @@ fn create_generator_from_values(
     module_ptr: *const (),
     closure: Option<Arc<ClosureEnv>>,
     args: &[Value],
+    iterable_coroutine: bool,
 ) -> ControlFlow {
     let mut locals = [Value::none(); 256];
     for (i, arg) in args.iter().copied().enumerate() {
         locals[i] = arg;
     }
 
-    let mut generator = GeneratorObject::from_code(Arc::clone(code));
+    let mut generator = generator_from_code(code, iterable_coroutine);
     generator.set_module_ptr(module_ptr);
     if let Some(closure) = closure {
         generator.set_closure(closure);
@@ -1728,6 +1733,7 @@ pub(crate) fn call_user_function_from_values(
         Err(err) => return ControlFlow::Error(err),
     };
     let is_generator_function = is_generator_code(&code);
+    let iterable_coroutine = func.is_iterable_coroutine();
     let defaults_empty = func.defaults.as_ref().is_none_or(|d| d.is_empty());
     let kwdefaults_empty = func.kwdefaults.as_ref().is_none_or(|d| d.is_empty());
     let simple_positional = keyword_args.is_empty()
@@ -1746,6 +1752,7 @@ pub(crate) fn call_user_function_from_values(
             module_ptr,
             closure.clone(),
             positional_args,
+            iterable_coroutine,
         );
     }
 
@@ -1794,6 +1801,7 @@ pub(crate) fn call_user_function_from_values(
             &bound,
             varargs_value,
             varkw_value,
+            iterable_coroutine,
         );
     }
 
@@ -1881,6 +1889,7 @@ fn invoke_user_function_direct_impl_guarded(
             &bound,
             varargs_value,
             varkw_value,
+            func.is_iterable_coroutine(),
         ) {
             ControlFlow::Continue => Ok(InvokeCallableOutcome::Returned(
                 vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG),
@@ -1994,6 +2003,7 @@ fn invoke_user_function_direct_with_keywords_guarded(
             &bound,
             varargs_value,
             varkw_value,
+            func.is_iterable_coroutine(),
         ) {
             ControlFlow::Continue => Ok(vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG)),
             ControlFlow::Error(err) => Err(err),
@@ -2844,6 +2854,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     Err(err) => return ControlFlow::Error(err),
                 };
                 let is_generator_function = is_generator_code(code);
+                let iterable_coroutine = func.is_iterable_coroutine();
 
                 // Fast path for exact-arity positional calls without advanced binding.
                 let defaults_empty = func.defaults.as_ref().is_none_or(|d| d.is_empty());
@@ -2863,6 +2874,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                         argc,
                         function_module_ptr(vm, func),
                         closure.clone(),
+                        iterable_coroutine,
                     )
                 } else if simple_positional {
                     let module = resolve_function_module(vm, func);
@@ -3306,6 +3318,7 @@ fn call_kw_user_function(
     let total_params = arg_count + kwonly_count;
     let has_varargs = code.flags.contains(CodeFlags::VARARGS);
     let has_varkw = code.flags.contains(CodeFlags::VARKEYWORDS);
+    let iterable_coroutine = func.is_iterable_coroutine();
 
     // Optimization: use u64 bitmap for tracking bound parameters (supports ≤64 params)
     // Falls back to linear check for functions with >64 params (extremely rare)
@@ -3535,8 +3548,11 @@ fn call_kw_user_function(
             local_idx += 1;
         }
 
-        let mut generator = GeneratorObject::from_code(Arc::clone(&code));
+        let mut generator = generator_from_code(&code, iterable_coroutine);
         generator.set_module_ptr(function_module_ptr(vm, func));
+        if let Some(closure) = closure {
+            generator.set_closure(closure);
+        }
         generator.seed_locals(&locals, prefix_liveness(local_idx));
         let value = match alloc_heap_value(vm, generator, "generator object") {
             Ok(value) => value,
@@ -3601,6 +3617,15 @@ fn is_generator_code(code: &CodeObject) -> bool {
 }
 
 #[inline]
+fn generator_from_code(code: &Arc<CodeObject>, iterable_coroutine: bool) -> GeneratorObject {
+    let mut generator = GeneratorObject::from_code(Arc::clone(code));
+    if iterable_coroutine {
+        generator.mark_iterable_coroutine();
+    }
+    generator
+}
+
+#[inline]
 fn create_generator_from_simple_call(
     vm: &mut VirtualMachine,
     code: &Arc<CodeObject>,
@@ -3608,6 +3633,7 @@ fn create_generator_from_simple_call(
     argc: usize,
     module_ptr: *const (),
     closure: Option<Arc<ClosureEnv>>,
+    iterable_coroutine: bool,
 ) -> ControlFlow {
     let caller_frame_idx = vm.call_depth() - 1;
     let mut locals = [Value::none(); 256];
@@ -3615,7 +3641,7 @@ fn create_generator_from_simple_call(
         locals[i] = vm.frames[caller_frame_idx].get_reg(dst_reg + 1 + i as u8);
     }
 
-    let mut generator = GeneratorObject::from_code(Arc::clone(code));
+    let mut generator = generator_from_code(code, iterable_coroutine);
     generator.set_module_ptr(module_ptr);
     if let Some(closure) = closure {
         generator.set_closure(closure);
