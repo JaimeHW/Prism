@@ -17,13 +17,15 @@
 //! - `bytearray()` - Mutable byte sequence constructor
 //! - `format()` - String formatting (simplified)
 
-use super::BuiltinError;
 use super::float_format::{FloatFormatSign, FloatFormatSpec, format_python_float};
+use super::{BuiltinError, BuiltinFunctionObject};
 use crate::VirtualMachine;
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, RuntimeErrorKind};
+use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{
     IterStep, ensure_iterator_value, next_step, reserve_advisory_length_hint,
 };
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
@@ -35,7 +37,7 @@ use prism_core::python_unicode::{
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::{BytesObject, value_as_bytes_ref};
 use prism_runtime::types::memoryview::value_as_memoryview_ref;
-use prism_runtime::types::string::StringObject;
+use prism_runtime::types::string::{StringObject, value_as_string_ref};
 
 // =============================================================================
 // Unicode Constants
@@ -1320,9 +1322,34 @@ fn python_unicode_escape(ch: char) -> String {
 /// - `format(255, '#x')` → `'0xff'`
 /// - `format(1234567, ',')` → `'1,234,567'`
 ///
-/// # Implementation Note
-/// Full implementation requires __format__ protocol.
 pub fn builtin_format(args: &[Value]) -> Result<Value, BuiltinError> {
+    let parsed = parse_format_args(args)?;
+    format_value(parsed.value, &parsed.format_spec)
+}
+
+/// VM-aware `format(value[, format_spec])` that honors Python's `__format__`
+/// protocol for heap objects.
+pub fn builtin_format_vm(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    let parsed = parse_format_args(args)?;
+
+    if native_format_fast_path(parsed.value) {
+        return format_value(parsed.value, &parsed.format_spec);
+    }
+
+    if let Some(rendered) = format_protocol_value(vm, parsed.value, parsed.format_spec_value)? {
+        return Ok(rendered);
+    }
+
+    format_value_vm(vm, parsed.value, &parsed.format_spec)
+}
+
+struct ParsedFormatArgs {
+    value: Value,
+    format_spec_value: Value,
+    format_spec: String,
+}
+
+fn parse_format_args(args: &[Value]) -> Result<ParsedFormatArgs, BuiltinError> {
     if args.is_empty() || args.len() > 2 {
         return Err(BuiltinError::TypeError(format!(
             "format() takes 1 or 2 arguments ({} given)",
@@ -1331,19 +1358,82 @@ pub fn builtin_format(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     let value = args[0];
-    let format_spec = if args.len() == 2 {
-        value_to_string(args[1]).ok_or_else(|| {
+    let (format_spec_value, format_spec) = if let Some(spec) = args.get(1).copied() {
+        let text = value_to_string(spec).ok_or_else(|| {
             BuiltinError::TypeError(format!(
                 "format() argument 2 must be str, not {}",
-                type_name_of(args[1])
+                type_name_of(spec)
             ))
-        })?
+        })?;
+        (spec, text)
     } else {
-        String::new()
+        (Value::string(intern("")), String::new())
     };
 
-    // Handle basic numeric formatting
-    format_value(value, &format_spec)
+    Ok(ParsedFormatArgs {
+        value,
+        format_spec_value,
+        format_spec,
+    })
+}
+
+#[inline]
+fn native_format_fast_path(value: Value) -> bool {
+    value.as_bool().is_some() || value.as_int().is_some() || value.as_float().is_some()
+}
+
+fn format_protocol_value(
+    vm: &mut VirtualMachine,
+    value: Value,
+    format_spec: Value,
+) -> Result<Option<Value>, BuiltinError> {
+    let target = match resolve_special_method(value, "__format__") {
+        Ok(target) => target,
+        Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(super::runtime_error_to_builtin_error(err)),
+    };
+
+    if bound_method_target_is_builtin(&target, "object.__format__") {
+        return Ok(None);
+    }
+
+    let rendered = invoke_bound_method_one_arg(vm, &target, format_spec)?;
+    if value_as_string_ref(rendered).is_none() {
+        return Err(BuiltinError::TypeError(format!(
+            "__format__ must return a str, not {}",
+            type_name_of(rendered)
+        )));
+    }
+
+    Ok(Some(rendered))
+}
+
+#[inline]
+fn invoke_bound_method_one_arg(
+    vm: &mut VirtualMachine,
+    target: &BoundMethodTarget,
+    arg: Value,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self, arg]),
+        None => invoke_callable_value(vm, target.callable, &[arg]),
+    }
+    .map_err(super::runtime_error_to_builtin_error)
+}
+
+#[inline]
+fn bound_method_target_is_builtin(target: &BoundMethodTarget, name: &str) -> bool {
+    let Some(ptr) = target.callable.as_object_ptr() else {
+        return false;
+    };
+    if crate::ops::objects::extract_type_id(ptr) != TypeId::BUILTIN_FUNCTION {
+        return false;
+    }
+
+    let function = unsafe { &*(ptr as *const BuiltinFunctionObject) };
+    function.name() == name
 }
 
 /// Format a value according to format_spec.
@@ -1374,6 +1464,19 @@ fn format_value(value: Value, format_spec: &str) -> Result<Value, BuiltinError> 
         "unsupported format string passed to {}.__format__",
         type_name_of(value)
     )))
+}
+
+#[inline]
+fn format_value_vm(
+    vm: &mut VirtualMachine,
+    value: Value,
+    format_spec: &str,
+) -> Result<Value, BuiltinError> {
+    if format_spec.is_empty() {
+        return super::types::builtin_str_vm(vm, &[value]);
+    }
+
+    format_value(value, format_spec)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

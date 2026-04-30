@@ -7,7 +7,8 @@
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{
-    BuiltinError, BuiltinFunctionObject, builtin_ascii, builtin_format, builtin_repr, builtin_str,
+    BuiltinError, BuiltinFunctionObject, builtin_ascii_vm, builtin_format_vm, builtin_repr_vm,
+    builtin_str_vm,
 };
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
@@ -484,12 +485,16 @@ fn resolve_format_field(
     Ok(current)
 }
 
-fn apply_conversion(value: Value, conversion: Option<&str>) -> Result<Value, BuiltinError> {
+fn apply_conversion(
+    vm: &mut VirtualMachine,
+    value: Value,
+    conversion: Option<&str>,
+) -> Result<Value, BuiltinError> {
     match conversion {
         None | Some("") => Ok(value),
-        Some("r") => builtin_repr(&[value]),
-        Some("s") => builtin_str(&[value]),
-        Some("a") => builtin_ascii(&[value]),
+        Some("r") => builtin_repr_vm(vm, &[value]),
+        Some("s") => builtin_str_vm(vm, &[value]),
+        Some("a") => builtin_ascii_vm(vm, &[value]),
         Some(other) => Err(BuiltinError::ValueError(format!(
             "Unknown conversion specifier {other}"
         ))),
@@ -520,12 +525,12 @@ fn format_field_value(
     positional: &[Value],
     keywords: &[(&str, Value)],
 ) -> Result<String, BuiltinError> {
-    let converted = apply_conversion(value, conversion)?;
+    let converted = apply_conversion(vm, value, conversion)?;
     let resolved_spec = render_format_spec(vm, format_spec, positional, keywords)?;
     let formatted = if resolved_spec.is_empty() {
-        builtin_format(&[converted])?
+        builtin_format_vm(vm, &[converted])?
     } else {
-        builtin_format(&[converted, owned_string_value(resolved_spec)])?
+        builtin_format_vm(vm, &[converted, owned_string_value(resolved_spec)])?
     };
     value_to_string(formatted, "formatted value")
 }

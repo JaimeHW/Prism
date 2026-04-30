@@ -250,7 +250,7 @@ impl BuiltinRegistry {
         // Register string utilities
         registry.register_function("ord", string::builtin_ord);
         registry.register_function("chr", string::builtin_chr);
-        registry.register_function("format", string::builtin_format);
+        registry.register_function_vm("format", string::builtin_format_vm);
 
         // Register introspection functions
         registry.register_function_vm("dir", introspect::builtin_dir_vm);
