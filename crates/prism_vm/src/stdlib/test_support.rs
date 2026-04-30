@@ -25,7 +25,7 @@ use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{SubclassBitmap, register_global_class};
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::int::bigint_to_value;
+use prism_runtime::types::int::{bigint_to_value, value_to_i64};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::value_as_string_ref;
 use std::path::Path;
@@ -106,6 +106,12 @@ static INFINITE_RECURSION_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyL
     BuiltinFunctionObject::new(
         Arc::from("test.support._InfiniteRecursion.__exit__"),
         infinite_recursion_exit,
+    )
+});
+static INFINITE_RECURSION_CALL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support._InfiniteRecursion.__call__"),
+        infinite_recursion_call,
     )
 });
 static SWAP_ITEM_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -490,6 +496,10 @@ fn build_infinite_recursion_class() -> Arc<PyClassObject> {
         intern("__exit__"),
         builtin_value(&INFINITE_RECURSION_EXIT_FUNCTION),
     );
+    class.set_attr(
+        intern("__call__"),
+        builtin_value(&INFINITE_RECURSION_CALL_FUNCTION),
+    );
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::NATIVE_HEAPTYPE);
 
     let class = Arc::new(class);
@@ -570,11 +580,30 @@ fn never_eq_hash(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 fn infinite_recursion(args: &[Value]) -> Result<Value, BuiltinError> {
-    if !args.is_empty() {
+    if args.len() > 1 {
         return Err(BuiltinError::TypeError(format!(
-            "infinite_recursion() takes no arguments ({} given)",
+            "infinite_recursion() takes from 0 to 1 positional arguments but {} were given",
             args.len()
         )));
+    }
+    if let Some(max_depth) = args.first().copied()
+        && !max_depth.is_none()
+    {
+        let depth = max_depth
+            .as_bool()
+            .map(i64::from)
+            .or_else(|| value_to_i64(max_depth))
+            .ok_or_else(|| {
+                BuiltinError::TypeError(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    max_depth.type_name()
+                ))
+            })?;
+        if depth < 3 {
+            return Err(BuiltinError::ValueError(format!(
+                "max_depth must be at least 3, got {depth}"
+            )));
+        }
     }
     Ok(*INFINITE_RECURSION_VALUE)
 }
@@ -597,6 +626,16 @@ fn infinite_recursion_exit(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     Ok(Value::bool(false))
+}
+
+fn infinite_recursion_call(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "__call__() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(args[1])
 }
 
 fn swap_item(args: &[Value]) -> Result<Value, BuiltinError> {
