@@ -15,7 +15,8 @@ use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::arithmetic::{add_values, mul_values, sub_values, true_div_values};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::{
-    bitwise_or_value, compare_order_result, contains_value, eq_result, ne_result,
+    bitwise_or_value, compare_order_value_result, contains_value, eq_result, eq_value_result,
+    ne_value_result,
 };
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
@@ -468,43 +469,35 @@ fn value_type_name(value: Value) -> &'static str {
 
 fn operator_lt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("lt", args, 2)?;
-    compare_order_result(vm, args[0], args[1], RichCompareOp::Lt)
-        .map(Value::bool)
+    compare_order_value_result(vm, args[0], args[1], RichCompareOp::Lt)
         .map_err(BuiltinError::Raised)
 }
 
 fn operator_le(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("le", args, 2)?;
-    compare_order_result(vm, args[0], args[1], RichCompareOp::Le)
-        .map(Value::bool)
+    compare_order_value_result(vm, args[0], args[1], RichCompareOp::Le)
         .map_err(BuiltinError::Raised)
 }
 
 fn operator_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("eq", args, 2)?;
-    eq_result(vm, args[0], args[1])
-        .map(Value::bool)
-        .map_err(BuiltinError::Raised)
+    eq_value_result(vm, args[0], args[1]).map_err(BuiltinError::Raised)
 }
 
 fn operator_ne(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("ne", args, 2)?;
-    ne_result(vm, args[0], args[1])
-        .map(Value::bool)
-        .map_err(BuiltinError::Raised)
+    ne_value_result(vm, args[0], args[1]).map_err(BuiltinError::Raised)
 }
 
 fn operator_gt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("gt", args, 2)?;
-    compare_order_result(vm, args[0], args[1], RichCompareOp::Gt)
-        .map(Value::bool)
+    compare_order_value_result(vm, args[0], args[1], RichCompareOp::Gt)
         .map_err(BuiltinError::Raised)
 }
 
 fn operator_ge(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     expect_arg_count("ge", args, 2)?;
-    compare_order_result(vm, args[0], args[1], RichCompareOp::Ge)
-        .map(Value::bool)
+    compare_order_value_result(vm, args[0], args[1], RichCompareOp::Ge)
         .map_err(BuiltinError::Raised)
 }
 

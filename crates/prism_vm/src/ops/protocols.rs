@@ -195,6 +195,20 @@ pub(crate) fn rich_compare_bool(
     right: Value,
     op: RichCompareOp,
 ) -> Result<Option<bool>, RuntimeError> {
+    let Some(result) = rich_compare_value(vm, left, right, op)? else {
+        return Ok(None);
+    };
+
+    crate::truthiness::try_is_truthy(vm, result).map(Some)
+}
+
+#[inline]
+pub(crate) fn rich_compare_value(
+    vm: &mut VirtualMachine,
+    left: Value,
+    right: Value,
+    op: RichCompareOp,
+) -> Result<Option<Value>, RuntimeError> {
     let left_type = value_type_id(left);
     let right_type = value_type_id(right);
     let prefer_right = is_proper_runtime_subtype(right_type, left_type);
@@ -228,12 +242,12 @@ pub(crate) fn rich_compare_bool(
 
     if let Some(result) = try_special_method_call(vm, first_receiver, first_method, first_operand)?
     {
-        return crate::truthiness::try_is_truthy(vm, result).map(Some);
+        return Ok(Some(result));
     }
     if let Some(result) =
         try_special_method_call(vm, second_receiver, second_method, second_operand)?
     {
-        return crate::truthiness::try_is_truthy(vm, result).map(Some);
+        return Ok(Some(result));
     }
 
     Ok(None)

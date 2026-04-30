@@ -2237,28 +2237,28 @@ impl Compiler {
                     self.emit_cmpop(ops[0], result_reg, left_reg, right_reg);
                     self.builder.free_register(right_reg);
                 } else {
-                    // Chained comparisons
-                    self.builder.emit_load_true(result_reg);
+                    // Chained comparisons preserve the raw comparison object
+                    // that determines the final short-circuit result.
+                    let end_label = self.builder.create_label();
                     let mut prev_reg = left_reg;
 
-                    for (op, comp) in ops.iter().zip(comparators.iter()) {
+                    for (index, (op, comp)) in ops.iter().zip(comparators.iter()).enumerate() {
                         let next_reg = self.compile_expr(comp)?;
-                        let cmp_reg = self.builder.alloc_register();
+                        self.emit_cmpop(*op, result_reg, prev_reg, next_reg);
 
-                        self.emit_cmpop(*op, cmp_reg, prev_reg, next_reg);
-
-                        // result = result and cmp
-                        self.builder
-                            .emit_bitwise_and(result_reg, result_reg, cmp_reg);
-
-                        self.builder.free_register(cmp_reg);
                         if prev_reg != left_reg {
                             self.builder.free_register(prev_reg);
                         }
-                        prev_reg = next_reg;
+
+                        if index + 1 == ops.len() {
+                            self.builder.free_register(next_reg);
+                        } else {
+                            self.builder.emit_jump_if_false(result_reg, end_label);
+                            prev_reg = next_reg;
+                        }
                     }
 
-                    self.builder.free_register(prev_reg);
+                    self.builder.bind_label(end_label);
                 }
 
                 self.builder.free_register(left_reg);

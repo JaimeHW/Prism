@@ -10,7 +10,7 @@ use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::ops::protocols::{
-    RichCompareOp, binary_special_method, rich_compare_bool, value_type_id,
+    RichCompareOp, binary_special_method, rich_compare_bool, rich_compare_value, value_type_id,
 };
 use crate::python_numeric::{
     complex_like_parts, float_like_value, int_like_value, is_complex_value,
@@ -25,7 +25,7 @@ use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::BoundMethod;
 use prism_runtime::object::mro::ClassId;
-use prism_runtime::object::type_builtins::global_class_bitmap;
+use prism_runtime::object::type_builtins::{global_class, global_class_bitmap};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{
     DictViewKind, DictViewObject, MappingProxyObject, MappingProxySource, UnionTypeObject,
@@ -739,6 +739,90 @@ pub(crate) fn eq_or_identical(
     eq_result(vm, left, right)
 }
 
+#[inline]
+pub(crate) fn eq_value_result(
+    vm: &mut VirtualMachine,
+    a: Value,
+    b: Value,
+) -> Result<Value, RuntimeError> {
+    let mut seen_pairs = FxHashSet::default();
+    eq_value_result_inner(vm, a, b, &mut seen_pairs)
+}
+
+fn eq_value_result_inner(
+    vm: &mut VirtualMachine,
+    a: Value,
+    b: Value,
+    seen_pairs: &mut FxHashSet<(usize, usize)>,
+) -> Result<Value, RuntimeError> {
+    if has_numeric_subtype_operand(a, b)
+        && let Some(result) = rich_compare_value(vm, a, b, RichCompareOp::Eq)?
+    {
+        return Ok(result);
+    }
+
+    if let Some(ordering) = compare_numeric_values(a, b) {
+        return Ok(Value::bool(ordering.is_eq()));
+    }
+
+    if is_numeric_value(a) && is_numeric_value(b) {
+        return Ok(Value::bool(false));
+    }
+
+    if let Some(equal) = string_values_equal(a, b) {
+        return Ok(Value::bool(equal));
+    }
+
+    if let Some(equal) = bytes_values_equal(a, b) {
+        return Ok(Value::bool(equal));
+    }
+
+    if exact_slice_ref(a).is_some() || exact_slice_ref(b).is_some() {
+        return slice_eq_result(vm, a, b, seen_pairs).map(Value::bool);
+    }
+
+    if exact_native_sequence_kind(a).is_some()
+        && exact_native_sequence_kind(a) == exact_native_sequence_kind(b)
+        && let Some(equal) = native_sequence_eq_result(vm, a, b, seen_pairs)?
+    {
+        return Ok(Value::bool(equal));
+    }
+
+    if let Some(equal) = dict_view_eq_result(vm, a, b, seen_pairs)? {
+        return Ok(Value::bool(equal));
+    }
+
+    if let Some(equal) = mapping_eq_result(vm, a, b, seen_pairs)? {
+        return Ok(Value::bool(equal));
+    }
+
+    if let (Some((left_ptr, left)), Some((right_ptr, right))) =
+        (exact_dict_operand(a), exact_dict_operand(b))
+    {
+        let pair = ordered_object_pair(left_ptr, right_ptr);
+        return with_active_compare_pair(seen_pairs, pair, |seen_pairs| {
+            dict_eq_result(vm, left, right, seen_pairs)
+        })
+        .map(Value::bool);
+    }
+
+    if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
+        return Ok(Value::bool(
+            left_set.len() == right_set.len() && left_set.is_subset(right_set),
+        ));
+    }
+
+    if let Some(result) = rich_compare_value(vm, a, b, RichCompareOp::Eq)? {
+        return Ok(result);
+    }
+
+    if let Some(equal) = native_sequence_eq_result(vm, a, b, seen_pairs)? {
+        return Ok(Value::bool(equal));
+    }
+
+    Ok(Value::bool(values_equal(a, b)))
+}
+
 fn eq_result_inner(
     vm: &mut VirtualMachine,
     a: Value,
@@ -900,6 +984,76 @@ pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<b
     }
 
     Ok(!values_equal(a, b))
+}
+
+pub(crate) fn ne_value_result(
+    vm: &mut VirtualMachine,
+    a: Value,
+    b: Value,
+) -> Result<Value, RuntimeError> {
+    if has_numeric_subtype_operand(a, b)
+        && let Some(result) = rich_compare_value(vm, a, b, RichCompareOp::Ne)?
+    {
+        return Ok(result);
+    }
+
+    if let Some(ordering) = compare_numeric_values(a, b) {
+        return Ok(Value::bool(!ordering.is_eq()));
+    }
+
+    if is_numeric_value(a) && is_numeric_value(b) {
+        return Ok(Value::bool(true));
+    }
+
+    if let Some(equal) = string_values_equal(a, b) {
+        return Ok(Value::bool(!equal));
+    }
+
+    if let Some(equal) = bytes_values_equal(a, b) {
+        return Ok(Value::bool(!equal));
+    }
+
+    let mut seen_pairs = FxHashSet::default();
+    if exact_native_sequence_kind(a).is_some()
+        && exact_native_sequence_kind(a) == exact_native_sequence_kind(b)
+        && let Some(equal) = native_sequence_eq_result(vm, a, b, &mut seen_pairs)?
+    {
+        return Ok(Value::bool(!equal));
+    }
+
+    if let Some(equal) = dict_view_eq_result(vm, a, b, &mut seen_pairs)? {
+        return Ok(Value::bool(!equal));
+    }
+
+    if let Some(equal) = mapping_eq_result(vm, a, b, &mut seen_pairs)? {
+        return Ok(Value::bool(!equal));
+    }
+
+    if let (Some((left_ptr, left)), Some((right_ptr, right))) =
+        (exact_dict_operand(a), exact_dict_operand(b))
+    {
+        let pair = ordered_object_pair(left_ptr, right_ptr);
+        return with_active_compare_pair(&mut seen_pairs, pair, |seen_pairs| {
+            dict_eq_result(vm, left, right, seen_pairs)
+        })
+        .map(|equal| Value::bool(!equal));
+    }
+
+    if let (Some((left_set, _)), Some((right_set, _))) = (set_operand(a), set_operand(b)) {
+        return Ok(Value::bool(
+            left_set.len() != right_set.len() || !left_set.is_subset(right_set),
+        ));
+    }
+
+    if let Some(result) = rich_compare_value(vm, a, b, RichCompareOp::Ne)? {
+        return Ok(result);
+    }
+
+    if let Some(equal) = native_sequence_eq_result(vm, a, b, &mut seen_pairs)? {
+        return Ok(Value::bool(!equal));
+    }
+
+    Ok(Value::bool(!values_equal(a, b)))
 }
 
 fn dict_view_eq_result(
@@ -1188,12 +1342,26 @@ fn compare_sequence_result(
     Ok(Some(result))
 }
 
-pub(crate) fn compare_order_result(
+fn comparison_type_name(value: Value) -> String {
+    if let Some(ptr) = value.as_object_ptr() {
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id.raw() >= TypeId::FIRST_USER_TYPE
+            && let Some(class) = global_class(ClassId(type_id.raw()))
+        {
+            return class.name().as_str().to_string();
+        }
+        return type_id.name().to_string();
+    }
+
+    value.type_name().to_string()
+}
+
+pub(crate) fn compare_order_value_result(
     vm: &mut VirtualMachine,
     a: Value,
     b: Value,
     op: RichCompareOp,
-) -> Result<bool, RuntimeError> {
+) -> Result<Value, RuntimeError> {
     debug_assert!(matches!(
         op,
         RichCompareOp::Lt | RichCompareOp::Le | RichCompareOp::Gt | RichCompareOp::Ge
@@ -1209,54 +1377,54 @@ pub(crate) fn compare_order_result(
     if let Some(relation) = set_relation
         && let Some(result) = compare_set_relation(a, b, relation)
     {
-        return Ok(result);
+        return Ok(Value::bool(result));
     }
     if let Some(relation) = set_relation
         && let Some(result) = compare_set_like_relation(vm, a, b, relation)?
     {
-        return Ok(result);
+        return Ok(Value::bool(result));
     }
 
     if let Some(ordering) = compare_string_values(a, b) {
-        return Ok(match op {
+        return Ok(Value::bool(match op {
             RichCompareOp::Lt => ordering.is_lt(),
             RichCompareOp::Le => !ordering.is_gt(),
             RichCompareOp::Gt => ordering.is_gt(),
             RichCompareOp::Ge => !ordering.is_lt(),
             RichCompareOp::Eq | RichCompareOp::Ne => unreachable!(),
-        });
+        }));
     }
 
     if let Some(ordering) = compare_bytes_values(a, b) {
-        return Ok(match op {
+        return Ok(Value::bool(match op {
             RichCompareOp::Lt => ordering.is_lt(),
             RichCompareOp::Le => !ordering.is_gt(),
             RichCompareOp::Gt => ordering.is_gt(),
             RichCompareOp::Ge => !ordering.is_lt(),
             RichCompareOp::Eq | RichCompareOp::Ne => unreachable!(),
-        });
+        }));
     }
 
     if let Some(ordering) = compare_numeric_values(a, b) {
-        return Ok(match op {
+        return Ok(Value::bool(match op {
             RichCompareOp::Lt => ordering.is_lt(),
             RichCompareOp::Le => !ordering.is_gt(),
             RichCompareOp::Gt => ordering.is_gt(),
             RichCompareOp::Ge => !ordering.is_lt(),
             RichCompareOp::Eq | RichCompareOp::Ne => unreachable!(),
-        });
+        }));
     }
 
     if is_numeric_value(a) && is_numeric_value(b) {
-        return Ok(false);
+        return Ok(Value::bool(false));
     }
 
-    if let Some(result) = rich_compare_bool(vm, a, b, op)? {
+    if let Some(result) = rich_compare_value(vm, a, b, op)? {
         return Ok(result);
     }
 
     if let Some(result) = compare_sequence_result(vm, a, b, op)? {
-        return Ok(result);
+        return Ok(Value::bool(result));
     }
 
     let op = match op {
@@ -1268,9 +1436,19 @@ pub(crate) fn compare_order_result(
     };
     Err(RuntimeError::type_error(format!(
         "'{op}' not supported between instances of '{}' and '{}'",
-        a.type_name(),
-        b.type_name()
+        comparison_type_name(a),
+        comparison_type_name(b)
     )))
+}
+
+pub(crate) fn compare_order_result(
+    vm: &mut VirtualMachine,
+    a: Value,
+    b: Value,
+    op: RichCompareOp,
+) -> Result<bool, RuntimeError> {
+    let result = compare_order_value_result(vm, a, b, op)?;
+    crate::truthiness::try_is_truthy(vm, result)
 }
 
 /// Return the ordering relation used by Python's stable sort operations.
@@ -1372,10 +1550,9 @@ pub fn lt(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match compare_order_result(vm, a, b, RichCompareOp::Lt) {
+    match compare_order_value_result(vm, a, b, RichCompareOp::Lt) {
         Ok(result) => {
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::bool(result));
+            vm.current_frame_mut().set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(err),
@@ -1434,10 +1611,9 @@ pub fn le(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match compare_order_result(vm, a, b, RichCompareOp::Le) {
+    match compare_order_value_result(vm, a, b, RichCompareOp::Le) {
         Ok(result) => {
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::bool(result));
+            vm.current_frame_mut().set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(err),
@@ -1496,10 +1672,9 @@ pub fn gt(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match compare_order_result(vm, a, b, RichCompareOp::Gt) {
+    match compare_order_value_result(vm, a, b, RichCompareOp::Gt) {
         Ok(result) => {
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::bool(result));
+            vm.current_frame_mut().set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(err),
@@ -1558,10 +1733,9 @@ pub fn ge(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match compare_order_result(vm, a, b, RichCompareOp::Ge) {
+    match compare_order_value_result(vm, a, b, RichCompareOp::Ge) {
         Ok(result) => {
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::bool(result));
+            vm.current_frame_mut().set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(err),
@@ -1631,10 +1805,9 @@ pub fn eq(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match eq_result(vm, a, b) {
+    match eq_value_result(vm, a, b) {
         Ok(result) => {
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::bool(result));
+            vm.current_frame_mut().set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(err),
@@ -1700,10 +1873,9 @@ pub fn ne(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         vm.speculation_cache.insert(site, spec);
     }
 
-    match ne_result(vm, a, b) {
+    match ne_value_result(vm, a, b) {
         Ok(result) => {
-            vm.current_frame_mut()
-                .set_reg(inst.dst().0, Value::bool(result));
+            vm.current_frame_mut().set_reg(inst.dst().0, result);
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(err),
