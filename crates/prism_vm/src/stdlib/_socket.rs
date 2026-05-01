@@ -14,6 +14,7 @@ use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
+use prism_runtime::object::descriptor::PropertyDescriptor;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
@@ -24,11 +25,13 @@ use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::value_as_string_ref;
-use prism_runtime::types::tuple::TupleObject;
+use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use rustc_hash::FxHashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 const MODULE_DOC: &str = "Native bootstrap implementation of the _socket module.";
 
@@ -44,7 +47,6 @@ const SOL_SOCKET_VALUE: i64 = 1;
 
 const EXPORTED_CONSTANTS: &[(&str, i64)] = &[
     ("AF_UNSPEC", 0),
-    ("AF_UNIX", 1),
     ("AF_INET", 2),
     ("SOCK_STREAM", 1),
     ("SOCK_DGRAM", 2),
@@ -85,10 +87,12 @@ const EXPORTED_CONSTANTS: &[(&str, i64)] = &[
     ("MSG_WAITALL", 8),
 ];
 
+const AF_INET_VALUE: i64 = 2;
+const SOCK_STREAM_VALUE: i64 = 1;
+
 const EXPORTED_NAMES: &[&str] = &[
     "AF_INET",
     "AF_INET6",
-    "AF_UNIX",
     "AF_UNSPEC",
     "AI_ADDRCONFIG",
     "AI_ALL",
@@ -161,16 +165,36 @@ const EXPORTED_NAMES: &[&str] = &[
 static SOCKET_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_socket_class);
 static DEFAULT_TIMEOUT: Mutex<Option<f64>> = Mutex::new(None);
 static NEXT_SOCKET_FD: AtomicI64 = AtomicI64::new(10_000);
+static SOCKET_STATES: LazyLock<Mutex<FxHashMap<i64, SocketState>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 static SOCKET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.__init__"), socket_init)
 });
+static SOCKET_FAMILY_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.family.fget"), socket_family_get)
+});
+static SOCKET_TYPE_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.type.fget"), socket_type_get)
+});
+static SOCKET_PROTO_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.proto.fget"), socket_proto_get)
+});
+static SOCKET_FAMILY_PROPERTY: LazyLock<PropertyDescriptor> =
+    LazyLock::new(|| PropertyDescriptor::new_getter(builtin_value(&SOCKET_FAMILY_GET_METHOD)));
+static SOCKET_TYPE_PROPERTY: LazyLock<PropertyDescriptor> =
+    LazyLock::new(|| PropertyDescriptor::new_getter(builtin_value(&SOCKET_TYPE_GET_METHOD)));
+static SOCKET_PROTO_PROPERTY: LazyLock<PropertyDescriptor> =
+    LazyLock::new(|| PropertyDescriptor::new_getter(builtin_value(&SOCKET_PROTO_GET_METHOD)));
 static SOCKET_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.close"), socket_close));
 static SOCKET_DETACH_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.detach"), socket_detach));
 static SOCKET_FILENO_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.fileno"), socket_fileno));
+static SOCKET_GETBLOCKING_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.getblocking"), socket_getblocking)
+});
 static SOCKET_GETTIMEOUT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_socket.socket.gettimeout"), socket_gettimeout)
 });
@@ -181,21 +205,42 @@ static SOCKET_SETBLOCKING_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::ne
     BuiltinFunctionObject::new(Arc::from("_socket.socket.setblocking"), socket_setblocking)
 });
 static SOCKET_BIND_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.bind"), socket_noop));
-static SOCKET_LISTEN_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.listen"), socket_noop));
-static SOCKET_CONNECT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.connect"), socket_noop));
-static SOCKET_CONNECT_EX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_socket.socket.connect_ex"), socket_connect_ex)
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.bind"), socket_bind));
+static SOCKET_LISTEN_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.listen"), socket_listen)
 });
-static SOCKET_SHUTDOWN_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.shutdown"), socket_noop));
+static SOCKET_CONNECT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.connect"), socket_connect)
+});
+static SOCKET_CONNECT_EX_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.connect_ex"), socket_connect_ex)
+});
+static SOCKET_ACCEPT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket._accept"), socket_accept)
+});
+static SOCKET_GETSOCKNAME_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.getsockname"), socket_getsockname)
+});
+static SOCKET_GETPEERNAME_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.getpeername"), socket_getpeername)
+});
+static SOCKET_DUP_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.dup"), socket_dup));
+static SOCKET_RECV_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.recv"), socket_recv));
+static SOCKET_SEND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.send"), socket_send));
+static SOCKET_SENDALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.sendall"), socket_sendall)
+});
+static SOCKET_SHUTDOWN_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("_socket.socket.shutdown"), socket_shutdown)
+});
 static SOCKET_SETSOCKOPT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_socket.socket.setsockopt"), socket_noop)
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.setsockopt"), socket_setsockopt)
 });
 static SOCKET_GETSOCKOPT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_socket.socket.getsockopt"), socket_getsockopt)
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.getsockopt"), socket_getsockopt)
 });
 
 static CMSG_LEN_FUNCTION: LazyLock<BuiltinFunctionObject> =
@@ -262,6 +307,116 @@ static SETDEFAULTTIMEOUT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::n
         socket_setdefaulttimeout,
     )
 });
+
+#[derive(Debug)]
+struct SocketState {
+    family: i64,
+    kind: i64,
+    proto: i64,
+    timeout: Option<f64>,
+    handle: SocketHandle,
+    bound_addr: Option<SocketAddr>,
+    options: FxHashMap<(i64, i64), i64>,
+}
+
+#[derive(Debug)]
+enum SocketHandle {
+    Empty,
+    Listener(TcpListener),
+    Stream(TcpStream),
+}
+
+impl SocketState {
+    fn new(family: i64, kind: i64, proto: i64, timeout: Option<f64>) -> Self {
+        Self {
+            family: normalize_family(family),
+            kind: normalize_socket_type(kind),
+            proto: normalize_proto(proto),
+            timeout,
+            handle: SocketHandle::Empty,
+            bound_addr: None,
+            options: FxHashMap::default(),
+        }
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        match &self.handle {
+            SocketHandle::Listener(listener) => listener.local_addr().ok(),
+            SocketHandle::Stream(stream) => stream.local_addr().ok(),
+            SocketHandle::Empty => self.bound_addr,
+        }
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        match &self.handle {
+            SocketHandle::Stream(stream) => stream.peer_addr().ok(),
+            SocketHandle::Listener(_) | SocketHandle::Empty => None,
+        }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<(), BuiltinError> {
+        match &self.handle {
+            SocketHandle::Listener(listener) => listener.set_nonblocking(nonblocking),
+            SocketHandle::Stream(stream) => stream.set_nonblocking(nonblocking),
+            SocketHandle::Empty => Ok(()),
+        }
+        .map_err(socket_io_error)
+    }
+
+    fn apply_timeout(&self) -> Result<(), BuiltinError> {
+        let read_write_timeout =
+            timeout_duration(self.timeout).filter(|duration| !duration.is_zero());
+        match &self.handle {
+            SocketHandle::Stream(stream) => {
+                stream
+                    .set_read_timeout(read_write_timeout)
+                    .map_err(socket_io_error)?;
+                stream
+                    .set_write_timeout(read_write_timeout)
+                    .map_err(socket_io_error)?;
+                stream
+                    .set_nonblocking(self.timeout == Some(0.0))
+                    .map_err(socket_io_error)
+            }
+            SocketHandle::Listener(listener) => listener
+                .set_nonblocking(self.timeout == Some(0.0))
+                .map_err(socket_io_error),
+            SocketHandle::Empty => Ok(()),
+        }
+    }
+
+    fn clone_state(&self) -> Result<Self, BuiltinError> {
+        let handle = match &self.handle {
+            SocketHandle::Empty => SocketHandle::Empty,
+            SocketHandle::Listener(listener) => {
+                SocketHandle::Listener(listener.try_clone().map_err(socket_io_error)?)
+            }
+            SocketHandle::Stream(stream) => {
+                SocketHandle::Stream(stream.try_clone().map_err(socket_io_error)?)
+            }
+        };
+        let clone = Self {
+            family: self.family,
+            kind: self.kind,
+            proto: self.proto,
+            timeout: self.timeout,
+            handle,
+            bound_addr: self.bound_addr,
+            options: self.options.clone(),
+        };
+        clone.apply_timeout()?;
+        Ok(clone)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SocketSnapshot {
+    fd: i64,
+    family: i64,
+    kind: i64,
+    proto: i64,
+    timeout: Option<f64>,
+}
 
 /// Native `_socket` module descriptor.
 pub struct SocketModule {
@@ -384,12 +539,21 @@ fn socket_class_value() -> Value {
     Value::object_ptr(Arc::as_ptr(&SOCKET_CLASS) as *const ())
 }
 
+#[inline]
+fn property_value(property: &'static LazyLock<PropertyDescriptor>) -> Value {
+    Value::object_ptr(&**property as *const PropertyDescriptor as *const ())
+}
+
 fn build_socket_class() -> Arc<PyClassObject> {
     let mut class = PyClassObject::new_simple(intern("socket"));
     class.set_attr(intern("__module__"), Value::string(intern("_socket")));
     class.set_attr(intern("__qualname__"), Value::string(intern("socket")));
     class.set_attr(intern("__doc__"), Value::string(intern("socket object")));
     class.set_attr(intern("__init__"), builtin_value(&SOCKET_INIT_METHOD));
+    class.set_attr(intern("family"), property_value(&SOCKET_FAMILY_PROPERTY));
+    class.set_attr(intern("type"), property_value(&SOCKET_TYPE_PROPERTY));
+    class.set_attr(intern("proto"), property_value(&SOCKET_PROTO_PROPERTY));
+    class.set_attr(intern("_accept"), builtin_value(&SOCKET_ACCEPT_METHOD));
     class.set_attr(intern("bind"), builtin_value(&SOCKET_BIND_METHOD));
     class.set_attr(intern("close"), builtin_value(&SOCKET_CLOSE_METHOD));
     class.set_attr(intern("connect"), builtin_value(&SOCKET_CONNECT_METHOD));
@@ -398,7 +562,20 @@ fn build_socket_class() -> Arc<PyClassObject> {
         builtin_value(&SOCKET_CONNECT_EX_METHOD),
     );
     class.set_attr(intern("detach"), builtin_value(&SOCKET_DETACH_METHOD));
+    class.set_attr(intern("dup"), builtin_value(&SOCKET_DUP_METHOD));
     class.set_attr(intern("fileno"), builtin_value(&SOCKET_FILENO_METHOD));
+    class.set_attr(
+        intern("getblocking"),
+        builtin_value(&SOCKET_GETBLOCKING_METHOD),
+    );
+    class.set_attr(
+        intern("getpeername"),
+        builtin_value(&SOCKET_GETPEERNAME_METHOD),
+    );
+    class.set_attr(
+        intern("getsockname"),
+        builtin_value(&SOCKET_GETSOCKNAME_METHOD),
+    );
     class.set_attr(
         intern("getsockopt"),
         builtin_value(&SOCKET_GETSOCKOPT_METHOD),
@@ -412,6 +589,9 @@ fn build_socket_class() -> Arc<PyClassObject> {
         intern("setblocking"),
         builtin_value(&SOCKET_SETBLOCKING_METHOD),
     );
+    class.set_attr(intern("recv"), builtin_value(&SOCKET_RECV_METHOD));
+    class.set_attr(intern("send"), builtin_value(&SOCKET_SEND_METHOD));
+    class.set_attr(intern("sendall"), builtin_value(&SOCKET_SENDALL_METHOD));
     class.set_attr(
         intern("setsockopt"),
         builtin_value(&SOCKET_SETSOCKOPT_METHOD),
@@ -466,32 +646,30 @@ fn socket_init(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
         _ => NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed),
     };
 
-    let object = shaped_socket_mut(args[0])?;
-    let registry = shape_registry();
-    object.set_property(intern("family"), Value::int(family).unwrap(), registry);
-    object.set_property(intern("type"), Value::int(kind).unwrap(), registry);
-    object.set_property(intern("proto"), Value::int(proto).unwrap(), registry);
-    object.set_property(
-        intern("__prism_socket_fd__"),
-        Value::int(fileno).unwrap(),
-        registry,
-    );
-    object.set_property(
-        intern("__prism_socket_closed__"),
-        Value::bool(false),
-        registry,
-    );
-    object.set_property(
-        intern("__prism_socket_timeout__"),
-        timeout_option_value(*DEFAULT_TIMEOUT.lock().unwrap()),
-        registry,
-    );
+    let snapshot = initialize_socket_state(fileno, family, kind, proto);
+    write_socket_snapshot(shaped_socket_mut(args[0])?, snapshot);
     Ok(Value::none())
+}
+
+fn socket_family_get(args: &[Value]) -> Result<Value, BuiltinError> {
+    socket_member_get(args, "family")
+}
+
+fn socket_type_get(args: &[Value]) -> Result<Value, BuiltinError> {
+    socket_member_get(args, "type")
+}
+
+fn socket_proto_get(args: &[Value]) -> Result<Value, BuiltinError> {
+    socket_member_get(args, "proto")
 }
 
 fn socket_close(args: &[Value]) -> Result<Value, BuiltinError> {
     exact_min_args(args, "close", 1)?;
     let object = shaped_socket_mut(args[0])?;
+    let fd = socket_fd(object);
+    if fd >= 0 {
+        SOCKET_STATES.lock().unwrap().remove(&fd);
+    }
     let registry = shape_registry();
     object.set_property(
         intern("__prism_socket_closed__"),
@@ -529,6 +707,12 @@ fn socket_fileno(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::int(socket_fd(shaped_socket_ref(args[0])?)).unwrap_or_else(Value::none))
 }
 
+fn socket_getblocking(args: &[Value]) -> Result<Value, BuiltinError> {
+    exact_min_args(args, "getblocking", 1)?;
+    let timeout = socket_timeout(shaped_socket_ref(args[0])?);
+    Ok(Value::bool(timeout != Some(0.0)))
+}
+
 fn socket_gettimeout(args: &[Value]) -> Result<Value, BuiltinError> {
     exact_min_args(args, "gettimeout", 1)?;
     Ok(shaped_socket_ref(args[0])?
@@ -544,7 +728,15 @@ fn socket_settimeout(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     let timeout = timeout_value(args[1])?;
-    shaped_socket_mut(args[0])?.set_property(
+    let object = shaped_socket_mut(args[0])?;
+    if let Some(fd) = open_socket_fd(object) {
+        let mut states = SOCKET_STATES.lock().unwrap();
+        if let Some(state) = states.get_mut(&fd) {
+            state.timeout = timeout;
+            state.apply_timeout()?;
+        }
+    }
+    object.set_property(
         intern("__prism_socket_timeout__"),
         timeout_option_value(timeout),
         shape_registry(),
@@ -560,7 +752,15 @@ fn socket_setblocking(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
     let timeout = if args[1].is_falsey() { Some(0.0) } else { None };
-    shaped_socket_mut(args[0])?.set_property(
+    let object = shaped_socket_mut(args[0])?;
+    if let Some(fd) = open_socket_fd(object) {
+        let mut states = SOCKET_STATES.lock().unwrap();
+        if let Some(state) = states.get_mut(&fd) {
+            state.timeout = timeout;
+            state.apply_timeout()?;
+        }
+    }
+    object.set_property(
         intern("__prism_socket_timeout__"),
         timeout_option_value(timeout),
         shape_registry(),
@@ -568,22 +768,315 @@ fn socket_setblocking(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::none())
 }
 
-fn socket_noop(args: &[Value]) -> Result<Value, BuiltinError> {
-    exact_min_args(args, "socket method", 1)?;
-    let _ = shaped_socket_ref(args[0])?;
+fn socket_connect_ex(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    match socket_connect(vm, args) {
+        Ok(_) => Ok(Value::int(0).unwrap()),
+        Err(_) => Ok(Value::int(1).unwrap()),
+    }
+}
+
+fn socket_getsockopt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 3 {
+        return Err(BuiltinError::TypeError(
+            "getsockopt() missing required argument".to_string(),
+        ));
+    }
+    let object = shaped_socket_ref(args[0])?;
+    let level = int_arg_vm(vm, args[1], "level")?;
+    let optname = int_arg_vm(vm, args[2], "optname")?;
+    let Some(fd) = open_socket_fd(object) else {
+        return Err(BuiltinError::OSError("Bad file descriptor".to_string()));
+    };
+    let states = SOCKET_STATES.lock().unwrap();
+    let Some(state) = states.get(&fd) else {
+        return Err(BuiltinError::OSError("Bad file descriptor".to_string()));
+    };
+    if level == 6
+        && optname == 1
+        && let SocketHandle::Stream(stream) = &state.handle
+        && let Ok(enabled) = stream.nodelay()
+    {
+        return Ok(Value::int(i64::from(enabled)).unwrap());
+    }
+    let value = state.options.get(&(level, optname)).copied().unwrap_or(0);
+    Ok(Value::int(value).unwrap())
+}
+
+fn socket_bind(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "bind() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let addr = sockaddr_arg(vm, args[1], socket_family(object))?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+
+    if state.kind == SOCK_STREAM_VALUE {
+        let listener = TcpListener::bind(addr).map_err(socket_io_error)?;
+        listener
+            .set_nonblocking(state.timeout == Some(0.0))
+            .map_err(socket_io_error)?;
+        state.bound_addr = listener.local_addr().ok();
+        state.handle = SocketHandle::Listener(listener);
+    } else {
+        state.bound_addr = Some(addr);
+    }
     Ok(Value::none())
 }
 
-fn socket_connect_ex(args: &[Value]) -> Result<Value, BuiltinError> {
-    exact_min_args(args, "connect_ex", 1)?;
-    let _ = shaped_socket_ref(args[0])?;
-    Ok(Value::int(0).unwrap())
+fn socket_listen(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() > 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "listen() takes at most one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    if let Some(backlog) = args.get(1).copied() {
+        let _ = int_arg_vm(vm, backlog, "backlog")?;
+    }
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    if matches!(state.handle, SocketHandle::Empty) && state.kind == SOCK_STREAM_VALUE {
+        let addr = default_bind_addr(state.family);
+        let listener = TcpListener::bind(addr).map_err(socket_io_error)?;
+        listener
+            .set_nonblocking(state.timeout == Some(0.0))
+            .map_err(socket_io_error)?;
+        state.bound_addr = listener.local_addr().ok();
+        state.handle = SocketHandle::Listener(listener);
+    }
+    Ok(Value::none())
 }
 
-fn socket_getsockopt(args: &[Value]) -> Result<Value, BuiltinError> {
-    exact_min_args(args, "getsockopt", 1)?;
-    let _ = shaped_socket_ref(args[0])?;
-    Ok(Value::int(0).unwrap())
+fn socket_connect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "connect() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let addr = sockaddr_arg(vm, args[1], socket_family(object))?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    if state.kind != SOCK_STREAM_VALUE {
+        state.bound_addr = Some(addr);
+        return Ok(Value::none());
+    }
+
+    let stream = connect_tcp_stream(addr, state.timeout)?;
+    apply_stream_options(&stream, state)?;
+    state.bound_addr = stream.local_addr().ok();
+    state.handle = SocketHandle::Stream(stream);
+    Ok(Value::none())
+}
+
+fn socket_accept(args: &[Value]) -> Result<Value, BuiltinError> {
+    exact_min_args(args, "_accept", 1)?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let SocketHandle::Listener(listener) = &state.handle else {
+        return Err(BuiltinError::OSError("socket is not listening".to_string()));
+    };
+    let family = state.family;
+    let kind = state.kind;
+    let proto = state.proto;
+    let timeout = state.timeout;
+
+    let (stream, peer) = listener.accept().map_err(socket_io_error)?;
+    stream
+        .set_nonblocking(timeout == Some(0.0))
+        .map_err(socket_io_error)?;
+    let accepted_fd = NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed);
+    let mut accepted = SocketState::new(family, kind, proto, timeout);
+    accepted.bound_addr = stream.local_addr().ok();
+    accepted.handle = SocketHandle::Stream(stream);
+    states.insert(accepted_fd, accepted);
+    Ok(tuple_value(vec![
+        Value::int(accepted_fd).unwrap(),
+        sockaddr_value(peer, family),
+    ]))
+}
+
+fn socket_getsockname(args: &[Value]) -> Result<Value, BuiltinError> {
+    exact_min_args(args, "getsockname", 1)?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let addr = state
+        .local_addr()
+        .unwrap_or_else(|| default_socket_addr(state.family));
+    Ok(sockaddr_value(addr, state.family))
+}
+
+fn socket_getpeername(args: &[Value]) -> Result<Value, BuiltinError> {
+    exact_min_args(args, "getpeername", 1)?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let addr = state
+        .peer_addr()
+        .ok_or_else(|| BuiltinError::OSError("socket is not connected".to_string()))?;
+    Ok(sockaddr_value(addr, state.family))
+}
+
+fn socket_dup(args: &[Value]) -> Result<Value, BuiltinError> {
+    exact_min_args(args, "dup", 1)?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let new_fd = NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed);
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let cloned = state.clone_state()?;
+    states.insert(new_fd, cloned);
+    Ok(Value::int(new_fd).unwrap())
+}
+
+fn socket_recv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "recv() takes 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    if let Some(flags) = args.get(2).copied() {
+        let _ = int_arg_vm(vm, flags, "flags")?;
+    }
+    let size = usize::try_from(int_arg_vm(vm, args[1], "bufsize")?)
+        .map_err(|_| BuiltinError::ValueError("negative buffersize in recv".to_string()))?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let SocketHandle::Stream(stream) = &mut state.handle else {
+        return Err(BuiltinError::OSError("socket is not connected".to_string()));
+    };
+    let mut buffer = vec![0_u8; size];
+    let read = stream.read(&mut buffer).map_err(socket_io_error)?;
+    buffer.truncate(read);
+    Ok(bytes_value(&buffer))
+}
+
+fn socket_send(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "send() takes 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let bytes = bytes_arg(args[1], "a bytes-like object is required")?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let SocketHandle::Stream(stream) = &mut state.handle else {
+        return Err(BuiltinError::OSError("socket is not connected".to_string()));
+    };
+    let written = stream.write(&bytes).map_err(socket_io_error)?;
+    Ok(Value::int(written as i64).unwrap())
+}
+
+fn socket_sendall(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "sendall() takes 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let bytes = bytes_arg(args[1], "a bytes-like object is required")?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    let SocketHandle::Stream(stream) = &mut state.handle else {
+        return Err(BuiltinError::OSError("socket is not connected".to_string()));
+    };
+    stream.write_all(&bytes).map_err(socket_io_error)?;
+    Ok(Value::none())
+}
+
+fn socket_shutdown(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "shutdown() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let how = match args[1].as_int().unwrap_or(2) {
+        0 => Shutdown::Read,
+        1 => Shutdown::Write,
+        _ => Shutdown::Both,
+    };
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    if let SocketHandle::Stream(stream) = &state.handle {
+        stream.shutdown(how).map_err(socket_io_error)?;
+    }
+    Ok(Value::none())
+}
+
+fn socket_setsockopt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 4 {
+        return Err(BuiltinError::TypeError(
+            "setsockopt() missing required argument".to_string(),
+        ));
+    }
+    let object = shaped_socket_ref(args[0])?;
+    let level = int_arg_vm(vm, args[1], "level")?;
+    let optname = int_arg_vm(vm, args[2], "optname")?;
+    let optvalue = if let Some(integer) = int_value_to_i64(args[3])? {
+        integer
+    } else {
+        1
+    };
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    state.options.insert((level, optname), optvalue);
+    if level == 6
+        && optname == 1
+        && let SocketHandle::Stream(stream) = &state.handle
+    {
+        stream.set_nodelay(optvalue != 0).map_err(socket_io_error)?;
+    }
+    Ok(Value::none())
 }
 
 fn socket_getdefaulttimeout(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -897,6 +1390,241 @@ fn cmsg_size(
         header + payload
     };
     Ok(Value::int(total as i64).expect("CMSG size should fit"))
+}
+
+fn initialize_socket_state(fileno: i64, family: i64, kind: i64, proto: i64) -> SocketSnapshot {
+    let default_timeout = *DEFAULT_TIMEOUT.lock().unwrap();
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .entry(fileno)
+        .or_insert_with(|| SocketState::new(family, kind, proto, default_timeout));
+    if family != -1 {
+        state.family = normalize_family(family);
+    }
+    if kind != -1 {
+        state.kind = normalize_socket_type(kind);
+    }
+    if proto != -1 {
+        state.proto = normalize_proto(proto);
+    }
+    if state.timeout.is_none() {
+        state.timeout = default_timeout;
+    }
+    SocketSnapshot {
+        fd: fileno,
+        family: state.family,
+        kind: state.kind,
+        proto: state.proto,
+        timeout: state.timeout,
+    }
+}
+
+fn write_socket_snapshot(object: &mut ShapedObject, snapshot: SocketSnapshot) {
+    let registry = shape_registry();
+    object.set_property(
+        intern("family"),
+        Value::int(snapshot.family).unwrap(),
+        registry,
+    );
+    object.set_property(intern("type"), Value::int(snapshot.kind).unwrap(), registry);
+    object.set_property(
+        intern("proto"),
+        Value::int(snapshot.proto).unwrap(),
+        registry,
+    );
+    object.set_property(
+        intern("__prism_socket_fd__"),
+        Value::int(snapshot.fd).unwrap(),
+        registry,
+    );
+    object.set_property(
+        intern("__prism_socket_closed__"),
+        Value::bool(false),
+        registry,
+    );
+    object.set_property(
+        intern("__prism_socket_timeout__"),
+        timeout_option_value(snapshot.timeout),
+        registry,
+    );
+}
+
+fn socket_member_get(args: &[Value], name: &str) -> Result<Value, BuiltinError> {
+    exact_min_args(args, name, 1)?;
+    let object = shaped_socket_ref(args[0])?;
+    if let Some(fd) = open_socket_fd(object)
+        && let Some(state) = SOCKET_STATES.lock().unwrap().get(&fd)
+    {
+        let value = match name {
+            "family" => state.family,
+            "type" => state.kind,
+            "proto" => state.proto,
+            _ => unreachable!("socket member getter is registered for known names"),
+        };
+        return Ok(Value::int(value).unwrap());
+    }
+    object
+        .get_property(name)
+        .ok_or_else(|| BuiltinError::AttributeError(format!("socket has no attribute '{name}'")))
+}
+
+fn socket_family(object: &ShapedObject) -> i64 {
+    object
+        .get_property("family")
+        .and_then(|value| value.as_int())
+        .unwrap_or(AF_INET_VALUE)
+}
+
+fn socket_timeout(object: &ShapedObject) -> Option<f64> {
+    object
+        .get_property("__prism_socket_timeout__")
+        .and_then(|value| {
+            if value.is_none() {
+                Some(None)
+            } else if let Some(float) = value.as_float() {
+                Some(Some(float))
+            } else {
+                value.as_int().map(|integer| Some(integer as f64))
+            }
+        })
+        .unwrap_or_else(|| *DEFAULT_TIMEOUT.lock().unwrap())
+}
+
+fn open_socket_fd(object: &ShapedObject) -> Option<i64> {
+    let fd = socket_fd(object);
+    (fd >= 0
+        && object
+            .get_property("__prism_socket_closed__")
+            .and_then(|value| value.as_bool())
+            != Some(true))
+    .then_some(fd)
+}
+
+fn require_open_socket_fd(object: &ShapedObject) -> Result<i64, BuiltinError> {
+    open_socket_fd(object).ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))
+}
+
+fn normalize_family(family: i64) -> i64 {
+    match family {
+        -1 | 0 => AF_INET_VALUE,
+        value => value,
+    }
+}
+
+fn normalize_socket_type(kind: i64) -> i64 {
+    match kind {
+        -1 | 0 => SOCK_STREAM_VALUE,
+        value => value,
+    }
+}
+
+fn normalize_proto(proto: i64) -> i64 {
+    match proto {
+        -1 => 0,
+        value => value,
+    }
+}
+
+fn timeout_duration(timeout: Option<f64>) -> Option<Duration> {
+    let timeout = timeout?;
+    if timeout <= 0.0 {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_secs_f64(timeout))
+}
+
+fn socket_io_error(err: std::io::Error) -> BuiltinError {
+    BuiltinError::OSError(err.to_string())
+}
+
+fn connect_tcp_stream(addr: SocketAddr, timeout: Option<f64>) -> Result<TcpStream, BuiltinError> {
+    match timeout_duration(timeout) {
+        Some(duration) if !duration.is_zero() => {
+            TcpStream::connect_timeout(&addr, duration).map_err(socket_io_error)
+        }
+        _ => TcpStream::connect(addr).map_err(socket_io_error),
+    }
+}
+
+fn apply_stream_options(stream: &TcpStream, state: &SocketState) -> Result<(), BuiltinError> {
+    if let Some(value) = state.options.get(&(6, 1)) {
+        stream.set_nodelay(*value != 0).map_err(socket_io_error)?;
+    }
+    stream
+        .set_nonblocking(state.timeout == Some(0.0))
+        .map_err(socket_io_error)?;
+    let duration = timeout_duration(state.timeout).filter(|duration| !duration.is_zero());
+    stream.set_read_timeout(duration).map_err(socket_io_error)?;
+    stream.set_write_timeout(duration).map_err(socket_io_error)
+}
+
+fn default_bind_addr(family: i64) -> SocketAddr {
+    if family == AF_INET6_VALUE {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    }
+}
+
+fn default_socket_addr(family: i64) -> SocketAddr {
+    if family == AF_INET6_VALUE {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    }
+}
+
+fn sockaddr_arg(
+    vm: &mut VirtualMachine,
+    value: Value,
+    family: i64,
+) -> Result<SocketAddr, BuiltinError> {
+    let tuple = value_as_tuple_ref(value)
+        .ok_or_else(|| BuiltinError::TypeError("socket address must be a tuple".to_string()))?;
+    if tuple.len() < 2 {
+        return Err(BuiltinError::TypeError(
+            "socket address must contain host and port".to_string(),
+        ));
+    }
+    let host_value = tuple.get(0).expect("length checked above");
+    let port_value = tuple.get(1).expect("length checked above");
+    let host = string_arg(host_value, "host")?;
+    let port = u16::try_from(port_number(vm, port_value)?)
+        .map_err(|_| BuiltinError::OverflowError("port must be 0-65535".to_string()))?;
+    let ip = if family == AF_INET6_VALUE {
+        IpAddr::V6(
+            resolve_host_to_ipv6(&host)
+                .parse::<Ipv6Addr>()
+                .map_err(|_| {
+                    BuiltinError::OSError("address family not supported by protocol".to_string())
+                })?,
+        )
+    } else {
+        IpAddr::V4(
+            resolve_host_to_ipv4(&host)
+                .parse::<Ipv4Addr>()
+                .map_err(|_| {
+                    BuiltinError::OSError("address family not supported by protocol".to_string())
+                })?,
+        )
+    };
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn sockaddr_value(addr: SocketAddr, family: i64) -> Value {
+    if family == AF_INET6_VALUE || addr.is_ipv6() {
+        tuple_value(vec![
+            Value::string(intern(&addr.ip().to_string())),
+            Value::int(i64::from(addr.port())).unwrap(),
+            Value::int(0).unwrap(),
+            Value::int(0).unwrap(),
+        ])
+    } else {
+        tuple_value(vec![
+            Value::string(intern(&addr.ip().to_string())),
+            Value::int(i64::from(addr.port())).unwrap(),
+        ])
+    }
 }
 
 #[inline]
