@@ -8,6 +8,7 @@
 //! - System limits and configuration
 
 mod argv;
+mod asyncgen_hooks;
 mod hooks;
 mod internals;
 mod limits;
@@ -16,6 +17,7 @@ mod runtime;
 mod streams;
 
 pub use argv::*;
+pub(crate) use asyncgen_hooks::{asyncgen_finalizer_hook, asyncgen_firstiter_hook};
 pub use hooks::*;
 pub use internals::*;
 pub use limits::*;
@@ -313,6 +315,8 @@ impl Module for SysModule {
             "settrace" => Ok(builtin_value(&SETTRACE_FUNCTION)),
             "getprofile" => Ok(builtin_value(&GETPROFILE_FUNCTION)),
             "setprofile" => Ok(builtin_value(&SETPROFILE_FUNCTION)),
+            "get_asyncgen_hooks" => Ok(asyncgen_hooks::get_asyncgen_hooks_function_value()),
+            "set_asyncgen_hooks" => Ok(asyncgen_hooks::set_asyncgen_hooks_function_value()),
             "getswitchinterval" => Ok(builtin_value(&GETSWITCHINTERVAL_FUNCTION)),
             "setswitchinterval" => Ok(builtin_value(&SETSWITCHINTERVAL_FUNCTION)),
             "_settraceallthreads" => Ok(builtin_value(&SETTRACE_ALL_THREADS_FUNCTION)),
@@ -430,6 +434,8 @@ impl Module for SysModule {
             Arc::from("settrace"),
             Arc::from("getprofile"),
             Arc::from("setprofile"),
+            Arc::from("get_asyncgen_hooks"),
+            Arc::from("set_asyncgen_hooks"),
             Arc::from("getswitchinterval"),
             Arc::from("setswitchinterval"),
             Arc::from("_settraceallthreads"),

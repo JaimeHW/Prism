@@ -2115,6 +2115,12 @@ pub(crate) fn get_attribute_value(
                         };
                         alloc_heap_value(vm, TupleObject::from_vec(items), "exception args tuple")
                     }
+                    "value"
+                        if exc.exception_type_id
+                            == ExceptionTypeId::StopIteration.as_u8() as u16 =>
+                    {
+                        Ok(exception_arg_or_none(exc, 0))
+                    }
                     "msg" => Ok(exc
                         .message()
                         .map(|message| Value::string(intern(message)))

@@ -20,11 +20,154 @@ impl VirtualMachine {
         self.resume_generator(generator, GeneratorResumeMode::Throw { exception, type_id })
     }
 
+    /// Drive a native async-generator helper operation (`asend`, `athrow`,
+    /// `aclose`) through its coroutine-compatible send protocol.
+    pub(crate) fn resume_async_generator_operation(
+        &mut self,
+        operation: &mut AsyncGeneratorOperationObject,
+        send_value: Value,
+    ) -> VmResult<AsyncGeneratorOperationOutcome> {
+        start_async_generator_operation(operation, send_value)?;
+
+        let result = match operation.kind() {
+            AsyncGeneratorOperationKind::ASend => self.resume_async_generator_asend(operation),
+            AsyncGeneratorOperationKind::AThrow => self.resume_async_generator_athrow(operation),
+            AsyncGeneratorOperationKind::AClose => self.resume_async_generator_close(operation),
+        };
+        operation.finish();
+        result
+    }
+
+    /// Drive an exception thrown into a native async-generator helper operation.
+    pub(crate) fn throw_async_generator_operation(
+        &mut self,
+        operation: &mut AsyncGeneratorOperationObject,
+        exception: Value,
+        type_id: u16,
+    ) -> VmResult<AsyncGeneratorOperationOutcome> {
+        operation
+            .try_start()
+            .map_err(async_generator_operation_start_error)?;
+
+        let result = self.with_operation_generator_mut(operation, |vm, generator| {
+            match vm.resume_generator_for_throw(generator, exception, type_id) {
+                Ok(GeneratorResumeOutcome::Yielded(value)) => {
+                    Ok(AsyncGeneratorOperationOutcome::Completed(value))
+                }
+                Ok(GeneratorResumeOutcome::Returned(_)) => Err(stop_async_iteration_error()),
+                Err(err) => Err(err),
+            }
+        });
+        operation.finish();
+        result
+    }
+
+    fn resume_async_generator_asend(
+        &mut self,
+        operation: &AsyncGeneratorOperationObject,
+    ) -> VmResult<AsyncGeneratorOperationOutcome> {
+        self.with_operation_generator_mut(operation, |vm, generator| {
+            match vm.resume_generator_for_send(generator, operation.send_value()) {
+                Ok(GeneratorResumeOutcome::Yielded(value)) => {
+                    Ok(AsyncGeneratorOperationOutcome::Completed(value))
+                }
+                Ok(GeneratorResumeOutcome::Returned(_)) => Err(stop_async_iteration_error()),
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    fn resume_async_generator_athrow(
+        &mut self,
+        operation: &AsyncGeneratorOperationObject,
+    ) -> VmResult<AsyncGeneratorOperationOutcome> {
+        self.with_operation_generator_mut(operation, |vm, generator| {
+            match vm.resume_generator_for_throw(
+                generator,
+                operation.exception(),
+                operation.exception_type_id(),
+            ) {
+                Ok(GeneratorResumeOutcome::Yielded(value)) => {
+                    Ok(AsyncGeneratorOperationOutcome::Completed(value))
+                }
+                Ok(GeneratorResumeOutcome::Returned(_)) => Err(stop_async_iteration_error()),
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    fn resume_async_generator_close(
+        &mut self,
+        operation: &AsyncGeneratorOperationObject,
+    ) -> VmResult<AsyncGeneratorOperationOutcome> {
+        self.with_operation_generator_mut(operation, |vm, generator| match generator.state() {
+            RuntimeGeneratorState::Created => {
+                let _ = generator.try_start();
+                generator.exhaust();
+                Ok(AsyncGeneratorOperationOutcome::Completed(Value::none()))
+            }
+            RuntimeGeneratorState::Exhausted => {
+                Ok(AsyncGeneratorOperationOutcome::Completed(Value::none()))
+            }
+            RuntimeGeneratorState::Running => Err(RuntimeError::value_error(
+                "async generator already executing",
+            )),
+            RuntimeGeneratorState::Suspended => match vm.resume_generator_for_throw(
+                generator,
+                operation.exception(),
+                operation.exception_type_id(),
+            ) {
+                Ok(GeneratorResumeOutcome::Yielded(_)) => {
+                    generator.exhaust();
+                    Err(async_generator_ignored_generator_exit_error())
+                }
+                Ok(GeneratorResumeOutcome::Returned(_)) => {
+                    Ok(AsyncGeneratorOperationOutcome::Completed(Value::none()))
+                }
+                Err(err)
+                    if runtime_error_is_exception_type(&err, ExceptionTypeId::GeneratorExit)
+                        || runtime_error_is_exception_type(
+                            &err,
+                            ExceptionTypeId::StopAsyncIteration,
+                        ) =>
+                {
+                    Ok(AsyncGeneratorOperationOutcome::Completed(Value::none()))
+                }
+                Err(err) => Err(err),
+            },
+        })
+    }
+
+    fn with_operation_generator_mut<T>(
+        &mut self,
+        operation: &AsyncGeneratorOperationObject,
+        f: impl FnOnce(&mut Self, &mut GeneratorObject) -> VmResult<T>,
+    ) -> VmResult<T> {
+        let generator =
+            GeneratorObject::from_value_mut(operation.generator()).ok_or_else(|| {
+                RuntimeError::internal("async generator operation lost its generator")
+            })?;
+
+        if !generator.is_async() {
+            return Err(RuntimeError::type_error(
+                "async generator operation target is not an async generator",
+            ));
+        }
+
+        f(self, generator)
+    }
+
     fn resume_generator(
         &mut self,
         generator: &mut GeneratorObject,
         mode: GeneratorResumeMode,
     ) -> VmResult<GeneratorResumeOutcome> {
+        if self.frames.is_empty() {
+            return Err(RuntimeError::internal(
+                "cannot resume generator without an active caller frame",
+            ));
+        }
+
         let prev_state = match mode {
             GeneratorResumeMode::Send(send_value) => {
                 let prev_state = match generator.try_start() {
@@ -71,10 +214,11 @@ impl VirtualMachine {
             },
         };
 
-        if self.frames.is_empty() {
-            return Err(RuntimeError::internal(
-                "cannot resume generator without an active caller frame",
-            ));
+        if prev_state == RuntimeGeneratorState::Created
+            && let Err(err) = self.initialize_async_generator_hooks(generator)
+        {
+            generator.reset_to_created();
+            return Err(err);
         }
 
         let caller_idx = self.current_frame_idx;
@@ -343,5 +487,87 @@ impl VirtualMachine {
                 "generator resume exited without outcome",
             )),
         }
+    }
+
+    fn initialize_async_generator_hooks(
+        &mut self,
+        generator: &mut GeneratorObject,
+    ) -> VmResult<()> {
+        if !generator.is_async() || generator.asyncgen_hooks_initialized() {
+            return Ok(());
+        }
+
+        generator.mark_asyncgen_hooks_initialized();
+        let generator_value = Value::object_ptr(generator as *mut GeneratorObject as *const ());
+        if let Some(finalizer) = crate::stdlib::sys::asyncgen_finalizer_hook() {
+            generator.set_asyncgen_finalizer(finalizer);
+            self.register_finalizer_candidate(generator_value);
+        }
+        if let Some(firstiter) = crate::stdlib::sys::asyncgen_firstiter_hook() {
+            crate::ops::calls::invoke_callable_value(self, firstiter, &[generator_value])?;
+        }
+
+        Ok(())
+    }
+}
+
+#[inline]
+fn start_async_generator_operation(
+    operation: &mut AsyncGeneratorOperationObject,
+    send_value: Value,
+) -> VmResult<()> {
+    operation
+        .try_start()
+        .map_err(async_generator_operation_start_error)?;
+
+    if !send_value.is_none() {
+        operation.finish();
+        return Err(RuntimeError::type_error(
+            "can't send non-None value to a just-started async generator operation",
+        ));
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn async_generator_operation_start_error(error: AsyncGeneratorOperationStartError) -> RuntimeError {
+    match error {
+        AsyncGeneratorOperationStartError::AlreadyRunning => {
+            RuntimeError::value_error("async generator operation already executing")
+        }
+        AsyncGeneratorOperationStartError::Closed => RuntimeError::exception(
+            ExceptionTypeId::RuntimeError.as_u8() as u16,
+            "cannot reuse already awaited async generator operation",
+        ),
+    }
+}
+
+#[inline]
+fn async_generator_ignored_generator_exit_error() -> RuntimeError {
+    RuntimeError::exception(
+        ExceptionTypeId::RuntimeError.as_u8() as u16,
+        "async generator ignored GeneratorExit",
+    )
+}
+
+#[inline]
+fn stop_async_iteration_error() -> RuntimeError {
+    let exception = crate::builtins::create_exception(ExceptionTypeId::StopAsyncIteration, None);
+    RuntimeError::raised_exception(
+        ExceptionTypeId::StopAsyncIteration.as_u8() as u16,
+        exception,
+        "",
+    )
+}
+
+#[inline]
+fn runtime_error_is_exception_type(error: &RuntimeError, exception_type: ExceptionTypeId) -> bool {
+    let expected = exception_type.as_u8() as u16;
+    match error.kind() {
+        RuntimeErrorKind::GeneratorExit => exception_type == ExceptionTypeId::GeneratorExit,
+        RuntimeErrorKind::StopIteration => exception_type == ExceptionTypeId::StopIteration,
+        RuntimeErrorKind::Exception { type_id, .. } => *type_id == expected,
+        _ => false,
     }
 }

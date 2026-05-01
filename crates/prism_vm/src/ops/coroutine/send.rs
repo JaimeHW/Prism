@@ -26,8 +26,10 @@ use crate::builtins::{create_exception, create_exception_with_args};
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
-use crate::stdlib::generators::{GeneratorObject, GeneratorState as RuntimeGeneratorState};
-use crate::vm::GeneratorResumeOutcome;
+use crate::stdlib::generators::{
+    AsyncGeneratorOperationObject, GeneratorObject, GeneratorState as RuntimeGeneratorState,
+};
+use crate::vm::{AsyncGeneratorOperationOutcome, GeneratorResumeOutcome};
 use prism_code::Instruction;
 use prism_core::Value;
 
@@ -53,6 +55,16 @@ pub fn send(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     // =========================================================================
 
     // Check if the object is a generator or coroutine
+    if let Some(operation) = AsyncGeneratorOperationObject::from_value_mut(generator) {
+        return match vm.resume_async_generator_operation(operation, value) {
+            Ok(AsyncGeneratorOperationOutcome::Completed(result)) => {
+                vm.current_frame_mut().set_reg(dst, result);
+                ControlFlow::Continue
+            }
+            Err(e) => ControlFlow::Error(e),
+        };
+    }
+
     match get_generator_state(&generator) {
         GeneratorState::NotAGenerator => {
             return ControlFlow::Error(RuntimeError::type_error(format!(

@@ -77,6 +77,8 @@ impl TypeId {
     pub const ENUMERATE: Self = Self(54);
     pub const COROUTINE: Self = Self(55);
     pub const ASYNC_GENERATOR: Self = Self(56);
+    pub const ASYNC_GENERATOR_ASEND: Self = Self(57);
+    pub const ASYNC_GENERATOR_ATHROW: Self = Self(58);
 
     /// First ID available for user-defined types.
     pub const FIRST_USER_TYPE: u32 = 256;
@@ -159,6 +161,8 @@ impl TypeId {
             54 => "enumerate",
             55 => "coroutine",
             56 => "async_generator",
+            57 => "async_generator_asend",
+            58 => "async_generator_athrow",
             _ => "<unknown>",
         }
     }

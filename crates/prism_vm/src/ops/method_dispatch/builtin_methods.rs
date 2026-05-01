@@ -9,9 +9,9 @@ use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, EXCEPTION_TYPE_ID, ExceptionTypeObject, ExceptionValue,
     builtin_hash, builtin_mapping_proxy_contains_key, builtin_mapping_proxy_entries_static,
     builtin_mapping_proxy_get_item_static, builtin_mapping_proxy_len,
-    builtin_not_implemented_value, create_exception_with_args, get_exception_type,
-    get_iterator_mut, iterator_to_value, runtime_error_to_builtin_error, try_length_hint,
-    value_to_iterator,
+    builtin_not_implemented_value, create_exception, create_exception_with_args,
+    get_exception_type, get_iterator_mut, iterator_to_value, runtime_error_to_builtin_error,
+    try_length_hint, value_to_iterator,
 };
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
@@ -41,9 +41,10 @@ use crate::python_numeric::{complex_like_parts, float_like_value};
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{
-    CloseResult, GeneratorObject, is_generator_storage_type_id, prepare_close,
+    AsyncGeneratorOperationObject, CloseResult, GeneratorObject, is_generator_storage_type_id,
+    prepare_close,
 };
-use crate::vm::GeneratorResumeOutcome;
+use crate::vm::{AsyncGeneratorOperationOutcome, GeneratorResumeOutcome};
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use prism_core::Value;
@@ -486,6 +487,69 @@ static GENERATOR_SEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("generator.send"), generator_send));
 static GENERATOR_THROW_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("generator.throw"), generator_throw));
+static ASYNC_GENERATOR_AITER_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("async_generator.__aiter__"),
+        async_generator_aiter,
+    )
+});
+static ASYNC_GENERATOR_ANEXT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("async_generator.__anext__"),
+        async_generator_anext,
+    )
+});
+static ASYNC_GENERATOR_ASEND_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("async_generator.asend"), async_generator_asend)
+});
+static ASYNC_GENERATOR_ATHROW_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("async_generator.athrow"), async_generator_athrow)
+});
+static ASYNC_GENERATOR_ACLOSE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("async_generator.aclose"), async_generator_aclose)
+});
+static ASYNC_GENERATOR_OPERATION_AWAIT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("async_generator_operation.__await__"),
+            async_generator_operation_await,
+        )
+    });
+static ASYNC_GENERATOR_OPERATION_ITER_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("async_generator_operation.__iter__"),
+            async_generator_operation_iter,
+        )
+    });
+static ASYNC_GENERATOR_OPERATION_NEXT_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_vm(
+            Arc::from("async_generator_operation.__next__"),
+            async_generator_operation_next,
+        )
+    });
+static ASYNC_GENERATOR_OPERATION_SEND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_vm(
+            Arc::from("async_generator_operation.send"),
+            async_generator_operation_send,
+        )
+    });
+static ASYNC_GENERATOR_OPERATION_THROW_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_vm(
+            Arc::from("async_generator_operation.throw"),
+            async_generator_operation_throw,
+        )
+    });
+static ASYNC_GENERATOR_OPERATION_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("async_generator_operation.close"),
+            async_generator_operation_close,
+        )
+    });
 static FUNCTION_GET_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("function.__get__"), function_get));
 static CLASSMETHOD_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -1203,7 +1267,28 @@ pub fn resolve_iterator_method(name: &str) -> Option<CachedMethod> {
 }
 
 /// Resolve builtin generator methods backed by static builtin function objects.
-pub fn resolve_generator_method(name: &str) -> Option<CachedMethod> {
+pub fn resolve_generator_method(type_id: TypeId, name: &str) -> Option<CachedMethod> {
+    if type_id == TypeId::ASYNC_GENERATOR {
+        return match name {
+            "__aiter__" => Some(CachedMethod::simple(builtin_method_value(
+                &ASYNC_GENERATOR_AITER_METHOD,
+            ))),
+            "__anext__" => Some(CachedMethod::simple(builtin_method_value(
+                &ASYNC_GENERATOR_ANEXT_METHOD,
+            ))),
+            "asend" => Some(CachedMethod::simple(builtin_method_value(
+                &ASYNC_GENERATOR_ASEND_METHOD,
+            ))),
+            "athrow" => Some(CachedMethod::simple(builtin_method_value(
+                &ASYNC_GENERATOR_ATHROW_METHOD,
+            ))),
+            "aclose" => Some(CachedMethod::simple(builtin_method_value(
+                &ASYNC_GENERATOR_ACLOSE_METHOD,
+            ))),
+            _ => None,
+        };
+    }
+
     match name {
         "close" => Some(CachedMethod::simple(builtin_method_value(
             &GENERATOR_CLOSE_METHOD,
@@ -1213,6 +1298,34 @@ pub fn resolve_generator_method(name: &str) -> Option<CachedMethod> {
         ))),
         "throw" => Some(CachedMethod::simple(builtin_method_value(
             &GENERATOR_THROW_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+/// Resolve builtin async-generator operation methods.
+pub fn resolve_async_generator_operation_method(
+    _type_id: TypeId,
+    name: &str,
+) -> Option<CachedMethod> {
+    match name {
+        "__await__" => Some(CachedMethod::simple(builtin_method_value(
+            &ASYNC_GENERATOR_OPERATION_AWAIT_METHOD,
+        ))),
+        "__iter__" => Some(CachedMethod::simple(builtin_method_value(
+            &ASYNC_GENERATOR_OPERATION_ITER_METHOD,
+        ))),
+        "__next__" => Some(CachedMethod::simple(builtin_method_value(
+            &ASYNC_GENERATOR_OPERATION_NEXT_METHOD,
+        ))),
+        "send" => Some(CachedMethod::simple(builtin_method_value(
+            &ASYNC_GENERATOR_OPERATION_SEND_METHOD,
+        ))),
+        "throw" => Some(CachedMethod::simple(builtin_method_value(
+            &ASYNC_GENERATOR_OPERATION_THROW_METHOD,
+        ))),
+        "close" => Some(CachedMethod::simple(builtin_method_value(
+            &ASYNC_GENERATOR_OPERATION_CLOSE_METHOD,
         ))),
         _ => None,
     }
@@ -4410,6 +4523,127 @@ fn generator_throw(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
 }
 
 #[inline]
+fn async_generator_aiter(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator", "__aiter__", args, 0)?;
+    expect_async_generator(args[0], "__aiter__")?;
+    Ok(args[0])
+}
+
+#[inline]
+fn async_generator_anext(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator", "__anext__", args, 0)?;
+    expect_async_generator(args[0], "__anext__")?;
+    Ok(crate::alloc_managed_value(
+        AsyncGeneratorOperationObject::new_asend(args[0], Value::none()),
+    ))
+}
+
+#[inline]
+fn async_generator_asend(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator", "asend", args, 1)?;
+    expect_async_generator(args[0], "asend")?;
+    Ok(crate::alloc_managed_value(
+        AsyncGeneratorOperationObject::new_asend(args[0], args[1]),
+    ))
+}
+
+#[inline]
+fn async_generator_athrow(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("async_generator", "athrow", args, 1, 3)?;
+    expect_async_generator(args[0], "athrow")?;
+    let (exception, type_id) = normalize_generator_throw_arguments(vm, &args[1..])?;
+    Ok(crate::alloc_managed_value(
+        AsyncGeneratorOperationObject::new_athrow(args[0], exception, type_id),
+    ))
+}
+
+#[inline]
+fn async_generator_aclose(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator", "aclose", args, 0)?;
+    expect_async_generator(args[0], "aclose")?;
+    let exception = create_exception(ExceptionTypeId::GeneratorExit, None);
+    Ok(crate::alloc_managed_value(
+        AsyncGeneratorOperationObject::new_aclose(
+            args[0],
+            exception,
+            ExceptionTypeId::GeneratorExit.as_u8() as u16,
+        ),
+    ))
+}
+
+#[inline]
+fn async_generator_operation_await(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator_operation", "__await__", args, 0)?;
+    expect_async_generator_operation(args[0], "__await__")?;
+    Ok(args[0])
+}
+
+#[inline]
+fn async_generator_operation_iter(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator_operation", "__iter__", args, 0)?;
+    expect_async_generator_operation(args[0], "__iter__")?;
+    Ok(args[0])
+}
+
+#[inline]
+fn async_generator_operation_next(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator_operation", "__next__", args, 0)?;
+    let operation = expect_async_generator_operation_mut(args[0], "__next__")?;
+    resume_async_generator_operation_as_iterator(vm, operation, Value::none())
+}
+
+#[inline]
+fn async_generator_operation_send(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator_operation", "send", args, 1)?;
+    let operation = expect_async_generator_operation_mut(args[0], "send")?;
+    resume_async_generator_operation_as_iterator(vm, operation, args[1])
+}
+
+#[inline]
+fn resume_async_generator_operation_as_iterator(
+    vm: &mut VirtualMachine,
+    operation: &mut AsyncGeneratorOperationObject,
+    send_value: Value,
+) -> Result<Value, BuiltinError> {
+    match vm.resume_async_generator_operation(operation, send_value) {
+        Ok(AsyncGeneratorOperationOutcome::Completed(value)) => {
+            Err(BuiltinError::Raised(stop_iteration_runtime_error(value)))
+        }
+        Err(err) => Err(BuiltinError::Raised(err)),
+    }
+}
+
+#[inline]
+fn async_generator_operation_throw(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    expect_method_arg_range("async_generator_operation", "throw", args, 1, 3)?;
+    let (exception, type_id) = normalize_generator_throw_arguments(vm, &args[1..])?;
+    let operation = expect_async_generator_operation_mut(args[0], "throw")?;
+    match vm.throw_async_generator_operation(operation, exception, type_id) {
+        Ok(AsyncGeneratorOperationOutcome::Completed(value)) => {
+            Err(BuiltinError::Raised(stop_iteration_runtime_error(value)))
+        }
+        Err(err) => Err(BuiltinError::Raised(err)),
+    }
+}
+
+#[inline]
+fn async_generator_operation_close(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("async_generator_operation", "close", args, 0)?;
+    let operation = expect_async_generator_operation_mut(args[0], "close")?;
+    operation.finish();
+    Ok(Value::none())
+}
+
+#[inline]
 fn property_getter(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_method_arg_count("property", "getter", args, 1)?;
     property_copy(args[0], "getter", Some(args[1]), None, None)
@@ -4460,6 +4694,55 @@ fn expect_generator_mut(
     }
 
     Ok(unsafe { &mut *(ptr as *mut GeneratorObject) })
+}
+
+#[inline]
+fn expect_async_generator(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static GeneratorObject, BuiltinError> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'async_generator.{method_name}' requires an 'async_generator' object but received '{}'",
+            value.type_name()
+        )));
+    };
+
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.type_id != TypeId::ASYNC_GENERATOR {
+        return Err(BuiltinError::TypeError(format!(
+            "descriptor 'async_generator.{method_name}' requires an 'async_generator' object but received '{}'",
+            header.type_id.name()
+        )));
+    }
+
+    Ok(unsafe { &*(ptr as *const GeneratorObject) })
+}
+
+#[inline]
+fn expect_async_generator_operation(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static AsyncGeneratorOperationObject, BuiltinError> {
+    AsyncGeneratorOperationObject::from_value(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor 'async_generator_operation.{method_name}' requires an async generator operation object but received '{}'",
+            value.type_name()
+        ))
+    })
+}
+
+#[inline]
+fn expect_async_generator_operation_mut(
+    value: Value,
+    method_name: &'static str,
+) -> Result<&'static mut AsyncGeneratorOperationObject, BuiltinError> {
+    AsyncGeneratorOperationObject::from_value_mut(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "descriptor 'async_generator_operation.{method_name}' requires an async generator operation object but received '{}'",
+            value.type_name()
+        ))
+    })
 }
 
 #[inline]

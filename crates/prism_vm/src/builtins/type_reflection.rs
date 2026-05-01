@@ -616,7 +616,16 @@ const SLICE_METHOD_NAMES: &[&str] = &["__hash__", "indices"];
 const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
 const COROUTINE_METHOD_NAMES: &[&str] = &["close", "send", "throw"];
-const ASYNC_GENERATOR_METHOD_NAMES: &[&str] = &["close", "throw"];
+const ASYNC_GENERATOR_METHOD_NAMES: &[&str] =
+    &["__aiter__", "__anext__", "asend", "athrow", "aclose"];
+const ASYNC_GENERATOR_OPERATION_METHOD_NAMES: &[&str] = &[
+    "__await__",
+    "__iter__",
+    "__next__",
+    "close",
+    "send",
+    "throw",
+];
 const PROPERTY_METHOD_NAMES: &[&str] = &[
     "__get__",
     "__set__",
@@ -697,6 +706,9 @@ fn builtin_reflected_method_names(type_id: TypeId) -> &'static [&'static str] {
         TypeId::GENERATOR => GENERATOR_METHOD_NAMES,
         TypeId::COROUTINE => COROUTINE_METHOD_NAMES,
         TypeId::ASYNC_GENERATOR => ASYNC_GENERATOR_METHOD_NAMES,
+        TypeId::ASYNC_GENERATOR_ASEND | TypeId::ASYNC_GENERATOR_ATHROW => {
+            ASYNC_GENERATOR_OPERATION_METHOD_NAMES
+        }
         TypeId::PROPERTY => PROPERTY_METHOD_NAMES,
         TypeId::REGEX_PATTERN => REGEX_PATTERN_METHOD_NAMES,
         TypeId::REGEX_MATCH => REGEX_MATCH_METHOD_NAMES,
@@ -769,14 +781,10 @@ fn alloc_view<T>(
     context: &'static str,
 ) -> Result<Value, RuntimeError>
 where
-    T: prism_runtime::Trace,
+    T: prism_runtime::Trace + 'static,
 {
-    vm.allocator()
-        .alloc(object)
-        .map(|ptr| Value::object_ptr(ptr as *const ()))
-        .ok_or_else(|| {
-            RuntimeError::internal(format!("out of memory: failed to allocate {context}"))
-        })
+    let _ = (vm, context);
+    Ok(crate::alloc_managed_value(object))
 }
 
 #[inline]

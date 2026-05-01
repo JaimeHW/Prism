@@ -31,6 +31,7 @@ use crate::stdlib::_codecs::{SharedCodecRegistry, new_shared_codec_registry};
 use crate::stdlib::_thread::{SharedThreadGroup, new_thread_group};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{
+    AsyncGeneratorOperationKind, AsyncGeneratorOperationObject, AsyncGeneratorOperationStartError,
     GeneratorObject, GeneratorState as RuntimeGeneratorState, LivenessMap,
 };
 use prism_code::{CodeFlags, CodeObject, Instruction, LineTableEntry, Opcode};
@@ -134,6 +135,13 @@ pub(crate) enum GeneratorResumeOutcome {
     Yielded(Value),
     /// Generator returned and is exhausted.
     Returned(Value),
+}
+
+/// Result of driving an async-generator helper awaitable to completion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AsyncGeneratorOperationOutcome {
+    /// The helper operation completed and produced an await result.
+    Completed(Value),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3010,6 +3018,16 @@ impl VirtualMachine {
     }
 
     fn invoke_python_finalizer(&mut self, value: Value) {
+        if let Some(generator) = GeneratorObject::from_value(value)
+            && generator.is_async()
+            && let Some(finalizer) = generator.asyncgen_finalizer()
+        {
+            if crate::ops::calls::invoke_callable_value(self, finalizer, &[value]).is_err() {
+                self.clear_active_exception();
+            }
+            return;
+        }
+
         let finalizer_name = intern("__del__");
         let finalizer = match crate::ops::objects::get_attribute_value(self, value, &finalizer_name)
         {

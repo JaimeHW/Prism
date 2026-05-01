@@ -58,7 +58,10 @@ pub(crate) fn resolve_builtin_instance_method(type_id: TypeId, name: &str) -> Op
         TypeId::STR => builtin_methods::resolve_str_method(name),
         TypeId::SET | TypeId::FROZENSET => builtin_methods::resolve_set_method(type_id, name),
         TypeId::GENERATOR | TypeId::COROUTINE | TypeId::ASYNC_GENERATOR => {
-            builtin_methods::resolve_generator_method(name)
+            builtin_methods::resolve_generator_method(type_id, name)
+        }
+        TypeId::ASYNC_GENERATOR_ASEND | TypeId::ASYNC_GENERATOR_ATHROW => {
+            builtin_methods::resolve_async_generator_operation_method(type_id, name)
         }
         TypeId::FUNCTION | TypeId::CLOSURE => builtin_methods::resolve_function_method(name),
         TypeId::CLASSMETHOD => builtin_methods::resolve_classmethod_method(name),

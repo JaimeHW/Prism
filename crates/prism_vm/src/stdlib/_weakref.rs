@@ -6,7 +6,8 @@
 
 use super::{Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
-use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
+use crate::ops::comparison::eq_result;
 use crate::stdlib::collections::deque::DequeObject;
 use prism_code::CodeFlags;
 use prism_core::Value;
@@ -61,6 +62,12 @@ static REF_INIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
 });
 static REF_CALL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_weakref.ReferenceType.__call__"), reference_call)
+});
+static REF_HASH_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_weakref.ReferenceType.__hash__"), reference_hash)
+});
+static REF_EQ_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_weakref.ReferenceType.__eq__"), reference_eq)
 });
 static REFERENCE_TYPE_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_reference_type("ReferenceType"));
@@ -171,6 +178,8 @@ fn build_reference_type(name: &str) -> Arc<PyClassObject> {
     class.set_attr(intern("__new__"), builtin_value(&REF_NEW_FUNCTION));
     class.set_attr(intern("__init__"), builtin_value(&REF_INIT_FUNCTION));
     class.set_attr(intern("__call__"), builtin_value(&REF_CALL_FUNCTION));
+    class.set_attr(intern("__hash__"), builtin_value(&REF_HASH_FUNCTION));
+    class.set_attr(intern("__eq__"), builtin_value(&REF_EQ_FUNCTION));
     class.add_flags(
         ClassFlags::INITIALIZED
             | ClassFlags::HAS_NEW
@@ -261,12 +270,16 @@ fn reference_self(args: &[Value], fn_name: &str) -> Result<*mut ShapedObject, Bu
     Ok(self_ptr as *mut ShapedObject)
 }
 
-fn reference_target_property() -> prism_core::intern::InternedString {
+pub(crate) fn reference_target_property() -> prism_core::intern::InternedString {
     intern("__weakref_target__")
 }
 
 fn reference_callback_property() -> prism_core::intern::InternedString {
     intern("__weakref_callback__")
+}
+
+fn reference_hash_property() -> prism_core::intern::InternedString {
+    intern("__weakref_hash__")
 }
 
 fn register_weakref(reference: Value) {
@@ -312,13 +325,13 @@ pub(crate) fn clear_unreachable_weakrefs(vm: &VirtualMachine) {
         });
     }
 
-    super::weakref::clear_unreachable_weak_dicts(&reachable);
+    super::weakref::clear_unreachable_weak_containers(&reachable);
 }
 
 pub(crate) fn clear_unreachable_weakrefs_if_registered(vm: &VirtualMachine) {
     let has_registered_weak_state = {
         let weakrefs = WEAKREFS.lock().expect("weakref registry lock poisoned");
-        !weakrefs.is_empty() || super::weakref::has_registered_weak_dicts()
+        !weakrefs.is_empty() || super::weakref::has_registered_weak_containers()
     };
 
     if has_registered_weak_state {
@@ -537,6 +550,11 @@ impl ReachabilityMarker {
                 self.push(*item);
             }
         }
+        if let Some(set) = object.set_backing() {
+            for item in set.iter() {
+                self.push(item);
+            }
+        }
     }
 
     fn push_weak_key_dict_entries(&mut self, dict: &DictObject) {
@@ -612,7 +630,7 @@ fn is_shaped_object(value: Value, type_id: TypeId) -> bool {
     type_id.raw() >= TypeId::FIRST_USER_TYPE && global_class(ClassId(type_id.raw())).is_some()
 }
 
-fn is_reference_type_id(type_id: TypeId) -> bool {
+pub(crate) fn is_reference_type_id(type_id: TypeId) -> bool {
     let reference_type_id = REFERENCE_TYPE_CLASS.class_type_id();
     if type_id == reference_type_id {
         return true;
@@ -631,6 +649,26 @@ pub(crate) fn is_reference_value(value: Value) -> bool {
     };
     let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
     is_reference_type_id(type_id)
+}
+
+pub(crate) fn new_reference(target: Value, callback: Option<Value>) -> Result<Value, BuiltinError> {
+    expect_object_arg(&[target], "ref")?;
+    allocate_reference(
+        &REFERENCE_TYPE_CLASS,
+        target,
+        callback.unwrap_or_else(Value::none),
+    )
+}
+
+pub(crate) fn reference_target(reference: Value) -> Option<Value> {
+    let ptr = aligned_object_ptr(reference)?;
+    let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+    if !is_reference_type_id(type_id) {
+        return None;
+    }
+
+    let object = unsafe { &*(ptr as *const ShapedObject) };
+    object.get_property(reference_target_property().as_ref())
 }
 
 fn reference_new(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -665,18 +703,11 @@ fn reference_new(args: &[Value]) -> Result<Value, BuiltinError> {
         ));
     }
 
-    let registry = shape_registry();
-    let mut object = ShapedObject::new(class.class_type_id(), Arc::clone(class.instance_shape()));
-    object.set_property(reference_target_property(), args[1], registry);
-    object.set_property(
-        reference_callback_property(),
+    allocate_reference(
+        class,
+        args[1],
         args.get(2).copied().unwrap_or_else(Value::none),
-        registry,
-    );
-
-    let reference = leak_object_value(object);
-    register_weakref(reference);
-    Ok(reference)
+    )
 }
 
 fn reference_init(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -696,6 +727,7 @@ fn reference_init(args: &[Value]) -> Result<Value, BuiltinError> {
         args.get(2).copied().unwrap_or_else(Value::none),
         registry,
     );
+    object.set_property(reference_hash_property(), Value::none(), registry);
     register_weakref(args[0]);
     Ok(Value::none())
 }
@@ -713,6 +745,88 @@ fn reference_call(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(object
         .get_property(reference_target_property().as_ref())
         .unwrap_or_else(Value::none))
+}
+
+fn reference_hash(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "__hash__() takes 1 positional argument but {} were given",
+            args.len()
+        )));
+    }
+
+    let self_ptr = reference_self(args, "__hash__")?;
+    let hash_name = reference_hash_property();
+    let target_name = reference_target_property();
+    let cached = {
+        let object = unsafe { &*self_ptr };
+        object
+            .get_property(hash_name.as_ref())
+            .unwrap_or_else(Value::none)
+    };
+    if !cached.is_none() {
+        return Ok(cached);
+    }
+
+    let target = {
+        let object = unsafe { &*self_ptr };
+        object
+            .get_property(target_name.as_ref())
+            .unwrap_or_else(Value::none)
+    };
+    if target.is_none() {
+        return Err(BuiltinError::TypeError(
+            "weak object has gone away".to_string(),
+        ));
+    }
+
+    let hash = crate::builtins::builtin_hash_vm(vm, &[target])?;
+    let registry = shape_registry();
+    let object = unsafe { &mut *self_ptr };
+    object.set_property(hash_name, hash, registry);
+    Ok(hash)
+}
+
+fn reference_eq(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "__eq__() takes 2 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    if args[0].raw_bits() == args[1].raw_bits() {
+        return Ok(Value::bool(true));
+    }
+    if !is_reference_value(args[1]) {
+        return Ok(Value::bool(false));
+    }
+
+    let left = reference_target(args[0]).unwrap_or_else(Value::none);
+    let right = reference_target(args[1]).unwrap_or_else(Value::none);
+    if left.is_none() || right.is_none() {
+        return Ok(Value::bool(false));
+    }
+
+    Ok(Value::bool(
+        eq_result(vm, left, right).map_err(runtime_error_to_builtin_error)?,
+    ))
+}
+
+fn allocate_reference(
+    class: &PyClassObject,
+    target: Value,
+    callback: Value,
+) -> Result<Value, BuiltinError> {
+    let registry = shape_registry();
+    let mut object = ShapedObject::new(class.class_type_id(), Arc::clone(class.instance_shape()));
+    object.set_property(reference_target_property(), target, registry);
+    object.set_property(reference_callback_property(), callback, registry);
+    object.set_property(reference_hash_property(), Value::none(), registry);
+
+    let reference = leak_object_value(object);
+    register_weakref(reference);
+    Ok(reference)
 }
 
 pub(crate) fn builtin_proxy(args: &[Value]) -> Result<Value, BuiltinError> {

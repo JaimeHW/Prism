@@ -42,6 +42,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 static NEXT_THREAD_IDENT: AtomicU64 = AtomicU64::new(1);
+static MAIN_THREAD_IDENT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_THREAD_COUNT: AtomicU64 = AtomicU64::new(1);
 static NEXT_INTERRUPT_TARGET: AtomicU64 = AtomicU64::new(1);
 static PENDING_MAIN_INTERRUPTS: LazyLock<Mutex<FxHashMap<u64, i64>>> =
@@ -230,6 +231,15 @@ pub(crate) fn active_thread_count() -> u64 {
     ACTIVE_THREAD_COUNT.load(Ordering::SeqCst)
 }
 
+pub(crate) fn active_thread_idents() -> Vec<u64> {
+    ACTIVE_THREAD_IDENTS
+        .lock()
+        .expect("active thread registry lock poisoned")
+        .iter()
+        .copied()
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct NativeLockState {
     locked: bool,
@@ -334,7 +344,7 @@ fn runtime_error_type_value() -> Value {
 }
 
 #[inline]
-fn current_thread_ident() -> u64 {
+pub(crate) fn current_thread_ident() -> u64 {
     THREAD_IDENT.with(|ident| {
         if let Some(existing) = ident.get() {
             existing
@@ -345,6 +355,17 @@ fn current_thread_ident() -> u64 {
             assigned
         }
     })
+}
+
+pub(crate) fn main_thread_ident() -> u64 {
+    let recorded = MAIN_THREAD_IDENT.load(Ordering::Acquire);
+    if recorded != 0 {
+        return recorded;
+    }
+
+    let current = current_thread_ident();
+    let _ = MAIN_THREAD_IDENT.compare_exchange(0, current, Ordering::AcqRel, Ordering::Acquire);
+    MAIN_THREAD_IDENT.load(Ordering::Acquire)
 }
 
 #[inline]
@@ -373,7 +394,8 @@ fn unregister_thread_ident(ident: u64) {
 }
 
 pub(crate) fn new_main_interrupt_target() -> u64 {
-    let _ = current_thread_ident();
+    let ident = current_thread_ident();
+    let _ = MAIN_THREAD_IDENT.compare_exchange(0, ident, Ordering::AcqRel, Ordering::Acquire);
     let target = NEXT_INTERRUPT_TARGET.fetch_add(1, Ordering::Relaxed);
     THREAD_INTERRUPT_TARGET.with(|slot| slot.set(target));
     THREAD_IS_PYTHON_WORKER.with(|slot| slot.set(false));

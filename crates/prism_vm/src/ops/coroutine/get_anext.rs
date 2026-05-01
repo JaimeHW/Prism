@@ -21,7 +21,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
+use crate::stdlib::generators::{AsyncGeneratorOperationObject, GeneratorFlags, GeneratorObject};
 use prism_code::Instruction;
 use prism_core::Value;
 
@@ -79,7 +79,9 @@ pub fn get_anext(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 fn try_native_anext(value: &Value) -> Option<Value> {
     let generator = GeneratorObject::from_value(*value)?;
     if generator.flags().contains(GeneratorFlags::IS_ASYNC) {
-        Some(*value)
+        Some(crate::alloc_managed_value(
+            AsyncGeneratorOperationObject::new_asend(*value, Value::none()),
+        ))
     } else {
         None
     }

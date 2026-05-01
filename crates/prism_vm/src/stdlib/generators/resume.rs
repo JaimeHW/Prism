@@ -291,7 +291,7 @@ pub fn suspend_at_yield(
 
 /// Marks a generator as exhausted after it returns.
 #[inline]
-pub fn exhaust_generator(generator: &GeneratorObject) {
+pub fn exhaust_generator(generator: &mut GeneratorObject) {
     generator.exhaust();
 }
 

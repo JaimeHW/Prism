@@ -949,7 +949,10 @@ fn collections_abc_builtin_type_matches(type_id: TypeId, kind: CollectionsAbcKin
     use crate::stdlib::collections::abc::CollectionsAbcKind::*;
 
     match kind {
-        Awaitable | Coroutine => type_id == TypeId::COROUTINE,
+        Awaitable | Coroutine => matches!(
+            type_id,
+            TypeId::COROUTINE | TypeId::ASYNC_GENERATOR_ASEND | TypeId::ASYNC_GENERATOR_ATHROW
+        ),
         AsyncIterable | AsyncIterator | AsyncGenerator => type_id == TypeId::ASYNC_GENERATOR,
         Hashable => !matches!(
             type_id,

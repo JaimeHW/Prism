@@ -20,7 +20,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
-use crate::stdlib::generators::GeneratorObject;
+use crate::stdlib::generators::{AsyncGeneratorOperationObject, GeneratorObject};
 use prism_code::Instruction;
 use prism_core::Value;
 
@@ -100,6 +100,10 @@ pub fn get_awaitable(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 /// These types are inherently awaitable and need no conversion.
 #[inline(always)]
 fn is_native_awaitable(value: &Value) -> bool {
+    if AsyncGeneratorOperationObject::from_value(*value).is_some() {
+        return true;
+    }
+
     GeneratorObject::from_value(*value).is_some_and(GeneratorObject::is_coroutine)
 }
 

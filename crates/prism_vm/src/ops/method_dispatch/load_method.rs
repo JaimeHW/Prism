@@ -504,7 +504,11 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
         TypeId::INT => resolve_int_method(name),
         TypeId::FLOAT => resolve_float_method(name),
         TypeId::GENERATOR | TypeId::COROUTINE | TypeId::ASYNC_GENERATOR => {
-            resolve_generator_method(name)
+            resolve_generator_method(type_id, name)
+        }
+        TypeId::ASYNC_GENERATOR_ASEND | TypeId::ASYNC_GENERATOR_ATHROW => {
+            builtin_methods::resolve_async_generator_operation_method(type_id, name)
+                .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name))
         }
         TypeId::FUNCTION | TypeId::CLOSURE => resolve_function_method(name),
         TypeId::CLASSMETHOD | TypeId::STATICMETHOD => {
@@ -793,18 +797,12 @@ fn resolve_float_method(name: &str) -> Result<CachedMethod, RuntimeError> {
 }
 
 /// Resolve builtin generator methods.
-fn resolve_generator_method(name: &str) -> Result<CachedMethod, RuntimeError> {
-    if let Some(cached) = builtin_methods::resolve_generator_method(name) {
+fn resolve_generator_method(type_id: TypeId, name: &str) -> Result<CachedMethod, RuntimeError> {
+    if let Some(cached) = builtin_methods::resolve_generator_method(type_id, name) {
         return Ok(cached);
     }
 
-    match name {
-        "send" => Err(RuntimeError::attribute_error(
-            "generator",
-            format!("{} (not yet implemented)", name),
-        )),
-        _ => Err(RuntimeError::attribute_error("generator", name)),
-    }
+    Err(RuntimeError::attribute_error(type_id.name(), name))
 }
 
 /// Resolve builtin property methods.

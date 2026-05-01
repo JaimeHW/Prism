@@ -10,8 +10,8 @@ use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use crate::stdlib::exceptions::ExceptionTypeId;
-use crate::stdlib::generators::GeneratorObject;
-use crate::vm::GeneratorResumeOutcome;
+use crate::stdlib::generators::{AsyncGeneratorOperationObject, GeneratorObject};
+use crate::vm::{AsyncGeneratorOperationOutcome, GeneratorResumeOutcome};
 use prism_code::Instruction;
 use prism_core::Value;
 
@@ -231,6 +231,18 @@ fn drive_yield_from_delegate(
     iterator: Value,
     send_value: Value,
 ) -> Result<YieldFromStep, RuntimeError> {
+    if let Some(operation) = AsyncGeneratorOperationObject::from_value_mut(iterator) {
+        return match vm.resume_async_generator_operation(operation, send_value) {
+            Ok(AsyncGeneratorOperationOutcome::Completed(value)) => {
+                Ok(YieldFromStep::Returned(value))
+            }
+            Err(err) if is_stop_iteration(&err) => Ok(YieldFromStep::Returned(
+                stop_iteration_value(&err).unwrap_or_else(Value::none),
+            )),
+            Err(err) => Err(err),
+        };
+    }
+
     if let Some(generator) = GeneratorObject::from_value_mut(iterator) {
         return match vm.resume_generator_for_send(generator, send_value) {
             Ok(GeneratorResumeOutcome::Yielded(value)) => Ok(YieldFromStep::Yielded(value)),

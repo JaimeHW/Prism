@@ -58,6 +58,8 @@ impl GeneratorFlags {
     pub const STARTED: Self = Self(0b0010_0000);
     /// Generator can be awaited through the legacy iterable-coroutine protocol.
     pub const IS_ITERABLE_COROUTINE: Self = Self(0b0100_0000);
+    /// Async generator hooks have been initialized.
+    pub const ASYNCGEN_HOOKS_INITED: Self = Self(0b1000_0000);
     /// Empty flag set.
     pub const EMPTY: Self = Self(0);
 
@@ -170,6 +172,9 @@ pub struct GeneratorObject {
 
     /// Exception state owned by this suspended generator.
     exception_context: Option<crate::vm::ExceptionContextSnapshot>,
+
+    /// Async-generator finalizer captured from `sys.set_asyncgen_hooks`.
+    asyncgen_finalizer: Option<Value>,
 }
 
 impl GeneratorObject {
@@ -192,6 +197,7 @@ impl GeneratorObject {
             closure: None,
             module_ptr: std::ptr::null(),
             exception_context: None,
+            asyncgen_finalizer: None,
         }
     }
 
@@ -211,6 +217,7 @@ impl GeneratorObject {
             closure: None,
             module_ptr: std::ptr::null(),
             exception_context: None,
+            asyncgen_finalizer: None,
         }
     }
 
@@ -349,8 +356,9 @@ impl GeneratorObject {
 
     /// Marks the generator as exhausted (returned or closed).
     #[inline]
-    pub fn exhaust(&self) {
+    pub fn exhaust(&mut self) {
         self.state_header.exhaust();
+        self.clear_frame_state();
     }
 
     /// Restores the generator's frame to a register file.
@@ -441,6 +449,41 @@ impl GeneratorObject {
         self.exception_context = None;
     }
 
+    /// Releases frame-owned references once a generator or coroutine is closed.
+    ///
+    /// An exhausted generator no longer has a live Python frame. Dropping these
+    /// references here keeps completed coroutine/task chains from retaining
+    /// locals captured at their last suspension point.
+    #[inline]
+    fn clear_frame_state(&mut self) {
+        self.ip = 0;
+        self.liveness_bits = 0;
+        self.storage.clear();
+        self.receive_value = None;
+        self.closure = None;
+        self.exception_context = None;
+        self.asyncgen_finalizer = None;
+    }
+
+    /// Restores a just-started generator to its initial resumable state.
+    #[inline]
+    pub(crate) fn reset_to_created(&self) {
+        self.state_header
+            .set_state_and_index(GeneratorState::Created, 0);
+    }
+
+    /// Stores the finalizer hook captured when an async generator first runs.
+    #[inline]
+    pub(crate) fn set_asyncgen_finalizer(&mut self, finalizer: Value) {
+        self.asyncgen_finalizer = Some(finalizer);
+    }
+
+    /// Returns the captured async generator finalizer, if any.
+    #[inline]
+    pub(crate) fn asyncgen_finalizer(&self) -> Option<Value> {
+        self.asyncgen_finalizer
+    }
+
     /// Sets the STARTED flag.
     #[inline]
     pub fn mark_started(&mut self) {
@@ -473,6 +516,18 @@ impl GeneratorObject {
             && !self.is_async()
     }
 
+    /// Marks async-generator hooks as initialized for this object.
+    #[inline]
+    pub(crate) fn mark_asyncgen_hooks_initialized(&mut self) {
+        self.flags |= GeneratorFlags::ASYNCGEN_HOOKS_INITED;
+    }
+
+    /// Returns true if async-generator hooks have already been initialized.
+    #[inline]
+    pub(crate) fn asyncgen_hooks_initialized(&self) -> bool {
+        self.flags.contains(GeneratorFlags::ASYNCGEN_HOOKS_INITED)
+    }
+
     /// Returns true if this is an async generator.
     #[inline]
     pub fn is_async(&self) -> bool {
@@ -495,6 +550,7 @@ impl Clone for GeneratorObject {
             closure: self.closure.clone(),
             module_ptr: self.module_ptr,
             exception_context: self.exception_context.clone(),
+            asyncgen_finalizer: self.asyncgen_finalizer,
         }
     }
 }
@@ -532,6 +588,7 @@ unsafe impl Trace for GeneratorObject {
         if let Some(context) = &self.exception_context {
             context.trace_values(tracer);
         }
+        self.asyncgen_finalizer.trace(tracer);
     }
 }
 

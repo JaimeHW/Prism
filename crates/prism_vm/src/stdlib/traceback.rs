@@ -10,6 +10,7 @@ use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, ExceptionTypeObject, ExceptionValue, builtin_str_vm,
     exception_display_text_for_value, runtime_error_to_builtin_error,
 };
+use crate::ops::calls::invoke_callable_value;
 use crate::ops::objects::{extract_type_id, get_attribute_value};
 use prism_core::Value;
 use prism_core::intern::intern;
@@ -43,6 +44,9 @@ static FORMAT_EXCEPTION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::ne
 });
 static FORMAT_EXC_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm_kw(Arc::from("traceback.format_exc"), format_exc)
+});
+static PRINT_EXCEPTION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("traceback.print_exception"), print_exception)
 });
 static TRACEBACK_EXCEPTION_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(build_traceback_exception_class);
@@ -90,6 +94,7 @@ impl TracebackModule {
                 Arc::from("format_exception"),
                 Arc::from("format_exception_only"),
                 Arc::from("format_tb"),
+                Arc::from("print_exception"),
             ],
         }
     }
@@ -115,6 +120,7 @@ impl Module for TracebackModule {
             "format_exception" => Ok(builtin_value(&FORMAT_EXCEPTION_FUNCTION)),
             "format_exception_only" => Ok(builtin_value(&FORMAT_EXCEPTION_ONLY_FUNCTION)),
             "format_tb" => Ok(builtin_value(&FORMAT_TB_FUNCTION)),
+            "print_exception" => Ok(builtin_value(&PRINT_EXCEPTION_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'traceback' has no attribute '{}'",
                 name
@@ -306,6 +312,23 @@ fn format_exc(
     Ok(owned_string_value(lines.concat()))
 }
 
+fn print_exception(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let bound = bind_print_exception_args(vm, args, keywords)?;
+    let lines = format_exception_values(
+        vm,
+        bound.exc_type,
+        bound.exc_value,
+        bound.exc_traceback,
+        bound.limit,
+    )?;
+    write_traceback_lines(vm, bound.file, &lines)?;
+    Ok(Value::none())
+}
+
 fn traceback_exception_init(
     vm: &mut VirtualMachine,
     args: &[Value],
@@ -393,6 +416,15 @@ struct FormatExceptionArgs {
 #[derive(Clone, Copy)]
 struct FormatExcArgs {
     limit: Option<Value>,
+}
+
+#[derive(Clone, Copy)]
+struct PrintExceptionArgs {
+    exc_type: Value,
+    exc_value: Value,
+    exc_traceback: Value,
+    limit: Option<Value>,
+    file: Option<Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -534,6 +566,61 @@ fn bind_format_exc_args(
     Ok(FormatExcArgs { limit })
 }
 
+fn bind_print_exception_args(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<PrintExceptionArgs, BuiltinError> {
+    if args.is_empty() || args.len() == 2 || args.len() > 5 {
+        return Err(BuiltinError::TypeError(format!(
+            "print_exception() takes 1 or 3 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+
+    let mut limit = args.get(3).copied();
+    let mut file = args.get(4).copied();
+    for &(name, value) in keywords {
+        match name {
+            "limit" => assign_optional_keyword(
+                &mut limit,
+                value,
+                "print_exception",
+                "limit",
+                args.len() > 3,
+            )?,
+            "file" => assign_optional_keyword(
+                &mut file,
+                value,
+                "print_exception",
+                "file",
+                args.len() > 4,
+            )?,
+            "chain" => {}
+            other => return Err(unexpected_keyword("print_exception", other)),
+        }
+    }
+
+    if args.len() == 1 {
+        let exc_value = args[0];
+        return Ok(PrintExceptionArgs {
+            exc_type: exception_class_value(vm, exc_value)?,
+            exc_value,
+            exc_traceback: exception_traceback_value(vm, exc_value)?,
+            limit,
+            file,
+        });
+    }
+
+    Ok(PrintExceptionArgs {
+        exc_type: args[0],
+        exc_value: args[1],
+        exc_traceback: args[2],
+        limit,
+        file,
+    })
+}
+
 fn assign_optional_keyword(
     slot: &mut Option<Value>,
     value: Value,
@@ -587,6 +674,25 @@ fn format_exception_values(
     let message = exception_message_text(vm, exc_value)?;
     lines.push(format_exception_only_line(exc_type, exc_value, &message));
     Ok(lines)
+}
+
+fn write_traceback_lines(
+    vm: &mut VirtualMachine,
+    file: Option<Value>,
+    lines: &[String],
+) -> Result<(), BuiltinError> {
+    let Some(file) = file.filter(|value| !value.is_none()) else {
+        eprint!("{}", lines.concat());
+        return Ok(());
+    };
+
+    let write =
+        get_attribute_value(vm, file, &intern("write")).map_err(runtime_error_to_builtin_error)?;
+    for line in lines {
+        invoke_callable_value(vm, write, &[owned_string_value(line.clone())])
+            .map_err(runtime_error_to_builtin_error)?;
+    }
+    Ok(())
 }
 
 fn traceback_exception_lines(

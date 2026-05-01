@@ -7,7 +7,9 @@
 
 use prism_core::Value;
 use prism_gc::trace::{ObjectTracer, Tracer};
-use prism_runtime::RuntimeObjectTracer;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::shaped_object::ShapedObject;
+use prism_runtime::{RuntimeObjectTracer, Trace};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default)]
@@ -88,7 +90,7 @@ impl ReachabilityTracer {
         let tracer = RuntimeObjectTracer::new();
         while let Some(ptr) = self.worklist.pop() {
             unsafe {
-                tracer.trace_object(ptr, self);
+                self.trace_object(ptr, &tracer);
             }
         }
     }
@@ -96,6 +98,66 @@ impl ReachabilityTracer {
     #[inline]
     pub(crate) fn reachable(&self) -> &FxHashSet<usize> {
         &self.reachable
+    }
+
+    unsafe fn trace_object(&mut self, ptr: *const (), tracer: &RuntimeObjectTracer) {
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        let type_id = header.type_id;
+
+        if crate::stdlib::_weakref::is_reference_type_id(type_id)
+            || crate::stdlib::weakref::weak_dict_kind_for_type_id(type_id).is_some()
+        {
+            let object = unsafe { &*(ptr as *const ShapedObject) };
+            self.trace_shaped_object(type_id, object);
+            return;
+        }
+
+        unsafe {
+            tracer.trace_object(ptr, self);
+        }
+    }
+
+    fn trace_shaped_object(
+        &mut self,
+        type_id: prism_runtime::object::type_obj::TypeId,
+        object: &ShapedObject,
+    ) {
+        let is_weakref = crate::stdlib::_weakref::is_reference_type_id(type_id);
+        let weakref_target = crate::stdlib::_weakref::reference_target_property();
+        for (name, value) in object.iter_properties() {
+            if is_weakref && name == weakref_target {
+                continue;
+            }
+            self.trace_value(value);
+        }
+
+        if let Some(value) = object.instance_dict_value() {
+            self.trace_value(value);
+        }
+        if let Some(dict) = object.dict_backing() {
+            match crate::stdlib::weakref::weak_dict_kind_for_type_id(type_id) {
+                Some(crate::stdlib::weakref::WeakDictKind::Key) => {
+                    for (_, value) in dict.iter() {
+                        self.trace_value(value);
+                    }
+                }
+                Some(crate::stdlib::weakref::WeakDictKind::Value) => {
+                    for (key, _) in dict.iter() {
+                        self.trace_value(key);
+                    }
+                }
+                None => dict.trace(self),
+            }
+        }
+        if let Some(list) = object.list_backing() {
+            list.trace(self);
+        }
+        if let Some(set) = object.set_backing() {
+            set.trace(self);
+        }
+        if let Some(tuple) = object.tuple_backing() {
+            tuple.trace(self);
+        }
     }
 }
 

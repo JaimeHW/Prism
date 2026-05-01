@@ -1222,6 +1222,7 @@ fn gc_collect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinE
     }
 
     crate::stdlib::_weakref::clear_unreachable_weakrefs(vm);
+    vm.drain_unreachable_finalizers();
     Ok(Value::none())
 }
 

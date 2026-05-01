@@ -19,6 +19,7 @@
 //! | Resume | ~5 cycles |
 //! | Memory (small) | 96 bytes |
 
+mod async_op;
 mod iterator;
 mod methods;
 mod object;
@@ -26,6 +27,10 @@ mod resume;
 mod state;
 mod storage;
 
+pub use async_op::{
+    AsyncGeneratorOperationKind, AsyncGeneratorOperationObject, AsyncGeneratorOperationStartError,
+    is_async_generator_operation_type_id,
+};
 pub use iterator::{GeneratorError, GeneratorException, GeneratorIterator, IterResult};
 pub use methods::{
     CloseResult, SendResult, ThrowResult, complete_close_caught, complete_close_exception,
