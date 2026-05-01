@@ -21,6 +21,7 @@ use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use prism_code::Instruction;
 use prism_core::Value;
+use prism_core::intern::intern;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::PyClassObject;
 use prism_runtime::object::descriptor::BoundMethod;
@@ -104,6 +105,35 @@ fn is_exact_numeric_fast_type(type_id: TypeId) -> bool {
 fn has_numeric_subtype_operand(left: Value, right: Value) -> bool {
     (is_numeric_value(left) && !is_exact_numeric_fast_type(value_type_id(left)))
         || (is_numeric_value(right) && !is_exact_numeric_fast_type(value_type_id(right)))
+}
+
+#[inline]
+fn has_user_rich_compare_override(value: Value, method_name: &'static str) -> bool {
+    let type_id = value_type_id(value);
+    if type_id.raw() < TypeId::FIRST_USER_TYPE {
+        return false;
+    }
+
+    global_class(ClassId(type_id.raw())).is_some_and(|class| {
+        class
+            .lookup_method_published(&intern(method_name))
+            .is_some()
+    })
+}
+
+#[inline]
+fn has_user_rich_compare_override_pair(left: Value, right: Value, op: RichCompareOp) -> bool {
+    has_user_rich_compare_override(left, op.left_method_name())
+        || has_user_rich_compare_override(right, op.right_method_name())
+}
+
+#[inline]
+fn needs_rich_compare_before_primitive_fast_path(
+    left: Value,
+    right: Value,
+    op: RichCompareOp,
+) -> bool {
+    has_numeric_subtype_operand(left, right) || has_user_rich_compare_override_pair(left, right, op)
 }
 
 #[inline]
@@ -755,7 +785,7 @@ fn eq_value_result_inner(
     b: Value,
     seen_pairs: &mut FxHashSet<(usize, usize)>,
 ) -> Result<Value, RuntimeError> {
-    if has_numeric_subtype_operand(a, b)
+    if needs_rich_compare_before_primitive_fast_path(a, b, RichCompareOp::Eq)
         && let Some(result) = rich_compare_value(vm, a, b, RichCompareOp::Eq)?
     {
         return Ok(result);
@@ -829,7 +859,7 @@ fn eq_result_inner(
     b: Value,
     seen_pairs: &mut FxHashSet<(usize, usize)>,
 ) -> Result<bool, RuntimeError> {
-    if has_numeric_subtype_operand(a, b)
+    if needs_rich_compare_before_primitive_fast_path(a, b, RichCompareOp::Eq)
         && let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Eq)?
     {
         return Ok(result);
@@ -929,6 +959,12 @@ fn slice_eq_result(
 
 #[inline]
 pub(crate) fn ne_result(vm: &mut VirtualMachine, a: Value, b: Value) -> Result<bool, RuntimeError> {
+    if needs_rich_compare_before_primitive_fast_path(a, b, RichCompareOp::Ne)
+        && let Some(result) = rich_compare_bool(vm, a, b, RichCompareOp::Ne)?
+    {
+        return Ok(result);
+    }
+
     if let Some(ordering) = compare_numeric_values(a, b) {
         return Ok(!ordering.is_eq());
     }
@@ -991,7 +1027,7 @@ pub(crate) fn ne_value_result(
     a: Value,
     b: Value,
 ) -> Result<Value, RuntimeError> {
-    if has_numeric_subtype_operand(a, b)
+    if needs_rich_compare_before_primitive_fast_path(a, b, RichCompareOp::Ne)
         && let Some(result) = rich_compare_value(vm, a, b, RichCompareOp::Ne)?
     {
         return Ok(result);
@@ -1383,6 +1419,12 @@ pub(crate) fn compare_order_value_result(
         && let Some(result) = compare_set_like_relation(vm, a, b, relation)?
     {
         return Ok(Value::bool(result));
+    }
+
+    if needs_rich_compare_before_primitive_fast_path(a, b, op)
+        && let Some(result) = rich_compare_value(vm, a, b, op)?
+    {
+        return Ok(result);
     }
 
     if let Some(ordering) = compare_string_values(a, b) {
@@ -1782,12 +1824,15 @@ pub fn eq(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 vm.speculation_cache.invalidate(site);
             }
             Speculation::StrStr => {
-                if let Some(equal) = string_values_equal(a, b) {
+                if needs_rich_compare_before_primitive_fast_path(a, b, RichCompareOp::Eq) {
+                    vm.speculation_cache.invalidate(site);
+                } else if let Some(equal) = string_values_equal(a, b) {
                     let frame = vm.current_frame_mut();
                     frame.set_reg(inst.dst().0, Value::bool(equal));
                     return ControlFlow::Continue;
+                } else {
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
             }
             Speculation::None
             | Speculation::StrInt
@@ -1850,12 +1895,15 @@ pub fn ne(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                 vm.speculation_cache.invalidate(site);
             }
             Speculation::StrStr => {
-                if let Some(equal) = string_values_equal(a, b) {
+                if needs_rich_compare_before_primitive_fast_path(a, b, RichCompareOp::Ne) {
+                    vm.speculation_cache.invalidate(site);
+                } else if let Some(equal) = string_values_equal(a, b) {
                     let frame = vm.current_frame_mut();
                     frame.set_reg(inst.dst().0, Value::bool(!equal));
                     return ControlFlow::Continue;
+                } else {
+                    vm.speculation_cache.invalidate(site);
                 }
-                vm.speculation_cache.invalidate(site);
             }
             Speculation::None
             | Speculation::StrInt

@@ -21,7 +21,7 @@ pub(crate) enum RichCompareOp {
 
 impl RichCompareOp {
     #[inline]
-    fn left_method_name(self) -> &'static str {
+    pub(crate) fn left_method_name(self) -> &'static str {
         match self {
             Self::Eq => "__eq__",
             Self::Ne => "__ne__",
@@ -33,7 +33,7 @@ impl RichCompareOp {
     }
 
     #[inline]
-    fn right_method_name(self) -> &'static str {
+    pub(crate) fn right_method_name(self) -> &'static str {
         match self {
             Self::Eq => "__eq__",
             Self::Ne => "__ne__",
