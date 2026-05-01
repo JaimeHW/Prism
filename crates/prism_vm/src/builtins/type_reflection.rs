@@ -615,7 +615,7 @@ const TUPLE_METHOD_NAMES: &[&str] = &[
 const SLICE_METHOD_NAMES: &[&str] = &["__hash__", "indices"];
 const ITERATOR_METHOD_NAMES: &[&str] = &["__iter__", "__next__", "__length_hint__"];
 const GENERATOR_METHOD_NAMES: &[&str] = &["close"];
-const COROUTINE_METHOD_NAMES: &[&str] = &["close", "throw"];
+const COROUTINE_METHOD_NAMES: &[&str] = &["close", "send", "throw"];
 const ASYNC_GENERATOR_METHOD_NAMES: &[&str] = &["close", "throw"];
 const PROPERTY_METHOD_NAMES: &[&str] = &[
     "__get__",

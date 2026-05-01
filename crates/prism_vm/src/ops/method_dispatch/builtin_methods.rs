@@ -167,6 +167,8 @@ static DEQUE_POPLEFT_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.popleft"), deque_popleft));
 static DEQUE_REMOVE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.remove"), deque_remove));
+static DEQUE_CLEAR_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.clear"), deque_clear));
 static DEQUE_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("deque.__getitem__"), deque_getitem));
 static REGEX_PATTERN_MATCH_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -480,6 +482,8 @@ static ITERATOR_SETSTATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new
 });
 static GENERATOR_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("generator.close"), generator_close));
+static GENERATOR_SEND_METHOD: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("generator.send"), generator_send));
 static GENERATOR_THROW_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("generator.throw"), generator_throw));
 static FUNCTION_GET_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -641,6 +645,9 @@ pub fn resolve_deque_method(name: &str) -> Option<CachedMethod> {
         ))),
         "remove" => Some(CachedMethod::simple(builtin_method_value(
             &DEQUE_REMOVE_METHOD,
+        ))),
+        "clear" => Some(CachedMethod::simple(builtin_method_value(
+            &DEQUE_CLEAR_METHOD,
         ))),
         "__getitem__" => Some(CachedMethod::simple(builtin_method_value(
             &DEQUE_GETITEM_METHOD,
@@ -1200,6 +1207,9 @@ pub fn resolve_generator_method(name: &str) -> Option<CachedMethod> {
     match name {
         "close" => Some(CachedMethod::simple(builtin_method_value(
             &GENERATOR_CLOSE_METHOD,
+        ))),
+        "send" => Some(CachedMethod::simple(builtin_method_value(
+            &GENERATOR_SEND_METHOD,
         ))),
         "throw" => Some(CachedMethod::simple(builtin_method_value(
             &GENERATOR_THROW_METHOD,
@@ -2254,6 +2264,14 @@ fn deque_remove(args: &[Value]) -> Result<Value, BuiltinError> {
             "deque.remove(x): x not in deque".to_string(),
         ))
     }
+}
+
+#[inline]
+fn deque_clear(args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("deque", "clear", args, 0)?;
+    let deque = expect_deque_mut(args[0], "clear")?;
+    deque.deque_mut().clear();
+    Ok(Value::none())
 }
 
 #[inline]
@@ -4361,6 +4379,19 @@ fn generator_close(args: &[Value]) -> Result<Value, BuiltinError> {
         CloseResult::YieldedInFinally(_) => Err(BuiltinError::ValueError(
             "generator ignored GeneratorExit".to_string(),
         )),
+    }
+}
+
+#[inline]
+fn generator_send(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    expect_method_arg_count("generator", "send", args, 1)?;
+    let generator = expect_generator_mut(args[0], "send")?;
+    match vm.resume_generator_for_send(generator, args[1]) {
+        Ok(GeneratorResumeOutcome::Yielded(value)) => Ok(value),
+        Ok(GeneratorResumeOutcome::Returned(value)) => {
+            Err(BuiltinError::Raised(stop_iteration_runtime_error(value)))
+        }
+        Err(err) => Err(BuiltinError::Raised(err)),
     }
 }
 
