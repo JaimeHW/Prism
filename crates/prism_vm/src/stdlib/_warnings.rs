@@ -199,6 +199,19 @@ pub(crate) fn emit_deprecation_warning(
     )
 }
 
+pub(crate) fn emit_runtime_warning(
+    vm: &mut VirtualMachine,
+    message: &str,
+) -> Result<(), RuntimeError> {
+    let context = WarningContext::capture(vm)?;
+    emit_warning(
+        vm,
+        builtin_warning_category(ExceptionTypeId::RuntimeWarning)?,
+        message,
+        &context,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct WarnCall {
     message: Value,

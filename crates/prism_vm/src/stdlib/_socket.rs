@@ -27,7 +27,7 @@ use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use rustc_hash::FxHashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -324,6 +324,33 @@ enum SocketHandle {
     Empty,
     Listener(TcpListener),
     Stream(TcpStream),
+}
+
+pub(crate) fn write_signal_wakeup_byte(fd: i64, byte: u8) -> io::Result<()> {
+    let mut states = SOCKET_STATES
+        .lock()
+        .expect("socket state registry lock poisoned");
+    let state = states.get_mut(&fd).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "signal wakeup file descriptor is not an open Prism socket",
+        )
+    })?;
+    let SocketHandle::Stream(stream) = &mut state.handle else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "signal wakeup file descriptor is not a stream socket",
+        ));
+    };
+
+    match stream.write(&[byte]) {
+        Ok(1) => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "failed to write signal wakeup byte",
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 impl SocketState {

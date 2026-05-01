@@ -29,6 +29,9 @@ static DEFAULT_INT_HANDLER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock:
 });
 static GETSIGNAL_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("signal.getsignal"), builtin_getsignal));
+static SET_WAKEUP_FD_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(Arc::from("signal.set_wakeup_fd"), builtin_set_wakeup_fd)
+});
 static SIGNAL_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("signal.signal"), builtin_signal));
 static SIGNAL_STATE: LazyLock<RwLock<SignalState>> =
@@ -37,6 +40,8 @@ static SIGNAL_STATE: LazyLock<RwLock<SignalState>> =
 #[derive(Default)]
 struct SignalState {
     handlers: FxHashMap<i64, Value>,
+    wakeup_fd: i64,
+    warn_on_full_buffer: bool,
 }
 
 impl SignalState {
@@ -47,7 +52,11 @@ impl SignalState {
             SIGTERM,
             Value::int(SIG_DFL).expect("signal default constant fits in Value::int"),
         );
-        Self { handlers }
+        Self {
+            handlers,
+            wakeup_fd: -1,
+            warn_on_full_buffer: true,
+        }
     }
 
     fn get(&self, signum: i64) -> Value {
@@ -60,6 +69,13 @@ impl SignalState {
     fn set(&mut self, signum: i64, handler: Value) -> Value {
         let previous = self.get(signum);
         self.handlers.insert(signum, handler);
+        previous
+    }
+
+    fn set_wakeup_fd(&mut self, fd: i64, warn_on_full_buffer: bool) -> i64 {
+        let previous = self.wakeup_fd;
+        self.wakeup_fd = fd;
+        self.warn_on_full_buffer = warn_on_full_buffer;
         previous
     }
 }
@@ -83,6 +99,7 @@ impl SignalModule {
                 Arc::from("NSIG"),
                 Arc::from("default_int_handler"),
                 Arc::from("getsignal"),
+                Arc::from("set_wakeup_fd"),
                 Arc::from("signal"),
             ],
             all_value: export_names_value(),
@@ -111,6 +128,7 @@ impl Module for SignalModule {
             "NSIG" => Ok(Value::int(NSIG).expect("NSIG fits in Value::int")),
             "default_int_handler" => Ok(builtin_value(&DEFAULT_INT_HANDLER_FUNCTION)),
             "getsignal" => Ok(builtin_value(&GETSIGNAL_FUNCTION)),
+            "set_wakeup_fd" => Ok(builtin_value(&SET_WAKEUP_FD_FUNCTION)),
             "signal" => Ok(builtin_value(&SIGNAL_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'signal' has no attribute '{}'",
@@ -144,6 +162,7 @@ fn export_names_value() -> Value {
             "NSIG",
             "default_int_handler",
             "getsignal",
+            "set_wakeup_fd",
             "signal",
         ]
         .into_iter()
@@ -176,6 +195,34 @@ pub(crate) fn is_valid_signal_number(signum: i64) -> bool {
 #[inline]
 pub(crate) fn handler_for_signal(signum: i64) -> Value {
     SIGNAL_STATE.read().unwrap().get(signum)
+}
+
+pub(crate) fn notify_wakeup_fd(
+    vm: &mut crate::VirtualMachine,
+    signum: i64,
+) -> Result<(), RuntimeError> {
+    let Some((fd, warn_on_full_buffer)) = wakeup_fd_config() else {
+        return Ok(());
+    };
+
+    match super::_socket::write_signal_wakeup_byte(fd, signum as u8) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            if warn_on_full_buffer {
+                super::_warnings::emit_runtime_warning(
+                    vm,
+                    "signal wakeup fd buffer is full; signal number lost",
+                )?;
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+fn wakeup_fd_config() -> Option<(i64, bool)> {
+    let state = SIGNAL_STATE.read().unwrap();
+    (state.wakeup_fd >= 0).then_some((state.wakeup_fd, state.warn_on_full_buffer))
 }
 
 #[inline]
@@ -219,6 +266,53 @@ fn builtin_getsignal(args: &[Value]) -> Result<Value, BuiltinError> {
 
     let signum = parse_signal_number(args[0], "getsignal")?;
     Ok(SIGNAL_STATE.read().unwrap().get(signum))
+}
+
+fn builtin_set_wakeup_fd(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "set_wakeup_fd() takes exactly one positional argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let Some(fd) = args[0].as_int() else {
+        return Err(BuiltinError::TypeError(
+            "set_wakeup_fd() fd must be int".to_string(),
+        ));
+    };
+    if fd < -1 {
+        return Err(BuiltinError::ValueError(
+            "set_wakeup_fd() fd must be non-negative, or -1".to_string(),
+        ));
+    }
+
+    let mut warn_on_full_buffer = true;
+    for (name, value) in keywords {
+        match *name {
+            "warn_on_full_buffer" => warn_on_full_buffer = crate::truthiness::is_truthy(*value),
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "set_wakeup_fd() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    if super::_thread::current_thread_ident() != super::_thread::main_thread_ident() {
+        return Err(BuiltinError::ValueError(
+            "set_wakeup_fd only works in main thread of the main interpreter".to_string(),
+        ));
+    }
+
+    let previous = SIGNAL_STATE
+        .write()
+        .unwrap()
+        .set_wakeup_fd(fd, warn_on_full_buffer);
+    Ok(Value::int(previous).expect("signal wakeup fd fits in Value::int"))
 }
 
 fn builtin_signal(args: &[Value]) -> Result<Value, BuiltinError> {

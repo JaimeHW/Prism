@@ -558,6 +558,7 @@ pub(crate) fn deliver_interrupt_signal(
     vm: &mut VirtualMachine,
     signum: i64,
 ) -> Result<(), RuntimeError> {
+    super::signal::notify_wakeup_fd(vm, signum)?;
     let handler = super::signal::handler_for_signal(signum);
     if super::signal::is_default_or_ignored_handler(handler) {
         return Ok(());
