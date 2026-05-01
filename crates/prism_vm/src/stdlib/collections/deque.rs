@@ -36,9 +36,13 @@ use crate::builtins::{BuiltinError, get_iterator_mut, value_to_iterator};
 use crate::error::RuntimeError;
 use prism_core::Value;
 use prism_gc::trace::{Trace, Tracer};
+use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::{ObjectHeader, PyObject};
 use std::ops::{Index, IndexMut};
+use std::sync::Once;
+
+static DEQUE_GC_DISPATCH_ONCE: Once = Once::new();
 
 // =============================================================================
 // Native Deque Object
@@ -60,6 +64,7 @@ impl DequeObject {
 
     #[inline]
     pub fn from_deque(deque: Deque) -> Self {
+        ensure_deque_gc_dispatch_registered();
         Self {
             header: ObjectHeader::new(TypeId::DEQUE),
             deque,
@@ -210,6 +215,33 @@ fn build_deque(
 #[inline]
 fn leak_deque_value(object: DequeObject) -> Value {
     crate::alloc_managed_value(object)
+}
+
+fn ensure_deque_gc_dispatch_registered() {
+    DEQUE_GC_DISPATCH_ONCE.call_once(|| {
+        register_external_dispatch(
+            TypeId::DEQUE,
+            DispatchEntry {
+                trace: trace_deque_object,
+                size: size_deque_object,
+                finalize: finalize_deque_object,
+            },
+        );
+    });
+}
+
+unsafe fn trace_deque_object(ptr: *const (), tracer: &mut dyn Tracer) {
+    let object = unsafe { &*(ptr as *const DequeObject) };
+    object.trace(tracer);
+}
+
+unsafe fn size_deque_object(ptr: *const ()) -> usize {
+    let object = unsafe { &*(ptr as *const DequeObject) };
+    object.size_of()
+}
+
+unsafe fn finalize_deque_object(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut DequeObject) };
 }
 
 fn collect_iterable_values_static(value: Value) -> Result<Vec<Value>, BuiltinError> {

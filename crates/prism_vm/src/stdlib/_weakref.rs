@@ -9,11 +9,18 @@ use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
 use crate::ops::comparison::eq_result;
 use crate::stdlib::collections::deque::DequeObject;
+use crate::stdlib::generators::{
+    AsyncGeneratorOperationObject, GeneratorObject, is_async_generator_operation_type_id,
+    is_generator_storage_type_id,
+};
 use prism_code::CodeFlags;
 use prism_core::Value;
 use prism_core::intern::{intern, interned_by_ptr};
+use prism_gc::Trace;
+use prism_gc::trace::Tracer;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::class::{ClassDict, ClassFlags, PyClassObject};
+use prism_runtime::object::descriptor::BoundMethod;
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
@@ -446,6 +453,10 @@ impl ReachabilityMarker {
                     self.push(bound_self);
                 }
             }
+            TypeId::METHOD => {
+                let method = unsafe { &*(ptr as *const BoundMethod) };
+                method.trace(self);
+            }
             TypeId::CELL => {
                 let cell = unsafe { &*(ptr as *const Cell) };
                 if let Some(value) = cell.get() {
@@ -503,6 +514,14 @@ impl ReachabilityMarker {
                 if let Some(next) = traceback.next() {
                     self.push(next);
                 }
+            }
+            type_id if is_generator_storage_type_id(type_id) => {
+                let generator = unsafe { &*(ptr as *const GeneratorObject) };
+                generator.trace(self);
+            }
+            type_id if is_async_generator_operation_type_id(type_id) => {
+                let operation = unsafe { &*(ptr as *const AsyncGeneratorOperationObject) };
+                operation.trace(self);
             }
             type_id if is_shaped_object(value, type_id) => {
                 let object = unsafe { &*(ptr as *const ShapedObject) };
@@ -566,6 +585,20 @@ impl ReachabilityMarker {
     fn push_weak_value_dict_entries(&mut self, dict: &DictObject) {
         for (key, _) in dict.iter() {
             self.push(key);
+        }
+    }
+}
+
+impl Tracer for ReachabilityMarker {
+    #[inline]
+    fn trace_value(&mut self, value: Value) {
+        self.push(value);
+    }
+
+    #[inline]
+    fn trace_ptr(&mut self, ptr: *const ()) {
+        if !ptr.is_null() {
+            self.push(Value::object_ptr(ptr));
         }
     }
 }

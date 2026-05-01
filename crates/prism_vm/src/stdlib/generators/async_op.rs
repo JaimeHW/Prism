@@ -8,8 +8,13 @@
 use prism_core::Value;
 use prism_gc::Trace;
 use prism_gc::trace::Tracer;
+use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
+use std::mem;
+use std::sync::Once;
+
+static ASYNC_GENERATOR_OPERATION_GC_DISPATCH_ONCE: Once = Once::new();
 
 /// The async-generator helper operation to perform when the object is driven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +101,7 @@ impl AsyncGeneratorOperationObject {
         exception: Value,
         exception_type_id: u16,
     ) -> Self {
+        ensure_async_generator_operation_gc_dispatch_registered();
         Self {
             header: ObjectHeader::new(kind.type_id()),
             generator,
@@ -195,6 +201,31 @@ pub fn is_async_generator_operation_type_id(type_id: TypeId) -> bool {
 fn object_type_id(ptr: *const ()) -> TypeId {
     let header = ptr as *const ObjectHeader;
     unsafe { (*header).type_id }
+}
+
+fn ensure_async_generator_operation_gc_dispatch_registered() {
+    ASYNC_GENERATOR_OPERATION_GC_DISPATCH_ONCE.call_once(|| {
+        let entry = DispatchEntry {
+            trace: trace_async_generator_operation,
+            size: size_async_generator_operation,
+            finalize: finalize_async_generator_operation,
+        };
+        register_external_dispatch(TypeId::ASYNC_GENERATOR_ASEND, entry);
+        register_external_dispatch(TypeId::ASYNC_GENERATOR_ATHROW, entry);
+    });
+}
+
+unsafe fn trace_async_generator_operation(ptr: *const (), tracer: &mut dyn Tracer) {
+    let object = unsafe { &*(ptr as *const AsyncGeneratorOperationObject) };
+    object.trace(tracer);
+}
+
+unsafe fn size_async_generator_operation(_ptr: *const ()) -> usize {
+    mem::size_of::<AsyncGeneratorOperationObject>()
+}
+
+unsafe fn finalize_async_generator_operation(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut AsyncGeneratorOperationObject) };
 }
 
 unsafe impl Send for AsyncGeneratorOperationObject {}

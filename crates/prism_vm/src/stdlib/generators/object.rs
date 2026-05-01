@@ -27,13 +27,18 @@ use prism_code::{CodeFlags, CodeObject};
 use prism_core::Value;
 use prism_gc::Trace;
 use prism_gc::trace::Tracer;
+use prism_runtime::gc_dispatch::{DispatchEntry, register_external_dispatch};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use std::fmt;
+use std::mem;
 use std::sync::Arc;
+use std::sync::Once;
 
 use super::state::{GeneratorHeader, GeneratorState};
 use super::storage::{FrameStorage, LivenessMap};
+
+static GENERATOR_GC_DISPATCH_ONCE: Once = Once::new();
 
 // ============================================================================
 // Generator Flags
@@ -184,6 +189,7 @@ impl GeneratorObject {
     /// with the first call to `next()`.
     #[inline]
     pub fn new(code: Arc<CodeObject>) -> Self {
+        ensure_generator_gc_dispatch_registered();
         Self {
             header: ObjectHeader::new(TypeId::GENERATOR),
             state_header: GeneratorHeader::new(),
@@ -204,6 +210,7 @@ impl GeneratorObject {
     /// Creates a generator with specific flags (e.g., for async generators).
     #[inline]
     pub fn with_flags(code: Arc<CodeObject>, flags: GeneratorFlags) -> Self {
+        ensure_generator_gc_dispatch_registered();
         Self {
             header: ObjectHeader::new(type_id_for_flags(flags)),
             state_header: GeneratorHeader::new(),
@@ -533,6 +540,16 @@ impl GeneratorObject {
     pub fn is_async(&self) -> bool {
         self.flags.contains(GeneratorFlags::IS_ASYNC)
     }
+
+    #[inline]
+    fn size_of(&self) -> usize {
+        let boxed_storage = if self.storage.is_boxed() {
+            self.storage.capacity() * mem::size_of::<Value>()
+        } else {
+            0
+        };
+        mem::size_of::<Self>() + boxed_storage
+    }
 }
 
 impl Clone for GeneratorObject {
@@ -596,4 +613,31 @@ unsafe impl Trace for GeneratorObject {
 fn object_type_id(ptr: *const ()) -> TypeId {
     let header = ptr as *const ObjectHeader;
     unsafe { (*header).type_id }
+}
+
+fn ensure_generator_gc_dispatch_registered() {
+    GENERATOR_GC_DISPATCH_ONCE.call_once(|| {
+        let entry = DispatchEntry {
+            trace: trace_generator_object,
+            size: size_generator_object,
+            finalize: finalize_generator_object,
+        };
+        register_external_dispatch(TypeId::GENERATOR, entry);
+        register_external_dispatch(TypeId::COROUTINE, entry);
+        register_external_dispatch(TypeId::ASYNC_GENERATOR, entry);
+    });
+}
+
+unsafe fn trace_generator_object(ptr: *const (), tracer: &mut dyn Tracer) {
+    let object = unsafe { &*(ptr as *const GeneratorObject) };
+    object.trace(tracer);
+}
+
+unsafe fn size_generator_object(ptr: *const ()) -> usize {
+    let object = unsafe { &*(ptr as *const GeneratorObject) };
+    object.size_of()
+}
+
+unsafe fn finalize_generator_object(ptr: *mut ()) {
+    unsafe { std::ptr::drop_in_place(ptr as *mut GeneratorObject) };
 }
