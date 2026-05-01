@@ -21,6 +21,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::method_dispatch::load_method::BoundMethodTarget;
 use crate::stdlib::generators::{AsyncGeneratorOperationObject, GeneratorFlags, GeneratorObject};
 use prism_code::Instruction;
 use prism_core::Value;
@@ -90,7 +91,7 @@ fn try_native_anext(value: &Value) -> Option<Value> {
 /// Result of looking up __anext__ method.
 enum ANextLookup {
     /// Method found, ready to call.
-    Found(Value),
+    Found(BoundMethodTarget),
     /// No __anext__ method on the type.
     NotFound,
     /// Error during lookup.
@@ -111,8 +112,8 @@ fn lookup_anext_method(vm: &VirtualMachine, obj: Value) -> ANextLookup {
 #[inline]
 fn call_anext_method(
     vm: &mut VirtualMachine,
-    method: Value,
-    obj: Value,
+    method: BoundMethodTarget,
+    _obj: Value,
 ) -> Result<Value, RuntimeError> {
-    call_unary_magic_method(vm, method, obj, "__anext__")
+    call_unary_magic_method(vm, method)
 }

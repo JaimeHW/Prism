@@ -20,6 +20,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::method_dispatch::load_method::BoundMethodTarget;
 use crate::stdlib::generators::{AsyncGeneratorOperationObject, GeneratorObject};
 use prism_code::Instruction;
 use prism_core::Value;
@@ -119,7 +120,7 @@ fn is_iterable_coroutine(value: &Value) -> bool {
 /// Result of looking up __await__ method.
 enum AwaitLookup {
     /// Method found, ready to call.
-    Found(Value),
+    Found(BoundMethodTarget),
     /// No __await__ method on the type.
     NotFound,
     /// Error during lookup.
@@ -140,8 +141,8 @@ fn lookup_await_method(vm: &VirtualMachine, obj: Value) -> AwaitLookup {
 #[inline]
 fn call_await_method(
     vm: &mut VirtualMachine,
-    method: Value,
-    obj: Value,
+    method: BoundMethodTarget,
+    _obj: Value,
 ) -> Result<Value, RuntimeError> {
-    call_unary_magic_method(vm, method, obj, "__await__")
+    call_unary_magic_method(vm, method)
 }

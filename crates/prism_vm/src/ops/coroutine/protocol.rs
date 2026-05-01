@@ -6,13 +6,11 @@
 //! - zero-allocation unary method invocation fast paths
 
 use crate::VirtualMachine;
-use crate::builtins::BuiltinFunctionObject;
 use crate::error::RuntimeError;
-use crate::ops::attribute::is_user_defined_type;
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
 use prism_core::Value;
 use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::descriptor::BoundMethod;
-use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
 
 /// Extract TypeId from an object pointer.
@@ -49,83 +47,29 @@ pub(crate) fn is_iterator(value: &Value) -> bool {
     matches!(extract_type_id(ptr), TypeId::ITERATOR | TypeId::GENERATOR)
 }
 
-/// Look up a magic method on object instance storage.
-///
-/// Current runtime support resolves instance-level attributes on shaped objects.
-/// Type/MRO lookup can be layered on top once class registry dispatch is fully wired.
+/// Look up a special method using Prism's normal type/MRO binding path.
 #[inline]
 pub(crate) fn lookup_magic_method(
     _vm: &VirtualMachine,
     obj: Value,
     method_name: &str,
-) -> Result<Option<Value>, RuntimeError> {
-    let Some(ptr) = obj.as_object_ptr() else {
-        return Ok(None);
-    };
-
-    let type_id = extract_type_id(ptr);
-    if type_id == TypeId::OBJECT || is_user_defined_type(type_id) {
-        let shaped = unsafe { &*(ptr as *const ShapedObject) };
-        return Ok(shaped.get_property(method_name));
+) -> Result<Option<BoundMethodTarget>, RuntimeError> {
+    match resolve_special_method(obj, method_name) {
+        Ok(target) => Ok(Some(target)),
+        Err(err) if err.is_attribute_error() => Ok(None),
+        Err(err) => Err(err),
     }
-
-    Ok(None)
 }
 
-/// Invoke an already-resolved unary magic method (`method(obj)`).
-///
-/// This path currently supports native builtin-function objects directly.
+/// Invoke an already-resolved unary special method.
 #[inline]
 pub(crate) fn call_unary_magic_method(
-    _vm: &mut VirtualMachine,
-    method: Value,
-    obj: Value,
-    method_name: &'static str,
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
 ) -> Result<Value, RuntimeError> {
-    let Some(ptr) = method.as_object_ptr() else {
-        return Err(RuntimeError::type_error(format!(
-            "'{}' attribute is not callable",
-            method_name
-        )));
-    };
-
-    match extract_type_id(ptr) {
-        TypeId::BUILTIN_FUNCTION => {
-            let builtin = unsafe { &*(ptr as *const BuiltinFunctionObject) };
-            builtin
-                .call(&[obj])
-                .map_err(|e| RuntimeError::type_error(e.to_string()))
-        }
-        TypeId::METHOD => {
-            let bound = unsafe { &*(ptr as *const BoundMethod) };
-            let function = bound.function();
-            let instance = bound.instance();
-
-            let Some(function_ptr) = function.as_object_ptr() else {
-                return Err(RuntimeError::type_error(format!(
-                    "bound '{}' method has non-callable function",
-                    method_name
-                )));
-            };
-
-            match extract_type_id(function_ptr) {
-                TypeId::BUILTIN_FUNCTION => {
-                    let builtin = unsafe { &*(function_ptr as *const BuiltinFunctionObject) };
-                    builtin
-                        .call(&[instance])
-                        .map_err(|e| RuntimeError::type_error(e.to_string()))
-                }
-                other => Err(RuntimeError::internal(format!(
-                    "bound '{}' method target '{}' is not integrated yet",
-                    method_name,
-                    other.name()
-                ))),
-            }
-        }
-        other => Err(RuntimeError::type_error(format!(
-            "'{}' attribute '{}' is not callable",
-            other.name(),
-            method_name
-        ))),
+    if let Some(self_arg) = target.implicit_self {
+        invoke_callable_value(vm, target.callable, &[self_arg])
+    } else {
+        invoke_callable_value(vm, target.callable, &[])
     }
 }

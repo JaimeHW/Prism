@@ -22,6 +22,7 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::ops::method_dispatch::load_method::BoundMethodTarget;
 use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_code::Instruction;
 use prism_core::Value;
@@ -111,7 +112,7 @@ fn has_anext_method(vm: &VirtualMachine, value: &Value) -> bool {
 /// Result of looking up __aiter__ method.
 enum AIterLookup {
     /// Method found, ready to call.
-    Found(Value),
+    Found(BoundMethodTarget),
     /// No __aiter__ method on the type.
     NotFound,
     /// Error during lookup.
@@ -132,8 +133,8 @@ fn lookup_aiter_method(vm: &VirtualMachine, obj: Value) -> AIterLookup {
 #[inline]
 fn call_aiter_method(
     vm: &mut VirtualMachine,
-    method: Value,
-    obj: Value,
+    method: BoundMethodTarget,
+    _obj: Value,
 ) -> Result<Value, RuntimeError> {
-    call_unary_magic_method(vm, method, obj, "__aiter__")
+    call_unary_magic_method(vm, method)
 }

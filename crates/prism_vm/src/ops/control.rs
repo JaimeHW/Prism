@@ -12,7 +12,7 @@ use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_specia
 use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{AsyncGeneratorOperationObject, GeneratorObject};
 use crate::vm::{AsyncGeneratorOperationOutcome, GeneratorResumeOutcome};
-use prism_code::Instruction;
+use prism_code::{CodeFlags, Instruction};
 use prism_core::Value;
 
 // =============================================================================
@@ -196,7 +196,7 @@ pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let src = inst.src1().0;
 
     let delegated = vm.current_frame().get_reg(src);
-    let iterator = match ensure_iterator_value(vm, delegated) {
+    let iterator = match yield_from_delegate_value(vm, delegated) {
         Ok(iterator) => iterator,
         Err(err) => return ControlFlow::Error(err),
     };
@@ -219,6 +219,29 @@ pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
         Err(err) => ControlFlow::Error(err),
     }
+}
+
+#[inline]
+fn yield_from_delegate_value(
+    vm: &mut VirtualMachine,
+    delegated: Value,
+) -> Result<Value, RuntimeError> {
+    if let Some(generator) = GeneratorObject::from_value(delegated) {
+        if generator.is_coroutine() && !current_frame_accepts_native_await(vm) {
+            return Err(RuntimeError::type_error(
+                "'coroutine' object is not iterable",
+            ));
+        }
+        return Ok(delegated);
+    }
+
+    ensure_iterator_value(vm, delegated)
+}
+
+#[inline]
+fn current_frame_accepts_native_await(vm: &VirtualMachine) -> bool {
+    let flags = vm.current_frame().code.flags;
+    flags.contains(CodeFlags::COROUTINE) || flags.contains(CodeFlags::ASYNC_GENERATOR)
 }
 
 enum YieldFromStep {
