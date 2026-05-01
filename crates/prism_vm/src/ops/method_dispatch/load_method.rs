@@ -40,6 +40,7 @@ use prism_runtime::object::type_builtins::{
     builtin_class_mro, class_id_to_type_id, global_class, global_class_version,
 };
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::object::views::DescriptorViewObject;
 use std::sync::Arc;
 
 use super::builtin_methods;
@@ -340,11 +341,11 @@ fn resolve_type_object_special_method(
     if let Some(class) = class_object_from_type_ptr(ptr)
         && let Some(value) = lookup_class_metaclass_attr(class, &interned_name)
     {
-        return Ok(cached_method_from_value(value));
+        return Ok(cached_type_object_special_method_from_value(value));
     }
 
     crate::builtins::builtin_bound_type_attribute_value_static(TypeId::TYPE, obj, &interned_name)?
-        .map(cached_method_from_value)
+        .map(cached_builtin_type_object_special_method_from_value)
         .ok_or_else(|| RuntimeError::attribute_error("type", name))
 }
 
@@ -416,12 +417,58 @@ fn cached_method_from_value(value: Value) -> CachedMethod {
 }
 
 #[inline]
+fn cached_type_object_special_method_from_value(value: Value) -> CachedMethod {
+    reflected_descriptor_callable(value)
+        .map(CachedMethod::simple)
+        .unwrap_or_else(|| cached_method_from_value(value))
+}
+
+#[inline]
+fn cached_builtin_type_object_special_method_from_value(value: Value) -> CachedMethod {
+    let Some(ptr) = value.as_object_ptr() else {
+        return CachedMethod::descriptor(value);
+    };
+
+    if let Some(callable) = reflected_descriptor_callable(value) {
+        return CachedMethod::simple(callable);
+    }
+
+    match extract_type_id(ptr) {
+        TypeId::BUILTIN_FUNCTION => CachedMethod::simple(value),
+        _ => cached_method_from_value(value),
+    }
+}
+
+#[inline]
+fn reflected_descriptor_callable(value: Value) -> Option<Value> {
+    let ptr = value.as_object_ptr()?;
+    let descriptor_type = extract_type_id(ptr);
+    if !matches!(
+        descriptor_type,
+        TypeId::WRAPPER_DESCRIPTOR | TypeId::METHOD_DESCRIPTOR | TypeId::CLASSMETHOD_DESCRIPTOR
+    ) {
+        return None;
+    }
+
+    let descriptor = unsafe { &*(ptr as *const DescriptorViewObject) };
+    crate::builtins::reflected_descriptor_callable_value(
+        descriptor_type,
+        descriptor.owner(),
+        descriptor.name(),
+    )
+}
+
+#[inline]
 fn cached_method_from_user_class_slot(slot: MethodSlot) -> CachedMethod {
     let Some(ptr) = slot.value.as_object_ptr() else {
         return CachedMethod::descriptor(slot.value);
     };
 
     match extract_type_id(ptr) {
+        // Reflected builtin descriptors keep descriptor binding semantics when
+        // copied into a Python class body, so instance lookup must still pass
+        // the receiver as the first argument.
+        TypeId::WRAPPER_DESCRIPTOR | TypeId::METHOD_DESCRIPTOR => CachedMethod::simple(slot.value),
         TypeId::FUNCTION | TypeId::CLOSURE => CachedMethod::simple(slot.value),
         TypeId::BUILTIN_FUNCTION
             if slot.defining_class.0 >= TypeId::FIRST_USER_TYPE
@@ -479,7 +526,7 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
     // TODO: Implement full MRO traversal when type system is complete
 
     // Check for builtin methods based on type
-    match type_id {
+    let resolved = match type_id {
         TypeId::OBJECT => super::resolve_builtin_instance_method(TypeId::OBJECT, name)
             .ok_or_else(|| RuntimeError::attribute_error("object", name)),
         TypeId::DEQUE => resolve_deque_method(name),
@@ -524,7 +571,28 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
             // For now, return AttributeError
             Err(RuntimeError::attribute_error(type_id.name(), name))
         }
+    };
+
+    match resolved {
+        Ok(cached) => Ok(cached),
+        Err(err) if err.is_attribute_error() => {
+            match resolve_reflected_builtin_instance_method(obj, type_id, name)? {
+                Some(cached) => Ok(cached),
+                None => Err(err),
+            }
+        }
+        Err(err) => Err(err),
     }
+}
+
+fn resolve_reflected_builtin_instance_method(
+    obj: Value,
+    type_id: TypeId,
+    name: &str,
+) -> Result<Option<CachedMethod>, RuntimeError> {
+    let interned_name = prism_core::intern::intern(name);
+    crate::builtins::builtin_bound_type_attribute_value_static(type_id, obj, &interned_name)
+        .map(|value| value.map(CachedMethod::descriptor))
 }
 
 fn resolve_type_object_method(obj: Value, name: &str) -> Result<CachedMethod, RuntimeError> {

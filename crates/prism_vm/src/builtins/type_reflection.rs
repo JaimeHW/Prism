@@ -211,6 +211,7 @@ enum ReflectedValueKind {
     QualNameString,
     ModuleString,
     FlagsValue,
+    NoneValue,
     WrapperDescriptor,
     MethodDescriptor,
     ClassMethodDescriptor,
@@ -227,6 +228,11 @@ struct AttrSpec {
 const NEW_WRAPPER_ATTR: AttrSpec = AttrSpec {
     name: "__new__",
     kind: ReflectedValueKind::WrapperDescriptor,
+};
+
+const HASH_NONE_ATTR: AttrSpec = AttrSpec {
+    name: "__hash__",
+    kind: ReflectedValueKind::NoneValue,
 };
 
 const TYPE_ATTRS: &[AttrSpec] = &[
@@ -343,6 +349,7 @@ const BYTES_TYPE_ATTRS: &[AttrSpec] = &[
 
 const BYTEARRAY_TYPE_ATTRS: &[AttrSpec] = &[
     NEW_WRAPPER_ATTR,
+    HASH_NONE_ATTR,
     AttrSpec {
         name: "__init__",
         kind: ReflectedValueKind::WrapperDescriptor,
@@ -359,12 +366,13 @@ const BYTEARRAY_TYPE_ATTRS: &[AttrSpec] = &[
 
 const MEMORYVIEW_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
-const LIST_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
+const LIST_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR, HASH_NONE_ATTR];
 
 const TUPLE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
 const DICT_TYPE_ATTRS: &[AttrSpec] = &[
     NEW_WRAPPER_ATTR,
+    HASH_NONE_ATTR,
     AttrSpec {
         name: "__init__",
         kind: ReflectedValueKind::WrapperDescriptor,
@@ -381,6 +389,7 @@ const DICT_TYPE_ATTRS: &[AttrSpec] = &[
 
 const SET_TYPE_ATTRS: &[AttrSpec] = &[
     NEW_WRAPPER_ATTR,
+    HASH_NONE_ATTR,
     AttrSpec {
         name: "__init__",
         kind: ReflectedValueKind::WrapperDescriptor,
@@ -394,6 +403,10 @@ const FROZENSET_TYPE_ATTRS: &[AttrSpec] = &[
         kind: ReflectedValueKind::WrapperDescriptor,
     },
 ];
+
+const DICT_VIEW_TYPE_ATTRS: &[AttrSpec] = &[HASH_NONE_ATTR];
+
+const DEQUE_TYPE_ATTRS: &[AttrSpec] = &[HASH_NONE_ATTR];
 
 const MODULE_TYPE_ATTRS: &[AttrSpec] = &[NEW_WRAPPER_ATTR];
 
@@ -672,6 +685,8 @@ fn builtin_type_attr_specs(type_id: TypeId) -> &'static [AttrSpec] {
         TypeId::DICT => DICT_TYPE_ATTRS,
         TypeId::SET => SET_TYPE_ATTRS,
         TypeId::FROZENSET => FROZENSET_TYPE_ATTRS,
+        TypeId::DICT_KEYS | TypeId::DICT_VALUES | TypeId::DICT_ITEMS => DICT_VIEW_TYPE_ATTRS,
+        TypeId::DEQUE => DEQUE_TYPE_ATTRS,
         TypeId::MODULE => MODULE_TYPE_ATTRS,
         TypeId::ENUMERATE => ENUMERATE_TYPE_ATTRS,
         TypeId::FUNCTION => FUNCTION_TYPE_ATTRS,
@@ -808,7 +823,8 @@ fn descriptor_type_id(kind: ReflectedValueKind) -> Option<TypeId> {
         | ReflectedValueKind::NameString
         | ReflectedValueKind::QualNameString
         | ReflectedValueKind::ModuleString
-        | ReflectedValueKind::FlagsValue => None,
+        | ReflectedValueKind::FlagsValue
+        | ReflectedValueKind::NoneValue => None,
     }
 }
 
@@ -1258,6 +1274,7 @@ fn materialize_attr_value(
             _ => "builtins",
         }))),
         ReflectedValueKind::FlagsValue => Ok(python_type_flags_value_for_builtin(owner)),
+        ReflectedValueKind::NoneValue => Ok(Value::none()),
         other => {
             let type_id = descriptor_type_id(other)
                 .expect("descriptor type id required for non-mapping-proxy reflection");
@@ -1300,6 +1317,7 @@ fn materialize_attr_value_static(
             _ => "builtins",
         }))),
         ReflectedValueKind::FlagsValue => Ok(python_type_flags_value_for_builtin(owner)),
+        ReflectedValueKind::NoneValue => Ok(Value::none()),
         other => {
             let type_id = descriptor_type_id(other)
                 .expect("descriptor type id required for non-mapping-proxy reflection");
@@ -1664,7 +1682,11 @@ pub(crate) fn builtin_type_attribute_value(
         return materialize_attr_value(vm, owner, name, kind).map(Some);
     }
 
-    builtin_mapping_proxy_attribute_value(vm, owner, name)
+    if let Some(value) = builtin_mapping_proxy_attribute_value(vm, owner, name)? {
+        return Ok(Some(value));
+    }
+
+    builtin_inherited_type_attribute_value(vm, owner, name)
 }
 
 pub(crate) fn builtin_type_attribute_value_static(
@@ -1675,7 +1697,46 @@ pub(crate) fn builtin_type_attribute_value_static(
         return materialize_attr_value_static(owner, name, kind).map(Some);
     }
 
-    builtin_mapping_proxy_attribute_value_static(owner, name)
+    if let Some(value) = builtin_mapping_proxy_attribute_value_static(owner, name)? {
+        return Ok(Some(value));
+    }
+
+    builtin_inherited_type_attribute_value_static(owner, name)
+}
+
+fn builtin_inherited_type_attribute_value(
+    vm: &mut VirtualMachine,
+    owner: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    for class_id in builtin_class_mro(owner).into_iter().skip(1) {
+        if class_id.0 >= TypeId::FIRST_USER_TYPE {
+            continue;
+        }
+        let inherited_owner = class_id_to_type_id(class_id);
+        if let Some(value) = builtin_mapping_proxy_attribute_value(vm, inherited_owner, name)? {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
+fn builtin_inherited_type_attribute_value_static(
+    owner: TypeId,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    for class_id in builtin_class_mro(owner).into_iter().skip(1) {
+        if class_id.0 >= TypeId::FIRST_USER_TYPE {
+            continue;
+        }
+        let inherited_owner = class_id_to_type_id(class_id);
+        if let Some(value) = builtin_mapping_proxy_attribute_value_static(inherited_owner, name)? {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn builtin_bound_type_attribute_value(
@@ -1832,11 +1893,31 @@ fn bind_reflected_descriptor_if_needed(
         return value;
     };
     let descriptor_type = crate::ops::objects::extract_type_id(ptr);
-    let Some(target) = reflected_descriptor_callable_value(descriptor_type, owner, name) else {
+    let (descriptor_owner, descriptor_name) = if descriptor_type_id_matches_view(descriptor_type) {
+        let descriptor = unsafe { &*(ptr as *const DescriptorViewObject) };
+        (descriptor.owner(), descriptor.name())
+    } else {
+        (owner, name)
+    };
+    let Some(target) =
+        reflected_descriptor_callable_value(descriptor_type, descriptor_owner, descriptor_name)
+    else {
         return value;
     };
 
     crate::ops::objects::bind_cached_builtin_method(target, owner_value)
+}
+
+#[inline]
+fn descriptor_type_id_matches_view(type_id: TypeId) -> bool {
+    matches!(
+        type_id,
+        TypeId::WRAPPER_DESCRIPTOR
+            | TypeId::METHOD_DESCRIPTOR
+            | TypeId::CLASSMETHOD_DESCRIPTOR
+            | TypeId::GETSET_DESCRIPTOR
+            | TypeId::MEMBER_DESCRIPTOR
+    )
 }
 
 #[inline]
@@ -1851,7 +1932,18 @@ fn should_bind_builtin_type_callable(owner_value: Value) -> bool {
 
 #[inline]
 pub(crate) fn builtin_type_has_attribute(owner: TypeId, name: &InternedString) -> bool {
-    reflected_type_attr_kind(name).is_some() || reflected_builtin_attr_kind(owner, name).is_some()
+    if reflected_type_attr_kind(name).is_some()
+        || reflected_builtin_attr_kind(owner, name).is_some()
+    {
+        return true;
+    }
+
+    builtin_class_mro(owner)
+        .into_iter()
+        .skip(1)
+        .filter(|class_id| class_id.0 < TypeId::FIRST_USER_TYPE)
+        .map(class_id_to_type_id)
+        .any(|inherited_owner| reflected_builtin_attr_kind(inherited_owner, name).is_some())
 }
 
 pub(crate) fn heap_type_attribute_value(
