@@ -6,7 +6,11 @@
 //! export list before full OS socket handles are implemented.
 
 use super::{Module, ModuleError, ModuleResult};
-use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::VirtualMachine;
+use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
+use crate::ops::calls::invoke_callable_value;
+use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::class::{ClassFlags, PyClassObject};
@@ -17,6 +21,7 @@ use prism_runtime::object::type_builtins::{
 };
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
@@ -157,8 +162,9 @@ static SOCKET_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_socket_c
 static DEFAULT_TIMEOUT: Mutex<Option<f64>> = Mutex::new(None);
 static NEXT_SOCKET_FD: AtomicI64 = AtomicI64::new(10_000);
 
-static SOCKET_INIT_METHOD: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.__init__"), socket_init));
+static SOCKET_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.__init__"), socket_init)
+});
 static SOCKET_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.close"), socket_close));
 static SOCKET_DETACH_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -193,11 +199,11 @@ static SOCKET_GETSOCKOPT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new
 });
 
 static CMSG_LEN_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.CMSG_LEN"), cmsg_len));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.CMSG_LEN"), cmsg_len));
 static CMSG_SPACE_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.CMSG_SPACE"), cmsg_space));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.CMSG_SPACE"), cmsg_space));
 static GETADDRINFO_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_socket.getaddrinfo"), socket_getaddrinfo)
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.getaddrinfo"), socket_getaddrinfo)
 });
 static GETDEFAULTTIMEOUT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
@@ -221,7 +227,7 @@ static GETHOSTNAME_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| 
     BuiltinFunctionObject::new(Arc::from("_socket.gethostname"), socket_gethostname)
 });
 static GETNAMEINFO_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_socket.getnameinfo"), socket_getnameinfo)
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.getnameinfo"), socket_getnameinfo)
 });
 static GETPROTOBYNAME_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_socket.getprotobyname"), socket_getprotobyname)
@@ -230,24 +236,26 @@ static GETSERVBYNAME_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
     BuiltinFunctionObject::new(Arc::from("_socket.getservbyname"), socket_getservbyname)
 });
 static GETSERVBYPORT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(Arc::from("_socket.getservbyport"), socket_getservbyport)
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.getservbyport"), socket_getservbyport)
 });
 static HTONL_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.htonl"), socket_htonl));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.htonl"), socket_htonl));
 static HTONS_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.htons"), socket_htons));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.htons"), socket_htons));
 static INET_ATON_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.inet_aton"), socket_inet_aton));
 static INET_NTOA_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.inet_ntoa"), socket_inet_ntoa));
-static INET_NTOP_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.inet_ntop"), socket_inet_ntop));
-static INET_PTON_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.inet_pton"), socket_inet_pton));
+static INET_NTOP_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.inet_ntop"), socket_inet_ntop)
+});
+static INET_PTON_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.inet_pton"), socket_inet_pton)
+});
 static NTOHL_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.ntohl"), socket_ntohl));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.ntohl"), socket_ntohl));
 static NTOHS_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.ntohs"), socket_ntohs));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.ntohs"), socket_ntohs));
 static SETDEFAULTTIMEOUT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("_socket.setdefaulttimeout"),
@@ -424,7 +432,7 @@ fn build_socket_class() -> Arc<PyClassObject> {
     class
 }
 
-fn socket_init(args: &[Value]) -> Result<Value, BuiltinError> {
+fn socket_init(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.is_empty() || args.len() > 5 {
         return Err(BuiltinError::TypeError(format!(
             "socket.__init__() takes at most 4 arguments ({} given)",
@@ -432,26 +440,29 @@ fn socket_init(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let family = int_arg(
+    let family = int_arg_vm(
+        vm,
         args.get(1)
             .copied()
             .unwrap_or_else(|| Value::int(-1).unwrap()),
         "family",
     )?;
-    let kind = int_arg(
+    let kind = int_arg_vm(
+        vm,
         args.get(2)
             .copied()
             .unwrap_or_else(|| Value::int(-1).unwrap()),
         "type",
     )?;
-    let proto = int_arg(
+    let proto = int_arg_vm(
+        vm,
         args.get(3)
             .copied()
             .unwrap_or_else(|| Value::int(-1).unwrap()),
         "proto",
     )?;
     let fileno = match args.get(4).copied() {
-        Some(value) if !value.is_none() => int_arg(value, "fileno")?,
+        Some(value) if !value.is_none() => int_arg_vm(vm, value, "fileno")?,
         _ => NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed),
     };
 
@@ -651,7 +662,7 @@ fn socket_gethostbyaddr(args: &[Value]) -> Result<Value, BuiltinError> {
     ]))
 }
 
-fn socket_getaddrinfo(args: &[Value]) -> Result<Value, BuiltinError> {
+fn socket_getaddrinfo(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if !(2..=6).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
             "getaddrinfo() takes 2 to 6 arguments ({} given)",
@@ -663,10 +674,10 @@ fn socket_getaddrinfo(args: &[Value]) -> Result<Value, BuiltinError> {
     } else {
         string_arg(args[0], "host")?
     };
-    let port = port_number(args[1])?;
-    let family = optional_i64_arg(args.get(2).copied(), 0, "family")?;
-    let kind = optional_i64_arg(args.get(3).copied(), 0, "type")?;
-    let proto = optional_i64_arg(args.get(4).copied(), 0, "proto")?;
+    let port = port_number(vm, args[1])?;
+    let family = optional_i64_arg_vm(vm, args.get(2).copied(), 0, "family")?;
+    let kind = optional_i64_arg_vm(vm, args.get(3).copied(), 0, "type")?;
+    let proto = optional_i64_arg_vm(vm, args.get(4).copied(), 0, "proto")?;
     let family = if family == 0 { 2 } else { family };
     let kind = if kind == 0 { 1 } else { kind };
     let sockaddr = if family == AF_INET6_VALUE {
@@ -692,12 +703,15 @@ fn socket_getaddrinfo(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(list_value(vec![entry]))
 }
 
-fn socket_getnameinfo(args: &[Value]) -> Result<Value, BuiltinError> {
+fn socket_getnameinfo(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if !(1..=2).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
             "getnameinfo() takes 1 or 2 arguments ({} given)",
             args.len()
         )));
+    }
+    if let Some(flags) = args.get(1).copied() {
+        let _ = int_arg_vm(vm, flags, "flags")?;
     }
     Ok(tuple_value(vec![
         Value::string(intern("localhost")),
@@ -737,14 +751,14 @@ fn socket_getservbyname(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::int(port).unwrap())
 }
 
-fn socket_getservbyport(args: &[Value]) -> Result<Value, BuiltinError> {
+fn socket_getservbyport(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if !(1..=2).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
             "getservbyport() takes 1 or 2 arguments ({} given)",
             args.len()
         )));
     }
-    let port = int_arg(args[0], "port")?;
+    let port = int_arg_vm(vm, args[0], "port")?;
     let service = match port {
         80 => "http",
         443 => "https",
@@ -755,20 +769,20 @@ fn socket_getservbyport(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::string(intern(service)))
 }
 
-fn socket_htonl(args: &[Value]) -> Result<Value, BuiltinError> {
-    convert_u32(args, "htonl", u32::to_be)
+fn socket_htonl(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    convert_u32(vm, args, "htonl", u32::to_be)
 }
 
-fn socket_ntohl(args: &[Value]) -> Result<Value, BuiltinError> {
-    convert_u32(args, "ntohl", u32::from_be)
+fn socket_ntohl(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    convert_u32(vm, args, "ntohl", u32::from_be)
 }
 
-fn socket_htons(args: &[Value]) -> Result<Value, BuiltinError> {
-    convert_u16(args, "htons", u16::to_be)
+fn socket_htons(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    convert_u16(vm, args, "htons", u16::to_be)
 }
 
-fn socket_ntohs(args: &[Value]) -> Result<Value, BuiltinError> {
-    convert_u16(args, "ntohs", u16::from_be)
+fn socket_ntohs(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    convert_u16(vm, args, "ntohs", u16::from_be)
 }
 
 fn socket_inet_aton(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -804,14 +818,14 @@ fn socket_inet_ntoa(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::string(intern(&Ipv4Addr::from(octets).to_string())))
 }
 
-fn socket_inet_pton(args: &[Value]) -> Result<Value, BuiltinError> {
+fn socket_inet_pton(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
             "inet_pton() takes exactly 2 arguments ({} given)",
             args.len()
         )));
     }
-    let family = int_arg(args[0], "family")?;
+    let family = int_arg_vm(vm, args[0], "family")?;
     let addr = string_arg(args[1], "address")?;
     if family == 2 {
         let parsed = addr.parse::<Ipv4Addr>().map_err(|_| {
@@ -830,14 +844,14 @@ fn socket_inet_pton(args: &[Value]) -> Result<Value, BuiltinError> {
     ))
 }
 
-fn socket_inet_ntop(args: &[Value]) -> Result<Value, BuiltinError> {
+fn socket_inet_ntop(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
             "inet_ntop() takes exactly 2 arguments ({} given)",
             args.len()
         )));
     }
-    let family = int_arg(args[0], "family")?;
+    let family = int_arg_vm(vm, args[0], "family")?;
     let bytes = bytes_arg(args[1], "packed IP wrong length for inet_ntop")?;
     if family == 2 && bytes.len() == 4 {
         return Ok(Value::string(intern(
@@ -854,22 +868,27 @@ fn socket_inet_ntop(args: &[Value]) -> Result<Value, BuiltinError> {
     ))
 }
 
-fn cmsg_len(args: &[Value]) -> Result<Value, BuiltinError> {
-    cmsg_size(args, "CMSG_LEN", false)
+fn cmsg_len(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    cmsg_size(vm, args, "CMSG_LEN", false)
 }
 
-fn cmsg_space(args: &[Value]) -> Result<Value, BuiltinError> {
-    cmsg_size(args, "CMSG_SPACE", true)
+fn cmsg_space(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    cmsg_size(vm, args, "CMSG_SPACE", true)
 }
 
-fn cmsg_size(args: &[Value], name: &str, align_payload: bool) -> Result<Value, BuiltinError> {
+fn cmsg_size(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    name: &str,
+    align_payload: bool,
+) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
             "{name}() takes exactly one argument ({} given)",
             args.len()
         )));
     }
-    let payload = usize::try_from(int_arg(args[0], "length")?)
+    let payload = usize::try_from(int_arg_vm(vm, args[0], "length")?)
         .map_err(|_| BuiltinError::OverflowError("CMSG length is too large".to_string()))?;
     let header = 16_usize;
     let total = if align_payload {
@@ -942,17 +961,65 @@ fn timeout_option_value(timeout: Option<f64>) -> Value {
     timeout.map(Value::float).unwrap_or_else(Value::none)
 }
 
-fn int_arg(value: Value, name: &str) -> Result<i64, BuiltinError> {
-    if let Some(flag) = value.as_bool() {
-        return Ok(if flag { 1 } else { 0 });
+fn int_arg_vm(vm: &mut VirtualMachine, value: Value, name: &str) -> Result<i64, BuiltinError> {
+    if let Some(integer) = int_value_to_i64(value)? {
+        return Ok(integer);
     }
-    value
-        .as_int()
-        .ok_or_else(|| BuiltinError::TypeError(format!("{name} must be an integer")))
+
+    let target = match resolve_special_method(value, "__index__") {
+        Ok(target) => target,
+        Err(err) if err.is_attribute_error() => {
+            return Err(BuiltinError::TypeError(format!(
+                "{name} must be an integer"
+            )));
+        }
+        Err(err) => return Err(runtime_error_to_builtin_error(err)),
+    };
+
+    let indexed = invoke_bound_method_no_args(vm, target)?;
+    match int_value_to_i64(indexed)? {
+        Some(integer) => Ok(integer),
+        None => Err(BuiltinError::TypeError(format!(
+            "__index__ returned non-int (type {})",
+            indexed.type_name()
+        ))),
+    }
 }
 
-fn optional_i64_arg(value: Option<Value>, default: i64, name: &str) -> Result<i64, BuiltinError> {
-    value.map_or(Ok(default), |value| int_arg(value, name))
+fn optional_i64_arg_vm(
+    vm: &mut VirtualMachine,
+    value: Option<Value>,
+    default: i64,
+    name: &str,
+) -> Result<i64, BuiltinError> {
+    value.map_or(Ok(default), |value| int_arg_vm(vm, value, name))
+}
+
+fn int_value_to_i64(value: Value) -> Result<Option<i64>, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(Some(i64::from(flag)));
+    }
+
+    let Some(integer) = value_to_bigint(value) else {
+        return Ok(None);
+    };
+
+    integer
+        .to_i64()
+        .map(Some)
+        .ok_or_else(|| BuiltinError::OverflowError("Python int too large to convert".to_string()))
+}
+
+#[inline]
+fn invoke_bound_method_no_args(
+    vm: &mut VirtualMachine,
+    target: BoundMethodTarget,
+) -> Result<Value, BuiltinError> {
+    match target.implicit_self {
+        Some(implicit_self) => invoke_callable_value(vm, target.callable, &[implicit_self]),
+        None => invoke_callable_value(vm, target.callable, &[]),
+    }
+    .map_err(runtime_error_to_builtin_error)
 }
 
 fn string_arg(value: Value, name: &str) -> Result<String, BuiltinError> {
@@ -983,15 +1050,17 @@ fn list_value(items: Vec<Value>) -> Value {
     leak_object_value(ListObject::from_iter(items))
 }
 
-fn port_number(value: Value) -> Result<i64, BuiltinError> {
+fn port_number(vm: &mut VirtualMachine, value: Value) -> Result<i64, BuiltinError> {
     if value.is_none() {
         return Ok(0);
     }
-    if let Some(port) = value.as_int() {
+    if let Some(port) = int_value_to_i64(value)? {
         return Ok(port);
     }
-    let service = string_arg(value, "port")?;
-    Ok(service_port(&service).unwrap_or(0))
+    if let Some(service) = value_as_string_ref(value) {
+        return Ok(service_port(service.as_str()).unwrap_or(0));
+    }
+    int_arg_vm(vm, value, "port")
 }
 
 fn service_port(service: &str) -> Option<i64> {
@@ -1027,6 +1096,7 @@ fn resolve_host_to_ipv6(host: &str) -> &str {
 }
 
 fn convert_u16(
+    vm: &mut VirtualMachine,
     args: &[Value],
     fn_name: &str,
     convert: fn(u16) -> u16,
@@ -1037,12 +1107,13 @@ fn convert_u16(
             args.len()
         )));
     }
-    let value = u16::try_from(int_arg(args[0], "integer")?)
+    let value = u16::try_from(int_arg_vm(vm, args[0], "integer")?)
         .map_err(|_| BuiltinError::OverflowError("unsigned short is out of range".to_string()))?;
     Ok(Value::int(i64::from(convert(value))).unwrap())
 }
 
 fn convert_u32(
+    vm: &mut VirtualMachine,
     args: &[Value],
     fn_name: &str,
     convert: fn(u32) -> u32,
@@ -1053,7 +1124,7 @@ fn convert_u32(
             args.len()
         )));
     }
-    let value = u32::try_from(int_arg(args[0], "integer")?)
+    let value = u32::try_from(int_arg_vm(vm, args[0], "integer")?)
         .map_err(|_| BuiltinError::OverflowError("unsigned int is out of range".to_string()))?;
     Ok(Value::int(i64::from(convert(value))).unwrap())
 }
