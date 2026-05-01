@@ -833,7 +833,7 @@ pub(crate) fn snapshot_module_dict(module: &crate::import::ModuleObject) -> Dict
 }
 
 fn module_attribute_value(
-    _vm: &mut VirtualMachine,
+    vm: &mut VirtualMachine,
     module: &crate::import::ModuleObject,
     name: &InternedString,
 ) -> Result<Value, RuntimeError> {
@@ -841,9 +841,21 @@ fn module_attribute_value(
         return Ok(module.dict_value());
     }
 
-    module
-        .get_attr(name.as_str())
-        .ok_or_else(|| RuntimeError::attribute_error("module", name.as_str()))
+    if let Some(value) = module.get_attr(name.as_str()) {
+        return Ok(value);
+    }
+
+    if name.as_str() != "__getattr__"
+        && let Some(getattr) = module.get_attr("__getattr__")
+    {
+        return crate::ops::calls::invoke_callable_value(
+            vm,
+            getattr,
+            &[Value::string(name.clone())],
+        );
+    }
+
+    Err(RuntimeError::attribute_error("module", name.as_str()))
 }
 
 pub(crate) fn snapshot_current_globals_dict(vm: &VirtualMachine) -> DictObject {
