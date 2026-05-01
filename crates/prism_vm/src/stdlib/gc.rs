@@ -172,19 +172,27 @@ fn builtin_collect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Bui
 
 fn builtin_disable(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_no_args("disable", args)?;
-    GC_STATE.write().unwrap().enabled = false;
+    set_enabled(false);
     Ok(Value::none())
 }
 
 fn builtin_enable(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_no_args("enable", args)?;
-    GC_STATE.write().unwrap().enabled = true;
+    set_enabled(true);
     Ok(Value::none())
 }
 
 fn builtin_isenabled(args: &[Value]) -> Result<Value, BuiltinError> {
     expect_no_args("isenabled", args)?;
-    Ok(Value::bool(GC_STATE.read().unwrap().enabled))
+    Ok(Value::bool(is_enabled()))
+}
+
+pub(crate) fn is_enabled() -> bool {
+    GC_STATE.read().unwrap().enabled
+}
+
+pub(crate) fn set_enabled(enabled: bool) {
+    GC_STATE.write().unwrap().enabled = enabled;
 }
 
 fn builtin_is_tracked(args: &[Value]) -> Result<Value, BuiltinError> {

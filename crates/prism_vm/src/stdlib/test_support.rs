@@ -5,7 +5,7 @@
 //! compatibility targets natively, so individual regression modules can run
 //! before the whole support stack is implemented.
 
-use super::{_thread, Module, ModuleError, ModuleResult};
+use super::{_thread, Module, ModuleError, ModuleResult, gc};
 use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, ExceptionValue, allocate_heap_instance_for_class,
@@ -50,6 +50,7 @@ const SWAP_ITEM_KEY_ATTR: &str = "__prism_swap_item_key__";
 const SWAP_ITEM_VALUE_ATTR: &str = "__prism_swap_item_value__";
 const SWAP_ITEM_OLD_VALUE_ATTR: &str = "__prism_swap_item_old_value__";
 const SWAP_ITEM_HAD_ITEM_ATTR: &str = "__prism_swap_item_had_item__";
+const DISABLE_GC_WAS_ENABLED_ATTR: &str = "__prism_disable_gc_was_enabled__";
 
 static ALWAYS_EQ_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_sentinel_class("_ALWAYS_EQ", &ALWAYS_EQ_METHODS));
@@ -71,6 +72,14 @@ static SWAP_ITEM_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
         "test.support",
         &SWAP_ITEM_ENTER_FUNCTION,
         &SWAP_ITEM_EXIT_FUNCTION,
+    )
+});
+static DISABLE_GC_CONTEXT_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(|| {
+    build_context_manager_class(
+        "_DisableGc",
+        "test.support",
+        &DISABLE_GC_ENTER_FUNCTION,
+        &DISABLE_GC_EXIT_FUNCTION,
     )
 });
 static ALWAYS_EQ_VALUE: LazyLock<Value> =
@@ -131,6 +140,20 @@ static SWAP_ITEM_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new
 });
 static SWAP_ITEM_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("test.support._SwapItem.__exit__"), swap_item_exit)
+});
+static DISABLE_GC_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("test.support.disable_gc"), disable_gc));
+static DISABLE_GC_ENTER_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support._DisableGc.__enter__"),
+        disable_gc_enter,
+    )
+});
+static DISABLE_GC_EXIT_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support._DisableGc.__exit__"),
+        disable_gc_exit,
+    )
 });
 static CPYTHON_ONLY_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("test.support.cpython_only"), cpython_only)
@@ -389,6 +412,7 @@ impl SupportModule {
                 Arc::from("check_impl_detail"),
                 Arc::from("check_free_after_iterating"),
                 Arc::from("check_syntax_error"),
+                Arc::from("disable_gc"),
                 Arc::from("failfast"),
                 Arc::from("has_socket_support"),
                 Arc::from("MISSING_C_DOCSTRINGS"),
@@ -466,6 +490,7 @@ impl Module for SupportModule {
             "check_impl_detail" => Ok(builtin_value(&CHECK_IMPL_DETAIL_FUNCTION)),
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
             "check_syntax_error" => Ok(builtin_value(&CHECK_SYNTAX_ERROR_FUNCTION)),
+            "disable_gc" => Ok(builtin_value(&DISABLE_GC_FUNCTION)),
             "failfast" => Ok(Value::bool(false)),
             "has_socket_support" => Ok(Value::bool(true)),
             "INTERNET_TIMEOUT" => Ok(Value::float(INTERNET_TIMEOUT)),
@@ -846,6 +871,100 @@ fn swap_item_property(object: &ShapedObject, name: &str) -> Result<Value, Builti
     object
         .get_property(name)
         .ok_or_else(|| BuiltinError::TypeError(format!("corrupt _SwapItem object: missing {name}")))
+}
+
+fn disable_gc(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "disable_gc() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut instance = allocate_heap_instance_for_class(DISABLE_GC_CONTEXT_CLASS.as_ref());
+    set_disable_gc_property(
+        &mut instance,
+        DISABLE_GC_WAS_ENABLED_ATTR,
+        Value::bool(false),
+    );
+    Ok(crate::alloc_managed_value(instance))
+}
+
+fn disable_gc_enter(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "__enter__() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let was_enabled = gc::is_enabled();
+    {
+        let object = disable_gc_object_mut(args[0])?;
+        set_disable_gc_property(
+            object,
+            DISABLE_GC_WAS_ENABLED_ATTR,
+            Value::bool(was_enabled),
+        );
+    }
+    gc::set_enabled(false);
+    Ok(Value::none())
+}
+
+fn disable_gc_exit(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "__exit__() takes exactly 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let was_enabled =
+        disable_gc_property(disable_gc_object_ref(args[0])?, DISABLE_GC_WAS_ENABLED_ATTR)?
+            .as_bool()
+            .unwrap_or(false);
+    if was_enabled {
+        gc::set_enabled(true);
+    }
+    Ok(Value::bool(false))
+}
+
+fn disable_gc_object_ref(value: Value) -> Result<&'static ShapedObject, BuiltinError> {
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(disable_gc_receiver_error)?;
+    if extract_type_id(ptr) != DISABLE_GC_CONTEXT_CLASS.class_type_id() {
+        return Err(disable_gc_receiver_error());
+    }
+    Ok(unsafe { &*(ptr as *const ShapedObject) })
+}
+
+fn disable_gc_object_mut(value: Value) -> Result<&'static mut ShapedObject, BuiltinError> {
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(disable_gc_receiver_error)?;
+    if extract_type_id(ptr) != DISABLE_GC_CONTEXT_CLASS.class_type_id() {
+        return Err(disable_gc_receiver_error());
+    }
+    Ok(unsafe { &mut *(ptr as *mut ShapedObject) })
+}
+
+fn disable_gc_receiver_error() -> BuiltinError {
+    BuiltinError::TypeError(
+        "_DisableGc context manager method requires a '_DisableGc' object".into(),
+    )
+}
+
+#[inline]
+fn set_disable_gc_property(object: &mut ShapedObject, name: &str, value: Value) {
+    object.set_property(intern(name), value, shape_registry());
+}
+
+#[inline]
+fn disable_gc_property(object: &ShapedObject, name: &str) -> Result<Value, BuiltinError> {
+    object.get_property(name).ok_or_else(|| {
+        BuiltinError::TypeError(format!("corrupt _DisableGc object: missing {name}"))
+    })
 }
 
 fn mapping_get_optional(
