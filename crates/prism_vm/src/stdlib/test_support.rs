@@ -5,7 +5,7 @@
 //! compatibility targets natively, so individual regression modules can run
 //! before the whole support stack is implemented.
 
-use super::{Module, ModuleError, ModuleResult};
+use super::{_thread, Module, ModuleError, ModuleResult};
 use crate::VirtualMachine;
 use crate::builtins::{
     BuiltinError, BuiltinFunctionObject, ExceptionValue, allocate_heap_instance_for_class,
@@ -29,6 +29,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::int::{bigint_to_value, value_to_i64};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::value_as_string_ref;
+use prism_runtime::types::tuple::TupleObject;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -39,6 +40,11 @@ const BIGMEM_1M: i64 = 1024 * 1024;
 const BIGMEM_1G: i64 = 1024 * BIGMEM_1M;
 const BIGMEM_2G: i64 = 2 * BIGMEM_1G;
 const BIGMEM_4G: i64 = 4 * BIGMEM_1G;
+const LOOPBACK_TIMEOUT: f64 = 10.0;
+const INTERNET_TIMEOUT: f64 = 60.0;
+const SHORT_TIMEOUT: f64 = 30.0;
+const LONG_TIMEOUT: f64 = 5.0 * 60.0;
+const PIPE_MAX_SIZE: i64 = 4 * 1024 * 1024 + 1;
 const SWAP_ITEM_MAPPING_ATTR: &str = "__prism_swap_item_mapping__";
 const SWAP_ITEM_KEY_ATTR: &str = "__prism_swap_item_key__";
 const SWAP_ITEM_VALUE_ATTR: &str = "__prism_swap_item_value__";
@@ -174,6 +180,12 @@ static REQUIRES_SUBPROCESS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock:
         requires_subprocess,
     )
 });
+static REQUIRES_WORKING_SOCKET_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_kw(
+        Arc::from("test.support.requires_working_socket"),
+        requires_working_socket,
+    )
+});
 static NO_TRACING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support.no_tracing"), identity_decorator)
 });
@@ -278,6 +290,18 @@ static REAP_THREADS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(||
         identity_decorator,
     )
 });
+static THREADING_SETUP_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.threading_helper.threading_setup"),
+        threading_setup,
+    )
+});
+static THREADING_CLEANUP_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("test.support.threading_helper.threading_cleanup"),
+        threading_cleanup,
+    )
+});
 static REQUIRES_WORKING_THREADING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("test.support.threading_helper.requires_working_threading"),
@@ -355,12 +379,23 @@ impl SupportModule {
                 Arc::from("check_impl_detail"),
                 Arc::from("check_free_after_iterating"),
                 Arc::from("check_syntax_error"),
+                Arc::from("failfast"),
+                Arc::from("has_socket_support"),
                 Arc::from("MISSING_C_DOCSTRINGS"),
+                Arc::from("INTERNET_TIMEOUT"),
+                Arc::from("LONG_TIMEOUT"),
+                Arc::from("LOOPBACK_TIMEOUT"),
                 Arc::from("MAX_Py_ssize_t"),
+                Arc::from("max_memuse"),
+                Arc::from("MS_WINDOWS"),
                 Arc::from("NHASHBITS"),
                 Arc::from("NEVER_EQ"),
+                Arc::from("PIPE_MAX_SIZE"),
                 Arc::from("Py_DEBUG"),
+                Arc::from("real_max_memuse"),
+                Arc::from("SHORT_TIMEOUT"),
                 Arc::from("TestFailed"),
+                Arc::from("TEST_HOME_DIR"),
                 Arc::from("cpython_only"),
                 Arc::from("gc_collect"),
                 Arc::from("get_attribute"),
@@ -376,6 +411,7 @@ impl SupportModule {
                 Arc::from("os_helper"),
                 Arc::from("requires_resource"),
                 Arc::from("requires_subprocess"),
+                Arc::from("requires_working_socket"),
                 Arc::from("requires_limited_api"),
                 Arc::from("requires_docstrings"),
                 Arc::from("requires_IEEE_754"),
@@ -386,6 +422,7 @@ impl SupportModule {
                 Arc::from("sortdict"),
                 Arc::from("swap_item"),
                 Arc::from("threading_helper"),
+                Arc::from("use_resources"),
                 Arc::from("verbose"),
             ],
         }
@@ -417,17 +454,30 @@ impl Module for SupportModule {
             "check_impl_detail" => Ok(builtin_value(&CHECK_IMPL_DETAIL_FUNCTION)),
             "check_free_after_iterating" => Ok(builtin_value(&CHECK_FREE_AFTER_ITERATING_FUNCTION)),
             "check_syntax_error" => Ok(builtin_value(&CHECK_SYNTAX_ERROR_FUNCTION)),
+            "failfast" => Ok(Value::bool(false)),
+            "has_socket_support" => Ok(Value::bool(true)),
+            "INTERNET_TIMEOUT" => Ok(Value::float(INTERNET_TIMEOUT)),
+            "LONG_TIMEOUT" => Ok(Value::float(LONG_TIMEOUT)),
+            "LOOPBACK_TIMEOUT" => Ok(Value::float(LOOPBACK_TIMEOUT)),
             "MISSING_C_DOCSTRINGS" => Ok(Value::bool(true)),
             "MAX_Py_ssize_t" => Ok(bigint_to_value(BigInt::from(isize::MAX))),
+            "max_memuse" => Ok(Value::int(0).expect("max_memuse fits in tagged int")),
+            "MS_WINDOWS" => Ok(Value::bool(cfg!(windows))),
             "NHASHBITS" => Ok(
                 Value::int((usize::BITS - 1) as i64).expect("hash bit width fits in tagged int")
             ),
             "NEVER_EQ" => Ok(*NEVER_EQ_VALUE),
+            "PIPE_MAX_SIZE" => {
+                Ok(Value::int(PIPE_MAX_SIZE).expect("PIPE_MAX_SIZE fits in tagged int"))
+            }
             "Py_DEBUG" => Ok(Value::bool(false)),
+            "real_max_memuse" => Ok(Value::int(0).expect("real_max_memuse fits in tagged int")),
+            "SHORT_TIMEOUT" => Ok(Value::float(SHORT_TIMEOUT)),
             "TestFailed" => Ok(exception_type_value_for_id(
                 ExceptionTypeId::AssertionError.as_u8() as u16,
             )
             .expect("AssertionError exception type is registered")),
+            "TEST_HOME_DIR" => Ok(Value::string(intern(&test_home_dir()))),
             "cpython_only" => Ok(builtin_value(&CPYTHON_ONLY_FUNCTION)),
             "gc_collect" => Ok(builtin_value(&GC_COLLECT_FUNCTION)),
             "get_attribute" => Ok(builtin_value(&GET_ATTRIBUTE_FUNCTION)),
@@ -442,6 +492,7 @@ impl Module for SupportModule {
             "refcount_test" => Ok(builtin_value(&REFCOUNT_TEST_FUNCTION)),
             "requires_resource" => Ok(builtin_value(&REQUIRES_RESOURCE_FUNCTION)),
             "requires_subprocess" => Ok(builtin_value(&REQUIRES_SUBPROCESS_FUNCTION)),
+            "requires_working_socket" => Ok(builtin_value(&REQUIRES_WORKING_SOCKET_FUNCTION)),
             "requires_limited_api" => Ok(builtin_value(&REQUIRES_LIMITED_API_FUNCTION)),
             "requires_docstrings" => Ok(builtin_value(&REQUIRES_DOCSTRINGS_FUNCTION)),
             "requires_IEEE_754" => Ok(builtin_value(&REQUIRES_IEEE_754_FUNCTION)),
@@ -451,6 +502,7 @@ impl Module for SupportModule {
             "skip_on_s390x" => Ok(builtin_value(&SKIP_ON_S390X_FUNCTION)),
             "sortdict" => Ok(builtin_value(&SORTDICT_FUNCTION)),
             "swap_item" => Ok(builtin_value(&SWAP_ITEM_FUNCTION)),
+            "use_resources" => Ok(Value::none()),
             "verbose" => Ok(Value::int(1).expect("support.verbose fits in tagged int")),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support' has no attribute '{}'",
@@ -538,6 +590,25 @@ fn build_context_manager_class(
 
 fn sentinel_instance(class: &PyClassObject) -> Value {
     crate::alloc_managed_value(allocate_heap_instance_for_class(class))
+}
+
+fn test_home_dir() -> String {
+    if let Some(paths) = std::env::var_os("PYTHONPATH") {
+        for root in std::env::split_paths(&paths) {
+            let candidate = root.join("test");
+            if candidate.is_dir() {
+                return candidate.to_string_lossy().into_owned();
+            }
+            if root.file_name().is_some_and(|name| name == "test") && root.is_dir() {
+                return root.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| Path::new(".").to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[inline]
@@ -1249,6 +1320,49 @@ fn requires_subprocess(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
 }
 
+fn requires_working_socket(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "requires_working_socket() takes no positional arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut module = false;
+    for (keyword, value) in keywords {
+        match *keyword {
+            "module" => module = support_bool_argument(*value),
+            _ => {
+                return Err(BuiltinError::TypeError(format!(
+                    "requires_working_socket() got an unexpected keyword argument '{keyword}'"
+                )));
+            }
+        }
+    }
+
+    if module {
+        Ok(Value::none())
+    } else {
+        Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
+    }
+}
+
+fn support_bool_argument(value: Value) -> bool {
+    if value.is_none() {
+        return false;
+    }
+    if let Some(flag) = value.as_bool() {
+        return flag;
+    }
+    if let Some(integer) = value.as_int() {
+        return integer != 0;
+    }
+    true
+}
+
 fn identity_decorator(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 1 {
         return Err(BuiltinError::TypeError(format!(
@@ -1623,6 +1737,8 @@ impl ThreadingHelperModule {
             attrs: vec![
                 Arc::from("reap_threads"),
                 Arc::from("requires_working_threading"),
+                Arc::from("threading_cleanup"),
+                Arc::from("threading_setup"),
             ],
         }
     }
@@ -1643,6 +1759,8 @@ impl Module for ThreadingHelperModule {
         match name {
             "reap_threads" => Ok(builtin_value(&REAP_THREADS_FUNCTION)),
             "requires_working_threading" => Ok(builtin_value(&REQUIRES_WORKING_THREADING_FUNCTION)),
+            "threading_cleanup" => Ok(builtin_value(&THREADING_CLEANUP_FUNCTION)),
+            "threading_setup" => Ok(builtin_value(&THREADING_SETUP_FUNCTION)),
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'test.support.threading_helper' has no attribute '{}'",
                 name
@@ -1653,6 +1771,30 @@ impl Module for ThreadingHelperModule {
     fn dir(&self) -> Vec<Arc<str>> {
         self.attrs.clone()
     }
+}
+
+fn threading_setup(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "threading_setup() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(crate::alloc_managed_value(TupleObject::from_iter([
+        Value::int(_thread::active_thread_count() as i64).expect("thread count fits in tagged int"),
+        Value::int(0).expect("dangling thread count fits in tagged int"),
+    ])))
+}
+
+fn threading_cleanup(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "threading_cleanup() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(Value::none())
 }
 
 fn requires_working_threading(args: &[Value]) -> Result<Value, BuiltinError> {

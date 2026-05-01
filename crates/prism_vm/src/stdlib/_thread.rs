@@ -225,6 +225,11 @@ static LOCKS_BY_PTR: LazyLock<Mutex<FxHashMap<usize, Arc<NativeLock>>>> =
 static RLOCKS_BY_PTR: LazyLock<Mutex<FxHashMap<usize, Arc<NativeRLock>>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
+#[inline]
+pub(crate) fn active_thread_count() -> u64 {
+    ACTIVE_THREAD_COUNT.load(Ordering::SeqCst)
+}
+
 #[derive(Debug, Default)]
 struct NativeLockState {
     locked: bool,
@@ -412,10 +417,7 @@ fn thread_count(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    Ok(
-        Value::int(ACTIVE_THREAD_COUNT.load(Ordering::SeqCst) as i64)
-            .expect("thread count should fit in i64"),
-    )
+    Ok(Value::int(active_thread_count() as i64).expect("thread count should fit in i64"))
 }
 
 fn thread_is_main_interpreter(args: &[Value]) -> Result<Value, BuiltinError> {
