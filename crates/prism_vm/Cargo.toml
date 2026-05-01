@@ -29,6 +29,7 @@ parking_lot.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
 getrandom.workspace = true
+idna.workspace = true
 
 # Math functions (gamma, erf, etc.)
 libm.workspace = true

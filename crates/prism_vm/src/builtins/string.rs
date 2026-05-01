@@ -683,6 +683,7 @@ fn encode_string(input: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, B
         "utf8" | "utf-8" => encode_utf8(input, policy, "utf-8"),
         "ascii" => encode_ascii(input, policy, "ascii"),
         "latin1" | "latin-1" | "iso-8859-1" => encode_latin1(input, policy, "latin-1"),
+        "idna" => encode_idna(input, policy),
         "raw-unicode-escape" => Ok(encode_raw_unicode_escape(input)),
         _ => Err(BuiltinError::ValueError(format!(
             "unknown encoding: {}",
@@ -699,6 +700,7 @@ fn decode_string(input: &[u8], encoding: &str, errors: &str) -> Result<String, B
         "utf8" | "utf-8" => decode_utf8(input, policy, "utf-8"),
         "ascii" => decode_ascii(input, policy, "ascii"),
         "latin1" | "latin-1" | "iso-8859-1" => decode_latin1(input),
+        "idna" => decode_idna(input, policy),
         "raw-unicode-escape" => decode_raw_unicode_escape(input, policy),
         _ => Err(BuiltinError::ValueError(format!(
             "unknown encoding: {}",
@@ -859,6 +861,33 @@ fn encode_raw_unicode_escape(input: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+fn encode_idna(input: &str, policy: TextCodecErrorPolicy) -> Result<Vec<u8>, BuiltinError> {
+    ensure_idna_strict_policy(policy)?;
+    idna::domain_to_ascii(input)
+        .map(|domain| domain.into_bytes())
+        .map_err(|err| unicode_error(format!("encoding with 'idna' codec failed: {err:?}")))
+}
+
+fn decode_idna(input: &[u8], policy: TextCodecErrorPolicy) -> Result<String, BuiltinError> {
+    ensure_idna_strict_policy(policy)?;
+    let ascii = decode_ascii(input, TextCodecErrorPolicy::Strict, "idna")?;
+    let (domain, result) = idna::domain_to_unicode(&ascii);
+    result
+        .map(|_| domain)
+        .map_err(|err| unicode_error(format!("decoding with 'idna' codec failed: {err:?}")))
+}
+
+fn ensure_idna_strict_policy(policy: TextCodecErrorPolicy) -> Result<(), BuiltinError> {
+    if matches!(policy, TextCodecErrorPolicy::Strict) {
+        Ok(())
+    } else {
+        Err(unicode_error(format!(
+            "Unsupported error handling: {}",
+            policy.name()
+        )))
+    }
 }
 
 fn decode_raw_unicode_escape(
@@ -1303,6 +1332,28 @@ fn unicode_decode_error(
             "'{codec_name}' codec can't decode byte 0x{byte:02x} in position {position}: {reason}",
         ),
     ))
+}
+
+#[inline]
+fn unicode_error(message: String) -> BuiltinError {
+    BuiltinError::Raised(RuntimeError::exception(
+        ExceptionTypeId::UnicodeError.as_u8() as u16,
+        message,
+    ))
+}
+
+impl TextCodecErrorPolicy {
+    #[inline]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Ignore => "ignore",
+            Self::Replace => "replace",
+            Self::BackslashReplace => "backslashreplace",
+            Self::SurrogateEscape => "surrogateescape",
+            Self::SurrogatePass => "surrogatepass",
+        }
+    }
 }
 
 #[inline]

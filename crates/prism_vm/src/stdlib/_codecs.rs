@@ -111,6 +111,8 @@ static UTF8_SIG_CODEC_INFO: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_codec_info(CodecKind::Utf8Sig));
 static RAW_UNICODE_ESCAPE_CODEC_INFO: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_codec_info(CodecKind::RawUnicodeEscape));
+static IDNA_CODEC_INFO: LazyLock<Arc<PyClassObject>> =
+    LazyLock::new(|| build_codec_info(CodecKind::Idna));
 
 static ASCII_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_encode(CodecKind::Ascii));
@@ -132,6 +134,10 @@ static RAW_UNICODE_ESCAPE_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_encode(CodecKind::RawUnicodeEscape));
 static RAW_UNICODE_ESCAPE_CODEC_DECODE: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| codec_method_decode(CodecKind::RawUnicodeEscape));
+static IDNA_CODEC_ENCODE: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| codec_method_encode(CodecKind::Idna));
+static IDNA_CODEC_DECODE: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| codec_method_decode(CodecKind::Idna));
 
 pub(crate) type SharedCodecRegistry = Arc<RwLock<CodecRegistry>>;
 
@@ -146,6 +152,7 @@ enum CodecKind {
     Utf8,
     Utf8Sig,
     RawUnicodeEscape,
+    Idna,
 }
 
 impl CodecKind {
@@ -156,6 +163,7 @@ impl CodecKind {
             Self::Utf8 => "utf-8",
             Self::Utf8Sig => "utf-8-sig",
             Self::RawUnicodeEscape => "raw-unicode-escape",
+            Self::Idna => "idna",
         }
     }
 
@@ -166,6 +174,7 @@ impl CodecKind {
             Self::Utf8 => "utf_8_codec_info",
             Self::Utf8Sig => "utf_8_sig_codec_info",
             Self::RawUnicodeEscape => "raw_unicode_escape_codec_info",
+            Self::Idna => "idna_codec_info",
         }
     }
 
@@ -176,6 +185,7 @@ impl CodecKind {
             Self::Utf8 => &*UTF8_CODEC_INFO,
             Self::Utf8Sig => &*UTF8_SIG_CODEC_INFO,
             Self::RawUnicodeEscape => &*RAW_UNICODE_ESCAPE_CODEC_INFO,
+            Self::Idna => &*IDNA_CODEC_INFO,
         };
         Value::object_ptr(Arc::as_ptr(class) as *const ())
     }
@@ -187,6 +197,7 @@ impl CodecKind {
             Self::Utf8 => &UTF8_CODEC_ENCODE,
             Self::Utf8Sig => &UTF8_SIG_CODEC_ENCODE,
             Self::RawUnicodeEscape => &RAW_UNICODE_ESCAPE_CODEC_ENCODE,
+            Self::Idna => &IDNA_CODEC_ENCODE,
         }
     }
 
@@ -197,6 +208,7 @@ impl CodecKind {
             Self::Utf8 => &UTF8_CODEC_DECODE,
             Self::Utf8Sig => &UTF8_SIG_CODEC_DECODE,
             Self::RawUnicodeEscape => &RAW_UNICODE_ESCAPE_CODEC_DECODE,
+            Self::Idna => &IDNA_CODEC_DECODE,
         }
     }
 }
@@ -686,6 +698,7 @@ fn codec_kind_for_label(label: &str) -> Option<CodecKind> {
         "utf8" | "utf-8" => Some(CodecKind::Utf8),
         "utf-8-sig" | "utf8-sig" => Some(CodecKind::Utf8Sig),
         "raw-unicode-escape" | "rawunicodeescape" => Some(CodecKind::RawUnicodeEscape),
+        "idna" => Some(CodecKind::Idna),
         _ => None,
     }
 }
@@ -800,6 +813,10 @@ fn encode_with_kind(input: &str, kind: CodecKind, errors: &str) -> Result<Vec<u8
             Some(normalized_errors.as_str()),
         )
         .map_err(remap_unknown_error_handler),
+        CodecKind::Idna => {
+            encode_text_to_data(input, Some("idna"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
     }
 }
 
@@ -833,6 +850,10 @@ fn decode_with_kind(input: &[u8], kind: CodecKind, errors: &str) -> Result<Strin
             Some(normalized_errors.as_str()),
         )
         .map_err(remap_unknown_error_handler),
+        CodecKind::Idna => {
+            decode_bytes_to_text(input, Some("idna"), Some(normalized_errors.as_str()))
+                .map_err(remap_unknown_error_handler)
+        }
     }
 }
 
