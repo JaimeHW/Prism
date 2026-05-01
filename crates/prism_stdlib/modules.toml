@@ -342,7 +342,7 @@ policy = "prefer_native"
 
 [[module]]
 name = "threading"
-policy = "prefer_native"
+policy = "prefer_source_when_available"
 
 [[module]]
 name = "time"
