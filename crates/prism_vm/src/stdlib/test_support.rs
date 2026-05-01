@@ -186,6 +186,16 @@ static REQUIRES_WORKING_SOCKET_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyL
         requires_working_socket,
     )
 });
+static REAP_CHILDREN_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("test.support.reap_children"), reap_children)
+});
+static MAYBE_GET_EVENT_LOOP_POLICY_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_vm(
+            Arc::from("test.support.maybe_get_event_loop_policy"),
+            maybe_get_event_loop_policy,
+        )
+    });
 static NO_TRACING_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("test.support.no_tracing"), identity_decorator)
 });
@@ -406,9 +416,11 @@ impl SupportModule {
                 Arc::from("iter_builtin_types"),
                 Arc::from("iter_slot_wrappers"),
                 Arc::from("load_package_tests"),
+                Arc::from("maybe_get_event_loop_policy"),
                 Arc::from("no_tracing"),
                 Arc::from("refcount_test"),
                 Arc::from("os_helper"),
+                Arc::from("reap_children"),
                 Arc::from("requires_resource"),
                 Arc::from("requires_subprocess"),
                 Arc::from("requires_working_socket"),
@@ -488,8 +500,12 @@ impl Module for SupportModule {
             "iter_builtin_types" => Ok(builtin_value(&ITER_BUILTIN_TYPES_FUNCTION)),
             "iter_slot_wrappers" => Ok(builtin_value(&ITER_SLOT_WRAPPERS_FUNCTION)),
             "load_package_tests" => Ok(builtin_value(&LOAD_PACKAGE_TESTS_FUNCTION)),
+            "maybe_get_event_loop_policy" => {
+                Ok(builtin_value(&MAYBE_GET_EVENT_LOOP_POLICY_FUNCTION))
+            }
             "no_tracing" => Ok(builtin_value(&NO_TRACING_FUNCTION)),
             "refcount_test" => Ok(builtin_value(&REFCOUNT_TEST_FUNCTION)),
+            "reap_children" => Ok(builtin_value(&REAP_CHILDREN_FUNCTION)),
             "requires_resource" => Ok(builtin_value(&REQUIRES_RESOURCE_FUNCTION)),
             "requires_subprocess" => Ok(builtin_value(&REQUIRES_SUBPROCESS_FUNCTION)),
             "requires_working_socket" => Ok(builtin_value(&REQUIRES_WORKING_SOCKET_FUNCTION)),
@@ -1347,6 +1363,42 @@ fn requires_working_socket(
         Ok(Value::none())
     } else {
         Ok(builtin_value(&IDENTITY_DECORATOR_FUNCTION))
+    }
+}
+
+fn reap_children(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "reap_children() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    Ok(Value::none())
+}
+
+fn maybe_get_event_loop_policy(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "maybe_get_event_loop_policy() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let module = vm
+        .import_module_named("asyncio.events")
+        .map_err(runtime_error_to_builtin_error)?;
+    let module_value = Value::object_ptr(Arc::as_ptr(&module) as *const ());
+    match crate::ops::objects::get_attribute_value(vm, module_value, &intern("_event_loop_policy"))
+    {
+        Ok(policy) => Ok(policy),
+        Err(err) if matches!(err.kind(), RuntimeErrorKind::AttributeError { .. }) => {
+            Ok(Value::none())
+        }
+        Err(err) => Err(runtime_error_to_builtin_error(err)),
     }
 }
 
