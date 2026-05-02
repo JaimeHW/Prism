@@ -32,15 +32,17 @@ use crate::ops::calls::value_supports_call_protocol;
 use crate::ops::objects::{snapshot_frame_globals_dict, snapshot_frame_locals_dict};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::views::FrameViewObject;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::bigint_to_value;
+use prism_runtime::types::int::{bigint_to_value, value_to_bigint};
 use prism_runtime::types::list::ListObject;
 use prism_runtime::types::tuple::TupleObject;
+use std::cell::Cell;
 use std::sync::{Arc, LazyLock, Mutex};
 
 /// The sys module providing runtime system configuration.
@@ -130,6 +132,20 @@ static GETSWITCHINTERVAL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::n
 static SETSWITCHINTERVAL_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("sys.setswitchinterval"), sys_setswitchinterval)
 });
+static GET_COROUTINE_ORIGIN_TRACKING_DEPTH_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new(
+            Arc::from("sys.get_coroutine_origin_tracking_depth"),
+            sys_get_coroutine_origin_tracking_depth,
+        )
+    });
+static SET_COROUTINE_ORIGIN_TRACKING_DEPTH_FUNCTION: LazyLock<BuiltinFunctionObject> =
+    LazyLock::new(|| {
+        BuiltinFunctionObject::new_kw(
+            Arc::from("sys.set_coroutine_origin_tracking_depth"),
+            sys_set_coroutine_origin_tracking_depth,
+        )
+    });
 static SETTRACE_ALL_THREADS_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("sys._settraceallthreads"),
@@ -154,6 +170,9 @@ static CURRENT_PROFILE_FUNCTION: LazyLock<Mutex<Value>> =
     LazyLock::new(|| Mutex::new(Value::none()));
 static CURRENT_SWITCH_INTERVAL: LazyLock<Mutex<SwitchInterval>> =
     LazyLock::new(|| Mutex::new(SwitchInterval::new()));
+thread_local! {
+    static COROUTINE_ORIGIN_TRACKING_DEPTH: Cell<i32> = const { Cell::new(0) };
+}
 
 impl SysModule {
     /// Create a new sys module with default configuration.
@@ -319,6 +338,12 @@ impl Module for SysModule {
             "set_asyncgen_hooks" => Ok(asyncgen_hooks::set_asyncgen_hooks_function_value()),
             "getswitchinterval" => Ok(builtin_value(&GETSWITCHINTERVAL_FUNCTION)),
             "setswitchinterval" => Ok(builtin_value(&SETSWITCHINTERVAL_FUNCTION)),
+            "get_coroutine_origin_tracking_depth" => {
+                Ok(builtin_value(&GET_COROUTINE_ORIGIN_TRACKING_DEPTH_FUNCTION))
+            }
+            "set_coroutine_origin_tracking_depth" => {
+                Ok(builtin_value(&SET_COROUTINE_ORIGIN_TRACKING_DEPTH_FUNCTION))
+            }
             "_settraceallthreads" => Ok(builtin_value(&SETTRACE_ALL_THREADS_FUNCTION)),
             "_setprofileallthreads" => Ok(builtin_value(&SETPROFILE_ALL_THREADS_FUNCTION)),
             "intern" => Ok(builtin_value(&INTERN_FUNCTION)),
@@ -438,6 +463,8 @@ impl Module for SysModule {
             Arc::from("set_asyncgen_hooks"),
             Arc::from("getswitchinterval"),
             Arc::from("setswitchinterval"),
+            Arc::from("get_coroutine_origin_tracking_depth"),
+            Arc::from("set_coroutine_origin_tracking_depth"),
             Arc::from("_settraceallthreads"),
             Arc::from("_setprofileallthreads"),
             Arc::from("exit"),
@@ -682,6 +709,78 @@ fn switch_interval_from_value(value: Value) -> Result<f64, BuiltinError> {
         "setswitchinterval() argument must be real number, not {}",
         value.type_name()
     )))
+}
+
+fn sys_get_coroutine_origin_tracking_depth(args: &[Value]) -> Result<Value, BuiltinError> {
+    if !args.is_empty() {
+        return Err(BuiltinError::TypeError(format!(
+            "get_coroutine_origin_tracking_depth() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let depth = COROUTINE_ORIGIN_TRACKING_DEPTH.with(Cell::get);
+    Ok(Value::int(i64::from(depth)).expect("coroutine origin depth fits in Value::int"))
+}
+
+fn sys_set_coroutine_origin_tracking_depth(
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    if args.len() > 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "set_coroutine_origin_tracking_depth() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+
+    let mut depth = args.first().copied();
+    for &(name, value) in keywords {
+        match name {
+            "depth" => {
+                if depth.is_some() {
+                    return Err(BuiltinError::TypeError(
+                        "set_coroutine_origin_tracking_depth() got multiple values for argument 'depth'"
+                            .to_string(),
+                    ));
+                }
+                depth = Some(value);
+            }
+            other => {
+                return Err(BuiltinError::TypeError(format!(
+                    "set_coroutine_origin_tracking_depth() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+
+    let depth = depth.ok_or_else(|| {
+        BuiltinError::TypeError(
+            "set_coroutine_origin_tracking_depth() missing required argument 'depth'".to_string(),
+        )
+    })?;
+    let depth = coroutine_origin_tracking_depth_arg(depth)?;
+    COROUTINE_ORIGIN_TRACKING_DEPTH.with(|cell| cell.set(depth));
+    Ok(Value::none())
+}
+
+fn coroutine_origin_tracking_depth_arg(value: Value) -> Result<i32, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(if flag { 1 } else { 0 });
+    }
+    let depth = value_to_bigint(value).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value.type_name()
+        ))
+    })?;
+    let depth = depth.to_i32().ok_or_else(|| {
+        BuiltinError::OverflowError("Python int too large to convert to C int".to_string())
+    })?;
+    if depth < 0 {
+        return Err(BuiltinError::ValueError("depth must be >= 0".to_string()));
+    }
+    Ok(depth)
 }
 
 fn sys_getrefcount(args: &[Value]) -> Result<Value, BuiltinError> {
