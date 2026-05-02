@@ -16,8 +16,10 @@ use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::{
     SubclassBitmap, class_id_to_type_id, register_global_class,
 };
+use prism_runtime::types::tuple::TupleObject;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 const INVALID_HANDLE_VALUE: i64 = -1;
 const ERROR_NETNAME_DELETED: i64 = 64;
@@ -41,6 +43,83 @@ const EXPORTED_CONSTANTS: &[(&str, i64)] = &[
 
 static NEXT_FAKE_HANDLE: AtomicI64 = AtomicI64::new(0x1000);
 static NEXT_OVERLAPPED_ADDRESS: AtomicI64 = AtomicI64::new(0x1_0000_0000);
+static IOCP_REGISTRY: LazyLock<Mutex<IocpRegistry>> =
+    LazyLock::new(|| Mutex::new(IocpRegistry::default()));
+
+#[derive(Clone, Copy)]
+struct IocpRegistration {
+    port: i64,
+    key: i64,
+}
+
+#[derive(Clone, Copy)]
+struct CompletionStatus {
+    error: i64,
+    transferred: i64,
+    key: i64,
+    address: i64,
+}
+
+#[derive(Default)]
+struct IocpRegistry {
+    ports: HashMap<i64, VecDeque<CompletionStatus>>,
+    registrations: HashMap<i64, IocpRegistration>,
+    owned_handles: HashSet<i64>,
+}
+
+impl IocpRegistry {
+    fn allocate_handle(&mut self) -> i64 {
+        let handle = NEXT_FAKE_HANDLE.fetch_add(1, Ordering::Relaxed);
+        self.owned_handles.insert(handle);
+        handle
+    }
+
+    fn ensure_port(&mut self, port: i64) {
+        self.ports.entry(port).or_default();
+    }
+
+    fn register_handle(&mut self, handle: i64, port: i64, key: i64) {
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return;
+        }
+        self.ensure_port(port);
+        self.registrations
+            .insert(handle, IocpRegistration { port, key });
+    }
+
+    fn queue_for_handle(&mut self, handle: i64, transferred: i64, address: i64) {
+        let Some(registration) = self.registrations.get(&handle).copied() else {
+            return;
+        };
+        self.push(
+            registration.port,
+            CompletionStatus {
+                error: 0,
+                transferred,
+                key: registration.key,
+                address,
+            },
+        );
+    }
+
+    fn push(&mut self, port: i64, status: CompletionStatus) {
+        self.ports.entry(port).or_default().push_back(status);
+    }
+
+    fn pop(&mut self, port: i64) -> Option<CompletionStatus> {
+        self.ports.get_mut(&port)?.pop_front()
+    }
+
+    fn close_owned_handle(&mut self, handle: i64) -> bool {
+        if !self.owned_handles.remove(&handle) {
+            return false;
+        }
+        self.ports.remove(&handle);
+        self.registrations
+            .retain(|_, registration| registration.port != handle);
+        true
+    }
+}
 
 static OVERLAPPED_CLASS: LazyLock<Arc<PyClassObject>> =
     LazyLock::new(|| build_overlapped_class("Overlapped"));
@@ -70,7 +149,7 @@ static OVERLAPPED_CONNECT_NAMED_PIPE_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static OVERLAPPED_OPERATION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("_overlapped.Overlapped.operation"),
-        overlapped_complete,
+        overlapped_io_operation,
     )
 });
 
@@ -93,7 +172,7 @@ static GET_QUEUED_COMPLETION_STATUS_FUNCTION: LazyLock<BuiltinFunctionObject> =
 static REGISTER_WAIT_WITH_QUEUE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(
         Arc::from("_overlapped.RegisterWaitWithQueue"),
-        fake_handle_function,
+        register_wait_with_queue,
     )
 });
 static CONNECT_PIPE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -106,6 +185,13 @@ static NOOP_FUNCTION: LazyLock<BuiltinFunctionObject> =
 #[derive(Debug, Clone)]
 pub struct OverlappedModule {
     attrs: Vec<Arc<str>>,
+}
+
+pub(crate) fn close_overlapped_handle(handle: i64) -> bool {
+    IOCP_REGISTRY
+        .lock()
+        .expect("_overlapped IOCP registry mutex poisoned")
+        .close_owned_handle(handle)
 }
 
 impl OverlappedModule {
@@ -253,17 +339,26 @@ fn overlapped_new(args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 fn overlapped_complete(args: &[Value]) -> Result<Value, BuiltinError> {
-    if let Some(object) = args.first().and_then(|value| overlapped_object_mut(*value)) {
-        object.set_property(intern("pending"), Value::bool(false), shape_registry());
-    }
+    complete_overlapped(args.first().copied());
     Ok(Value::none())
 }
 
 fn overlapped_bool_operation(args: &[Value]) -> Result<Value, BuiltinError> {
-    if let Some(object) = args.first().and_then(|value| overlapped_object_mut(*value)) {
-        object.set_property(intern("pending"), Value::bool(false), shape_registry());
+    if let Some(address) = complete_overlapped(args.first().copied())
+        && let Some(handle) = args.get(1).and_then(|value| value.as_int())
+    {
+        queue_completion_for_handle(handle, 0, address);
     }
     Ok(Value::bool(false))
+}
+
+fn overlapped_io_operation(args: &[Value]) -> Result<Value, BuiltinError> {
+    if let Some(address) = complete_overlapped(args.first().copied())
+        && let Some(handle) = args.get(1).and_then(|value| value.as_int())
+    {
+        queue_completion_for_handle(handle, 0, address);
+    }
+    Ok(Value::none())
 }
 
 fn overlapped_getresult(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -292,12 +387,23 @@ fn create_io_completion_port(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    if let Some(existing_port) = args.get(1).and_then(|value| value.as_int())
-        && existing_port != 0
-    {
-        return int_value(existing_port);
-    }
-    fake_handle()
+    let file_handle = integer_arg(args[0], "CreateIoCompletionPort", "file_handle")?;
+    let existing_port = integer_arg(args[1], "CreateIoCompletionPort", "existing_port")?;
+    let completion_key = integer_arg(args[2], "CreateIoCompletionPort", "completion_key")?;
+    let port = if existing_port != 0 {
+        existing_port
+    } else {
+        IOCP_REGISTRY
+            .lock()
+            .expect("_overlapped IOCP registry mutex poisoned")
+            .allocate_handle()
+    };
+
+    IOCP_REGISTRY
+        .lock()
+        .expect("_overlapped IOCP registry mutex poisoned")
+        .register_handle(file_handle, port, completion_key);
+    int_value(port)
 }
 
 fn get_queued_completion_status(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -307,11 +413,45 @@ fn get_queued_completion_status(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    Ok(Value::none())
+    let port = integer_arg(args[0], "GetQueuedCompletionStatus", "completion_port")?;
+    let Some(status) = IOCP_REGISTRY
+        .lock()
+        .expect("_overlapped IOCP registry mutex poisoned")
+        .pop(port)
+    else {
+        return Ok(Value::none());
+    };
+    Ok(completion_status_value(status)?)
 }
 
 fn fake_handle_function(_args: &[Value]) -> Result<Value, BuiltinError> {
     fake_handle()
+}
+
+fn register_wait_with_queue(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "RegisterWaitWithQueue() takes exactly 4 arguments ({} given)",
+            args.len()
+        )));
+    }
+
+    let completion_port = integer_arg(args[1], "RegisterWaitWithQueue", "completion_port")?;
+    let address = integer_arg(args[2], "RegisterWaitWithQueue", "overlapped_address")?;
+    let mut registry = IOCP_REGISTRY
+        .lock()
+        .expect("_overlapped IOCP registry mutex poisoned");
+    let wait_handle = registry.allocate_handle();
+    registry.push(
+        completion_port,
+        CompletionStatus {
+            error: 0,
+            transferred: 0,
+            key: 0,
+            address,
+        },
+    );
+    int_value(wait_handle)
 }
 
 fn noop_function(_args: &[Value]) -> Result<Value, BuiltinError> {
@@ -319,11 +459,55 @@ fn noop_function(_args: &[Value]) -> Result<Value, BuiltinError> {
 }
 
 fn fake_handle() -> Result<Value, BuiltinError> {
-    int_value(NEXT_FAKE_HANDLE.fetch_add(1, Ordering::Relaxed))
+    let handle = IOCP_REGISTRY
+        .lock()
+        .expect("_overlapped IOCP registry mutex poisoned")
+        .allocate_handle();
+    int_value(handle)
 }
 
 fn int_value(value: i64) -> Result<Value, BuiltinError> {
     Value::int(value).ok_or_else(|| BuiltinError::OverflowError("integer overflow".to_string()))
+}
+
+fn integer_arg(value: Value, fn_name: &str, arg_name: &str) -> Result<i64, BuiltinError> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(i64::from(flag));
+    }
+    value.as_int().ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "{fn_name}() {arg_name} must be an integer, not {}",
+            value.type_name()
+        ))
+    })
+}
+
+fn completion_status_value(status: CompletionStatus) -> Result<Value, BuiltinError> {
+    Ok(tuple_value(vec![
+        int_value(status.error)?,
+        int_value(status.transferred)?,
+        int_value(status.key)?,
+        int_value(status.address)?,
+    ]))
+}
+
+fn tuple_value(items: Vec<Value>) -> Value {
+    leak_object_value(TupleObject::from_vec(items))
+}
+
+fn complete_overlapped(value: Option<Value>) -> Option<i64> {
+    let object = value.and_then(overlapped_object_mut)?;
+    object.set_property(intern("pending"), Value::bool(false), shape_registry());
+    object
+        .get_property("address")
+        .and_then(|value| value.as_int())
+}
+
+fn queue_completion_for_handle(handle: i64, transferred: i64, address: i64) {
+    IOCP_REGISTRY
+        .lock()
+        .expect("_overlapped IOCP registry mutex poisoned")
+        .queue_for_handle(handle, transferred, address);
 }
 
 fn class_from_value(

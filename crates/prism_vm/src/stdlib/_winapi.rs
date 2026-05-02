@@ -637,6 +637,10 @@ fn winapi_close_handle(args: &[Value]) -> Result<Value, BuiltinError> {
     parse_exact_arity(args, "CloseHandle", 1)?;
     let handle = integer_arg(args[0], "CloseHandle", "handle")?;
 
+    if crate::stdlib::_overlapped::close_overlapped_handle(handle) {
+        return Ok(Value::none());
+    }
+
     #[cfg(windows)]
     {
         if was_closed_by_parent_pipe_cleanup(handle) {
