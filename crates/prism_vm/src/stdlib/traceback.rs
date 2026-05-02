@@ -30,6 +30,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::object::views::{FrameViewObject, TracebackViewObject};
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
 use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use std::sync::{Arc, LazyLock};
@@ -82,6 +83,24 @@ static FRAME_SUMMARY_REPR_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::ne
     BuiltinFunctionObject::new_vm(
         Arc::from("traceback.FrameSummary.__repr__"),
         frame_summary_repr,
+    )
+});
+static FRAME_SUMMARY_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("traceback.FrameSummary.__getitem__"),
+        frame_summary_getitem,
+    )
+});
+static FRAME_SUMMARY_ITER_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("traceback.FrameSummary.__iter__"),
+        frame_summary_iter,
+    )
+});
+static FRAME_SUMMARY_LEN_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("traceback.FrameSummary.__len__"),
+        frame_summary_len,
     )
 });
 static STACK_SUMMARY_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -142,6 +161,12 @@ static STACK_SUMMARY_GETITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock:
     BuiltinFunctionObject::new(
         Arc::from("traceback.StackSummary.__getitem__"),
         stack_summary_getitem,
+    )
+});
+static STACK_SUMMARY_DELITEM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(
+        Arc::from("traceback.StackSummary.__delitem__"),
+        stack_summary_delitem,
     )
 });
 static TRACEBACK_EXCEPTION_INIT_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
@@ -285,6 +310,15 @@ fn build_frame_summary_class() -> Arc<PyClassObject> {
         intern("__repr__"),
         builtin_value(&FRAME_SUMMARY_REPR_METHOD),
     );
+    class.set_attr(
+        intern("__getitem__"),
+        builtin_value(&FRAME_SUMMARY_GETITEM_METHOD),
+    );
+    class.set_attr(
+        intern("__iter__"),
+        builtin_value(&FRAME_SUMMARY_ITER_METHOD),
+    );
+    class.set_attr(intern("__len__"), builtin_value(&FRAME_SUMMARY_LEN_METHOD));
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::HAS_INIT | ClassFlags::NATIVE_HEAPTYPE);
 
     register_traceback_class(class)
@@ -337,6 +371,10 @@ fn build_stack_summary_class() -> Arc<PyClassObject> {
     class.set_attr(
         intern("__getitem__"),
         builtin_value(&STACK_SUMMARY_GETITEM_METHOD),
+    );
+    class.set_attr(
+        intern("__delitem__"),
+        builtin_value(&STACK_SUMMARY_DELITEM_METHOD),
     );
     class.add_flags(ClassFlags::INITIALIZED | ClassFlags::HAS_INIT | ClassFlags::NATIVE_HEAPTYPE);
 
@@ -721,6 +759,57 @@ fn frame_summary_repr(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     )))
 }
 
+fn frame_summary_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "FrameSummary.__getitem__() takes exactly 1 argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let values = frame_summary_sequence_values(frame_summary_ref(args[0])?);
+    if let Some(slice) = slice_object_from_value(args[1]) {
+        if slice.step() == Some(0) {
+            return Err(BuiltinError::ValueError(
+                "slice step cannot be zero".to_string(),
+            ));
+        }
+        return Ok(tuple_value(&slice_values(&values, slice)));
+    }
+
+    let index = sequence_index_arg(args[1]).ok_or_else(|| {
+        BuiltinError::TypeError(format!(
+            "tuple indices must be integers or slices, not {}",
+            args[1].type_name()
+        ))
+    })?;
+    sequence_get(values.as_slice(), index)
+        .ok_or_else(|| BuiltinError::IndexError("tuple index out of range".to_string()))
+}
+
+fn frame_summary_iter(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "FrameSummary.__iter__() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(iterator_to_value(IteratorObject::from_values(
+        frame_summary_sequence_values(frame_summary_ref(args[0])?).to_vec(),
+    )))
+}
+
+fn frame_summary_len(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "FrameSummary.__len__() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    frame_summary_ref(args[0])?;
+    Ok(int_value(4))
+}
+
 fn stack_summary_init(
     vm: &mut VirtualMachine,
     args: &[Value],
@@ -852,6 +941,16 @@ fn stack_summary_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len().saturating_sub(1)
         )));
     }
+    if let Some(slice) = slice_object_from_value(args[1]) {
+        if slice.step() == Some(0) {
+            return Err(BuiltinError::ValueError(
+                "slice step cannot be zero".to_string(),
+            ));
+        }
+        let frames = stack_summary_frames_ref(args[0], "__getitem__")?;
+        return Ok(list_value(slice_values(frames.as_slice(), slice)));
+    }
+
     let index = args[1].as_int().or_else(|| {
         args[1]
             .as_bool()
@@ -865,6 +964,42 @@ fn stack_summary_getitem(args: &[Value]) -> Result<Value, BuiltinError> {
     };
     stack_summary_frames_ref(args[0], "__getitem__")?
         .get(index)
+        .ok_or_else(|| BuiltinError::IndexError("list index out of range".to_string()))
+}
+
+fn stack_summary_delitem(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "StackSummary.__delitem__() takes exactly 1 argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    if let Some(slice) = slice_object_from_value(args[1]) {
+        if slice.step() == Some(0) {
+            return Err(BuiltinError::ValueError(
+                "slice step cannot be zero".to_string(),
+            ));
+        }
+        stack_summary_frames_mut(args[0], "__delitem__")?.delete_slice(slice);
+        return Ok(Value::none());
+    }
+
+    let index = args[1].as_int().or_else(|| {
+        args[1]
+            .as_bool()
+            .map(|flag| if flag { 1_i64 } else { 0_i64 })
+    });
+    let Some(index) = index else {
+        return Err(BuiltinError::TypeError(format!(
+            "list indices must be integers or slices, not {}",
+            args[1].type_name()
+        )));
+    };
+    let frames = stack_summary_frames_mut(args[0], "__delitem__")?;
+    frames
+        .remove(index)
+        .map(|_| Value::none())
         .ok_or_else(|| BuiltinError::IndexError("list index out of range".to_string()))
 }
 
@@ -2189,6 +2324,46 @@ fn stack_summary_type_error(context: &'static str) -> BuiltinError {
 #[inline]
 fn set_attr(object: &mut ShapedObject, name: &str, value: Value) {
     object.set_property(intern(name), value, shape_registry());
+}
+
+#[inline]
+fn slice_object_from_value(value: Value) -> Option<&'static SliceObject> {
+    let ptr = value.as_object_ptr()?;
+    (extract_type_id(ptr) == TypeId::SLICE).then(|| unsafe { &*(ptr as *const SliceObject) })
+}
+
+fn slice_values(values: &[Value], slice: &SliceObject) -> Vec<Value> {
+    let indices = slice.indices(values.len());
+    let mut result = Vec::with_capacity(indices.length);
+    let mut index = indices.start as isize;
+    for _ in 0..indices.length {
+        result.push(values[index as usize]);
+        index += indices.step;
+    }
+    result
+}
+
+fn frame_summary_sequence_values(frame: &ShapedObject) -> [Value; 4] {
+    [
+        frame.get_property("filename").unwrap_or_else(Value::none),
+        frame.get_property("lineno").unwrap_or_else(Value::none),
+        frame.get_property("name").unwrap_or_else(Value::none),
+        frame.get_property("line").unwrap_or_else(Value::none),
+    ]
+}
+
+#[inline]
+fn sequence_index_arg(value: Value) -> Option<i64> {
+    value
+        .as_int()
+        .or_else(|| value.as_bool().map(|flag| if flag { 1 } else { 0 }))
+}
+
+#[inline]
+fn sequence_get(values: &[Value], index: i64) -> Option<Value> {
+    let len = values.len() as i64;
+    let index = if index < 0 { len + index } else { index };
+    (0..len).contains(&index).then(|| values[index as usize])
 }
 
 #[inline]
