@@ -105,8 +105,10 @@ impl GcHeap {
             return Some(ptr);
         }
 
-        // Nursery full - caller should trigger minor GC
-        None
+        // The current minor collector is conservative and preserves nursery
+        // objects until exact moving roots are enabled. Keep allocation
+        // progressing by placing subsequent small objects in tenured space.
+        self.alloc_tenured(aligned_size)
     }
 
     /// Allocate memory for an object with an explicit Rust layout.
