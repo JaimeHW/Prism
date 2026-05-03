@@ -3030,7 +3030,7 @@ impl Compiler {
             };
 
             let converted_reg = self.builder.alloc_register();
-            self.emit_named_call_from_regs(builtin_name, &[current_reg], converted_reg)?;
+            self.emit_builtin_call_from_regs(builtin_name, &[current_reg], converted_reg)?;
             self.builder.free_register(current_reg);
             current_reg = converted_reg;
         }
@@ -3038,12 +3038,12 @@ impl Compiler {
         let formatted_reg = if let Some(spec_expr) = format_spec {
             let spec_reg = self.compile_expr(spec_expr)?;
             let result_reg = self.builder.alloc_register();
-            self.emit_named_call_from_regs("format", &[current_reg, spec_reg], result_reg)?;
+            self.emit_builtin_call_from_regs("format", &[current_reg, spec_reg], result_reg)?;
             self.builder.free_register(spec_reg);
             result_reg
         } else {
             let result_reg = self.builder.alloc_register();
-            self.emit_named_call_from_regs("format", &[current_reg], result_reg)?;
+            self.emit_builtin_call_from_regs("format", &[current_reg], result_reg)?;
             result_reg
         };
 
@@ -3056,23 +3056,43 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_builtin_call_from_regs(
+        &mut self,
+        name: &str,
+        args: &[Register],
+        dst: Register,
+    ) -> CompileResult<()> {
+        let func_reg = self.builder.alloc_register();
+        self.emit_load_builtin_name(func_reg, name);
+        self.emit_call_from_loaded_function(name, func_reg, args, dst)
+    }
+
     fn emit_named_call_from_regs(
         &mut self,
         name: &str,
         args: &[Register],
         dst: Register,
     ) -> CompileResult<()> {
+        let func_reg = self.builder.alloc_register();
+        let location = self.resolve_variable(name);
+        self.builder.emit_load_var(func_reg, location, Some(name));
+        self.emit_call_from_loaded_function(name, func_reg, args, dst)
+    }
+
+    fn emit_call_from_loaded_function(
+        &mut self,
+        name: &str,
+        mut func_reg: Register,
+        args: &[Register],
+        dst: Register,
+    ) -> CompileResult<()> {
         if args.len() > u8::MAX as usize {
             return Err(CompileError {
-                message: format!("too many arguments for builtin call '{name}'"),
+                message: format!("too many arguments for call '{name}'"),
                 line: 0,
                 column: 0,
             });
         }
-
-        let mut func_reg = self.builder.alloc_register();
-        let location = self.resolve_variable(name);
-        self.builder.emit_load_var(func_reg, location, Some(name));
 
         if args.is_empty() {
             self.builder.emit_call(dst, func_reg, 0);
