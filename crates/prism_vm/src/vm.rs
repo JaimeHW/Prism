@@ -11,6 +11,7 @@ use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack};
 use crate::finalizers::{FinalizerRegistry, ReachabilityTracer};
 use crate::frame::{ClosureEnv, Frame, FramePool, MAX_RECURSION_DEPTH};
 use crate::gc_integration::ManagedHeap;
+use crate::global_cache::{GlobalLoadCache, GlobalLoadCacheContext, GlobalLoadCacheKey};
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
 use crate::import::{
@@ -55,6 +56,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) type SharedManagedHeap = Arc<Mutex<ManagedHeap>>;
 pub(crate) type SharedClassPublications = Arc<PublishedClassScope>;
+
+const BUILTIN_LOAD_CACHE_SCOPE: usize = usize::MAX;
 
 #[derive(Debug, Default)]
 pub(crate) struct PublishedClassScope {
@@ -304,6 +307,8 @@ pub struct VirtualMachine {
     pub(crate) builtins: BuiltinRegistry,
     /// Inline cache storage.
     pub(crate) inline_caches: InlineCacheStore,
+    /// Version-guarded cache for global and builtin name loads.
+    global_load_cache: GlobalLoadCache,
     /// Execution profiler.
     pub(crate) profiler: Profiler,
     /// IC Manager for centralized type profiling.
@@ -439,6 +444,106 @@ impl VirtualMachine {
         } else {
             self.globals.get_arc(name)
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn load_global_cached(&mut self, name_index: u16) -> Result<Value, Arc<str>> {
+        let (context, cacheable) = self.global_load_cache_context(name_index);
+        if cacheable && let Some(value) = self.global_load_cache.get(context) {
+            return Ok(value);
+        }
+
+        let name = {
+            let frame = self.current_frame();
+            Arc::clone(frame.get_name(name_index))
+        };
+        let value = match self.module_scope_value(&name) {
+            Some(value) => Some(value),
+            None => self.builtins.get(&name),
+        };
+
+        match value {
+            Some(value) => {
+                if cacheable {
+                    self.global_load_cache.insert(context, value);
+                }
+                Ok(value)
+            }
+            None => Err(name),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn load_builtin_cached(&mut self, name_index: u16) -> Result<Value, Arc<str>> {
+        let context = self.builtin_load_cache_context(name_index);
+        if let Some(value) = self.global_load_cache.get(context) {
+            return Ok(value);
+        }
+
+        let name = {
+            let frame = self.current_frame();
+            Arc::clone(frame.get_name(name_index))
+        };
+        match self.builtins.get(&name) {
+            Some(value) => {
+                self.global_load_cache.insert(context, value);
+                Ok(value)
+            }
+            None => Err(name),
+        }
+    }
+
+    #[inline(always)]
+    fn global_load_cache_context(&self, name_index: u16) -> (GlobalLoadCacheContext, bool) {
+        let frame = self.current_frame();
+        let code = Arc::as_ptr(&frame.code) as usize;
+        let builtins_version = self.builtins.version();
+
+        let (scope, namespace_version, main_globals_version, cacheable) =
+            if let Some(module) = frame.module.as_ref() {
+                (
+                    Arc::as_ptr(module) as usize,
+                    module.version(),
+                    if module.name() == "__main__" {
+                        self.globals.version()
+                    } else {
+                        0
+                    },
+                    module.globals_cacheable(),
+                )
+            } else {
+                (
+                    &self.globals as *const GlobalScope as usize,
+                    self.globals.version(),
+                    0,
+                    true,
+                )
+            };
+
+        (
+            GlobalLoadCacheContext::new(
+                GlobalLoadCacheKey::new(code, name_index, scope),
+                namespace_version,
+                main_globals_version,
+                builtins_version,
+            ),
+            cacheable,
+        )
+    }
+
+    #[inline(always)]
+    fn builtin_load_cache_context(&self, name_index: u16) -> GlobalLoadCacheContext {
+        let frame = self.current_frame();
+        GlobalLoadCacheContext::new(
+            GlobalLoadCacheKey::new(
+                Arc::as_ptr(&frame.code) as usize,
+                name_index,
+                BUILTIN_LOAD_CACHE_SCOPE,
+            ),
+            0,
+            0,
+            self.builtins.version(),
+        )
     }
 
     pub(crate) fn set_module_scope_value_for_module(
@@ -1528,6 +1633,7 @@ impl VirtualMachine {
             globals: GlobalScope::new(),
             builtins,
             inline_caches: InlineCacheStore::default(),
+            global_load_cache: GlobalLoadCache::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
             speculation_cache: SpeculationCache::new(),
@@ -1601,6 +1707,7 @@ impl VirtualMachine {
             globals: GlobalScope::new(),
             builtins,
             inline_caches: InlineCacheStore::default(),
+            global_load_cache: GlobalLoadCache::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
             speculation_cache: SpeculationCache::new(),
@@ -1682,6 +1789,7 @@ impl VirtualMachine {
             globals: GlobalScope::new(),
             builtins,
             inline_caches: InlineCacheStore::default(),
+            global_load_cache: GlobalLoadCache::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
             speculation_cache: SpeculationCache::new(),
@@ -1732,6 +1840,7 @@ impl VirtualMachine {
             globals: GlobalScope::new(),
             builtins,
             inline_caches: InlineCacheStore::default(),
+            global_load_cache: GlobalLoadCache::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
             speculation_cache: SpeculationCache::new(),
@@ -1777,6 +1886,7 @@ impl VirtualMachine {
             globals,
             builtins,
             inline_caches: InlineCacheStore::default(),
+            global_load_cache: GlobalLoadCache::default(),
             profiler: Profiler::new(),
             ic_manager: ICManager::new(),
             speculation_cache: SpeculationCache::new(),
@@ -3596,5 +3706,74 @@ fn module_package_name(name: &str, is_package: bool) -> Arc<str> {
         Arc::from(package)
     } else {
         Arc::from("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code_with_name(name: &str) -> Arc<CodeObject> {
+        let mut code = CodeObject::new("test", "<test>");
+        code.names = vec![Arc::<str>::from(name)].into_boxed_slice();
+        code.register_count = 1;
+        Arc::new(code)
+    }
+
+    fn push_test_frame(
+        vm: &mut VirtualMachine,
+        code: Arc<CodeObject>,
+        module: Option<Arc<ModuleObject>>,
+    ) {
+        let frame = vm.frame_pool.acquire(code, None, 0, None, module);
+        vm.frames.push(frame);
+        vm.set_current_frame_idx(vm.frames.len() - 1);
+    }
+
+    #[test]
+    fn global_load_cache_tracks_global_shadowing_builtin() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, code_with_name("len"), None);
+
+        let builtin_len = vm.load_global_cached(0).expect("len builtin");
+        assert!(builtin_len.as_object_ptr().is_some());
+
+        vm.globals.set(Arc::from("len"), Value::int_unchecked(7));
+
+        let shadowed = vm.load_global_cached(0).expect("shadowed len");
+        assert_eq!(shadowed.as_int(), Some(7));
+    }
+
+    #[test]
+    fn global_load_cache_tracks_module_attr_mutation() {
+        let module = Arc::new(ModuleObject::new("m"));
+        module.set_attr("x", Value::int_unchecked(1));
+
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, code_with_name("x"), Some(Arc::clone(&module)));
+
+        assert_eq!(vm.load_global_cached(0).unwrap().as_int(), Some(1));
+
+        module.set_attr("x", Value::int_unchecked(2));
+
+        assert_eq!(vm.load_global_cached(0).unwrap().as_int(), Some(2));
+    }
+
+    #[test]
+    fn global_load_cache_bypasses_materialized_module_dict() {
+        let module = Arc::new(ModuleObject::new("m"));
+        module.set_attr("x", Value::int_unchecked(1));
+
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, code_with_name("x"), Some(Arc::clone(&module)));
+
+        assert_eq!(vm.load_global_cached(0).unwrap().as_int(), Some(1));
+
+        let dict_value = module.dict_value();
+        let dict_ptr = dict_value.as_object_ptr().expect("module dict pointer");
+        let dict = unsafe { &mut *(dict_ptr as *mut DictObject) };
+        dict.set(Value::string(intern("x")), Value::int_unchecked(3));
+
+        assert_eq!(vm.load_global_cached(0).unwrap().as_int(), Some(3));
     }
 }

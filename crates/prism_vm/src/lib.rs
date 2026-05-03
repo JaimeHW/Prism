@@ -52,6 +52,7 @@ mod error;
 mod finalizers;
 mod frame;
 mod gc_integration;
+mod global_cache;
 mod globals;
 mod vm;
 

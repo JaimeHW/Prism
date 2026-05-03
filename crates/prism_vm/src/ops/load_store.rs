@@ -364,12 +364,9 @@ fn is_missing_mapping_key_error(err: &RuntimeError) -> bool {
 /// LoadGlobal: dst = globals[names[imm16]]
 #[inline(always)]
 pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let (name, locals_mapping) = {
-        let frame = vm.current_frame();
-        (frame.get_name(inst.imm16()).clone(), frame.locals_mapping())
-    };
-
+    let locals_mapping = vm.current_frame().locals_mapping();
     if let Some(mapping) = locals_mapping {
+        let name = vm.current_frame().get_name(inst.imm16()).clone();
         return match load_mapped_local(vm, mapping, &name) {
             Ok(value) => {
                 vm.current_frame_mut().set_reg(inst.dst().0, value);
@@ -379,36 +376,24 @@ pub fn load_global(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         };
     }
 
-    match vm.module_scope_value(&name) {
-        Some(value) => {
+    match vm.load_global_cached(inst.imm16()) {
+        Ok(value) => {
             vm.current_frame_mut().set_reg(inst.dst().0, value);
             ControlFlow::Continue
         }
-        None => {
-            // Check builtins
-            match vm.builtins.get(&name) {
-                Some(value) => {
-                    vm.current_frame_mut().set_reg(inst.dst().0, value);
-                    ControlFlow::Continue
-                }
-                None => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
-            }
-        }
+        Err(name) => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
     }
 }
 
 /// LoadBuiltin: dst = builtins[names[imm16]]
 #[inline(always)]
 pub fn load_builtin(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let name = frame.get_name(inst.imm16()).clone();
-
-    match vm.builtins.get(&name) {
-        Some(value) => {
+    match vm.load_builtin_cached(inst.imm16()) {
+        Ok(value) => {
             vm.current_frame_mut().set_reg(inst.dst().0, value);
             ControlFlow::Continue
         }
-        None => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
+        Err(name) => ControlFlow::Error(crate::error::RuntimeError::name_error(name)),
     }
 }
 

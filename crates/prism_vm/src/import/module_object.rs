@@ -14,6 +14,7 @@ use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
 use rustc_hash::FxHashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 // =============================================================================
@@ -85,6 +86,8 @@ pub struct ModuleObject {
 
     /// Lazily materialized live module namespace exposed as `module.__dict__`.
     dict: RwLock<Option<Value>>,
+    /// Lock-free marker used by global load caches to avoid probing `dict`.
+    dict_materialized: AtomicBool,
 
     /// Module documentation string
     doc: Option<Arc<str>>,
@@ -94,6 +97,9 @@ pub struct ModuleObject {
 
     /// Package name (e.g., "os" for "os.path")
     package: Option<Arc<str>>,
+
+    /// Monotonic mutation counter for module global lookup caches.
+    version: AtomicU64,
 }
 
 impl ModuleObject {
@@ -108,9 +114,11 @@ impl ModuleObject {
             name,
             attrs: RwLock::new(attrs),
             dict: RwLock::new(None),
+            dict_materialized: AtomicBool::new(false),
             doc: None,
             file: None,
             package: None,
+            version: AtomicU64::new(0),
         }
     }
 
@@ -145,9 +153,11 @@ impl ModuleObject {
             name,
             attrs: RwLock::new(attrs),
             dict: RwLock::new(None),
+            dict_materialized: AtomicBool::new(false),
             doc,
             file,
             package,
+            version: AtomicU64::new(0),
         }
     }
 
@@ -167,6 +177,23 @@ impl ModuleObject {
     #[inline]
     pub fn package_name(&self) -> Option<&str> {
         self.package.as_deref()
+    }
+
+    /// Current module namespace version.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    /// Whether module-global inline caches may borrow values from this module.
+    ///
+    /// Once `__dict__` is materialized, external code can mutate the live dict
+    /// without going through `set_attr`/`del_attr`. The VM therefore bypasses
+    /// module-global caches for that namespace until dict mutations grow a
+    /// value-versioned invalidation hook.
+    #[inline]
+    pub fn globals_cacheable(&self) -> bool {
+        !self.dict_materialized.load(Ordering::Relaxed)
     }
 
     /// Get an attribute from the module.
@@ -194,6 +221,7 @@ impl ModuleObject {
             dict.set(Value::string(key.clone()), value);
         }
         self.attrs.write().unwrap().insert(key, value);
+        self.bump_version();
     }
 
     /// Check if the module has an attribute.
@@ -225,6 +253,9 @@ impl ModuleObject {
             false
         };
         let removed_attr = self.attrs.write().unwrap().remove(&key).is_some();
+        if removed_attr || removed_dict {
+            self.bump_version();
+        }
         removed_attr || removed_dict
     }
 
@@ -350,6 +381,8 @@ impl ModuleObject {
         }
         let value = alloc_value_in_current_heap_or_box(dict);
         *dict_slot = Some(value);
+        self.dict_materialized.store(true, Ordering::Release);
+        self.bump_version();
         value
     }
 
@@ -358,6 +391,14 @@ impl ModuleObject {
         let value = *self.dict.read().unwrap();
         let ptr = value?.as_object_ptr()?;
         Some(unsafe { &*(ptr as *const DictObject) })
+    }
+
+    #[inline]
+    fn bump_version(&self) {
+        let current = self.version.fetch_add(1, Ordering::Relaxed);
+        if current == u64::MAX {
+            self.version.store(1, Ordering::Relaxed);
+        }
     }
 }
 

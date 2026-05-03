@@ -174,6 +174,8 @@ pub struct BuiltinRegistry {
     vm_functions: FxHashMap<Arc<str>, VmBuiltinFn>,
     /// VM-aware function table for builtins that accept keyword arguments.
     vm_keyword_functions: FxHashMap<Arc<str>, VmBuiltinKwFn>,
+    /// Monotonic mutation counter used by builtin/global lookup caches.
+    version: u64,
 }
 
 static ELLIPSIS_SINGLETON: LazyLock<Value> =
@@ -207,6 +209,7 @@ impl BuiltinRegistry {
             keyword_functions: FxHashMap::default(),
             vm_functions: FxHashMap::default(),
             vm_keyword_functions: FxHashMap::default(),
+            version: 0,
         }
     }
 
@@ -399,25 +402,27 @@ impl BuiltinRegistry {
         for (name, exc_type) in exception_type::EXCEPTION_TYPE_TABLE {
             let exc_type_obj: &exception_type::ExceptionTypeObject = exc_type;
             let ptr = exc_type_obj as *const exception_type::ExceptionTypeObject as *const ();
-            registry
-                .entries
-                .insert(Arc::from(*name), Value::object_ptr(ptr));
+            registry.insert_entry(Arc::from(*name), Value::object_ptr(ptr));
         }
 
         for (name, class) in exception_type::SUPPLEMENTAL_EXCEPTION_CLASS_TABLE {
             let ptr = std::sync::Arc::as_ptr(&***class) as *const ();
-            registry
-                .entries
-                .insert(Arc::from(*name), Value::object_ptr(ptr));
+            registry.insert_entry(Arc::from(*name), Value::object_ptr(ptr));
         }
 
         registry
     }
 
+    /// Current registry version.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Register a builtin value.
     #[inline]
     pub fn register_value(&mut self, name: impl Into<Arc<str>>, value: Value) {
-        self.entries.insert(name.into(), value);
+        self.insert_entry(name.into(), value);
     }
 
     /// Register a builtin function.
@@ -433,7 +438,7 @@ impl BuiltinRegistry {
         // TODO: Use GC allocator instead of Box::leak
         let builtin_obj = Box::new(BuiltinFunctionObject::new(name.clone(), func));
         let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
-        self.entries.insert(name, Value::object_ptr(ptr));
+        self.insert_entry(name, Value::object_ptr(ptr));
     }
 
     /// Register a builtin function that accepts keyword arguments.
@@ -444,7 +449,7 @@ impl BuiltinRegistry {
 
         let builtin_obj = Box::new(BuiltinFunctionObject::new_kw(name.clone(), func));
         let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
-        self.entries.insert(name, Value::object_ptr(ptr));
+        self.insert_entry(name, Value::object_ptr(ptr));
     }
 
     /// Register a builtin function that needs VM context at call time.
@@ -455,7 +460,7 @@ impl BuiltinRegistry {
 
         let builtin_obj = Box::new(BuiltinFunctionObject::new_vm(name.clone(), func));
         let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
-        self.entries.insert(name, Value::object_ptr(ptr));
+        self.insert_entry(name, Value::object_ptr(ptr));
     }
 
     /// Register a builtin function that needs VM context and accepts keyword arguments.
@@ -466,7 +471,7 @@ impl BuiltinRegistry {
 
         let builtin_obj = Box::new(BuiltinFunctionObject::new_vm_kw(name.clone(), func));
         let ptr = Box::leak(builtin_obj) as *mut BuiltinFunctionObject as *const ();
-        self.entries.insert(name, Value::object_ptr(ptr));
+        self.insert_entry(name, Value::object_ptr(ptr));
     }
 
     /// Register a builtin type object while preserving the direct-call
@@ -480,8 +485,7 @@ impl BuiltinRegistry {
     ) {
         let name = name.into();
         self.functions.insert(name.clone(), constructor);
-        self.entries
-            .insert(name, types::builtin_type_object_for_type_id(type_id));
+        self.insert_entry(name, types::builtin_type_object_for_type_id(type_id));
     }
 
     /// Register a builtin type object with a VM-aware direct-call constructor.
@@ -494,8 +498,7 @@ impl BuiltinRegistry {
     ) {
         let name = name.into();
         self.vm_functions.insert(name.clone(), constructor);
-        self.entries
-            .insert(name, types::builtin_type_object_for_type_id(type_id));
+        self.insert_entry(name, types::builtin_type_object_for_type_id(type_id));
     }
 
     /// Get a builtin value by name.
@@ -599,6 +602,17 @@ impl BuiltinRegistry {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[inline]
+    fn insert_entry(&mut self, name: Arc<str>, value: Value) {
+        self.entries.insert(name, value);
+        self.bump_version();
+    }
+
+    #[inline]
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1).max(1);
     }
 }
 
