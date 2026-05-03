@@ -186,6 +186,15 @@ pub(crate) fn next_step(
                             Err(err) => Err(err),
                         }
                     },
+                    &mut |iterable| {
+                        if let Ok(iterator) = value_to_iterator(&iterable) {
+                            return Ok(iterator);
+                        }
+
+                        let vm = &mut *vm_cell.borrow_mut();
+                        let iterator_value = ensure_iterator_value(vm, iterable)?;
+                        Ok(IteratorObject::from_existing_iterator(iterator_value))
+                    },
                 )? {
                     Some(value) => IterStep::Yielded(value),
                     None => IterStep::Exhausted,

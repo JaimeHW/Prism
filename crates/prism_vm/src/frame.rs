@@ -339,6 +339,15 @@ impl Frame {
         self.written_registers[word] |= 1u64 << bit;
     }
 
+    /// Pointer to the register-written bitset used by JIT code.
+    ///
+    /// The template JIT mutates this mask for native local stores/deletes so
+    /// deoptimization preserves Python's assigned-vs-unbound local semantics.
+    #[inline(always)]
+    pub(crate) fn written_registers_mut_ptr(&mut self) -> *mut u64 {
+        self.written_registers.as_mut_ptr()
+    }
+
     #[inline(always)]
     pub fn snapshot_register(&self, reg: u8) -> RegisterSnapshot {
         RegisterSnapshot {

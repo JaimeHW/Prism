@@ -277,8 +277,12 @@ impl FrameStorage {
     pub fn capture(&mut self, registers: &[Value; 256], liveness: LivenessMap) {
         let count = liveness.count() as usize;
 
-        // Ensure capacity
-        if count > INLINE_CAPACITY && !self.is_boxed {
+        if count > INLINE_CAPACITY
+            && self
+                .boxed
+                .as_ref()
+                .map_or(true, |boxed| boxed.len() < count)
+        {
             self.boxed = Some(vec![Value::none(); count].into_boxed_slice());
             self.is_boxed = true;
         }
@@ -353,3 +357,46 @@ impl fmt::Debug for FrameStorage {
 // SAFETY: FrameStorage contains Values which are Copy and thread-safe
 unsafe impl Send for FrameStorage {}
 unsafe impl Sync for FrameStorage {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn liveness_with_prefix(count: u8) -> LivenessMap {
+        let mut liveness = LivenessMap::empty();
+        for register in 0..count {
+            liveness = liveness.with_live(register);
+        }
+        liveness
+    }
+
+    fn register_file() -> [Value; 256] {
+        let mut registers = [Value::none(); 256];
+        for (index, register) in registers.iter_mut().enumerate().take(64) {
+            *register = Value::int(index as i64).unwrap();
+        }
+        registers
+    }
+
+    #[test]
+    fn capture_grows_boxed_storage_for_larger_liveness_maps() {
+        let registers = register_file();
+        let mut storage = FrameStorage::new();
+
+        storage.capture(&registers, liveness_with_prefix(9));
+        assert!(storage.is_boxed());
+        assert_eq!(storage.len(), 9);
+        assert_eq!(storage.capacity(), 9);
+
+        storage.capture(&registers, liveness_with_prefix(16));
+        assert!(storage.is_boxed());
+        assert_eq!(storage.len(), 16);
+        assert!(storage.capacity() >= 16);
+
+        let mut restored = [Value::none(); 256];
+        storage.restore(&mut restored, liveness_with_prefix(16));
+        for index in 0..16 {
+            assert_eq!(restored[index], Value::int(index as i64).unwrap());
+        }
+    }
+}

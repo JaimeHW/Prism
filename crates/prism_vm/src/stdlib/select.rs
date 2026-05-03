@@ -7,18 +7,21 @@
 //! surface.
 
 use super::{Module, ModuleError, ModuleResult};
-use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+use crate::VirtualMachine;
+use crate::builtins::{BuiltinError, BuiltinFunctionObject, runtime_error_to_builtin_error};
+use crate::ops::iteration::collect_iterable_values;
 use prism_core::Value;
 use prism_core::intern::intern;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
 
 const MODULE_DOC: &str = "Native bootstrap implementation of the select module.";
 
 static SELECT_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("select.select"), select_select));
+    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("select.select"), select_select));
 
 /// Native `select` module descriptor.
 #[derive(Debug, Clone)]
@@ -77,7 +80,7 @@ fn os_error_type_value() -> Value {
     Value::object_ptr((&*crate::builtins::OS_ERROR) as *const _ as *const ())
 }
 
-fn select_select(args: &[Value]) -> Result<Value, BuiltinError> {
+fn select_select(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
     if !(3..=4).contains(&args.len()) {
         return Err(BuiltinError::TypeError(format!(
             "select.select() takes 3 or 4 arguments ({} given)",
@@ -85,9 +88,9 @@ fn select_select(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let readers = sequence_arg(args[0], "rlist")?;
-    let writers = sequence_arg(args[1], "wlist")?;
-    let exceptional = sequence_arg(args[2], "xlist")?;
+    let readers = iterable_arg(vm, args[0], "rlist")?;
+    let writers = iterable_arg(vm, args[1], "wlist")?;
+    let exceptional = iterable_arg(vm, args[2], "xlist")?;
     if let Some(timeout) = args.get(3).copied() {
         validate_timeout(timeout)?;
     }
@@ -122,19 +125,22 @@ fn validate_timeout(value: Value) -> Result<(), BuiltinError> {
     Ok(())
 }
 
-fn sequence_arg(value: Value, name: &str) -> Result<Vec<Value>, BuiltinError> {
+fn iterable_arg(
+    vm: &mut VirtualMachine,
+    value: Value,
+    name: &str,
+) -> Result<Vec<Value>, BuiltinError> {
     let ptr = value.as_object_ptr().ok_or_else(|| {
-        BuiltinError::TypeError(format!(
-            "{name} must be a list or tuple of file descriptors"
-        ))
+        BuiltinError::TypeError(format!("{name} must be an iterable of file descriptors"))
     })?;
 
     match crate::ops::objects::extract_type_id(ptr) {
         TypeId::LIST => Ok(unsafe { &*(ptr as *const ListObject) }.as_slice().to_vec()),
         TypeId::TUPLE => Ok(unsafe { &*(ptr as *const TupleObject) }.as_slice().to_vec()),
-        _ => Err(BuiltinError::TypeError(format!(
-            "{name} must be a list or tuple of file descriptors"
-        ))),
+        TypeId::SET | TypeId::FROZENSET => {
+            Ok(unsafe { &*(ptr as *const SetObject) }.iter().collect())
+        }
+        _ => collect_iterable_values(vm, value).map_err(runtime_error_to_builtin_error),
     }
 }
 

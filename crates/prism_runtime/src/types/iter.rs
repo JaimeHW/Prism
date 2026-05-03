@@ -403,6 +403,16 @@ enum IterKind {
         current: usize,
     },
 
+    /// Chain iterator built from a single outer iterable of inner iterables.
+    ///
+    /// Unlike `Chain`, this preserves the `chain.from_iterable()` contract by
+    /// advancing the outer iterator lazily and converting each yielded iterable
+    /// only when its turn is reached.
+    ChainFromIterable {
+        outer: Box<IteratorObject>,
+        current_inner: Option<Box<IteratorObject>>,
+    },
+
     /// Enumerate iterator - yields (index, value) tuples.
     ///
     /// # Performance
@@ -1607,6 +1617,7 @@ impl IteratorObject {
                 collect_remaining_repeated_combinations(pool, indices, *r, *first, self.exhausted),
             )),
             IterKind::Chain { .. }
+            | IterKind::ChainFromIterable { .. }
             | IterKind::Zip { .. }
             | IterKind::ZipLongest { .. }
             | IterKind::Map { .. }
@@ -1691,6 +1702,20 @@ impl IteratorObject {
             kind: IterKind::Chain {
                 iterators,
                 current: 0,
+            },
+            exhausted,
+        }
+    }
+
+    /// Create a lazy `chain.from_iterable()` iterator.
+    #[inline]
+    pub fn chain_from_iterable(outer: IteratorObject) -> Self {
+        let exhausted = outer.is_exhausted();
+        Self {
+            header: ObjectHeader::new(TypeId::ITERATOR),
+            kind: IterKind::ChainFromIterable {
+                outer: Box::new(outer),
+                current_inner: None,
             },
             exhausted,
         }
@@ -1890,6 +1915,12 @@ impl IteratorObject {
 
                 self.exhausted = true;
                 None
+            }
+
+            IterKind::ChainFromIterable { .. } => {
+                return Err(IteratorAdvanceError::mutated(
+                    "chain.from_iterable iterator requires VM context",
+                ));
             }
 
             IterKind::Enumerate { inner, index } => {
@@ -2318,6 +2349,7 @@ impl IteratorObject {
                 }
                 Some(total)
             }
+            IterKind::ChainFromIterable { .. } => None,
             IterKind::Enumerate { inner, .. } => inner.size_hint(),
             IterKind::Zip { iterators } => {
                 // Minimum of all iterator size hints
@@ -2510,6 +2542,7 @@ impl IteratorObject {
                 }
                 Some(values)
             }
+            IterKind::ChainFromIterable { .. } => None,
             IterKind::Enumerate { inner, index } => {
                 let mut next_index = index.clone();
                 let values = inner
@@ -2620,13 +2653,14 @@ impl IteratorObject {
     ///
     /// This is required for iterators such as `map` and `filter` whose
     /// semantics depend on evaluating Python callables while iterating.
-    pub fn next_with<E, F, T, N, S, C>(
+    pub fn next_with<E, F, T, N, S, C, I>(
         &mut self,
         invoke: &mut F,
         is_truthy: &mut T,
         advance_iterator: &mut N,
         advance_sequence: &mut S,
         advance_call_sentinel: &mut C,
+        ensure_iterator: &mut I,
     ) -> Result<Option<Value>, E>
     where
         E: From<IteratorAdvanceError>,
@@ -2635,6 +2669,7 @@ impl IteratorObject {
         N: FnMut(Value) -> Result<Option<Value>, E>,
         S: FnMut(Value, Option<Value>, i64) -> Result<Option<Value>, E>,
         C: FnMut(Value, Value) -> Result<Option<Value>, E>,
+        I: FnMut(Value) -> Result<IteratorObject, E>,
     {
         if self.exhausted {
             return Ok(None);
@@ -2649,6 +2684,7 @@ impl IteratorObject {
                         advance_iterator,
                         advance_sequence,
                         advance_call_sentinel,
+                        ensure_iterator,
                     )?;
                     self.exhausted = iter.is_exhausted();
                     next
@@ -2704,6 +2740,7 @@ impl IteratorObject {
                     advance_iterator,
                     advance_sequence,
                     advance_call_sentinel,
+                    ensure_iterator,
                 )? {
                     Some(value) => invoke(*func, &[value]).map(Some),
                     None => {
@@ -2719,6 +2756,7 @@ impl IteratorObject {
                     advance_iterator,
                     advance_sequence,
                     advance_call_sentinel,
+                    ensure_iterator,
                 )? {
                     Some(value) => Ok(Some(create_tuple_pair(index.next_value(), value))),
                     None => {
@@ -2741,6 +2779,7 @@ impl IteratorObject {
                         advance_iterator,
                         advance_sequence,
                         advance_call_sentinel,
+                        ensure_iterator,
                     )? {
                         Some(value) => values.push(value),
                         None => {
@@ -2773,6 +2812,7 @@ impl IteratorObject {
                             advance_iterator,
                             advance_sequence,
                             advance_call_sentinel,
+                            ensure_iterator,
                         )? {
                             Some(value) => {
                                 yielded_any = true;
@@ -2803,6 +2843,7 @@ impl IteratorObject {
                     advance_iterator,
                     advance_sequence,
                     advance_call_sentinel,
+                    ensure_iterator,
                 )? {
                     Some(value) => {
                         let keep = if let Some(predicate) = *func {
@@ -2830,6 +2871,7 @@ impl IteratorObject {
                         advance_iterator,
                         advance_sequence,
                         advance_call_sentinel,
+                        ensure_iterator,
                     )? {
                         Some(value) => return Ok(Some(value)),
                         None => *current += 1,
@@ -2839,6 +2881,43 @@ impl IteratorObject {
                 self.exhausted = true;
                 return Ok(None);
             }
+            IterKind::ChainFromIterable {
+                outer,
+                current_inner,
+            } => loop {
+                if let Some(inner) = current_inner.as_mut() {
+                    match inner.next_with(
+                        invoke,
+                        is_truthy,
+                        advance_iterator,
+                        advance_sequence,
+                        advance_call_sentinel,
+                        ensure_iterator,
+                    )? {
+                        Some(value) => return Ok(Some(value)),
+                        None => {
+                            *current_inner = None;
+                        }
+                    }
+                }
+
+                match outer.next_with(
+                    invoke,
+                    is_truthy,
+                    advance_iterator,
+                    advance_sequence,
+                    advance_call_sentinel,
+                    ensure_iterator,
+                )? {
+                    Some(iterable) => {
+                        *current_inner = Some(Box::new(ensure_iterator(iterable)?));
+                    }
+                    None => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
+                }
+            },
             IterKind::ISlice {
                 inner,
                 next_yield,
@@ -2859,6 +2938,7 @@ impl IteratorObject {
                             advance_iterator,
                             advance_sequence,
                             advance_call_sentinel,
+                            ensure_iterator,
                         )?
                         .is_none()
                     {
@@ -2874,6 +2954,7 @@ impl IteratorObject {
                     advance_iterator,
                     advance_sequence,
                     advance_call_sentinel,
+                    ensure_iterator,
                 )? {
                     Some(value) => {
                         *pos += 1;
@@ -2934,7 +3015,7 @@ impl fmt::Debug for IteratorObject {
             IterKind::GenericAlias { .. } => "generic_alias_iterator",
             IterKind::Empty => "empty_iterator",
             // Composite iterators
-            IterKind::Chain { .. } => "chain",
+            IterKind::Chain { .. } | IterKind::ChainFromIterable { .. } => "chain",
             IterKind::Enumerate { .. } => "enumerate",
             IterKind::Zip { .. } => "zip",
             IterKind::ZipLongest { .. } => "zip_longest",

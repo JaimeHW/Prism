@@ -41,6 +41,10 @@ use crate::ops::iteration::{
 use crate::stdlib::{Module, ModuleResult};
 use prism_core::Value;
 use prism_core::intern::intern;
+use prism_runtime::object::class::{ClassFlags, PyClassObject};
+use prism_runtime::object::type_builtins::{
+    SubclassBitmap, class_id_to_type_id, register_global_class,
+};
 use prism_runtime::types::int::value_to_i64;
 use prism_runtime::types::iter::IteratorObject;
 use prism_runtime::types::tuple::TupleObject;
@@ -75,8 +79,16 @@ itertools_stub!(
     "itertools.accumulate",
     "accumulate"
 );
-static CHAIN_FUNCTION: LazyLock<BuiltinFunctionObject> =
-    LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("itertools.chain"), builtin_chain));
+static CHAIN_NEW_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("itertools.chain.__new__"), builtin_chain_new)
+});
+static CHAIN_FROM_ITERABLE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(
+        Arc::from("itertools.chain.from_iterable"),
+        builtin_chain_from_iterable,
+    )
+});
+static CHAIN_CLASS: LazyLock<Arc<PyClassObject>> = LazyLock::new(build_chain_class);
 itertools_stub!(
     COMPRESS_FUNCTION,
     builtin_compress,
@@ -167,7 +179,7 @@ impl Module for ItertoolsModule {
             "cycle" => Ok(builtin_value(&CYCLE_FUNCTION)),
             "repeat" => Ok(builtin_value(&REPEAT_FUNCTION)),
             "accumulate" => Ok(builtin_value(&ACCUMULATE_FUNCTION)),
-            "chain" => Ok(builtin_value(&CHAIN_FUNCTION)),
+            "chain" => Ok(chain_class_value()),
             "compress" => Ok(builtin_value(&COMPRESS_FUNCTION)),
             "dropwhile" => Ok(builtin_value(&DROPWHILE_FUNCTION)),
             "takewhile" => Ok(builtin_value(&TAKEWHILE_FUNCTION)),
@@ -220,8 +232,34 @@ fn builtin_value(function: &'static BuiltinFunctionObject) -> Value {
 }
 
 #[inline]
+fn chain_class_value() -> Value {
+    Value::object_ptr(Arc::as_ptr(&CHAIN_CLASS) as *const ())
+}
+
+#[inline]
 fn iterator_value(iter: IteratorObject) -> Value {
     crate::builtins::iterator_to_value(iter)
+}
+
+fn build_chain_class() -> Arc<PyClassObject> {
+    let mut class = PyClassObject::new_simple(intern("chain"));
+    class.set_attr(intern("__module__"), Value::string(intern("itertools")));
+    class.set_attr(intern("__qualname__"), Value::string(intern("chain")));
+    class.set_attr(intern("__new__"), builtin_value(&CHAIN_NEW_FUNCTION));
+    class.set_attr(
+        intern("from_iterable"),
+        builtin_value(&CHAIN_FROM_ITERABLE_FUNCTION),
+    );
+    class.add_flags(ClassFlags::INITIALIZED | ClassFlags::HAS_NEW | ClassFlags::NATIVE_HEAPTYPE);
+
+    let mut bitmap = SubclassBitmap::new();
+    for &class_id in class.mro() {
+        bitmap.set_bit(class_id_to_type_id(class_id));
+    }
+
+    let class = Arc::new(class);
+    register_global_class(Arc::clone(&class), bitmap);
+    class
 }
 
 #[inline]
@@ -332,6 +370,34 @@ fn builtin_chain(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value
     }
 
     Ok(iterator_value(IteratorObject::chain(iterators)))
+}
+
+fn builtin_chain_new(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let Some((_class, iterables)) = args.split_first() else {
+        return Err(BuiltinError::TypeError(
+            "chain.__new__() missing class argument".to_string(),
+        ));
+    };
+
+    builtin_chain(vm, iterables)
+}
+
+fn builtin_chain_from_iterable(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    if args.len() != 1 {
+        return Err(BuiltinError::TypeError(format!(
+            "chain.from_iterable expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+
+    let outer = iterator_object_from_iterable(vm, args[0])?;
+    Ok(iterator_value(IteratorObject::chain_from_iterable(outer)))
 }
 
 fn builtin_islice(vm: &mut crate::VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
