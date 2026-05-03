@@ -604,6 +604,18 @@ impl VirtualMachine {
             ImportResolver::with_sys_args_and_builtins(args, self.builtins.clone());
     }
 
+    pub fn reset_imports_with_sys_args_and_flags(
+        &mut self,
+        args: Vec<String>,
+        sys_flags: crate::SysFlags,
+    ) {
+        self.import_resolver = ImportResolver::with_sys_args_flags_and_builtins(
+            args,
+            sys_flags,
+            self.builtins.clone(),
+        );
+    }
+
     #[inline]
     pub fn add_import_search_path(&self, path: impl Into<Arc<str>>) {
         self.import_resolver.add_search_path(path.into());

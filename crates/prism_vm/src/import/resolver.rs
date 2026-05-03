@@ -244,6 +244,18 @@ impl ImportResolver {
         )
     }
 
+    /// Create a new resolver with explicit `sys.argv`, `sys.flags`, and shared builtin state.
+    pub fn with_sys_args_flags_and_builtins(
+        args: Vec<String>,
+        sys_flags: crate::SysFlags,
+        builtins: BuiltinRegistry,
+    ) -> Self {
+        Self::with_stdlib_and_paths(
+            StdlibRegistry::with_sys_args_flags_and_builtins(args, sys_flags, builtins),
+            Vec::new(),
+        )
+    }
+
     /// Create a resolver with custom search paths.
     pub fn with_paths(paths: Vec<Arc<str>>) -> Self {
         Self::with_stdlib_and_paths(StdlibRegistry::new(), paths)

@@ -204,7 +204,7 @@ fn execute_source_entry(
     vm.set_source_optimization(vm_source_optimization_level(config.optimize));
     vm.set_import_verbosity(config.verbose);
     vm.set_execution_step_limit(config.execution_step_limit);
-    vm.reset_imports_with_sys_args(script_args.to_vec());
+    vm.reset_imports_with_sys_args_and_flags(script_args.to_vec(), runtime_sys_flags(config));
     for search_path in search_paths {
         vm.add_import_search_path(Arc::<str>::from(search_path.to_string_lossy().into_owned()));
     }
@@ -313,6 +313,27 @@ fn vm_source_optimization_level(level: CliOptimizationLevel) -> prism_vm::Source
         CliOptimizationLevel::None => prism_vm::SourceOptimization::None,
         CliOptimizationLevel::Basic => prism_vm::SourceOptimization::Basic,
         CliOptimizationLevel::Full => prism_vm::SourceOptimization::Full,
+    }
+}
+
+pub(crate) fn runtime_sys_flags(config: &RuntimeConfig) -> prism_vm::SysFlags {
+    prism_vm::SysFlags {
+        debug: config.debug,
+        inspect: config.inspect,
+        interactive: false,
+        optimize: match config.optimize {
+            CliOptimizationLevel::None => 0,
+            CliOptimizationLevel::Basic => 1,
+            CliOptimizationLevel::Full => 2,
+        },
+        dont_write_bytecode: config.dont_write_bytecode,
+        no_user_site: config.no_user_site,
+        no_site: config.no_site,
+        ignore_environment: config.ignore_environment,
+        verbose: config.verbose,
+        quiet: config.quiet,
+        isolated: config.isolated,
+        dev_mode: config.dev_mode,
     }
 }
 

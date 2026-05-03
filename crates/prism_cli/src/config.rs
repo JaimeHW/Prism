@@ -52,6 +52,9 @@ pub struct RuntimeConfig {
     /// Implementation-specific `-X` options.
     pub x_options: Vec<String>,
 
+    /// Python development mode (`-X dev` or `PYTHONDEVMODE`).
+    pub dev_mode: bool,
+
     /// Deterministic interpreter step budget (`-X max-steps=N`).
     pub execution_step_limit: Option<u64>,
 
@@ -109,6 +112,9 @@ impl RuntimeConfig {
             None
         };
 
+        let dev_mode = Self::xoption_enables_dev_mode(&args.x_options)
+            || (!ignore_env && Self::env_bool("PYTHONDEVMODE"));
+
         Self {
             optimize,
             inspect,
@@ -122,6 +128,7 @@ impl RuntimeConfig {
             no_site: args.no_site,
             warnings: args.warnings.clone(),
             x_options: args.x_options.clone(),
+            dev_mode,
             execution_step_limit: Self::parse_execution_step_limit(&args.x_options),
             debug: args.debug,
             hash_seed,
@@ -161,6 +168,15 @@ impl RuntimeConfig {
         }
 
         limit
+    }
+
+    fn xoption_enables_dev_mode(x_options: &[String]) -> bool {
+        x_options.iter().any(|opt| {
+            matches!(
+                opt.as_str(),
+                "dev" | "dev=1" | "dev=true" | "dev=True" | "dev=yes" | "dev=on"
+            )
+        })
     }
 
     /// Check if an environment variable is set to a non-empty, truthy value.

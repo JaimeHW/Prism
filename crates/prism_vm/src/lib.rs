@@ -101,6 +101,7 @@ pub use imports::{FrozenModuleSource, ModuleObject};
 pub use jit_context::{JitConfig, JitStats};
 pub(crate) use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box as alloc_managed_value;
 pub use source::SourceOptimization;
+pub use stdlib::sys::SysFlags;
 pub use vm::VirtualMachine;
 
 /// Convenience function to create and run a VM.

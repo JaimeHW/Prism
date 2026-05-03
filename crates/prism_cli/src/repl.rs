@@ -40,6 +40,10 @@ pub fn run_repl(config: &RuntimeConfig) -> ExitCode {
     } else {
         prism_vm::VirtualMachine::new()
     };
+    vm.reset_imports_with_sys_args_and_flags(
+        vec![String::new()],
+        crate::pipeline::runtime_sys_flags(config),
+    );
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();

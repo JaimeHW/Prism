@@ -192,29 +192,48 @@ struct RegisteredModule {
 impl StdlibRegistry {
     /// Create a new registry with all stdlib modules.
     pub fn new() -> Self {
-        Self::with_optional_sys_args_and_builtins(None, BuiltinRegistry::with_standard_builtins())
+        Self::with_optional_sys_args_flags_and_builtins(
+            None,
+            sys::SysFlags::default(),
+            BuiltinRegistry::with_standard_builtins(),
+        )
     }
 
     /// Create a registry with an explicit `sys.argv` payload.
     pub fn with_sys_args(args: Vec<String>) -> Self {
-        Self::with_optional_sys_args_and_builtins(
+        Self::with_optional_sys_args_flags_and_builtins(
             Some(args),
+            sys::SysFlags::default(),
             BuiltinRegistry::with_standard_builtins(),
         )
     }
 
     /// Create a registry that projects a specific builtin registry.
     pub fn with_builtins(builtins: BuiltinRegistry) -> Self {
-        Self::with_optional_sys_args_and_builtins(None, builtins)
+        Self::with_optional_sys_args_flags_and_builtins(None, sys::SysFlags::default(), builtins)
     }
 
     /// Create a registry with explicit `sys.argv` and builtin registry state.
     pub fn with_sys_args_and_builtins(args: Vec<String>, builtins: BuiltinRegistry) -> Self {
-        Self::with_optional_sys_args_and_builtins(Some(args), builtins)
+        Self::with_optional_sys_args_flags_and_builtins(
+            Some(args),
+            sys::SysFlags::default(),
+            builtins,
+        )
     }
 
-    fn with_optional_sys_args_and_builtins(
+    /// Create a registry with explicit `sys.argv`, flags, and builtin state.
+    pub fn with_sys_args_flags_and_builtins(
+        args: Vec<String>,
+        sys_flags: sys::SysFlags,
+        builtins: BuiltinRegistry,
+    ) -> Self {
+        Self::with_optional_sys_args_flags_and_builtins(Some(args), sys_flags, builtins)
+    }
+
+    fn with_optional_sys_args_flags_and_builtins(
         sys_args: Option<Vec<String>>,
+        sys_flags: sys::SysFlags,
         builtins: BuiltinRegistry,
     ) -> Self {
         let mut modules: std::collections::HashMap<Arc<str>, RegisteredModule> =
@@ -416,8 +435,8 @@ impl StdlibRegistry {
 
         // Register sys module
         let sys_module = match sys_args {
-            Some(args) => sys::SysModule::with_args(args),
-            None => sys::SysModule::new(),
+            Some(args) => sys::SysModule::with_args_and_flags(args, sys_flags),
+            None => sys::SysModule::with_flags(sys_flags),
         };
         Self::insert_module(&mut modules, "sys", Box::new(sys_module));
 

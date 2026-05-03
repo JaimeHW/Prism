@@ -45,6 +45,26 @@ use prism_runtime::types::tuple::TupleObject;
 use std::cell::Cell;
 use std::sync::{Arc, LazyLock, Mutex};
 
+/// Interpreter process flags exposed through `sys.flags`.
+///
+/// The CLI resolves these once at startup and passes the compact snapshot into
+/// the VM, so Python-visible flag reads are plain attribute loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SysFlags {
+    pub debug: bool,
+    pub inspect: bool,
+    pub interactive: bool,
+    pub optimize: i32,
+    pub dont_write_bytecode: bool,
+    pub no_user_site: bool,
+    pub no_site: bool,
+    pub ignore_environment: bool,
+    pub verbose: u32,
+    pub quiet: bool,
+    pub isolated: bool,
+    pub dev_mode: bool,
+}
+
 /// The sys module providing runtime system configuration.
 pub struct SysModule {
     /// Cached platform
@@ -178,45 +198,27 @@ impl SysModule {
     /// Create a new sys module with default configuration.
     #[inline]
     pub fn new() -> Self {
+        Self::with_flags(SysFlags::default())
+    }
+
+    /// Create a new sys module with explicit interpreter flags.
+    pub fn with_flags(flags: SysFlags) -> Self {
         let argv = SysArgv::from_env();
-        let path = SysPaths::from_env();
-        let platform = Platform::detect();
-        let stdin_value = super::io::new_stdin_stream_object();
-        let stdout_value = super::io::new_stdout_stream_object();
-        let stderr_value = super::io::new_stderr_stream_object();
-        let executable_path = std::env::current_exe().ok();
-        let executable = executable_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(String::new);
-        let prefixes = SysPrefixes::from_env(executable_path.as_deref());
-        Self {
-            platform,
-            executable: executable.into(),
-            argv_value: argv.to_value(),
-            builtin_module_names_value: builtin_module_names_value(platform),
-            warnoptions_value: empty_list_value(),
-            meta_path_value: empty_list_value(),
-            path_hooks_value: empty_list_value(),
-            path_importer_cache_value: empty_dict_value(),
-            modules_value: empty_dict_value(),
-            stdin_value,
-            stdout_value,
-            stderr_value,
-            original_stdin_value: stdin_value,
-            original_stdout_value: stdout_value,
-            original_stderr_value: stderr_value,
-            flags_value: sys_flags_value(),
-            argv,
-            path,
-            prefixes,
-            recursion_limit: RecursionLimit::new(),
-        }
+        Self::from_argv_and_flags(argv, flags)
     }
 
     /// Create sys module with custom arguments (for testing).
     pub fn with_args(args: Vec<String>) -> Self {
+        Self::with_args_and_flags(args, SysFlags::default())
+    }
+
+    /// Create sys module with custom arguments and interpreter flags.
+    pub fn with_args_and_flags(args: Vec<String>, flags: SysFlags) -> Self {
         let argv = SysArgv::new(args);
+        Self::from_argv_and_flags(argv, flags)
+    }
+
+    fn from_argv_and_flags(argv: SysArgv, flags: SysFlags) -> Self {
         let path = SysPaths::from_env();
         let platform = Platform::detect();
         let stdin_value = super::io::new_stdin_stream_object();
@@ -244,7 +246,7 @@ impl SysModule {
             original_stdin_value: stdin_value,
             original_stdout_value: stdout_value,
             original_stderr_value: stderr_value,
-            flags_value: sys_flags_value(),
+            flags_value: sys_flags_value(flags),
             argv,
             path,
             prefixes,
@@ -966,34 +968,39 @@ fn git_info_tuple() -> Value {
     ]))
 }
 
-fn sys_flags_value() -> Value {
+fn sys_flags_value(flags: SysFlags) -> Value {
     let registry = shape_registry();
-    let mut flags = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
+    let mut object = Box::new(ShapedObject::with_empty_shape(registry.empty_shape()));
 
     for (name, value) in [
-        ("debug", Value::int(0).unwrap()),
-        ("inspect", Value::int(0).unwrap()),
-        ("interactive", Value::int(0).unwrap()),
-        ("optimize", Value::int(0).unwrap()),
-        ("dont_write_bytecode", Value::int(0).unwrap()),
-        ("no_user_site", Value::int(0).unwrap()),
-        ("no_site", Value::int(0).unwrap()),
-        ("ignore_environment", Value::int(0).unwrap()),
-        ("verbose", Value::int(0).unwrap()),
+        ("debug", flag_int(flags.debug)),
+        ("inspect", flag_int(flags.inspect)),
+        ("interactive", flag_int(flags.interactive)),
+        ("optimize", Value::int(flags.optimize as i64).unwrap()),
+        ("dont_write_bytecode", flag_int(flags.dont_write_bytecode)),
+        ("no_user_site", flag_int(flags.no_user_site)),
+        ("no_site", flag_int(flags.no_site)),
+        ("ignore_environment", flag_int(flags.ignore_environment)),
+        ("verbose", Value::int(flags.verbose as i64).unwrap()),
         ("bytes_warning", Value::int(0).unwrap()),
-        ("quiet", Value::int(0).unwrap()),
+        ("quiet", flag_int(flags.quiet)),
         ("hash_randomization", Value::int(1).unwrap()),
-        ("isolated", Value::int(0).unwrap()),
-        ("dev_mode", Value::bool(false)),
+        ("isolated", flag_int(flags.isolated)),
+        ("dev_mode", Value::bool(flags.dev_mode)),
         ("utf8_mode", Value::int(0).unwrap()),
         ("warn_default_encoding", Value::int(0).unwrap()),
         ("safe_path", Value::bool(false)),
         ("int_max_str_digits", Value::int(4300).unwrap()),
     ] {
-        flags.set_property(intern(name), value, registry);
+        object.set_property(intern(name), value, registry);
     }
 
-    Value::object_ptr(Box::into_raw(flags) as *const ())
+    Value::object_ptr(Box::into_raw(object) as *const ())
+}
+
+#[inline]
+fn flag_int(enabled: bool) -> Value {
+    Value::int(if enabled { 1 } else { 0 }).unwrap()
 }
 
 fn builtin_module_names_value(platform: Platform) -> Value {
