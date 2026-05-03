@@ -543,6 +543,13 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
+            TemplateInstruction::BytecodeBridge {
+                opcode,
+                helper_addr,
+                ..
+            } => {
+                self.emit_tier1_bytecode_helper(ctx, *opcode, *helper_addr, deopt_idx, None);
+            }
             TemplateInstruction::Move { dst, src, .. } => {
                 MoveTemplate {
                     dst_reg: *dst,
@@ -1516,6 +1523,15 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         value: bool,
+    },
+
+    // Runtime bridge operations
+    /// Execute one fallthrough VM bytecode exactly, then reload the Tier 1
+    /// register mirror and continue in native control flow.
+    BytecodeBridge {
+        bc_offset: u32,
+        opcode: u8,
+        helper_addr: u64,
     },
 
     // Register operations
@@ -2507,6 +2523,7 @@ impl TemplateInstruction {
             | TemplateInstruction::LoadFloat { bc_offset, .. }
             | TemplateInstruction::LoadNone { bc_offset, .. }
             | TemplateInstruction::LoadBool { bc_offset, .. }
+            | TemplateInstruction::BytecodeBridge { bc_offset, .. }
             | TemplateInstruction::Move { bc_offset, .. }
             | TemplateInstruction::LoadLocal { bc_offset, .. }
             | TemplateInstruction::StoreLocal { bc_offset, .. }
@@ -2668,6 +2685,7 @@ impl TemplateInstruction {
         matches!(
             self,
             TemplateInstruction::InterpreterFallback { .. }
+                | TemplateInstruction::BytecodeBridge { helper_addr: 0, .. }
                 | TemplateInstruction::LoadGlobal { helper_addr: 0, .. }
                 | TemplateInstruction::StoreGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
@@ -2750,6 +2768,7 @@ impl TemplateInstruction {
         matches!(
             self,
             TemplateInstruction::IntAdd { .. }
+                | TemplateInstruction::BytecodeBridge { .. }
                 | TemplateInstruction::IntSub { .. }
                 | TemplateInstruction::IntMul { .. }
                 | TemplateInstruction::IntDiv { .. }

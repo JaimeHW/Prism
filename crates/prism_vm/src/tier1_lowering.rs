@@ -94,6 +94,15 @@ fn interpreter_fallback(bc_offset: u32) -> TemplateInstruction {
     TemplateInstruction::InterpreterFallback { bc_offset }
 }
 
+#[inline]
+fn bytecode_bridge(op: Opcode, bc_offset: u32) -> TemplateInstruction {
+    TemplateInstruction::BytecodeBridge {
+        bc_offset,
+        opcode: op as u8,
+        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+    }
+}
+
 fn infer_numeric_kind(
     op: Opcode,
     bc_offset: u32,
@@ -144,7 +153,11 @@ pub(crate) fn lower_code_to_templates(
                 set_reg_type(&mut reg_types, dst, ty);
                 template
             }
-            Opcode::LoadBuiltin => interpreter_fallback(bc_offset),
+            Opcode::LoadBuiltin => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                bytecode_bridge(op, bc_offset)
+            }
             Opcode::LoadGlobal => {
                 let dst = inst.dst().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Unknown);
@@ -303,7 +316,7 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -342,7 +355,7 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -381,7 +394,7 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -430,7 +443,7 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -479,7 +492,7 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -548,7 +561,7 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Int | NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -560,6 +573,52 @@ pub(crate) fn lower_code_to_templates(
                     dst,
                     src: inst.src1().0,
                 }
+            }
+            Opcode::Neg => {
+                let dst = inst.dst().0;
+                let src = inst.src1().0;
+                match get_reg_type(&reg_types, src) {
+                    KnownType::Int => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Int);
+                        TemplateInstruction::IntNeg {
+                            bc_offset,
+                            dst,
+                            src,
+                        }
+                    }
+                    KnownType::Float => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Float);
+                        TemplateInstruction::FloatNeg {
+                            bc_offset,
+                            dst,
+                            src,
+                        }
+                    }
+                    _ => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        bytecode_bridge(op, bc_offset)
+                    }
+                }
+            }
+            Opcode::PosInt => {
+                let dst = inst.dst().0;
+                let src = inst.src1().0;
+                if get_reg_type(&reg_types, src) == KnownType::Int {
+                    set_reg_type(&mut reg_types, dst, KnownType::Int);
+                    TemplateInstruction::Move {
+                        bc_offset,
+                        dst,
+                        src,
+                    }
+                } else {
+                    set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                    bytecode_bridge(op, bc_offset)
+                }
+            }
+            Opcode::Pos => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                bytecode_bridge(op, bc_offset)
             }
 
             Opcode::Lt => {
@@ -582,7 +641,7 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -606,7 +665,7 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -630,7 +689,7 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -654,7 +713,7 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -678,7 +737,7 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -702,7 +761,7 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        interpreter_fallback(bc_offset)
+                        bytecode_bridge(op, bc_offset)
                     }
                 }
             }
@@ -725,6 +784,11 @@ pub(crate) fn lower_code_to_templates(
                     lhs: inst.src1().0,
                     rhs: inst.src2().0,
                 }
+            }
+            Opcode::In | Opcode::NotIn => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Bool);
+                bytecode_bridge(op, bc_offset)
             }
             Opcode::BitwiseAnd => {
                 let dst = inst.dst().0;
@@ -1417,6 +1481,57 @@ mod tests {
         builder.finish()
     }
 
+    fn load_builtin_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("load_builtin");
+        let name_idx = builder.add_name("len");
+        builder.emit_load_builtin(Register::new(0), name_idx);
+        builder.emit_return(Register::new(0));
+        builder.finish()
+    }
+
+    fn dynamic_binary_code(opcode: Opcode) -> CodeObject {
+        let mut builder = FunctionBuilder::new("dynamic_binary");
+        builder.reserve_parameters(3);
+        builder.emit(Instruction::op_dss(
+            opcode,
+            Register::new(2),
+            Register::new(0),
+            Register::new(1),
+        ));
+        builder.emit_return(Register::new(2));
+        builder.finish()
+    }
+
+    fn dynamic_unary_code(opcode: Opcode) -> CodeObject {
+        let mut builder = FunctionBuilder::new("dynamic_unary");
+        builder.reserve_parameters(2);
+        builder.emit(Instruction::op_ds(
+            opcode,
+            Register::new(1),
+            Register::new(0),
+        ));
+        builder.emit_return(Register::new(1));
+        builder.finish()
+    }
+
+    fn assert_bytecode_bridge(template: &TemplateInstruction, bc_offset: u32, opcode: Opcode) {
+        match template {
+            TemplateInstruction::BytecodeBridge {
+                bc_offset: actual_offset,
+                opcode: actual_opcode,
+                helper_addr,
+            } => {
+                assert_eq!(*actual_offset, bc_offset);
+                assert_eq!(*actual_opcode, opcode as u8);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected BytecodeBridge template, got {template:?}"),
+        }
+
+        assert!(!template.requires_interpreter_in_tier1());
+        assert!(template.can_deopt());
+    }
+
     #[test]
     fn normal_load_global_lowers_to_runtime_helper_template() {
         let code = load_global_code(CodeFlags::NONE);
@@ -1450,6 +1565,42 @@ mod tests {
             TemplateInstruction::InterpreterFallback { bc_offset: 0 }
         ));
         assert!(templates[0].requires_interpreter_in_tier1());
+    }
+
+    #[test]
+    fn normal_load_builtin_lowers_to_exact_bytecode_bridge() {
+        let code = load_builtin_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert_bytecode_bridge(&templates[0], 0, Opcode::LoadBuiltin);
+    }
+
+    #[test]
+    fn unknown_add_lowers_to_exact_bytecode_bridge() {
+        let code = dynamic_binary_code(Opcode::Add);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert_bytecode_bridge(&templates[0], 0, Opcode::Add);
+    }
+
+    #[test]
+    fn unknown_comparison_lowers_to_exact_bytecode_bridge() {
+        let code = dynamic_binary_code(Opcode::Lt);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert_bytecode_bridge(&templates[0], 0, Opcode::Lt);
+    }
+
+    #[test]
+    fn unknown_unary_and_membership_lower_to_exact_bytecode_bridge() {
+        let neg = dynamic_unary_code(Opcode::Neg);
+        let neg_templates = lower_code_to_templates(&neg).expect("lowering should succeed");
+        assert_bytecode_bridge(&neg_templates[0], 0, Opcode::Neg);
+
+        let contains = dynamic_binary_code(Opcode::In);
+        let contains_templates =
+            lower_code_to_templates(&contains).expect("lowering should succeed");
+        assert_bytecode_bridge(&contains_templates[0], 0, Opcode::In);
     }
 
     #[test]
