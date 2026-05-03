@@ -448,7 +448,18 @@ impl VirtualMachine {
 
     #[inline(always)]
     pub(crate) fn load_global_cached(&mut self, name_index: u16) -> Result<Value, Arc<str>> {
-        let (context, cacheable) = self.global_load_cache_context(name_index);
+        let (code_key, module_ptr) = {
+            let frame = self.current_frame();
+            (
+                Arc::as_ptr(&frame.code) as usize,
+                frame
+                    .module
+                    .as_deref()
+                    .map(|module| module as *const ModuleObject),
+            )
+        };
+        let module = module_ptr.map(|ptr| unsafe { &*ptr });
+        let (context, cacheable) = self.global_load_cache_context_for(code_key, name_index, module);
         if cacheable && let Some(value) = self.global_load_cache.get(context) {
             return Ok(value);
         }
@@ -474,6 +485,34 @@ impl VirtualMachine {
     }
 
     #[inline(always)]
+    pub(crate) fn load_global_for_jit(
+        &mut self,
+        code: &CodeObject,
+        module: Option<&ModuleObject>,
+        name_index: u16,
+    ) -> Option<Value> {
+        let name = code.names.get(name_index as usize)?;
+        let code_key = code as *const CodeObject as usize;
+        let (context, cacheable) = self.global_load_cache_context_for(code_key, name_index, module);
+        if cacheable && let Some(value) = self.global_load_cache.get(context) {
+            return Some(value);
+        }
+
+        let value = match module {
+            Some(module) => self.module_scope_value_for_module(module, name),
+            None => self.globals.get_arc(name),
+        }
+        .or_else(|| self.builtins.get(name));
+
+        if let Some(value) = value
+            && cacheable
+        {
+            self.global_load_cache.insert(context, value);
+        }
+        value
+    }
+
+    #[inline(always)]
     pub(crate) fn load_builtin_cached(&mut self, name_index: u16) -> Result<Value, Arc<str>> {
         let context = self.builtin_load_cache_context(name_index);
         if let Some(value) = self.global_load_cache.get(context) {
@@ -494,15 +533,18 @@ impl VirtualMachine {
     }
 
     #[inline(always)]
-    fn global_load_cache_context(&self, name_index: u16) -> (GlobalLoadCacheContext, bool) {
-        let frame = self.current_frame();
-        let code = Arc::as_ptr(&frame.code) as usize;
+    fn global_load_cache_context_for(
+        &self,
+        code_key: usize,
+        name_index: u16,
+        module: Option<&ModuleObject>,
+    ) -> (GlobalLoadCacheContext, bool) {
         let builtins_version = self.builtins.version();
 
         let (scope, namespace_version, main_globals_version, cacheable) =
-            if let Some(module) = frame.module.as_ref() {
+            if let Some(module) = module {
                 (
-                    Arc::as_ptr(module) as usize,
+                    module as *const ModuleObject as usize,
                     module.version(),
                     if module.name() == "__main__" {
                         self.globals.version()
@@ -522,7 +564,7 @@ impl VirtualMachine {
 
         (
             GlobalLoadCacheContext::new(
-                GlobalLoadCacheKey::new(code, name_index, scope),
+                GlobalLoadCacheKey::new(code_key, name_index, scope),
                 namespace_version,
                 main_globals_version,
                 builtins_version,
@@ -2170,7 +2212,10 @@ impl VirtualMachine {
         let frame_idx = self.current_frame_idx;
         let (code, header_bc_offset) = {
             let frame = &self.frames[frame_idx];
-            if frame.closure.is_some() || frame.code.flags.contains(CodeFlags::SEPARATE_LOCALS) {
+            if frame.closure.is_some()
+                || frame.locals_mapping().is_some()
+                || frame.code.flags.contains(CodeFlags::SEPARATE_LOCALS)
+            {
                 return Ok(None);
             }
             (Arc::clone(&frame.code), frame.ip.saturating_mul(4))
@@ -2180,6 +2225,7 @@ impl VirtualMachine {
         let hot = self.profiler.record_loop(code_id, header_bc_offset);
         let code_ptr_id = Arc::as_ptr(&code) as u64;
         let global_scope = &self.globals as *const GlobalScope as *const u64;
+        let vm_context = self as *mut VirtualMachine as *mut ();
 
         let execution_result = {
             let Some(jit) = self.jit.as_mut() else {
@@ -2197,11 +2243,12 @@ impl VirtualMachine {
                 return Ok(None);
             }
 
-            jit.try_osr_with_global_scope(
+            jit.try_osr_with_runtime_context(
                 code_ptr_id,
                 header_bc_offset,
                 &mut self.frames[frame_idx],
                 global_scope,
+                vm_context,
             )
         };
 
@@ -2756,6 +2803,7 @@ impl VirtualMachine {
             };
 
             let global_scope = &self.globals as *const GlobalScope as *const u64;
+            let vm_context = self as *mut VirtualMachine as *mut ();
             let jit_outcome = {
                 let profiler = &self.profiler;
                 let (frame_pool, jit_slot) = (&mut self.frame_pool, &mut self.jit);
@@ -2779,10 +2827,11 @@ impl VirtualMachine {
                         );
 
                         Some(
-                            match jit.try_execute_with_global_scope(
+                            match jit.try_execute_with_runtime_context(
                                 code_ptr_id,
                                 &mut jit_frame,
                                 global_scope,
+                                vm_context,
                             ) {
                                 Some(ExecutionResult::Return(value)) => {
                                     frame_pool.release(jit_frame);
@@ -2891,6 +2940,7 @@ impl VirtualMachine {
             let frame = &self.frames[frame_idx];
             if frame.ip != 0
                 || frame.closure.is_some()
+                || frame.locals_mapping().is_some()
                 || frame.code.flags.contains(CodeFlags::SEPARATE_LOCALS)
             {
                 return Ok(false);
@@ -2901,6 +2951,7 @@ impl VirtualMachine {
         let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
         let code_ptr_id = Arc::as_ptr(&code) as u64;
         let global_scope = &self.globals as *const GlobalScope as *const u64;
+        let vm_context = self as *mut VirtualMachine as *mut ();
         let execution_result = {
             let Some(jit) = self.jit.as_mut() else {
                 return Ok(false);
@@ -2916,10 +2967,11 @@ impl VirtualMachine {
                 return Ok(false);
             }
 
-            jit.try_execute_with_global_scope(
+            jit.try_execute_with_runtime_context(
                 code_ptr_id,
                 &mut self.frames[frame_idx],
                 global_scope,
+                vm_context,
             )
         };
 

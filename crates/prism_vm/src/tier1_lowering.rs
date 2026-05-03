@@ -141,6 +141,20 @@ pub(crate) fn lower_code_to_templates(
                 template
             }
             Opcode::LoadBuiltin => interpreter_fallback(bc_offset),
+            Opcode::LoadGlobal => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                if class_local_semantics {
+                    interpreter_fallback(bc_offset)
+                } else {
+                    TemplateInstruction::LoadGlobal {
+                        bc_offset,
+                        dst,
+                        name_idx: inst.imm16(),
+                        helper_addr: crate::jit_runtime_helpers::tier1_load_global_addr(),
+                    }
+                }
+            }
             Opcode::LoadNone => {
                 let dst = inst.dst().0;
                 set_reg_type(&mut reg_types, dst, KnownType::None);
@@ -886,5 +900,55 @@ fn jump_target(template: &TemplateInstruction) -> Option<u32> {
         | TemplateInstruction::BranchIfNotNone { target, .. } => Some(*target),
         TemplateInstruction::EndAsyncFor { target, .. } => Some(*target as u32),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_code::{FunctionBuilder, Register};
+
+    fn load_global_code(flags: CodeFlags) -> CodeObject {
+        let mut builder = FunctionBuilder::new("load_global");
+        builder.add_flags(flags);
+        let name_idx = builder.add_name("answer");
+        builder.emit_load_global(Register::new(0), name_idx);
+        builder.emit_return(Register::new(0));
+        builder.finish()
+    }
+
+    #[test]
+    fn normal_load_global_lowers_to_runtime_helper_template() {
+        let code = load_global_code(CodeFlags::NONE);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::LoadGlobal {
+                bc_offset,
+                dst,
+                name_idx,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 0);
+                assert_eq!(*name_idx, 0);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected LoadGlobal template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+    }
+
+    #[test]
+    fn class_body_load_global_keeps_interpreter_semantics() {
+        let code = load_global_code(CodeFlags::CLASS);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert!(matches!(
+            templates[0],
+            TemplateInstruction::InterpreterFallback { bc_offset: 0 }
+        ));
+        assert!(templates[0].requires_interpreter_in_tier1());
     }
 }

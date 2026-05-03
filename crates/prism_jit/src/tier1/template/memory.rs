@@ -7,7 +7,7 @@
 //! - Register-to-register moves
 
 use super::{OpcodeTemplate, TemplateContext};
-use crate::backend::x64::MemOperand;
+use crate::backend::x64::{Gpr, MemOperand};
 use crate::tier1::frame::JIT_FRAME_STATE_WRITTEN_REGISTERS_OFFSET;
 
 // =============================================================================
@@ -140,6 +140,56 @@ fn update_local_written_bit(ctx: &mut TemplateContext, local_idx: u16, written: 
     ctx.asm.mov_mr(&word_slot, ctx.regs.scratch2);
 }
 
+#[inline]
+fn helper_arg0() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::Rcx
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rdi
+    }
+}
+
+#[inline]
+fn helper_arg1() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::Rdx
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rsi
+    }
+}
+
+#[inline]
+fn helper_arg2() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::R8
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rdx
+    }
+}
+
+fn emit_runtime_call(ctx: &mut TemplateContext, helper_addr: u64) {
+    #[cfg(target_os = "windows")]
+    {
+        ctx.asm.sub_ri(Gpr::Rsp, 32);
+    }
+
+    ctx.asm.call_abs(helper_addr, Gpr::R11);
+
+    #[cfg(target_os = "windows")]
+    {
+        ctx.asm.add_ri(Gpr::Rsp, 32);
+    }
+}
+
 // =============================================================================
 // Load/Store Global Variables
 // =============================================================================
@@ -151,32 +201,32 @@ fn update_local_written_bit(ctx: &mut TemplateContext, local_idx: u16, written: 
 pub struct LoadGlobalTemplate {
     pub dst_reg: u8,
     pub name_idx: u16,
+    pub helper_addr: u64,
     pub deopt_idx: usize,
 }
 
 impl OpcodeTemplate for LoadGlobalTemplate {
     fn emit(&self, ctx: &mut TemplateContext) {
-        // Load global scope pointer
-        let scope_slot = ctx.frame.global_scope_slot();
-        ctx.asm.mov_rm(ctx.regs.scratch1, &scope_slot);
+        if self.helper_addr == 0 {
+            ctx.asm.jmp(ctx.deopt_label(self.deopt_idx));
+            return;
+        }
 
-        // Call runtime helper to look up global (would be inlined in full impl)
-        // For now, emit a call to a stub address
-        // In production, this would be an inline cache
-
-        // Simplified: just load the name index and deopt
-        // The actual implementation would do proper lookup
-        ctx.asm.mov_ri32(ctx.regs.scratch2, self.name_idx as u32);
-
-        // Deopt if global not found (placeholder - actual impl would check)
-        // Store result
         let dst_slot = ctx.frame.register_slot(self.dst_reg as u16);
-        ctx.asm.mov_mr(&dst_slot, ctx.regs.accumulator);
+
+        ctx.asm.mov_rm(helper_arg0(), &ctx.frame.context_slot());
+        ctx.asm.mov_ri32(helper_arg1(), self.name_idx as u32);
+        ctx.asm.lea(helper_arg2(), &dst_slot);
+
+        emit_runtime_call(ctx, self.helper_addr);
+
+        ctx.asm.cmp_ri(ctx.regs.accumulator, 0);
+        ctx.asm.jne(ctx.deopt_label(self.deopt_idx));
     }
 
     #[inline]
     fn estimated_size(&self) -> usize {
-        48 // Multiple loads + potential call
+        64
     }
 }
 

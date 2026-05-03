@@ -293,6 +293,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     dst: inst.dst().0,
                     name_idx: inst.imm16(),
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::StoreGlobal) => {

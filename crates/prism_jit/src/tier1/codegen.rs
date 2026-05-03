@@ -347,10 +347,16 @@ impl TemplateCompiler {
             TemplateInstruction::DeleteLocal { slot, .. } => {
                 DeleteLocalTemplate { local_idx: *slot }.emit(ctx);
             }
-            TemplateInstruction::LoadGlobal { dst, name_idx, .. } => {
+            TemplateInstruction::LoadGlobal {
+                dst,
+                name_idx,
+                helper_addr,
+                ..
+            } => {
                 LoadGlobalTemplate {
                     dst_reg: *dst,
                     name_idx: *name_idx,
+                    helper_addr: *helper_addr,
                     deopt_idx,
                 }
                 .emit(ctx);
@@ -1137,6 +1143,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         name_idx: u16,
+        helper_addr: u64,
     },
     /// Store to global variable: globals[name_idx] = src
     StoreGlobal {
@@ -2183,7 +2190,7 @@ impl TemplateInstruction {
         matches!(
             self,
             TemplateInstruction::InterpreterFallback { .. }
-                | TemplateInstruction::LoadGlobal { .. }
+                | TemplateInstruction::LoadGlobal { helper_addr: 0, .. }
                 | TemplateInstruction::StoreGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
                 | TemplateInstruction::LoadClosure { .. }

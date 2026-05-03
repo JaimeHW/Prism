@@ -115,6 +115,12 @@ pub struct JitFrameState {
     pub global_scope: *const u64,
     /// Pointer to the interpreter frame's register-written bitset.
     pub written_registers: *mut u64,
+    /// Opaque pointer to the owning VM for runtime helpers.
+    pub vm_context: *mut (),
+    /// Opaque pointer to the executing `CodeObject`.
+    pub code: *const (),
+    /// Opaque pointer to the frame module, or null for VM globals.
+    pub module: *const (),
 }
 
 // SAFETY: JitFrameState contains raw pointers but is only used within
@@ -131,6 +137,9 @@ impl Default for JitFrameState {
             closure_env: std::ptr::null(),
             global_scope: std::ptr::null(),
             written_registers: std::ptr::null_mut(),
+            vm_context: std::ptr::null_mut(),
+            code: std::ptr::null(),
+            module: std::ptr::null(),
         }
     }
 }
@@ -240,8 +249,19 @@ impl JitExecutor {
         frame: &mut Frame,
         global_scope: *const u64,
     ) -> ExecutionResult {
+        self.execute_with_runtime_context(entry, frame, global_scope, std::ptr::null_mut())
+    }
+
+    /// Execute compiled code with explicit global-scope and runtime context pointers.
+    pub fn execute_with_runtime_context(
+        &mut self,
+        entry: &CompiledEntry,
+        frame: &mut Frame,
+        global_scope: *const u64,
+        vm_context: *mut (),
+    ) -> ExecutionResult {
         // Setup JIT frame state from interpreter frame
-        self.setup_frame_state(frame, global_scope);
+        self.setup_frame_state(frame, global_scope, vm_context);
 
         // Get the entry point
         let entry_fn: JitEntryFn = unsafe { std::mem::transmute(entry.entry_point()) };
@@ -306,6 +326,17 @@ impl JitExecutor {
         frame: &mut Frame,
         osr_bc_offset: u32,
     ) -> ExecutionResult {
+        self.execute_osr_with_runtime_context(entry, frame, osr_bc_offset, std::ptr::null_mut())
+    }
+
+    /// Execute at an OSR entry point with an explicit runtime context pointer.
+    pub fn execute_osr_with_runtime_context(
+        &mut self,
+        entry: &CompiledEntry,
+        frame: &mut Frame,
+        osr_bc_offset: u32,
+        vm_context: *mut (),
+    ) -> ExecutionResult {
         // Check for OSR entry at this offset
         let osr_entry = match entry.osr_entries() {
             Some(osr) => match osr.lookup_entry(osr_bc_offset) {
@@ -329,7 +360,7 @@ impl JitExecutor {
         let osr_offset = osr_entry.jit_offset;
 
         // Setup frame state
-        self.setup_frame_state(frame, std::ptr::null());
+        self.setup_frame_state(frame, std::ptr::null(), vm_context);
         self.frame_state.bc_offset = osr_bc_offset;
 
         // Calculate OSR entry point
@@ -375,7 +406,12 @@ impl JitExecutor {
 
     /// Setup JIT frame state from interpreter frame.
     #[inline]
-    fn setup_frame_state(&mut self, frame: &mut Frame, global_scope: *const u64) {
+    fn setup_frame_state(
+        &mut self,
+        frame: &mut Frame,
+        global_scope: *const u64,
+        vm_context: *mut (),
+    ) {
         self.frame_state.frame_base = frame.registers.as_ptr() as *mut u64;
         self.frame_state.num_registers = frame.code.register_count;
         self.frame_state.bc_offset = frame.ip.saturating_mul(4);
@@ -385,6 +421,12 @@ impl JitExecutor {
         });
         self.frame_state.global_scope = global_scope;
         self.frame_state.written_registers = frame.written_registers_mut_ptr();
+        self.frame_state.vm_context = vm_context;
+        self.frame_state.code = Arc::as_ptr(&frame.code) as *const ();
+        self.frame_state.module = frame
+            .module
+            .as_ref()
+            .map_or(std::ptr::null(), |module| Arc::as_ptr(module) as *const ());
     }
 
     /// Restore interpreter frame state from JIT frame.

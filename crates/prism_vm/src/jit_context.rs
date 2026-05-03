@@ -257,6 +257,18 @@ impl JitContext {
         frame: &mut Frame,
         global_scope: *const u64,
     ) -> Option<ExecutionResult> {
+        self.try_execute_with_runtime_context(code_id, frame, global_scope, std::ptr::null_mut())
+    }
+
+    /// Try to execute compiled code with explicit runtime helper context.
+    #[inline]
+    pub fn try_execute_with_runtime_context(
+        &mut self,
+        code_id: u64,
+        frame: &mut Frame,
+        global_scope: *const u64,
+        vm_context: *mut (),
+    ) -> Option<ExecutionResult> {
         // Fast path: lookup compiled code
         let entry = self.lookup(code_id)?;
 
@@ -264,7 +276,7 @@ impl JitContext {
         self.stats.cache_hits += 1;
 
         // Execute compiled code
-        Some(self.execute_entry(&entry, frame, global_scope))
+        Some(self.execute_entry(&entry, frame, global_scope, vm_context))
     }
 
     /// Execute compiled code from a cached entry.
@@ -273,9 +285,10 @@ impl JitContext {
         entry: &CompiledEntry,
         frame: &mut Frame,
         global_scope: *const u64,
+        vm_context: *mut (),
     ) -> ExecutionResult {
         self.bridge
-            .execute_with_global_scope(entry, frame, global_scope)
+            .execute_with_runtime_context(entry, frame, global_scope, vm_context)
     }
 
     /// Record a cache miss for statistics.
@@ -317,6 +330,25 @@ impl JitContext {
         frame: &mut Frame,
         global_scope: *const u64,
     ) -> Option<ExecutionResult> {
+        self.try_osr_with_runtime_context(
+            code_id,
+            bc_offset,
+            frame,
+            global_scope,
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// Try to enter compiled code via OSR with explicit runtime helper context.
+    #[inline]
+    pub fn try_osr_with_runtime_context(
+        &mut self,
+        code_id: u64,
+        bc_offset: u32,
+        frame: &mut Frame,
+        global_scope: *const u64,
+        vm_context: *mut (),
+    ) -> Option<ExecutionResult> {
         if !self.config.enable_osr {
             return None;
         }
@@ -329,7 +361,7 @@ impl JitContext {
         self.stats.osr_entries += 1;
         Some(
             self.bridge
-                .execute_with_global_scope(&entry, frame, global_scope),
+                .execute_with_runtime_context(&entry, frame, global_scope, vm_context),
         )
     }
 

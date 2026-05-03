@@ -338,8 +338,19 @@ impl JitBridge {
         frame: &mut crate::frame::Frame,
         global_scope: *const u64,
     ) -> ExecutionResult {
+        self.execute_with_runtime_context(entry, frame, global_scope, std::ptr::null_mut())
+    }
+
+    /// Execute compiled code with VM runtime context for native helper calls.
+    pub fn execute_with_runtime_context(
+        &mut self,
+        entry: &CompiledEntry,
+        frame: &mut crate::frame::Frame,
+        global_scope: *const u64,
+        vm_context: *mut (),
+    ) -> ExecutionResult {
         self.executor
-            .execute_with_global_scope(entry, frame, global_scope)
+            .execute_with_runtime_context(entry, frame, global_scope, vm_context)
     }
 
     /// Execute at an OSR entry point.

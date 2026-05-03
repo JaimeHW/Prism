@@ -81,6 +81,7 @@ mod jit_bridge;
 mod jit_context;
 mod jit_dispatch;
 mod jit_executor;
+mod jit_runtime_helpers;
 mod tier1_lowering;
 
 // Opcode handlers (organized by category)
