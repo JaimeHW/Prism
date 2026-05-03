@@ -236,8 +236,7 @@ impl DictObject {
         let value = {
             let slot = &mut self.entries.slots[index];
             if slot.requires_protocol_lookup() {
-                self.entries.protocol_key_count =
-                    self.entries.protocol_key_count.saturating_sub(1);
+                self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
             }
             slot.set_live(false);
             slot.value
@@ -384,8 +383,7 @@ impl DictObject {
             self.bump_version();
             self.entries.index.remove(&slot.key);
             if slot.requires_protocol_lookup() {
-                self.entries.protocol_key_count =
-                    self.entries.protocol_key_count.saturating_sub(1);
+                self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
             }
             return Some((slot.key.0, slot.value));
         }
@@ -610,5 +608,10 @@ mod tests {
         }
 
         assert_eq!(seen, vec![(0, 100), (2, 102), (4, 104), (5, 105)]);
+    }
+
+    #[test]
+    fn slot_layout_stays_cache_compact() {
+        assert!(std::mem::size_of::<DictSlot>() <= 32);
     }
 }
