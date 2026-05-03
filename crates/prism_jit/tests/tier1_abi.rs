@@ -1,4 +1,5 @@
 use prism_core::Value;
+use prism_core::value::{SMALL_INT_MAX, SMALL_INT_MIN};
 use prism_jit::runtime::ExitReason;
 use prism_jit::tier1::TemplateCompiler;
 use prism_jit::tier1::codegen::TemplateInstruction;
@@ -97,6 +98,110 @@ fn tier1_deopt_exit_is_encoded_not_returned_as_value() {
     );
 
     assert_eq!(result & 0xFF, ExitReason::Deoptimize as u64);
+}
+
+#[test]
+fn tier1_int_add_deopts_on_small_int_payload_overflow() {
+    let mut registers = vec![
+        Value::int(SMALL_INT_MAX).unwrap().to_bits(),
+        Value::int(1).unwrap().to_bits(),
+        Value::none().to_bits(),
+    ];
+    let result = run_tier1(
+        &mut registers,
+        &[
+            TemplateInstruction::IntAdd {
+                bc_offset: 0,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 4,
+                value: 2,
+            },
+        ],
+    );
+
+    assert_eq!(result & 0xFF, ExitReason::Deoptimize as u64);
+}
+
+#[test]
+fn tier1_int_neg_deopts_on_small_int_payload_overflow() {
+    let mut registers = vec![
+        Value::int(SMALL_INT_MIN).unwrap().to_bits(),
+        Value::none().to_bits(),
+    ];
+    let result = run_tier1(
+        &mut registers,
+        &[
+            TemplateInstruction::IntNeg {
+                bc_offset: 0,
+                dst: 1,
+                src: 0,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 4,
+                value: 1,
+            },
+        ],
+    );
+
+    assert_eq!(result & 0xFF, ExitReason::Deoptimize as u64);
+}
+
+#[test]
+fn tier1_int_floor_div_uses_python_sign_semantics() {
+    let mut registers = vec![
+        Value::int(-3).unwrap().to_bits(),
+        Value::int(2).unwrap().to_bits(),
+        Value::none().to_bits(),
+    ];
+    let result = run_tier1(
+        &mut registers,
+        &[
+            TemplateInstruction::IntDiv {
+                bc_offset: 0,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 4,
+                value: 2,
+            },
+        ],
+    );
+
+    assert_eq!(result & 0xFF, ExitReason::Return as u64);
+    assert_eq!(Value::from_bits(registers[0]).as_int(), Some(-2));
+}
+
+#[test]
+fn tier1_int_mod_uses_python_sign_semantics() {
+    let mut registers = vec![
+        Value::int(-3).unwrap().to_bits(),
+        Value::int(2).unwrap().to_bits(),
+        Value::none().to_bits(),
+    ];
+    let result = run_tier1(
+        &mut registers,
+        &[
+            TemplateInstruction::IntMod {
+                bc_offset: 0,
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            TemplateInstruction::Return {
+                bc_offset: 4,
+                value: 2,
+            },
+        ],
+    );
+
+    assert_eq!(result & 0xFF, ExitReason::Return as u64);
+    assert_eq!(Value::from_bits(registers[0]).as_int(), Some(1));
 }
 
 #[test]

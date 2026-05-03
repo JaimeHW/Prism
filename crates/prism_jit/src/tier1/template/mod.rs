@@ -115,8 +115,8 @@ pub mod value_tags {
     /// These bounds are part of the value ABI: arithmetic fast paths must
     /// transfer to the generic runtime before boxing any result outside this
     /// range, because the payload is only 48 bits wide.
-    pub const SMALL_INT_MIN: i64 = -(1_i64 << 47);
-    pub const SMALL_INT_MAX: i64 = (1_i64 << 47) - 1;
+    pub const SMALL_INT_MIN: i64 = prism_core::value::SMALL_INT_MIN;
+    pub const SMALL_INT_MAX: i64 = prism_core::value::SMALL_INT_MAX;
 
     // =========================================================================
     // Masks

@@ -32,6 +32,17 @@ fn emit_int_check_and_extract(
     ctx.asm.sar_ri(dst, 16);
 }
 
+/// Emit code to deoptimize if a signed result cannot fit in the 48-bit integer
+/// payload used by Prism's NaN-boxed immediate representation.
+fn emit_int_range_check(ctx: &mut TemplateContext, value: Gpr, scratch: Gpr, deopt_idx: usize) {
+    ctx.asm.mov_ri64(scratch, value_tags::SMALL_INT_MIN);
+    ctx.asm.cmp_rr(value, scratch);
+    ctx.asm.jl(ctx.deopt_label(deopt_idx));
+    ctx.asm.mov_ri64(scratch, value_tags::SMALL_INT_MAX);
+    ctx.asm.cmp_rr(value, scratch);
+    ctx.asm.jg(ctx.deopt_label(deopt_idx));
+}
+
 /// Emit code to box an integer result.
 fn emit_int_box(ctx: &mut TemplateContext, value: Gpr, scratch: Gpr) {
     // Mask to 48 bits and add tag
@@ -75,6 +86,7 @@ impl OpcodeTemplate for IntAddTemplate {
         // Add with overflow check
         ctx.asm.add_rr(acc, scratch2);
         ctx.asm.jo(ctx.deopt_label(self.deopt_idx));
+        emit_int_range_check(ctx, acc, scratch1, self.deopt_idx);
 
         // Box result
         emit_int_box(ctx, acc, scratch1);
@@ -122,6 +134,7 @@ impl OpcodeTemplate for IntSubTemplate {
         // Subtract with overflow check
         ctx.asm.sub_rr(acc, scratch2);
         ctx.asm.jo(ctx.deopt_label(self.deopt_idx));
+        emit_int_range_check(ctx, acc, scratch1, self.deopt_idx);
 
         // Box result
         emit_int_box(ctx, acc, scratch1);
@@ -169,6 +182,7 @@ impl OpcodeTemplate for IntMulTemplate {
         // Multiply with overflow check (imul sets OF)
         ctx.asm.imul_rr(acc, scratch2);
         ctx.asm.jo(ctx.deopt_label(self.deopt_idx));
+        emit_int_range_check(ctx, acc, scratch1, self.deopt_idx);
 
         // Box result
         emit_int_box(ctx, acc, scratch1);
@@ -216,16 +230,26 @@ impl OpcodeTemplate for IntFloorDivTemplate {
         ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.jz(ctx.deopt_label(self.deopt_idx));
 
+        // Track whether operand signs differ before idiv clobbers RDX.
+        ctx.asm.mov_rr(scratch1, Gpr::Rax);
+        ctx.asm.xor_rr(scratch1, scratch2);
+
         // Sign-extend RAX into RDX:RAX
         ctx.asm.cqo();
 
         // Divide (quotient in RAX, remainder in RDX)
         ctx.asm.idiv(scratch2);
 
-        // Python floor division rounds towards negative infinity
-        // If signs differ and remainder != 0, decrement quotient
-        // For simplicity, deopt on negative divisor for now
-        // (Full implementation would handle this properly)
+        // Python floor division rounds toward negative infinity.
+        let done = ctx.asm.create_label();
+        ctx.asm.and_flags_rr(Gpr::Rdx, Gpr::Rdx);
+        ctx.asm.jz(done);
+        ctx.asm.and_flags_rr(scratch1, scratch1);
+        ctx.asm.jns(done);
+        ctx.asm.dec(Gpr::Rax);
+        ctx.asm.bind_label(done);
+
+        emit_int_range_check(ctx, Gpr::Rax, scratch1, self.deopt_idx);
 
         // Box result
         emit_int_box(ctx, Gpr::Rax, scratch1);
@@ -273,11 +297,24 @@ impl OpcodeTemplate for IntModTemplate {
         ctx.asm.and_flags_rr(scratch2, scratch2);
         ctx.asm.jz(ctx.deopt_label(self.deopt_idx));
 
+        // Track whether operand signs differ before idiv clobbers RDX.
+        ctx.asm.mov_rr(scratch1, Gpr::Rax);
+        ctx.asm.xor_rr(scratch1, scratch2);
+
         // Sign-extend RAX into RDX:RAX
         ctx.asm.cqo();
 
         // Divide (remainder in RDX)
         ctx.asm.idiv(scratch2);
+
+        // Python modulo has the divisor's sign.
+        let done = ctx.asm.create_label();
+        ctx.asm.and_flags_rr(Gpr::Rdx, Gpr::Rdx);
+        ctx.asm.jz(done);
+        ctx.asm.and_flags_rr(scratch1, scratch1);
+        ctx.asm.jns(done);
+        ctx.asm.add_rr(Gpr::Rdx, scratch2);
+        ctx.asm.bind_label(done);
 
         // Move remainder to result register
         ctx.asm.mov_rr(Gpr::Rax, Gpr::Rdx);
@@ -321,6 +358,7 @@ impl OpcodeTemplate for IntNegTemplate {
         // Negate (can overflow for MIN_INT)
         ctx.asm.neg(acc);
         ctx.asm.jo(ctx.deopt_label(self.deopt_idx));
+        emit_int_range_check(ctx, acc, scratch1, self.deopt_idx);
 
         // Box result
         emit_int_box(ctx, acc, scratch1);
