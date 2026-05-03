@@ -46,8 +46,11 @@ pub use comparison::*;
 pub use containers::*;
 pub use control::*;
 pub use guards::*;
+pub use list_enhance::ListLenTemplate;
+pub use list_specialize::{ListAppendFastTemplate, ListIndexTemplate, ListStoreTemplate};
 pub use memory::*;
 pub use objects::*;
+pub use tuple_specialize::{TupleIndexTemplate, TupleLenTemplate};
 pub use values::*;
 
 // =============================================================================

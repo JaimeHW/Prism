@@ -13,6 +13,8 @@ enum KnownType {
     Bool,
     Int,
     Float,
+    List,
+    Tuple,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -792,22 +794,57 @@ pub(crate) fn lower_code_to_templates(
             }
             Opcode::GetItem => {
                 let dst = inst.dst().0;
+                let container = inst.src1().0;
+                let key = inst.src2().0;
+                let container_ty = get_reg_type(&reg_types, container);
+                let key_ty = get_reg_type(&reg_types, key);
                 set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                TemplateInstruction::GetItem {
-                    bc_offset,
-                    dst,
-                    container: inst.src1().0,
-                    key: inst.src2().0,
-                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+
+                match (container_ty, key_ty) {
+                    (KnownType::List, KnownType::Int) => TemplateInstruction::ListGetItem {
+                        bc_offset,
+                        dst,
+                        list: container,
+                        index: key,
+                    },
+                    (KnownType::Tuple, KnownType::Int) => TemplateInstruction::TupleGetItem {
+                        bc_offset,
+                        dst,
+                        tuple: container,
+                        index: key,
+                    },
+                    _ => TemplateInstruction::GetItem {
+                        bc_offset,
+                        dst,
+                        container,
+                        key,
+                        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    },
                 }
             }
-            Opcode::SetItem => TemplateInstruction::SetItem {
-                bc_offset,
-                container: inst.src1().0,
-                key: inst.dst().0,
-                value: inst.src2().0,
-                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
-            },
+            Opcode::SetItem => {
+                let container = inst.src1().0;
+                let key = inst.dst().0;
+                let value = inst.src2().0;
+                match (
+                    get_reg_type(&reg_types, container),
+                    get_reg_type(&reg_types, key),
+                ) {
+                    (KnownType::List, KnownType::Int) => TemplateInstruction::ListSetItem {
+                        bc_offset,
+                        list: container,
+                        index: key,
+                        value,
+                    },
+                    _ => TemplateInstruction::SetItem {
+                        bc_offset,
+                        container,
+                        key,
+                        value,
+                        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    },
+                }
+            }
             Opcode::DelItem => TemplateInstruction::DelItem {
                 bc_offset,
                 container: inst.src1().0,
@@ -816,12 +853,25 @@ pub(crate) fn lower_code_to_templates(
             },
             Opcode::Len => {
                 let dst = inst.dst().0;
+                let src = inst.src1().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Int);
-                TemplateInstruction::Len {
-                    bc_offset,
-                    dst,
-                    src: inst.src1().0,
-                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                match get_reg_type(&reg_types, src) {
+                    KnownType::List => TemplateInstruction::ListLen {
+                        bc_offset,
+                        dst,
+                        list: src,
+                    },
+                    KnownType::Tuple => TemplateInstruction::TupleLen {
+                        bc_offset,
+                        dst,
+                        tuple: src,
+                    },
+                    _ => TemplateInstruction::Len {
+                        bc_offset,
+                        dst,
+                        src,
+                        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    },
                 }
             }
             Opcode::IsCallable => {
@@ -860,7 +910,7 @@ pub(crate) fn lower_code_to_templates(
             }
             Opcode::BuildList => {
                 let dst = inst.dst().0;
-                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                set_reg_type(&mut reg_types, dst, KnownType::List);
                 TemplateInstruction::BuildList {
                     bc_offset,
                     dst,
@@ -871,7 +921,7 @@ pub(crate) fn lower_code_to_templates(
             }
             Opcode::BuildTuple => {
                 let dst = inst.dst().0;
-                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                set_reg_type(&mut reg_types, dst, KnownType::Tuple);
                 TemplateInstruction::BuildTuple {
                     bc_offset,
                     dst,
@@ -924,12 +974,24 @@ pub(crate) fn lower_code_to_templates(
                     helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
                 }
             }
-            Opcode::ListAppend => TemplateInstruction::ListAppend {
-                bc_offset,
-                list: inst.src1().0,
-                value: inst.src2().0,
-                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
-            },
+            Opcode::ListAppend => {
+                let list = inst.src1().0;
+                let value = inst.src2().0;
+                if get_reg_type(&reg_types, list) == KnownType::List {
+                    TemplateInstruction::ListAppendFast {
+                        bc_offset,
+                        list,
+                        value,
+                    }
+                } else {
+                    TemplateInstruction::ListAppend {
+                        bc_offset,
+                        list,
+                        value,
+                        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    }
+                }
+            }
             Opcode::SetAdd => TemplateInstruction::SetAdd {
                 bc_offset,
                 set: inst.src1().0,
@@ -1231,6 +1293,95 @@ mod tests {
         builder.finish()
     }
 
+    fn list_get_item_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("list_get_item");
+        builder.reserve_parameters(5);
+        let first = builder.add_int(10);
+        let second = builder.add_int(20);
+        let index = builder.add_int(1);
+        builder.emit_load_const(Register::new(0), first);
+        builder.emit_load_const(Register::new(1), second);
+        builder.emit_build_list(Register::new(2), Register::new(0), 2);
+        builder.emit_load_const(Register::new(3), index);
+        builder.emit_get_item(Register::new(4), Register::new(2), Register::new(3));
+        builder.emit_return(Register::new(4));
+        builder.finish()
+    }
+
+    fn tuple_get_item_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("tuple_get_item");
+        builder.reserve_parameters(5);
+        let first = builder.add_int(10);
+        let second = builder.add_int(20);
+        let index = builder.add_int(0);
+        builder.emit_load_const(Register::new(0), first);
+        builder.emit_load_const(Register::new(1), second);
+        builder.emit_build_tuple(Register::new(2), Register::new(0), 2);
+        builder.emit_load_const(Register::new(3), index);
+        builder.emit_get_item(Register::new(4), Register::new(2), Register::new(3));
+        builder.emit_return(Register::new(4));
+        builder.finish()
+    }
+
+    fn list_set_item_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("list_set_item");
+        builder.reserve_parameters(5);
+        let first = builder.add_int(10);
+        let second = builder.add_int(20);
+        let index = builder.add_int(1);
+        let value = builder.add_int(30);
+        builder.emit_load_const(Register::new(0), first);
+        builder.emit_load_const(Register::new(1), second);
+        builder.emit_build_list(Register::new(2), Register::new(0), 2);
+        builder.emit_load_const(Register::new(3), index);
+        builder.emit_load_const(Register::new(4), value);
+        builder.emit_set_item(Register::new(2), Register::new(3), Register::new(4));
+        builder.emit_return(Register::new(2));
+        builder.finish()
+    }
+
+    fn list_len_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("list_len");
+        builder.reserve_parameters(4);
+        builder.emit_build_list(Register::new(2), Register::new(0), 0);
+        builder.emit(Instruction::op_ds(
+            Opcode::Len,
+            Register::new(3),
+            Register::new(2),
+        ));
+        builder.emit_return(Register::new(3));
+        builder.finish()
+    }
+
+    fn tuple_len_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("tuple_len");
+        builder.reserve_parameters(4);
+        builder.emit_build_tuple(Register::new(2), Register::new(0), 0);
+        builder.emit(Instruction::op_ds(
+            Opcode::Len,
+            Register::new(3),
+            Register::new(2),
+        ));
+        builder.emit_return(Register::new(3));
+        builder.finish()
+    }
+
+    fn list_append_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("list_append");
+        builder.reserve_parameters(4);
+        let value = builder.add_int(30);
+        builder.emit_build_list(Register::new(2), Register::new(0), 0);
+        builder.emit_load_const(Register::new(3), value);
+        builder.emit(Instruction::op_dss(
+            Opcode::ListAppend,
+            Register::new(0),
+            Register::new(2),
+            Register::new(3),
+        ));
+        builder.emit_return(Register::new(2));
+        builder.finish()
+    }
+
     fn dict_set_code() -> CodeObject {
         let mut builder = FunctionBuilder::new("dict_set");
         builder.emit(Instruction::op_dss(
@@ -1447,6 +1598,159 @@ mod tests {
 
         assert!(!templates[0].requires_interpreter_in_tier1());
         assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn proven_list_index_lowers_to_native_fast_path() {
+        let code = list_get_item_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        let get_item = templates
+            .iter()
+            .find(|template| matches!(template, TemplateInstruction::ListGetItem { .. }))
+            .expect("expected a list getitem specialization");
+
+        match get_item {
+            TemplateInstruction::ListGetItem {
+                bc_offset,
+                dst,
+                list,
+                index,
+            } => {
+                assert_eq!(*bc_offset, 16);
+                assert_eq!(*dst, 4);
+                assert_eq!(*list, 2);
+                assert_eq!(*index, 3);
+            }
+            template => panic!("expected ListGetItem template, got {template:?}"),
+        }
+
+        assert!(!get_item.requires_interpreter_in_tier1());
+        assert!(get_item.can_deopt());
+    }
+
+    #[test]
+    fn proven_tuple_index_lowers_to_native_fast_path() {
+        let code = tuple_get_item_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        let get_item = templates
+            .iter()
+            .find(|template| matches!(template, TemplateInstruction::TupleGetItem { .. }))
+            .expect("expected a tuple getitem specialization");
+
+        match get_item {
+            TemplateInstruction::TupleGetItem {
+                bc_offset,
+                dst,
+                tuple,
+                index,
+            } => {
+                assert_eq!(*bc_offset, 16);
+                assert_eq!(*dst, 4);
+                assert_eq!(*tuple, 2);
+                assert_eq!(*index, 3);
+            }
+            template => panic!("expected TupleGetItem template, got {template:?}"),
+        }
+
+        assert!(!get_item.requires_interpreter_in_tier1());
+        assert!(get_item.can_deopt());
+    }
+
+    #[test]
+    fn proven_list_store_lowers_to_native_fast_path() {
+        let code = list_set_item_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        let set_item = templates
+            .iter()
+            .find(|template| matches!(template, TemplateInstruction::ListSetItem { .. }))
+            .expect("expected a list setitem specialization");
+
+        match set_item {
+            TemplateInstruction::ListSetItem {
+                bc_offset,
+                list,
+                index,
+                value,
+            } => {
+                assert_eq!(*bc_offset, 20);
+                assert_eq!(*list, 2);
+                assert_eq!(*index, 3);
+                assert_eq!(*value, 4);
+            }
+            template => panic!("expected ListSetItem template, got {template:?}"),
+        }
+
+        assert!(!set_item.requires_interpreter_in_tier1());
+        assert!(set_item.can_deopt());
+    }
+
+    #[test]
+    fn proven_list_len_lowers_to_native_fast_path() {
+        let code = list_len_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[1] {
+            TemplateInstruction::ListLen {
+                bc_offset,
+                dst,
+                list,
+            } => {
+                assert_eq!(*bc_offset, 4);
+                assert_eq!(*dst, 3);
+                assert_eq!(*list, 2);
+            }
+            template => panic!("expected ListLen template, got {template:?}"),
+        }
+
+        assert!(!templates[1].requires_interpreter_in_tier1());
+        assert!(templates[1].can_deopt());
+    }
+
+    #[test]
+    fn proven_tuple_len_lowers_to_native_fast_path() {
+        let code = tuple_len_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[1] {
+            TemplateInstruction::TupleLen {
+                bc_offset,
+                dst,
+                tuple,
+            } => {
+                assert_eq!(*bc_offset, 4);
+                assert_eq!(*dst, 3);
+                assert_eq!(*tuple, 2);
+            }
+            template => panic!("expected TupleLen template, got {template:?}"),
+        }
+
+        assert!(!templates[1].requires_interpreter_in_tier1());
+        assert!(templates[1].can_deopt());
+    }
+
+    #[test]
+    fn proven_list_append_lowers_to_capacity_checked_fast_path() {
+        let code = list_append_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[2] {
+            TemplateInstruction::ListAppendFast {
+                bc_offset,
+                list,
+                value,
+            } => {
+                assert_eq!(*bc_offset, 8);
+                assert_eq!(*list, 2);
+                assert_eq!(*value, 3);
+            }
+            template => panic!("expected ListAppendFast template, got {template:?}"),
+        }
+
+        assert!(!templates[2].requires_interpreter_in_tier1());
+        assert!(templates[2].can_deopt());
     }
 
     #[test]

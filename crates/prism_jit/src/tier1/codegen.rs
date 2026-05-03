@@ -654,6 +654,16 @@ impl TemplateCompiler {
                     None,
                 );
             }
+            TemplateInstruction::ListGetItem {
+                dst, list, index, ..
+            } => {
+                ListIndexTemplate::new(*dst, *list, *index, deopt_idx).emit(ctx);
+            }
+            TemplateInstruction::TupleGetItem {
+                dst, tuple, index, ..
+            } => {
+                TupleIndexTemplate::new(*dst, *tuple, *index, deopt_idx).emit(ctx);
+            }
             TemplateInstruction::SetItem { helper_addr, .. } => {
                 self.emit_tier1_bytecode_helper(
                     ctx,
@@ -662,6 +672,11 @@ impl TemplateCompiler {
                     deopt_idx,
                     None,
                 );
+            }
+            TemplateInstruction::ListSetItem {
+                list, index, value, ..
+            } => {
+                ListStoreTemplate::new(*list, *index, *value, deopt_idx).emit(ctx);
             }
             TemplateInstruction::DelItem { helper_addr, .. } => {
                 self.emit_tier1_bytecode_helper(
@@ -707,6 +722,12 @@ impl TemplateCompiler {
                     deopt_idx,
                     None,
                 );
+            }
+            TemplateInstruction::ListLen { dst, list, .. } => {
+                ListLenTemplate::new(*dst, *list, deopt_idx).emit(ctx);
+            }
+            TemplateInstruction::TupleLen { dst, tuple, .. } => {
+                TupleLenTemplate::new(*dst, *tuple, deopt_idx).emit(ctx);
             }
             TemplateInstruction::IsCallable { helper_addr, .. } => {
                 self.emit_tier1_bytecode_helper(
@@ -779,6 +800,9 @@ impl TemplateCompiler {
                     deopt_idx,
                     None,
                 );
+            }
+            TemplateInstruction::ListAppendFast { list, value, .. } => {
+                ListAppendFastTemplate::new(*list, *value, deopt_idx).emit(ctx);
             }
             TemplateInstruction::SetAdd { helper_addr, .. } => {
                 self.emit_tier1_bytecode_helper(
@@ -1542,6 +1566,20 @@ pub enum TemplateInstruction {
         key: u8,
         helper_addr: u64,
     },
+    /// Exact-list integer index fast path: dst = list[index]
+    ListGetItem {
+        bc_offset: u32,
+        dst: u8,
+        list: u8,
+        index: u8,
+    },
+    /// Exact-tuple integer index fast path: dst = tuple[index]
+    TupleGetItem {
+        bc_offset: u32,
+        dst: u8,
+        tuple: u8,
+        index: u8,
+    },
     /// Set item: container[key] = value
     /// Requires type dispatch - deopt for Tier 1
     SetItem {
@@ -1550,6 +1588,13 @@ pub enum TemplateInstruction {
         key: u8,
         value: u8,
         helper_addr: u64,
+    },
+    /// Exact-list integer index store fast path: list[index] = value
+    ListSetItem {
+        bc_offset: u32,
+        list: u8,
+        index: u8,
+        value: u8,
     },
     /// Delete item: del container[key]
     /// Requires type dispatch - deopt for Tier 1
@@ -1587,6 +1632,18 @@ pub enum TemplateInstruction {
         dst: u8,
         src: u8,
         helper_addr: u64,
+    },
+    /// Exact-list length fast path: dst = len(list)
+    ListLen {
+        bc_offset: u32,
+        dst: u8,
+        list: u8,
+    },
+    /// Exact-tuple length fast path: dst = len(tuple)
+    TupleLen {
+        bc_offset: u32,
+        dst: u8,
+        tuple: u8,
     },
     /// Check if callable: dst = callable(src)
     /// Requires type checking - deopt for Tier 1
@@ -1659,6 +1716,12 @@ pub enum TemplateInstruction {
         list: u8,
         value: u8,
         helper_addr: u64,
+    },
+    /// Exact-list append fast path when existing capacity is sufficient.
+    ListAppendFast {
+        bc_offset: u32,
+        list: u8,
+        value: u8,
     },
     /// Set add: set.add(value)
     /// Requires type dispatch - deopt for Tier 1
@@ -2389,11 +2452,16 @@ impl TemplateInstruction {
             | TemplateInstruction::DelAttr { bc_offset, .. }
             | TemplateInstruction::LoadMethod { bc_offset, .. }
             | TemplateInstruction::GetItem { bc_offset, .. }
+            | TemplateInstruction::ListGetItem { bc_offset, .. }
+            | TemplateInstruction::TupleGetItem { bc_offset, .. }
             | TemplateInstruction::SetItem { bc_offset, .. }
+            | TemplateInstruction::ListSetItem { bc_offset, .. }
             | TemplateInstruction::DelItem { bc_offset, .. }
             | TemplateInstruction::GetIter { bc_offset, .. }
             | TemplateInstruction::ForIter { bc_offset, .. }
             | TemplateInstruction::Len { bc_offset, .. }
+            | TemplateInstruction::ListLen { bc_offset, .. }
+            | TemplateInstruction::TupleLen { bc_offset, .. }
             | TemplateInstruction::IsCallable { bc_offset, .. }
             | TemplateInstruction::BuildList { bc_offset, .. }
             | TemplateInstruction::BuildTuple { bc_offset, .. }
@@ -2402,6 +2470,7 @@ impl TemplateInstruction {
             | TemplateInstruction::BuildString { bc_offset, .. }
             | TemplateInstruction::BuildSlice { bc_offset, .. }
             | TemplateInstruction::ListAppend { bc_offset, .. }
+            | TemplateInstruction::ListAppendFast { bc_offset, .. }
             | TemplateInstruction::SetAdd { bc_offset, .. }
             | TemplateInstruction::DictSet { bc_offset, .. }
             | TemplateInstruction::UnpackSequence { bc_offset, .. }
@@ -2638,11 +2707,16 @@ impl TemplateInstruction {
                 | TemplateInstruction::SetAttr { .. }
                 | TemplateInstruction::LoadMethod { .. }
                 | TemplateInstruction::GetItem { .. }
+                | TemplateInstruction::ListGetItem { .. }
+                | TemplateInstruction::TupleGetItem { .. }
                 | TemplateInstruction::SetItem { .. }
+                | TemplateInstruction::ListSetItem { .. }
                 | TemplateInstruction::DelItem { .. }
                 | TemplateInstruction::GetIter { .. }
                 | TemplateInstruction::ForIter { .. }
                 | TemplateInstruction::Len { .. }
+                | TemplateInstruction::ListLen { .. }
+                | TemplateInstruction::TupleLen { .. }
                 | TemplateInstruction::IsCallable { .. }
                 | TemplateInstruction::BuildList { .. }
                 | TemplateInstruction::BuildTuple { .. }
@@ -2651,6 +2725,7 @@ impl TemplateInstruction {
                 | TemplateInstruction::BuildString { .. }
                 | TemplateInstruction::BuildSlice { .. }
                 | TemplateInstruction::ListAppend { .. }
+                | TemplateInstruction::ListAppendFast { .. }
                 | TemplateInstruction::SetAdd { .. }
                 | TemplateInstruction::DictSet { .. }
                 | TemplateInstruction::UnpackSequence { .. }
@@ -2691,6 +2766,11 @@ impl TemplateInstruction {
             | TemplateInstruction::FloatMod { .. }
             | TemplateInstruction::LoadGlobal { .. }
             | TemplateInstruction::DeleteGlobal { .. }
+            | TemplateInstruction::ListGetItem { .. }
+            | TemplateInstruction::TupleGetItem { .. }
+            | TemplateInstruction::ListSetItem { .. }
+            | TemplateInstruction::ListLen { .. }
+            | TemplateInstruction::TupleLen { .. }
             | TemplateInstruction::GuardInt { .. }
             | TemplateInstruction::GuardFloat { .. }
             | TemplateInstruction::GuardBool { .. }
