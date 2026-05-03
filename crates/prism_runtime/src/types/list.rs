@@ -75,6 +75,16 @@ impl ListObject {
         }
     }
 
+    /// Create a list from an already-owned value vector.
+    #[inline]
+    pub fn from_vec(items: Vec<Value>) -> Self {
+        Self {
+            header: ObjectHeader::new(TypeId::LIST),
+            items,
+            mutation_version: 0,
+        }
+    }
+
     /// Create a list from a slice.
     #[inline]
     pub fn from_slice(slice: &[Value]) -> Self {

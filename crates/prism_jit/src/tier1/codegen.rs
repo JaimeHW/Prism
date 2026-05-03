@@ -394,6 +394,7 @@ impl TemplateCompiler {
         ctx.asm.jmp(ctx.deopt_label(deopt_idx));
 
         ctx.asm.bind_label(exception);
+        emit_frame_state_writeback(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
         ctx.asm.mov_ri64(Gpr::Rax, ExitReason::Exception as i64);
         self.emit_native_epilogue(ctx.asm, ctx.frame);
 
@@ -459,6 +460,47 @@ impl TemplateCompiler {
 
         ctx.asm.bind_label(success);
         emit_frame_state_reload(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
+    }
+
+    /// Emit a direct sequence-construction helper call.
+    ///
+    /// Unlike the generic bytecode bridge, this ABI reads and writes the native
+    /// register mirror directly. That avoids full-frame writeback/reload around
+    /// list and tuple literals, which are common enough to matter in Tier 1.
+    fn emit_tier1_sequence_build_helper(
+        &self,
+        ctx: &mut TemplateContext,
+        dst: u8,
+        start: u8,
+        count: u8,
+        helper_addr: u64,
+        deopt_idx: usize,
+    ) {
+        if helper_addr == 0 {
+            ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+            return;
+        }
+
+        let success = ctx.asm.create_label();
+        let exception = ctx.asm.create_label();
+        let packed_operands = (u32::from(dst) << 16) | (u32::from(start) << 8) | u32::from(count);
+
+        ctx.asm.mov_rm(helper_arg0(), &ctx.frame.context_slot());
+        ctx.asm.lea(helper_arg1(), &ctx.frame.register_slot(0));
+        ctx.asm.mov_ri32(helper_arg2(), packed_operands);
+        emit_runtime_call(ctx.asm, helper_addr);
+
+        ctx.asm.cmp_ri(Gpr::Rax, 0);
+        ctx.asm.je(success);
+        ctx.asm.cmp_ri(Gpr::Rax, 2);
+        ctx.asm.je(exception);
+        ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+
+        ctx.asm.bind_label(exception);
+        ctx.asm.mov_ri64(Gpr::Rax, ExitReason::Exception as i64);
+        self.emit_native_epilogue(ctx.asm, ctx.frame);
+
+        ctx.asm.bind_label(success);
     }
 
     /// Emit code for a single instruction.
@@ -738,22 +780,36 @@ impl TemplateCompiler {
                     None,
                 );
             }
-            TemplateInstruction::BuildList { helper_addr, .. } => {
-                self.emit_tier1_bytecode_helper(
+            TemplateInstruction::BuildList {
+                dst,
+                start,
+                count,
+                helper_addr,
+                ..
+            } => {
+                self.emit_tier1_sequence_build_helper(
                     ctx,
-                    Opcode::BuildList as u8,
+                    *dst,
+                    *start,
+                    *count,
                     *helper_addr,
                     deopt_idx,
-                    None,
                 );
             }
-            TemplateInstruction::BuildTuple { helper_addr, .. } => {
-                self.emit_tier1_bytecode_helper(
+            TemplateInstruction::BuildTuple {
+                dst,
+                start,
+                count,
+                helper_addr,
+                ..
+            } => {
+                self.emit_tier1_sequence_build_helper(
                     ctx,
-                    Opcode::BuildTuple as u8,
+                    *dst,
+                    *start,
+                    *count,
                     *helper_addr,
                     deopt_idx,
-                    None,
                 );
             }
             TemplateInstruction::BuildSet { helper_addr, .. } => {
@@ -1656,7 +1712,7 @@ pub enum TemplateInstruction {
 
     // Container building operations
     /// Build list: dst = [r(start)..r(start+count)]
-    /// Requires allocation - deopt for Tier 1
+    /// Uses a direct Tier 1 allocation helper when `helper_addr` is non-zero.
     BuildList {
         bc_offset: u32,
         dst: u8,
@@ -1665,7 +1721,7 @@ pub enum TemplateInstruction {
         helper_addr: u64,
     },
     /// Build tuple: dst = (r(start)..r(start+count))
-    /// Requires allocation - deopt for Tier 1
+    /// Uses a direct Tier 1 allocation helper when `helper_addr` is non-zero.
     BuildTuple {
         bc_offset: u32,
         dst: u8,

@@ -7,6 +7,9 @@
 
 use prism_code::{CodeObject, Opcode};
 use prism_core::Value;
+use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
+use prism_runtime::types::list::ListObject;
+use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
 
 use crate::VirtualMachine;
@@ -30,6 +33,14 @@ pub(crate) fn tier1_call_addr() -> u64 {
 
 pub(crate) fn tier1_bytecode_addr() -> u64 {
     tier1_execute_bytecode as *const () as usize as u64
+}
+
+pub(crate) fn tier1_build_list_addr() -> u64 {
+    tier1_build_list as *const () as usize as u64
+}
+
+pub(crate) fn tier1_build_tuple_addr() -> u64 {
+    tier1_build_tuple as *const () as usize as u64
 }
 
 /// Resolve `LOAD_GLOBAL` for Tier 1 code.
@@ -138,6 +149,75 @@ pub(crate) unsafe extern "C" fn tier1_call(
     }
 }
 
+/// Materialize a list literal for Tier 1 code from the native register mirror.
+///
+/// The helper does not read the interpreter frame register array. Passing the
+/// native mirror lets compiled code avoid a full frame writeback/reload around
+/// every list literal while still marking the destination as an initialized VM
+/// register for deoptimization and normal frame restoration.
+///
+/// # Safety
+///
+/// `state` must point to the active `JitFrameState`, and `registers` must point
+/// to the first contiguous native register mirror slot for that frame.
+pub(crate) unsafe extern "C" fn tier1_build_list(
+    state: *mut JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+) -> u64 {
+    if state.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+    let state = unsafe { &mut *state };
+    let Some((dst, start, count)) = validate_sequence_build_args(state, registers, packed_operands)
+    else {
+        return TIER1_HELPER_DEOPT;
+    };
+
+    let Some(values) = collect_mirror_values(registers, start, count) else {
+        return TIER1_HELPER_DEOPT;
+    };
+
+    let value = alloc_value_in_current_heap_or_box(ListObject::from_vec(values));
+    unsafe {
+        *registers.add(dst) = value.to_bits();
+    }
+    mark_register_written(state, dst);
+    TIER1_HELPER_SUCCESS
+}
+
+/// Materialize a tuple literal for Tier 1 code from the native register mirror.
+///
+/// # Safety
+///
+/// `state` must point to the active `JitFrameState`, and `registers` must point
+/// to the first contiguous native register mirror slot for that frame.
+pub(crate) unsafe extern "C" fn tier1_build_tuple(
+    state: *mut JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+) -> u64 {
+    if state.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+    let state = unsafe { &mut *state };
+    let Some((dst, start, count)) = validate_sequence_build_args(state, registers, packed_operands)
+    else {
+        return TIER1_HELPER_DEOPT;
+    };
+
+    let Some(values) = collect_mirror_values(registers, start, count) else {
+        return TIER1_HELPER_DEOPT;
+    };
+
+    let value = alloc_value_in_current_heap_or_box(TupleObject::from_vec(values));
+    unsafe {
+        *registers.add(dst) = value.to_bits();
+    }
+    mark_register_written(state, dst);
+    TIER1_HELPER_SUCCESS
+}
+
 /// Execute a single fallthrough bytecode using the VM's canonical handler.
 ///
 /// This is the exact-semantics bridge for high-impact dynamic operations while
@@ -223,6 +303,57 @@ pub(crate) unsafe extern "C" fn tier1_execute_bytecode(
     }
 }
 
+#[cfg(test)]
+#[inline]
+fn pack_build_operands(dst: u8, start: u8, count: u8) -> u32 {
+    (u32::from(dst) << 16) | (u32::from(start) << 8) | u32::from(count)
+}
+
+#[inline]
+fn unpack_build_operands(packed: u32) -> Option<(usize, usize, usize)> {
+    if packed & 0xFF00_0000 != 0 {
+        return None;
+    }
+
+    let dst = ((packed >> 16) & 0xFF) as usize;
+    let start = ((packed >> 8) & 0xFF) as usize;
+    let count = (packed & 0xFF) as usize;
+    Some((dst, start, count))
+}
+
+#[inline]
+fn validate_sequence_build_args(
+    state: &JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+) -> Option<(usize, usize, usize)> {
+    if registers.is_null() {
+        return None;
+    }
+
+    let (dst, start, count) = unpack_build_operands(packed_operands)?;
+    let num_registers = usize::from(state.num_registers);
+    let end = start.checked_add(count)?;
+    if dst >= num_registers || end > num_registers {
+        return None;
+    }
+
+    Some((dst, start, count))
+}
+
+#[inline]
+fn collect_mirror_values(registers: *const u64, start: usize, count: usize) -> Option<Vec<Value>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).ok()?;
+
+    for index in 0..count {
+        let raw = unsafe { *registers.add(start + index) };
+        values.push(Value::from_bits(raw));
+    }
+
+    Some(values)
+}
+
 #[inline]
 fn apply_helper_relative_jump(vm: &mut VirtualMachine, offset: i16) -> Result<(), RuntimeError> {
     if vm.call_depth() == 0 {
@@ -285,6 +416,8 @@ mod tests {
     use crate::ops::iteration::ensure_iterator_value;
     use prism_code::{FunctionBuilder, Instruction, Opcode, Register};
     use prism_core::intern::intern;
+    use prism_runtime::types::list::value_as_list_ref;
+    use prism_runtime::types::tuple::value_as_tuple_ref;
     use std::sync::Arc;
 
     fn helper_frame() -> (VirtualMachine, Arc<CodeObject>, u16) {
@@ -348,6 +481,14 @@ mod tests {
         vm.push_frame(Arc::clone(&code), 0)
             .expect("frame push should succeed");
         (vm, code)
+    }
+
+    fn native_build_state(num_registers: u16, written_registers: *mut u64) -> JitFrameState {
+        JitFrameState {
+            num_registers,
+            written_registers,
+            ..JitFrameState::default()
+        }
     }
 
     #[test]
@@ -439,5 +580,70 @@ mod tests {
         assert_eq!(vm.current_frame().ip, 2);
         assert_eq!(state.bc_offset, 8);
         assert!(vm.take_last_jit_error().is_none());
+    }
+
+    #[test]
+    fn tier1_build_list_helper_materializes_from_native_mirror() {
+        let mut slots = [
+            Value::int_unchecked(10).to_bits(),
+            Value::int_unchecked(20).to_bits(),
+            Value::int_unchecked(30).to_bits(),
+            Value::none().to_bits(),
+        ];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state(4, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_list(&mut state, slots.as_mut_ptr(), pack_build_operands(3, 0, 3))
+        };
+
+        assert_eq!(status, TIER1_HELPER_SUCCESS);
+        assert_eq!(written[0] & (1 << 3), 1 << 3);
+
+        let value = Value::from_bits(slots[3]);
+        let list = value_as_list_ref(value).expect("helper should create a list");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.get(0).and_then(|value| value.as_int()), Some(10));
+        assert_eq!(list.get(1).and_then(|value| value.as_int()), Some(20));
+        assert_eq!(list.get(2).and_then(|value| value.as_int()), Some(30));
+    }
+
+    #[test]
+    fn tier1_build_tuple_helper_materializes_from_native_mirror() {
+        let mut slots = [
+            Value::int_unchecked(7).to_bits(),
+            Value::int_unchecked(8).to_bits(),
+            Value::none().to_bits(),
+        ];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state(3, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_tuple(&mut state, slots.as_mut_ptr(), pack_build_operands(2, 0, 2))
+        };
+
+        assert_eq!(status, TIER1_HELPER_SUCCESS);
+        assert_eq!(written[0] & (1 << 2), 1 << 2);
+
+        let value = Value::from_bits(slots[2]);
+        let tuple = value_as_tuple_ref(value).expect("helper should create a tuple");
+        assert_eq!(tuple.len(), 2);
+        assert_eq!(tuple.get(0).and_then(|value| value.as_int()), Some(7));
+        assert_eq!(tuple.get(1).and_then(|value| value.as_int()), Some(8));
+    }
+
+    #[test]
+    fn tier1_build_sequence_helper_deopts_on_invalid_register_window() {
+        let mut slots = [Value::none().to_bits(); 2];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state(2, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_list(&mut state, slots.as_mut_ptr(), pack_build_operands(1, 1, 2))
+        };
+
+        assert_eq!(status, TIER1_HELPER_DEOPT);
+        assert_eq!(slots[1], Value::none().to_bits());
+        assert_eq!(written[0], 0);
     }
 }

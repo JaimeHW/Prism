@@ -916,7 +916,7 @@ pub(crate) fn lower_code_to_templates(
                     dst,
                     start: inst.src1().0,
                     count: inst.src2().0,
-                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    helper_addr: crate::jit_runtime_helpers::tier1_build_list_addr(),
                 }
             }
             Opcode::BuildTuple => {
@@ -927,7 +927,7 @@ pub(crate) fn lower_code_to_templates(
                     dst,
                     start: inst.src1().0,
                     count: inst.src2().0,
-                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    helper_addr: crate::jit_runtime_helpers::tier1_build_tuple_addr(),
                 }
             }
             Opcode::BuildSet => {
@@ -1293,6 +1293,13 @@ mod tests {
         builder.finish()
     }
 
+    fn build_tuple_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("build_tuple");
+        builder.emit_build_tuple(Register::new(3), Register::new(0), 3);
+        builder.emit_return(Register::new(3));
+        builder.finish()
+    }
+
     fn list_get_item_code() -> CodeObject {
         let mut builder = FunctionBuilder::new("list_get_item");
         builder.reserve_parameters(5);
@@ -1575,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_build_list_lowers_to_runtime_helper_template() {
+    fn normal_build_list_lowers_to_direct_sequence_helper_template() {
         let code = build_list_code();
         let templates = lower_code_to_templates(&code).expect("lowering should succeed");
 
@@ -1591,9 +1598,41 @@ mod tests {
                 assert_eq!(*dst, 3);
                 assert_eq!(*start, 0);
                 assert_eq!(*count, 3);
-                assert_ne!(*helper_addr, 0);
+                assert_eq!(
+                    *helper_addr,
+                    crate::jit_runtime_helpers::tier1_build_list_addr()
+                );
             }
             template => panic!("expected BuildList template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_build_tuple_lowers_to_direct_sequence_helper_template() {
+        let code = build_tuple_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::BuildTuple {
+                bc_offset,
+                dst,
+                start,
+                count,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 3);
+                assert_eq!(*start, 0);
+                assert_eq!(*count, 3);
+                assert_eq!(
+                    *helper_addr,
+                    crate::jit_runtime_helpers::tier1_build_tuple_addr()
+                );
+            }
+            template => panic!("expected BuildTuple template, got {template:?}"),
         }
 
         assert!(!templates[0].requires_interpreter_in_tier1());
