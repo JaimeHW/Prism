@@ -462,12 +462,12 @@ impl TemplateCompiler {
         emit_frame_state_reload(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
     }
 
-    /// Emit a direct sequence-construction helper call.
+    /// Emit a direct collection-construction helper call.
     ///
     /// Unlike the generic bytecode bridge, this ABI reads and writes the native
     /// register mirror directly. That avoids full-frame writeback/reload around
-    /// list and tuple literals, which are common enough to matter in Tier 1.
-    fn emit_tier1_sequence_build_helper(
+    /// container literals, which are common enough to matter in Tier 1.
+    fn emit_tier1_collection_build_helper(
         &self,
         ctx: &mut TemplateContext,
         dst: u8,
@@ -787,7 +787,7 @@ impl TemplateCompiler {
                 helper_addr,
                 ..
             } => {
-                self.emit_tier1_sequence_build_helper(
+                self.emit_tier1_collection_build_helper(
                     ctx,
                     *dst,
                     *start,
@@ -803,7 +803,7 @@ impl TemplateCompiler {
                 helper_addr,
                 ..
             } => {
-                self.emit_tier1_sequence_build_helper(
+                self.emit_tier1_collection_build_helper(
                     ctx,
                     *dst,
                     *start,
@@ -812,22 +812,36 @@ impl TemplateCompiler {
                     deopt_idx,
                 );
             }
-            TemplateInstruction::BuildSet { helper_addr, .. } => {
-                self.emit_tier1_bytecode_helper(
+            TemplateInstruction::BuildSet {
+                dst,
+                start,
+                count,
+                helper_addr,
+                ..
+            } => {
+                self.emit_tier1_collection_build_helper(
                     ctx,
-                    Opcode::BuildSet as u8,
+                    *dst,
+                    *start,
+                    *count,
                     *helper_addr,
                     deopt_idx,
-                    None,
                 );
             }
-            TemplateInstruction::BuildDict { helper_addr, .. } => {
-                self.emit_tier1_bytecode_helper(
+            TemplateInstruction::BuildDict {
+                dst,
+                start,
+                count,
+                helper_addr,
+                ..
+            } => {
+                self.emit_tier1_collection_build_helper(
                     ctx,
-                    Opcode::BuildDict as u8,
+                    *dst,
+                    *start,
+                    *count,
                     *helper_addr,
                     deopt_idx,
-                    None,
                 );
             }
             TemplateInstruction::BuildString { helper_addr, .. } => {
@@ -1730,7 +1744,7 @@ pub enum TemplateInstruction {
         helper_addr: u64,
     },
     /// Build set: dst = {r(start)..r(start+count)}
-    /// Requires allocation - deopt for Tier 1
+    /// Uses a direct Tier 1 allocation helper when `helper_addr` is non-zero.
     BuildSet {
         bc_offset: u32,
         dst: u8,
@@ -1739,7 +1753,7 @@ pub enum TemplateInstruction {
         helper_addr: u64,
     },
     /// Build dict: dst = {} with count key-value pairs starting at start
-    /// Requires allocation - deopt for Tier 1
+    /// Uses a direct Tier 1 allocation helper when `helper_addr` is non-zero.
     BuildDict {
         bc_offset: u32,
         dst: u8,

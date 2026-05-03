@@ -15,6 +15,7 @@ pub mod coroutine;
 pub mod dict_access;
 pub mod exception;
 pub mod generator;
+pub mod hash_protocol;
 pub mod iteration;
 pub mod kw_binding;
 pub mod load_store;

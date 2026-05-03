@@ -9,12 +9,10 @@ use crate::VirtualMachine;
 use crate::builtins::{BuiltinError, hash_set_contents_vm, hash_value_vm};
 use crate::error::RuntimeError;
 use crate::ops::comparison::eq_or_identical;
-use crate::ops::objects::{extract_type_id, set_storage_ref_from_ptr};
+use crate::ops::hash_protocol::value_requires_hash_protocol;
+use crate::ops::objects::set_storage_ref_from_ptr;
 use prism_core::Value;
-use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::set::SetObject;
-use prism_runtime::types::string::value_as_string_ref;
 
 #[inline]
 pub(crate) fn set_contains_item(
@@ -38,7 +36,7 @@ pub(crate) fn set_add_item(
     key: Value,
 ) -> Result<bool, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    let key_requires_protocol_lookup = value_requires_hash_protocol(key);
     if !key_requires_protocol_lookup && !set.has_protocol_keys() {
         return Ok(set.add_with_hash_and_protocol_lookup(key, key_hash, false));
     }
@@ -96,7 +94,7 @@ fn set_contains_hashed(
     key: Value,
     key_hash: i64,
 ) -> Result<bool, RuntimeError> {
-    if !requires_protocol_scan(key) && !set.has_protocol_keys() {
+    if !value_requires_hash_protocol(key) && !set.has_protocol_keys() {
         return Ok(set.contains(key));
     }
 
@@ -115,7 +113,7 @@ fn set_remove_hashed(
     key: Value,
     key_hash: i64,
 ) -> Result<bool, RuntimeError> {
-    if !requires_protocol_scan(key) && !set.has_protocol_keys() {
+    if !value_requires_hash_protocol(key) && !set.has_protocol_keys() {
         return Ok(set.remove(key));
     }
 
@@ -217,26 +215,4 @@ fn is_set_like_probe(value: Value) -> bool {
         .as_object_ptr()
         .and_then(set_storage_ref_from_ptr)
         .is_some()
-}
-
-#[inline]
-fn requires_protocol_scan(value: Value) -> bool {
-    if value.as_bool().is_some()
-        || value.as_int().is_some()
-        || value.as_float().is_some()
-        || value_to_bigint(value).is_some()
-        || value.is_none()
-        || value_as_string_ref(value).is_some()
-    {
-        return false;
-    }
-
-    let Some(ptr) = value.as_object_ptr() else {
-        return true;
-    };
-    let type_id = extract_type_id(ptr);
-    match type_id {
-        TypeId::TUPLE => true,
-        _ => true,
-    }
 }

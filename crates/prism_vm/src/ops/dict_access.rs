@@ -10,6 +10,7 @@ use crate::builtins::hash_value_vm;
 use crate::error::RuntimeError;
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::comparison::eq_or_identical;
+use crate::ops::hash_protocol::value_requires_hash_protocol;
 use crate::ops::objects::{bind_user_class_attribute_value_in_vm, extract_type_id};
 use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_core::Value;
@@ -18,8 +19,6 @@ use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
-use prism_runtime::types::int::value_to_bigint;
-use prism_runtime::types::string::value_as_string_ref;
 
 #[inline]
 pub(crate) fn dict_get_item(
@@ -28,7 +27,7 @@ pub(crate) fn dict_get_item(
     key: Value,
 ) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    let key_requires_protocol_lookup = value_requires_hash_protocol(key);
     if !key_requires_protocol_lookup {
         if let Some(value) = dict.get_with_hash(key, key_hash) {
             return Ok(Some(value));
@@ -63,7 +62,7 @@ pub(crate) fn dict_set_item(
     value: Value,
 ) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    let key_requires_protocol_lookup = value_requires_hash_protocol(key);
     if !key_requires_protocol_lookup && dict.contains_key_with_hash(key, key_hash) {
         let replaced = dict.set_with_hash_and_protocol_lookup(
             key,
@@ -87,7 +86,7 @@ pub(crate) fn dict_set_item(
                 candidate,
                 value,
                 key_hash,
-                requires_protocol_scan(candidate),
+                value_requires_hash_protocol(candidate),
             );
             vm.drain_if_released_finalizer_candidate(replaced, value);
             return Ok(replaced);
@@ -107,7 +106,7 @@ pub(crate) fn dict_remove_item(
     key: Value,
 ) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    let key_requires_protocol_lookup = value_requires_hash_protocol(key);
     if !key_requires_protocol_lookup {
         if let Some(value) = dict.remove_with_hash(key, key_hash) {
             return Ok(Some(value));
@@ -135,7 +134,7 @@ pub(crate) fn dict_setdefault(
     default: Value,
 ) -> Result<Value, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
-    let key_requires_protocol_lookup = requires_protocol_scan(key);
+    let key_requires_protocol_lookup = value_requires_hash_protocol(key);
     if !key_requires_protocol_lookup {
         if let Some(value) = dict.get_with_hash(key, key_hash) {
             return Ok(value);
@@ -221,26 +220,4 @@ fn dict_candidate_matches(
         return Ok(false);
     }
     eq_or_identical(vm, candidate, key)
-}
-
-#[inline]
-fn requires_protocol_scan(value: Value) -> bool {
-    if value.as_bool().is_some()
-        || value.as_int().is_some()
-        || value.as_float().is_some()
-        || value_to_bigint(value).is_some()
-        || value.is_none()
-        || value_as_string_ref(value).is_some()
-    {
-        return false;
-    }
-
-    let Some(ptr) = value.as_object_ptr() else {
-        return true;
-    };
-    let type_id = extract_type_id(ptr);
-    match type_id {
-        TypeId::TUPLE => true,
-        _ => true,
-    }
 }

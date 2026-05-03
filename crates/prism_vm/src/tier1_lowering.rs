@@ -15,6 +15,8 @@ enum KnownType {
     Float,
     List,
     Tuple,
+    Set,
+    Dict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -932,24 +934,24 @@ pub(crate) fn lower_code_to_templates(
             }
             Opcode::BuildSet => {
                 let dst = inst.dst().0;
-                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                set_reg_type(&mut reg_types, dst, KnownType::Set);
                 TemplateInstruction::BuildSet {
                     bc_offset,
                     dst,
                     start: inst.src1().0,
                     count: inst.src2().0,
-                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    helper_addr: crate::jit_runtime_helpers::tier1_build_set_addr(),
                 }
             }
             Opcode::BuildDict => {
                 let dst = inst.dst().0;
-                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                set_reg_type(&mut reg_types, dst, KnownType::Dict);
                 TemplateInstruction::BuildDict {
                     bc_offset,
                     dst,
                     start: inst.src1().0,
                     count: inst.src2().0,
-                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                    helper_addr: crate::jit_runtime_helpers::tier1_build_dict_addr(),
                 }
             }
             Opcode::BuildString => {
@@ -1300,6 +1302,20 @@ mod tests {
         builder.finish()
     }
 
+    fn build_set_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("build_set");
+        builder.emit(Instruction::new(Opcode::BuildSet, 3, 0, 3));
+        builder.emit_return(Register::new(3));
+        builder.finish()
+    }
+
+    fn build_dict_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("build_dict");
+        builder.emit(Instruction::new(Opcode::BuildDict, 4, 0, 2));
+        builder.emit_return(Register::new(4));
+        builder.finish()
+    }
+
     fn list_get_item_code() -> CodeObject {
         let mut builder = FunctionBuilder::new("list_get_item");
         builder.reserve_parameters(5);
@@ -1633,6 +1649,64 @@ mod tests {
                 );
             }
             template => panic!("expected BuildTuple template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_build_set_lowers_to_direct_hash_container_helper_template() {
+        let code = build_set_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::BuildSet {
+                bc_offset,
+                dst,
+                start,
+                count,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 3);
+                assert_eq!(*start, 0);
+                assert_eq!(*count, 3);
+                assert_eq!(
+                    *helper_addr,
+                    crate::jit_runtime_helpers::tier1_build_set_addr()
+                );
+            }
+            template => panic!("expected BuildSet template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_build_dict_lowers_to_direct_hash_container_helper_template() {
+        let code = build_dict_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::BuildDict {
+                bc_offset,
+                dst,
+                start,
+                count,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 4);
+                assert_eq!(*start, 0);
+                assert_eq!(*count, 2);
+                assert_eq!(
+                    *helper_addr,
+                    crate::jit_runtime_helpers::tier1_build_dict_addr()
+                );
+            }
+            template => panic!("expected BuildDict template, got {template:?}"),
         }
 
         assert!(!templates[0].requires_interpreter_in_tier1());

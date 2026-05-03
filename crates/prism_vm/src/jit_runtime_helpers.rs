@@ -8,15 +8,19 @@
 use prism_code::{CodeObject, Opcode};
 use prism_core::Value;
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
+use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::set::SetObject;
 use prism_runtime::types::tuple::TupleObject;
 use smallvec::SmallVec;
 
 use crate::VirtualMachine;
+use crate::builtins::hash_value_vm;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::RuntimeError;
 use crate::import::ModuleObject;
 use crate::jit_executor::JitFrameState;
+use crate::ops::hash_protocol::value_requires_hash_protocol;
 
 const TIER1_HELPER_SUCCESS: u64 = 0;
 const TIER1_HELPER_DEOPT: u64 = 1;
@@ -41,6 +45,14 @@ pub(crate) fn tier1_build_list_addr() -> u64 {
 
 pub(crate) fn tier1_build_tuple_addr() -> u64 {
     tier1_build_tuple as *const () as usize as u64
+}
+
+pub(crate) fn tier1_build_set_addr() -> u64 {
+    tier1_build_set as *const () as usize as u64
+}
+
+pub(crate) fn tier1_build_dict_addr() -> u64 {
+    tier1_build_dict as *const () as usize as u64
 }
 
 /// Resolve `LOAD_GLOBAL` for Tier 1 code.
@@ -218,6 +230,122 @@ pub(crate) unsafe extern "C" fn tier1_build_tuple(
     TIER1_HELPER_SUCCESS
 }
 
+/// Materialize a set literal for Tier 1 code from the native register mirror.
+///
+/// The fast path accepts only keys whose hash/equality path cannot execute
+/// Python code. Values requiring protocol lookup deopt before any visible side
+/// effect, letting the interpreter preserve exact user-defined semantics.
+///
+/// # Safety
+///
+/// `state` must point to the active `JitFrameState`, and `registers` must point
+/// to the first contiguous native register mirror slot for that frame.
+pub(crate) unsafe extern "C" fn tier1_build_set(
+    state: *mut JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+) -> u64 {
+    if state.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+    let state = unsafe { &mut *state };
+    let Some((dst, start, count)) = validate_sequence_build_args(state, registers, packed_operands)
+    else {
+        return TIER1_HELPER_DEOPT;
+    };
+    if state.vm_context.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let vm = unsafe { &mut *(state.vm_context as *mut VirtualMachine) };
+    let mut set = SetObject::with_capacity(count);
+    for index in 0..count {
+        let raw = unsafe { *registers.add(start + index) };
+        let value = Value::from_bits(raw);
+        if value_requires_hash_protocol(value) {
+            return TIER1_HELPER_DEOPT;
+        }
+
+        let hash = match hash_value_vm(vm, value) {
+            Ok(hash) => hash,
+            Err(err) => {
+                vm.record_jit_error(RuntimeError::from(err));
+                return TIER1_HELPER_EXCEPTION;
+            }
+        };
+        set.add_with_hash_and_protocol_lookup(value, hash, false);
+    }
+
+    let value = alloc_value_in_current_heap_or_box(set);
+    unsafe {
+        *registers.add(dst) = value.to_bits();
+    }
+    mark_register_written(state, dst);
+    TIER1_HELPER_SUCCESS
+}
+
+/// Materialize a dict literal for Tier 1 code from the native register mirror.
+///
+/// This handles the dominant literal case: unique primitive/recursively-fast
+/// keys with values already in native registers. Keys that may need Python
+/// `__hash__`/`__eq__`, and duplicate keys that could release overwritten
+/// values, deopt cleanly to the interpreter.
+///
+/// # Safety
+///
+/// `state` must point to the active `JitFrameState`, and `registers` must point
+/// to the first contiguous native register mirror slot for that frame.
+pub(crate) unsafe extern "C" fn tier1_build_dict(
+    state: *mut JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+) -> u64 {
+    if state.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+    let state = unsafe { &mut *state };
+    let Some((dst, start, pair_count)) =
+        validate_dict_build_args(state, registers, packed_operands)
+    else {
+        return TIER1_HELPER_DEOPT;
+    };
+    if state.vm_context.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let vm = unsafe { &mut *(state.vm_context as *mut VirtualMachine) };
+    let mut dict = DictObject::with_capacity(pair_count);
+    for index in 0..pair_count {
+        let key_index = start + (index * 2);
+        let key = Value::from_bits(unsafe { *registers.add(key_index) });
+        let value = Value::from_bits(unsafe { *registers.add(key_index + 1) });
+        if value_requires_hash_protocol(key) {
+            return TIER1_HELPER_DEOPT;
+        }
+
+        let hash = match hash_value_vm(vm, key) {
+            Ok(hash) => hash,
+            Err(err) => {
+                vm.record_jit_error(RuntimeError::from(err));
+                return TIER1_HELPER_EXCEPTION;
+            }
+        };
+        if dict
+            .set_with_hash_and_protocol_lookup(key, value, hash, false)
+            .is_some()
+        {
+            return TIER1_HELPER_DEOPT;
+        }
+    }
+
+    let value = alloc_value_in_current_heap_or_box(dict);
+    unsafe {
+        *registers.add(dst) = value.to_bits();
+    }
+    mark_register_written(state, dst);
+    TIER1_HELPER_SUCCESS
+}
+
 /// Execute a single fallthrough bytecode using the VM's canonical handler.
 ///
 /// This is the exact-semantics bridge for high-impact dynamic operations while
@@ -327,13 +455,33 @@ fn validate_sequence_build_args(
     registers: *mut u64,
     packed_operands: u32,
 ) -> Option<(usize, usize, usize)> {
+    validate_build_register_window(state, registers, packed_operands, 1)
+}
+
+#[inline]
+fn validate_dict_build_args(
+    state: &JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+) -> Option<(usize, usize, usize)> {
+    validate_build_register_window(state, registers, packed_operands, 2)
+}
+
+#[inline]
+fn validate_build_register_window(
+    state: &JitFrameState,
+    registers: *mut u64,
+    packed_operands: u32,
+    operand_slots_per_item: usize,
+) -> Option<(usize, usize, usize)> {
     if registers.is_null() {
         return None;
     }
 
     let (dst, start, count) = unpack_build_operands(packed_operands)?;
     let num_registers = usize::from(state.num_registers);
-    let end = start.checked_add(count)?;
+    let operand_count = count.checked_mul(operand_slots_per_item)?;
+    let end = start.checked_add(operand_count)?;
     if dst >= num_registers || end > num_registers {
         return None;
     }
@@ -414,6 +562,7 @@ mod tests {
     use super::*;
     use crate::error::RuntimeErrorKind;
     use crate::ops::iteration::ensure_iterator_value;
+    use crate::ops::objects::{dict_storage_ref_from_ptr, set_storage_ref_from_ptr};
     use prism_code::{FunctionBuilder, Instruction, Opcode, Register};
     use prism_core::intern::intern;
     use prism_runtime::types::list::value_as_list_ref;
@@ -487,6 +636,19 @@ mod tests {
         JitFrameState {
             num_registers,
             written_registers,
+            ..JitFrameState::default()
+        }
+    }
+
+    fn native_build_state_with_vm(
+        vm: &mut VirtualMachine,
+        num_registers: u16,
+        written_registers: *mut u64,
+    ) -> JitFrameState {
+        JitFrameState {
+            num_registers,
+            written_registers,
+            vm_context: vm as *mut VirtualMachine as *mut (),
             ..JitFrameState::default()
         }
     }
@@ -630,6 +792,120 @@ mod tests {
         assert_eq!(tuple.len(), 2);
         assert_eq!(tuple.get(0).and_then(|value| value.as_int()), Some(7));
         assert_eq!(tuple.get(1).and_then(|value| value.as_int()), Some(8));
+    }
+
+    #[test]
+    fn tier1_build_set_helper_materializes_fast_keys_from_native_mirror() {
+        let mut vm = VirtualMachine::new();
+        let string_key = Value::string(intern("two"));
+        let mut slots = [
+            Value::int_unchecked(1).to_bits(),
+            string_key.to_bits(),
+            Value::bool(true).to_bits(),
+            Value::none().to_bits(),
+        ];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state_with_vm(&mut vm, 4, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_set(&mut state, slots.as_mut_ptr(), pack_build_operands(3, 0, 3))
+        };
+
+        assert_eq!(status, TIER1_HELPER_SUCCESS);
+        assert_eq!(written[0] & (1 << 3), 1 << 3);
+
+        let value = Value::from_bits(slots[3]);
+        let set = value
+            .as_object_ptr()
+            .and_then(set_storage_ref_from_ptr)
+            .expect("helper should create a set");
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(Value::int_unchecked(1)));
+        assert!(set.contains(string_key));
+        assert!(set.stored_hash(string_key).is_some());
+    }
+
+    #[test]
+    fn tier1_build_dict_helper_materializes_fast_pairs_from_native_mirror() {
+        let mut vm = VirtualMachine::new();
+        let string_key = Value::string(intern("answer"));
+        let mut slots = [
+            Value::int_unchecked(1).to_bits(),
+            Value::int_unchecked(10).to_bits(),
+            string_key.to_bits(),
+            Value::int_unchecked(42).to_bits(),
+            Value::none().to_bits(),
+        ];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state_with_vm(&mut vm, 5, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_dict(&mut state, slots.as_mut_ptr(), pack_build_operands(4, 0, 2))
+        };
+
+        assert_eq!(status, TIER1_HELPER_SUCCESS);
+        assert_eq!(written[0] & (1 << 4), 1 << 4);
+
+        let value = Value::from_bits(slots[4]);
+        let dict = value
+            .as_object_ptr()
+            .and_then(dict_storage_ref_from_ptr)
+            .expect("helper should create a dict");
+        assert_eq!(dict.len(), 2);
+        assert_eq!(
+            dict.get(Value::int_unchecked(1))
+                .and_then(|value| value.as_int()),
+            Some(10)
+        );
+        assert_eq!(
+            dict.get(string_key).and_then(|value| value.as_int()),
+            Some(42)
+        );
+        assert!(dict.stored_hash(string_key).is_some());
+    }
+
+    #[test]
+    fn tier1_build_dict_helper_deopts_on_duplicate_fast_key() {
+        let mut vm = VirtualMachine::new();
+        let mut slots = [
+            Value::int_unchecked(1).to_bits(),
+            Value::int_unchecked(10).to_bits(),
+            Value::int_unchecked(1).to_bits(),
+            Value::int_unchecked(20).to_bits(),
+            Value::none().to_bits(),
+        ];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state_with_vm(&mut vm, 5, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_dict(&mut state, slots.as_mut_ptr(), pack_build_operands(4, 0, 2))
+        };
+
+        assert_eq!(status, TIER1_HELPER_DEOPT);
+        assert_eq!(slots[4], Value::none().to_bits());
+        assert_eq!(written[0], 0);
+    }
+
+    #[test]
+    fn tier1_build_hash_container_helper_deopts_on_protocol_key() {
+        let mut vm = VirtualMachine::new();
+        let list_key =
+            alloc_value_in_current_heap_or_box(ListObject::from_vec(vec![Value::int_unchecked(1)]));
+        let mut slots = [
+            list_key.to_bits(),
+            Value::int_unchecked(10).to_bits(),
+            Value::none().to_bits(),
+        ];
+        let mut written = [0_u64; 1];
+        let mut state = native_build_state_with_vm(&mut vm, 3, written.as_mut_ptr());
+
+        let status = unsafe {
+            tier1_build_dict(&mut state, slots.as_mut_ptr(), pack_build_operands(2, 0, 1))
+        };
+
+        assert_eq!(status, TIER1_HELPER_DEOPT);
+        assert_eq!(slots[2], Value::none().to_bits());
+        assert_eq!(written[0], 0);
     }
 
     #[test]
