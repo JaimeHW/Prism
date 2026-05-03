@@ -907,9 +907,9 @@ impl VirtualMachine {
             match control {
                 ControlFlow::Continue => {}
                 ControlFlow::Jump(offset) => {
-                    let frame = &mut self.frames[self.current_frame_idx];
-                    let new_ip = (frame.ip as i32) + (offset as i32);
-                    frame.ip = new_ip.max(0) as u32;
+                    if self.apply_relative_jump(offset)?.is_some() {
+                        return Ok(());
+                    }
                 }
                 ControlFlow::Call { code, return_reg } => {
                     self.push_frame(code, return_reg)?;
@@ -1171,9 +1171,11 @@ impl VirtualMachine {
             match control {
                 ControlFlow::Continue => {}
                 ControlFlow::Jump(offset) => {
-                    let frame = &mut self.frames[self.current_frame_idx];
-                    let new_ip = (frame.ip as i32) + (offset as i32);
-                    frame.ip = new_ip.max(0) as u32;
+                    if self.apply_relative_jump(offset)?.is_some() {
+                        return Err(RuntimeError::internal(
+                            "nested execution unwound to empty frame stack",
+                        ));
+                    }
                 }
                 ControlFlow::Call { code, return_reg } => {
                     self.push_frame(code, return_reg)?;
@@ -1324,9 +1326,11 @@ impl VirtualMachine {
             match control {
                 ControlFlow::Continue => {}
                 ControlFlow::Jump(offset) => {
-                    let frame = &mut self.frames[self.current_frame_idx];
-                    let new_ip = (frame.ip as i32) + (offset as i32);
-                    frame.ip = new_ip.max(0) as u32;
+                    if self.apply_relative_jump(offset)?.is_some() {
+                        return Err(RuntimeError::internal(
+                            "namespace execution unwound to empty frame stack",
+                        ));
+                    }
                 }
                 ControlFlow::Call { code, return_reg } => {
                     self.push_frame(code, return_reg)?;
@@ -2061,17 +2065,8 @@ impl VirtualMachine {
                 ControlFlow::Continue => {}
 
                 ControlFlow::Jump(offset) => {
-                    // Apply relative jump
-                    // Note: offset is computed by compiler relative to instruction after jump,
-                    // and fetch() already advanced ip, so just add offset directly
-                    let frame = &mut self.frames[self.current_frame_idx];
-                    let old_ip = frame.ip;
-                    let new_ip = (frame.ip as i32) + (offset as i32);
-                    frame.ip = new_ip.max(0) as u32;
-                    if frame.ip < old_ip {
-                        if let Some(value) = self.try_enter_osr_at_current_ip()? {
-                            return Ok(value);
-                        }
+                    if let Some(value) = self.apply_relative_jump(offset)? {
+                        return Ok(value);
                     }
                 }
 
@@ -2201,6 +2196,20 @@ impl VirtualMachine {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn apply_relative_jump(&mut self, offset: i16) -> VmResult<Option<Value>> {
+        let frame = &mut self.frames[self.current_frame_idx];
+        let old_ip = frame.ip;
+        let new_ip = (frame.ip as i32) + (offset as i32);
+        frame.ip = new_ip.max(0) as u32;
+
+        if frame.ip < old_ip {
+            return self.try_enter_osr_at_current_ip();
+        }
+
+        Ok(None)
     }
 
     #[inline(never)]
