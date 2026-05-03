@@ -18,7 +18,7 @@ use super::frame::{
     emit_frame_state_writeback,
 };
 use super::template::*;
-use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label, MemOperand};
+use crate::backend::x64::{Assembler, Condition, ExecutableBuffer, Gpr, Label, MemOperand};
 use crate::runtime::ExitReason;
 use prism_code::Opcode;
 
@@ -503,6 +503,141 @@ impl TemplateCompiler {
         ctx.asm.bind_label(success);
     }
 
+    /// Emit an unknown-type binary op as a native small-int fast path with an
+    /// exact VM bytecode fallback in the same compiled frame.
+    fn emit_dynamic_int_binary_bridge(
+        &self,
+        ctx: &mut TemplateContext,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+        op: DynamicIntBinaryOp,
+        opcode: u8,
+        helper_addr: u64,
+        deopt_idx: usize,
+    ) {
+        let slow = ctx.asm.create_label();
+        let done = ctx.asm.create_label();
+        let lhs_slot = ctx.frame.register_slot(u16::from(lhs));
+        let rhs_slot = ctx.frame.register_slot(u16::from(rhs));
+        let dst_slot = ctx.frame.register_slot(u16::from(dst));
+        let acc = ctx.regs.accumulator;
+        let scratch1 = ctx.regs.scratch1;
+        let scratch2 = ctx.regs.scratch2;
+
+        ctx.asm.mov_rm(acc, &lhs_slot);
+        Self::emit_int_guard_extract_or_jump(ctx, acc, acc, scratch1, slow);
+
+        ctx.asm.mov_rm(scratch2, &rhs_slot);
+        Self::emit_int_guard_extract_or_jump(ctx, scratch2, scratch2, scratch1, slow);
+
+        match op {
+            DynamicIntBinaryOp::Add => ctx.asm.add_rr(acc, scratch2),
+            DynamicIntBinaryOp::Sub => ctx.asm.sub_rr(acc, scratch2),
+            DynamicIntBinaryOp::Mul => ctx.asm.imul_rr(acc, scratch2),
+        }
+        ctx.asm.jo(slow);
+        Self::emit_int_range_guard_or_jump(ctx, acc, scratch1, slow);
+
+        Self::emit_int_box(ctx, acc, scratch1);
+        ctx.asm.mov_mr(&dst_slot, acc);
+        ctx.asm.jmp(done);
+
+        ctx.asm.bind_label(slow);
+        self.emit_tier1_bytecode_helper(ctx, opcode, helper_addr, deopt_idx, None);
+        ctx.asm.bind_label(done);
+    }
+
+    /// Emit an unknown-type comparison as a native small-int fast path with an
+    /// exact VM bytecode fallback for floats, objects, strings, and protocol
+    /// dispatch.
+    fn emit_dynamic_int_compare_bridge(
+        &self,
+        ctx: &mut TemplateContext,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+        op: DynamicIntCompareOp,
+        opcode: u8,
+        helper_addr: u64,
+        deopt_idx: usize,
+    ) {
+        let slow = ctx.asm.create_label();
+        let done = ctx.asm.create_label();
+        let lhs_slot = ctx.frame.register_slot(u16::from(lhs));
+        let rhs_slot = ctx.frame.register_slot(u16::from(rhs));
+        let dst_slot = ctx.frame.register_slot(u16::from(dst));
+        let acc = ctx.regs.accumulator;
+        let scratch1 = ctx.regs.scratch1;
+        let scratch2 = ctx.regs.scratch2;
+
+        ctx.asm.mov_rm(acc, &lhs_slot);
+        Self::emit_int_guard_extract_or_jump(ctx, acc, acc, scratch1, slow);
+
+        ctx.asm.mov_rm(scratch2, &rhs_slot);
+        Self::emit_int_guard_extract_or_jump(ctx, scratch2, scratch2, scratch1, slow);
+
+        ctx.asm.cmp_rr(acc, scratch2);
+        let true_label = ctx.asm.create_label();
+        let store_label = ctx.asm.create_label();
+        ctx.asm.jcc(op.condition(), true_label);
+        ctx.asm.mov_ri64(acc, value_tags::false_value() as i64);
+        ctx.asm.jmp(store_label);
+        ctx.asm.bind_label(true_label);
+        ctx.asm.mov_ri64(acc, value_tags::true_value() as i64);
+        ctx.asm.bind_label(store_label);
+        ctx.asm.mov_mr(&dst_slot, acc);
+        ctx.asm.jmp(done);
+
+        ctx.asm.bind_label(slow);
+        self.emit_tier1_bytecode_helper(ctx, opcode, helper_addr, deopt_idx, None);
+        ctx.asm.bind_label(done);
+    }
+
+    #[inline]
+    fn emit_int_guard_extract_or_jump(
+        ctx: &mut TemplateContext,
+        src: Gpr,
+        dst: Gpr,
+        scratch: Gpr,
+        fallback: Label,
+    ) {
+        ctx.asm.mov_rr(scratch, src);
+        ctx.asm.shr_ri(scratch, 48);
+        ctx.asm.cmp_ri(scratch, value_tags::int_tag_check() as i32);
+        ctx.asm.jne(fallback);
+
+        ctx.asm.mov_rr(dst, src);
+        ctx.asm.shl_ri(dst, 16);
+        ctx.asm.sar_ri(dst, 16);
+    }
+
+    #[inline]
+    fn emit_int_range_guard_or_jump(
+        ctx: &mut TemplateContext,
+        value: Gpr,
+        scratch: Gpr,
+        fallback: Label,
+    ) {
+        ctx.asm.mov_ri64(scratch, value_tags::SMALL_INT_MIN);
+        ctx.asm.cmp_rr(value, scratch);
+        ctx.asm.jl(fallback);
+        ctx.asm.mov_ri64(scratch, value_tags::SMALL_INT_MAX);
+        ctx.asm.cmp_rr(value, scratch);
+        ctx.asm.jg(fallback);
+    }
+
+    #[inline]
+    fn emit_int_box(ctx: &mut TemplateContext, value: Gpr, scratch: Gpr) {
+        ctx.asm.mov_ri64(scratch, value_tags::PAYLOAD_MASK as i64);
+        ctx.asm.and_rr(value, scratch);
+        ctx.asm.mov_ri64(
+            scratch,
+            (value_tags::QNAN_BITS | value_tags::INT_TAG) as i64,
+        );
+        ctx.asm.or_rr(value, scratch);
+    }
+
     /// Emit code for a single instruction.
     fn emit_instruction(
         &self,
@@ -549,6 +684,46 @@ impl TemplateCompiler {
                 ..
             } => {
                 self.emit_tier1_bytecode_helper(ctx, *opcode, *helper_addr, deopt_idx, None);
+            }
+            TemplateInstruction::DynamicIntBinary {
+                dst,
+                lhs,
+                rhs,
+                op,
+                opcode,
+                helper_addr,
+                ..
+            } => {
+                self.emit_dynamic_int_binary_bridge(
+                    ctx,
+                    *dst,
+                    *lhs,
+                    *rhs,
+                    *op,
+                    *opcode,
+                    *helper_addr,
+                    deopt_idx,
+                );
+            }
+            TemplateInstruction::DynamicIntCompare {
+                dst,
+                lhs,
+                rhs,
+                op,
+                opcode,
+                helper_addr,
+                ..
+            } => {
+                self.emit_dynamic_int_compare_bridge(
+                    ctx,
+                    *dst,
+                    *lhs,
+                    *rhs,
+                    *op,
+                    *opcode,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
             TemplateInstruction::Move { dst, src, .. } => {
                 MoveTemplate {
@@ -1500,6 +1675,39 @@ impl TemplateCompiler {
 // Template Instruction (IR for template compilation)
 // =============================================================================
 
+/// Small-int operation used by dynamic Tier 1 bridges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicIntBinaryOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Small-int comparison used by dynamic Tier 1 bridges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicIntCompareOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl DynamicIntCompareOp {
+    #[inline]
+    fn condition(self) -> Condition {
+        match self {
+            DynamicIntCompareOp::Lt => Condition::Less,
+            DynamicIntCompareOp::Le => Condition::LessEqual,
+            DynamicIntCompareOp::Gt => Condition::Greater,
+            DynamicIntCompareOp::Ge => Condition::GreaterEqual,
+            DynamicIntCompareOp::Eq => Condition::Equal,
+            DynamicIntCompareOp::Ne => Condition::NotEqual,
+        }
+    }
+}
+
 /// Intermediate representation for template-based compilation.
 /// This is a simplified IR that maps 1:1 to bytecode operations.
 #[derive(Debug, Clone)]
@@ -1530,6 +1738,28 @@ pub enum TemplateInstruction {
     /// register mirror and continue in native control flow.
     BytecodeBridge {
         bc_offset: u32,
+        opcode: u8,
+        helper_addr: u64,
+    },
+    /// Speculate that an unknown binary op is small-int Add/Sub/Mul; execute
+    /// the exact VM bytecode in-frame when the speculation misses.
+    DynamicIntBinary {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+        op: DynamicIntBinaryOp,
+        opcode: u8,
+        helper_addr: u64,
+    },
+    /// Speculate that an unknown comparison is a small-int comparison; execute
+    /// the exact VM bytecode in-frame when the speculation misses.
+    DynamicIntCompare {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+        op: DynamicIntCompareOp,
         opcode: u8,
         helper_addr: u64,
     },
@@ -2524,6 +2754,8 @@ impl TemplateInstruction {
             | TemplateInstruction::LoadNone { bc_offset, .. }
             | TemplateInstruction::LoadBool { bc_offset, .. }
             | TemplateInstruction::BytecodeBridge { bc_offset, .. }
+            | TemplateInstruction::DynamicIntBinary { bc_offset, .. }
+            | TemplateInstruction::DynamicIntCompare { bc_offset, .. }
             | TemplateInstruction::Move { bc_offset, .. }
             | TemplateInstruction::LoadLocal { bc_offset, .. }
             | TemplateInstruction::StoreLocal { bc_offset, .. }
@@ -2686,6 +2918,8 @@ impl TemplateInstruction {
             self,
             TemplateInstruction::InterpreterFallback { .. }
                 | TemplateInstruction::BytecodeBridge { helper_addr: 0, .. }
+                | TemplateInstruction::DynamicIntBinary { helper_addr: 0, .. }
+                | TemplateInstruction::DynamicIntCompare { helper_addr: 0, .. }
                 | TemplateInstruction::LoadGlobal { helper_addr: 0, .. }
                 | TemplateInstruction::StoreGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
@@ -2769,6 +3003,8 @@ impl TemplateInstruction {
             self,
             TemplateInstruction::IntAdd { .. }
                 | TemplateInstruction::BytecodeBridge { .. }
+                | TemplateInstruction::DynamicIntBinary { .. }
+                | TemplateInstruction::DynamicIntCompare { .. }
                 | TemplateInstruction::IntSub { .. }
                 | TemplateInstruction::IntMul { .. }
                 | TemplateInstruction::IntDiv { .. }

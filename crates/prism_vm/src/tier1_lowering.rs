@@ -4,7 +4,7 @@
 //! compilation paths use identical semantics.
 
 use prism_code::{CodeFlags, CodeObject, Constant, Opcode};
-use prism_jit::tier1::codegen::TemplateInstruction;
+use prism_jit::tier1::codegen::{DynamicIntBinaryOp, DynamicIntCompareOp, TemplateInstruction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KnownType {
@@ -98,6 +98,46 @@ fn interpreter_fallback(bc_offset: u32) -> TemplateInstruction {
 fn bytecode_bridge(op: Opcode, bc_offset: u32) -> TemplateInstruction {
     TemplateInstruction::BytecodeBridge {
         bc_offset,
+        opcode: op as u8,
+        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+    }
+}
+
+#[inline]
+fn dynamic_int_binary_bridge(
+    op: Opcode,
+    bc_offset: u32,
+    dst: u8,
+    lhs: u8,
+    rhs: u8,
+    fast_op: DynamicIntBinaryOp,
+) -> TemplateInstruction {
+    TemplateInstruction::DynamicIntBinary {
+        bc_offset,
+        dst,
+        lhs,
+        rhs,
+        op: fast_op,
+        opcode: op as u8,
+        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+    }
+}
+
+#[inline]
+fn dynamic_int_compare_bridge(
+    op: Opcode,
+    bc_offset: u32,
+    dst: u8,
+    lhs: u8,
+    rhs: u8,
+    fast_op: DynamicIntCompareOp,
+) -> TemplateInstruction {
+    TemplateInstruction::DynamicIntCompare {
+        bc_offset,
+        dst,
+        lhs,
+        rhs,
+        op: fast_op,
         opcode: op as u8,
         helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
     }
@@ -316,7 +356,14 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_binary_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntBinaryOp::Add,
+                        )
                     }
                 }
             }
@@ -355,7 +402,14 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_binary_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntBinaryOp::Sub,
+                        )
                     }
                 }
             }
@@ -394,7 +448,14 @@ pub(crate) fn lower_code_to_templates(
                     }
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_binary_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntBinaryOp::Mul,
+                        )
                     }
                 }
             }
@@ -641,7 +702,14 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_compare_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntCompareOp::Lt,
+                        )
                     }
                 }
             }
@@ -665,7 +733,14 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_compare_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntCompareOp::Le,
+                        )
                     }
                 }
             }
@@ -689,7 +764,14 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_compare_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntCompareOp::Eq,
+                        )
                     }
                 }
             }
@@ -713,7 +795,14 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_compare_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntCompareOp::Ne,
+                        )
                     }
                 }
             }
@@ -737,7 +826,14 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_compare_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntCompareOp::Gt,
+                        )
                     }
                 }
             }
@@ -761,7 +857,14 @@ pub(crate) fn lower_code_to_templates(
                     },
                     NumericKind::Fallback => {
                         set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                        bytecode_bridge(op, bc_offset)
+                        dynamic_int_compare_bridge(
+                            op,
+                            bc_offset,
+                            dst,
+                            lhs,
+                            rhs,
+                            DynamicIntCompareOp::Ge,
+                        )
                     }
                 }
             }
@@ -1532,6 +1635,58 @@ mod tests {
         assert!(template.can_deopt());
     }
 
+    fn assert_dynamic_int_binary_bridge(
+        template: &TemplateInstruction,
+        bc_offset: u32,
+        opcode: Opcode,
+        op: DynamicIntBinaryOp,
+    ) {
+        match template {
+            TemplateInstruction::DynamicIntBinary {
+                bc_offset: actual_offset,
+                opcode: actual_opcode,
+                op: actual_op,
+                helper_addr,
+                ..
+            } => {
+                assert_eq!(*actual_offset, bc_offset);
+                assert_eq!(*actual_opcode, opcode as u8);
+                assert_eq!(*actual_op, op);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected DynamicIntBinary template, got {template:?}"),
+        }
+
+        assert!(!template.requires_interpreter_in_tier1());
+        assert!(template.can_deopt());
+    }
+
+    fn assert_dynamic_int_compare_bridge(
+        template: &TemplateInstruction,
+        bc_offset: u32,
+        opcode: Opcode,
+        op: DynamicIntCompareOp,
+    ) {
+        match template {
+            TemplateInstruction::DynamicIntCompare {
+                bc_offset: actual_offset,
+                opcode: actual_opcode,
+                op: actual_op,
+                helper_addr,
+                ..
+            } => {
+                assert_eq!(*actual_offset, bc_offset);
+                assert_eq!(*actual_opcode, opcode as u8);
+                assert_eq!(*actual_op, op);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected DynamicIntCompare template, got {template:?}"),
+        }
+
+        assert!(!template.requires_interpreter_in_tier1());
+        assert!(template.can_deopt());
+    }
+
     #[test]
     fn normal_load_global_lowers_to_runtime_helper_template() {
         let code = load_global_code(CodeFlags::NONE);
@@ -1576,19 +1731,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_add_lowers_to_exact_bytecode_bridge() {
+    fn unknown_add_lowers_to_guarded_int_bridge() {
         let code = dynamic_binary_code(Opcode::Add);
         let templates = lower_code_to_templates(&code).expect("lowering should succeed");
 
-        assert_bytecode_bridge(&templates[0], 0, Opcode::Add);
+        assert_dynamic_int_binary_bridge(&templates[0], 0, Opcode::Add, DynamicIntBinaryOp::Add);
     }
 
     #[test]
-    fn unknown_comparison_lowers_to_exact_bytecode_bridge() {
+    fn unknown_comparison_lowers_to_guarded_int_bridge() {
         let code = dynamic_binary_code(Opcode::Lt);
         let templates = lower_code_to_templates(&code).expect("lowering should succeed");
 
-        assert_bytecode_bridge(&templates[0], 0, Opcode::Lt);
+        assert_dynamic_int_compare_bridge(&templates[0], 0, Opcode::Lt, DynamicIntCompareOp::Lt);
     }
 
     #[test]

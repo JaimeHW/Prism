@@ -110,6 +110,14 @@ pub mod value_tags {
     /// Tag for string values (tag = 4). Payload: 48-bit interned string pointer.
     pub const STRING_TAG: u64 = 4 << TAG_SHIFT;
 
+    /// Signed payload range for immediate integers.
+    ///
+    /// These bounds are part of the value ABI: arithmetic fast paths must
+    /// transfer to the generic runtime before boxing any result outside this
+    /// range, because the payload is only 48 bits wide.
+    pub const SMALL_INT_MIN: i64 = -(1_i64 << 47);
+    pub const SMALL_INT_MAX: i64 = (1_i64 << 47) - 1;
+
     // =========================================================================
     // Masks
     // =========================================================================
