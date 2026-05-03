@@ -8,7 +8,8 @@ use crate::types::hashable::HashableValue;
 use crate::types::int::value_to_bigint;
 use crate::types::tuple::TupleObject;
 use prism_core::Value;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::{Hash, Hasher};
 
 // =============================================================================
 // Dictionary Object
@@ -29,10 +30,41 @@ pub struct DictObject {
 
 #[derive(Debug, Clone, Default)]
 struct DictEntries {
-    index: FxHashMap<HashableValue, usize>,
+    index: FxHashMap<DictIndexKey, usize>,
     slots: Vec<DictSlot>,
+    live_count: usize,
+    hashed_key_count: usize,
     protocol_key_count: usize,
     tombstones: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DictIndexKey {
+    key: HashableValue,
+    hash: u64,
+}
+
+impl DictIndexKey {
+    #[inline]
+    fn new(key: HashableValue, hash: u64) -> Self {
+        Self { key, hash }
+    }
+}
+
+impl PartialEq for DictIndexKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for DictIndexKey {}
+
+impl Hash for DictIndexKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,10 +133,21 @@ impl DictSlot {
     }
 
     #[inline]
+    fn has_cached_hash(self) -> bool {
+        self.flags & SLOT_HAS_HASH != 0
+    }
+
+    #[inline]
     fn set_hash(&mut self, hash: i64) {
         self.hash = hash;
         self.flags |= SLOT_HAS_HASH;
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DictLookupMode {
+    Raw,
+    PythonHash,
 }
 
 impl DictObject {
@@ -126,6 +169,8 @@ impl DictObject {
             entries: DictEntries {
                 index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
                 slots: Vec::with_capacity(capacity),
+                live_count: 0,
+                hashed_key_count: 0,
                 protocol_key_count: 0,
                 tombstones: 0,
             },
@@ -136,7 +181,7 @@ impl DictObject {
     /// Get the number of items.
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries.index.len()
+        self.entries.live_count
     }
 
     /// Monotonic structural mutation counter for iterator invalidation.
@@ -148,7 +193,7 @@ impl DictObject {
     /// Check if the dict is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.entries.index.is_empty()
+        self.entries.live_count == 0
     }
 
     /// Return true when at least one key can require Python-level equality for
@@ -161,7 +206,23 @@ impl DictObject {
     /// Get a value by key.
     #[inline]
     pub fn get(&self, key: Value) -> Option<Value> {
-        self.slot_for_key(HashableValue(key)).map(|slot| slot.value)
+        self.slot_for_key(
+            HashableValue(key),
+            index_hash_for_value(key),
+            DictLookupMode::Raw,
+        )
+        .map(|slot| slot.value)
+    }
+
+    /// Get a value by key after the caller has already computed Python hash.
+    #[inline]
+    pub fn get_with_hash(&self, key: Value, hash: i64) -> Option<Value> {
+        self.slot_for_key(
+            HashableValue(key),
+            index_hash_for_python_hash(hash),
+            DictLookupMode::PythonHash,
+        )
+        .map(|slot| slot.value)
     }
 
     /// Set a key-value pair.
@@ -198,12 +259,32 @@ impl DictObject {
         requires_protocol_lookup: bool,
     ) -> Option<Value> {
         let key = HashableValue(key);
-        if let Some(index) = self.entries.index.get(&key).copied() {
+        let lookup_mode = if hash.is_some() {
+            DictLookupMode::PythonHash
+        } else {
+            DictLookupMode::Raw
+        };
+        let index_key = DictIndexKey::new(
+            key,
+            hash.map_or_else(|| index_hash_for_value(key.0), index_hash_for_python_hash),
+        );
+        if let Some(index) = self.slot_index_for_key(key, index_key.hash, lookup_mode) {
+            let replacement_index_key = hash
+                .map(|hash| DictIndexKey::new(key, index_hash_for_python_hash(hash)))
+                .unwrap_or_else(|| self.index_key_for_slot(self.entries.slots[index]));
+            if self.entries.index.get(&replacement_index_key).copied() != Some(index) {
+                self.remove_slot_index_from_index(index);
+                self.entries.index.insert(replacement_index_key, index);
+            }
             let slot = &mut self.entries.slots[index];
             let old_value = slot.value;
+            let was_hashless = !slot.has_cached_hash();
             slot.value = value;
             if let Some(hash) = hash {
                 slot.set_hash(hash);
+                if was_hashless {
+                    self.entries.hashed_key_count += 1;
+                }
             }
             if requires_protocol_lookup && !slot.requires_protocol_lookup() {
                 slot.mark_protocol_lookup();
@@ -214,10 +295,14 @@ impl DictObject {
 
         self.bump_version();
         let index = self.entries.slots.len();
-        self.entries.index.insert(key, index);
+        self.entries.index.insert(index_key, index);
         self.entries
             .slots
             .push(DictSlot::new(key, value, hash, requires_protocol_lookup));
+        self.entries.live_count += 1;
+        if hash.is_some() {
+            self.entries.hashed_key_count += 1;
+        }
         if requires_protocol_lookup {
             self.entries.protocol_key_count += 1;
         }
@@ -228,8 +313,37 @@ impl DictObject {
     #[inline]
     pub fn remove(&mut self, key: Value) -> Option<Value> {
         let key = HashableValue(key);
-        let Some((_stored_key, index)) = self.entries.index.remove_entry(&key) else {
-            return None;
+        self.remove_indexed(key, index_hash_for_value(key.0), DictLookupMode::Raw)
+    }
+
+    /// Remove a key after the caller has already computed Python hash.
+    #[inline]
+    pub fn remove_with_hash(&mut self, key: Value, hash: i64) -> Option<Value> {
+        self.remove_indexed(
+            HashableValue(key),
+            index_hash_for_python_hash(hash),
+            DictLookupMode::PythonHash,
+        )
+    }
+
+    #[inline]
+    fn remove_indexed(
+        &mut self,
+        key: HashableValue,
+        index_hash: u64,
+        mode: DictLookupMode,
+    ) -> Option<Value> {
+        let index_key = DictIndexKey::new(key, index_hash);
+        let index = match self.entries.index.remove_entry(&index_key) {
+            Some((_stored_key, index)) => index,
+            None => {
+                if !self.may_need_cross_hash_fallback(mode) {
+                    return None;
+                }
+                let index = self.linear_slot_index_for_key(key)?;
+                self.remove_slot_index_from_index(index);
+                index
+            }
         };
 
         self.bump_version();
@@ -238,9 +352,13 @@ impl DictObject {
             if slot.requires_protocol_lookup() {
                 self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
             }
+            if slot.has_cached_hash() {
+                self.entries.hashed_key_count = self.entries.hashed_key_count.saturating_sub(1);
+            }
             slot.set_live(false);
             slot.value
         };
+        self.entries.live_count = self.entries.live_count.saturating_sub(1);
         self.entries.tombstones += 1;
         self.maybe_compact_order();
         Some(value)
@@ -249,17 +367,32 @@ impl DictObject {
     /// Check if the dict contains a key.
     #[inline]
     pub fn contains_key(&self, key: Value) -> bool {
-        self.entries.index.contains_key(&HashableValue(key))
+        let key = HashableValue(key);
+        self.slot_index_for_key(key, index_hash_for_value(key.0), DictLookupMode::Raw)
+            .is_some()
+    }
+
+    /// Check if the dict contains a key after the caller computed Python hash.
+    #[inline]
+    pub fn contains_key_with_hash(&self, key: Value, hash: i64) -> bool {
+        self.slot_index_for_key(
+            HashableValue(key),
+            index_hash_for_python_hash(hash),
+            DictLookupMode::PythonHash,
+        )
+        .is_some()
     }
 
     /// Clear all items.
     #[inline]
     pub fn clear(&mut self) {
-        if !self.entries.index.is_empty() {
+        if self.entries.live_count != 0 {
             self.bump_version();
         }
         self.entries.index.clear();
         self.entries.slots.clear();
+        self.entries.live_count = 0;
+        self.entries.hashed_key_count = 0;
         self.entries.protocol_key_count = 0;
         self.entries.tombstones = 0;
     }
@@ -288,6 +421,22 @@ impl DictObject {
             .filter_map(|slot| slot.is_live().then_some((slot.key.0, slot.value)))
     }
 
+    /// Get an iterator over key-value-hash triples without re-indexing keys.
+    pub fn iter_with_hashes(&self) -> impl Iterator<Item = (Value, Value, Option<i64>)> + '_ {
+        self.entries.slots.iter().filter_map(|slot| {
+            slot.is_live()
+                .then_some((slot.key.0, slot.value, slot.cached_hash()))
+        })
+    }
+
+    /// Get an iterator over keys and cached hashes without re-indexing keys.
+    pub fn keys_with_hashes(&self) -> impl Iterator<Item = (Value, Option<i64>)> + '_ {
+        self.entries
+            .slots
+            .iter()
+            .filter_map(|slot| slot.is_live().then_some((slot.key.0, slot.cached_hash())))
+    }
+
     /// Return the next live key-value pair at or after an insertion-order cursor.
     ///
     /// The cursor is advanced past skipped tombstones and the returned entry.
@@ -309,14 +458,18 @@ impl DictObject {
     /// Return the cached Python hash for a stored key, when available.
     #[inline]
     pub fn stored_hash(&self, key: Value) -> Option<i64> {
-        self.slot_for_key(HashableValue(key))
-            .and_then(|slot| slot.cached_hash())
+        self.slot_for_key(
+            HashableValue(key),
+            index_hash_for_value(key),
+            DictLookupMode::Raw,
+        )
+        .and_then(|slot| slot.cached_hash())
     }
 
     /// Update this dict with items from another.
     pub fn update(&mut self, other: &DictObject) {
-        for (key, value) in other.iter() {
-            if let Some(hash) = other.stored_hash(key) {
+        for (key, value, hash) in other.iter_with_hashes() {
+            if let Some(hash) = hash {
                 self.set_with_hash(key, value, hash);
             } else {
                 self.set(key, value);
@@ -343,7 +496,9 @@ impl DictObject {
     /// Move an existing key to either end of the insertion order.
     pub fn move_to_end(&mut self, key: Value, last: bool) -> bool {
         let key = HashableValue(key);
-        let Some(index) = self.entries.index.get(&key).copied() else {
+        let Some(index) =
+            self.slot_index_for_key(key, index_hash_for_value(key.0), DictLookupMode::Raw)
+        else {
             return false;
         };
 
@@ -354,11 +509,14 @@ impl DictObject {
 
             self.bump_version();
             let mut moved = self.entries.slots[index];
+            self.remove_slot_index_from_index(index);
             self.entries.slots[index].set_live(false);
             self.entries.tombstones += 1;
             moved.set_live(true);
             let new_index = self.entries.slots.len();
-            self.entries.index.insert(moved.key, new_index);
+            self.entries
+                .index
+                .insert(self.index_key_for_slot(moved), new_index);
             self.entries.slots.push(moved);
             self.maybe_compact_order();
             return true;
@@ -381,10 +539,14 @@ impl DictObject {
             }
 
             self.bump_version();
-            self.entries.index.remove(&slot.key);
+            self.remove_slot_index_from_index(self.entries.slots.len());
             if slot.requires_protocol_lookup() {
                 self.entries.protocol_key_count = self.entries.protocol_key_count.saturating_sub(1);
             }
+            if slot.has_cached_hash() {
+                self.entries.hashed_key_count = self.entries.hashed_key_count.saturating_sub(1);
+            }
+            self.entries.live_count = self.entries.live_count.saturating_sub(1);
             return Some((slot.key.0, slot.value));
         }
     }
@@ -396,7 +558,7 @@ impl DictObject {
 
     #[inline]
     fn maybe_compact_order(&mut self) {
-        if self.entries.tombstones > 16 && self.entries.tombstones > self.entries.index.len() {
+        if self.entries.tombstones > 16 && self.entries.tombstones > self.entries.live_count {
             self.compact_order();
         }
     }
@@ -406,9 +568,11 @@ impl DictObject {
             return;
         }
 
-        let live_len = self.entries.index.len();
+        let live_len = self.entries.live_count;
         let old_slots = std::mem::take(&mut self.entries.slots);
         self.entries.index.clear();
+        self.entries.live_count = 0;
+        self.entries.hashed_key_count = 0;
         self.entries.protocol_key_count = 0;
         self.entries.slots = Vec::with_capacity(live_len);
 
@@ -426,9 +590,11 @@ impl DictObject {
             return;
         }
 
-        let live_len = self.entries.index.len();
+        let live_len = self.entries.live_count;
         let old_slots = std::mem::take(&mut self.entries.slots);
         self.entries.index.clear();
+        self.entries.live_count = 0;
+        self.entries.hashed_key_count = 0;
         self.entries.protocol_key_count = 0;
         self.entries.slots = Vec::with_capacity(live_len);
 
@@ -444,11 +610,61 @@ impl DictObject {
     }
 
     #[inline]
-    fn slot_for_key(&self, key: HashableValue) -> Option<&DictSlot> {
-        let index = self.entries.index.get(&key).copied()?;
+    fn slot_for_key(
+        &self,
+        key: HashableValue,
+        index_hash: u64,
+        mode: DictLookupMode,
+    ) -> Option<&DictSlot> {
+        let index = self.slot_index_for_key(key, index_hash, mode)?;
         let slot = self.entries.slots.get(index)?;
         debug_assert!(slot.is_live());
         slot.is_live().then_some(slot)
+    }
+
+    #[inline]
+    fn slot_index_for_key(
+        &self,
+        key: HashableValue,
+        index_hash: u64,
+        mode: DictLookupMode,
+    ) -> Option<usize> {
+        self.entries
+            .index
+            .get(&DictIndexKey::new(key, index_hash))
+            .copied()
+            .filter(|index| {
+                self.entries
+                    .slots
+                    .get(*index)
+                    .is_some_and(|slot| slot.is_live())
+            })
+            .or_else(|| {
+                self.may_need_cross_hash_fallback(mode)
+                    .then(|| self.linear_slot_index_for_key(key))
+                    .flatten()
+            })
+    }
+
+    #[inline]
+    fn may_need_cross_hash_fallback(&self, mode: DictLookupMode) -> bool {
+        match mode {
+            DictLookupMode::Raw => self.entries.hashed_key_count != 0,
+            DictLookupMode::PythonHash => self.entries.hashed_key_count != self.entries.live_count,
+        }
+    }
+
+    #[inline]
+    fn linear_slot_index_for_key(&self, key: HashableValue) -> Option<usize> {
+        self.entries
+            .slots
+            .iter()
+            .position(|slot| slot.is_live() && slot.key == key)
+    }
+
+    #[inline]
+    fn remove_slot_index_from_index(&mut self, slot_index: usize) {
+        self.entries.index.retain(|_, index| *index != slot_index);
     }
 
     #[inline]
@@ -465,12 +681,39 @@ impl DictObject {
     fn push_compacted_slot(&mut self, mut slot: DictSlot) {
         slot.set_live(true);
         let index = self.entries.slots.len();
-        self.entries.index.insert(slot.key, index);
+        self.entries
+            .index
+            .insert(self.index_key_for_slot(slot), index);
         if slot.requires_protocol_lookup() {
             self.entries.protocol_key_count += 1;
         }
+        if slot.has_cached_hash() {
+            self.entries.hashed_key_count += 1;
+        }
+        self.entries.live_count += 1;
         self.entries.slots.push(slot);
     }
+
+    #[inline]
+    fn index_key_for_slot(&self, slot: DictSlot) -> DictIndexKey {
+        let hash = slot.cached_hash().map_or_else(
+            || index_hash_for_value(slot.key.0),
+            index_hash_for_python_hash,
+        );
+        DictIndexKey::new(slot.key, hash)
+    }
+}
+
+#[inline]
+fn index_hash_for_python_hash(hash: i64) -> u64 {
+    hash as u64
+}
+
+#[inline]
+fn index_hash_for_value(value: Value) -> u64 {
+    let mut hasher = FxHasher::default();
+    HashableValue(value).hash(&mut hasher);
+    hasher.finish()
 }
 
 #[inline]
@@ -576,6 +819,37 @@ mod tests {
         assert_eq!(dict.stored_hash(int(1)), Some(111));
         assert_eq!(dict.stored_hash(int(2)), Some(222));
         assert_eq!(ints(dict.keys()), vec![2, 1]);
+    }
+
+    #[test]
+    fn hashed_and_raw_paths_share_one_entry() {
+        let mut dict = DictObject::new();
+
+        dict.set(int(1), int(10));
+        assert_eq!(dict.set_with_hash(int(1), int(11), 1), Some(int(10)));
+        assert_eq!(dict.len(), 1);
+        assert_eq!(dict.get_with_hash(int(1), 1), Some(int(11)));
+        assert_eq!(dict.stored_hash(int(1)), Some(1));
+
+        assert_eq!(dict.set(int(1), int(12)), Some(int(11)));
+        assert_eq!(dict.len(), 1);
+        assert_eq!(dict.get(int(1)), Some(int(12)));
+        assert_eq!(dict.remove_with_hash(int(1), 1), Some(int(12)));
+        assert!(dict.is_empty());
+    }
+
+    #[test]
+    fn hash_iterators_read_slot_hashes_directly() {
+        let mut dict = DictObject::new();
+        dict.set_with_hash(int(1), int(10), 101);
+        dict.set(int(2), int(20));
+
+        let entries = dict.iter_with_hashes().collect::<Vec<_>>();
+        assert_eq!(entries[0], (int(1), int(10), Some(101)));
+        assert_eq!(entries[1], (int(2), int(20), None));
+
+        let keys = dict.keys_with_hashes().collect::<Vec<_>>();
+        assert_eq!(keys, vec![(int(1), Some(101)), (int(2), None)]);
     }
 
     #[test]

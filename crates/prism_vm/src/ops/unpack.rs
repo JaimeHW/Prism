@@ -238,7 +238,9 @@ pub fn build_dict_unpack(vm: &mut VirtualMachine, inst: Instruction) -> ControlF
                 Err(err) => return ControlFlow::Error(err),
             };
             for (key, val) in entries {
-                dict.set(key, val);
+                if let Err(err) = crate::ops::dict_access::dict_set_item(vm, &mut dict, key, val) {
+                    return ControlFlow::Error(err);
+                }
             }
         }
     }

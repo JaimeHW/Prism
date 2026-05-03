@@ -1775,10 +1775,12 @@ fn ordered_dict_init(
     let dict = expect_collection_dict_mut_from_ptr(ptr, "__init__")?;
     dict.clear();
     for (key, value) in entries {
-        dict.set(key, value);
+        crate::ops::dict_access::dict_set_item(vm, dict, key, value)
+            .map_err(BuiltinError::Raised)?;
     }
     for &(name, value) in keywords {
-        dict.set(Value::string(intern(name)), value);
+        crate::ops::dict_access::dict_set_item(vm, dict, Value::string(intern(name)), value)
+            .map_err(BuiltinError::Raised)?;
     }
 
     Ok(Value::none())
@@ -2452,7 +2454,8 @@ fn chainmap_fromkeys(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
     let keys = collect_iterable_values_runtime(vm, args[1]).map_err(BuiltinError::Raised)?;
     let mut dict = DictObject::with_capacity(keys.len());
     for key in keys {
-        dict.set(key, default);
+        crate::ops::dict_access::dict_set_item(vm, &mut dict, key, default)
+            .map_err(BuiltinError::Raised)?;
     }
     invoke_callable_value(vm, args[0], &[leak_object_value(dict)]).map_err(BuiltinError::Raised)
 }

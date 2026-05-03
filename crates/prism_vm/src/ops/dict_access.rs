@@ -30,7 +30,7 @@ pub(crate) fn dict_get_item(
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
     if !key_requires_protocol_lookup {
-        if let Some(value) = dict.get(key) {
+        if let Some(value) = dict.get_with_hash(key, key_hash) {
             return Ok(Some(value));
         }
         if !dict.has_protocol_keys() {
@@ -38,8 +38,8 @@ pub(crate) fn dict_get_item(
         }
     }
 
-    for (candidate, value) in dict.iter() {
-        if dict_candidate_matches(vm, dict, candidate, key, key_hash)? {
+    for (candidate, value, candidate_hash) in dict.iter_with_hashes() {
+        if dict_candidate_matches(vm, candidate, candidate_hash, key, key_hash)? {
             return Ok(Some(value));
         }
     }
@@ -64,7 +64,7 @@ pub(crate) fn dict_set_item(
 ) -> Result<Option<Value>, RuntimeError> {
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
-    if !key_requires_protocol_lookup && dict.contains_key(key) {
+    if !key_requires_protocol_lookup && dict.contains_key_with_hash(key, key_hash) {
         let replaced = dict.set_with_hash_and_protocol_lookup(
             key,
             value,
@@ -80,9 +80,9 @@ pub(crate) fn dict_set_item(
         return Ok(replaced);
     }
 
-    let keys = dict.keys().collect::<Vec<_>>();
-    for candidate in keys {
-        if dict_candidate_matches(vm, dict, candidate, key, key_hash)? {
+    let keys = dict.keys_with_hashes().collect::<Vec<_>>();
+    for (candidate, candidate_hash) in keys {
+        if dict_candidate_matches(vm, candidate, candidate_hash, key, key_hash)? {
             let replaced = dict.set_with_hash_and_protocol_lookup(
                 candidate,
                 value,
@@ -109,7 +109,7 @@ pub(crate) fn dict_remove_item(
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
     if !key_requires_protocol_lookup {
-        if let Some(value) = dict.remove(key) {
+        if let Some(value) = dict.remove_with_hash(key, key_hash) {
             return Ok(Some(value));
         }
         if !dict.has_protocol_keys() {
@@ -117,10 +117,10 @@ pub(crate) fn dict_remove_item(
         }
     }
 
-    let keys = dict.keys().collect::<Vec<_>>();
-    for candidate in keys {
-        if dict_candidate_matches(vm, dict, candidate, key, key_hash)? {
-            return Ok(dict.remove(candidate));
+    let keys = dict.keys_with_hashes().collect::<Vec<_>>();
+    for (candidate, candidate_hash) in keys {
+        if dict_candidate_matches(vm, candidate, candidate_hash, key, key_hash)? {
+            return Ok(dict.remove_with_hash(candidate, candidate_hash.unwrap_or(key_hash)));
         }
     }
 
@@ -137,7 +137,7 @@ pub(crate) fn dict_setdefault(
     let key_hash = hash_value_vm(vm, key).map_err(RuntimeError::from)?;
     let key_requires_protocol_lookup = requires_protocol_scan(key);
     if !key_requires_protocol_lookup {
-        if let Some(value) = dict.get(key) {
+        if let Some(value) = dict.get_with_hash(key, key_hash) {
             return Ok(value);
         }
         if !dict.has_protocol_keys() {
@@ -146,11 +146,12 @@ pub(crate) fn dict_setdefault(
         }
     }
 
-    let keys = dict.keys().collect::<Vec<_>>();
-    for candidate in keys {
-        if dict_candidate_matches(vm, dict, candidate, key, key_hash)? {
+    let keys = dict.keys_with_hashes().collect::<Vec<_>>();
+    for (candidate, candidate_hash) in keys {
+        if dict_candidate_matches(vm, candidate, candidate_hash, key, key_hash)? {
+            let candidate_hash = candidate_hash.unwrap_or(key_hash);
             return Ok(dict
-                .get(candidate)
+                .get_with_hash(candidate, candidate_hash)
                 .expect("candidate key came from this dictionary"));
         }
     }
@@ -207,12 +208,12 @@ pub(crate) fn dict_missing_value(
 #[inline]
 fn dict_candidate_matches(
     vm: &mut VirtualMachine,
-    dict: &DictObject,
     candidate: Value,
+    candidate_hash: Option<i64>,
     key: Value,
     key_hash: i64,
 ) -> Result<bool, RuntimeError> {
-    let candidate_hash = match dict.stored_hash(candidate) {
+    let candidate_hash = match candidate_hash {
         Some(hash) => hash,
         None => hash_value_vm(vm, candidate).map_err(RuntimeError::from)?,
     };

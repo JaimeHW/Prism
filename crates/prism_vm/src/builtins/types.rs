@@ -1529,8 +1529,8 @@ pub(crate) fn call_builtin_type_with_vm(
                 if crate::ops::objects::extract_type_id(ptr) == TypeId::DICT {
                     let source = unsafe { &*(ptr as *const DictObject) };
                     let mut copy = DictObject::with_capacity(source.len());
-                    for (key, value) in source.iter() {
-                        if let Some(hash) = source.stored_hash(key) {
+                    for (key, value, hash) in source.iter_with_hashes() {
+                        if let Some(hash) = hash {
                             copy.set_with_hash(key, value, hash);
                         } else {
                             copy.set(key, value);

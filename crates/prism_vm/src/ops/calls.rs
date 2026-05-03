@@ -3516,7 +3516,10 @@ fn call_kw_user_function(
         let mut dict = DictObject::new();
         if let Some(entries) = &varkw_entries {
             for (key, val) in entries {
-                dict.set(*key, *val);
+                if let Err(err) = crate::ops::dict_access::dict_set_item(vm, &mut dict, *key, *val)
+                {
+                    return ControlFlow::Error(err);
+                }
             }
         }
         Some(alloc_value_in_current_heap_or_box(dict))
