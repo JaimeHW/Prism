@@ -18,6 +18,7 @@ use crate::jit_executor::JitFrameState;
 const TIER1_HELPER_SUCCESS: u64 = 0;
 const TIER1_HELPER_DEOPT: u64 = 1;
 const TIER1_HELPER_EXCEPTION: u64 = 2;
+const TIER1_HELPER_JUMP: u64 = 3;
 
 pub(crate) fn tier1_load_global_addr() -> u64 {
     tier1_load_global as *const () as usize as u64
@@ -194,6 +195,17 @@ pub(crate) unsafe extern "C" fn tier1_execute_bytecode(
             sync_jit_state_ip_from_current_frame(vm, state);
             TIER1_HELPER_SUCCESS
         }
+        ControlFlow::Jump(offset) => match apply_helper_relative_jump(vm, offset) {
+            Ok(()) => {
+                sync_jit_state_ip_from_current_frame(vm, state);
+                TIER1_HELPER_JUMP
+            }
+            Err(err) => {
+                sync_jit_state_ip_from_current_frame(vm, state);
+                vm.record_jit_error(err);
+                TIER1_HELPER_EXCEPTION
+            }
+        },
         ControlFlow::Error(err) => {
             sync_jit_state_ip_from_current_frame(vm, state);
             vm.record_jit_error(err);
@@ -209,6 +221,21 @@ pub(crate) unsafe extern "C" fn tier1_execute_bytecode(
             TIER1_HELPER_EXCEPTION
         }
     }
+}
+
+#[inline]
+fn apply_helper_relative_jump(vm: &mut VirtualMachine, offset: i16) -> Result<(), RuntimeError> {
+    if vm.call_depth() == 0 {
+        return Err(RuntimeError::internal(
+            "Tier 1 bytecode helper jump with no active frame",
+        ));
+    }
+
+    let frame = vm.current_frame_mut();
+    let next_ip = (frame.ip as i64 + i64::from(offset)).max(0);
+    frame.ip = u32::try_from(next_ip)
+        .map_err(|_| RuntimeError::internal("Tier 1 bytecode helper jump target out of range"))?;
+    Ok(())
 }
 
 #[inline]
@@ -255,6 +282,7 @@ fn sync_jit_state_ip_from_current_frame(vm: &VirtualMachine, state: &mut JitFram
 mod tests {
     use super::*;
     use crate::error::RuntimeErrorKind;
+    use crate::ops::iteration::ensure_iterator_value;
     use prism_code::{FunctionBuilder, Instruction, Opcode, Register};
     use prism_core::intern::intern;
     use std::sync::Arc;
@@ -297,6 +325,20 @@ mod tests {
             Register::new(1),
             Register::new(0),
         ));
+        builder.emit_return(Register::new(1));
+        let mut code = builder.finish();
+        code.register_count = 2;
+        let code = Arc::new(code);
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::clone(&code), 0)
+            .expect("frame push should succeed");
+        (vm, code)
+    }
+
+    fn for_iter_helper_frame() -> (VirtualMachine, Arc<CodeObject>) {
+        let mut builder = FunctionBuilder::new("tier1_for_iter_helper");
+        builder.emit(Instruction::op_di(Opcode::ForIter, Register::new(1), 1));
         builder.emit_return(Register::new(1));
         let mut code = builder.finish();
         code.register_count = 2;
@@ -381,5 +423,21 @@ mod tests {
             .expect("helper should store the real VM error");
         assert!(matches!(err.kind(), RuntimeErrorKind::TypeError { .. }));
         assert_eq!(state.bc_offset, vm.current_frame().ip * 4);
+    }
+
+    #[test]
+    fn tier1_bytecode_helper_applies_relative_jump() {
+        let (mut vm, code) = for_iter_helper_frame();
+        let iterator = ensure_iterator_value(&mut vm, Value::string(intern("")))
+            .expect("empty string should produce an iterator");
+        vm.current_frame_mut().set_reg(0, iterator);
+
+        let mut state = state_for_current_frame(&mut vm, &code);
+        let status = unsafe { tier1_execute_bytecode(&mut state, Opcode::ForIter as u32, 0) };
+
+        assert_eq!(status, TIER1_HELPER_JUMP);
+        assert_eq!(vm.current_frame().ip, 2);
+        assert_eq!(state.bc_offset, 8);
+        assert!(vm.take_last_jit_error().is_none());
     }
 }

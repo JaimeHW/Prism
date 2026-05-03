@@ -419,6 +419,7 @@ impl TemplateCompiler {
         expected_opcode: u8,
         helper_addr: u64,
         deopt_idx: usize,
+        branch_target: Option<Label>,
     ) {
         if helper_addr == 0 {
             ctx.asm.jmp(ctx.deopt_label(deopt_idx));
@@ -427,6 +428,7 @@ impl TemplateCompiler {
 
         let success = ctx.asm.create_label();
         let exception = ctx.asm.create_label();
+        let branch = ctx.asm.create_label();
 
         emit_frame_state_writeback(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
 
@@ -439,11 +441,21 @@ impl TemplateCompiler {
         ctx.asm.je(success);
         ctx.asm.cmp_ri(Gpr::Rax, 2);
         ctx.asm.je(exception);
+        ctx.asm.cmp_ri(Gpr::Rax, 3);
+        ctx.asm.je(branch);
         ctx.asm.jmp(ctx.deopt_label(deopt_idx));
 
         ctx.asm.bind_label(exception);
         ctx.asm.mov_ri64(Gpr::Rax, ExitReason::Exception as i64);
         self.emit_native_epilogue(ctx.asm, ctx.frame);
+
+        ctx.asm.bind_label(branch);
+        if let Some(target) = branch_target {
+            emit_frame_state_reload(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
+            ctx.asm.jmp(target);
+        } else {
+            ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+        }
 
         ctx.asm.bind_label(success);
         emit_frame_state_reload(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
@@ -570,6 +582,7 @@ impl TemplateCompiler {
                         Opcode::GetAttr as u8,
                         *helper_addr,
                         deopt_idx,
+                        None,
                     );
                     return;
                 }
@@ -601,6 +614,7 @@ impl TemplateCompiler {
                         Opcode::SetAttr as u8,
                         *helper_addr,
                         deopt_idx,
+                        None,
                     );
                     return;
                 }
@@ -627,6 +641,7 @@ impl TemplateCompiler {
                     Opcode::LoadMethod as u8,
                     *helper_addr,
                     deopt_idx,
+                    None,
                 );
             }
             // Container item operations - deopt to interpreter for Tier 1
@@ -636,6 +651,7 @@ impl TemplateCompiler {
                     Opcode::GetItem as u8,
                     *helper_addr,
                     deopt_idx,
+                    None,
                 );
             }
             TemplateInstruction::SetItem { helper_addr, .. } => {
@@ -644,6 +660,7 @@ impl TemplateCompiler {
                     Opcode::SetItem as u8,
                     *helper_addr,
                     deopt_idx,
+                    None,
                 );
             }
             TemplateInstruction::DelItem { helper_addr, .. } => {
@@ -652,20 +669,44 @@ impl TemplateCompiler {
                     Opcode::DelItem as u8,
                     *helper_addr,
                     deopt_idx,
+                    None,
                 );
             }
-            // Iteration operations - deopt to interpreter for Tier 1
-            TemplateInstruction::GetIter { .. } => {
-                // Iterator creation requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::GetIter { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::GetIter as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::ForIter { .. } => {
-                // Iterator advance requires iterator state - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::ForIter {
+                helper_addr,
+                target,
+                ..
+            } => {
+                let Some(label) = labels.get(target).copied() else {
+                    ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+                    return;
+                };
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::ForIter as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    Some(label),
+                );
             }
             // Utility operations - deopt to interpreter for Tier 1
             TemplateInstruction::Len { helper_addr, .. } => {
-                self.emit_tier1_bytecode_helper(ctx, Opcode::Len as u8, *helper_addr, deopt_idx);
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::Len as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
             TemplateInstruction::IsCallable { helper_addr, .. } => {
                 self.emit_tier1_bytecode_helper(
@@ -673,52 +714,107 @@ impl TemplateCompiler {
                     Opcode::IsCallable as u8,
                     *helper_addr,
                     deopt_idx,
+                    None,
                 );
             }
-            // Container building operations - deopt to interpreter for Tier 1
-            TemplateInstruction::BuildList { .. } => {
-                // List allocation requires GC - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::BuildList { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::BuildList as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::BuildTuple { .. } => {
-                // Tuple allocation requires GC - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::BuildTuple { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::BuildTuple as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::BuildSet { .. } => {
-                // Set allocation requires GC - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::BuildSet { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::BuildSet as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::BuildDict { .. } => {
-                // Dict allocation requires GC - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::BuildDict { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::BuildDict as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::BuildString { .. } => {
-                // String allocation requires GC - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::BuildString { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::BuildString as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::BuildSlice { .. } => {
-                // Slice allocation requires GC - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::BuildSlice { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::BuildSlice as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::ListAppend { .. } => {
-                // List append requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::ListAppend { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::ListAppend as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::SetAdd { .. } => {
-                // Set add requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::SetAdd { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::SetAdd as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::DictSet { .. } => {
-                // Dict set requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::DictSet { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::DictSet as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::UnpackSequence { .. } => {
-                // Unpack requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::UnpackSequence { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::UnpackSequence as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
-            TemplateInstruction::UnpackEx { .. } => {
-                // Unpack with star requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::UnpackEx { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::UnpackEx as u8,
+                    *helper_addr,
+                    deopt_idx,
+                    None,
+                );
             }
             // Function call operations
             TemplateInstruction::Call {
@@ -740,6 +836,7 @@ impl TemplateCompiler {
                     Opcode::CallMethod as u8,
                     *helper_addr,
                     deopt_idx,
+                    None,
                 );
             }
             TemplateInstruction::TailCall { .. } => {
@@ -1470,6 +1567,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         src: u8,
+        helper_addr: u64,
     },
     /// For-loop iterator advance: dst = next(iter), jump if StopIteration
     /// Requires iterator state access - deopt for Tier 1
@@ -1477,7 +1575,8 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         iter: u8,
-        offset: i16, // Jump offset on StopIteration
+        target: u32,
+        helper_addr: u64,
     },
 
     // Utility operations
@@ -1506,6 +1605,7 @@ pub enum TemplateInstruction {
         dst: u8,
         start: u8,
         count: u8,
+        helper_addr: u64,
     },
     /// Build tuple: dst = (r(start)..r(start+count))
     /// Requires allocation - deopt for Tier 1
@@ -1514,6 +1614,7 @@ pub enum TemplateInstruction {
         dst: u8,
         start: u8,
         count: u8,
+        helper_addr: u64,
     },
     /// Build set: dst = {r(start)..r(start+count)}
     /// Requires allocation - deopt for Tier 1
@@ -1522,6 +1623,7 @@ pub enum TemplateInstruction {
         dst: u8,
         start: u8,
         count: u8,
+        helper_addr: u64,
     },
     /// Build dict: dst = {} with count key-value pairs starting at start
     /// Requires allocation - deopt for Tier 1
@@ -1530,6 +1632,7 @@ pub enum TemplateInstruction {
         dst: u8,
         start: u8,
         count: u8,
+        helper_addr: u64,
     },
     /// Build string: dst = "".join(r(start)..r(start+count))
     /// Requires allocation - deopt for Tier 1
@@ -1538,6 +1641,7 @@ pub enum TemplateInstruction {
         dst: u8,
         start: u8,
         count: u8,
+        helper_addr: u64,
     },
     /// Build slice: dst = slice(start, stop)
     /// Requires allocation - deopt for Tier 1
@@ -1546,6 +1650,7 @@ pub enum TemplateInstruction {
         dst: u8,
         start: u8,
         stop: u8,
+        helper_addr: u64,
     },
     /// List append: list.append(value)
     /// Requires type dispatch - deopt for Tier 1
@@ -1553,6 +1658,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         list: u8,
         value: u8,
+        helper_addr: u64,
     },
     /// Set add: set.add(value)
     /// Requires type dispatch - deopt for Tier 1
@@ -1560,6 +1666,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         set: u8,
         value: u8,
+        helper_addr: u64,
     },
     /// Dict set: dict[key] = value
     /// Requires type dispatch - deopt for Tier 1
@@ -1568,6 +1675,7 @@ pub enum TemplateInstruction {
         dict: u8,
         key: u8,
         value: u8,
+        helper_addr: u64,
     },
     /// Unpack sequence: r(dst)..r(dst+count) = unpack(src)
     /// Requires type dispatch - deopt for Tier 1
@@ -1576,6 +1684,7 @@ pub enum TemplateInstruction {
         dst: u8,
         src: u8,
         count: u8,
+        helper_addr: u64,
     },
     /// Unpack with star: unpack with *rest
     /// Requires type dispatch - deopt for Tier 1
@@ -1585,6 +1694,7 @@ pub enum TemplateInstruction {
         src: u8,
         before: u8, // Elements before *rest
         after: u8,  // Elements after *rest
+        helper_addr: u64,
     },
 
     // Function call operations
@@ -2407,6 +2517,7 @@ impl TemplateInstruction {
             TemplateInstruction::BranchIfFalse { target, .. } => Some(*target),
             TemplateInstruction::BranchIfNone { target, .. } => Some(*target),
             TemplateInstruction::BranchIfNotNone { target, .. } => Some(*target),
+            TemplateInstruction::ForIter { target, .. } => Some(*target),
             TemplateInstruction::EndAsyncFor { target, .. } => Some(*target as u32),
             _ => None,
         }
@@ -2429,21 +2540,21 @@ impl TemplateInstruction {
                 | TemplateInstruction::GetItem { helper_addr: 0, .. }
                 | TemplateInstruction::SetItem { helper_addr: 0, .. }
                 | TemplateInstruction::DelItem { helper_addr: 0, .. }
-                | TemplateInstruction::GetIter { .. }
-                | TemplateInstruction::ForIter { .. }
+                | TemplateInstruction::GetIter { helper_addr: 0, .. }
+                | TemplateInstruction::ForIter { helper_addr: 0, .. }
                 | TemplateInstruction::Len { helper_addr: 0, .. }
                 | TemplateInstruction::IsCallable { helper_addr: 0, .. }
-                | TemplateInstruction::BuildList { .. }
-                | TemplateInstruction::BuildTuple { .. }
-                | TemplateInstruction::BuildSet { .. }
-                | TemplateInstruction::BuildDict { .. }
-                | TemplateInstruction::BuildString { .. }
-                | TemplateInstruction::BuildSlice { .. }
-                | TemplateInstruction::ListAppend { .. }
-                | TemplateInstruction::SetAdd { .. }
-                | TemplateInstruction::DictSet { .. }
-                | TemplateInstruction::UnpackSequence { .. }
-                | TemplateInstruction::UnpackEx { .. }
+                | TemplateInstruction::BuildList { helper_addr: 0, .. }
+                | TemplateInstruction::BuildTuple { helper_addr: 0, .. }
+                | TemplateInstruction::BuildSet { helper_addr: 0, .. }
+                | TemplateInstruction::BuildDict { helper_addr: 0, .. }
+                | TemplateInstruction::BuildString { helper_addr: 0, .. }
+                | TemplateInstruction::BuildSlice { helper_addr: 0, .. }
+                | TemplateInstruction::ListAppend { helper_addr: 0, .. }
+                | TemplateInstruction::SetAdd { helper_addr: 0, .. }
+                | TemplateInstruction::DictSet { helper_addr: 0, .. }
+                | TemplateInstruction::UnpackSequence { helper_addr: 0, .. }
+                | TemplateInstruction::UnpackEx { helper_addr: 0, .. }
                 | TemplateInstruction::Call { helper_addr: 0, .. }
                 | TemplateInstruction::CallKw { .. }
                 | TemplateInstruction::CallMethod { helper_addr: 0, .. }
@@ -2529,8 +2640,21 @@ impl TemplateInstruction {
                 | TemplateInstruction::GetItem { .. }
                 | TemplateInstruction::SetItem { .. }
                 | TemplateInstruction::DelItem { .. }
+                | TemplateInstruction::GetIter { .. }
+                | TemplateInstruction::ForIter { .. }
                 | TemplateInstruction::Len { .. }
                 | TemplateInstruction::IsCallable { .. }
+                | TemplateInstruction::BuildList { .. }
+                | TemplateInstruction::BuildTuple { .. }
+                | TemplateInstruction::BuildSet { .. }
+                | TemplateInstruction::BuildDict { .. }
+                | TemplateInstruction::BuildString { .. }
+                | TemplateInstruction::BuildSlice { .. }
+                | TemplateInstruction::ListAppend { .. }
+                | TemplateInstruction::SetAdd { .. }
+                | TemplateInstruction::DictSet { .. }
+                | TemplateInstruction::UnpackSequence { .. }
+                | TemplateInstruction::UnpackEx { .. }
                 | TemplateInstruction::CallMethod { .. }
                 | TemplateInstruction::BranchIfTrue { .. }
                 | TemplateInstruction::BranchIfFalse { .. }

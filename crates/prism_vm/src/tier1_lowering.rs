@@ -834,6 +834,153 @@ pub(crate) fn lower_code_to_templates(
                     helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
                 }
             }
+            Opcode::GetIter => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::GetIter {
+                    bc_offset,
+                    dst,
+                    src: inst.src1().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::ForIter => {
+                let dst = inst.dst().0;
+                let iter = dst.checked_sub(1).ok_or_else(|| {
+                    "ForIter destination register must follow its iterator register".to_string()
+                })?;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::ForIter {
+                    bc_offset,
+                    dst,
+                    iter,
+                    target: calculate_jump_target(bc_offset, inst.imm16() as i16)?,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::BuildList => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::BuildList {
+                    bc_offset,
+                    dst,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::BuildTuple => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::BuildTuple {
+                    bc_offset,
+                    dst,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::BuildSet => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::BuildSet {
+                    bc_offset,
+                    dst,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::BuildDict => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::BuildDict {
+                    bc_offset,
+                    dst,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::BuildString => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::BuildString {
+                    bc_offset,
+                    dst,
+                    start: inst.src1().0,
+                    count: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::BuildSlice => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::BuildSlice {
+                    bc_offset,
+                    dst,
+                    start: inst.src1().0,
+                    stop: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::ListAppend => TemplateInstruction::ListAppend {
+                bc_offset,
+                list: inst.src1().0,
+                value: inst.src2().0,
+                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+            },
+            Opcode::SetAdd => TemplateInstruction::SetAdd {
+                bc_offset,
+                set: inst.src1().0,
+                value: inst.src2().0,
+                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+            },
+            Opcode::DictSet => TemplateInstruction::DictSet {
+                bc_offset,
+                dict: inst.src1().0,
+                key: inst.dst().0,
+                value: inst.src2().0,
+                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+            },
+            Opcode::UnpackSequence => {
+                let dst = inst.dst().0;
+                for offset in 0..inst.src2().0 {
+                    set_reg_type(
+                        &mut reg_types,
+                        dst.saturating_add(offset),
+                        KnownType::Unknown,
+                    );
+                }
+                TemplateInstruction::UnpackSequence {
+                    bc_offset,
+                    dst,
+                    src: inst.src1().0,
+                    count: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::UnpackEx => {
+                let dst = inst.dst().0;
+                let counts = inst.src2().0;
+                let before = counts >> 4;
+                let after = counts & 0x0F;
+                for offset in 0..before.saturating_add(1).saturating_add(after) {
+                    set_reg_type(
+                        &mut reg_types,
+                        dst.saturating_add(offset),
+                        KnownType::Unknown,
+                    );
+                }
+                TemplateInstruction::UnpackEx {
+                    bc_offset,
+                    dst,
+                    src: inst.src1().0,
+                    before,
+                    after,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
 
             Opcode::Call => {
                 let dst = inst.dst().0;
@@ -1063,6 +1210,39 @@ mod tests {
         builder.finish()
     }
 
+    fn get_iter_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("get_iter");
+        builder.emit_get_iter(Register::new(1), Register::new(0));
+        builder.emit_return(Register::new(1));
+        builder.finish()
+    }
+
+    fn for_iter_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("for_iter");
+        builder.emit(Instruction::op_di(Opcode::ForIter, Register::new(1), 1));
+        builder.emit_return(Register::new(1));
+        builder.finish()
+    }
+
+    fn build_list_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("build_list");
+        builder.emit_build_list(Register::new(3), Register::new(0), 3);
+        builder.emit_return(Register::new(3));
+        builder.finish()
+    }
+
+    fn dict_set_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("dict_set");
+        builder.emit(Instruction::op_dss(
+            Opcode::DictSet,
+            Register::new(2),
+            Register::new(0),
+            Register::new(1),
+        ));
+        builder.emit_return(Register::new(0));
+        builder.finish()
+    }
+
     #[test]
     fn normal_load_global_lowers_to_runtime_helper_template() {
         let code = load_global_code(CodeFlags::NONE);
@@ -1187,6 +1367,108 @@ mod tests {
                 assert_ne!(*helper_addr, 0);
             }
             template => panic!("expected Len template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_get_iter_lowers_to_runtime_helper_template() {
+        let code = get_iter_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::GetIter {
+                bc_offset,
+                dst,
+                src,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 1);
+                assert_eq!(*src, 0);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected GetIter template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_for_iter_lowers_to_branching_runtime_helper_template() {
+        let code = for_iter_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::ForIter {
+                bc_offset,
+                dst,
+                iter,
+                target,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 1);
+                assert_eq!(*iter, 0);
+                assert_eq!(*target, 8);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected ForIter template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_build_list_lowers_to_runtime_helper_template() {
+        let code = build_list_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::BuildList {
+                bc_offset,
+                dst,
+                start,
+                count,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 3);
+                assert_eq!(*start, 0);
+                assert_eq!(*count, 3);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected BuildList template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_dict_set_lowers_to_runtime_helper_template() {
+        let code = dict_set_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::DictSet {
+                bc_offset,
+                dict,
+                key,
+                value,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dict, 0);
+                assert_eq!(*key, 2);
+                assert_eq!(*value, 1);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected DictSet template, got {template:?}"),
         }
 
         assert!(!templates[0].requires_interpreter_in_tier1());

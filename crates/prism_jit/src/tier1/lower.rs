@@ -662,6 +662,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     dst: inst.dst().0,
                     src: inst.src1().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::ForIter) => {
@@ -673,7 +674,8 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     dst,
                     iter,
-                    offset: inst.imm16() as i16,
+                    target: self.calculate_jump_target(bc_offset, inst.imm16() as i16),
+                    helper_addr: 0,
                 });
             }
 
@@ -709,6 +711,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     start: inst.src1().0,
                     count: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::BuildTuple) => {
@@ -718,6 +721,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     start: inst.src1().0,
                     count: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::BuildSet) => {
@@ -727,6 +731,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     start: inst.src1().0,
                     count: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::BuildDict) => {
@@ -736,6 +741,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     start: inst.src1().0,
                     count: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::BuildString) => {
@@ -745,6 +751,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     start: inst.src1().0,
                     count: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::BuildSlice) => {
@@ -754,6 +761,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     start: inst.src1().0,
                     stop: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::ListAppend) => {
@@ -762,6 +770,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     list: inst.src1().0,
                     value: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::SetAdd) => {
@@ -770,6 +779,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     set: inst.src1().0,
                     value: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::DictSet) => {
@@ -779,6 +789,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dict: inst.src1().0,
                     key: inst.dst().0,
                     value: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::UnpackSequence) => {
@@ -788,6 +799,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     src: inst.src1().0,
                     count: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::UnpackEx) => {
@@ -800,6 +812,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     src: inst.src1().0,
                     before: counts >> 4,
                     after: counts & 0x0F,
+                    helper_addr: 0,
                 });
             }
 
