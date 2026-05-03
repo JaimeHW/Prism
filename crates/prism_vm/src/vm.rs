@@ -370,6 +370,8 @@ pub struct VirtualMachine {
     native_recursion_depth: usize,
     /// Most recent runtime error reported by a native AOT helper call.
     last_aot_error: Option<RuntimeError>,
+    /// Most recent runtime error reported by a native JIT helper call.
+    last_jit_error: Option<RuntimeError>,
     /// Instances with Python finalizers awaiting an explicit collection pass.
     finalizers: FinalizerRegistry,
     /// Interpreter-local codec registry shared by native Python threads.
@@ -804,6 +806,18 @@ impl VirtualMachine {
 
     pub(crate) fn take_last_aot_error(&mut self) -> Option<RuntimeError> {
         self.last_aot_error.take()
+    }
+
+    pub(crate) fn record_jit_error(&mut self, err: RuntimeError) {
+        self.last_jit_error = Some(err);
+    }
+
+    pub(crate) fn clear_last_jit_error(&mut self) {
+        self.last_jit_error = None;
+    }
+
+    pub(crate) fn take_last_jit_error(&mut self) -> Option<RuntimeError> {
+        self.last_jit_error.take()
     }
 
     #[inline]
@@ -1738,6 +1752,7 @@ impl VirtualMachine {
             eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
+            last_jit_error: None,
             finalizers: FinalizerRegistry::default(),
         }
     }
@@ -1813,6 +1828,7 @@ impl VirtualMachine {
             eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
+            last_jit_error: None,
             finalizers: FinalizerRegistry::default(),
         }
     }
@@ -1896,6 +1912,7 @@ impl VirtualMachine {
             eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
+            last_jit_error: None,
             finalizers: FinalizerRegistry::default(),
         }
     }
@@ -1948,6 +1965,7 @@ impl VirtualMachine {
             eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
+            last_jit_error: None,
             finalizers: FinalizerRegistry::default(),
         }
     }
@@ -1995,6 +2013,7 @@ impl VirtualMachine {
             eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
+            last_jit_error: None,
             finalizers: FinalizerRegistry::default(),
         }
     }

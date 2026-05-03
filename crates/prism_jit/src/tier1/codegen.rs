@@ -13,13 +13,76 @@
 
 use super::deopt::{DeoptInfo, DeoptReason, DeoptStubGenerator, encode_deopt_exit};
 use super::frame::{
-    FrameLayout, JIT_FRAME_STATE_BC_OFFSET_OFFSET, JitCallingConvention,
-    emit_frame_state_initialization, emit_frame_state_writeback,
+    FrameLayout, JIT_FRAME_STATE_BC_OFFSET_OFFSET, JIT_FRAME_STATE_FRAME_BASE_OFFSET,
+    JitCallingConvention, emit_frame_state_initialization, emit_frame_state_writeback,
 };
 use super::template::*;
 use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label, MemOperand};
+use crate::runtime::ExitReason;
 
 use std::collections::HashMap;
+
+#[inline]
+fn helper_arg0() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::Rcx
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rdi
+    }
+}
+
+#[inline]
+fn helper_arg1() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::Rdx
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rsi
+    }
+}
+
+#[inline]
+fn helper_arg2() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::R8
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rdx
+    }
+}
+
+#[inline]
+fn helper_arg3() -> Gpr {
+    #[cfg(target_os = "windows")]
+    {
+        Gpr::R9
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Gpr::Rcx
+    }
+}
+
+fn emit_runtime_call(asm: &mut Assembler, helper_addr: u64) {
+    #[cfg(target_os = "windows")]
+    {
+        asm.sub_ri(Gpr::Rsp, 32);
+    }
+
+    asm.call_abs(helper_addr, Gpr::R11);
+
+    #[cfg(target_os = "windows")]
+    {
+        asm.add_ri(Gpr::Rsp, 32);
+    }
+}
 
 // =============================================================================
 // Compilation Result
@@ -283,6 +346,69 @@ impl TemplateCompiler {
         self.emit_native_epilogue(ctx.asm, ctx.frame);
     }
 
+    /// Emit a Tier 1 runtime call through the VM's callable dispatch helper.
+    ///
+    /// Calls are semantically side-effecting, so the slow return states must not
+    /// deopt and re-execute the bytecode. The helper returns a compact status:
+    /// success continues in native code, deopt means no side effect occurred, and
+    /// exception exits through the JIT exception ABI with the real VM error.
+    fn emit_tier1_call_helper(
+        &self,
+        ctx: &mut TemplateContext,
+        dst: u8,
+        func: u8,
+        argc: u8,
+        helper_addr: u64,
+        deopt_idx: usize,
+    ) {
+        if helper_addr == 0 {
+            ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+            return;
+        }
+
+        let success = ctx.asm.create_label();
+        let exception = ctx.asm.create_label();
+        let resume_bc_offset = (ctx.bc_offset as u32).saturating_add(4);
+
+        emit_frame_state_writeback(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
+
+        ctx.asm.mov_rm(Gpr::R10, &ctx.frame.context_slot());
+        ctx.asm.mov_ri32(Gpr::R11, resume_bc_offset);
+        ctx.asm.mov_mr32(
+            &MemOperand::base_disp(Gpr::R10, JIT_FRAME_STATE_BC_OFFSET_OFFSET),
+            Gpr::R11,
+        );
+
+        ctx.asm.mov_rm(helper_arg0(), &ctx.frame.context_slot());
+        ctx.asm.mov_ri32(helper_arg1(), u32::from(dst));
+        ctx.asm.mov_ri32(helper_arg2(), u32::from(func));
+        ctx.asm.mov_ri32(helper_arg3(), u32::from(argc));
+        emit_runtime_call(ctx.asm, helper_addr);
+
+        ctx.asm.cmp_ri(Gpr::Rax, 0);
+        ctx.asm.je(success);
+        ctx.asm.cmp_ri(Gpr::Rax, 2);
+        ctx.asm.je(exception);
+        ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+
+        ctx.asm.bind_label(exception);
+        ctx.asm.mov_ri64(Gpr::Rax, ExitReason::Exception as i64);
+        self.emit_native_epilogue(ctx.asm, ctx.frame);
+
+        ctx.asm.bind_label(success);
+        let dst_slot = ctx.frame.register_slot(u16::from(dst));
+        ctx.asm.mov_rm(Gpr::R10, &ctx.frame.context_slot());
+        ctx.asm.mov_rm(
+            Gpr::R10,
+            &MemOperand::base_disp(Gpr::R10, JIT_FRAME_STATE_FRAME_BASE_OFFSET),
+        );
+        ctx.asm.mov_rm(
+            Gpr::R11,
+            &MemOperand::base_disp(Gpr::R10, i32::from(dst) * FrameLayout::SLOT_SIZE),
+        );
+        ctx.asm.mov_mr(&dst_slot, Gpr::R11);
+    }
+
     /// Emit code for a single instruction.
     fn emit_instruction(
         &self,
@@ -513,10 +639,15 @@ impl TemplateCompiler {
                 // Unpack with star requires type dispatch - deopt for Tier 1
                 ctx.asm.nop();
             }
-            // Function call operations - deopt to interpreter for Tier 1
-            TemplateInstruction::Call { .. } => {
-                // Call dispatch requires frame setup - deopt for Tier 1
-                ctx.asm.nop();
+            // Function call operations
+            TemplateInstruction::Call {
+                dst,
+                func,
+                argc,
+                helper_addr,
+                ..
+            } => {
+                self.emit_tier1_call_helper(ctx, *dst, *func, *argc, *helper_addr, deopt_idx);
             }
             TemplateInstruction::CallKw { .. } => {
                 // Keyword call requires frame setup - deopt for Tier 1
@@ -1363,12 +1494,13 @@ pub enum TemplateInstruction {
 
     // Function call operations
     /// Call function: dst = func(args...)
-    /// Requires call dispatch - deopt for Tier 1
+    /// Uses a VM helper when `helper_addr` is non-zero.
     Call {
         bc_offset: u32,
         dst: u8,
         func: u8,
         argc: u8,
+        helper_addr: u64,
     },
     /// Call with keyword args
     /// Requires call dispatch - deopt for Tier 1
@@ -2216,7 +2348,7 @@ impl TemplateInstruction {
                 | TemplateInstruction::DictSet { .. }
                 | TemplateInstruction::UnpackSequence { .. }
                 | TemplateInstruction::UnpackEx { .. }
-                | TemplateInstruction::Call { .. }
+                | TemplateInstruction::Call { helper_addr: 0, .. }
                 | TemplateInstruction::CallKw { .. }
                 | TemplateInstruction::CallMethod { .. }
                 | TemplateInstruction::TailCall { .. }
@@ -2294,6 +2426,7 @@ impl TemplateInstruction {
                 | TemplateInstruction::FloatMod { .. }
                 | TemplateInstruction::LoadGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
+                | TemplateInstruction::Call { .. }
                 | TemplateInstruction::GetAttr { .. }
                 | TemplateInstruction::SetAttr { .. }
                 | TemplateInstruction::BranchIfTrue { .. }

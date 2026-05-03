@@ -802,6 +802,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     func: inst.src1().0,
                     argc: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::CallKw) => {

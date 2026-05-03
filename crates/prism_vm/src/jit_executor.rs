@@ -17,6 +17,7 @@ use std::sync::Arc;
 use prism_core::Value;
 use prism_jit::runtime::{CodeCache, CompiledEntry, ExitReason, ReturnAbi};
 
+use crate::VirtualMachine;
 use crate::error::RuntimeError;
 use crate::frame::Frame;
 
@@ -268,6 +269,7 @@ impl JitExecutor {
     ) -> ExecutionResult {
         // Setup JIT frame state from interpreter frame
         self.setup_frame_state(frame, global_scope, vm_context);
+        self.clear_runtime_helper_error();
 
         // Get the entry point
         let entry_fn: JitEntryFn = unsafe { std::mem::transmute(entry.entry_point()) };
@@ -302,7 +304,7 @@ impl JitExecutor {
             }
             ExitReason::Exception => {
                 self.restore_frame_state(frame);
-                ExecutionResult::Exception(RuntimeError::internal("JIT exception occurred"))
+                ExecutionResult::Exception(self.take_runtime_helper_error())
             }
             ExitReason::TailCall => {
                 let target = self.frame_state.const_pool as u64; // Reused for target
@@ -368,6 +370,7 @@ impl JitExecutor {
         // Setup frame state
         self.setup_frame_state(frame, std::ptr::null(), vm_context);
         self.frame_state.bc_offset = osr_bc_offset;
+        self.clear_runtime_helper_error();
 
         // Calculate OSR entry point
         let osr_entry_fn: JitEntryFn = unsafe {
@@ -399,6 +402,10 @@ impl JitExecutor {
                     DeoptReason::from_u8((data & 0xFF) as u8).unwrap_or(DeoptReason::UncommonTrap);
                 let bc_offset = self.decode_deopt_offset(entry, frame, data);
                 ExecutionResult::Deopt { bc_offset, reason }
+            }
+            ExitReason::Exception => {
+                self.restore_frame_state(frame);
+                ExecutionResult::Exception(self.take_runtime_helper_error())
             }
             _ => {
                 self.restore_frame_state(frame);
@@ -454,6 +461,32 @@ impl JitExecutor {
             let raw = *self.frame_state.frame_base;
             Value::from_bits(raw)
         }
+    }
+
+    #[inline]
+    fn clear_runtime_helper_error(&mut self) {
+        if self.frame_state.vm_context.is_null() {
+            return;
+        }
+
+        unsafe {
+            let vm = &mut *(self.frame_state.vm_context as *mut VirtualMachine);
+            vm.clear_last_jit_error();
+        }
+    }
+
+    #[inline]
+    fn take_runtime_helper_error(&mut self) -> RuntimeError {
+        if !self.frame_state.vm_context.is_null() {
+            unsafe {
+                let vm = &mut *(self.frame_state.vm_context as *mut VirtualMachine);
+                if let Some(err) = vm.take_last_jit_error() {
+                    return err;
+                }
+            }
+        }
+
+        RuntimeError::internal("JIT exception occurred")
     }
 
     /// Decode deopt offset and fall back to deopt-site metadata when needed.

@@ -758,6 +758,22 @@ pub(crate) fn lower_code_to_templates(
                 }
             }
 
+            Opcode::Call => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                if class_local_semantics {
+                    interpreter_fallback(bc_offset)
+                } else {
+                    TemplateInstruction::Call {
+                        bc_offset,
+                        dst,
+                        func: inst.src1().0,
+                        argc: inst.src2().0,
+                        helper_addr: crate::jit_runtime_helpers::tier1_call_addr(),
+                    }
+                }
+            }
+
             Opcode::Jump => TemplateInstruction::Jump {
                 bc_offset,
                 target: calculate_jump_target(bc_offset, inst.imm16() as i16)?,
@@ -917,6 +933,14 @@ mod tests {
         builder.finish()
     }
 
+    fn call_code(flags: CodeFlags) -> CodeObject {
+        let mut builder = FunctionBuilder::new("call");
+        builder.add_flags(flags);
+        builder.emit_call(Register::new(0), Register::new(3), 2);
+        builder.emit_return(Register::new(0));
+        builder.finish()
+    }
+
     #[test]
     fn normal_load_global_lowers_to_runtime_helper_template() {
         let code = load_global_code(CodeFlags::NONE);
@@ -943,6 +967,44 @@ mod tests {
     #[test]
     fn class_body_load_global_keeps_interpreter_semantics() {
         let code = load_global_code(CodeFlags::CLASS);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert!(matches!(
+            templates[0],
+            TemplateInstruction::InterpreterFallback { bc_offset: 0 }
+        ));
+        assert!(templates[0].requires_interpreter_in_tier1());
+    }
+
+    #[test]
+    fn normal_call_lowers_to_runtime_helper_template() {
+        let code = call_code(CodeFlags::NONE);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::Call {
+                bc_offset,
+                dst,
+                func,
+                argc,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 0);
+                assert_eq!(*func, 3);
+                assert_eq!(*argc, 2);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected Call template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn class_body_call_keeps_interpreter_semantics() {
+        let code = call_code(CodeFlags::CLASS);
         let templates = lower_code_to_templates(&code).expect("lowering should succeed");
 
         assert!(matches!(
