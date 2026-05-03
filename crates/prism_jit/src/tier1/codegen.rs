@@ -13,10 +13,11 @@
 
 use super::deopt::{DeoptInfo, DeoptReason, DeoptStubGenerator, encode_deopt_exit};
 use super::frame::{
-    FrameLayout, JitCallingConvention, emit_frame_state_initialization, emit_frame_state_writeback,
+    FrameLayout, JIT_FRAME_STATE_BC_OFFSET_OFFSET, JitCallingConvention,
+    emit_frame_state_initialization, emit_frame_state_writeback,
 };
 use super::template::*;
-use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label};
+use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label, MemOperand};
 
 use std::collections::HashMap;
 
@@ -103,9 +104,13 @@ impl TemplateCompiler {
             deopt_labels.push(asm.create_label());
         }
 
-        // Collect all labels for jump targets
+        // Collect labels for every instruction. Jump targets use this map, and
+        // the prologue dispatches through it for OSR entry at hot loop headers.
         let mut labels: HashMap<u32, Label> = HashMap::new();
         for instr in instructions {
+            labels
+                .entry(instr.bc_offset())
+                .or_insert_with(|| asm.create_label());
             if let Some(target) = instr.jump_target() {
                 if !labels.contains_key(&target) {
                     let label = if target == function_end_bc_offset {
@@ -120,6 +125,7 @@ impl TemplateCompiler {
 
         // Emit prologue
         self.emit_prologue(&mut asm, &frame, &cc);
+        self.emit_osr_entry_dispatch(&mut asm, &frame, &labels);
 
         // Emit each instruction using a scoped context
         {
@@ -194,6 +200,47 @@ impl TemplateCompiler {
         }
 
         emit_frame_state_initialization(asm, frame, cc.arg0, Gpr::R10, Gpr::R11);
+    }
+
+    /// Dispatch from the normal function entry to a bytecode label when the
+    /// frame state carries a non-zero bytecode offset. Normal calls keep the
+    /// fast path to offset zero; hot-loop OSR enters through the same native ABI
+    /// with `JitFrameState.bc_offset` set to the loop header.
+    fn emit_osr_entry_dispatch(
+        &self,
+        asm: &mut Assembler,
+        frame: &FrameLayout,
+        labels: &HashMap<u32, Label>,
+    ) {
+        let Some(normal_entry) = labels.get(&0).copied() else {
+            return;
+        };
+
+        asm.mov_rm(Gpr::R10, &frame.context_slot());
+        asm.mov_rm32(
+            Gpr::R11,
+            &MemOperand::base_disp(Gpr::R10, JIT_FRAME_STATE_BC_OFFSET_OFFSET),
+        );
+        asm.cmp_ri(Gpr::R11, 0);
+        asm.je(normal_entry);
+
+        let mut offsets: Vec<u32> = labels
+            .keys()
+            .copied()
+            .filter(|offset| *offset != 0)
+            .collect();
+        offsets.sort_unstable();
+        for offset in offsets {
+            if let Some(label) = labels.get(&offset).copied() {
+                asm.cmp_ri(Gpr::R11, offset as i32);
+                asm.je(label);
+            }
+        }
+
+        let encoded = encode_deopt_exit(0, DeoptReason::UncommonTrap);
+        asm.mov_ri64(Gpr::Rax, encoded as i64);
+        emit_frame_state_writeback(asm, frame, Gpr::R10, Gpr::R11);
+        self.emit_native_epilogue(asm, frame);
     }
 
     /// Emit function epilogue.

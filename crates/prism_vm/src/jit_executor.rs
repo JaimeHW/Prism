@@ -113,6 +113,8 @@ pub struct JitFrameState {
     pub closure_env: *const u64,
     /// Pointer to global scope.
     pub global_scope: *const u64,
+    /// Pointer to the interpreter frame's register-written bitset.
+    pub written_registers: *mut u64,
 }
 
 // SAFETY: JitFrameState contains raw pointers but is only used within
@@ -128,6 +130,7 @@ impl Default for JitFrameState {
             const_pool: std::ptr::null(),
             closure_env: std::ptr::null(),
             global_scope: std::ptr::null(),
+            written_registers: std::ptr::null_mut(),
         }
     }
 }
@@ -151,22 +154,22 @@ fn decode_jit_result(result: u64) -> (ExitReason, u32) {
     (reason, data)
 }
 
-/// Convert JIT bytecode offset metadata into the interpreter's instruction index.
+/// Validate JIT bytecode offset metadata.
 #[inline]
-fn deopt_bytecode_offset_to_ip(bc_offset: u32, instruction_count: u32) -> Option<u32> {
+fn valid_deopt_bytecode_offset(bc_offset: u32, instruction_count: u32) -> Option<u32> {
     if instruction_count == 0 || bc_offset % 4 != 0 {
         return None;
     }
 
     let ip = bc_offset / 4;
-    (ip <= instruction_count).then_some(ip)
+    (ip <= instruction_count).then_some(bc_offset)
 }
 
-/// Normalize an encoded deopt resume point for `Frame.ip`.
+/// Normalize an encoded deopt resume point to a bytecode offset.
 #[inline]
-fn normalize_deopt_resume_ip(encoded: u32, instruction_count: u32) -> Option<u32> {
-    deopt_bytecode_offset_to_ip(encoded, instruction_count)
-        .or_else(|| (instruction_count != 0 && encoded <= instruction_count).then_some(encoded))
+fn normalize_deopt_resume_offset(encoded: u32, instruction_count: u32) -> Option<u32> {
+    valid_deopt_bytecode_offset(encoded, instruction_count)
+        .or_else(|| (instruction_count != 0 && encoded <= instruction_count).then_some(encoded * 4))
 }
 
 // =============================================================================
@@ -372,21 +375,22 @@ impl JitExecutor {
 
     /// Setup JIT frame state from interpreter frame.
     #[inline]
-    fn setup_frame_state(&mut self, frame: &Frame, global_scope: *const u64) {
+    fn setup_frame_state(&mut self, frame: &mut Frame, global_scope: *const u64) {
         self.frame_state.frame_base = frame.registers.as_ptr() as *mut u64;
         self.frame_state.num_registers = frame.code.register_count;
-        self.frame_state.bc_offset = frame.ip;
+        self.frame_state.bc_offset = frame.ip.saturating_mul(4);
         self.frame_state.const_pool = frame.code.constants.as_ptr() as *const u64;
         self.frame_state.closure_env = frame.closure.as_ref().map_or(std::ptr::null(), |closure| {
             Arc::as_ptr(closure) as *const u64
         });
         self.frame_state.global_scope = global_scope;
+        self.frame_state.written_registers = frame.written_registers_mut_ptr();
     }
 
     /// Restore interpreter frame state from JIT frame.
     #[inline]
     fn restore_frame_state(&self, frame: &mut Frame) {
-        frame.ip = self.frame_state.bc_offset;
+        frame.ip = self.frame_state.bc_offset / 4;
         // Registers are modified in-place via frame_base pointer
     }
 
@@ -410,16 +414,16 @@ impl JitExecutor {
         let encoded = (data >> 8) & 0xFFFFFF;
         let instruction_count = frame.code.instructions.len() as u32;
 
-        if let Some(ip) = deopt_bytecode_offset_to_ip(encoded, instruction_count) {
-            return ip;
+        if let Some(bc_offset) = valid_deopt_bytecode_offset(encoded, instruction_count) {
+            return bc_offset;
         }
 
         if let Some(site_bc_offset) = entry.lookup_deopt_bc_offset_by_index(encoded) {
-            return normalize_deopt_resume_ip(site_bc_offset, instruction_count)
+            return normalize_deopt_resume_offset(site_bc_offset, instruction_count)
                 .unwrap_or(site_bc_offset);
         }
 
-        normalize_deopt_resume_ip(encoded, instruction_count).unwrap_or(encoded)
+        normalize_deopt_resume_offset(encoded, instruction_count).unwrap_or(encoded)
     }
 
     /// Get code cache reference.

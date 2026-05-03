@@ -11,7 +11,7 @@
 use crate::allocation_context::alloc_value_in_current_heap_or_box;
 use crate::object::shaped_object::ShapedObject;
 use crate::object::type_obj::TypeId;
-use crate::object::{HASH_NOT_COMPUTED, ObjectHeader, PyObject};
+use crate::object::{ObjectHeader, PyObject};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use std::borrow::Cow;
@@ -414,12 +414,10 @@ impl StringObject {
     /// Get the cached hash, computing if needed.
     #[inline]
     pub fn hash(&self) -> u64 {
-        if self.header.hash != HASH_NOT_COMPUTED {
-            return self.header.hash;
+        if let Some(hash) = self.header.cached_hash() {
+            return hash;
         }
-        // Compute and cache (note: header.hash is not mut, we'd need interior mutability)
-        // For now, compute each time if not cached
-        self.compute_hash()
+        self.header.cache_hash(self.compute_hash())
     }
 
     /// Compute string hash using FxHash algorithm.

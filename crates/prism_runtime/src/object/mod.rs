@@ -19,7 +19,7 @@ pub mod type_obj;
 pub mod views;
 
 use crate::object::type_obj::TypeId;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // =============================================================================
 // GC Flags
@@ -121,7 +121,7 @@ pub struct ObjectHeader {
     /// GC flags (color, pinned, finalized).
     pub gc_flags: AtomicU32,
     /// Cached hash value (HASH_NOT_COMPUTED = not yet computed).
-    pub hash: u64,
+    pub hash: AtomicU64,
 }
 
 impl ObjectHeader {
@@ -131,7 +131,7 @@ impl ObjectHeader {
         Self {
             type_id,
             gc_flags: AtomicU32::new(0),
-            hash: HASH_NOT_COMPUTED,
+            hash: AtomicU64::new(HASH_NOT_COMPUTED),
         }
     }
 
@@ -164,17 +164,30 @@ impl ObjectHeader {
     /// Check if hash is computed.
     #[inline]
     pub fn has_hash(&self) -> bool {
-        self.hash != HASH_NOT_COMPUTED
+        self.hash.load(Ordering::Relaxed) != HASH_NOT_COMPUTED
     }
 
     /// Get cached hash (or None if not computed).
     #[inline]
     pub fn cached_hash(&self) -> Option<u64> {
-        if self.has_hash() {
-            Some(self.hash)
+        let hash = self.hash.load(Ordering::Relaxed);
+        if hash != HASH_NOT_COMPUTED {
+            Some(hash)
         } else {
             None
         }
+    }
+
+    /// Store a computed hash value and return the canonical cached value.
+    #[inline]
+    pub fn cache_hash(&self, hash: u64) -> u64 {
+        let hash = if hash == HASH_NOT_COMPUTED {
+            HASH_NOT_COMPUTED - 1
+        } else {
+            hash
+        };
+        self.hash.store(hash, Ordering::Relaxed);
+        hash
     }
 }
 
@@ -183,7 +196,7 @@ impl std::fmt::Debug for ObjectHeader {
         f.debug_struct("ObjectHeader")
             .field("type_id", &self.type_id)
             .field("gc_flags", &self.gc_flags())
-            .field("hash", &self.hash)
+            .field("hash", &self.cached_hash())
             .finish()
     }
 }

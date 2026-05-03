@@ -7,7 +7,8 @@
 //! - Register-to-register moves
 
 use super::{OpcodeTemplate, TemplateContext};
-use crate::backend::x64::{Gpr, MemOperand};
+use crate::backend::x64::MemOperand;
+use crate::tier1::frame::JIT_FRAME_STATE_WRITTEN_REGISTERS_OFFSET;
 
 // =============================================================================
 // Move Between Registers
@@ -79,6 +80,8 @@ impl OpcodeTemplate for StoreLocalTemplate {
 
         ctx.asm.mov_rm(ctx.regs.accumulator, &src_slot);
         ctx.asm.mov_mr(&local_slot, ctx.regs.accumulator);
+
+        update_local_written_bit(ctx, self.local_idx, true);
     }
 
     #[inline]
@@ -103,12 +106,38 @@ impl OpcodeTemplate for DeleteLocalTemplate {
         ctx.asm.xor_rr(ctx.regs.accumulator, ctx.regs.accumulator);
         let local_slot = ctx.frame.local_slot(self.local_idx);
         ctx.asm.mov_mr(&local_slot, ctx.regs.accumulator);
+
+        update_local_written_bit(ctx, self.local_idx, false);
     }
 
     #[inline]
     fn estimated_size(&self) -> usize {
         12
     }
+}
+
+#[inline]
+fn update_local_written_bit(ctx: &mut TemplateContext, local_idx: u16, written: bool) {
+    let word_offset = i32::from(local_idx / 64) * 8;
+    let bit = u32::from(local_idx % 64);
+    let mask = 1u64 << bit;
+
+    ctx.asm.mov_rm(ctx.regs.scratch1, &ctx.frame.context_slot());
+    ctx.asm.mov_rm(
+        ctx.regs.scratch1,
+        &MemOperand::base_disp(ctx.regs.scratch1, JIT_FRAME_STATE_WRITTEN_REGISTERS_OFFSET),
+    );
+
+    let word_slot = MemOperand::base_disp(ctx.regs.scratch1, word_offset);
+    ctx.asm.mov_rm(ctx.regs.scratch2, &word_slot);
+    ctx.asm.mov_ri64(ctx.regs.accumulator, mask as i64);
+    if written {
+        ctx.asm.or_rr(ctx.regs.scratch2, ctx.regs.accumulator);
+    } else {
+        ctx.asm.not(ctx.regs.accumulator);
+        ctx.asm.and_rr(ctx.regs.scratch2, ctx.regs.accumulator);
+    }
+    ctx.asm.mov_mr(&word_slot, ctx.regs.scratch2);
 }
 
 // =============================================================================

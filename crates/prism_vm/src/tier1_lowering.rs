@@ -3,7 +3,7 @@
 //! This module centralizes bytecode -> template lowering so sync and async
 //! compilation paths use identical semantics.
 
-use prism_code::{CodeObject, Constant, Opcode};
+use prism_code::{CodeFlags, CodeObject, Constant, Opcode};
 use prism_jit::tier1::codegen::TemplateInstruction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,7 @@ enum KnownType {
 enum NumericKind {
     Int,
     Float,
+    Fallback,
 }
 
 #[inline]
@@ -36,37 +37,93 @@ fn set_reg_type(reg_types: &mut [KnownType], reg: u8, ty: KnownType) {
     }
 }
 
+fn initial_local_written(code: &CodeObject) -> Vec<bool> {
+    let local_count = code
+        .locals
+        .len()
+        .max(code.arg_count as usize + code.kwonlyarg_count as usize)
+        .min(256);
+    let mut written = vec![false; local_count];
+    let initialized_params =
+        (code.arg_count as usize + code.kwonlyarg_count as usize).min(local_count);
+    for slot in &mut written[..initialized_params] {
+        *slot = true;
+    }
+    written
+}
+
+#[inline]
+fn ensure_local_capacity<T: Copy>(locals: &mut Vec<T>, slot: u16, default: T) {
+    let needed = slot as usize + 1;
+    if locals.len() < needed {
+        locals.resize(needed, default);
+    }
+}
+
+#[inline]
+fn local_is_definitely_written(local_written: &[bool], slot: u16) -> bool {
+    local_written.get(slot as usize).copied().unwrap_or(false)
+}
+
+#[inline]
+fn set_local_written(local_written: &mut Vec<bool>, slot: u16, written: bool) {
+    ensure_local_capacity(local_written, slot, false);
+    local_written[slot as usize] = written;
+}
+
+#[inline]
+fn get_local_type(local_types: &[KnownType], slot: u16) -> KnownType {
+    local_types
+        .get(slot as usize)
+        .copied()
+        .unwrap_or(KnownType::Unknown)
+}
+
+#[inline]
+fn set_local_type(local_types: &mut Vec<KnownType>, slot: u16, ty: KnownType) {
+    ensure_local_capacity(local_types, slot, KnownType::Unknown);
+    local_types[slot as usize] = ty;
+}
+
+#[inline]
+fn interpreter_fallback(bc_offset: u32) -> TemplateInstruction {
+    TemplateInstruction::InterpreterFallback { bc_offset }
+}
+
 fn infer_numeric_kind(
     op: Opcode,
     bc_offset: u32,
     lhs: u8,
     rhs: u8,
     reg_types: &[KnownType],
-) -> Result<NumericKind, String> {
+) -> NumericKind {
     let lhs_ty = get_reg_type(reg_types, lhs);
     let rhs_ty = get_reg_type(reg_types, rhs);
     match (lhs_ty, rhs_ty) {
-        (KnownType::Int, KnownType::Int) => Ok(NumericKind::Int),
-        (KnownType::Float, KnownType::Float) => Ok(NumericKind::Float),
-        _ => Err(format!(
-            "tier1 lowering requires monomorphic numeric operands for {:?} at bytecode offset {} (lhs r{}={:?}, rhs r{}={:?})",
-            op, bc_offset, lhs, lhs_ty, rhs, rhs_ty
-        )),
+        (KnownType::Int, KnownType::Int) => NumericKind::Int,
+        (KnownType::Float, KnownType::Float) => NumericKind::Float,
+        _ => {
+            let _ = (op, bc_offset, lhs, lhs_ty, rhs, rhs_ty);
+            NumericKind::Fallback
+        }
     }
 }
 
 /// Lower a code object to template IR for Tier 1 compilation.
 ///
-/// This performs strict validation to prevent silent miscompilation and only
-/// accepts a known-safe Tier 1 subset:
-/// - every supported bytecode lowers to one concrete template
-/// - unsupported bytecodes return an error (caller falls back to interpreter)
+/// This performs conservative lowering:
+/// - safe bytecodes lower to concrete native templates
+/// - unsupported or semantically complex bytecodes lower to an explicit
+///   interpreter fallback at the same bytecode offset
 /// - every jump target must resolve to a valid bytecode offset
 pub(crate) fn lower_code_to_templates(
     code: &CodeObject,
 ) -> Result<Vec<TemplateInstruction>, String> {
     let mut templates = Vec::with_capacity(code.instructions.len());
     let mut reg_types = vec![KnownType::Unknown; code.register_count as usize];
+    let mut local_written = initial_local_written(code);
+    let mut local_types = vec![KnownType::Unknown; local_written.len()];
+    let class_local_semantics = code.flags.contains(CodeFlags::CLASS);
 
     for (index, inst) in code.instructions.iter().enumerate() {
         let bc_offset = (index as u32) * 4;
@@ -83,9 +140,7 @@ pub(crate) fn lower_code_to_templates(
                 set_reg_type(&mut reg_types, dst, ty);
                 template
             }
-            Opcode::LoadBuiltin => {
-                return Err("Tier1 lowering does not yet support LoadBuiltin".to_string());
-            }
+            Opcode::LoadBuiltin => interpreter_fallback(bc_offset),
             Opcode::LoadNone => {
                 let dst = inst.dst().0;
                 set_reg_type(&mut reg_types, dst, KnownType::None);
@@ -120,6 +175,47 @@ pub(crate) fn lower_code_to_templates(
                     src,
                 }
             }
+            Opcode::LoadLocal => {
+                let dst = inst.dst().0;
+                let slot = inst.imm16();
+                if class_local_semantics || !local_is_definitely_written(&local_written, slot) {
+                    set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                    interpreter_fallback(bc_offset)
+                } else {
+                    let ty = get_local_type(&local_types, slot);
+                    set_reg_type(&mut reg_types, dst, ty);
+                    TemplateInstruction::LoadLocal {
+                        bc_offset,
+                        dst,
+                        slot,
+                    }
+                }
+            }
+            Opcode::StoreLocal => {
+                let src = inst.dst().0;
+                let slot = inst.imm16();
+                if class_local_semantics {
+                    interpreter_fallback(bc_offset)
+                } else {
+                    set_local_written(&mut local_written, slot, true);
+                    set_local_type(&mut local_types, slot, get_reg_type(&reg_types, src));
+                    TemplateInstruction::StoreLocal {
+                        bc_offset,
+                        src,
+                        slot,
+                    }
+                }
+            }
+            Opcode::DeleteLocal => {
+                let slot = inst.imm16();
+                if class_local_semantics {
+                    interpreter_fallback(bc_offset)
+                } else {
+                    set_local_written(&mut local_written, slot, false);
+                    set_local_type(&mut local_types, slot, KnownType::Unknown);
+                    TemplateInstruction::DeleteLocal { bc_offset, slot }
+                }
+            }
 
             Opcode::AddInt => {
                 let dst = inst.dst().0;
@@ -135,7 +231,7 @@ pub(crate) fn lower_code_to_templates(
                 let dst = inst.dst().0;
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => {
                         set_reg_type(&mut reg_types, dst, KnownType::Int);
                         TemplateInstruction::IntAdd {
@@ -154,6 +250,10 @@ pub(crate) fn lower_code_to_templates(
                             rhs,
                         }
                     }
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::SubInt => {
@@ -170,7 +270,7 @@ pub(crate) fn lower_code_to_templates(
                 let dst = inst.dst().0;
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => {
                         set_reg_type(&mut reg_types, dst, KnownType::Int);
                         TemplateInstruction::IntSub {
@@ -189,6 +289,10 @@ pub(crate) fn lower_code_to_templates(
                             rhs,
                         }
                     }
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::MulInt => {
@@ -205,7 +309,7 @@ pub(crate) fn lower_code_to_templates(
                 let dst = inst.dst().0;
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => {
                         set_reg_type(&mut reg_types, dst, KnownType::Int);
                         TemplateInstruction::IntMul {
@@ -223,6 +327,10 @@ pub(crate) fn lower_code_to_templates(
                             lhs,
                             rhs,
                         }
+                    }
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
                     }
                 }
             }
@@ -250,7 +358,7 @@ pub(crate) fn lower_code_to_templates(
                 let dst = inst.dst().0;
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => {
                         set_reg_type(&mut reg_types, dst, KnownType::Int);
                         TemplateInstruction::IntDiv {
@@ -268,6 +376,10 @@ pub(crate) fn lower_code_to_templates(
                             lhs,
                             rhs,
                         }
+                    }
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
                     }
                 }
             }
@@ -295,7 +407,7 @@ pub(crate) fn lower_code_to_templates(
                 let dst = inst.dst().0;
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => {
                         set_reg_type(&mut reg_types, dst, KnownType::Int);
                         TemplateInstruction::IntMod {
@@ -313,6 +425,10 @@ pub(crate) fn lower_code_to_templates(
                             lhs,
                             rhs,
                         }
+                    }
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
                     }
                 }
             }
@@ -369,7 +485,7 @@ pub(crate) fn lower_code_to_templates(
                 let dst = inst.dst().0;
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Float => {
                         set_reg_type(&mut reg_types, dst, KnownType::Float);
                         TemplateInstruction::FloatDiv {
@@ -379,11 +495,9 @@ pub(crate) fn lower_code_to_templates(
                             rhs,
                         }
                     }
-                    NumericKind::Int => {
-                        return Err(format!(
-                            "tier1 lowering does not support int TrueDiv at bytecode offset {}",
-                            bc_offset
-                        ));
+                    NumericKind::Int | NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
                     }
                 }
             }
@@ -402,7 +516,7 @@ pub(crate) fn lower_code_to_templates(
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Bool);
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => TemplateInstruction::IntLt {
                         bc_offset,
                         dst,
@@ -415,6 +529,10 @@ pub(crate) fn lower_code_to_templates(
                         lhs,
                         rhs,
                     },
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::Le => {
@@ -422,7 +540,7 @@ pub(crate) fn lower_code_to_templates(
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Bool);
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => TemplateInstruction::IntLe {
                         bc_offset,
                         dst,
@@ -435,6 +553,10 @@ pub(crate) fn lower_code_to_templates(
                         lhs,
                         rhs,
                     },
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::Eq => {
@@ -442,7 +564,7 @@ pub(crate) fn lower_code_to_templates(
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Bool);
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => TemplateInstruction::IntEq {
                         bc_offset,
                         dst,
@@ -455,6 +577,10 @@ pub(crate) fn lower_code_to_templates(
                         lhs,
                         rhs,
                     },
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::Ne => {
@@ -462,7 +588,7 @@ pub(crate) fn lower_code_to_templates(
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Bool);
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => TemplateInstruction::IntNe {
                         bc_offset,
                         dst,
@@ -475,6 +601,10 @@ pub(crate) fn lower_code_to_templates(
                         lhs,
                         rhs,
                     },
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::Gt => {
@@ -482,7 +612,7 @@ pub(crate) fn lower_code_to_templates(
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Bool);
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => TemplateInstruction::IntGt {
                         bc_offset,
                         dst,
@@ -495,6 +625,10 @@ pub(crate) fn lower_code_to_templates(
                         lhs,
                         rhs,
                     },
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::Ge => {
@@ -502,7 +636,7 @@ pub(crate) fn lower_code_to_templates(
                 let lhs = inst.src1().0;
                 let rhs = inst.src2().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Bool);
-                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types)? {
+                match infer_numeric_kind(op, bc_offset, lhs, rhs, &reg_types) {
                     NumericKind::Int => TemplateInstruction::IntGe {
                         bc_offset,
                         dst,
@@ -515,6 +649,10 @@ pub(crate) fn lower_code_to_templates(
                         lhs,
                         rhs,
                     },
+                    NumericKind::Fallback => {
+                        set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                        interpreter_fallback(bc_offset)
+                    }
                 }
             }
             Opcode::Is => {
@@ -636,12 +774,7 @@ pub(crate) fn lower_code_to_templates(
             },
             Opcode::ReturnNone => TemplateInstruction::ReturnNone { bc_offset },
 
-            _ => {
-                return Err(format!(
-                    "tier1 lowering unsupported opcode {:?} at bytecode offset {}",
-                    op, bc_offset
-                ));
-            }
+            _ => interpreter_fallback(bc_offset),
         };
 
         templates.push(template);
@@ -706,14 +839,9 @@ fn load_const_template(
                 KnownType::Float,
             ))
         }
-        Constant::Value(_) => Err(format!(
-            "tier1 lowering unsupported constant type at index {} for bytecode offset {}",
-            const_idx, bc_offset
-        )),
-        Constant::BigInt(_) => Err(format!(
-            "tier1 lowering unsupported bigint constant at index {} for bytecode offset {}",
-            const_idx, bc_offset
-        )),
+        Constant::Value(_) | Constant::BigInt(_) => {
+            Ok((interpreter_fallback(bc_offset), KnownType::Unknown))
+        }
     }
 }
 

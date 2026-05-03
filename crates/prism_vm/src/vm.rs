@@ -1901,8 +1901,14 @@ impl VirtualMachine {
                     // Note: offset is computed by compiler relative to instruction after jump,
                     // and fetch() already advanced ip, so just add offset directly
                     let frame = &mut self.frames[self.current_frame_idx];
+                    let old_ip = frame.ip;
                     let new_ip = (frame.ip as i32) + (offset as i32);
                     frame.ip = new_ip.max(0) as u32;
+                    if frame.ip < old_ip {
+                        if let Some(value) = self.try_enter_osr_at_current_ip()? {
+                            return Ok(value);
+                        }
+                    }
                 }
 
                 ControlFlow::Call { code, return_reg } => {
@@ -2029,6 +2035,71 @@ impl VirtualMachine {
                     }
                     self.propagate_runtime_error_to_depth(1, err)?;
                 }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn try_enter_osr_at_current_ip(&mut self) -> VmResult<Option<Value>> {
+        if self.execution_budget.step_limit().is_some() || self.frames.is_empty() {
+            return Ok(None);
+        }
+
+        let frame_idx = self.current_frame_idx;
+        let (code, header_bc_offset) = {
+            let frame = &self.frames[frame_idx];
+            if frame.closure.is_some() || frame.code.flags.contains(CodeFlags::SEPARATE_LOCALS) {
+                return Ok(None);
+            }
+            (Arc::clone(&frame.code), frame.ip.saturating_mul(4))
+        };
+
+        let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
+        let hot = self.profiler.record_loop(code_id, header_bc_offset);
+        let code_ptr_id = Arc::as_ptr(&code) as u64;
+        let global_scope = &self.globals as *const GlobalScope as *const u64;
+
+        let execution_result = {
+            let Some(jit) = self.jit.as_mut() else {
+                return Ok(None);
+            };
+
+            if hot {
+                jit.handle_tier_up(&code, TierUpDecision::Tier1);
+            }
+
+            if jit.lookup(code_ptr_id).is_none() {
+                if hot {
+                    jit.record_miss();
+                }
+                return Ok(None);
+            }
+
+            jit.try_osr_with_global_scope(
+                code_ptr_id,
+                header_bc_offset,
+                &mut self.frames[frame_idx],
+                global_scope,
+            )
+        };
+
+        match execution_result {
+            Some(ExecutionResult::Return(value)) => self.pop_frame(value),
+            Some(ExecutionResult::Deopt { bc_offset, reason }) => {
+                if let Some(jit) = self.jit.as_mut() {
+                    jit.handle_deopt(code_ptr_id, reason);
+                }
+                if let Some(frame) = self.frames.get_mut(frame_idx) {
+                    frame.ip = bc_offset / 4;
+                }
+                Ok(None)
+            }
+            Some(ExecutionResult::Exception(err)) => Err(err),
+            Some(ExecutionResult::TailCall { .. }) | None => {
+                if let Some(jit) = self.jit.as_mut() {
+                    jit.record_miss();
+                }
+                Ok(None)
             }
         }
     }
@@ -2597,7 +2668,7 @@ impl VirtualMachine {
                                 }
                                 Some(ExecutionResult::Deopt { bc_offset, reason }) => {
                                     jit.handle_deopt(code_ptr_id, reason);
-                                    jit_frame.ip = bc_offset;
+                                    jit_frame.ip = bc_offset / 4;
                                     JitDispatchOutcome::Deopt(jit_frame)
                                 }
                                 Some(ExecutionResult::Exception(err)) => {
@@ -2741,7 +2812,7 @@ impl VirtualMachine {
                 if let Some(jit) = self.jit.as_mut() {
                     jit.handle_deopt(code_ptr_id, reason);
                 }
-                self.frames[frame_idx].ip = bc_offset;
+                self.frames[frame_idx].ip = bc_offset / 4;
                 Ok(false)
             }
             Some(ExecutionResult::Exception(err)) => Err(err),

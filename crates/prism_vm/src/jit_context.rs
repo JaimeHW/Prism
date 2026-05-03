@@ -305,21 +305,32 @@ impl JitContext {
         bc_offset: u32,
         frame: &mut Frame,
     ) -> Option<ExecutionResult> {
+        self.try_osr_with_global_scope(code_id, bc_offset, frame, std::ptr::null())
+    }
+
+    /// Try to enter compiled code via OSR with an explicit global scope.
+    #[inline]
+    pub fn try_osr_with_global_scope(
+        &mut self,
+        code_id: u64,
+        bc_offset: u32,
+        frame: &mut Frame,
+        global_scope: *const u64,
+    ) -> Option<ExecutionResult> {
         if !self.config.enable_osr {
             return None;
         }
 
-        // Look up compiled code with OSR entries
+        // Tier 1 entry dispatch reads JitFrameState.bc_offset and jumps to the
+        // matching bytecode label, so a normal compiled entry can serve as an
+        // OSR target once the function has been compiled.
         let entry = self.lookup(code_id)?;
-        let osr_entries = entry.osr_entries()?;
-
-        // Check if OSR entry exists at this offset
-        if osr_entries.lookup_entry(bc_offset).is_some() {
-            self.stats.osr_entries += 1;
-            Some(self.bridge.execute_osr(&entry, frame, bc_offset))
-        } else {
-            None
-        }
+        frame.ip = bc_offset / 4;
+        self.stats.osr_entries += 1;
+        Some(
+            self.bridge
+                .execute_with_global_scope(&entry, frame, global_scope),
+        )
     }
 
     // =========================================================================

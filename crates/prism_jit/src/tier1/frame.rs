@@ -29,12 +29,16 @@ use crate::backend::x64::{Assembler, CallingConvention, Gpr, GprSet, MemOperand,
 
 /// Offset of `JitFrameState.frame_base`.
 pub(crate) const JIT_FRAME_STATE_FRAME_BASE_OFFSET: i32 = 0;
+/// Offset of `JitFrameState.bc_offset`.
+pub(crate) const JIT_FRAME_STATE_BC_OFFSET_OFFSET: i32 = 12;
 /// Offset of `JitFrameState.const_pool`.
 pub(crate) const JIT_FRAME_STATE_CONST_POOL_OFFSET: i32 = 16;
 /// Offset of `JitFrameState.closure_env`.
 pub(crate) const JIT_FRAME_STATE_CLOSURE_ENV_OFFSET: i32 = 24;
 /// Offset of `JitFrameState.global_scope`.
 pub(crate) const JIT_FRAME_STATE_GLOBAL_SCOPE_OFFSET: i32 = 32;
+/// Offset of `JitFrameState.written_registers`.
+pub(crate) const JIT_FRAME_STATE_WRITTEN_REGISTERS_OFFSET: i32 = 40;
 
 /// Offsets within the JIT stack frame.
 #[derive(Debug, Clone, Copy)]
