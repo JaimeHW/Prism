@@ -218,7 +218,11 @@ impl Compiler {
             self.builder.bind_label(handler_abort_label);
             let handler_abort_pc = self.builder.current_pc();
             self.builder.emit(Instruction::op(Opcode::AbortExcept));
-            self.builder.emit(Instruction::op(Opcode::Reraise));
+            if let Some(fin_label) = finally_label {
+                self.builder.emit_jump(fin_label);
+            } else {
+                self.builder.emit(Instruction::op(Opcode::Reraise));
+            }
 
             // Add exception entry for this handler
             self.builder.add_exception_entry(ExceptionEntry {
