@@ -574,6 +574,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     obj: inst.src1().0,
                     name_idx: inst.src2().0,
                     ic_site_idx,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::SetAttr) => {
@@ -593,6 +594,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     name_idx: inst.src1().0,
                     value: inst.src2().0,
                     ic_site_idx,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::DelAttr) => {
@@ -610,7 +612,12 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     obj: inst.src1().0,
                     name_idx: inst.src2().0,
+                    helper_addr: 0,
                 });
+            }
+            Some(Opcode::AttrName) => {
+                // Metadata consumed by the preceding attribute opcode.
+                self.output.push(TemplateInstruction::Nop { bc_offset });
             }
 
             // =================================================================
@@ -623,6 +630,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     container: inst.src1().0,
                     key: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::SetItem) => {
@@ -632,6 +640,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     container: inst.src1().0,
                     key: inst.dst().0,
                     value: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::DelItem) => {
@@ -640,6 +649,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     container: inst.src1().0,
                     key: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
 
@@ -676,6 +686,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     dst: inst.dst().0,
                     src: inst.src1().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::IsCallable) => {
@@ -684,6 +695,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     bc_offset,
                     dst: inst.dst().0,
                     src: inst.src1().0,
+                    helper_addr: 0,
                 });
             }
 
@@ -821,6 +833,7 @@ impl<'a, S: SpeculationProvider> BytecodeLowerer<'a, S> {
                     dst: inst.dst().0,
                     method: inst.src1().0,
                     argc: inst.src2().0,
+                    helper_addr: 0,
                 });
             }
             Some(Opcode::TailCall) => {

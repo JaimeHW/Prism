@@ -14,11 +14,13 @@
 use super::deopt::{DeoptInfo, DeoptReason, DeoptStubGenerator, encode_deopt_exit};
 use super::frame::{
     FrameLayout, JIT_FRAME_STATE_BC_OFFSET_OFFSET, JIT_FRAME_STATE_FRAME_BASE_OFFSET,
-    JitCallingConvention, emit_frame_state_initialization, emit_frame_state_writeback,
+    JitCallingConvention, emit_frame_state_initialization, emit_frame_state_reload,
+    emit_frame_state_writeback,
 };
 use super::template::*;
 use crate::backend::x64::{Assembler, ExecutableBuffer, Gpr, Label, MemOperand};
 use crate::runtime::ExitReason;
+use prism_code::Opcode;
 
 use std::collections::HashMap;
 
@@ -409,6 +411,44 @@ impl TemplateCompiler {
         ctx.asm.mov_mr(&dst_slot, Gpr::R11);
     }
 
+    /// Execute the current bytecode through an exact VM helper and continue in
+    /// Tier 1 when the opcode reports normal fallthrough.
+    fn emit_tier1_bytecode_helper(
+        &self,
+        ctx: &mut TemplateContext,
+        expected_opcode: u8,
+        helper_addr: u64,
+        deopt_idx: usize,
+    ) {
+        if helper_addr == 0 {
+            ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+            return;
+        }
+
+        let success = ctx.asm.create_label();
+        let exception = ctx.asm.create_label();
+
+        emit_frame_state_writeback(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
+
+        ctx.asm.mov_rm(helper_arg0(), &ctx.frame.context_slot());
+        ctx.asm.mov_ri32(helper_arg1(), u32::from(expected_opcode));
+        ctx.asm.mov_ri32(helper_arg2(), ctx.bc_offset as u32);
+        emit_runtime_call(ctx.asm, helper_addr);
+
+        ctx.asm.cmp_ri(Gpr::Rax, 0);
+        ctx.asm.je(success);
+        ctx.asm.cmp_ri(Gpr::Rax, 2);
+        ctx.asm.je(exception);
+        ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+
+        ctx.asm.bind_label(exception);
+        ctx.asm.mov_ri64(Gpr::Rax, ExitReason::Exception as i64);
+        self.emit_native_epilogue(ctx.asm, ctx.frame);
+
+        ctx.asm.bind_label(success);
+        emit_frame_state_reload(ctx.asm, ctx.frame, Gpr::R10, Gpr::R11);
+    }
+
     /// Emit code for a single instruction.
     fn emit_instruction(
         &self,
@@ -521,8 +561,19 @@ impl TemplateCompiler {
                 obj,
                 name_idx,
                 ic_site_idx,
+                helper_addr,
                 ..
             } => {
+                if *helper_addr != 0 {
+                    self.emit_tier1_bytecode_helper(
+                        ctx,
+                        Opcode::GetAttr as u8,
+                        *helper_addr,
+                        deopt_idx,
+                    );
+                    return;
+                }
+
                 // Calculate IC offset from site index
                 // Each IC site is 8 bytes (shape_id: 4, slot_offset: 2, flags: 2)
                 let ic_offset = ic_site_idx.map(|idx| (idx as i32) * 8);
@@ -541,8 +592,19 @@ impl TemplateCompiler {
                 name_idx,
                 value,
                 ic_site_idx,
+                helper_addr,
                 ..
             } => {
+                if *helper_addr != 0 {
+                    self.emit_tier1_bytecode_helper(
+                        ctx,
+                        Opcode::SetAttr as u8,
+                        *helper_addr,
+                        deopt_idx,
+                    );
+                    return;
+                }
+
                 // Calculate IC offset from site index
                 let ic_offset = ic_site_idx.map(|idx| (idx as i32) * 8);
 
@@ -559,22 +621,38 @@ impl TemplateCompiler {
                 // Attribute delete requires type dispatch - deopt for Tier 1
                 ctx.asm.nop();
             }
-            TemplateInstruction::LoadMethod { .. } => {
-                // Method loading requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::LoadMethod { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::LoadMethod as u8,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
             // Container item operations - deopt to interpreter for Tier 1
-            TemplateInstruction::GetItem { .. } => {
-                // Container indexing requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::GetItem { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::GetItem as u8,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
-            TemplateInstruction::SetItem { .. } => {
-                // Container item write requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::SetItem { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::SetItem as u8,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
-            TemplateInstruction::DelItem { .. } => {
-                // Container item delete requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::DelItem { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::DelItem as u8,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
             // Iteration operations - deopt to interpreter for Tier 1
             TemplateInstruction::GetIter { .. } => {
@@ -586,13 +664,16 @@ impl TemplateCompiler {
                 ctx.asm.nop();
             }
             // Utility operations - deopt to interpreter for Tier 1
-            TemplateInstruction::Len { .. } => {
-                // Length requires type dispatch - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::Len { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(ctx, Opcode::Len as u8, *helper_addr, deopt_idx);
             }
-            TemplateInstruction::IsCallable { .. } => {
-                // Callable check requires type checking - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::IsCallable { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::IsCallable as u8,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
             // Container building operations - deopt to interpreter for Tier 1
             TemplateInstruction::BuildList { .. } => {
@@ -653,9 +734,13 @@ impl TemplateCompiler {
                 // Keyword call requires frame setup - deopt for Tier 1
                 ctx.asm.nop();
             }
-            TemplateInstruction::CallMethod { .. } => {
-                // Method call requires frame setup - deopt for Tier 1
-                ctx.asm.nop();
+            TemplateInstruction::CallMethod { helper_addr, .. } => {
+                self.emit_tier1_bytecode_helper(
+                    ctx,
+                    Opcode::CallMethod as u8,
+                    *helper_addr,
+                    deopt_idx,
+                );
             }
             TemplateInstruction::TailCall { .. } => {
                 // Tail call requires frame reuse - deopt for Tier 1
@@ -1318,6 +1403,8 @@ pub enum TemplateInstruction {
         name_idx: u8, // 8-bit name index from src2 field
         /// IC site index for inline caching (None = no IC, deopt directly)
         ic_site_idx: Option<u32>,
+        /// Exact VM helper for cache miss / VM-side Tier 1 lowering.
+        helper_addr: u64,
     },
     /// Set attribute: obj.attr[name_idx] = value
     /// Uses inline caching when ic_site_idx is Some for O(1) property access.
@@ -1328,6 +1415,8 @@ pub enum TemplateInstruction {
         value: u8,
         /// IC site index for inline caching (None = no IC, deopt directly)
         ic_site_idx: Option<u32>,
+        /// Exact VM helper for cache miss / VM-side Tier 1 lowering.
+        helper_addr: u64,
     },
     /// Delete attribute: del obj.attr[name_idx]
     /// Requires type dispatch - deopt for Tier 1
@@ -1343,6 +1432,7 @@ pub enum TemplateInstruction {
         dst: u8,
         obj: u8,
         name_idx: u8,
+        helper_addr: u64,
     },
 
     // Container item operations
@@ -1353,6 +1443,7 @@ pub enum TemplateInstruction {
         dst: u8,
         container: u8,
         key: u8,
+        helper_addr: u64,
     },
     /// Set item: container[key] = value
     /// Requires type dispatch - deopt for Tier 1
@@ -1361,6 +1452,7 @@ pub enum TemplateInstruction {
         container: u8,
         key: u8,
         value: u8,
+        helper_addr: u64,
     },
     /// Delete item: del container[key]
     /// Requires type dispatch - deopt for Tier 1
@@ -1368,6 +1460,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         container: u8,
         key: u8,
+        helper_addr: u64,
     },
 
     // Iteration operations
@@ -1394,6 +1487,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         src: u8,
+        helper_addr: u64,
     },
     /// Check if callable: dst = callable(src)
     /// Requires type checking - deopt for Tier 1
@@ -1401,6 +1495,7 @@ pub enum TemplateInstruction {
         bc_offset: u32,
         dst: u8,
         src: u8,
+        helper_addr: u64,
     },
 
     // Container building operations
@@ -1517,6 +1612,7 @@ pub enum TemplateInstruction {
         dst: u8,
         method: u8,
         argc: u8,
+        helper_addr: u64,
     },
     /// Tail call (reuse frame)
     /// Requires call dispatch - deopt for Tier 1
@@ -2329,14 +2425,14 @@ impl TemplateInstruction {
                 | TemplateInstruction::StoreClosure { .. }
                 | TemplateInstruction::DeleteClosure { .. }
                 | TemplateInstruction::DelAttr { .. }
-                | TemplateInstruction::LoadMethod { .. }
-                | TemplateInstruction::GetItem { .. }
-                | TemplateInstruction::SetItem { .. }
-                | TemplateInstruction::DelItem { .. }
+                | TemplateInstruction::LoadMethod { helper_addr: 0, .. }
+                | TemplateInstruction::GetItem { helper_addr: 0, .. }
+                | TemplateInstruction::SetItem { helper_addr: 0, .. }
+                | TemplateInstruction::DelItem { helper_addr: 0, .. }
                 | TemplateInstruction::GetIter { .. }
                 | TemplateInstruction::ForIter { .. }
-                | TemplateInstruction::Len { .. }
-                | TemplateInstruction::IsCallable { .. }
+                | TemplateInstruction::Len { helper_addr: 0, .. }
+                | TemplateInstruction::IsCallable { helper_addr: 0, .. }
                 | TemplateInstruction::BuildList { .. }
                 | TemplateInstruction::BuildTuple { .. }
                 | TemplateInstruction::BuildSet { .. }
@@ -2350,7 +2446,7 @@ impl TemplateInstruction {
                 | TemplateInstruction::UnpackEx { .. }
                 | TemplateInstruction::Call { helper_addr: 0, .. }
                 | TemplateInstruction::CallKw { .. }
-                | TemplateInstruction::CallMethod { .. }
+                | TemplateInstruction::CallMethod { helper_addr: 0, .. }
                 | TemplateInstruction::TailCall { .. }
                 | TemplateInstruction::MakeFunction { .. }
                 | TemplateInstruction::MakeClosure { .. }
@@ -2429,6 +2525,13 @@ impl TemplateInstruction {
                 | TemplateInstruction::Call { .. }
                 | TemplateInstruction::GetAttr { .. }
                 | TemplateInstruction::SetAttr { .. }
+                | TemplateInstruction::LoadMethod { .. }
+                | TemplateInstruction::GetItem { .. }
+                | TemplateInstruction::SetItem { .. }
+                | TemplateInstruction::DelItem { .. }
+                | TemplateInstruction::Len { .. }
+                | TemplateInstruction::IsCallable { .. }
+                | TemplateInstruction::CallMethod { .. }
                 | TemplateInstruction::BranchIfTrue { .. }
                 | TemplateInstruction::BranchIfFalse { .. }
                 | TemplateInstruction::GuardInt { .. }

@@ -286,6 +286,29 @@ pub(crate) fn emit_frame_state_writeback(
     }
 }
 
+/// Reload the Tier 1 stack mirror from the interpreter register array.
+pub(crate) fn emit_frame_state_reload(
+    asm: &mut Assembler,
+    frame: &FrameLayout,
+    frame_base_scratch: Gpr,
+    value_scratch: Gpr,
+) {
+    asm.mov_rm(frame_base_scratch, &frame.context_slot());
+    asm.mov_rm(
+        frame_base_scratch,
+        &MemOperand::base_disp(frame_base_scratch, JIT_FRAME_STATE_FRAME_BASE_OFFSET),
+    );
+
+    for reg_idx in 0..frame.num_registers {
+        let source = MemOperand::base_disp(
+            frame_base_scratch,
+            i32::from(reg_idx) * FrameLayout::SLOT_SIZE,
+        );
+        asm.mov_rm(value_scratch, &source);
+        asm.mov_mr(&frame.register_slot(reg_idx), value_scratch);
+    }
+}
+
 /// Standard register assignments for the Template JIT.
 #[derive(Debug, Clone, Copy)]
 pub struct RegisterAssignment {

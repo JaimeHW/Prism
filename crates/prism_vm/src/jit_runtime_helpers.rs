@@ -5,11 +5,13 @@
 //! the interpreter resumes at the original bytecode and raises or continues
 //! with exact Python behavior.
 
-use prism_code::CodeObject;
+use prism_code::{CodeObject, Opcode};
 use prism_core::Value;
 use smallvec::SmallVec;
 
 use crate::VirtualMachine;
+use crate::dispatch::{ControlFlow, get_handler};
+use crate::error::RuntimeError;
 use crate::import::ModuleObject;
 use crate::jit_executor::JitFrameState;
 
@@ -23,6 +25,10 @@ pub(crate) fn tier1_load_global_addr() -> u64 {
 
 pub(crate) fn tier1_call_addr() -> u64 {
     tier1_call as *const () as usize as u64
+}
+
+pub(crate) fn tier1_bytecode_addr() -> u64 {
+    tier1_execute_bytecode as *const () as usize as u64
 }
 
 /// Resolve `LOAD_GLOBAL` for Tier 1 code.
@@ -131,6 +137,80 @@ pub(crate) unsafe extern "C" fn tier1_call(
     }
 }
 
+/// Execute a single fallthrough bytecode using the VM's canonical handler.
+///
+/// This is the exact-semantics bridge for high-impact dynamic operations while
+/// Tier 1 grows specialized fast paths. Native code writes its register mirror
+/// back before entry; on success the helper leaves the interpreter frame as the
+/// source of truth and compiled code reloads its mirror before continuing.
+///
+/// # Safety
+///
+/// `state` must describe the active VM frame. `current_bc_offset` must identify
+/// the bytecode that native code is replacing, and `expected_opcode` must match
+/// the opcode in that frame.
+pub(crate) unsafe extern "C" fn tier1_execute_bytecode(
+    state: *mut JitFrameState,
+    expected_opcode: u32,
+    current_bc_offset: u32,
+) -> u64 {
+    if state.is_null() || expected_opcode > u8::MAX as u32 || current_bc_offset % 4 != 0 {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let state = unsafe { &mut *state };
+    if state.vm_context.is_null() || state.frame_base.is_null() || state.code.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let vm = unsafe { &mut *(state.vm_context as *mut VirtualMachine) };
+    if vm.call_depth() == 0 {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let current_index = current_bc_offset / 4;
+    let inst = {
+        let frame = vm.current_frame_mut();
+        let code_ptr = std::sync::Arc::as_ptr(&frame.code) as *const ();
+        if code_ptr != state.code {
+            return TIER1_HELPER_DEOPT;
+        }
+
+        let Some(inst) = frame.code.instructions.get(current_index as usize).copied() else {
+            return TIER1_HELPER_DEOPT;
+        };
+
+        if u32::from(inst.opcode()) != expected_opcode {
+            return TIER1_HELPER_DEOPT;
+        }
+
+        frame.ip = current_index.saturating_add(1);
+        inst
+    };
+
+    let handler = get_handler(inst.opcode());
+    match handler(vm, inst) {
+        ControlFlow::Continue => {
+            sync_jit_state_ip_from_current_frame(vm, state);
+            TIER1_HELPER_SUCCESS
+        }
+        ControlFlow::Error(err) => {
+            sync_jit_state_ip_from_current_frame(vm, state);
+            vm.record_jit_error(err);
+            TIER1_HELPER_EXCEPTION
+        }
+        other => {
+            sync_jit_state_ip_from_current_frame(vm, state);
+            vm.record_jit_error(RuntimeError::internal(format!(
+                "Tier 1 bytecode helper for {:?} produced unsupported control flow {:?}",
+                Opcode::from_u8(inst.opcode()),
+                other
+            )));
+            TIER1_HELPER_EXCEPTION
+        }
+    }
+}
+
 #[inline]
 fn mark_register_written(state: &mut JitFrameState, register: usize) {
     if state.written_registers.is_null() {
@@ -175,7 +255,8 @@ fn sync_jit_state_ip_from_current_frame(vm: &VirtualMachine, state: &mut JitFram
 mod tests {
     use super::*;
     use crate::error::RuntimeErrorKind;
-    use prism_code::{FunctionBuilder, Register};
+    use prism_code::{FunctionBuilder, Instruction, Opcode, Register};
+    use prism_core::intern::intern;
     use std::sync::Arc;
 
     fn helper_frame() -> (VirtualMachine, Arc<CodeObject>, u16) {
@@ -207,6 +288,24 @@ mod tests {
             code: Arc::as_ptr(code) as *const (),
             module: std::ptr::null(),
         }
+    }
+
+    fn len_helper_frame() -> (VirtualMachine, Arc<CodeObject>) {
+        let mut builder = FunctionBuilder::new("tier1_bytecode_helper");
+        builder.emit(Instruction::op_ds(
+            Opcode::Len,
+            Register::new(1),
+            Register::new(0),
+        ));
+        builder.emit_return(Register::new(1));
+        let mut code = builder.finish();
+        code.register_count = 2;
+        let code = Arc::new(code);
+
+        let mut vm = VirtualMachine::new();
+        vm.push_frame(Arc::clone(&code), 0)
+            .expect("frame push should succeed");
+        (vm, code)
     }
 
     #[test]
@@ -249,6 +348,38 @@ mod tests {
             err.kind(),
             RuntimeErrorKind::TypeError { .. } | RuntimeErrorKind::NotCallable { .. }
         ));
+        assert_eq!(state.bc_offset, vm.current_frame().ip * 4);
+    }
+
+    #[test]
+    fn tier1_bytecode_helper_executes_fallthrough_vm_opcode() {
+        let (mut vm, code) = len_helper_frame();
+        vm.current_frame_mut()
+            .set_reg(0, Value::string(intern("hello")));
+
+        let mut state = state_for_current_frame(&mut vm, &code);
+        let status = unsafe { tier1_execute_bytecode(&mut state, Opcode::Len as u32, 0) };
+
+        assert_eq!(status, TIER1_HELPER_SUCCESS);
+        assert_eq!(vm.current_frame().get_reg(1).as_int(), Some(5));
+        assert!(vm.current_frame().local_is_written(1));
+        assert_eq!(state.bc_offset, 4);
+        assert!(vm.take_last_jit_error().is_none());
+    }
+
+    #[test]
+    fn tier1_bytecode_helper_preserves_vm_opcode_error() {
+        let (mut vm, code) = len_helper_frame();
+        vm.current_frame_mut().set_reg(0, Value::int_unchecked(42));
+
+        let mut state = state_for_current_frame(&mut vm, &code);
+        let status = unsafe { tier1_execute_bytecode(&mut state, Opcode::Len as u32, 0) };
+
+        assert_eq!(status, TIER1_HELPER_EXCEPTION);
+        let err = vm
+            .take_last_jit_error()
+            .expect("helper should store the real VM error");
+        assert!(matches!(err.kind(), RuntimeErrorKind::TypeError { .. }));
         assert_eq!(state.bc_offset, vm.current_frame().ip * 4);
     }
 }

@@ -189,6 +189,39 @@ pub(crate) fn lower_code_to_templates(
                     src,
                 }
             }
+            Opcode::GetAttr => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::GetAttr {
+                    bc_offset,
+                    dst,
+                    obj: inst.src1().0,
+                    name_idx: inst.src2().0,
+                    ic_site_idx: None,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::SetAttr => TemplateInstruction::SetAttr {
+                bc_offset,
+                obj: inst.dst().0,
+                name_idx: inst.src1().0,
+                value: inst.src2().0,
+                ic_site_idx: None,
+                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+            },
+            Opcode::LoadMethod => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                set_reg_type(&mut reg_types, dst.saturating_add(1), KnownType::Unknown);
+                TemplateInstruction::LoadMethod {
+                    bc_offset,
+                    dst,
+                    obj: inst.src1().0,
+                    name_idx: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::AttrName => TemplateInstruction::Nop { bc_offset },
             Opcode::LoadLocal => {
                 let dst = inst.dst().0;
                 let slot = inst.imm16();
@@ -757,6 +790,50 @@ pub(crate) fn lower_code_to_templates(
                     src: inst.src1().0,
                 }
             }
+            Opcode::GetItem => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                TemplateInstruction::GetItem {
+                    bc_offset,
+                    dst,
+                    container: inst.src1().0,
+                    key: inst.src2().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::SetItem => TemplateInstruction::SetItem {
+                bc_offset,
+                container: inst.src1().0,
+                key: inst.dst().0,
+                value: inst.src2().0,
+                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+            },
+            Opcode::DelItem => TemplateInstruction::DelItem {
+                bc_offset,
+                container: inst.src1().0,
+                key: inst.src2().0,
+                helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+            },
+            Opcode::Len => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Int);
+                TemplateInstruction::Len {
+                    bc_offset,
+                    dst,
+                    src: inst.src1().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
+            Opcode::IsCallable => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Bool);
+                TemplateInstruction::IsCallable {
+                    bc_offset,
+                    dst,
+                    src: inst.src1().0,
+                    helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
+                }
+            }
 
             Opcode::Call => {
                 let dst = inst.dst().0;
@@ -770,6 +847,21 @@ pub(crate) fn lower_code_to_templates(
                         func: inst.src1().0,
                         argc: inst.src2().0,
                         helper_addr: crate::jit_runtime_helpers::tier1_call_addr(),
+                    }
+                }
+            }
+            Opcode::CallMethod => {
+                let dst = inst.dst().0;
+                set_reg_type(&mut reg_types, dst, KnownType::Unknown);
+                if class_local_semantics {
+                    interpreter_fallback(bc_offset)
+                } else {
+                    TemplateInstruction::CallMethod {
+                        bc_offset,
+                        dst,
+                        method: inst.src1().0,
+                        argc: inst.src2().0,
+                        helper_addr: crate::jit_runtime_helpers::tier1_bytecode_addr(),
                     }
                 }
             }
@@ -922,7 +1014,7 @@ fn jump_target(template: &TemplateInstruction) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prism_code::{FunctionBuilder, Register};
+    use prism_code::{FunctionBuilder, Instruction, Register};
 
     fn load_global_code(flags: CodeFlags) -> CodeObject {
         let mut builder = FunctionBuilder::new("load_global");
@@ -938,6 +1030,36 @@ mod tests {
         builder.add_flags(flags);
         builder.emit_call(Register::new(0), Register::new(3), 2);
         builder.emit_return(Register::new(0));
+        builder.finish()
+    }
+
+    fn get_attr_code(name_count_before_target: usize) -> CodeObject {
+        let mut builder = FunctionBuilder::new("get_attr");
+        for idx in 0..name_count_before_target {
+            builder.add_name(format!("dummy_{idx}"));
+        }
+        let name_idx = builder.add_name("target");
+        builder.emit_get_attr(Register::new(1), Register::new(0), name_idx);
+        builder.emit_return(Register::new(1));
+        builder.finish()
+    }
+
+    fn call_method_code(flags: CodeFlags) -> CodeObject {
+        let mut builder = FunctionBuilder::new("call_method");
+        builder.add_flags(flags);
+        builder.emit_call_method(Register::new(0), Register::new(3), 2);
+        builder.emit_return(Register::new(0));
+        builder.finish()
+    }
+
+    fn len_code() -> CodeObject {
+        let mut builder = FunctionBuilder::new("len");
+        builder.emit(Instruction::op_ds(
+            Opcode::Len,
+            Register::new(1),
+            Register::new(0),
+        ));
+        builder.emit_return(Register::new(1));
         builder.finish()
     }
 
@@ -1003,8 +1125,115 @@ mod tests {
     }
 
     #[test]
+    fn normal_get_attr_lowers_to_runtime_helper_template() {
+        let code = get_attr_code(0);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::GetAttr {
+                bc_offset,
+                dst,
+                obj,
+                name_idx,
+                helper_addr,
+                ..
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 1);
+                assert_eq!(*obj, 0);
+                assert_eq!(*name_idx, 0);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected GetAttr template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn extended_attr_name_metadata_lowers_to_nop() {
+        let code = get_attr_code(255);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert!(matches!(
+            templates[0],
+            TemplateInstruction::GetAttr {
+                name_idx: u8::MAX,
+                ..
+            }
+        ));
+        assert!(matches!(
+            templates[1],
+            TemplateInstruction::Nop { bc_offset: 4 }
+        ));
+    }
+
+    #[test]
+    fn normal_len_lowers_to_runtime_helper_template() {
+        let code = len_code();
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::Len {
+                bc_offset,
+                dst,
+                src,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 1);
+                assert_eq!(*src, 0);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected Len template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
+    fn normal_call_method_lowers_to_runtime_helper_template() {
+        let code = call_method_code(CodeFlags::NONE);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        match &templates[0] {
+            TemplateInstruction::CallMethod {
+                bc_offset,
+                dst,
+                method,
+                argc,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 0);
+                assert_eq!(*method, 3);
+                assert_eq!(*argc, 2);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected CallMethod template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
+    }
+
+    #[test]
     fn class_body_call_keeps_interpreter_semantics() {
         let code = call_code(CodeFlags::CLASS);
+        let templates = lower_code_to_templates(&code).expect("lowering should succeed");
+
+        assert!(matches!(
+            templates[0],
+            TemplateInstruction::InterpreterFallback { bc_offset: 0 }
+        ));
+        assert!(templates[0].requires_interpreter_in_tier1());
+    }
+
+    #[test]
+    fn class_body_call_method_keeps_interpreter_semantics() {
+        let code = call_method_code(CodeFlags::CLASS);
         let templates = lower_code_to_templates(&code).expect("lowering should succeed");
 
         assert!(matches!(
