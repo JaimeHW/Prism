@@ -249,6 +249,10 @@ struct ExecutionBudget {
 /// the native stack.
 const MAX_NATIVE_RECURSION_DEPTH: usize = 64;
 
+/// Number of bytecodes between interpreter slow-path checks when no exact
+/// execution budget is active.
+const EVAL_BREAKER_INTERVAL_OPCODES: u32 = 64;
+
 impl ExecutionBudget {
     #[inline]
     fn set_step_limit(&mut self, limit: Option<u64>) {
@@ -264,6 +268,11 @@ impl ExecutionBudget {
     #[inline]
     fn step_limit(&self) -> Option<u64> {
         self.step_limit
+    }
+
+    #[inline]
+    fn has_limit(&self) -> bool {
+        self.step_limit.is_some()
     }
 
     #[inline]
@@ -355,6 +364,8 @@ pub struct VirtualMachine {
     compiler_optimization: SourceOptimization,
     /// Deterministic interpreter execution budget.
     execution_budget: ExecutionBudget,
+    /// Countdown for amortized interpreter slow-path checks.
+    eval_breaker_countdown: u32,
     /// Depth of synchronous runtime re-entry into Python code.
     native_recursion_depth: usize,
     /// Most recent runtime error reported by a native AOT helper call.
@@ -798,6 +809,7 @@ impl VirtualMachine {
     #[inline]
     pub fn set_execution_step_limit(&mut self, limit: Option<u64>) {
         self.execution_budget.set_step_limit(limit);
+        self.eval_breaker_countdown = EVAL_BREAKER_INTERVAL_OPCODES;
     }
 
     #[inline]
@@ -873,9 +885,7 @@ impl VirtualMachine {
                 return Ok(());
             }
 
-            self.execution_budget.consume_step()?;
-            crate::threading_runtime::checkpoint();
-            self.poll_pending_main_interrupt_to_depth(stop_depth)?;
+            self.eval_breaker_tick(stop_depth)?;
 
             let inst = {
                 let frame = &mut self.frames[self.current_frame_idx];
@@ -1024,6 +1034,30 @@ impl VirtualMachine {
     }
 
     #[inline]
+    fn eval_breaker_tick(&mut self, min_depth: usize) -> VmResult<()> {
+        if self.execution_budget.has_limit() {
+            self.execution_budget.consume_step()?;
+            crate::threading_runtime::checkpoint();
+            return self.poll_pending_main_interrupt_to_depth(min_depth);
+        }
+
+        let remaining = self.eval_breaker_countdown;
+        if remaining > 1 {
+            self.eval_breaker_countdown = remaining - 1;
+            return Ok(());
+        }
+
+        self.eval_breaker_countdown = EVAL_BREAKER_INTERVAL_OPCODES;
+        self.poll_eval_breaker_slow_path(min_depth)
+    }
+
+    #[inline(never)]
+    fn poll_eval_breaker_slow_path(&mut self, min_depth: usize) -> VmResult<()> {
+        crate::threading_runtime::checkpoint_now();
+        self.poll_pending_main_interrupt_to_depth(min_depth)
+    }
+
+    #[inline]
     fn poll_pending_main_interrupt_to_depth(&mut self, min_depth: usize) -> VmResult<()> {
         self.poll_pending_async_exception_to_depth(min_depth)?;
 
@@ -1123,8 +1157,7 @@ impl VirtualMachine {
         }
 
         loop {
-            crate::threading_runtime::checkpoint();
-            self.poll_pending_main_interrupt_to_depth(stop_depth)?;
+            self.eval_breaker_tick(stop_depth)?;
 
             if self.frames.len() < stop_depth {
                 return Err(RuntimeError::internal(
@@ -1295,8 +1328,7 @@ impl VirtualMachine {
         let target_frame_id = self.current_frame_id();
 
         loop {
-            crate::threading_runtime::checkpoint();
-            self.poll_pending_main_interrupt_to_depth(stop_depth)?;
+            self.eval_breaker_tick(stop_depth)?;
 
             let inst = {
                 let current_frame_idx = self.current_frame_idx;
@@ -1703,6 +1735,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
             finalizers: FinalizerRegistry::default(),
@@ -1777,6 +1810,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
             finalizers: FinalizerRegistry::default(),
@@ -1859,6 +1893,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
             finalizers: FinalizerRegistry::default(),
@@ -1910,6 +1945,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
             finalizers: FinalizerRegistry::default(),
@@ -1956,6 +1992,7 @@ impl VirtualMachine {
             import_verbosity: 0,
             compiler_optimization: SourceOptimization::None,
             execution_budget: ExecutionBudget::default(),
+            eval_breaker_countdown: EVAL_BREAKER_INTERVAL_OPCODES,
             native_recursion_depth: 0,
             last_aot_error: None,
             finalizers: FinalizerRegistry::default(),
@@ -2036,9 +2073,7 @@ impl VirtualMachine {
     fn run_loop(&mut self) -> VmResult<Value> {
         let _execution_region = crate::threading_runtime::enter_execution_region();
         loop {
-            self.execution_budget.consume_step()?;
-            crate::threading_runtime::checkpoint();
-            self.poll_pending_main_interrupt_to_depth(1)?;
+            self.eval_breaker_tick(1)?;
 
             // Fetch instruction
             let inst = {

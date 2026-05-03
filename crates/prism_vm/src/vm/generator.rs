@@ -1,6 +1,61 @@
 use super::*;
 
 impl VirtualMachine {
+    #[inline]
+    fn generator_eval_breaker_tick(&mut self, caller_depth: usize) -> VmResult<()> {
+        if self.execution_budget.has_limit() {
+            self.execution_budget.consume_step()?;
+            crate::threading_runtime::checkpoint();
+            return self.poll_generator_eval_breaker(caller_depth);
+        }
+
+        let remaining = self.eval_breaker_countdown;
+        if remaining > 1 {
+            self.eval_breaker_countdown = remaining - 1;
+            return Ok(());
+        }
+
+        self.eval_breaker_countdown = super::EVAL_BREAKER_INTERVAL_OPCODES;
+        self.poll_generator_eval_breaker_slow_path(caller_depth)
+    }
+
+    #[inline(never)]
+    fn poll_generator_eval_breaker_slow_path(&mut self, caller_depth: usize) -> VmResult<()> {
+        crate::threading_runtime::checkpoint_now();
+        self.poll_generator_eval_breaker(caller_depth)
+    }
+
+    fn poll_generator_eval_breaker(&mut self, caller_depth: usize) -> VmResult<()> {
+        if let Some(exception) =
+            crate::stdlib::_thread::take_pending_async_exception_for_current_thread()
+        {
+            let (exception, type_id) = self.normalize_async_exception(exception)?;
+            self.set_active_exception_with_type(exception, type_id);
+            if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
+                return Err(self.uncaught_exception_error(type_id));
+            }
+        }
+
+        let Some(signum) =
+            crate::stdlib::_thread::take_pending_main_interrupt(self.thread_interrupt_target)
+        else {
+            return Ok(());
+        };
+
+        if let Err(err) = crate::stdlib::_thread::deliver_interrupt_signal(self, signum) {
+            if err.is_control_transferred() {
+                return Ok(());
+            }
+
+            let type_id = self.materialize_active_exception_from_runtime_error(&err);
+            if !self.propagate_exception_within_generator_frames(type_id, caller_depth) {
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Resume a generator object for exactly one send()/next() step.
     pub(crate) fn resume_generator_for_send(
         &mut self,
@@ -289,26 +344,9 @@ impl VirtualMachine {
 
         if failure.is_none() {
             'exec: loop {
-                if let Err(err) = self.execution_budget.consume_step() {
+                if let Err(err) = self.generator_eval_breaker_tick(caller_depth) {
                     failure = Some(err);
                     break 'exec;
-                }
-                if let Some(signum) = crate::stdlib::_thread::take_pending_main_interrupt(
-                    self.thread_interrupt_target,
-                ) {
-                    if let Err(err) = crate::stdlib::_thread::deliver_interrupt_signal(self, signum)
-                    {
-                        if err.is_control_transferred() {
-                            continue;
-                        }
-
-                        let type_id = self.materialize_active_exception_from_runtime_error(&err);
-                        if !self.propagate_exception_within_generator_frames(type_id, caller_depth)
-                        {
-                            failure = Some(err);
-                            break 'exec;
-                        }
-                    }
                 }
 
                 let inst = {

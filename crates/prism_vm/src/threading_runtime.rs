@@ -86,12 +86,22 @@ pub(crate) fn checkpoint() {
     });
 
     if should_yield {
-        if let Some(_released) = release_for_checkpoint_handoff() {
-            thread::yield_now();
-        } else {
-            let _released = release_for_blocking_operation();
-            thread::yield_now();
-        }
+        checkpoint_now();
+    }
+}
+
+/// Run the checkpoint slow path now.
+///
+/// VM eval-breaker countdowns call this after they have already amortized the
+/// per-op fast path. Keeping the handoff logic here preserves one scheduling
+/// policy for both direct and throttled checkpoints.
+#[inline]
+pub(crate) fn checkpoint_now() {
+    if let Some(_released) = release_for_checkpoint_handoff() {
+        thread::yield_now();
+    } else {
+        let _released = release_for_blocking_operation();
+        thread::yield_now();
     }
 }
 

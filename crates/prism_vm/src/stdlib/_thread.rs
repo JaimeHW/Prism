@@ -47,10 +47,12 @@ static ACTIVE_THREAD_COUNT: AtomicU64 = AtomicU64::new(1);
 static NEXT_INTERRUPT_TARGET: AtomicU64 = AtomicU64::new(1);
 static PENDING_MAIN_INTERRUPTS: LazyLock<Mutex<FxHashMap<u64, i64>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
+static PENDING_MAIN_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_THREAD_IDENTS: LazyLock<Mutex<FxHashSet<u64>>> =
     LazyLock::new(|| Mutex::new(FxHashSet::default()));
 static PENDING_ASYNC_EXCEPTIONS: LazyLock<Mutex<FxHashMap<u64, Value>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
+static PENDING_ASYNC_EXCEPTION_COUNT: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static THREAD_IDENT: Cell<Option<u64>> = const { Cell::new(None) };
     static THREAD_SENTINELS: RefCell<Vec<Arc<NativeLock>>> = const { RefCell::new(Vec::new()) };
@@ -387,10 +389,14 @@ fn unregister_thread_ident(ident: u64) {
         .lock()
         .expect("active thread registry lock poisoned")
         .remove(&ident);
-    PENDING_ASYNC_EXCEPTIONS
+    let removed_pending_exception = PENDING_ASYNC_EXCEPTIONS
         .lock()
         .expect("pending async exception registry lock poisoned")
-        .remove(&ident);
+        .remove(&ident)
+        .is_some();
+    if removed_pending_exception {
+        PENDING_ASYNC_EXCEPTION_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) fn new_main_interrupt_target() -> u64 {
@@ -513,45 +519,79 @@ fn parse_interrupt_signal(value: Value) -> Result<i64, BuiltinError> {
 
 #[inline]
 fn queue_pending_main_interrupt(target: u64, signum: i64) {
-    PENDING_MAIN_INTERRUPTS
+    let inserted = PENDING_MAIN_INTERRUPTS
         .lock()
         .expect("pending interrupt registry lock poisoned")
-        .insert(target, signum);
+        .insert(target, signum)
+        .is_none();
+    if inserted {
+        PENDING_MAIN_INTERRUPT_COUNT.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(crate) fn has_pending_main_interrupts() -> bool {
+    PENDING_MAIN_INTERRUPT_COUNT.load(Ordering::Acquire) != 0
 }
 
 pub(crate) fn take_pending_main_interrupt(target: u64) -> Option<i64> {
     if current_thread_is_python_worker() {
         return None;
     }
+    if !has_pending_main_interrupts() {
+        return None;
+    }
 
-    PENDING_MAIN_INTERRUPTS
+    let removed = PENDING_MAIN_INTERRUPTS
         .lock()
         .expect("pending interrupt registry lock poisoned")
-        .remove(&target)
+        .remove(&target);
+    if removed.is_some() {
+        PENDING_MAIN_INTERRUPT_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    removed
 }
 
 pub(crate) fn set_pending_async_exception_for_ident(ident: u64, exception: Value) -> bool {
-    let is_active = ACTIVE_THREAD_IDENTS
+    let active_idents = ACTIVE_THREAD_IDENTS
         .lock()
-        .expect("active thread registry lock poisoned")
-        .contains(&ident);
-    if !is_active {
+        .expect("active thread registry lock poisoned");
+    if !active_idents.contains(&ident) {
         return false;
     }
 
-    PENDING_ASYNC_EXCEPTIONS
+    // Hold the active-thread registry while publishing the exception so an
+    // unregistering thread cannot miss a pending value for its ident.
+    let inserted = PENDING_ASYNC_EXCEPTIONS
         .lock()
         .expect("pending async exception registry lock poisoned")
-        .insert(ident, exception);
+        .insert(ident, exception)
+        .is_none();
+    if inserted {
+        PENDING_ASYNC_EXCEPTION_COUNT.fetch_add(1, Ordering::Release);
+    }
     true
 }
 
+#[inline]
+pub(crate) fn has_pending_async_exceptions() -> bool {
+    PENDING_ASYNC_EXCEPTION_COUNT.load(Ordering::Acquire) != 0
+}
+
 pub(crate) fn take_pending_async_exception_for_current_thread() -> Option<Value> {
+    if !has_pending_async_exceptions() {
+        return None;
+    }
+
     let ident = current_thread_ident();
-    PENDING_ASYNC_EXCEPTIONS
+    let removed = PENDING_ASYNC_EXCEPTIONS
         .lock()
         .expect("pending async exception registry lock poisoned")
-        .remove(&ident)
+        .remove(&ident);
+    if removed.is_some() {
+        PENDING_ASYNC_EXCEPTION_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    removed
 }
 
 pub(crate) fn deliver_interrupt_signal(
