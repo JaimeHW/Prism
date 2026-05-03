@@ -84,11 +84,10 @@ pub struct ExceptionValue {
     syntax_details: Option<Box<SyntaxErrorDetails>>,
 
     /// Explicit cause (from `raise X from Y`).
-    /// Uses raw pointer to avoid recursive Box issues.
-    pub cause: Option<*const ExceptionValue>,
+    pub cause: Option<Value>,
 
     /// Implicit context (exception being handled when this was raised).
-    pub context: Option<*const ExceptionValue>,
+    pub context: Option<Value>,
 
     /// Python-visible traceback view attached to the exception.
     pub traceback: Option<Value>,
@@ -419,13 +418,13 @@ impl ExceptionValue {
     }
 
     /// Set the cause (from `raise X from Y`).
-    pub fn set_cause(&mut self, cause: *const ExceptionValue) {
+    pub fn set_cause(&mut self, cause: Value) {
         self.cause = Some(cause);
         self.flags = self.flags.with(ExceptionFlags::HAS_CAUSE);
     }
 
     /// Set the context (implicit chaining).
-    pub fn set_context(&mut self, context: *const ExceptionValue) {
+    pub fn set_context(&mut self, context: Value) {
         self.context = Some(context);
     }
 
@@ -640,10 +639,10 @@ unsafe impl Trace for ExceptionValue {
             }
         }
         if let Some(cause) = self.cause {
-            tracer.trace_ptr(cause as *const ());
+            tracer.trace_value(cause);
         }
         if let Some(context) = self.context {
-            tracer.trace_ptr(context as *const ());
+            tracer.trace_value(context);
         }
         if let Some(traceback) = self.traceback {
             tracer.trace_value(traceback);

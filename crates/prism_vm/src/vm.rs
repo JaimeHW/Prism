@@ -959,19 +959,9 @@ impl VirtualMachine {
                     self.propagate_exception_to_depth(stop_depth, type_id)?;
                 }
                 ControlFlow::Reraise => {
-                    let type_id = if let Some(tid) = self.active_exception_type_id {
-                        tid
-                    } else if let Some(exc_info) = self.exc_info_stack.peek() {
-                        exc_info.type_id()
-                    } else {
-                        return Err(RuntimeError::type_error("No active exception to re-raise"));
-                    };
-
-                    if type_id == 0 {
-                        return Err(RuntimeError::internal(
-                            "Reraise without active exception type",
-                        ));
-                    }
+                    let type_id = self.current_reraise_type_id().ok_or_else(|| {
+                        RuntimeError::type_error("No active exception to re-raise")
+                    })?;
 
                     self.propagate_reraise_to_depth(stop_depth, type_id)?;
                 }
@@ -1252,19 +1242,9 @@ impl VirtualMachine {
                     self.route_nested_exception(stop_depth, type_id)?;
                 }
                 ControlFlow::Reraise => {
-                    let type_id = if let Some(tid) = self.get_active_exception_type_id() {
-                        tid
-                    } else if let Some(exc_info) = self.exc_info_stack().peek() {
-                        exc_info.type_id()
-                    } else {
-                        return Err(RuntimeError::type_error("No active exception to re-raise"));
-                    };
-
-                    if type_id == 0 {
-                        return Err(RuntimeError::internal(
-                            "Reraise without active exception type",
-                        ));
-                    }
+                    let type_id = self.current_reraise_type_id().ok_or_else(|| {
+                        RuntimeError::type_error("No active exception to re-raise")
+                    })?;
 
                     self.route_nested_reraise(stop_depth, type_id)?;
                 }
@@ -1401,19 +1381,9 @@ impl VirtualMachine {
                     self.route_nested_exception(stop_depth, type_id)?;
                 }
                 ControlFlow::Reraise => {
-                    let type_id = if let Some(tid) = self.get_active_exception_type_id() {
-                        tid
-                    } else if let Some(exc_info) = self.exc_info_stack().peek() {
-                        exc_info.type_id()
-                    } else {
-                        return Err(RuntimeError::type_error("No active exception to re-raise"));
-                    };
-
-                    if type_id == 0 {
-                        return Err(RuntimeError::internal(
-                            "Reraise without active exception type",
-                        ));
-                    }
+                    let type_id = self.current_reraise_type_id().ok_or_else(|| {
+                        RuntimeError::type_error("No active exception to re-raise")
+                    })?;
 
                     self.route_nested_reraise(stop_depth, type_id)?;
                 }
@@ -2150,22 +2120,9 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Reraise => {
-                    // Re-raise the current active exception
-                    // First check active_exception_type_id (for except handlers)
-                    // then fall back to exc_info_stack (for finally blocks)
-                    let type_id = if let Some(tid) = self.active_exception_type_id {
-                        tid
-                    } else if let Some(exc_info) = self.exc_info_stack.peek() {
-                        exc_info.type_id()
-                    } else {
-                        return Err(RuntimeError::type_error("No active exception to re-raise"));
-                    };
-
-                    if type_id == 0 {
-                        return Err(RuntimeError::internal(
-                            "Reraise without active exception type",
-                        ));
-                    }
+                    let type_id = self.current_reraise_type_id().ok_or_else(|| {
+                        RuntimeError::type_error("No active exception to re-raise")
+                    })?;
 
                     self.propagate_reraise_to_depth(1, type_id)?;
                 }
@@ -3442,9 +3399,19 @@ impl VirtualMachine {
     pub(crate) fn has_active_exception(&self) -> bool {
         self.exc_state.has_exception()
             && self.active_exception.is_some()
-            && self
-                .active_exception_type_id
-                .is_some_and(|type_id| type_id != 0)
+            && self.active_exception_type_id.is_some()
+    }
+
+    #[inline]
+    pub(crate) fn current_reraise_type_id(&self) -> Option<u16> {
+        if self.has_active_exception() {
+            return self.active_exception_type_id;
+        }
+
+        self.exc_info_stack
+            .peek()
+            .filter(|entry| entry.is_active())
+            .map(|entry| entry.type_id())
     }
 
     /// Clear the active exception.

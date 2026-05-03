@@ -463,22 +463,11 @@ impl VirtualMachine {
                         }
                     }
                     ControlFlow::Reraise => {
-                        let type_id = if let Some(tid) = self.active_exception_type_id {
-                            tid
-                        } else if let Some(exc_info) = self.exc_info_stack.peek() {
-                            exc_info.type_id()
-                        } else {
+                        let Some(type_id) = self.current_reraise_type_id() else {
                             failure =
                                 Some(RuntimeError::type_error("No active exception to re-raise"));
                             break 'exec;
                         };
-
-                        if type_id == 0 {
-                            failure = Some(RuntimeError::internal(
-                                "Reraise without active exception type",
-                            ));
-                            break 'exec;
-                        }
 
                         if !self.propagate_exception_within_generator_frames(type_id, caller_depth)
                         {

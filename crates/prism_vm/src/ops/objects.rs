@@ -17,6 +17,7 @@ use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::frame::Frame;
 use crate::ops::attribute::is_user_defined_type;
+use crate::ops::exception::helpers::is_exception_instance_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
 use crate::ops::method_dispatch::method_cache::method_cache;
 use crate::ops::method_dispatch::resolve_builtin_instance_method;
@@ -2172,14 +2173,8 @@ pub(crate) fn get_attribute_value(
                     "end_offset" => Ok(optional_u32_to_value(exc.syntax_end_offset())),
                     "print_file_and_line" => Ok(Value::none()),
                     "__traceback__" => Ok(exc.traceback().unwrap_or_else(Value::none)),
-                    "__cause__" => Ok(exc
-                        .cause
-                        .map(|cause| Value::object_ptr(cause as *const ()))
-                        .unwrap_or_else(Value::none)),
-                    "__context__" => Ok(exc
-                        .context
-                        .map(|context| Value::object_ptr(context as *const ()))
-                        .unwrap_or_else(Value::none)),
+                    "__cause__" => Ok(exc.cause.unwrap_or_else(Value::none)),
+                    "__context__" => Ok(exc.context.unwrap_or_else(Value::none)),
                     "__suppress_context__" => {
                         Ok(Value::bool(exc.flags.has(ExceptionFlags::SUPPRESS_CONTEXT)))
                     }
@@ -2353,19 +2348,21 @@ fn exception_arg_or_message(exception: &ExceptionValue, index: usize) -> Value {
 }
 
 #[inline]
-fn exception_link_ptr(
+fn exception_link_value(
     value: Value,
     attr_name: &'static str,
-) -> Result<Option<*const ExceptionValue>, RuntimeError> {
+) -> Result<Option<Value>, RuntimeError> {
     if value.is_none() {
         return Ok(None);
     }
 
-    unsafe { ExceptionValue::from_value(value) }
-        .map(|exception| Some(exception as *const ExceptionValue))
-        .ok_or_else(|| {
-            RuntimeError::type_error(format!("{attr_name} must be an exception or None"))
-        })
+    if is_exception_instance_value(&value) {
+        Ok(Some(value))
+    } else {
+        Err(RuntimeError::type_error(format!(
+            "{attr_name} must be an exception or None"
+        )))
+    }
 }
 
 pub(crate) fn set_attribute_value(
@@ -2436,7 +2433,7 @@ pub(crate) fn set_attribute_value_default(
                         .replace_traceback(value)
                         .map_err(RuntimeError::type_error),
                     "__cause__" => {
-                        exc.cause = exception_link_ptr(value, "__cause__")?;
+                        exc.cause = exception_link_value(value, "__cause__")?;
                         exc.flags = if exc.cause.is_some() {
                             exc.flags.with(ExceptionFlags::HAS_CAUSE)
                         } else {
@@ -2446,7 +2443,7 @@ pub(crate) fn set_attribute_value_default(
                         Ok(())
                     }
                     "__context__" => {
-                        exc.context = exception_link_ptr(value, "__context__")?;
+                        exc.context = exception_link_value(value, "__context__")?;
                         Ok(())
                     }
                     "__suppress_context__" => {

@@ -621,13 +621,7 @@ fn attach_exception_cause(
     if let Some(exc) = exception_value_mut(exc_value) {
         match cause_value {
             Some(cause_value) => {
-                let cause =
-                    unsafe { ExceptionValue::from_value(cause_value) }.ok_or_else(|| {
-                        RuntimeError::internal(
-                            "normalized exception cause must be an exception instance",
-                        )
-                    })?;
-                exc.set_cause(cause as *const ExceptionValue);
+                exc.set_cause(cause_value);
                 exc.suppress_context();
             }
             None => {
@@ -792,9 +786,7 @@ pub fn raise_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         Ok(value) => value,
         Err(err) => return ControlFlow::Error(err),
     };
-    let type_id = unsafe { ExceptionValue::from_value(exc_value) }
-        .map(|exc| exc.exception_type_id)
-        .unwrap_or(4);
+    let type_id = extract_type_id_from_value(&exc_value);
     let cause_value = match normalize_exception_cause_value(vm, cause_value) {
         Ok(value) => value,
         Err(err) => return ControlFlow::Error(err),
