@@ -199,8 +199,6 @@ fn normalize_deopt_resume_offset(encoded: u32, instruction_count: u32) -> Option
 pub struct JitExecutor {
     /// Code cache for looking up compiled functions.
     code_cache: Arc<CodeCache>,
-    /// Reusable frame state to avoid allocation.
-    frame_state: JitFrameState,
     /// Deopt handler address for recovery.
     _deopt_handler: u64,
 }
@@ -210,7 +208,6 @@ impl JitExecutor {
     pub fn new(code_cache: Arc<CodeCache>) -> Self {
         Self {
             code_cache,
-            frame_state: JitFrameState::default(),
             _deopt_handler: 0, // Will be set during initialization
         }
     }
@@ -219,7 +216,6 @@ impl JitExecutor {
     pub fn with_deopt_handler(code_cache: Arc<CodeCache>, deopt_handler: u64) -> Self {
         Self {
             code_cache,
-            frame_state: JitFrameState::default(),
             _deopt_handler: deopt_handler,
         }
     }
@@ -268,19 +264,19 @@ impl JitExecutor {
         vm_context: *mut (),
     ) -> ExecutionResult {
         // Setup JIT frame state from interpreter frame
-        self.setup_frame_state(frame, global_scope, vm_context);
-        self.clear_runtime_helper_error();
+        let mut frame_state = Self::frame_state_for(frame, global_scope, vm_context);
+        Self::clear_runtime_helper_error(&frame_state);
 
         // Get the entry point
         let entry_fn: JitEntryFn = unsafe { std::mem::transmute(entry.entry_point()) };
 
         // Execute compiled code
-        let result = unsafe { entry_fn(&mut self.frame_state) };
+        let result = unsafe { entry_fn(&mut frame_state) };
 
         // Some JIT tiers return raw Prism Value bits in RAX.
         // Handle those paths directly to avoid interpreting valid values as exit reasons.
         if entry.return_abi() == ReturnAbi::RawValueBits {
-            self.restore_frame_state(frame);
+            Self::restore_frame_state(&frame_state, frame);
             return ExecutionResult::Return(Value::from_bits(result));
         }
 
@@ -290,29 +286,29 @@ impl JitExecutor {
         match exit_reason {
             ExitReason::Return => {
                 // Read return value from frame
-                let return_value = self.read_return_value();
-                self.restore_frame_state(frame);
+                let return_value = Self::read_return_value(&frame_state);
+                Self::restore_frame_state(&frame_state, frame);
                 ExecutionResult::Return(return_value)
             }
             ExitReason::Deoptimize => {
                 // Restore interpreter state and continue in interpreter
-                self.restore_frame_state(frame);
+                Self::restore_frame_state(&frame_state, frame);
                 let reason =
                     DeoptReason::from_u8((data & 0xFF) as u8).unwrap_or(DeoptReason::UncommonTrap);
                 let bc_offset = self.decode_deopt_offset(entry, frame, data);
                 ExecutionResult::Deopt { bc_offset, reason }
             }
             ExitReason::Exception => {
-                self.restore_frame_state(frame);
-                ExecutionResult::Exception(self.take_runtime_helper_error())
+                Self::restore_frame_state(&frame_state, frame);
+                ExecutionResult::Exception(Self::take_runtime_helper_error(&mut frame_state))
             }
             ExitReason::TailCall => {
-                let target = self.frame_state.const_pool as u64; // Reused for target
+                let target = frame_state.const_pool as u64; // Reused for target
                 let arg_count = (data & 0xFF) as u8;
                 ExecutionResult::TailCall { target, arg_count }
             }
             ExitReason::OsrExit => {
-                self.restore_frame_state(frame);
+                Self::restore_frame_state(&frame_state, frame);
                 ExecutionResult::Deopt {
                     bc_offset: data,
                     reason: DeoptReason::OsrExit,
@@ -368,9 +364,9 @@ impl JitExecutor {
         let osr_offset = osr_entry.jit_offset;
 
         // Setup frame state
-        self.setup_frame_state(frame, std::ptr::null(), vm_context);
-        self.frame_state.bc_offset = osr_bc_offset;
-        self.clear_runtime_helper_error();
+        let mut frame_state = Self::frame_state_for(frame, std::ptr::null(), vm_context);
+        frame_state.bc_offset = osr_bc_offset;
+        Self::clear_runtime_helper_error(&frame_state);
 
         // Calculate OSR entry point
         let osr_entry_fn: JitEntryFn = unsafe {
@@ -379,11 +375,11 @@ impl JitExecutor {
         };
 
         // Execute from OSR entry
-        let result = unsafe { osr_entry_fn(&mut self.frame_state) };
+        let result = unsafe { osr_entry_fn(&mut frame_state) };
 
         // Some JIT tiers return raw Prism Value bits in RAX.
         if entry.return_abi() == ReturnAbi::RawValueBits {
-            self.restore_frame_state(frame);
+            Self::restore_frame_state(&frame_state, frame);
             return ExecutionResult::Return(Value::from_bits(result));
         }
 
@@ -392,23 +388,23 @@ impl JitExecutor {
 
         match exit_reason {
             ExitReason::Return => {
-                let return_value = self.read_return_value();
-                self.restore_frame_state(frame);
+                let return_value = Self::read_return_value(&frame_state);
+                Self::restore_frame_state(&frame_state, frame);
                 ExecutionResult::Return(return_value)
             }
             ExitReason::Deoptimize => {
-                self.restore_frame_state(frame);
+                Self::restore_frame_state(&frame_state, frame);
                 let reason =
                     DeoptReason::from_u8((data & 0xFF) as u8).unwrap_or(DeoptReason::UncommonTrap);
                 let bc_offset = self.decode_deopt_offset(entry, frame, data);
                 ExecutionResult::Deopt { bc_offset, reason }
             }
             ExitReason::Exception => {
-                self.restore_frame_state(frame);
-                ExecutionResult::Exception(self.take_runtime_helper_error())
+                Self::restore_frame_state(&frame_state, frame);
+                ExecutionResult::Exception(Self::take_runtime_helper_error(&mut frame_state))
             }
             _ => {
-                self.restore_frame_state(frame);
+                Self::restore_frame_state(&frame_state, frame);
                 ExecutionResult::Deopt {
                     bc_offset: osr_bc_offset,
                     reason: DeoptReason::UncommonTrap,
@@ -419,33 +415,34 @@ impl JitExecutor {
 
     /// Setup JIT frame state from interpreter frame.
     #[inline]
-    fn setup_frame_state(
-        &mut self,
+    fn frame_state_for(
         frame: &mut Frame,
         global_scope: *const u64,
         vm_context: *mut (),
-    ) {
-        self.frame_state.frame_base = frame.registers.as_ptr() as *mut u64;
-        self.frame_state.num_registers = frame.code.register_count;
-        self.frame_state.bc_offset = frame.ip.saturating_mul(4);
-        self.frame_state.const_pool = frame.code.constants.as_ptr() as *const u64;
-        self.frame_state.closure_env = frame.closure.as_ref().map_or(std::ptr::null(), |closure| {
-            Arc::as_ptr(closure) as *const u64
-        });
-        self.frame_state.global_scope = global_scope;
-        self.frame_state.written_registers = frame.written_registers_mut_ptr();
-        self.frame_state.vm_context = vm_context;
-        self.frame_state.code = Arc::as_ptr(&frame.code) as *const ();
-        self.frame_state.module = frame
-            .module
-            .as_ref()
-            .map_or(std::ptr::null(), |module| Arc::as_ptr(module) as *const ());
+    ) -> JitFrameState {
+        JitFrameState {
+            frame_base: frame.registers.as_ptr() as *mut u64,
+            num_registers: frame.code.register_count,
+            bc_offset: frame.ip.saturating_mul(4),
+            const_pool: frame.code.constants.as_ptr() as *const u64,
+            closure_env: frame.closure.as_ref().map_or(std::ptr::null(), |closure| {
+                Arc::as_ptr(closure) as *const u64
+            }),
+            global_scope,
+            written_registers: frame.written_registers_mut_ptr(),
+            vm_context,
+            code: Arc::as_ptr(&frame.code) as *const (),
+            module: frame
+                .module
+                .as_ref()
+                .map_or(std::ptr::null(), |module| Arc::as_ptr(module) as *const ()),
+        }
     }
 
     /// Restore interpreter frame state from JIT frame.
     #[inline]
-    fn restore_frame_state(&self, frame: &mut Frame) {
-        frame.ip = self.frame_state.bc_offset / 4;
+    fn restore_frame_state(frame_state: &JitFrameState, frame: &mut Frame) {
+        frame.ip = frame_state.bc_offset / 4;
         // Registers are modified in-place via frame_base pointer
     }
 
@@ -453,33 +450,33 @@ impl JitExecutor {
     ///
     /// By convention, the return value is in register 0.
     #[inline]
-    fn read_return_value(&self) -> Value {
-        if self.frame_state.frame_base.is_null() {
+    fn read_return_value(frame_state: &JitFrameState) -> Value {
+        if frame_state.frame_base.is_null() {
             return Value::none();
         }
         unsafe {
-            let raw = *self.frame_state.frame_base;
+            let raw = *frame_state.frame_base;
             Value::from_bits(raw)
         }
     }
 
     #[inline]
-    fn clear_runtime_helper_error(&mut self) {
-        if self.frame_state.vm_context.is_null() {
+    fn clear_runtime_helper_error(frame_state: &JitFrameState) {
+        if frame_state.vm_context.is_null() {
             return;
         }
 
         unsafe {
-            let vm = &mut *(self.frame_state.vm_context as *mut VirtualMachine);
+            let vm = &mut *(frame_state.vm_context as *mut VirtualMachine);
             vm.clear_last_jit_error();
         }
     }
 
     #[inline]
-    fn take_runtime_helper_error(&mut self) -> RuntimeError {
-        if !self.frame_state.vm_context.is_null() {
+    fn take_runtime_helper_error(frame_state: &mut JitFrameState) -> RuntimeError {
+        if !frame_state.vm_context.is_null() {
             unsafe {
-                let vm = &mut *(self.frame_state.vm_context as *mut VirtualMachine);
+                let vm = &mut *(frame_state.vm_context as *mut VirtualMachine);
                 if let Some(err) = vm.take_last_jit_error() {
                     return err;
                 }
