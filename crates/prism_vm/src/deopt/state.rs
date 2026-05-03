@@ -34,45 +34,54 @@ pub enum DeoptReason {
     TypeGuard = 0,
     /// Integer overflow in arithmetic operation.
     Overflow = 1,
-    /// Array/string bounds check failed.
-    BoundsCheck = 2,
-    /// Inline cache miss - unexpected property layout.
-    CacheMiss = 3,
-    /// Unknown or uncompiled opcode encountered.
-    UnknownOp = 4,
     /// Division by zero.
-    DivByZero = 5,
+    DivByZero = 2,
+    /// Null or undefined access.
+    NullPointer = 3,
+    /// Array/string bounds check failed.
+    BoundsCheck = 4,
+    /// Inline cache miss - unexpected property layout.
+    CacheMiss = 5,
     /// Stack overflow detected.
     StackOverflow = 6,
-    /// OSR exit - leaving JIT code mid-loop.
-    OsrExit = 7,
     /// Uncommon trap - rarely-taken path.
-    UncommonTrap = 8,
+    UncommonTrap = 7,
+    /// Debugger breakpoint.
+    Breakpoint = 8,
+    /// Unknown or uncompiled opcode encountered.
+    UnknownOp = 9,
+    /// OSR exit - leaving JIT code mid-loop.
+    OsrExit = 10,
     /// Polymorphic call site - too many types.
-    PolymorphicSite = 9,
+    PolymorphicSite = 11,
     /// Memory allocation failure.
-    AllocationFailure = 10,
+    AllocationFailure = 12,
     /// Explicit deopt request (debugging).
-    Explicit = 11,
+    Explicit = 13,
 }
 
 impl DeoptReason {
+    /// Number of deopt reasons tracked by the VM statistics tables.
+    pub const COUNT: usize = 14;
+
     /// Convert from raw u8 value.
     #[inline]
     pub const fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::TypeGuard),
             1 => Some(Self::Overflow),
-            2 => Some(Self::BoundsCheck),
-            3 => Some(Self::CacheMiss),
-            4 => Some(Self::UnknownOp),
-            5 => Some(Self::DivByZero),
+            2 => Some(Self::DivByZero),
+            3 => Some(Self::NullPointer),
+            4 => Some(Self::BoundsCheck),
+            5 => Some(Self::CacheMiss),
             6 => Some(Self::StackOverflow),
-            7 => Some(Self::OsrExit),
-            8 => Some(Self::UncommonTrap),
-            9 => Some(Self::PolymorphicSite),
-            10 => Some(Self::AllocationFailure),
-            11 => Some(Self::Explicit),
+            7 => Some(Self::UncommonTrap),
+            8 => Some(Self::Breakpoint),
+            9 => Some(Self::UnknownOp),
+            10 => Some(Self::OsrExit),
+            11 => Some(Self::PolymorphicSite),
+            12 => Some(Self::AllocationFailure),
+            13 => Some(Self::Explicit),
             _ => None,
         }
     }
@@ -101,13 +110,15 @@ impl std::fmt::Display for DeoptReason {
         let name = match self {
             Self::TypeGuard => "type guard",
             Self::Overflow => "overflow",
+            Self::DivByZero => "division by zero",
+            Self::NullPointer => "null pointer",
             Self::BoundsCheck => "bounds check",
             Self::CacheMiss => "cache miss",
             Self::UnknownOp => "unknown op",
-            Self::DivByZero => "division by zero",
             Self::StackOverflow => "stack overflow",
             Self::OsrExit => "OSR exit",
             Self::UncommonTrap => "uncommon trap",
+            Self::Breakpoint => "breakpoint",
             Self::PolymorphicSite => "polymorphic site",
             Self::AllocationFailure => "allocation failure",
             Self::Explicit => "explicit",

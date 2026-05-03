@@ -55,20 +55,24 @@ pub enum DeoptReason {
     TypeGuard = 0,
     /// Overflow detected.
     Overflow = 1,
-    /// Bounds check failed.
-    BoundsCheck = 2,
-    /// Inline cache miss.
-    CacheMiss = 3,
-    /// Unknown opcode.
-    UnknownOp = 4,
     /// Division by zero.
-    DivByZero = 5,
+    DivByZero = 2,
+    /// Null pointer or undefined access.
+    NullPointer = 3,
+    /// Bounds check failed.
+    BoundsCheck = 4,
+    /// Inline cache miss.
+    CacheMiss = 5,
     /// Stack overflow.
     StackOverflow = 6,
-    /// OSR exit.
-    OsrExit = 7,
     /// Uncommon trap.
-    UncommonTrap = 8,
+    UncommonTrap = 7,
+    /// Debugger breakpoint.
+    Breakpoint = 8,
+    /// Unknown opcode.
+    UnknownOp = 9,
+    /// OSR exit.
+    OsrExit = 10,
 }
 
 impl DeoptReason {
@@ -78,13 +82,15 @@ impl DeoptReason {
         match value {
             0 => Some(Self::TypeGuard),
             1 => Some(Self::Overflow),
-            2 => Some(Self::BoundsCheck),
-            3 => Some(Self::CacheMiss),
-            4 => Some(Self::UnknownOp),
-            5 => Some(Self::DivByZero),
+            2 => Some(Self::DivByZero),
+            3 => Some(Self::NullPointer),
+            4 => Some(Self::BoundsCheck),
+            5 => Some(Self::CacheMiss),
             6 => Some(Self::StackOverflow),
-            7 => Some(Self::OsrExit),
-            8 => Some(Self::UncommonTrap),
+            7 => Some(Self::UncommonTrap),
+            8 => Some(Self::Breakpoint),
+            9 => Some(Self::UnknownOp),
+            10 => Some(Self::OsrExit),
             _ => None,
         }
     }
@@ -506,5 +512,38 @@ impl DeoptRecovery {
     /// Create recovery with bytecode offset and reason.
     pub fn new(bc_offset: u32, reason: DeoptReason) -> Self {
         Self { bc_offset, reason }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_jit::tier1::deopt::DeoptReason as Tier1DeoptReason;
+
+    #[test]
+    fn tier1_deopt_reason_payload_matches_vm_decoder() {
+        let expected = [
+            (Tier1DeoptReason::TypeGuardFailed, DeoptReason::TypeGuard),
+            (Tier1DeoptReason::IntegerOverflow, DeoptReason::Overflow),
+            (Tier1DeoptReason::DivisionByZero, DeoptReason::DivByZero),
+            (Tier1DeoptReason::NullPointer, DeoptReason::NullPointer),
+            (
+                Tier1DeoptReason::BoundsCheckFailed,
+                DeoptReason::BoundsCheck,
+            ),
+            (Tier1DeoptReason::InlineCacheMiss, DeoptReason::CacheMiss),
+            (Tier1DeoptReason::StackOverflow, DeoptReason::StackOverflow),
+            (Tier1DeoptReason::UncommonTrap, DeoptReason::UncommonTrap),
+            (Tier1DeoptReason::Breakpoint, DeoptReason::Breakpoint),
+        ];
+
+        for (jit_reason, vm_reason) in expected {
+            assert_eq!(
+                DeoptReason::from_u8(jit_reason as u8),
+                Some(vm_reason),
+                "Tier 1 reason {} must decode consistently in the VM",
+                jit_reason.as_str()
+            );
+        }
     }
 }

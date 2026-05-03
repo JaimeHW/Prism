@@ -43,7 +43,7 @@ pub struct DeoptSite {
     /// Total deopt count.
     count: AtomicU32,
     /// Count by reason.
-    by_reason: [AtomicU32; 12],
+    by_reason: [AtomicU32; DeoptReason::COUNT],
     /// Last deopt timestamp (TSC or nanos).
     last_timestamp: AtomicU64,
     /// Whether guard has been patched.
@@ -58,7 +58,7 @@ impl DeoptSite {
         Self {
             key,
             count: AtomicU32::new(0),
-            by_reason: [ZERO; 12],
+            by_reason: [ZERO; DeoptReason::COUNT],
             last_timestamp: AtomicU64::new(0),
             patched: AtomicU32::new(0),
         }
@@ -143,7 +143,7 @@ pub struct DeoptStats {
     /// Total deopts across all sites.
     total_deopts: AtomicU64,
     /// Total deopts by reason.
-    by_reason: [AtomicU64; 12],
+    by_reason: [AtomicU64; DeoptReason::COUNT],
 }
 
 impl DeoptStats {
@@ -154,7 +154,7 @@ impl DeoptStats {
         Self {
             sites: RwLock::new(HashMap::new()),
             total_deopts: AtomicU64::new(0),
-            by_reason: [ZERO; 12],
+            by_reason: [ZERO; DeoptReason::COUNT],
         }
     }
 
