@@ -34,3 +34,26 @@ else:
 "#,
     );
 }
+
+#[test]
+fn getaddrinfo_resolves_numeric_and_named_services() {
+    execute(
+        r#"
+import _socket
+
+for service, expected in (("80", 80), (b"80", 80), ("http", 80), (b"http", 80)):
+    infos = _socket.getaddrinfo("127.0.0.1", service, _socket.AF_INET, _socket.SOCK_STREAM)
+    sockaddr = infos[0][4]
+    if sockaddr != ("127.0.0.1", expected):
+        raise RuntimeError(sockaddr)
+
+for service in ("nonsense", b"nonsense"):
+    try:
+        _socket.getaddrinfo("127.0.0.1", service, _socket.AF_INET, _socket.SOCK_STREAM)
+    except OSError:
+        pass
+    else:
+        raise RuntimeError("unknown service should fail")
+"#,
+    );
+}

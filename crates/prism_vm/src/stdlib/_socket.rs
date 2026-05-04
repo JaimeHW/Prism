@@ -1193,7 +1193,7 @@ fn socket_getaddrinfo(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     let host = if args[0].is_none() {
         "127.0.0.1".to_string()
     } else {
-        string_arg(args[0], "host")?
+        string_or_bytes_arg(args[0], "host")?
     };
     let port = port_number(vm, args[1])?;
     let family = optional_i64_arg_vm(vm, args.get(2).copied(), 0, "family")?;
@@ -1793,6 +1793,21 @@ fn string_arg(value: Value, name: &str) -> Result<String, BuiltinError> {
         .ok_or_else(|| BuiltinError::TypeError(format!("{name} must be str")))
 }
 
+fn string_or_bytes_arg(value: Value, name: &str) -> Result<String, BuiltinError> {
+    if let Some(text) = value_as_string_ref(value) {
+        return Ok(text.as_str().to_string());
+    }
+
+    if let Some(bytes) = exact_bytes(value) {
+        return String::from_utf8(bytes)
+            .map_err(|_| BuiltinError::TypeError(format!("{name} must be valid UTF-8 bytes")));
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "{name} must be str or bytes"
+    )))
+}
+
 fn bytes_arg(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
     let ptr = value
         .as_object_ptr()
@@ -1810,6 +1825,15 @@ fn bytes_arg(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
             Ok(view.as_bytes().to_vec())
         }
         _ => Err(BuiltinError::TypeError(context.to_string())),
+    }
+}
+
+fn exact_bytes(value: Value) -> Option<Vec<u8>> {
+    let ptr = value.as_object_ptr()?;
+    if crate::ops::objects::extract_type_id(ptr) == TypeId::BYTES {
+        Some(unsafe { &*(ptr as *const BytesObject) }.to_vec())
+    } else {
+        None
     }
 }
 
@@ -1833,9 +1857,32 @@ fn port_number(vm: &mut VirtualMachine, value: Value) -> Result<i64, BuiltinErro
         return Ok(port);
     }
     if let Some(service) = value_as_string_ref(value) {
-        return Ok(service_port(service.as_str()).unwrap_or(0));
+        return resolve_service_port(service.as_str());
+    }
+    if let Some(service) = exact_bytes(value) {
+        let service = String::from_utf8(service)
+            .map_err(|_| BuiltinError::OSError("service/proto not found".to_string()))?;
+        return resolve_service_port(&service);
     }
     int_arg_vm(vm, value, "port")
+}
+
+fn resolve_service_port(service: &str) -> Result<i64, BuiltinError> {
+    if let Some(port) = parse_decimal_port(service) {
+        return Ok(port);
+    }
+
+    let normalized = service.to_ascii_lowercase();
+    service_port(&normalized)
+        .ok_or_else(|| BuiltinError::OSError(format!("service/proto not found: {service}")))
+}
+
+fn parse_decimal_port(service: &str) -> Option<i64> {
+    if service.is_empty() || !service.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    service.parse::<i64>().ok()
 }
 
 fn service_port(service: &str) -> Option<i64> {
