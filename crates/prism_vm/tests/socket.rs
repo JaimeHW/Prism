@@ -71,6 +71,67 @@ if _socket.SOL_TCP != _socket.IPPROTO_TCP:
 }
 
 #[test]
+fn udp_sendto_and_recvfrom_round_trip() {
+    execute(
+        r#"
+import _socket
+
+server = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+server.bind(("127.0.0.1", 0))
+server.settimeout(1.0)
+
+client = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+sent = client.sendto(b"ok", server.getsockname())
+if sent != 2:
+    raise RuntimeError(sent)
+
+data, peer = server.recvfrom(16)
+if data != b"ok":
+    raise RuntimeError(data)
+if peer[0] != "127.0.0.1":
+    raise RuntimeError(peer)
+"#,
+    );
+}
+
+#[test]
+fn udp_nonblocking_recvfrom_raises_blocking_io_error() {
+    execute(
+        r#"
+import _socket
+
+sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", 0))
+sock.setblocking(False)
+
+try:
+    sock.recvfrom(1)
+except BlockingIOError:
+    pass
+else:
+    raise RuntimeError("nonblocking recvfrom did not raise BlockingIOError")
+"#,
+    );
+}
+
+#[test]
+fn udp_broadcast_socket_option_round_trips() {
+    execute(
+        r#"
+import _socket
+
+sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+if sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST):
+    raise RuntimeError("SO_BROADCAST should be disabled by default")
+
+sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+if not sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST):
+    raise RuntimeError("SO_BROADCAST should be enabled")
+"#,
+    );
+}
+
+#[test]
 fn getaddrinfo_preserves_ipv6_family_and_scope_id() {
     execute(
         r#"

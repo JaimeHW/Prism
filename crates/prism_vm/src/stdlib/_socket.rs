@@ -31,6 +31,7 @@ use rustc_hash::FxHashMap;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream,
+    UdpSocket,
 };
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -93,6 +94,10 @@ const EXPORTED_CONSTANTS: &[(&str, i64)] = &[
 
 const AF_INET_VALUE: i64 = 2;
 const SOCK_STREAM_VALUE: i64 = 1;
+const SOCK_DGRAM_VALUE: i64 = 2;
+const IPPROTO_TCP_VALUE: i64 = 6;
+const TCP_NODELAY_VALUE: i64 = 1;
+const SO_BROADCAST_VALUE: i64 = 32;
 
 const EXPORTED_NAMES: &[&str] = &[
     "AF_INET",
@@ -233,8 +238,14 @@ static SOCKET_DUP_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.dup"), socket_dup));
 static SOCKET_RECV_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.recv"), socket_recv));
+static SOCKET_RECVFROM_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.recvfrom"), socket_recvfrom)
+});
 static SOCKET_SEND_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("_socket.socket.send"), socket_send));
+static SOCKET_SENDTO_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm(Arc::from("_socket.socket.sendto"), socket_sendto)
+});
 static SOCKET_SENDALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("_socket.socket.sendall"), socket_sendall)
 });
@@ -329,6 +340,7 @@ enum SocketHandle {
     Empty,
     Listener(TcpListener),
     Stream(TcpStream),
+    Datagram(UdpSocket),
 }
 
 pub(crate) fn write_signal_wakeup_byte(fd: i64, byte: u8) -> io::Result<()> {
@@ -375,6 +387,7 @@ impl SocketState {
         match &self.handle {
             SocketHandle::Listener(listener) => listener.local_addr().ok(),
             SocketHandle::Stream(stream) => stream.local_addr().ok(),
+            SocketHandle::Datagram(socket) => socket.local_addr().ok(),
             SocketHandle::Empty => self.bound_addr,
         }
     }
@@ -382,6 +395,7 @@ impl SocketState {
     fn peer_addr(&self) -> Option<SocketAddr> {
         match &self.handle {
             SocketHandle::Stream(stream) => stream.peer_addr().ok(),
+            SocketHandle::Datagram(socket) => socket.peer_addr().ok(),
             SocketHandle::Listener(_) | SocketHandle::Empty => None,
         }
     }
@@ -390,6 +404,7 @@ impl SocketState {
         match &self.handle {
             SocketHandle::Listener(listener) => listener.set_nonblocking(nonblocking),
             SocketHandle::Stream(stream) => stream.set_nonblocking(nonblocking),
+            SocketHandle::Datagram(socket) => socket.set_nonblocking(nonblocking),
             SocketHandle::Empty => Ok(()),
         }
         .map_err(socket_io_error)
@@ -413,6 +428,7 @@ impl SocketState {
             SocketHandle::Listener(listener) => listener
                 .set_nonblocking(self.timeout == Some(0.0))
                 .map_err(socket_io_error),
+            SocketHandle::Datagram(socket) => apply_datagram_options(socket, self),
             SocketHandle::Empty => Ok(()),
         }
     }
@@ -425,6 +441,9 @@ impl SocketState {
             }
             SocketHandle::Stream(stream) => {
                 SocketHandle::Stream(stream.try_clone().map_err(socket_io_error)?)
+            }
+            SocketHandle::Datagram(socket) => {
+                SocketHandle::Datagram(socket.try_clone().map_err(socket_io_error)?)
             }
         };
         let clone = Self {
@@ -622,7 +641,9 @@ fn build_socket_class() -> Arc<PyClassObject> {
         builtin_value(&SOCKET_SETBLOCKING_METHOD),
     );
     class.set_attr(intern("recv"), builtin_value(&SOCKET_RECV_METHOD));
+    class.set_attr(intern("recvfrom"), builtin_value(&SOCKET_RECVFROM_METHOD));
     class.set_attr(intern("send"), builtin_value(&SOCKET_SEND_METHOD));
+    class.set_attr(intern("sendto"), builtin_value(&SOCKET_SENDTO_METHOD));
     class.set_attr(intern("sendall"), builtin_value(&SOCKET_SENDALL_METHOD));
     class.set_attr(
         intern("setsockopt"),
@@ -823,10 +844,17 @@ fn socket_getsockopt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
     let Some(state) = states.get(&fd) else {
         return Err(BuiltinError::OSError("Bad file descriptor".to_string()));
     };
-    if level == 6
-        && optname == 1
+    if level == IPPROTO_TCP_VALUE
+        && optname == TCP_NODELAY_VALUE
         && let SocketHandle::Stream(stream) = &state.handle
         && let Ok(enabled) = stream.nodelay()
+    {
+        return Ok(Value::int(i64::from(enabled)).unwrap());
+    }
+    if level == SOL_SOCKET_VALUE
+        && optname == SO_BROADCAST_VALUE
+        && let SocketHandle::Datagram(socket) = &state.handle
+        && let Ok(enabled) = socket.broadcast()
     {
         return Ok(Value::int(i64::from(enabled)).unwrap());
     }
@@ -856,6 +884,14 @@ fn socket_bind(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
             .map_err(socket_io_error)?;
         state.bound_addr = listener.local_addr().ok();
         state.handle = SocketHandle::Listener(listener);
+    } else if state.kind == SOCK_DGRAM_VALUE {
+        if !matches!(state.handle, SocketHandle::Empty) {
+            return Err(BuiltinError::OSError("Invalid argument".to_string()));
+        }
+        let socket = UdpSocket::bind(addr).map_err(socket_io_error)?;
+        apply_datagram_options(&socket, state)?;
+        state.bound_addr = socket.local_addr().ok();
+        state.handle = SocketHandle::Datagram(socket);
     } else {
         state.bound_addr = Some(addr);
     }
@@ -904,8 +940,16 @@ fn socket_connect(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Buil
     let state = states
         .get_mut(&fd)
         .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    if state.kind == SOCK_DGRAM_VALUE {
+        let local_addr = {
+            let socket = ensure_datagram_socket(state)?;
+            socket.connect(addr).map_err(socket_io_error)?;
+            socket.local_addr().ok()
+        };
+        state.bound_addr = local_addr;
+        return Ok(Value::none());
+    }
     if state.kind != SOCK_STREAM_VALUE {
-        state.bound_addr = Some(addr);
         return Ok(Value::none());
     }
 
@@ -1007,6 +1051,14 @@ fn socket_recv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
     let state = states
         .get_mut(&fd)
         .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    if state.kind == SOCK_DGRAM_VALUE {
+        let socket = ensure_datagram_socket(state)?;
+        let mut buffer = vec![0_u8; size];
+        let read = socket.recv(&mut buffer).map_err(socket_io_error)?;
+        buffer.truncate(read);
+        return Ok(bytes_value(&buffer));
+    }
+
     let SocketHandle::Stream(stream) = &mut state.handle else {
         return Err(BuiltinError::OSError("socket is not connected".to_string()));
     };
@@ -1014,6 +1066,52 @@ fn socket_recv(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, Builtin
     let read = stream.read(&mut buffer).map_err(socket_io_error)?;
     buffer.truncate(read);
     Ok(bytes_value(&buffer))
+}
+
+fn socket_recvfrom(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(BuiltinError::TypeError(format!(
+            "recvfrom() takes 1 or 2 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    if let Some(flags) = args.get(2).copied() {
+        let _ = int_arg_vm(vm, flags, "flags")?;
+    }
+    let size = usize::try_from(int_arg_vm(vm, args[1], "bufsize")?)
+        .map_err(|_| BuiltinError::ValueError("negative buffersize in recvfrom".to_string()))?;
+    let object = shaped_socket_ref(args[0])?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+
+    if state.kind == SOCK_DGRAM_VALUE {
+        let family = state.family;
+        let socket = ensure_datagram_socket(state)?;
+        let mut buffer = vec![0_u8; size];
+        let (read, peer) = socket.recv_from(&mut buffer).map_err(socket_io_error)?;
+        buffer.truncate(read);
+        return Ok(tuple_value(vec![
+            bytes_value(&buffer),
+            sockaddr_value(peer, family),
+        ]));
+    }
+
+    let family = state.family;
+    let SocketHandle::Stream(stream) = &mut state.handle else {
+        return Err(BuiltinError::OSError("socket is not connected".to_string()));
+    };
+    let peer = stream.peer_addr().ok();
+    let mut buffer = vec![0_u8; size];
+    let read = stream.read(&mut buffer).map_err(socket_io_error)?;
+    buffer.truncate(read);
+    let peer = peer.unwrap_or_else(|| default_socket_addr(family));
+    Ok(tuple_value(vec![
+        bytes_value(&buffer),
+        sockaddr_value(peer, family),
+    ]))
 }
 
 fn socket_send(args: &[Value]) -> Result<Value, BuiltinError> {
@@ -1030,10 +1128,50 @@ fn socket_send(args: &[Value]) -> Result<Value, BuiltinError> {
     let state = states
         .get_mut(&fd)
         .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
-    let SocketHandle::Stream(stream) = &mut state.handle else {
-        return Err(BuiltinError::OSError("socket is not connected".to_string()));
+    let written = if state.kind == SOCK_DGRAM_VALUE {
+        ensure_datagram_socket(state)?
+            .send(&bytes)
+            .map_err(socket_io_error)?
+    } else {
+        let SocketHandle::Stream(stream) = &mut state.handle else {
+            return Err(BuiltinError::OSError("socket is not connected".to_string()));
+        };
+        stream.write(&bytes).map_err(socket_io_error)?
     };
-    let written = stream.write(&bytes).map_err(socket_io_error)?;
+    Ok(Value::int(written as i64).unwrap())
+}
+
+fn socket_sendto(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(BuiltinError::TypeError(format!(
+            "sendto() takes 2 or 3 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let bytes = bytes_arg(args[1], "a bytes-like object is required")?;
+    let address_arg = if args.len() == 3 {
+        args[2]
+    } else {
+        let _ = int_arg_vm(vm, args[2], "flags")?;
+        args[3]
+    };
+    let object = shaped_socket_ref(args[0])?;
+    let addr = sockaddr_arg(vm, address_arg, socket_family(object))?;
+    let fd = require_open_socket_fd(object)?;
+    let mut states = SOCKET_STATES.lock().unwrap();
+    let state = states
+        .get_mut(&fd)
+        .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
+    if state.kind != SOCK_DGRAM_VALUE {
+        return Err(BuiltinError::OSError(
+            "sendto() requires a datagram socket".to_string(),
+        ));
+    }
+
+    let written = ensure_datagram_socket(state)?
+        .send_to(&bytes, addr)
+        .map_err(socket_io_error)?;
     Ok(Value::int(written as i64).unwrap())
 }
 
@@ -1051,10 +1189,21 @@ fn socket_sendall(args: &[Value]) -> Result<Value, BuiltinError> {
     let state = states
         .get_mut(&fd)
         .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
-    let SocketHandle::Stream(stream) = &mut state.handle else {
-        return Err(BuiltinError::OSError("socket is not connected".to_string()));
-    };
-    stream.write_all(&bytes).map_err(socket_io_error)?;
+    if state.kind == SOCK_DGRAM_VALUE {
+        let written = ensure_datagram_socket(state)?
+            .send(&bytes)
+            .map_err(socket_io_error)?;
+        if written != bytes.len() {
+            return Err(BuiltinError::OSError(
+                "partial datagram send is not supported".to_string(),
+            ));
+        }
+    } else {
+        let SocketHandle::Stream(stream) = &mut state.handle else {
+            return Err(BuiltinError::OSError("socket is not connected".to_string()));
+        };
+        stream.write_all(&bytes).map_err(socket_io_error)?;
+    }
     Ok(Value::none())
 }
 
@@ -1102,11 +1251,19 @@ fn socket_setsockopt(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, B
         .get_mut(&fd)
         .ok_or_else(|| BuiltinError::OSError("Bad file descriptor".to_string()))?;
     state.options.insert((level, optname), optvalue);
-    if level == 6
-        && optname == 1
+    if level == IPPROTO_TCP_VALUE
+        && optname == TCP_NODELAY_VALUE
         && let SocketHandle::Stream(stream) = &state.handle
     {
         stream.set_nodelay(optvalue != 0).map_err(socket_io_error)?;
+    }
+    if level == SOL_SOCKET_VALUE
+        && optname == SO_BROADCAST_VALUE
+        && let SocketHandle::Datagram(socket) = &state.handle
+    {
+        socket
+            .set_broadcast(optvalue != 0)
+            .map_err(socket_io_error)?;
     }
     Ok(Value::none())
 }
@@ -1589,7 +1746,7 @@ fn connect_tcp_stream(addr: SocketAddr, timeout: Option<f64>) -> Result<TcpStrea
 }
 
 fn apply_stream_options(stream: &TcpStream, state: &SocketState) -> Result<(), BuiltinError> {
-    if let Some(value) = state.options.get(&(6, 1)) {
+    if let Some(value) = state.options.get(&(IPPROTO_TCP_VALUE, TCP_NODELAY_VALUE)) {
         stream.set_nodelay(*value != 0).map_err(socket_io_error)?;
     }
     stream
@@ -1600,11 +1757,56 @@ fn apply_stream_options(stream: &TcpStream, state: &SocketState) -> Result<(), B
     stream.set_write_timeout(duration).map_err(socket_io_error)
 }
 
+fn apply_datagram_options(socket: &UdpSocket, state: &SocketState) -> Result<(), BuiltinError> {
+    if let Some(value) = state.options.get(&(SOL_SOCKET_VALUE, SO_BROADCAST_VALUE)) {
+        socket.set_broadcast(*value != 0).map_err(socket_io_error)?;
+    }
+    socket
+        .set_nonblocking(state.timeout == Some(0.0))
+        .map_err(socket_io_error)?;
+    let duration = timeout_duration(state.timeout).filter(|duration| !duration.is_zero());
+    socket.set_read_timeout(duration).map_err(socket_io_error)?;
+    socket.set_write_timeout(duration).map_err(socket_io_error)
+}
+
+fn ensure_datagram_socket(state: &mut SocketState) -> Result<&mut UdpSocket, BuiltinError> {
+    match &state.handle {
+        SocketHandle::Datagram(_) => {}
+        SocketHandle::Empty => {
+            let addr = state
+                .bound_addr
+                .unwrap_or_else(|| default_datagram_bind_addr(state.family));
+            let socket = UdpSocket::bind(addr).map_err(socket_io_error)?;
+            apply_datagram_options(&socket, state)?;
+            state.bound_addr = socket.local_addr().ok();
+            state.handle = SocketHandle::Datagram(socket);
+        }
+        _ => {
+            return Err(BuiltinError::OSError(
+                "operation requires a datagram socket".to_string(),
+            ));
+        }
+    }
+
+    match &mut state.handle {
+        SocketHandle::Datagram(socket) => Ok(socket),
+        _ => unreachable!("ensure_datagram_socket installs a datagram handle"),
+    }
+}
+
 fn default_bind_addr(family: i64) -> SocketAddr {
     if family == AF_INET6_VALUE {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
     } else {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    }
+}
+
+fn default_datagram_bind_addr(family: i64) -> SocketAddr {
+    if family == AF_INET6_VALUE {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     }
 }
 
