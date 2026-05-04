@@ -158,8 +158,8 @@ pub struct GeneratorObject {
     // === EXECUTION STATE (8 bytes) ===
     /// Instruction pointer to resume at.
     ip: u32,
-    /// Liveness map for current yield point (compact form).
-    liveness_bits: u32,
+    /// Liveness map for current yield point.
+    liveness_bits: u64,
 
     // === FRAME STORAGE ===
     /// Storage for live register values.
@@ -324,7 +324,7 @@ impl GeneratorObject {
     /// Returns the liveness map for the current yield point.
     #[inline]
     pub fn liveness(&self) -> LivenessMap {
-        LivenessMap::from_bits(self.liveness_bits as u64)
+        LivenessMap::from_bits(self.liveness_bits)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -356,7 +356,7 @@ impl GeneratorObject {
         liveness: LivenessMap,
     ) {
         self.ip = ip;
-        self.liveness_bits = liveness.bits() as u32;
+        self.liveness_bits = liveness.bits();
         self.storage.capture(registers, liveness);
         self.state_header.suspend(resume_index);
     }
@@ -381,7 +381,7 @@ impl GeneratorObject {
     /// is created from bound call arguments.
     #[inline]
     pub fn seed_locals(&mut self, registers: &[Value; 256], liveness: LivenessMap) {
-        self.liveness_bits = liveness.bits() as u32;
+        self.liveness_bits = liveness.bits();
         self.storage.capture(registers, liveness);
     }
 
