@@ -28,6 +28,7 @@ use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_builtins::global_class;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
+use prism_runtime::types::list::ListObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::TupleObject;
@@ -83,6 +84,9 @@ pub struct ExceptionValue {
     /// Lazily allocated SyntaxError metadata.
     syntax_details: Option<Box<SyntaxErrorDetails>>,
 
+    /// Lazily allocated BaseExceptionGroup metadata.
+    exception_group_details: Option<Box<ExceptionGroupDetails>>,
+
     /// Explicit cause (from `raise X from Y`).
     pub cause: Option<Value>,
 
@@ -106,6 +110,11 @@ pub struct ExceptionValue {
 struct ImportErrorDetails {
     name: Option<Arc<str>>,
     path: Option<Arc<str>>,
+}
+
+#[derive(Debug)]
+struct ExceptionGroupDetails {
+    exceptions: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +264,7 @@ impl ExceptionValue {
             args: None,
             import_details: None,
             syntax_details: None,
+            exception_group_details: None,
             cause: None,
             context: None,
             traceback: None,
@@ -279,6 +289,7 @@ impl ExceptionValue {
             args: Some(args),
             import_details: None,
             syntax_details: None,
+            exception_group_details: None,
             cause: None,
             context: None,
             traceback: None,
@@ -368,6 +379,13 @@ impl ExceptionValue {
             .and_then(|details| details.end_offset)
     }
 
+    #[inline]
+    pub fn exception_group_exceptions(&self) -> Option<Value> {
+        self.exception_group_details
+            .as_ref()
+            .map(|details| details.exceptions)
+    }
+
     /// Render the exception payload using Python's `str(exception)` semantics.
     pub fn display_text(&self) -> String {
         if let Some(args) = self.args.as_deref() {
@@ -410,11 +428,42 @@ impl ExceptionValue {
 
     /// Replace the Python-visible constructor payload of an existing native
     /// exception instance.
-    pub fn reinitialize_args(&mut self, args: &[Value]) {
+    pub fn reinitialize_args(&mut self, args: &[Value]) -> Result<(), BuiltinError> {
+        if self
+            .type_id()
+            .is_subclass_of(ExceptionTypeId::BaseExceptionGroup)
+        {
+            return self.reinitialize_exception_group_args(args);
+        }
+
         self.message = args
             .first()
             .and_then(|value| owned_string_value(*value).map(Arc::from));
         self.args = Some(args.to_vec().into_boxed_slice());
+        self.exception_group_details = None;
+        Ok(())
+    }
+
+    fn reinitialize_exception_group_args(&mut self, args: &[Value]) -> Result<(), BuiltinError> {
+        if args.len() != 2 {
+            return Err(BuiltinError::TypeError(format!(
+                "{}() takes exactly 2 arguments ({} given)",
+                self.type_name(),
+                args.len()
+            )));
+        }
+
+        let Some(message) = owned_string_value(args[0]) else {
+            return Err(BuiltinError::TypeError(
+                "BaseExceptionGroup.__new__() argument 1 must be str".to_string(),
+            ));
+        };
+
+        let exceptions = exception_group_exceptions_tuple(args[1], self.type_id())?;
+        self.message = Some(Arc::from(message));
+        self.args = Some(args.to_vec().into_boxed_slice());
+        self.exception_group_details = Some(Box::new(ExceptionGroupDetails { exceptions }));
+        Ok(())
     }
 
     /// Set the cause (from `raise X from Y`).
@@ -650,6 +699,9 @@ unsafe impl Trace for ExceptionValue {
         if let Some(dict) = self.dict {
             tracer.trace_value(dict);
         }
+        if let Some(details) = self.exception_group_details.as_deref() {
+            tracer.trace_value(details.exceptions);
+        }
     }
 
     fn size_of(&self) -> usize {
@@ -662,6 +714,10 @@ unsafe impl Trace for ExceptionValue {
                 .syntax_details
                 .as_deref()
                 .map_or(0, |_| mem::size_of::<SyntaxErrorDetails>())
+            + self
+                .exception_group_details
+                .as_deref()
+                .map_or(0, |_| mem::size_of::<ExceptionGroupDetails>())
             + self
                 .args
                 .as_deref()
@@ -819,7 +875,7 @@ fn builtin_exception_init(args: &[Value]) -> Result<Value, BuiltinError> {
     };
 
     if let Some(exception) = unsafe { ExceptionValue::from_value_mut(receiver) } {
-        exception.reinitialize_args(&args[1..]);
+        exception.reinitialize_args(&args[1..])?;
         return Ok(Value::none());
     }
 
@@ -1154,6 +1210,70 @@ fn tuple_ref(value: Value) -> Option<&'static TupleObject> {
 }
 
 #[inline]
+fn list_ref(value: Value) -> Option<&'static ListObject> {
+    let ptr = value.as_object_ptr()?;
+    (unsafe { (*(ptr as *const ObjectHeader)).type_id } == TypeId::LIST)
+        .then(|| unsafe { &*(ptr as *const ListObject) })
+}
+
+fn exception_group_exceptions_tuple(
+    exceptions: Value,
+    group_type: ExceptionTypeId,
+) -> Result<Value, BuiltinError> {
+    let items = if let Some(tuple) = tuple_ref(exceptions) {
+        tuple.as_slice().to_vec()
+    } else if let Some(list) = list_ref(exceptions) {
+        list.as_slice().to_vec()
+    } else {
+        return Err(BuiltinError::TypeError(
+            "second argument (exceptions) must be a sequence".to_string(),
+        ));
+    };
+
+    if items.is_empty() {
+        return Err(BuiltinError::ValueError(
+            "second argument (exceptions) must be a non-empty sequence".to_string(),
+        ));
+    }
+
+    let requires_exception_subclass = group_type.is_subclass_of(ExceptionTypeId::Exception);
+    for (index, item) in items.iter().copied().enumerate() {
+        if !exception_instance_is_subclass_of(item, ExceptionTypeId::BaseException) {
+            return Err(BuiltinError::ValueError(format!(
+                "Item {index} of second argument (exceptions) is not an exception"
+            )));
+        }
+
+        if requires_exception_subclass
+            && !exception_instance_is_subclass_of(item, ExceptionTypeId::Exception)
+        {
+            return Err(BuiltinError::TypeError(format!(
+                "Cannot nest BaseExceptions in '{}'",
+                group_type.name()
+            )));
+        }
+    }
+
+    Ok(crate::alloc_managed_value(TupleObject::from_vec(items)))
+}
+
+fn exception_instance_is_subclass_of(value: Value, base: ExceptionTypeId) -> bool {
+    if let Some(exception) = unsafe { ExceptionValue::from_value(value) } {
+        return exception.type_id().is_subclass_of(base);
+    }
+
+    let Some(class) = heap_exception_class_from_value(value) else {
+        return false;
+    };
+
+    class.mro().iter().copied().any(|class_id| {
+        crate::builtins::exception_type_id_for_proxy_class_id(class_id)
+            .and_then(|type_id| ExceptionTypeId::from_u8(type_id as u8))
+            .is_some_and(|type_id| type_id.is_subclass_of(base))
+    })
+}
+
+#[inline]
 fn exception_arg_display_text(value: Value) -> String {
     if let Some(text) = owned_string_value(value) {
         return text;
@@ -1260,6 +1380,15 @@ pub fn create_exception_with_args(
     ExceptionValue::with_args(type_id, message, args).into_value()
 }
 
+pub fn create_exception_group_with_args(
+    type_id: ExceptionTypeId,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let mut exception = ExceptionValue::new(type_id, None);
+    exception.reinitialize_exception_group_args(args)?;
+    Ok(exception.into_value())
+}
+
 pub fn create_exception_with_args_in_vm(
     vm: &VirtualMachine,
     type_id: ExceptionTypeId,
@@ -1267,6 +1396,18 @@ pub fn create_exception_with_args_in_vm(
     args: Box<[Value]>,
 ) -> Result<Value, RuntimeError> {
     ExceptionValue::with_args(type_id, message, args).into_gc_value(vm)
+}
+
+pub fn create_exception_group_with_args_in_vm(
+    vm: &VirtualMachine,
+    type_id: ExceptionTypeId,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let mut exception = ExceptionValue::new(type_id, None);
+    exception
+        .reinitialize_exception_group_args(args)
+        .map_err(RuntimeError::from)?;
+    exception.into_gc_value(vm)
 }
 
 /// Create an import-related exception with `.name` / `.path` metadata.

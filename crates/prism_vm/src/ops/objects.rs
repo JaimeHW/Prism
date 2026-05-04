@@ -11,7 +11,8 @@ use crate::builtins::{
     builtin_bound_type_attribute_value, builtin_bound_type_attribute_value_static,
     builtin_instance_attribute_value, builtin_type_class_or_static_attribute_value_static,
     builtin_type_object_attribute_value, exception_proxy_class_id_from_ptr,
-    exception_type_attribute_value, heap_type_attribute_value,
+    exception_type_attribute_value, exception_type_id_for_proxy_class_id,
+    heap_type_attribute_value,
 };
 use crate::dispatch::ControlFlow;
 use crate::error::{RuntimeError, RuntimeErrorKind};
@@ -55,6 +56,8 @@ use prism_runtime::types::slice::SliceObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
 use std::sync::{Arc, LazyLock};
+
+static EXCEPTION_ARGS_ATTR: LazyLock<InternedString> = LazyLock::new(|| intern("args"));
 
 // =============================================================================
 // Type Extraction
@@ -465,6 +468,12 @@ fn lookup_builtin_base_instance_attr(
     };
 
     for &class_id in class.mro().iter().skip(1) {
+        if let Some(exception_type_id) = exception_type_id_for_proxy_class_id(class_id)
+            && let Some(value) = heap_exception_builtin_base_attr(vm, obj, exception_type_id, name)?
+        {
+            return Ok(Some(value));
+        }
+
         if class_id.0 >= TypeId::FIRST_USER_TYPE {
             continue;
         }
@@ -2145,6 +2154,15 @@ pub(crate) fn get_attribute_value(
                         Ok(exception_arg_or_message(exc, 1))
                     }
                     "winerror" if exc.is_subclass_of(ExceptionTypeId::OSError) => Ok(Value::none()),
+                    "message" if exc.is_subclass_of(ExceptionTypeId::BaseExceptionGroup) => Ok(exc
+                        .message()
+                        .map(|message| Value::string(intern(message)))
+                        .unwrap_or_else(Value::none)),
+                    "exceptions" if exc.is_subclass_of(ExceptionTypeId::BaseExceptionGroup) => {
+                        Ok(exc
+                            .exception_group_exceptions()
+                            .unwrap_or_else(|| exception_arg_or_none(exc, 1)))
+                    }
                     "name" => Ok(exc
                         .import_name()
                         .map(|import_name| Value::string(intern(import_name)))
@@ -2320,6 +2338,88 @@ pub(crate) fn get_attribute_value(
         primitive_attribute_type_name(obj),
         name.as_str(),
     ))
+}
+
+fn heap_exception_builtin_base_attr(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    exception_type_id: u16,
+    name: &InternedString,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(exception_type) = ExceptionTypeId::from_u8(exception_type_id as u8) else {
+        return Ok(None);
+    };
+
+    match name.as_str() {
+        "errno" if exception_type.is_subclass_of(ExceptionTypeId::OSError) => {
+            Ok(Some(heap_exception_arg_or_none(obj, 0)))
+        }
+        "strerror" if exception_type.is_subclass_of(ExceptionTypeId::OSError) => {
+            Ok(Some(heap_exception_arg_or_none(obj, 1)))
+        }
+        "winerror" if exception_type.is_subclass_of(ExceptionTypeId::OSError) => {
+            Ok(Some(Value::none()))
+        }
+        "filename" if exception_type.is_subclass_of(ExceptionTypeId::OSError) => {
+            Ok(Some(heap_exception_arg_or_none(obj, 2)))
+        }
+        "filename2" if exception_type.is_subclass_of(ExceptionTypeId::OSError) => {
+            Ok(Some(heap_exception_arg_or_none(obj, 4)))
+        }
+        "message" if exception_type.is_subclass_of(ExceptionTypeId::BaseExceptionGroup) => {
+            Ok(Some(heap_exception_arg_or_none(obj, 0)))
+        }
+        "exceptions" if exception_type.is_subclass_of(ExceptionTypeId::BaseExceptionGroup) => {
+            heap_exception_group_exceptions(vm, obj).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn heap_exception_arg_or_none(obj: Value, index: usize) -> Value {
+    heap_exception_args_tuple(obj)
+        .and_then(|args| args.get(index as i64))
+        .unwrap_or_else(Value::none)
+}
+
+fn heap_exception_args_tuple(obj: Value) -> Option<&'static TupleObject> {
+    let ptr = obj.as_object_ptr()?;
+    let shaped = unsafe { &*(ptr as *const ShapedObject) };
+    let args = shaped
+        .get_property_interned(&EXCEPTION_ARGS_ATTR)
+        .or_else(|| shaped.get_property("args"))?;
+    let args_ptr = args.as_object_ptr()?;
+    tuple_storage_ref_from_ptr(args_ptr)
+}
+
+fn heap_exception_group_exceptions(
+    vm: &mut VirtualMachine,
+    obj: Value,
+) -> Result<Value, RuntimeError> {
+    let exceptions = heap_exception_arg_or_none(obj, 1);
+    if exceptions.is_none() {
+        return Ok(Value::none());
+    }
+
+    if let Some(ptr) = exceptions.as_object_ptr() {
+        if let Some(tuple) = tuple_storage_ref_from_ptr(ptr) {
+            return alloc_heap_value(
+                vm,
+                TupleObject::from_slice(tuple.as_slice()),
+                "heap exception group exceptions tuple",
+            );
+        }
+
+        if let Some(list) = list_storage_ref_from_ptr(ptr) {
+            return alloc_heap_value(
+                vm,
+                TupleObject::from_slice(list.as_slice()),
+                "heap exception group exceptions tuple",
+            );
+        }
+    }
+
+    Ok(exceptions)
 }
 
 #[inline]

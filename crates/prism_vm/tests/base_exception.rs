@@ -55,3 +55,41 @@ if cause.args != ("cancelled",):
 "#,
     );
 }
+
+#[test]
+fn exception_group_exposes_message_and_exceptions_tuple() {
+    execute(
+        r#"
+err = OSError("network")
+group = ExceptionGroup("connect failed", [err])
+
+if group.message != "connect failed":
+    raise RuntimeError(group.message)
+if len(group.exceptions) != 1:
+    raise RuntimeError(group.exceptions)
+if group.exceptions[0] is not err:
+    raise RuntimeError(group.exceptions[0])
+"#,
+    );
+}
+
+#[test]
+fn os_error_subclasses_inherit_errno_attributes() {
+    execute(
+        r#"
+class Err(OSError):
+    pass
+
+exc = Err(7, "cannot bind", "addr")
+
+if exc.errno != 7:
+    raise RuntimeError(exc.errno)
+if exc.strerror != "cannot bind":
+    raise RuntimeError(exc.strerror)
+if exc.filename != "addr":
+    raise RuntimeError(exc.filename)
+if exc.winerror is not None:
+    raise RuntimeError(exc.winerror)
+"#,
+    );
+}

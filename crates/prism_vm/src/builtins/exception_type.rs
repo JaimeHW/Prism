@@ -48,8 +48,8 @@
 use crate::VirtualMachine;
 use crate::builtins::BuiltinError;
 use crate::builtins::exception_value::{
-    create_exception, create_exception_in_vm, create_exception_with_args,
-    create_exception_with_args_in_vm,
+    create_exception, create_exception_group_with_args, create_exception_group_with_args_in_vm,
+    create_exception_in_vm, create_exception_with_args, create_exception_with_args_in_vm,
 };
 use crate::error::RuntimeError;
 use crate::stdlib::exceptions::ExceptionTypeId;
@@ -330,6 +330,12 @@ impl ExceptionTypeObject {
         let type_id = ExceptionTypeId::from_u8(self.exception_type_id as u8)
             .unwrap_or(ExceptionTypeId::Exception);
 
+        if type_id.is_subclass_of(ExceptionTypeId::BaseExceptionGroup)
+            && let Ok(value) = create_exception_group_with_args(type_id, args)
+        {
+            return value;
+        }
+
         if args.is_empty() {
             return create_exception(type_id, None);
         }
@@ -347,6 +353,10 @@ impl ExceptionTypeObject {
         let type_id = ExceptionTypeId::from_u8(self.exception_type_id as u8)
             .unwrap_or(ExceptionTypeId::Exception);
 
+        if type_id.is_subclass_of(ExceptionTypeId::BaseExceptionGroup) {
+            return create_exception_group_with_args_in_vm(vm, type_id, args);
+        }
+
         if args.is_empty() {
             return create_exception_in_vm(vm, type_id, None);
         }
@@ -359,6 +369,12 @@ impl ExceptionTypeObject {
     /// This is the entry point for `ValueError("message")` style calls.
     #[inline]
     pub fn call(&self, args: &[Value]) -> Result<Value, BuiltinError> {
+        let type_id = ExceptionTypeId::from_u8(self.exception_type_id as u8)
+            .unwrap_or(ExceptionTypeId::Exception);
+        if type_id.is_subclass_of(ExceptionTypeId::BaseExceptionGroup) {
+            return create_exception_group_with_args(type_id, args);
+        }
+
         Ok(self.construct(args))
     }
 
