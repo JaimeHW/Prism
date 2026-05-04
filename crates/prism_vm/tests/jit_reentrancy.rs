@@ -41,3 +41,30 @@ for _ in range(200):
 "#,
     );
 }
+
+#[test]
+fn nested_jit_exceptions_unwind_the_compiled_target_frame() {
+    execute_with_deterministic_jit(
+        r#"
+class SubPattern:
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+def add_pattern(pattern):
+    total = 0
+    for op, av in pattern:
+        total = total + op
+    return total
+
+pattern = SubPattern([(1, None), (2, None)])
+
+for _ in range(50):
+    result = add_pattern(pattern)
+    if result != 3:
+        raise RuntimeError(result)
+"#,
+    );
+}

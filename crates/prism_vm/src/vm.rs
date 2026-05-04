@@ -1265,6 +1265,20 @@ impl VirtualMachine {
         }
     }
 
+    pub(crate) fn route_jit_exception_from_nested_call(
+        &mut self,
+        stop_depth: usize,
+        target_frame_id: u32,
+        err: RuntimeError,
+    ) -> VmResult<NestedTargetFrameOutcome> {
+        self.route_nested_runtime_error(stop_depth, err)?;
+        if self.frames.len() == stop_depth {
+            return Ok(NestedTargetFrameOutcome::ControlTransferred);
+        }
+
+        self.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)
+    }
+
     pub(crate) fn execute_code_collect_locals_namespace(
         &mut self,
         code: Arc<CodeObject>,

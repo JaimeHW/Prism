@@ -1558,13 +1558,31 @@ fn invoke_user_function_with_implicit_self(
         )
     };
     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
-    if vm.dispatch_prepared_current_frame_via_jit()? {
-        return Ok(vm.current_frame().get_reg(dst_reg));
-    }
     let target_frame_id = vm.current_frame_id();
-    match vm.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)? {
+    match execute_prepared_nested_call_frame(vm, stop_depth, target_frame_id, dst_reg)? {
         NestedTargetFrameOutcome::Returned(value) => Ok(value),
         NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::control_transferred()),
+    }
+}
+
+fn execute_prepared_nested_call_frame(
+    vm: &mut VirtualMachine,
+    stop_depth: usize,
+    target_frame_id: u32,
+    caller_return_reg: u8,
+) -> Result<NestedTargetFrameOutcome, RuntimeError> {
+    match vm.dispatch_prepared_current_frame_via_jit() {
+        Ok(true) => Ok(NestedTargetFrameOutcome::Returned(
+            vm.current_frame().get_reg(caller_return_reg),
+        )),
+        Ok(false) => {
+            if vm.call_depth() == stop_depth {
+                Ok(NestedTargetFrameOutcome::ControlTransferred)
+            } else {
+                vm.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)
+            }
+        }
+        Err(err) => vm.route_jit_exception_from_nested_call(stop_depth, target_frame_id, err),
     }
 }
 
@@ -1925,22 +1943,18 @@ fn invoke_user_function_direct_impl_guarded(
     };
 
     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
-    vm.dispatch_prepared_current_frame_via_jit()?;
-    let result = if vm.call_depth() == stop_depth {
-        Ok(InvokeCallableOutcome::Returned(
-            vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG),
-        ))
-    } else {
-        let target_frame_id = vm.current_frame_id();
-        match vm.execute_until_target_frame_returns_with_outcome(stop_depth, target_frame_id)? {
-            NestedTargetFrameOutcome::Returned(value) => Ok(InvokeCallableOutcome::Returned(value)),
-            NestedTargetFrameOutcome::ControlTransferred if allow_control_transfer => {
-                Ok(InvokeCallableOutcome::ControlTransferred)
-            }
-            NestedTargetFrameOutcome::ControlTransferred => {
-                Err(RuntimeError::control_transferred())
-            }
+    let target_frame_id = vm.current_frame_id();
+    let result = match execute_prepared_nested_call_frame(
+        vm,
+        stop_depth,
+        target_frame_id,
+        DIRECT_CALL_RETURN_REG,
+    )? {
+        NestedTargetFrameOutcome::Returned(value) => Ok(InvokeCallableOutcome::Returned(value)),
+        NestedTargetFrameOutcome::ControlTransferred if allow_control_transfer => {
+            Ok(InvokeCallableOutcome::ControlTransferred)
         }
+        NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::control_transferred()),
     };
     if should_restore_direct_call_caller_state(vm, stop_depth, &result) {
         restore_direct_call_caller_state(
@@ -2037,12 +2051,15 @@ fn invoke_user_function_direct_with_keywords_guarded(
     };
 
     initialize_closure_cellvars_from_locals(vm.current_frame_mut(), initialized_local_count);
-    vm.dispatch_prepared_current_frame_via_jit()?;
-    let result = if vm.call_depth() == stop_depth {
-        Ok(vm.current_frame().get_reg(DIRECT_CALL_RETURN_REG))
-    } else {
-        let target_frame_id = vm.current_frame_id();
-        vm.execute_until_target_frame_returns(stop_depth, target_frame_id)
+    let target_frame_id = vm.current_frame_id();
+    let result = match execute_prepared_nested_call_frame(
+        vm,
+        stop_depth,
+        target_frame_id,
+        DIRECT_CALL_RETURN_REG,
+    )? {
+        NestedTargetFrameOutcome::Returned(value) => Ok(value),
+        NestedTargetFrameOutcome::ControlTransferred => Err(RuntimeError::control_transferred()),
     };
     if should_restore_direct_call_caller_state_for_value_result(vm, stop_depth, &result) {
         restore_direct_call_caller_state(
