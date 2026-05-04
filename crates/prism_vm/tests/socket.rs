@@ -57,3 +57,24 @@ for service in ("nonsense", b"nonsense"):
 "#,
     );
 }
+
+#[test]
+fn getaddrinfo_preserves_ipv6_family_and_scope_id() {
+    execute(
+        r#"
+import _socket
+
+infos = _socket.getaddrinfo("::1", 80, _socket.AF_UNSPEC, _socket.SOCK_STREAM)
+if infos[0][0] != _socket.AF_INET6:
+    raise RuntimeError(infos[0])
+if infos[0][4] != ("::1", 80, 0, 0):
+    raise RuntimeError(infos[0][4])
+
+infos = _socket.getaddrinfo("fe80::1%1", b"http", _socket.AF_UNSPEC, _socket.SOCK_STREAM)
+if infos[0][0] != _socket.AF_INET6:
+    raise RuntimeError(infos[0])
+if infos[0][4] != ("fe80::1", 80, 0, 1):
+    raise RuntimeError(infos[0][4])
+"#,
+    );
+}

@@ -29,7 +29,9 @@ use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use rustc_hash::FxHashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream,
+};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -1199,14 +1201,15 @@ fn socket_getaddrinfo(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, 
     let family = optional_i64_arg_vm(vm, args.get(2).copied(), 0, "family")?;
     let kind = optional_i64_arg_vm(vm, args.get(3).copied(), 0, "type")?;
     let proto = optional_i64_arg_vm(vm, args.get(4).copied(), 0, "proto")?;
-    let family = if family == 0 { 2 } else { family };
+    let family = infer_getaddrinfo_family(family, &host);
     let kind = if kind == 0 { 1 } else { kind };
     let sockaddr = if family == AF_INET6_VALUE {
+        let resolved = resolve_host_to_ipv6(&host);
         tuple_value(vec![
-            Value::string(intern(resolve_host_to_ipv6(&host))),
+            Value::string(intern(resolved.address)),
             Value::int(port).unwrap(),
             Value::int(0).unwrap(),
-            Value::int(0).unwrap(),
+            Value::int(i64::from(resolved.scope_id)).unwrap(),
         ])
     } else {
         tuple_value(vec![
@@ -1628,24 +1631,31 @@ fn sockaddr_arg(
     let host = string_arg(host_value, "host")?;
     let port = u16::try_from(port_number(vm, port_value)?)
         .map_err(|_| BuiltinError::OverflowError("port must be 0-65535".to_string()))?;
-    let ip = if family == AF_INET6_VALUE {
-        IpAddr::V6(
-            resolve_host_to_ipv6(&host)
-                .parse::<Ipv6Addr>()
-                .map_err(|_| {
-                    BuiltinError::OSError("address family not supported by protocol".to_string())
-                })?,
-        )
+
+    if family == AF_INET6_VALUE {
+        if tuple.len() > 4 {
+            return Err(BuiltinError::TypeError(
+                "IPv6 socket address must be (host, port[, flowinfo[, scopeid]])".to_string(),
+            ));
+        }
+
+        let resolved = resolve_host_to_ipv6(&host);
+        let ip = resolved.address.parse::<Ipv6Addr>().map_err(|_| {
+            BuiltinError::OSError("address family not supported by protocol".to_string())
+        })?;
+        let flowinfo = optional_sockaddr_u32(vm, tuple, 2, 0, "flowinfo")?;
+        let scope_id = optional_sockaddr_u32(vm, tuple, 3, resolved.scope_id, "scopeid")?;
+        Ok(SocketAddr::V6(SocketAddrV6::new(
+            ip, port, flowinfo, scope_id,
+        )))
     } else {
-        IpAddr::V4(
-            resolve_host_to_ipv4(&host)
-                .parse::<Ipv4Addr>()
-                .map_err(|_| {
-                    BuiltinError::OSError("address family not supported by protocol".to_string())
-                })?,
-        )
-    };
-    Ok(SocketAddr::new(ip, port))
+        let ip = resolve_host_to_ipv4(&host)
+            .parse::<Ipv4Addr>()
+            .map_err(|_| {
+                BuiltinError::OSError("address family not supported by protocol".to_string())
+            })?;
+        Ok(SocketAddr::new(IpAddr::V4(ip), port))
+    }
 }
 
 fn sockaddr_value(addr: SocketAddr, family: i64) -> Value {
@@ -1907,14 +1917,74 @@ fn resolve_host_to_ipv4(host: &str) -> &str {
     }
 }
 
-fn resolve_host_to_ipv6(host: &str) -> &str {
-    if host == "localhost" || host.is_empty() {
-        "::1"
-    } else if host.parse::<Ipv6Addr>().is_ok() {
-        host
-    } else {
-        "::1"
+fn optional_sockaddr_u32(
+    vm: &mut VirtualMachine,
+    tuple: &TupleObject,
+    index: usize,
+    default: u32,
+    name: &str,
+) -> Result<u32, BuiltinError> {
+    if tuple.len() <= index {
+        return Ok(default);
     }
+
+    u32::try_from(int_arg_vm(
+        vm,
+        tuple.get(index as i64).expect("length checked above"),
+        name,
+    )?)
+    .map_err(|_| BuiltinError::OverflowError(format!("{name} must be 0-4294967295")))
+}
+
+struct ResolvedIpv6Host<'a> {
+    address: &'a str,
+    scope_id: u32,
+}
+
+fn infer_getaddrinfo_family(requested_family: i64, host: &str) -> i64 {
+    if requested_family != 0 {
+        return requested_family;
+    }
+
+    if is_ipv6_literal(host) {
+        AF_INET6_VALUE
+    } else {
+        AF_INET_VALUE
+    }
+}
+
+fn is_ipv6_literal(host: &str) -> bool {
+    let (address, _) = split_ipv6_scope(host);
+    address.parse::<Ipv6Addr>().is_ok()
+}
+
+fn resolve_host_to_ipv6(host: &str) -> ResolvedIpv6Host<'_> {
+    let (address, scope_id) = split_ipv6_scope(host);
+    if address == "localhost" || address.is_empty() {
+        ResolvedIpv6Host {
+            address: "::1",
+            scope_id: 0,
+        }
+    } else if address.parse::<Ipv6Addr>().is_ok() {
+        ResolvedIpv6Host { address, scope_id }
+    } else {
+        ResolvedIpv6Host {
+            address: "::1",
+            scope_id: 0,
+        }
+    }
+}
+
+fn split_ipv6_scope(host: &str) -> (&str, u32) {
+    let Some((address, scope)) = host.rsplit_once('%') else {
+        return (host, 0);
+    };
+
+    if !address.contains(':') {
+        return (host, 0);
+    }
+
+    (address, scope.parse::<u32>().unwrap_or(0))
 }
 
 fn convert_u16(
