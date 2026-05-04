@@ -2252,6 +2252,9 @@ impl VirtualMachine {
             {
                 return Ok(None);
             }
+            if !Self::is_tier1_osr_safe_header(frame) {
+                return Ok(None);
+            }
             (Arc::clone(&frame.code), frame.ip.saturating_mul(4))
         };
 
@@ -2305,6 +2308,22 @@ impl VirtualMachine {
                 Ok(None)
             }
         }
+    }
+
+    #[inline]
+    fn is_tier1_osr_safe_header(frame: &Frame) -> bool {
+        let Some(inst) = frame.code.instructions.get(frame.ip as usize) else {
+            return false;
+        };
+
+        // Iterator protocol headers enter through helper-owned control-flow
+        // opcodes. Tier 1 may still compile the enclosing function normally, but
+        // OSR needs per-header live-in validation before it can safely enter
+        // these mid-iteration states.
+        !matches!(
+            Opcode::from_u8(inst.opcode()),
+            Some(Opcode::ForIter | Opcode::EndAsyncFor)
+        )
     }
 
     #[inline]
