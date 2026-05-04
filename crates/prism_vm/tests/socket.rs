@@ -59,6 +59,18 @@ for service in ("nonsense", b"nonsense"):
 }
 
 #[test]
+fn exports_tcp_socket_level_alias() {
+    execute(
+        r#"
+import _socket
+
+if _socket.SOL_TCP != _socket.IPPROTO_TCP:
+    raise RuntimeError((_socket.SOL_TCP, _socket.IPPROTO_TCP))
+"#,
+    );
+}
+
+#[test]
 fn getaddrinfo_preserves_ipv6_family_and_scope_id() {
     execute(
         r#"
