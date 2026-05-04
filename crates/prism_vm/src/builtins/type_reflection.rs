@@ -431,6 +431,97 @@ const FUNCTION_TYPE_ATTRS: &[AttrSpec] = &[
     },
 ];
 
+const CODE_TYPE_ATTRS: &[AttrSpec] = &[
+    AttrSpec {
+        name: "co_argcount",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_cellvars",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_code",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_consts",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_exceptiontable",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_filename",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_firstlineno",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_flags",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_freevars",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_kwonlyargcount",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_lines",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+    AttrSpec {
+        name: "co_linetable",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_lnotab",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_name",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_names",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_nlocals",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_positions",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+    AttrSpec {
+        name: "co_posonlyargcount",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_qualname",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_stacksize",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "co_varnames",
+        kind: ReflectedValueKind::MemberDescriptor,
+    },
+    AttrSpec {
+        name: "replace",
+        kind: ReflectedValueKind::MethodDescriptor,
+    },
+];
+
 const DEQUE_METHOD_NAMES: &[&str] = &[
     "__getitem__",
     "append",
@@ -690,6 +781,7 @@ fn builtin_type_attr_specs(type_id: TypeId) -> &'static [AttrSpec] {
         TypeId::MODULE => MODULE_TYPE_ATTRS,
         TypeId::ENUMERATE => ENUMERATE_TYPE_ATTRS,
         TypeId::FUNCTION => FUNCTION_TYPE_ATTRS,
+        TypeId::CODE => CODE_TYPE_ATTRS,
         _ => &[],
     }
 }

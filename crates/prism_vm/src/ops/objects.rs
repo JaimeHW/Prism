@@ -24,7 +24,7 @@ use crate::ops::method_dispatch::method_cache::method_cache;
 use crate::ops::method_dispatch::resolve_builtin_instance_method;
 use crate::stdlib::collections::deque::DequeObject;
 use crate::stdlib::exceptions::ExceptionTypeId;
-use prism_code::{Constant, Instruction, Opcode};
+use prism_code::{CodeFlags, Constant, Instruction, Opcode};
 use prism_core::Value;
 use prism_core::intern::{InternedString, intern};
 use prism_runtime::allocation_context::alloc_value_in_current_heap_or_box;
@@ -787,6 +787,42 @@ where
 static CODE_CO_POSITIONS_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("code.co_positions"), code_co_positions));
 
+const PY_CO_OPTIMIZED: i64 = 0x0001;
+const PY_CO_NEWLOCALS: i64 = 0x0002;
+const PY_CO_VARARGS: i64 = 0x0004;
+const PY_CO_VARKEYWORDS: i64 = 0x0008;
+const PY_CO_NESTED: i64 = 0x0010;
+const PY_CO_GENERATOR: i64 = 0x0020;
+const PY_CO_COROUTINE: i64 = 0x0080;
+const PY_CO_ASYNC_GENERATOR: i64 = 0x0200;
+
+#[inline]
+pub(crate) fn python_code_flags_bits(flags: CodeFlags) -> i64 {
+    let mut bits = 0;
+    if !flags.contains(CodeFlags::MODULE) && !flags.contains(CodeFlags::CLASS) {
+        bits |= PY_CO_OPTIMIZED | PY_CO_NEWLOCALS;
+    }
+    if flags.contains(CodeFlags::VARARGS) {
+        bits |= PY_CO_VARARGS;
+    }
+    if flags.contains(CodeFlags::VARKEYWORDS) {
+        bits |= PY_CO_VARKEYWORDS;
+    }
+    if flags.contains(CodeFlags::NESTED) {
+        bits |= PY_CO_NESTED;
+    }
+    if flags.contains(CodeFlags::GENERATOR) {
+        bits |= PY_CO_GENERATOR;
+    }
+    if flags.contains(CodeFlags::COROUTINE) {
+        bits |= PY_CO_COROUTINE;
+    }
+    if flags.contains(CodeFlags::ASYNC_GENERATOR) {
+        bits |= PY_CO_ASYNC_GENERATOR;
+    }
+    bits
+}
+
 #[inline]
 fn optional_u32_to_value(value: Option<u32>) -> Value {
     value
@@ -1113,7 +1149,7 @@ fn code_attr_value_in_vm(
             Value::int(code.locals.len() as i64).unwrap_or_else(Value::none),
         )),
         "co_flags" => Ok(Some(
-            Value::int(code.flags.bits() as i64).unwrap_or_else(Value::none),
+            Value::int(python_code_flags_bits(code.flags)).unwrap_or_else(Value::none),
         )),
         "co_consts" => Ok(Some(alloc_heap_value(
             vm,

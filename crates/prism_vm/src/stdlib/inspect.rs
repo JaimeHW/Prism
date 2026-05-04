@@ -17,6 +17,7 @@ use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::function::FunctionObject;
+use prism_runtime::types::int::value_to_i64;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use rustc_hash::FxHashSet;
@@ -43,7 +44,7 @@ static ISFUNCTION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new(Arc::from("inspect.isfunction"), inspect_isfunction)
 });
 static ISCOROUTINEFUNCTION_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
-    BuiltinFunctionObject::new(
+    BuiltinFunctionObject::new_vm(
         Arc::from("inspect.iscoroutinefunction"),
         inspect_iscoroutinefunction,
     )
@@ -85,7 +86,11 @@ static GETSOURCEFILE_FUNCTION: LazyLock<BuiltinFunctionObject> = LazyLock::new(|
 static UNWRAP_FUNCTION: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new_vm(Arc::from("inspect.unwrap"), inspect_unwrap));
 
-const INSPECT_CODE_FLAGS: [(&str, i64); 8] = [
+const PY_CO_COROUTINE: i64 = 0x0080;
+
+const INSPECT_CODE_FLAGS: [(&str, i64); 10] = [
+    ("CO_OPTIMIZED", 0x0001),
+    ("CO_NEWLOCALS", 0x0002),
     ("CO_VARARGS", 0x0004),
     ("CO_VARKEYWORDS", 0x0008),
     ("CO_NESTED", 0x0010),
@@ -470,33 +475,48 @@ fn inspect_isfunction(args: &[Value]) -> Result<Value, BuiltinError> {
     })
 }
 
-fn inspect_iscoroutinefunction(args: &[Value]) -> Result<Value, BuiltinError> {
-    predicate_result("iscoroutinefunction", args, |value| {
-        let Some(ptr) = value.as_object_ptr() else {
-            return false;
-        };
+fn inspect_iscoroutinefunction(
+    vm: &mut crate::VirtualMachine,
+    args: &[Value],
+) -> Result<Value, BuiltinError> {
+    let value = exact_arity("iscoroutinefunction", args, 1)?;
+    if let Some(flags) = native_callable_code_flags(value) {
+        return Ok(Value::bool(flags.contains(CodeFlags::COROUTINE)));
+    }
 
-        match crate::ops::objects::extract_type_id(ptr) {
-            TypeId::FUNCTION => unsafe { &*(ptr as *const FunctionObject) }
-                .code
-                .flags
-                .contains(CodeFlags::COROUTINE),
-            TypeId::METHOD => {
-                let method = unsafe { &*(ptr as *const BoundMethod) };
-                let Some(function_ptr) = method.function().as_object_ptr() else {
-                    return false;
-                };
-                if crate::ops::objects::extract_type_id(function_ptr) != TypeId::FUNCTION {
-                    return false;
-                }
+    let Some(code) = attribute_value(vm, value, "__code__")? else {
+        return Ok(Value::bool(false));
+    };
+    let Some(flags) = attribute_value(vm, code, "co_flags")?.and_then(value_to_i64) else {
+        return Ok(Value::bool(false));
+    };
+
+    Ok(Value::bool(flags & PY_CO_COROUTINE != 0))
+}
+
+fn native_callable_code_flags(value: Value) -> Option<CodeFlags> {
+    let Some(ptr) = value.as_object_ptr() else {
+        return None;
+    };
+
+    match crate::ops::objects::extract_type_id(ptr) {
+        TypeId::FUNCTION => Some(unsafe { &*(ptr as *const FunctionObject) }.code.flags),
+        TypeId::METHOD => {
+            let method = unsafe { &*(ptr as *const BoundMethod) };
+            let Some(function_ptr) = method.function().as_object_ptr() else {
+                return None;
+            };
+            if crate::ops::objects::extract_type_id(function_ptr) != TypeId::FUNCTION {
+                return None;
+            }
+            Some(
                 unsafe { &*(function_ptr as *const FunctionObject) }
                     .code
-                    .flags
-                    .contains(CodeFlags::COROUTINE)
-            }
-            _ => false,
+                    .flags,
+            )
         }
-    })
+        _ => None,
+    }
 }
 
 fn inspect_isawaitable(
