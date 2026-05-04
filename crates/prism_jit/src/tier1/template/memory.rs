@@ -207,27 +207,69 @@ pub struct LoadGlobalTemplate {
 
 impl OpcodeTemplate for LoadGlobalTemplate {
     fn emit(&self, ctx: &mut TemplateContext) {
-        if self.helper_addr == 0 {
-            ctx.asm.jmp(ctx.deopt_label(self.deopt_idx));
-            return;
-        }
-
-        let dst_slot = ctx.frame.register_slot(self.dst_reg as u16);
-
-        ctx.asm.mov_rm(helper_arg0(), &ctx.frame.context_slot());
-        ctx.asm.mov_ri32(helper_arg1(), self.name_idx as u32);
-        ctx.asm.lea(helper_arg2(), &dst_slot);
-
-        emit_runtime_call(ctx, self.helper_addr);
-
-        ctx.asm.cmp_ri(ctx.regs.accumulator, 0);
-        ctx.asm.jne(ctx.deopt_label(self.deopt_idx));
+        emit_load_name_helper(
+            ctx,
+            self.dst_reg,
+            self.name_idx,
+            self.helper_addr,
+            self.deopt_idx,
+        );
     }
 
     #[inline]
     fn estimated_size(&self) -> usize {
         64
     }
+}
+
+/// Template for loading a builtin directly from the builtin registry.
+pub struct LoadBuiltinTemplate {
+    pub dst_reg: u8,
+    pub name_idx: u16,
+    pub helper_addr: u64,
+    pub deopt_idx: usize,
+}
+
+impl OpcodeTemplate for LoadBuiltinTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_load_name_helper(
+            ctx,
+            self.dst_reg,
+            self.name_idx,
+            self.helper_addr,
+            self.deopt_idx,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        64
+    }
+}
+
+#[inline]
+fn emit_load_name_helper(
+    ctx: &mut TemplateContext,
+    dst_reg: u8,
+    name_idx: u16,
+    helper_addr: u64,
+    deopt_idx: usize,
+) {
+    if helper_addr == 0 {
+        ctx.asm.jmp(ctx.deopt_label(deopt_idx));
+        return;
+    }
+
+    let dst_slot = ctx.frame.register_slot(dst_reg as u16);
+
+    ctx.asm.mov_rm(helper_arg0(), &ctx.frame.context_slot());
+    ctx.asm.mov_ri32(helper_arg1(), name_idx as u32);
+    ctx.asm.lea(helper_arg2(), &dst_slot);
+
+    emit_runtime_call(ctx, helper_addr);
+
+    ctx.asm.cmp_ri(ctx.regs.accumulator, 0);
+    ctx.asm.jne(ctx.deopt_label(deopt_idx));
 }
 
 /// Template for storing to a global variable.

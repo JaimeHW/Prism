@@ -763,6 +763,20 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
+            TemplateInstruction::LoadBuiltin {
+                dst,
+                name_idx,
+                helper_addr,
+                ..
+            } => {
+                LoadBuiltinTemplate {
+                    dst_reg: *dst,
+                    name_idx: *name_idx,
+                    helper_addr: *helper_addr,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
             TemplateInstruction::StoreGlobal { src, name_idx, .. } => {
                 StoreGlobalTemplate {
                     src_reg: *src,
@@ -1798,6 +1812,13 @@ pub enum TemplateInstruction {
         name_idx: u16,
         helper_addr: u64,
     },
+    /// Load from builtin registry: dst = builtins[name_idx]
+    LoadBuiltin {
+        bc_offset: u32,
+        dst: u8,
+        name_idx: u16,
+        helper_addr: u64,
+    },
     /// Store to global variable: globals[name_idx] = src
     StoreGlobal {
         bc_offset: u32,
@@ -2761,6 +2782,7 @@ impl TemplateInstruction {
             | TemplateInstruction::StoreLocal { bc_offset, .. }
             | TemplateInstruction::DeleteLocal { bc_offset, .. }
             | TemplateInstruction::LoadGlobal { bc_offset, .. }
+            | TemplateInstruction::LoadBuiltin { bc_offset, .. }
             | TemplateInstruction::StoreGlobal { bc_offset, .. }
             | TemplateInstruction::DeleteGlobal { bc_offset, .. }
             | TemplateInstruction::LoadClosure { bc_offset, .. }
@@ -2921,6 +2943,7 @@ impl TemplateInstruction {
                 | TemplateInstruction::DynamicIntBinary { helper_addr: 0, .. }
                 | TemplateInstruction::DynamicIntCompare { helper_addr: 0, .. }
                 | TemplateInstruction::LoadGlobal { helper_addr: 0, .. }
+                | TemplateInstruction::LoadBuiltin { helper_addr: 0, .. }
                 | TemplateInstruction::StoreGlobal { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
                 | TemplateInstruction::LoadClosure { .. }
@@ -3026,6 +3049,7 @@ impl TemplateInstruction {
                 | TemplateInstruction::FloatFloorDiv { .. }
                 | TemplateInstruction::FloatMod { .. }
                 | TemplateInstruction::LoadGlobal { .. }
+                | TemplateInstruction::LoadBuiltin { .. }
                 | TemplateInstruction::DeleteGlobal { .. }
                 | TemplateInstruction::Call { .. }
                 | TemplateInstruction::GetAttr { .. }
@@ -3090,6 +3114,7 @@ impl TemplateInstruction {
             | TemplateInstruction::FloatFloorDiv { .. }
             | TemplateInstruction::FloatMod { .. }
             | TemplateInstruction::LoadGlobal { .. }
+            | TemplateInstruction::LoadBuiltin { .. }
             | TemplateInstruction::DeleteGlobal { .. }
             | TemplateInstruction::ListGetItem { .. }
             | TemplateInstruction::TupleGetItem { .. }

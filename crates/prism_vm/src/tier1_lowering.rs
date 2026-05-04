@@ -196,7 +196,12 @@ pub(crate) fn lower_code_to_templates(
             Opcode::LoadBuiltin => {
                 let dst = inst.dst().0;
                 set_reg_type(&mut reg_types, dst, KnownType::Unknown);
-                bytecode_bridge(op, bc_offset)
+                TemplateInstruction::LoadBuiltin {
+                    bc_offset,
+                    dst,
+                    name_idx: inst.imm16(),
+                    helper_addr: crate::jit_runtime_helpers::tier1_load_builtin_addr(),
+                }
             }
             Opcode::LoadGlobal => {
                 let dst = inst.dst().0;
@@ -1723,11 +1728,27 @@ mod tests {
     }
 
     #[test]
-    fn normal_load_builtin_lowers_to_exact_bytecode_bridge() {
+    fn normal_load_builtin_lowers_to_runtime_helper_template() {
         let code = load_builtin_code();
         let templates = lower_code_to_templates(&code).expect("lowering should succeed");
 
-        assert_bytecode_bridge(&templates[0], 0, Opcode::LoadBuiltin);
+        match &templates[0] {
+            TemplateInstruction::LoadBuiltin {
+                bc_offset,
+                dst,
+                name_idx,
+                helper_addr,
+            } => {
+                assert_eq!(*bc_offset, 0);
+                assert_eq!(*dst, 0);
+                assert_eq!(*name_idx, 0);
+                assert_ne!(*helper_addr, 0);
+            }
+            template => panic!("expected LoadBuiltin template, got {template:?}"),
+        }
+
+        assert!(!templates[0].requires_interpreter_in_tier1());
+        assert!(templates[0].can_deopt());
     }
 
     #[test]

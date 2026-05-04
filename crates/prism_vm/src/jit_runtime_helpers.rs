@@ -31,6 +31,10 @@ pub(crate) fn tier1_load_global_addr() -> u64 {
     tier1_load_global as *const () as usize as u64
 }
 
+pub(crate) fn tier1_load_builtin_addr() -> u64 {
+    tier1_load_builtin as *const () as usize as u64
+}
+
 pub(crate) fn tier1_call_addr() -> u64 {
     tier1_call as *const () as usize as u64
 }
@@ -86,6 +90,41 @@ pub(crate) unsafe extern "C" fn tier1_load_global(
     };
 
     let Some(value) = vm.load_global_for_jit(code, module, name_idx as u16) else {
+        return TIER1_HELPER_DEOPT;
+    };
+
+    unsafe {
+        *out_value = value.to_bits();
+    }
+    TIER1_HELPER_SUCCESS
+}
+
+/// Resolve `LOAD_BUILTIN` for Tier 1 code.
+///
+/// # Safety
+///
+/// `state` must point to a live `JitFrameState`, `state.vm_context` must be the
+/// owning `VirtualMachine`, `state.code` must be the executing `CodeObject`,
+/// and `out_value` must point at the destination slot in the native Tier 1
+/// frame mirror.
+pub(crate) unsafe extern "C" fn tier1_load_builtin(
+    state: *mut JitFrameState,
+    name_idx: u32,
+    out_value: *mut u64,
+) -> u64 {
+    if state.is_null() || out_value.is_null() || name_idx > u16::MAX as u32 {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let state = unsafe { &mut *state };
+    if state.vm_context.is_null() || state.code.is_null() {
+        return TIER1_HELPER_DEOPT;
+    }
+
+    let vm = unsafe { &mut *(state.vm_context as *mut VirtualMachine) };
+    let code = unsafe { &*(state.code as *const CodeObject) };
+
+    let Some(value) = vm.load_builtin_for_jit(code, name_idx as u16) else {
         return TIER1_HELPER_DEOPT;
     };
 

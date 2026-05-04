@@ -526,6 +526,24 @@ impl VirtualMachine {
     }
 
     #[inline(always)]
+    pub(crate) fn load_builtin_for_jit(
+        &mut self,
+        code: &CodeObject,
+        name_index: u16,
+    ) -> Option<Value> {
+        let name = code.names.get(name_index as usize)?;
+        let code_key = code as *const CodeObject as usize;
+        let context = self.builtin_load_cache_context_for(code_key, name_index);
+        if let Some(value) = self.global_load_cache.get(context) {
+            return Some(value);
+        }
+
+        let value = self.builtins.get(name)?;
+        self.global_load_cache.insert(context, value);
+        Some(value)
+    }
+
+    #[inline(always)]
     pub(crate) fn load_builtin_cached(&mut self, name_index: u16) -> Result<Value, Arc<str>> {
         let context = self.builtin_load_cache_context(name_index);
         if let Some(value) = self.global_load_cache.get(context) {
@@ -589,12 +607,17 @@ impl VirtualMachine {
     #[inline(always)]
     fn builtin_load_cache_context(&self, name_index: u16) -> GlobalLoadCacheContext {
         let frame = self.current_frame();
+        self.builtin_load_cache_context_for(Arc::as_ptr(&frame.code) as usize, name_index)
+    }
+
+    #[inline(always)]
+    fn builtin_load_cache_context_for(
+        &self,
+        code_key: usize,
+        name_index: u16,
+    ) -> GlobalLoadCacheContext {
         GlobalLoadCacheContext::new(
-            GlobalLoadCacheKey::new(
-                Arc::as_ptr(&frame.code) as usize,
-                name_index,
-                BUILTIN_LOAD_CACHE_SCOPE,
-            ),
+            GlobalLoadCacheKey::new(code_key, name_index, BUILTIN_LOAD_CACHE_SCOPE),
             0,
             0,
             self.builtins.version(),
