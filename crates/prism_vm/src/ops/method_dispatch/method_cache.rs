@@ -49,11 +49,20 @@ pub struct CachedMethod {
     /// The resolved method/function value (pointer to FunctionObject, etc.)
     pub method: Value,
 
-    /// Whether this is a data descriptor requiring `__get__` call.
+    /// Whether this method target should be called without injecting `self`.
     ///
-    /// Data descriptors (with `__set__` or `__delete__`) take precedence
-    /// over instance attributes and require runtime binding.
+    /// This is true for targets that are already bound and for descriptor
+    /// objects that must be resolved through the descriptor protocol before
+    /// invocation.
     pub is_descriptor: bool,
+
+    /// Whether the cached class attribute still needs descriptor binding.
+    ///
+    /// Most cached descriptors in Prism are already resolved to the callable
+    /// that should be invoked. User-defined class attributes may instead be
+    /// arbitrary descriptor objects whose `__get__` method can run Python code,
+    /// so VM-aware protocol lookup must bind them before call dispatch.
+    pub needs_descriptor_get: bool,
 
     /// Slot index in type object for direct access.
     ///
@@ -69,6 +78,7 @@ impl CachedMethod {
         Self {
             method,
             is_descriptor: false,
+            needs_descriptor_get: false,
             slot: None,
         }
     }
@@ -79,6 +89,18 @@ impl CachedMethod {
         Self {
             method,
             is_descriptor: true,
+            needs_descriptor_get: false,
+            slot: None,
+        }
+    }
+
+    /// Create a cached class descriptor that needs runtime `__get__` binding.
+    #[inline]
+    pub fn runtime_descriptor(method: Value) -> Self {
+        Self {
+            method,
+            is_descriptor: true,
+            needs_descriptor_get: true,
             slot: None,
         }
     }
@@ -89,6 +111,7 @@ impl CachedMethod {
         Self {
             method,
             is_descriptor: false,
+            needs_descriptor_get: false,
             slot: Some(slot),
         }
     }

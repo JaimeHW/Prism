@@ -9,7 +9,9 @@ use crate::VirtualMachine;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::import::ModuleObject;
 use crate::ops::calls::{invoke_callable_value, value_supports_call_protocol};
-use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::method_dispatch::load_method::{
+    BoundMethodTarget, resolve_special_method, resolve_special_method_in_vm,
+};
 use crate::stdlib::collections::deque::{builtin_deque, builtin_deque_kw, builtin_deque_with_vm};
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -1297,7 +1299,7 @@ fn invoke_zero_arg_special_method(
     receiver: Value,
     method_name: &'static str,
 ) -> Result<Option<Value>, BuiltinError> {
-    let target = match resolve_special_method(receiver, method_name) {
+    let target = match resolve_special_method_in_vm(vm, receiver, method_name) {
         Ok(target) => target,
         Err(err) if matches!(err.kind, RuntimeErrorKind::AttributeError { .. }) => {
             return Ok(None);

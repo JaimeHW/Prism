@@ -26,7 +26,8 @@ use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::ops::objects::{
-    get_attribute_value, lookup_class_metaclass_attr, read_attr_name, super_attribute_value_static,
+    bind_instance_attribute_in_vm, get_attribute_value, lookup_class_metaclass_attr,
+    read_attr_name, super_attribute_value_static,
 };
 use prism_code::Instruction;
 use prism_core::Value;
@@ -307,15 +308,7 @@ pub(crate) fn resolve_special_method(
 ) -> Result<BoundMethodTarget, RuntimeError> {
     if let Some(ptr) = obj.as_object_ptr() {
         let type_id = extract_type_id(ptr);
-        let cached = match type_id {
-            TypeId::TYPE | TypeId::EXCEPTION_TYPE => resolve_type_object_special_method(obj, name)?,
-            TypeId::SUPER => resolve_super_method(obj, name)?,
-            _ if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
-                resolve_user_defined_method(obj, type_id, name)?
-            }
-            _ => resolve_method(obj, type_id, name)?,
-        };
-
+        let cached = resolve_object_special_method(obj, type_id, name)?;
         return Ok(bind_cached_method_target(obj, cached));
     }
 
@@ -326,6 +319,43 @@ pub(crate) fn resolve_special_method(
             Some(bound) => Ok(bound),
             None => Err(err),
         },
+    }
+}
+
+pub(crate) fn resolve_special_method_in_vm(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    name: &str,
+) -> Result<BoundMethodTarget, RuntimeError> {
+    if let Some(ptr) = obj.as_object_ptr() {
+        let type_id = extract_type_id(ptr);
+        let cached = resolve_object_special_method(obj, type_id, name)?;
+        return bind_cached_method_target_in_vm(vm, obj, cached);
+    }
+
+    let type_id = get_primitive_type_id(obj);
+    match resolve_primitive_method(type_id, name) {
+        Ok(cached) => bind_cached_method_target_in_vm(vm, obj, cached),
+        Err(err) => match resolve_primitive_fallback_target(obj, type_id, name)? {
+            Some(bound) => Ok(bound),
+            None => Err(err),
+        },
+    }
+}
+
+#[inline]
+fn resolve_object_special_method(
+    obj: Value,
+    type_id: TypeId,
+    name: &str,
+) -> Result<CachedMethod, RuntimeError> {
+    match type_id {
+        TypeId::TYPE | TypeId::EXCEPTION_TYPE => resolve_type_object_special_method(obj, name),
+        TypeId::SUPER => resolve_super_method(obj, name),
+        _ if type_id.raw() >= TypeId::FIRST_USER_TYPE => {
+            resolve_user_defined_method(obj, type_id, name)
+        }
+        _ => resolve_method(obj, type_id, name),
     }
 }
 
@@ -347,6 +377,22 @@ fn resolve_type_object_special_method(
     crate::builtins::builtin_bound_type_attribute_value_static(TypeId::TYPE, obj, &interned_name)?
         .map(cached_builtin_type_object_special_method_from_value)
         .ok_or_else(|| RuntimeError::attribute_error("type", name))
+}
+
+pub(crate) fn bind_cached_method_target_in_vm(
+    vm: &mut VirtualMachine,
+    obj: Value,
+    cached: CachedMethod,
+) -> Result<BoundMethodTarget, RuntimeError> {
+    if cached.needs_descriptor_get {
+        let bound = bind_instance_attribute_in_vm(vm, cached.method, obj)?;
+        return Ok(BoundMethodTarget {
+            callable: bound,
+            implicit_self: None,
+        });
+    }
+
+    Ok(bind_cached_method_target(obj, cached))
 }
 
 pub(crate) fn bind_cached_method_target(obj: Value, cached: CachedMethod) -> BoundMethodTarget {
@@ -477,7 +523,7 @@ fn cached_method_from_user_class_slot(slot: MethodSlot) -> CachedMethod {
         {
             CachedMethod::simple(slot.value)
         }
-        _ => CachedMethod::descriptor(slot.value),
+        _ => CachedMethod::runtime_descriptor(slot.value),
     }
 }
 

@@ -6,7 +6,9 @@ use crate::builtins::float_format::python_float_str;
 use crate::error::{RuntimeError, RuntimeErrorKind};
 use crate::ops::calls::invoke_callable_value;
 use crate::ops::iteration::{IterStep, ensure_iterator_value, next_step};
-use crate::ops::method_dispatch::load_method::{BoundMethodTarget, resolve_special_method};
+use crate::ops::method_dispatch::load_method::{
+    BoundMethodTarget, resolve_special_method, resolve_special_method_in_vm,
+};
 use crate::ops::protocols::binary_special_method;
 use crate::python_numeric::{
     complex_like_parts, int_like_value, is_complex_value, python_complex_pow_value,
@@ -1919,7 +1921,7 @@ pub(crate) fn hash_value_vm(vm: &mut VirtualMachine, value: Value) -> Result<i64
             let range = unsafe { &*(ptr as *const RangeObject) };
             hash_range(range)
         }
-        _ => match resolve_special_method(value, "__hash__") {
+        _ => match resolve_special_method_in_vm(vm, value, "__hash__") {
             Ok(target) => {
                 if target.callable.is_none() {
                     return Err(BuiltinError::TypeError(format!(
