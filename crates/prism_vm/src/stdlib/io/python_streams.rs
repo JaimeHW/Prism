@@ -13,9 +13,10 @@ use prism_runtime::object::class::{ClassFlags, PyClassObject};
 use prism_runtime::object::shape::shape_registry;
 use prism_runtime::object::shaped_object::ShapedObject;
 use prism_runtime::object::type_obj::TypeId;
-use prism_runtime::types::bytes::BytesObject;
+use prism_runtime::types::bytes::{BytesObject, value_as_bytes_mut};
 use prism_runtime::types::io::mode::FileMode as HostFileMode;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::memoryview::value_as_memoryview_mut;
 use prism_runtime::types::string::{StringObject, value_as_string_ref};
 use std::ffi::c_void;
 use std::fs::OpenOptions;
@@ -115,6 +116,9 @@ static BYTES_IO_TRUNCATE_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new
 });
 static FILE_STREAM_READ_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io.File.read"), file_stream_read));
+static FILE_STREAM_READINTO_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new(Arc::from("io.File.readinto"), file_stream_readinto)
+});
 static FILE_STREAM_SEEK_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("io.File.seek"), file_stream_seek));
 static FILE_STREAM_TELL_METHOD: LazyLock<BuiltinFunctionObject> =
@@ -321,6 +325,10 @@ fn set_common_stream_methods(class: &PyClassObject) {
 
 fn set_file_stream_methods(class: &PyClassObject) {
     class.set_attr(intern("read"), builtin_value(&FILE_STREAM_READ_METHOD));
+    class.set_attr(
+        intern("readinto"),
+        builtin_value(&FILE_STREAM_READINTO_METHOD),
+    );
     class.set_attr(intern("seek"), builtin_value(&FILE_STREAM_SEEK_METHOD));
     class.set_attr(intern("tell"), builtin_value(&FILE_STREAM_TELL_METHOD));
     class.set_attr(
@@ -1322,6 +1330,31 @@ fn file_stream_read(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 }
 
+fn file_stream_readinto(args: &[Value]) -> Result<Value, BuiltinError> {
+    if args.len() != 2 {
+        return Err(BuiltinError::TypeError(format!(
+            "readinto() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let receiver = args[0];
+    match StreamKind::from_receiver(receiver)? {
+        StreamKind::BinaryFile => {
+            let buffer = writable_readinto_buffer(args[1])?;
+            let read = read_file_bytes_into(receiver, buffer)?;
+            Ok(Value::int(read as i64).unwrap())
+        }
+        StreamKind::TextFile => Err(BuiltinError::TypeError(
+            "readinto() is only supported on binary streams".to_string(),
+        )),
+        other => Err(BuiltinError::TypeError(format!(
+            "readinto() is not supported for {}",
+            other.as_str()
+        ))),
+    }
+}
+
 fn file_stream_seek(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -1515,6 +1548,7 @@ fn initialize_text_io_wrapper_state(
     }
     if let Some(mode) = source.get_property(FILE_MODE_ATTR) {
         receiver_shaped.set_property(intern(FILE_MODE_ATTR), mode, shape_registry());
+        receiver_shaped.set_property(intern("mode"), mode, shape_registry());
     }
     if let Some(closefd) = source.get_property(CLOSEFD_ATTR) {
         receiver_shaped.set_property(intern(CLOSEFD_ATTR), closefd, shape_registry());
@@ -1552,6 +1586,7 @@ fn new_file_stream_object(
     );
     object.set_property(intern(FILE_PATH_ATTR), string_value(path), shape_registry());
     object.set_property(intern(FILE_MODE_ATTR), string_value(mode), shape_registry());
+    object.set_property(intern("mode"), string_value(mode), shape_registry());
     object.set_property(
         intern(POSITION_ATTR),
         Value::int(initial_position as i64).unwrap(),
@@ -1588,6 +1623,7 @@ fn new_fd_stream_object(
         shape_registry(),
     );
     object.set_property(intern(FILE_MODE_ATTR), string_value(mode), shape_registry());
+    object.set_property(intern("mode"), string_value(mode), shape_registry());
     object.set_property(
         intern(POSITION_ATTR),
         Value::int(0).unwrap(),
@@ -1655,6 +1691,11 @@ fn install_file_stream_methods(object: &mut ShapedObject) {
     object.set_property(
         intern("read"),
         bound_builtin_value(&FILE_STREAM_READ_METHOD, Value::none()),
+        shape_registry(),
+    );
+    object.set_property(
+        intern("readinto"),
+        bound_builtin_value(&FILE_STREAM_READINTO_METHOD, Value::none()),
         shape_registry(),
     );
     object.set_property(
@@ -1839,6 +1880,7 @@ fn finalize_stream_object(mut object: ShapedObject) -> Value {
                 | "getvalue"
                 | "getbuffer"
                 | "read"
+                | "readinto"
                 | "seek"
                 | "tell"
                 | "truncate"
@@ -2133,6 +2175,33 @@ fn read_text_file(receiver: Value, count: Option<usize>) -> Result<String, Built
 
 fn read_binary_file(receiver: Value, count: Option<usize>) -> Result<Vec<u8>, BuiltinError> {
     read_file_bytes(receiver, count)
+}
+
+fn read_file_bytes_into(receiver: Value, buffer: &mut [u8]) -> Result<usize, BuiltinError> {
+    ensure_open(receiver)?;
+
+    let mode = file_mode(receiver)?;
+    if !mode.read {
+        return Err(BuiltinError::OSError("stream is not readable".to_string()));
+    }
+
+    if buffer.is_empty() {
+        return Ok(0);
+    }
+
+    let read = if let Some(fd) = file_descriptor(receiver)? {
+        read_fd(fd, buffer).map_err(host_stream_error)?
+    } else {
+        let position = stream_position(receiver)?;
+        let mut file = reopen_file(receiver)?;
+        file.seek(SeekFrom::Start(position))
+            .map_err(host_stream_error)?;
+        file.read(buffer).map_err(host_stream_error)?
+    };
+
+    let position = stream_position(receiver)?.saturating_add(read as u64);
+    set_stream_position(receiver, position)?;
+    Ok(read)
 }
 
 fn read_file_bytes(receiver: Value, count: Option<usize>) -> Result<Vec<u8>, BuiltinError> {
@@ -2868,6 +2937,37 @@ fn bytes_from_value(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError
         )));
     }
     Ok(unsafe { &*(ptr as *const BytesObject) }.to_vec())
+}
+
+fn writable_readinto_buffer(value: Value) -> Result<&'static mut [u8], BuiltinError> {
+    if let Some(bytes) = value_as_bytes_mut(value) {
+        if !bytes.is_bytearray() {
+            return Err(BuiltinError::TypeError(
+                "readinto() argument must be read-write bytes-like object, not bytes".to_string(),
+            ));
+        }
+        return Ok(bytes.as_mut_bytes());
+    }
+
+    if let Some(view) = value_as_memoryview_mut(value) {
+        if view.released() {
+            return Err(BuiltinError::ValueError(
+                "operation forbidden on released memoryview object".to_string(),
+            ));
+        }
+        if view.readonly() {
+            return Err(BuiltinError::TypeError(
+                "readinto() argument must be read-write bytes-like object, not read-only memoryview"
+                    .to_string(),
+            ));
+        }
+        return Ok(view.as_mut_bytes());
+    }
+
+    Err(BuiltinError::TypeError(format!(
+        "readinto() argument must be read-write bytes-like object, not {}",
+        value.type_name()
+    )))
 }
 
 fn bool_value(value: Value, context: &str) -> Result<bool, BuiltinError> {

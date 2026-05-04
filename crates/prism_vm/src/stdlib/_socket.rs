@@ -24,6 +24,7 @@ use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::bytes::BytesObject;
 use prism_runtime::types::int::value_to_bigint;
 use prism_runtime::types::list::ListObject;
+use prism_runtime::types::memoryview::value_as_memoryview_ref;
 use prism_runtime::types::string::value_as_string_ref;
 use prism_runtime::types::tuple::{TupleObject, value_as_tuple_ref};
 use rustc_hash::FxHashMap;
@@ -1798,6 +1799,16 @@ fn bytes_arg(value: Value, context: &str) -> Result<Vec<u8>, BuiltinError> {
         .ok_or_else(|| BuiltinError::TypeError(context.to_string()))?;
     match crate::ops::objects::extract_type_id(ptr) {
         TypeId::BYTES | TypeId::BYTEARRAY => Ok(unsafe { &*(ptr as *const BytesObject) }.to_vec()),
+        TypeId::MEMORYVIEW => {
+            let view = value_as_memoryview_ref(value)
+                .ok_or_else(|| BuiltinError::TypeError(context.to_string()))?;
+            if view.released() {
+                return Err(BuiltinError::ValueError(
+                    "operation forbidden on released memoryview object".to_string(),
+                ));
+            }
+            Ok(view.as_bytes().to_vec())
+        }
         _ => Err(BuiltinError::TypeError(context.to_string())),
     }
 }

@@ -176,6 +176,12 @@ impl MemoryViewObject {
         &self.data
     }
 
+    /// Mutably borrow the raw bytes represented by this view.
+    #[inline]
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     /// Clone the raw bytes represented by this view.
     #[inline]
     pub fn to_vec(&self) -> Vec<u8> {

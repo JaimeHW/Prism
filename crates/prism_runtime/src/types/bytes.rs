@@ -107,6 +107,12 @@ impl BytesObject {
         &self.data
     }
 
+    /// Mutably borrow the underlying byte slice.
+    #[inline]
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     /// Get the number of bytes.
     #[inline]
     pub fn len(&self) -> usize {
