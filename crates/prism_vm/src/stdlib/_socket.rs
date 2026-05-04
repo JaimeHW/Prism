@@ -1561,7 +1561,16 @@ fn timeout_duration(timeout: Option<f64>) -> Option<Duration> {
 }
 
 fn socket_io_error(err: std::io::Error) -> BuiltinError {
+    if is_would_block(&err) {
+        return BuiltinError::BlockingIOError(err.to_string());
+    }
+
     BuiltinError::OSError(err.to_string())
+}
+
+fn is_would_block(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(err.raw_os_error(), Some(11) | Some(35) | Some(10035))
 }
 
 fn connect_tcp_stream(addr: SocketAddr, timeout: Option<f64>) -> Result<TcpStream, BuiltinError> {

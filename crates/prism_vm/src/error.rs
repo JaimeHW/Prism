@@ -602,6 +602,9 @@ impl From<BuiltinError> for RuntimeError {
             BuiltinError::OSError(message) => {
                 Self::exception(ExceptionTypeId::OSError.as_u8() as u16, message)
             }
+            BuiltinError::BlockingIOError(message) => {
+                Self::exception(ExceptionTypeId::BlockingIOError.as_u8() as u16, message)
+            }
             BuiltinError::ImportError(message) => {
                 Self::exception(ExceptionTypeId::ImportError.as_u8() as u16, message)
             }

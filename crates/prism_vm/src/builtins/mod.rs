@@ -73,6 +73,8 @@ pub enum BuiltinError {
     SyntaxError(String),
     /// Operating-system level failure.
     OSError(String),
+    /// Nonblocking I/O operation could not complete immediately.
+    BlockingIOError(String),
     /// Import failure while loading a module or attribute.
     ImportError(String),
     /// Requested module does not exist.
@@ -100,6 +102,7 @@ impl std::fmt::Display for BuiltinError {
             BuiltinError::ValueError(msg) => write!(f, "ValueError: {}", msg),
             BuiltinError::SyntaxError(msg) => write!(f, "SyntaxError: {}", msg),
             BuiltinError::OSError(msg) => write!(f, "OSError: {}", msg),
+            BuiltinError::BlockingIOError(msg) => write!(f, "BlockingIOError: {}", msg),
             BuiltinError::ImportError(msg) => write!(f, "ImportError: {}", msg),
             BuiltinError::ModuleNotFoundError(msg) => {
                 write!(f, "ModuleNotFoundError: {}", msg)
