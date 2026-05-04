@@ -604,6 +604,8 @@ fn resolve_method(obj: Value, type_id: TypeId, name: &str) -> Result<CachedMetho
                 .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name))
         }
         TypeId::FUNCTION | TypeId::CLOSURE => resolve_function_method(name),
+        TypeId::BUILTIN_FUNCTION | TypeId::METHOD => builtin_methods::resolve_callable_method(name)
+            .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name)),
         TypeId::CLASSMETHOD | TypeId::STATICMETHOD => {
             super::resolve_builtin_instance_method(type_id, name)
                 .ok_or_else(|| RuntimeError::attribute_error(type_id.name(), name))

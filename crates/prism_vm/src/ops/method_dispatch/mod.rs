@@ -64,8 +64,10 @@ pub(crate) fn resolve_builtin_instance_method(type_id: TypeId, name: &str) -> Op
             builtin_methods::resolve_async_generator_operation_method(type_id, name)
         }
         TypeId::FUNCTION | TypeId::CLOSURE => builtin_methods::resolve_function_method(name),
+        TypeId::BUILTIN_FUNCTION | TypeId::METHOD => builtin_methods::resolve_callable_method(name),
         TypeId::CLASSMETHOD => builtin_methods::resolve_classmethod_method(name),
-        TypeId::STATICMETHOD => builtin_methods::resolve_staticmethod_method(name),
+        TypeId::STATICMETHOD => builtin_methods::resolve_staticmethod_method(name)
+            .or_else(|| builtin_methods::resolve_callable_method(name)),
         _ => None,
     };
     resolved.or_else(|| builtin_methods::resolve_generic_dunder_method(type_id, name))

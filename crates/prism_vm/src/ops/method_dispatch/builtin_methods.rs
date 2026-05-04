@@ -15,7 +15,7 @@ use crate::builtins::{
 };
 use crate::error::RuntimeError;
 use crate::error::RuntimeErrorKind;
-use crate::ops::calls::invoke_callable_value;
+use crate::ops::calls::{invoke_callable_value, invoke_callable_value_with_keywords};
 use crate::ops::comparison::{compare_sort_ordering, eq_or_identical, eq_result};
 use crate::ops::dict_access::{
     dict_contains_key, dict_get_item, dict_missing_value, dict_remove_item, dict_set_item,
@@ -552,6 +552,9 @@ static ASYNC_GENERATOR_OPERATION_CLOSE_METHOD: LazyLock<BuiltinFunctionObject> =
     });
 static FUNCTION_GET_METHOD: LazyLock<BuiltinFunctionObject> =
     LazyLock::new(|| BuiltinFunctionObject::new(Arc::from("function.__get__"), function_get));
+static CALLABLE_CALL_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
+    BuiltinFunctionObject::new_vm_kw(Arc::from("callable.__call__"), callable_call)
+});
 static CLASSMETHOD_GET_METHOD: LazyLock<BuiltinFunctionObject> = LazyLock::new(|| {
     BuiltinFunctionObject::new_vm(Arc::from("classmethod.__get__"), classmethod_get)
 });
@@ -1336,6 +1339,19 @@ pub fn resolve_function_method(name: &str) -> Option<CachedMethod> {
     match name {
         "__get__" => Some(CachedMethod::simple(builtin_method_value(
             &FUNCTION_GET_METHOD,
+        ))),
+        "__call__" => Some(CachedMethod::simple(builtin_method_value(
+            &CALLABLE_CALL_METHOD,
+        ))),
+        _ => None,
+    }
+}
+
+/// Resolve methods shared by callable runtime objects.
+pub fn resolve_callable_method(name: &str) -> Option<CachedMethod> {
+    match name {
+        "__call__" => Some(CachedMethod::simple(builtin_method_value(
+            &CALLABLE_CALL_METHOD,
         ))),
         _ => None,
     }
@@ -4848,6 +4864,21 @@ fn function_get(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(crate::ops::objects::bind_instance_attribute(
         function, instance,
     ))
+}
+
+fn callable_call(
+    vm: &mut VirtualMachine,
+    args: &[Value],
+    keywords: &[(&str, Value)],
+) -> Result<Value, BuiltinError> {
+    let Some((callable, forwarded_args)) = args.split_first() else {
+        return Err(BuiltinError::TypeError(
+            "descriptor '__call__' needs a callable receiver".to_string(),
+        ));
+    };
+
+    invoke_callable_value_with_keywords(vm, *callable, forwarded_args, keywords)
+        .map_err(runtime_error_to_builtin_error)
 }
 
 fn classmethod_get(vm: &mut VirtualMachine, args: &[Value]) -> Result<Value, BuiltinError> {

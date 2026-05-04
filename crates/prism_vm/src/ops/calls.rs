@@ -2320,59 +2320,13 @@ pub(crate) fn call_callable_value_with_keywords_from_values(
                 keywords,
             )
         }
-        _ => {
-            match resolve_dunder_call_target(callable) {
-                Ok(Some(resolved)) => {
-                    return match vm.with_native_recursion_guard(|vm| {
-                        Ok(call_bound_callable_value_with_keywords_from_values(
-                            vm, resolved, dst_reg, args, keywords,
-                        ))
-                    }) {
-                        Ok(flow) => flow,
-                        Err(err) => ControlFlow::Error(err),
-                    };
-                }
-                Ok(None) => {}
-                Err(err) => return ControlFlow::Error(err),
+        _ => match invoke_callable_value_with_keywords(vm, callable, args, keywords) {
+            Ok(result) => {
+                vm.current_frame_mut().set_reg(dst_reg, result);
+                ControlFlow::Continue
             }
-
-            match invoke_callable_value_with_keywords(vm, callable, args, keywords) {
-                Ok(result) => {
-                    vm.current_frame_mut().set_reg(dst_reg, result);
-                    ControlFlow::Continue
-                }
-                Err(err) => ControlFlow::Error(err),
-            }
-        }
-    }
-}
-
-fn call_bound_callable_value_with_keywords_from_values(
-    vm: &mut VirtualMachine,
-    resolved: BoundMethodTarget,
-    dst_reg: u8,
-    args: &[Value],
-    keywords: &[(&str, Value)],
-) -> ControlFlow {
-    if let Some(implicit_self) = resolved.implicit_self {
-        let mut all_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
-        all_args.push(implicit_self);
-        all_args.extend_from_slice(args);
-        call_callable_value_with_keywords_from_values(
-            vm,
-            resolved.callable,
-            dst_reg,
-            &all_args,
-            keywords,
-        )
-    } else {
-        call_callable_value_with_keywords_from_values(
-            vm,
-            resolved.callable,
-            dst_reg,
-            args,
-            keywords,
-        )
+            Err(err) => ControlFlow::Error(err),
+        },
     }
 }
 
